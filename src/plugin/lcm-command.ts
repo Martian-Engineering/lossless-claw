@@ -40,6 +40,7 @@ const ROTATE_DATABASE_LOCK_TIMEOUT_MS = 30_000;
 const DOCTOR_APPLY_LARGE_MESSAGE_THRESHOLD = 1_000;
 const DOCTOR_APPLY_LARGE_TARGET_THRESHOLD = 25;
 const DOCTOR_APPLY_BUDGET_PRESSURE_RATIO = 0.75;
+const STUB_MIGRATION_THRESHOLD_BYTES = 8_000;
 
 type LcmStatusStats = {
   conversationCount: number;
@@ -48,6 +49,12 @@ type LcmStatusStats = {
   summarizedSourceTokens: number;
   leafSummaryCount: number;
   condensedSummaryCount: number;
+};
+
+type LargeToolPayloadStubStats = {
+  stubReadySidecars: number;
+  legacyRawToolRowsOverThreshold: number;
+  largeFileCount: number;
 };
 
 type LcmConversationStatusStats = {
@@ -127,6 +134,14 @@ function readCommandRuntimeContext(ctx: PluginCommandContext): Record<string, un
   return asRecord(asRecord(ctx)?.runtimeContext);
 }
 
+function readNestedString(root: unknown, path: string[]): string {
+  let current: unknown = root;
+  for (const segment of path) {
+    current = asRecord(current)?.[segment];
+  }
+  return typeof current === "string" ? current.trim() : "";
+}
+
 function formatBoolean(value: boolean): string {
   return value ? "yes" : "no";
 }
@@ -170,6 +185,20 @@ function buildSection(title: string, lines: string[]): string {
 
 function buildStatLine(label: string, value: string): string {
   return `${label}: ${value}`;
+}
+
+function formatConfigPair(provider: string, model: string): string {
+  if (!provider && !model) {
+    return "unset";
+  }
+  return `${provider || "default"} / ${model || "default"}`;
+}
+
+function resolveEnvBoolean(value: string | undefined): boolean | undefined {
+  if (value === undefined) {
+    return undefined;
+  }
+  return value === "true";
 }
 
 function formatFailureReason(error: unknown): string {
@@ -373,6 +402,142 @@ function getLcmStatusStats(db: DatabaseSync): LcmStatusStats {
     leafSummaryCount: row?.leaf_summary_count ?? 0,
     condensedSummaryCount: row?.condensed_summary_count ?? 0,
   };
+}
+
+function getLargeToolPayloadStubStats(db: DatabaseSync): LargeToolPayloadStubStats {
+  const row = db
+    .prepare(
+      `SELECT
+         COALESCE(SUM(CASE WHEN large_content IS NOT NULL THEN 1 ELSE 0 END), 0) AS stub_ready_sidecars,
+         COALESCE(SUM(
+           CASE
+             WHEN role = 'tool'
+              AND large_content IS NULL
+              AND length(CAST(content AS BLOB)) > ?
+             THEN 1
+             ELSE 0
+           END
+         ), 0) AS legacy_raw_tool_rows_over_threshold
+       FROM messages`,
+    )
+    .get(STUB_MIGRATION_THRESHOLD_BYTES) as
+    | {
+        stub_ready_sidecars: number;
+        legacy_raw_tool_rows_over_threshold: number;
+      }
+    | undefined;
+  const largeFileRow = db
+    .prepare(`SELECT COALESCE(COUNT(*), 0) AS large_file_count FROM large_files`)
+    .get() as { large_file_count: number } | undefined;
+
+  return {
+    stubReadySidecars: row?.stub_ready_sidecars ?? 0,
+    legacyRawToolRowsOverThreshold: row?.legacy_raw_tool_rows_over_threshold ?? 0,
+    largeFileCount: largeFileRow?.large_file_count ?? 0,
+  };
+}
+
+function buildRuntimeConfigLines(params: {
+  ctx: PluginCommandContext;
+  config: LcmConfig;
+}): string[] {
+  const pluginSummaryProvider = readNestedString(params.ctx.config, [
+    "plugins",
+    "entries",
+    "lossless-claw",
+    "config",
+    "summaryProvider",
+  ]);
+  const pluginSummaryModel = readNestedString(params.ctx.config, [
+    "plugins",
+    "entries",
+    "lossless-claw",
+    "config",
+    "summaryModel",
+  ]);
+  const envSummaryProvider = process.env.LCM_SUMMARY_PROVIDER?.trim() ?? "";
+  const envSummaryModel = process.env.LCM_SUMMARY_MODEL?.trim() ?? "";
+  const resolvedSummaryProvider = envSummaryProvider || params.config.summaryProvider;
+  const resolvedSummaryModel = envSummaryModel || params.config.summaryModel;
+  const envOverridesPlugin =
+    (envSummaryProvider !== "" && pluginSummaryProvider !== "" && envSummaryProvider !== pluginSummaryProvider)
+    || (envSummaryModel !== "" && pluginSummaryModel !== "" && envSummaryModel !== pluginSummaryModel);
+  const lines = [
+    buildStatLine(
+      "summary provider/model",
+      formatConfigPair(resolvedSummaryProvider, resolvedSummaryModel),
+    ),
+  ];
+
+  if (pluginSummaryProvider || pluginSummaryModel) {
+    lines.push(
+      buildStatLine(
+        "plugin summary provider/model",
+        formatConfigPair(pluginSummaryProvider, pluginSummaryModel),
+      ),
+    );
+  }
+  if (envSummaryProvider || envSummaryModel) {
+    lines.push(
+      buildStatLine(
+        "env summary override",
+        [
+          envSummaryProvider ? `LCM_SUMMARY_PROVIDER=${envSummaryProvider}` : "",
+          envSummaryModel ? `LCM_SUMMARY_MODEL=${envSummaryModel}` : "",
+        ].filter(Boolean).join(", "),
+      ),
+    );
+  }
+  if (envOverridesPlugin) {
+    lines.push(
+      buildStatLine(
+        "warning",
+        "LCM_SUMMARY_PROVIDER/LCM_SUMMARY_MODEL override plugin summary config; restart or clear stale service env if this is unexpected",
+      ),
+    );
+  }
+
+  return lines;
+}
+
+function buildLargeToolPayloadStubLines(params: {
+  config: LcmConfig;
+  stats: LargeToolPayloadStubStats;
+}): string[] {
+  const stubLargeToolPayloads =
+    resolveEnvBoolean(process.env.LCM_STUB_LARGE_TOOL_PAYLOADS) ?? params.config.stubLargeToolPayloads;
+  const lines = [
+    buildStatLine("stubLargeToolPayloads", stubLargeToolPayloads ? "enabled" : "disabled"),
+    buildStatLine("stub-ready sidecars", formatNumber(params.stats.stubReadySidecars)),
+    buildStatLine(
+      `legacy raw tool rows over ${formatNumber(STUB_MIGRATION_THRESHOLD_BYTES)} bytes`,
+      formatNumber(params.stats.legacyRawToolRowsOverThreshold),
+    ),
+    buildStatLine("large_files records", formatNumber(params.stats.largeFileCount)),
+    buildStatLine(
+      "note",
+      "runtime large-file references use large_files directly; messages.large_content only tracks migration-populated stub tier",
+    ),
+  ];
+
+  if (stubLargeToolPayloads && params.stats.stubReadySidecars === 0) {
+    lines.push(
+      buildStatLine(
+        "warning",
+        "enabled, but no rows are stub-ready; run scripts/lcm-blob-migrate.mjs for legacy tool rows before expecting assembler stubs",
+      ),
+    );
+  }
+  if (params.stats.legacyRawToolRowsOverThreshold > 0) {
+    lines.push(
+      buildStatLine(
+        "migration",
+        `${formatNumber(params.stats.legacyRawToolRowsOverThreshold)} legacy tool row(s) still need scripts/lcm-blob-migrate.mjs`,
+      ),
+    );
+  }
+
+  return lines;
 }
 
 function getConversationStatusStats(
@@ -904,6 +1069,7 @@ async function buildStatusText(params: {
   config: LcmConfig;
 }): Promise<string> {
   const status = getLcmStatusStats(params.db);
+  const largeToolPayloadStubStats = getLargeToolPayloadStubStats(params.db);
   const doctor = getDoctorSummaryStats(params.db);
   const enabled = resolvePluginEnabled(params.ctx.config);
   const selected = resolvePluginSelected(params.ctx.config);
@@ -924,6 +1090,8 @@ async function buildStatusText(params: {
       buildStatLine("db size", dbSize),
     ]),
     "",
+    buildSection("⚙️ Runtime config", buildRuntimeConfigLines(params)),
+    "",
     buildSection("🌐 Global", [
       buildStatLine("conversations", formatNumber(status.conversationCount)),
       buildStatLine(
@@ -933,6 +1101,14 @@ async function buildStatusText(params: {
       buildStatLine("stored summary tokens", formatNumber(status.storedSummaryTokens)),
       buildStatLine("summarized source tokens", formatNumber(status.summarizedSourceTokens)),
     ]),
+    "",
+    buildSection(
+      "🧱 Large tool payload stubs",
+      buildLargeToolPayloadStubLines({
+        config: params.config,
+        stats: largeToolPayloadStubStats,
+      }),
+    ),
     "",
   ];
 

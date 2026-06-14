@@ -267,7 +267,7 @@ Plugin config equivalents:
 - `delegationTimeoutMs`
 - `summaryTimeoutMs`
 
-Environment variables still win over plugin config when both are set.
+Environment variables still win over plugin config when both are set. `/lossless status` reports the resolved summary provider/model and warns when `LCM_SUMMARY_MODEL` or `LCM_SUMMARY_PROVIDER` differs from the plugin's configured summary target, which usually means the running service inherited stale env and should be restarted with those overrides cleared.
 
 ### Summary model priority
 

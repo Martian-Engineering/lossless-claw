@@ -80,7 +80,7 @@ Look up metadata and content for a specific summary or stored file.
 
 | Param | Type | Required | Default | Description |
 |-------|------|----------|---------|-------------|
-| `id` | string | ✅ | — | `sum_xxx` for summaries, `file_xxx` for files |
+| `id` | string | ✅ | — | `sum_xxx` for summaries, `file_xxx` for files, or the full `[LCM Tool Output: file_xxx ...]` reference string |
 | `conversationId` | number | | current session family | Scope to a specific physical conversation |
 | `allConversations` | boolean | | `false` | Allow cross-conversation lookups |
 
@@ -108,6 +108,9 @@ lcm_describe(id: "sum_abc123def456")
 
 # Retrieve a stored large file
 lcm_describe(id: "file_789abc012345")
+
+# Retrieve a file from a compact tool-output reference
+lcm_describe(id: "[LCM Tool Output: file_789abc012345 | tool=exec | 12,345 bytes]")
 ```
 
 ### lcm_expand_query

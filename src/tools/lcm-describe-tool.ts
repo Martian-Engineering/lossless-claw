@@ -75,6 +75,12 @@ function normalizeRequestedTokenCap(value: unknown): number | undefined {
   return Math.max(1, Math.trunc(value));
 }
 
+function normalizeDescribeId(value: string): string {
+  const trimmed = value.trim();
+  const match = trimmed.match(/^\[LCM Tool Output:\s*(file_[A-Za-z0-9_-]+)(?:\s*\||\s*\])[\s\S]*\]$/);
+  return match?.[1] ?? trimmed;
+}
+
 function compactDescribeDetails(result: DescribeResult | null) {
   if (!result) {
     return result;
@@ -130,7 +136,7 @@ export function createLcmDescribeTool(input: {
       const retrieval = lcm.getRetrieval();
       const timezone = lcm.timezone;
       const p = params as Record<string, unknown>;
-      const id = (p.id as string).trim();
+      const id = normalizeDescribeId(p.id as string);
       const conversationScope = await resolveLcmConversationScope({
         lcm,
         deps: input.deps,

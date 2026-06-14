@@ -201,7 +201,7 @@ Every automatic decision emits grep-able log lines prefixed with `[lcm] auto-rot
 | `freshTailCount` | `integer` | `64` | `LCM_FRESH_TAIL_COUNT` | Number of newest messages always kept raw. |
 | `freshTailMaxTokens` | `integer` | unset | `LCM_FRESH_TAIL_MAX_TOKENS` | Optional token cap for the protected fresh tail. The newest message is always preserved even if it exceeds the cap. |
 | `promptAwareEviction` | `boolean` | `false` | `LCM_PROMPT_AWARE_EVICTION_ENABLED` | When enabled, budget-constrained assembly keeps older evictable items by prompt relevance instead of pure chronology. This improves retrieval under tight budgets, but it can reduce prompt-cache hit rates because the preserved prefix changes as prompts change. |
-| `stubLargeToolPayloads` | `boolean` | `false` | `LCM_STUB_LARGE_TOOL_PAYLOADS` | When enabled, evictable tool-result rows backfilled with `messages.large_content` are assembled as `[LCM Tool Output: file_xxx ...]` stubs while the fresh tail stays inline. Requires `scripts/lcm-blob-migrate.mjs`, which defaults to the same large-files root as runtime LCM (`LCM_LARGE_FILES_DIR` or `${OPENCLAW_STATE_DIR}/lcm-files`). |
+| `stubLargeToolPayloads` | `boolean` | `false` | `LCM_STUB_LARGE_TOOL_PAYLOADS` | When enabled, evictable legacy tool-result rows backfilled with `messages.large_content` are assembled as `[LCM Tool Output: file_xxx ...]` stubs while the fresh tail stays inline. This is separate from runtime large-tool externalization, which writes `large_files` records and compact references during ingest. Requires `scripts/lcm-blob-migrate.mjs`, which defaults to the same large-files root as runtime LCM (`LCM_LARGE_FILES_DIR` or `${OPENCLAW_STATE_DIR}/lcm-files`). |
 | `leafMinFanout` | `integer` | `8` | `LCM_LEAF_MIN_FANOUT` | Minimum number of raw messages required before a leaf pass runs. |
 | `condensedMinFanout` | `integer` | `4` | `LCM_CONDENSED_MIN_FANOUT` | Number of same-depth summaries needed before condensation is attempted. |
 | `condensedMinFanoutHard` | `integer` | `2` | `LCM_CONDENSED_MIN_FANOUT_HARD` | Hard floor for condensation grouping during maintenance and repair flows. |
@@ -327,6 +327,8 @@ Compaction summarization resolves candidates in this order:
 5. `fallbackProviders`
 
 If `summaryModel` already contains a provider prefix such as `anthropic/claude-sonnet-4-20250514`, `summaryProvider` is ignored for that candidate.
+
+`LCM_SUMMARY_MODEL` and `LCM_SUMMARY_PROVIDER` are process environment overrides. They intentionally win over plugin config, so `/lossless status` reports the resolved summary provider/model and warns when those env values differ from `plugins.entries.lossless-claw.config.summaryModel` or `summaryProvider`. If status shows an unexpected env override after editing durable config, restart the service with the stale env cleared.
 
 Lossless does not resolve provider credentials directly for compaction summaries. OpenClaw's runtime LLM layer owns provider/model preparation, auth profiles, OAuth refresh, base URLs, and dispatch. Lossless only selects the requested summary target and passes it to the host runtime, where model override policy is enforced.
 

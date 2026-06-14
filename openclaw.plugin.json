@@ -51,7 +51,7 @@
     },
     "stubLargeToolPayloads": {
       "label": "Stub Large Tool Payloads",
-      "help": "When enabled, evictable tool-result rows whose payload was externalized via lcm-blob-migrate are replaced with a [LCM Tool Output: file_xxx | …] reference at assemble time. Fresh tail is never stubbed. The agent recovers the original output via lcm_describe(id=file_xxx, expandFile=true). Default off; requires running scripts/lcm-blob-migrate.mjs first to populate messages.large_content."
+      "help": "When enabled, evictable legacy tool-result rows whose messages.large_content sidecar was populated by lcm-blob-migrate are replaced with a [LCM Tool Output: file_xxx | …] reference at assemble time. Runtime large-tool externalization writes large_files directly and is reported separately. Fresh tail is never stubbed. The agent recovers the original output via lcm_describe(id=file_xxx, expandFile=true). Default off; requires running scripts/lcm-blob-migrate.mjs first to populate messages.large_content."
     },
     "leafChunkTokens": {
       "label": "Leaf Chunk Tokens",

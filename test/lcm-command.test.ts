@@ -72,6 +72,7 @@ describe("lcm command", () => {
 
   afterEach(() => {
     vi.restoreAllMocks();
+    vi.unstubAllEnvs();
     for (const dbPath of dbPaths) {
       closeLcmConnection(dbPath);
     }
@@ -149,6 +150,80 @@ describe("lcm command", () => {
     expect(result.text).toContain("**📍 Current conversation**");
     expect(result.text).toContain("status: unavailable");
     expect(result.text).toContain("OpenClaw did not expose an active session key or session id here");
+  });
+
+  it("warns when summary env overrides differ from plugin summary config", async () => {
+    vi.stubEnv("LCM_SUMMARY_PROVIDER", "openai-codex");
+    vi.stubEnv("LCM_SUMMARY_MODEL", "gpt-5.5");
+    const fixture = createCommandFixture();
+    tempDirs.add(fixture.tempDir);
+    dbPaths.add(fixture.dbPath);
+
+    const result = await fixture.command.handler(
+      createCommandContext("status", {
+        config: {
+          plugins: {
+            entries: {
+              "lossless-claw": {
+                enabled: true,
+                config: {
+                  summaryProvider: "openai",
+                  summaryModel: "gpt-5.4-mini",
+                },
+              },
+            },
+            slots: {
+              contextEngine: "lossless-claw",
+            },
+          },
+        },
+      }),
+    );
+
+    expect(result.text).toContain("**⚙️ Runtime config**");
+    expect(result.text).toContain("summary provider/model: openai-codex / gpt-5.5");
+    expect(result.text).toContain(
+      "warning: LCM_SUMMARY_PROVIDER/LCM_SUMMARY_MODEL override plugin summary config",
+    );
+    expect(result.text).toContain("plugin summary provider/model: openai / gpt-5.4-mini");
+    expect(result.text).toContain("restart or clear stale service env");
+  });
+
+  it("reports stub readiness when stubLargeToolPayloads has no migrated sidecars", async () => {
+    vi.stubEnv("LCM_STUB_LARGE_TOOL_PAYLOADS", "true");
+    const fixture = createCommandFixture();
+    tempDirs.add(fixture.tempDir);
+    dbPaths.add(fixture.dbPath);
+
+    const conversation = await fixture.conversationStore.createConversation({
+      sessionId: "stub-readiness-session",
+      sessionKey: "agent:main:telegram:stub-readiness",
+      title: "Stub readiness fixture",
+    });
+    await fixture.conversationStore.createMessagesBulk([
+      {
+        conversationId: conversation.conversationId,
+        seq: 0,
+        role: "tool",
+        content: "x".repeat(8_001),
+        tokenCount: 2_100,
+      },
+    ]);
+
+    const result = await fixture.command.handler(
+      createCommandContext("status", {
+        sessionId: "stub-readiness-session",
+        sessionKey: "agent:main:telegram:stub-readiness",
+      }),
+    );
+
+    expect(result.text).toContain("**🧱 Large tool payload stubs**");
+    expect(result.text).toContain("stubLargeToolPayloads: enabled");
+    expect(result.text).toContain("stub-ready sidecars: 0");
+    expect(result.text).toContain("legacy raw tool rows over 8,000 bytes: 1");
+    expect(result.text).toContain("warning: enabled, but no rows are stub-ready");
+    expect(result.text).toContain("scripts/lcm-blob-migrate.mjs");
+    expect(result.text).toContain("runtime large-file references use large_files directly");
   });
 
   it("resolves current conversation stats when the host provides a session key", async () => {

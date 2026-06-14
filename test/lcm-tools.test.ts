@@ -774,6 +774,60 @@ describe("LCM tools session scoping", () => {
     expect(JSON.stringify(cross.details)).not.toContain("subtree");
   });
 
+  it("lcm_describe accepts a full LCM Tool Output reference string as a file id", async () => {
+    const retrieval = {
+      grep: vi.fn(),
+      expand: vi.fn(),
+      describe: vi.fn(async () => ({
+        id: "file_abc123",
+        type: "file",
+        file: {
+          conversationId: 42,
+          fileName: "tool-output.txt",
+          mimeType: "text/plain",
+          byteSize: 1234,
+          storageUri: "/safe/lcm-files/file_abc123.txt",
+          explorationSummary: "Tool: exec | (command elided)",
+          createdAt: new Date("2026-01-01T00:00:00.000Z"),
+        },
+      })),
+    };
+
+    const tool = createLcmDescribeTool({
+      deps: makeDeps(),
+      lcm: buildLcmEngine({ retrieval }) as never,
+    });
+    const result = await tool.execute("call-tool-output-ref", {
+      id: "[LCM Tool Output: file_abc123 | tool=exec | 1,234 bytes]",
+      allConversations: true,
+    });
+
+    expect(retrieval.describe).toHaveBeenCalledWith("file_abc123", expect.any(Object));
+    expect((result.content[0] as { text: string }).text).toContain("## LCM File: file_abc123");
+    expect(result.details).toMatchObject({ id: "file_abc123", type: "file" });
+  });
+
+  it("lcm_describe does not extract file ids from arbitrary malformed text", async () => {
+    const retrieval = {
+      grep: vi.fn(),
+      expand: vi.fn(),
+      describe: vi.fn(async () => null),
+    };
+
+    const tool = createLcmDescribeTool({
+      deps: makeDeps(),
+      lcm: buildLcmEngine({ retrieval }) as never,
+    });
+    const malformed = "please describe file_abc123 from this sentence";
+    const result = await tool.execute("call-malformed-ref", {
+      id: malformed,
+      allConversations: true,
+    });
+
+    expect(retrieval.describe).toHaveBeenCalledWith(malformed, expect.any(Object));
+    expect((result.details as { error?: string }).error).toBe(`Not found: ${malformed}`);
+  });
+
   it("lcm_describe rejects allConversations results outside a delegated grant", async () => {
     const retrieval = {
       grep: vi.fn(),

@@ -199,6 +199,8 @@ Files embedded in user messages (typically via `<file>` blocks from tool output)
 
 This prevents a single large file paste from consuming the entire context window while keeping the content accessible.
 
+Runtime large-file externalization and the `messages.large_content` stub tier are related but distinct. Runtime externalization writes `large_files` records and replaces newly ingested large payloads with compact `[LCM Tool Output: file_xxx ...]` references or metadata immediately. The `messages.large_content` column is populated by `scripts/lcm-blob-migrate.mjs` for legacy tool-result rows so the assembler can stub older evictable rows later. A zero `messages.large_content` count does not mean runtime large-file externalization is absent; check `large_files` for that tier.
+
 ## Session reconciliation
 
 LCM handles crash recovery through **bootstrap reconciliation**:

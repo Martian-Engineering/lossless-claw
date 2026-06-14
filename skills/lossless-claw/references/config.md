@@ -112,13 +112,14 @@ Good default:
 
 ### `stubLargeToolPayloads`
 
-Controls whether older, evictable tool-result rows that were backfilled into the `large_files` store are assembled as compact `[LCM Tool Output: file_xxx ...]` stubs instead of full inline payloads.
+Controls whether older, evictable legacy tool-result rows whose `messages.large_content` sidecar was populated by `scripts/lcm-blob-migrate.mjs` are assembled as compact `[LCM Tool Output: file_xxx ...]` stubs instead of full inline payloads. This is separate from runtime large-tool externalization, which writes `large_files` records and compact references during ingest.
 
 Why it matters:
 
 - it reuses the existing `large_files` drilldown path for old tool output without changing the fresh tail
 - it can recover substantially more historical context at the same token budget in tool-heavy sessions
 - it should stay off until the operator has run `scripts/lcm-blob-migrate.mjs` for the target database
+- `/lossless status` reports `messages.large_content` sidecar readiness separately from runtime `large_files` records
 
 Good default:
 
@@ -436,6 +437,7 @@ Boolean toggle for assemble-time stub substitution of migrated tool-result paylo
 Why it matters:
 
 - only affects rows whose `messages.large_content` sidecar points at a `file_xxx` record
+- runtime large-tool externalization writes `large_files` directly; zero `messages.large_content` rows does not mean runtime externalization is absent
 - the fresh tail is still emitted verbatim
 - drilldown uses `lcm_describe(id=file_xxx, expandFile=true)`
 - `scripts/lcm-blob-migrate.mjs` defaults to the same storage root as runtime LCM: `LCM_LARGE_FILES_DIR` or `${OPENCLAW_STATE_DIR}/lcm-files`
