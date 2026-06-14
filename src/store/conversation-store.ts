@@ -34,6 +34,11 @@ export type CreateMessageInput = {
   tokenCount: number;
   identityHash?: string;
   /**
+   * Optional historical message timestamp, used by transcript recovery imports.
+   * Runtime ingests omit this and keep the store's current timestamp behavior.
+   */
+  createdAt?: Date | string;
+  /**
    * Stable JSONL envelope id of the transcript entry this message was
    * imported from. Enforced unique per conversation (partial index), so
    * transcript replays cannot duplicate rows. Null/undefined for runtime
@@ -229,6 +234,26 @@ function toConversationRecord(row: ConversationRow): ConversationRecord {
     createdAt: parseUtcTimestamp(row.created_at),
     updatedAt: parseUtcTimestamp(row.updated_at),
   };
+}
+
+function formatMessageCreatedAt(value: Date | string | undefined): string | undefined {
+  if (value === undefined) {
+    return undefined;
+  }
+  if (value instanceof Date) {
+    return Number.isFinite(value.getTime())
+      ? value.toISOString().slice(0, 19).replace("T", " ")
+      : undefined;
+  }
+  const trimmed = value.trim();
+  if (!trimmed) {
+    return undefined;
+  }
+  const parsed = parseUtcTimestampOrNull(trimmed);
+  if (parsed) {
+    return parsed.toISOString().slice(0, 19).replace("T", " ");
+  }
+  return undefined;
 }
 
 function toMessageRecord(row: MessageRow): MessageRecord {
@@ -1237,7 +1262,7 @@ export class ConversationStore {
   ): PreparedMessageInsert {
     return {
       ...input,
-      createdAt,
+      createdAt: formatMessageCreatedAt(input.createdAt) ?? createdAt,
       identityHash: input.identityHash ?? buildMessageIdentityHash(input.role, input.content),
     };
   }
