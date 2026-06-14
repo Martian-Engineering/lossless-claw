@@ -2800,6 +2800,16 @@ export class LcmContextEngine implements ContextEngine {
       this.deps.log.warn(
         `[lcm] afterTurn: transcript reconcile failed for ${sessionLabel}: ${describeLogError(err)}`,
       );
+      // Fail closed: without reconcile proof, the initialized in-sync default
+      // would persist this batch and refresh the checkpoint to EOF, advancing
+      // past transcript history that was never reconciled. Skipping persistence
+      // loses nothing — the transcript retains the turn and a later successful
+      // reconcile imports it.
+      transcriptReconcileResult = {
+        importedMessages: 0,
+        blockedByImportCap: false,
+        hasOverlap: false,
+      };
     }
     const transcriptReconcileUnsafeToAdvance =
       transcriptReconcileResult.blockedByImportCap ||

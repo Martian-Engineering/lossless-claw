@@ -1432,6 +1432,59 @@ describe("LcmContextEngine afterTurn", () => {
     ).toBe(false);
   });
 
+  it("afterTurn fails closed when the transcript reconcile throws: no batch persistence, no checkpoint advance", async () => {
+    // The catch handler used to leave the initialized in-sync default in place,
+    // so a thrown reconcile persisted the live batch AND refreshed the
+    // checkpoint to EOF — silently advancing past transcript history that was
+    // never reconciled.
+    const warnLog = vi.fn();
+    const engine = createEngineWithDeps(
+      {},
+      { log: { info: vi.fn(), warn: warnLog, error: vi.fn(), debug: vi.fn() } },
+    );
+    const sessionId = "reconcile-throw-fail-closed";
+    const sessionKey = "agent:main:reconcile-throw-fail-closed";
+    await engine.ingest({
+      sessionId,
+      sessionKey,
+      message: makeMessage({ role: "user", content: "seeded row before the failure" }),
+    });
+    const conversation = await engine.getConversationStore().getConversationForSession({
+      sessionId,
+      sessionKey,
+    });
+    expect(conversation).not.toBeNull();
+    const sessionFile = createSessionFilePath("reconcile-throw-fail-closed");
+    writeLeafTranscript(sessionFile, [
+      { role: "user", content: "seeded row before the failure" },
+    ]);
+    vi.spyOn(
+      (
+        engine as unknown as {
+          transcriptReconciler: { reconcileTranscriptTailForAfterTurn: () => Promise<unknown> };
+        }
+      ).transcriptReconciler,
+      "reconcileTranscriptTailForAfterTurn",
+    ).mockRejectedValueOnce(new Error("synthetic reconcile failure"));
+    await engine.afterTurn({
+      sessionId,
+      sessionKey,
+      sessionFile,
+      messages: [makeMessage({ role: "assistant", content: "batch during the failure" })],
+      prePromptMessageCount: 0,
+      tokenBudget: 4_096,
+    });
+    const contents = (
+      await engine.getConversationStore().getMessages(conversation!.conversationId)
+    ).map((m) => m.content);
+    expect(contents).not.toContain("batch during the failure");
+    expect(
+      await engine.getSummaryStore().getConversationBootstrapState(conversation!.conversationId),
+    ).toBeNull();
+    const warns = warnLog.mock.calls.map((c) => String(c[0]));
+    expect(warns.some((m) => m.includes("transcript reconcile failed"))).toBe(true);
+  });
+
   it("afterTurn recovers a checkpoint-missing conversation with a non-anchoring frontier instead of looping forever (#837)", async () => {
     // #837: a conversation with bootstrapped_at set but NO
     // conversation_bootstrap_state row classifies as reason="checkpoint-missing"
