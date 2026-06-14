@@ -1,9 +1,0 @@
----
-"@martian-engineering/lossless-claw": patch
----
-
-Fix a `#822` `afterTurn` deadlock where a conversation with an all-zero placeholder `conversation_bootstrap_state` row and a persisted frontier of only non-anchoring rows (e.g. one or more injected `Conversation info (untrusted metadata)` preambles) never re-imported its on-disk transcript. The placeholder-checkpoint-recovery reconcile ran without `allowNoAnchorImport`, so it imported 0 messages and never advanced the checkpoint; every turn then emitted the `did not cover the transcript frontier` warning, `assemble()` fell back to the raw transcript, and compaction never ran for that conversation.
-
-The placeholder recovery now opens a no-anchor import, but only when the persisted frontier is proven to hold no real conversation content — generalizing #837's single-injected-metadata-preamble check to a frontier composed entirely of non-anchoring injected-metadata rows (any count, via a bounded scan). A frontier with real anchoring rows conservatively freezes per #649's no-proof-no-advance guard, so an unrelated/rotated transcript can never be stitched onto real history (the failure mode that closed #824). For the proven-safe case the no-anchor import cap is lifted so a transcript larger than the cap recovers fully, bounded by the transcript length rather than left unbounded. The downstream import remains guarded by replay-overlap detection, the delivery-only block (now also applied to this lane), and the cross-conversation raw-id guard.
-
-The same generalized non-anchoring-frontier gate now also drives the afterTurn checkpoint-missing lane (#837), which previously required exactly one persisted frontier row: a conversation that accumulated several injected-metadata preambles before losing its checkpoint recovers there too, and the cap lift applies under the same proof.
