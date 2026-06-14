@@ -9,6 +9,7 @@ import type { CreateMessagePartInput } from "./store/conversation-store.js";
 import { extractToolResultIdForPairing } from "./tool-pairing.js";
 import { extractBootstrapMessageCandidate } from "./transcript.js";
 import { createHash } from "node:crypto";
+import { buildMessageIdentityKey } from "./store/message-identity.js";
 
 export function createBootstrapEntryHash(message: StoredMessage | null): string | null {
   if (!message) {
@@ -31,7 +32,7 @@ export function readBootstrapMessageFromJsonLine(line: string | null): AgentMess
 }
 
 export function messageIdentity(role: string, content: string): string {
-  return `${role}\u0000${content}`;
+  return buildMessageIdentityKey(role, content);
 }
 
 export function isBootstrapReplayCandidateMessage(message: AgentMessage): boolean {
