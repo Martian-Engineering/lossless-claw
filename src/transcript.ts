@@ -44,6 +44,27 @@ export function getTranscriptEntryId(message: AgentMessage): string | null {
   return getTranscriptEntryMeta(message)?.entryId ?? null;
 }
 
+export function resolveTranscriptMessageCreatedAt(message: AgentMessage): Date | string | undefined {
+  const envelopeTimestamp = getTranscriptEntryMeta(message)?.timestamp;
+  if (envelopeTimestamp) {
+    return envelopeTimestamp;
+  }
+
+  const raw = message as unknown as Record<string, unknown>;
+  const value = raw.timestamp ?? raw.createdAt ?? raw.created_at;
+  if (typeof value === "number") {
+    const parsed = new Date(value);
+    return Number.isFinite(parsed.getTime()) ? parsed : undefined;
+  }
+  if (value instanceof Date) {
+    return Number.isFinite(value.getTime()) ? value : undefined;
+  }
+  if (typeof value === "string" && value.trim()) {
+    return value;
+  }
+  return undefined;
+}
+
 function normalizeEnvelopeString(value: unknown): string | null {
   if (typeof value !== "string") {
     return null;

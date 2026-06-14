@@ -3496,7 +3496,7 @@ describe("LcmContextEngine.bootstrap", () => {
       role: "user",
       content: [{ type: "text", text: "seed user" }],
     } as AgentMessage);
-    appendSessionMessage(sm, {
+    const seedAssistantId = appendSessionMessage(sm, {
       role: "assistant",
       content: [{ type: "text", text: "seed assistant" }],
     } as AgentMessage);
@@ -3548,12 +3548,29 @@ describe("LcmContextEngine.bootstrap", () => {
     expect(staleBootstrapState).not.toBeNull();
     expect(staleBootstrapState?.lastProcessedEntryHash).toBe("mismatch");
 
-    for (let index = 0; index < 60; index += 1) {
-      appendSessionMessage(sm, {
+    const recoveredTailContents = Array.from({ length: 60 }, (_, index) =>
+      index < 3 ? "repeat ack" : `missing tail ${index}`,
+    );
+    const recoveredTailTimestamps = recoveredTailContents.map(
+      (_content, index) => `2026-06-10T18:${String(index).padStart(2, "0")}:00.000Z`,
+    );
+    const invalidTimestampIndex = 4;
+    const recoveredTailEntries = recoveredTailContents.map((content, index) => ({
+      type: "message",
+      id: `recovered-tail-${index}`,
+      parentId: index === 0 ? seedAssistantId : `recovered-tail-${index - 1}`,
+      timestamp:
+        index === invalidTimestampIndex ? "not-a-valid-transcript-timestamp" : recoveredTailTimestamps[index],
+      message: {
         role: index % 2 === 0 ? "user" : "assistant",
-        content: [{ type: "text", text: `missing tail ${index}` }],
-      } as AgentMessage);
-    }
+        content: [{ type: "text", text: content }],
+      },
+    }));
+    appendFileSync(
+      sessionFile,
+      recoveredTailEntries.map((entry) => JSON.stringify(entry)).join("\n") + "\n",
+      "utf8",
+    );
 
     const second = await engine.bootstrap({ sessionId, sessionKey, sessionFile });
     // Anchored backlog over the cap imports a bounded oldest-first chunk
@@ -3573,7 +3590,7 @@ describe("LcmContextEngine.bootstrap", () => {
       "seed user",
       "seed assistant",
     ]);
-    expect(storedAfterCap[2]?.content).toBe("missing tail 0");
+    expect(storedAfterCap[2]?.content).toBe("repeat ack");
     expect(storedAfterCap[51]?.content).toBe("missing tail 49");
 
     const secondBootstrapState = await engine
@@ -3596,6 +3613,15 @@ describe("LcmContextEngine.bootstrap", () => {
       .getMessages(conversation!.conversationId);
     expect(storedAfterDrain).toHaveLength(62);
     expect(storedAfterDrain[61]?.content).toBe("missing tail 59");
+    expect(
+      storedAfterDrain.slice(2, 5).map((message) => message.createdAt.toISOString()),
+    ).toEqual(recoveredTailTimestamps.slice(0, 3));
+    expect(storedAfterDrain[2 + invalidTimestampIndex]?.content).toBe(
+      recoveredTailContents[invalidTimestampIndex],
+    );
+    expect(
+      Number.isFinite(storedAfterDrain[2 + invalidTimestampIndex]!.createdAt.getTime()),
+    ).toBe(true);
   });
 
   it("uses the live ingest path for initial bootstrap", async () => {
@@ -4197,4 +4223,3 @@ describe("LcmContextEngine.bootstrap", () => {
 });
 
 // ── Assemble canonical path with fallback ───────────────────────────────────
-
