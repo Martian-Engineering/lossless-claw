@@ -68,6 +68,16 @@ const FLUSH_LAG_ADOPTION_TAIL_WINDOW = 16;
 // rather than scan an arbitrarily large real DB tail (#649 no-proof-no-advance).
 const NON_ANCHORING_FRONTIER_SCAN_LIMIT = 32;
 
+// No-anchor recovery reasons that can proceed from checkpoint/frontier metadata
+// instead of a content anchor. Block them if raw IDs are already owned by another
+// active conversation.
+const CROSS_CONVERSATION_RAW_ID_GUARDED_NO_ANCHOR_REASONS = new Set([
+  "same-path-shrink",
+  "checkpoint-missing-recovery",
+  "rotate-checkpoint-missing",
+  "placeholder-checkpoint-recovery",
+]);
+
 export type BootstrapCheckpointFileState = {
   lastProcessedOffset: number;
   lastSeenSize: number;
@@ -873,7 +883,10 @@ export class TranscriptReconciler {
       }
     }
 
-    if (params.noAnchorImportReason === "same-path-shrink") {
+    if (
+      params.noAnchorImportReason &&
+      CROSS_CONVERSATION_RAW_ID_GUARDED_NO_ANCHOR_REASONS.has(params.noAnchorImportReason)
+    ) {
       const rawIdMatches = this.countActiveCrossConversationRawIdMatches({
         conversationId,
         sessionId,
@@ -881,7 +894,7 @@ export class TranscriptReconciler {
       });
       if (rawIdMatches.matchedRawIds > 0) {
         this.host.deps.log.warn(
-          `[lcm] reconcileSessionTail: blocked same-path-shrink no-anchor import for ${sessionContext} because ${rawIdMatches.matchedRawIds}/${rawIdMatches.candidateRawIds} candidate raw ids already exist in other active conversations`,
+          `[lcm] reconcileSessionTail: blocked ${params.noAnchorImportReason} no-anchor import for ${sessionContext} because ${rawIdMatches.matchedRawIds}/${rawIdMatches.candidateRawIds} candidate raw ids already exist in other active conversations`,
         );
         this.host.deps.log.debug(
           `[lcm] reconcileSessionTail: blocked cross-conversation raw-id duplicate for ${sessionContext} duration=${formatDurationMs(Date.now() - startedAt)} historicalMessages=${historicalMessages.length} candidateRawIds=${rawIdMatches.candidateRawIds} matchedRawIds=${rawIdMatches.matchedRawIds} overlap=false`,

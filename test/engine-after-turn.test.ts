@@ -1579,6 +1579,163 @@ describe("LcmContextEngine afterTurn", () => {
     expect(advancedState?.lastProcessedOffset).toBeGreaterThan(0);
   });
 
+  it("blocks placeholder-checkpoint recovery when raw ids belong to another active conversation", async () => {
+    const warnLog = vi.fn();
+    const engine = createEngineWithDeps(
+      {},
+      { log: { info: vi.fn(), warn: warnLog, error: vi.fn(), debug: vi.fn() } },
+    );
+
+    const ownedMessages = [
+      makeMessage({
+        role: "user",
+        content: [{ type: "text", id: "placeholder-cross-user", text: "owned user turn" }],
+      }),
+      makeMessage({
+        role: "assistant",
+        content: [{ type: "text", id: "placeholder-cross-assistant", text: "owned answer" }],
+      }),
+    ];
+    const ownerSessionFile = createSessionFilePath("placeholder-rawid-owner");
+    writeLeafTranscriptMessages(ownerSessionFile, ownedMessages);
+    await engine.bootstrap({
+      sessionId: "placeholder-rawid-owner",
+      sessionKey: "agent:main:placeholder-rawid-owner",
+      sessionFile: ownerSessionFile,
+    });
+
+    const placeholderSessionId = "placeholder-rawid-candidate";
+    const placeholderSessionKey = "agent:main:placeholder-rawid-candidate";
+    await engine.ingest({
+      sessionId: placeholderSessionId,
+      sessionKey: placeholderSessionKey,
+      message: makeMessage({
+        role: "user",
+        content: "Conversation info (untrusted metadata): placeholder raw-id candidate",
+      }),
+    });
+    const placeholderConversation = await engine.getConversationStore().getConversationForSession({
+      sessionId: placeholderSessionId,
+      sessionKey: placeholderSessionKey,
+    });
+    expect(placeholderConversation).not.toBeNull();
+
+    const candidateSessionFile = createSessionFilePath("placeholder-rawid-candidate");
+    writeLeafTranscriptMessages(candidateSessionFile, ownedMessages);
+    await engine.getSummaryStore().upsertConversationBootstrapState({
+      conversationId: placeholderConversation!.conversationId,
+      sessionFilePath: candidateSessionFile,
+      lastSeenSize: 0,
+      lastSeenMtimeMs: 0,
+      lastProcessedOffset: 0,
+      lastProcessedEntryHash: null,
+    });
+
+    await engine.afterTurn({
+      sessionId: placeholderSessionId,
+      sessionKey: placeholderSessionKey,
+      sessionFile: candidateSessionFile,
+      messages: [],
+      prePromptMessageCount: 0,
+      tokenBudget: 4_096,
+    });
+
+    const placeholderMessages = await engine
+      .getConversationStore()
+      .getMessages(placeholderConversation!.conversationId);
+    expect(placeholderMessages.map((message) => message.content)).toEqual([
+      "Conversation info (untrusted metadata): placeholder raw-id candidate",
+    ]);
+    const state = await engine
+      .getSummaryStore()
+      .getConversationBootstrapState(placeholderConversation!.conversationId);
+    expect(state?.lastProcessedOffset).toBe(0);
+    expect(
+      warnLog.mock.calls
+        .map((c) => String(c[0]))
+        .some((m) => m.includes("blocked placeholder-checkpoint-recovery no-anchor import")),
+    ).toBe(true);
+  });
+
+  it("blocks checkpoint-missing recovery when raw ids belong to another active conversation", async () => {
+    const warnLog = vi.fn();
+    const engine = createEngineWithDeps(
+      {},
+      { log: { info: vi.fn(), warn: warnLog, error: vi.fn(), debug: vi.fn() } },
+    );
+
+    const ownedMessages = [
+      makeMessage({
+        role: "user",
+        content: [{ type: "text", id: "checkpoint-cross-user", text: "owned checkpoint user" }],
+      }),
+      makeMessage({
+        role: "assistant",
+        content: [{ type: "text", id: "checkpoint-cross-assistant", text: "owned checkpoint answer" }],
+      }),
+    ];
+    const ownerSessionFile = createSessionFilePath("checkpoint-rawid-owner");
+    writeLeafTranscriptMessages(ownerSessionFile, ownedMessages);
+    await engine.bootstrap({
+      sessionId: "checkpoint-rawid-owner",
+      sessionKey: "agent:main:checkpoint-rawid-owner",
+      sessionFile: ownerSessionFile,
+    });
+
+    const checkpointSessionId = "checkpoint-rawid-candidate";
+    const checkpointSessionKey = "agent:main:checkpoint-rawid-candidate";
+    await engine.ingest({
+      sessionId: checkpointSessionId,
+      sessionKey: checkpointSessionKey,
+      message: makeMessage({
+        role: "user",
+        content: "Conversation info (untrusted metadata): checkpoint raw-id candidate",
+      }),
+    });
+    const checkpointConversation = await engine.getConversationStore().getConversationForSession({
+      sessionId: checkpointSessionId,
+      sessionKey: checkpointSessionKey,
+    });
+    expect(checkpointConversation).not.toBeNull();
+    await engine
+      .getConversationStore()
+      .markConversationBootstrapped(checkpointConversation!.conversationId);
+    expect(
+      await engine
+        .getSummaryStore()
+        .getConversationBootstrapState(checkpointConversation!.conversationId),
+    ).toBeNull();
+
+    const candidateSessionFile = createSessionFilePath("checkpoint-rawid-candidate");
+    writeLeafTranscriptMessages(candidateSessionFile, ownedMessages);
+
+    await engine.afterTurn({
+      sessionId: checkpointSessionId,
+      sessionKey: checkpointSessionKey,
+      sessionFile: candidateSessionFile,
+      messages: [],
+      prePromptMessageCount: 0,
+      tokenBudget: 4_096,
+    });
+
+    const checkpointMessages = await engine
+      .getConversationStore()
+      .getMessages(checkpointConversation!.conversationId);
+    expect(checkpointMessages.map((message) => message.content)).toEqual([
+      "Conversation info (untrusted metadata): checkpoint raw-id candidate",
+    ]);
+    expect(
+      await engine
+        .getSummaryStore()
+        .getConversationBootstrapState(checkpointConversation!.conversationId),
+    ).toBeNull();
+    expect(
+      warnLog.mock.calls
+        .map((c) => String(c[0]))
+        .some((m) => m.includes("blocked checkpoint-missing-recovery no-anchor import")),
+    ).toBe(true);
+  });
+
   it("does NOT import an unrelated transcript onto a placeholder-checkpoint conversation that already holds real anchoring rows (#824 contamination guard)", async () => {
     // The failure that closed PR #824: a placeholder checkpoint can coexist with
     // real persisted rows; blindly opening an unbounded no-anchor import would
