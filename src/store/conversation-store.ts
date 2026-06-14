@@ -250,7 +250,7 @@ function formatMessageCreatedAt(value: Date | string | undefined): string | unde
     return undefined;
   }
   const parsed = parseUtcTimestampOrNull(trimmed);
-  if (parsed) {
+  if (parsed && Number.isFinite(parsed.getTime())) {
     return parsed.toISOString().slice(0, 19).replace("T", " ");
   }
   return undefined;

@@ -3554,11 +3554,13 @@ describe("LcmContextEngine.bootstrap", () => {
     const recoveredTailTimestamps = recoveredTailContents.map(
       (_content, index) => `2026-06-10T18:${String(index).padStart(2, "0")}:00.000Z`,
     );
+    const invalidTimestampIndex = 4;
     const recoveredTailEntries = recoveredTailContents.map((content, index) => ({
       type: "message",
       id: `recovered-tail-${index}`,
       parentId: index === 0 ? seedAssistantId : `recovered-tail-${index - 1}`,
-      timestamp: recoveredTailTimestamps[index],
+      timestamp:
+        index === invalidTimestampIndex ? "not-a-valid-transcript-timestamp" : recoveredTailTimestamps[index],
       message: {
         role: index % 2 === 0 ? "user" : "assistant",
         content: [{ type: "text", text: content }],
@@ -3614,6 +3616,12 @@ describe("LcmContextEngine.bootstrap", () => {
     expect(
       storedAfterDrain.slice(2, 5).map((message) => message.createdAt.toISOString()),
     ).toEqual(recoveredTailTimestamps.slice(0, 3));
+    expect(storedAfterDrain[2 + invalidTimestampIndex]?.content).toBe(
+      recoveredTailContents[invalidTimestampIndex],
+    );
+    expect(
+      Number.isFinite(storedAfterDrain[2 + invalidTimestampIndex]!.createdAt.getTime()),
+    ).toBe(true);
   });
 
   it("uses the live ingest path for initial bootstrap", async () => {
