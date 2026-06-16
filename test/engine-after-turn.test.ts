@@ -1685,6 +1685,59 @@ describe("LcmContextEngine afterTurn", () => {
     expect(checkpoint?.lastProcessedOffset).toBe(statSync(sessionFile).size);
   });
 
+  it("advances placeholder checkpoints over control suffixes after anchored durable history", async () => {
+    const engine = createEngine();
+    const sessionId = "placeholder-heartbeat-anchored-control-suffix";
+    const sessionKey = "agent:main:test:placeholder-heartbeat-anchored-control-suffix";
+    const sessionFile = createSessionFilePath("placeholder-heartbeat-anchored-control-suffix");
+    const sm = SessionManager.open(sessionFile);
+    appendSessionMessage(sm, makeMessage({ role: "user", content: "durable user" }));
+    appendSessionMessage(sm, makeMessage({ role: "assistant", content: "durable assistant" }));
+
+    const first = await engine.bootstrap({ sessionId, sessionKey, sessionFile });
+    expect(first.bootstrapped).toBe(true);
+
+    appendSessionMessage(sm, makeMessage({ role: "user", content: OPENCLAW_HEARTBEAT_POLL }));
+    appendSessionMessage(sm, makeMessage({ role: "assistant", content: "HEARTBEAT_OK" }));
+
+    const conversation = await engine.getConversationStore().getConversationForSession({
+      sessionId,
+      sessionKey,
+    });
+    expect(conversation).not.toBeNull();
+    await engine.getSummaryStore().upsertConversationBootstrapState({
+      conversationId: conversation!.conversationId,
+      sessionFilePath: sessionFile,
+      lastSeenSize: 0,
+      lastSeenMtimeMs: 0,
+      lastProcessedOffset: 0,
+      lastProcessedEntryHash: null,
+    });
+
+    await engine.afterTurn({
+      sessionId,
+      sessionKey,
+      sessionFile,
+      messages: [
+        makeMessage({ role: "user", content: OPENCLAW_HEARTBEAT_POLL }),
+        makeMessage({ role: "assistant", content: "HEARTBEAT_OK" }),
+      ],
+      isHeartbeat: true,
+      prePromptMessageCount: 0,
+      tokenBudget: 4096,
+    });
+
+    const stored = await engine.getConversationStore().getMessages(conversation!.conversationId);
+    expect(stored.map((message) => message.content)).toEqual([
+      "durable user",
+      "durable assistant",
+    ]);
+    const checkpoint = await engine
+      .getSummaryStore()
+      .getConversationBootstrapState(conversation!.conversationId);
+    expect(checkpoint?.lastProcessedOffset).toBe(statSync(sessionFile).size);
+  });
+
   it("does not drop durable assistant tails during heartbeat placeholder recovery", async () => {
     const engine = createEngine();
     const sessionId = "placeholder-heartbeat-preserve-assistant-tail";

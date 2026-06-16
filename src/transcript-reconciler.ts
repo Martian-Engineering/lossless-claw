@@ -1779,8 +1779,12 @@ export class TranscriptReconciler {
             importedMessages: reconcile.importedMessages,
           });
           if (
-            reconcile.importedMessages === 0 &&
-            reconcile.runtimeBatchDisposition === "skip-non-durable-control"
+            (reconcile.importedMessages === 0 &&
+              reconcile.runtimeBatchDisposition === "skip-non-durable-control") ||
+            (placeholderHeartbeatFiltered.skipped > 0 &&
+              !reconcile.blockedByImportCap &&
+              reconcile.importedMessages === 0 &&
+              reconcile.hasOverlap)
           ) {
             await this.refreshBootstrapState({
               conversationId: conversation.conversationId,
