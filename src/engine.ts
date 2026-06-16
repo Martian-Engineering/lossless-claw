@@ -69,8 +69,10 @@ import { resolveBootstrapMaxTokens, trimBootstrapMessagesToBudget } from "./boot
 import {
   batchLooksLikeHeartbeatAckTurn,
   filterSyntheticHeartbeatMessages,
-  isAssistantControlAckContent,
+  isHeartbeatOkContent,
+  NO_REPLY_TOKEN,
   pruneHeartbeatOkTurns,
+  turnLooksLikeHeartbeatTurn,
 } from "./heartbeat-filter.js";
 import { appendUncoveredVolatileLiveInputsWithinBudget, isVolatileLiveInputMessage, messageContentCoveredBySummary, resolveProtectedFreshTailAssembledIndexes } from "./live-coverage.js";
 import { buildMessageParts, extractMessageContent, filterPersistableMessages, hasPersistableMessageRole, isOpenClawRuntimeContextLeak, toStoredMessage } from "./message-content.js";
@@ -2845,9 +2847,46 @@ export class LcmContextEngine implements ContextEngine {
     } else if (transcriptOnlyNonDurableControl) {
       const runtimeFiltered = filterSyntheticHeartbeatMessages(newMessages);
       let skippedRuntimeControlMessages = runtimeFiltered.skipped;
-      const runtimeAlignmentMessages = runtimeFiltered.messages.filter((message) => {
+      const runtimeNoReplySkipIndexes = new Set<number>();
+      if (params.isHeartbeat === true) {
+        for (let index = 0; index < runtimeFiltered.messages.length; index += 1) {
+          const stored = toStoredMessage(runtimeFiltered.messages[index]!);
+          if (
+            stored.role !== "assistant" ||
+            stored.content.trim().toLowerCase() !== NO_REPLY_TOKEN
+          ) {
+            continue;
+          }
+          let turnStart = -1;
+          for (let cursor = index - 1; cursor >= 0; cursor -= 1) {
+            const previous = toStoredMessage(runtimeFiltered.messages[cursor]!);
+            if (previous.role === "user") {
+              turnStart = cursor;
+              break;
+            }
+          }
+          if (turnStart < 0) {
+            runtimeNoReplySkipIndexes.add(index);
+            continue;
+          }
+          const turnMessages = runtimeFiltered.messages
+            .slice(turnStart, index + 1)
+            .map((message) => toStoredMessage(message));
+          if (!turnLooksLikeHeartbeatTurn(turnMessages)) {
+            continue;
+          }
+          for (let cursor = turnStart; cursor <= index; cursor += 1) {
+            runtimeNoReplySkipIndexes.add(cursor);
+          }
+        }
+      }
+      const runtimeAlignmentMessages = runtimeFiltered.messages.filter((message, index) => {
+        if (runtimeNoReplySkipIndexes.has(index)) {
+          skippedRuntimeControlMessages += 1;
+          return false;
+        }
         const stored = toStoredMessage(message);
-        if (stored.role === "assistant" && isAssistantControlAckContent(stored.content)) {
+        if (stored.role === "assistant" && isHeartbeatOkContent(stored.content)) {
           skippedRuntimeControlMessages += 1;
           return false;
         }
@@ -2942,7 +2981,7 @@ export class LcmContextEngine implements ContextEngine {
           sessionId: params.sessionId,
           sessionKey: params.sessionKey,
           messages: ingestBatch,
-          isHeartbeat: params.isHeartbeat === true,
+          isHeartbeat: params.isHeartbeat === true && !transcriptOnlyNonDurableControl,
         });
       } catch (err) {
         // Never compact a stale or partially ingested frontier.
