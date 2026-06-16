@@ -125,7 +125,6 @@ export type ReconcileHost = {
     sessionId: string;
     sessionKey?: string;
     message: AgentMessage;
-    isHeartbeat?: boolean;
     createdAt?: Date | string;
     skipReplayTimestampFloodGuard?: boolean;
   }): Promise<IngestResult>;
@@ -2159,10 +2158,10 @@ export class TranscriptReconciler {
       sessionId: params.sessionId,
       sessionKey: params.sessionKey,
     });
-    const heartbeatFlagFiltered = this.filterHeartbeatFlaggedPlaceholderSuffix({
+    const heartbeatFlagFiltered = this.filterSyntheticHeartbeatTranscriptMessagesWithStats({
       messages: historicalMessages,
-      isHeartbeat: params.isHeartbeat,
       sessionContext: fullReadSessionContext,
+      source: "afterTurn transcript reconcile full-read",
     });
     if (heartbeatFlagFiltered.messages.length === 0 && heartbeatFlagFiltered.skipped > 0) {
       await this.refreshBootstrapState({
@@ -2334,7 +2333,6 @@ export class TranscriptReconciler {
       sessionId: params.sessionId,
       sessionKey: params.sessionKey,
       sessionFile: params.sessionFile,
-      isHeartbeat: params.isHeartbeat,
       allowNoAnchorImportOnCheckpointMissing: params.allowNoAnchorImportOnCheckpointMissing,
       queueKey,
       conversation,

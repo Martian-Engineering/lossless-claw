@@ -5329,7 +5329,7 @@ describe("LcmContextEngine afterTurn", () => {
     expect(checkpoint?.lastProcessedOffset).toBe(statSync(sessionFile).size);
   });
 
-  it("afterTurn full-read heartbeat reconcile skips assistant-only control suffixes", async () => {
+  it("afterTurn full-read heartbeat reconcile preserves unproven assistant-only exact tokens", async () => {
     const engine = createEngine();
     const sessionId = "after-turn-heartbeat-full-read-assistant-control";
     const sessionKey = "agent:main:test:after-turn-heartbeat-full-read-assistant-control";
@@ -5372,6 +5372,7 @@ describe("LcmContextEngine afterTurn", () => {
     expect(stored.map((message) => message.content)).toEqual([
       "seed user",
       "seed assistant",
+      "HEARTBEAT_OK",
     ]);
     const checkpoint = await engine
       .getSummaryStore()
