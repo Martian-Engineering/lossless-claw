@@ -4231,6 +4231,111 @@ describe("LcmContextEngine afterTurn", () => {
     ]);
   });
 
+  it("afterTurn first-contact import prunes NO_REPLY runtime control turns", async () => {
+    const engine = createEngine();
+    const sessionId = "after-turn-exact-heartbeat-no-reply-first-contact-mixed";
+    const sessionKey = "agent:main:test:after-turn-exact-heartbeat-no-reply-first-contact-mixed";
+    const sessionFile = createSessionFilePath(
+      "after-turn-exact-heartbeat-no-reply-first-contact-mixed",
+    );
+    const transcriptMessages = [
+      makeMessage({ role: "user", content: "real user" }),
+      makeMessage({ role: "assistant", content: "real assistant" }),
+      makeMessage({ role: "user", content: OPENCLAW_HEARTBEAT_POLL }),
+      makeMessage({ role: "assistant", content: "NO_REPLY" }),
+    ];
+    writeLeafTranscriptMessages(sessionFile, transcriptMessages);
+
+    await engine.afterTurn({
+      sessionId,
+      sessionKey,
+      sessionFile,
+      messages: [
+        makeMessage({ role: "user", content: OPENCLAW_HEARTBEAT_POLL }),
+        makeMessage({ role: "assistant", content: "NO_REPLY" }),
+      ],
+      prePromptMessageCount: 0,
+      tokenBudget: 4096,
+    });
+
+    const conversation = await engine.getConversationStore().getConversationForSession({
+      sessionId,
+      sessionKey,
+    });
+    expect(conversation).not.toBeNull();
+    const stored = await engine.getConversationStore().getMessages(conversation!.conversationId);
+    expect(stored.map((message) => message.content)).toEqual([
+      "real user",
+      "real assistant",
+    ]);
+  });
+
+  it("afterTurn keeps heartbeat-marker NO_REPLY turns durable without an exact poll", async () => {
+    const engine = createEngine();
+    const sessionId = "after-turn-heartbeat-marker-no-reply-durable";
+    const sessionKey = "agent:main:test:after-turn-heartbeat-marker-no-reply-durable";
+    const sessionFile = createSessionFilePath("after-turn-heartbeat-marker-no-reply-durable");
+    const transcriptMessages = [
+      makeMessage({ role: "user", content: "What does heartbeat.md say?" }),
+      makeMessage({ role: "assistant", content: "NO_REPLY" }),
+    ];
+    writeLeafTranscriptMessages(sessionFile, transcriptMessages);
+
+    await engine.afterTurn({
+      sessionId,
+      sessionKey,
+      sessionFile,
+      messages: transcriptMessages,
+      prePromptMessageCount: 0,
+      tokenBudget: 4096,
+    });
+
+    const conversation = await engine.getConversationStore().getConversationForSession({
+      sessionId,
+      sessionKey,
+    });
+    expect(conversation).not.toBeNull();
+    const stored = await engine.getConversationStore().getMessages(conversation!.conversationId);
+    expect(stored.map((message) => message.content)).toEqual([
+      "What does heartbeat.md say?",
+      "NO_REPLY",
+    ]);
+  });
+
+  it("afterTurn keeps NO_REPLY turns durable when non-user content quotes the exact poll", async () => {
+    const engine = createEngine();
+    const sessionId = "after-turn-no-reply-tool-quoted-poll-durable";
+    const sessionKey = "agent:main:test:after-turn-no-reply-tool-quoted-poll-durable";
+    const sessionFile = createSessionFilePath("after-turn-no-reply-tool-quoted-poll-durable");
+    const transcriptMessages = [
+      makeMessage({ role: "user", content: "What does heartbeat.md say?" }),
+      makeMessage({ role: "tool", content: OPENCLAW_HEARTBEAT_POLL }),
+      makeMessage({ role: "assistant", content: "NO_REPLY" }),
+    ];
+    writeLeafTranscriptMessages(sessionFile, transcriptMessages);
+
+    await engine.afterTurn({
+      sessionId,
+      sessionKey,
+      sessionFile,
+      messages: transcriptMessages,
+      prePromptMessageCount: 0,
+      tokenBudget: 4096,
+    });
+
+    const conversation = await engine.getConversationStore().getConversationForSession({
+      sessionId,
+      sessionKey,
+    });
+    expect(conversation).not.toBeNull();
+    const stored = await engine.getConversationStore().getMessages(conversation!.conversationId);
+    expect(stored.map((message) => message.content)).toEqual([
+      "What does heartbeat.md say?",
+      OPENCLAW_HEARTBEAT_POLL,
+      "NO_REPLY",
+    ]);
+  });
+
   it("afterTurn append-only reconcile skips exact heartbeat poll NO_REPLY turns without the heartbeat flag", async () => {
     const engine = createEngine();
     const sessionId = "after-turn-exact-heartbeat-no-reply-append-only";

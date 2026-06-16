@@ -25,6 +25,10 @@ export function isHeartbeatOkContent(content: string): boolean {
   return content.trim().toLowerCase() === HEARTBEAT_OK_TOKEN;
 }
 
+function isNoReplyContent(content: string): boolean {
+  return content.trim().toLowerCase() === NO_REPLY_TOKEN;
+}
+
 /**
  * Assistant-only control acknowledgements are safe to drop only after
  * transcript reconciliation already classified the matching suffix as
@@ -51,7 +55,8 @@ export function isHeartbeatNoiseContent(role: string, content: string): boolean 
 export function batchLooksLikeHeartbeatAckTurn(messages: AgentMessage[]): boolean {
   let sawHeartbeatMdMarker = false;
   let sawExactHeartbeatPoll = false;
-  let sawHeartbeatAck = false;
+  let sawHeartbeatOkAck = false;
+  let sawNoReplyAck = false;
   let sawNonExactPollTurnContent = false;
 
   for (const message of messages) {
@@ -63,12 +68,11 @@ export function batchLooksLikeHeartbeatAckTurn(messages: AgentMessage[]): boolea
     if (stored.role === "user" && normalized === OPENCLAW_HEARTBEAT_POLL) {
       sawExactHeartbeatPoll = true;
     }
-    if (
-      !sawHeartbeatAck &&
-      stored.role === "assistant" &&
-      isAssistantControlAckContent(stored.content)
-    ) {
-      sawHeartbeatAck = true;
+    if (stored.role === "assistant" && isHeartbeatOkContent(stored.content)) {
+      sawHeartbeatOkAck = true;
+    }
+    if (stored.role === "assistant" && isNoReplyContent(stored.content)) {
+      sawNoReplyAck = true;
     }
     if (
       normalized !== OPENCLAW_HEARTBEAT_POLL &&
@@ -76,12 +80,19 @@ export function batchLooksLikeHeartbeatAckTurn(messages: AgentMessage[]): boolea
     ) {
       sawNonExactPollTurnContent = true;
     }
-    if (sawHeartbeatMdMarker && sawHeartbeatAck) {
+    if (
+      sawHeartbeatMdMarker &&
+      (sawHeartbeatOkAck || (sawNoReplyAck && sawExactHeartbeatPoll))
+    ) {
       return true;
     }
   }
 
-  return sawExactHeartbeatPoll && sawHeartbeatAck && !sawNonExactPollTurnContent;
+  return (
+    sawExactHeartbeatPoll &&
+    (sawHeartbeatOkAck || sawNoReplyAck) &&
+    !sawNonExactPollTurnContent
+  );
 }
 
 export function filterSyntheticHeartbeatMessages(
@@ -126,6 +137,9 @@ export function filterSyntheticHeartbeatMessages(
     if (!turnLooksLikeHeartbeatTurn(turnMessages)) {
       continue;
     }
+    if (isNoReplyContent(stored.content) && !turnHasExactHeartbeatPoll(turnMessages)) {
+      continue;
+    }
 
     for (let cursor = turnStart; cursor <= index; cursor += 1) {
       skipIndexes.add(cursor);
@@ -152,18 +166,20 @@ export function turnLooksLikeHeartbeatTurn(turnMessages: Array<{ content: string
   });
 }
 
+function turnHasExactHeartbeatPoll(turnMessages: Array<{ role?: string; content: string }>): boolean {
+  return turnMessages.some(
+    (message) =>
+      message.role === "user" &&
+      message.content.trim().toLowerCase() === OPENCLAW_HEARTBEAT_POLL,
+  );
+}
 
 /**
- * Detect HEARTBEAT_OK turn cycles in a conversation and delete them.
+ * Detect heartbeat/control acknowledgement turn cycles in a conversation and delete them.
  *
- * A HEARTBEAT_OK turn is: a user message (the heartbeat prompt), followed by
- * any tool call/result messages, ending with an assistant message that is a
- * heartbeat ack. The entire sequence has no durable information value for LCM.
- *
- * Detection: assistant content (trimmed, lowercased) starts with "heartbeat_ok"
- * and any text after is not alphanumeric (matches OpenClaw core's ack detection).
- * This catches both exact "HEARTBEAT_OK" and chatty variants like
- * "HEARTBEAT_OK — weekend, no market".
+ * A control acknowledgement turn is: a user message (the heartbeat prompt),
+ * followed by any tool call/result messages, ending with an assistant control
+ * acknowledgement. The entire sequence has no durable information value for LCM.
  *
  * Returns the number of messages deleted.
  */
@@ -178,19 +194,18 @@ conversationId: number,
 
   const toDelete: number[] = [];
 
-  // Walk through messages finding HEARTBEAT_OK assistant replies, then
+  // Walk through messages finding assistant control replies, then
   // collect the entire turn (back to the preceding user message).
   for (let i = 0; i < allMessages.length; i++) {
     const msg = allMessages[i];
     if (msg.role !== "assistant") {
       continue;
     }
-    if (!isHeartbeatOkContent(msg.content)) {
+    if (!isAssistantControlAckContent(msg.content)) {
       continue;
     }
 
-    // Found an exact HEARTBEAT_OK reply. Walk backward to find the turn start
-    // (the preceding user message).
+    // Found a control ack. Walk backward to find the turn start.
     const turnMessages = [msg];
     for (let j = i - 1; j >= 0; j--) {
       const prev = allMessages[j];
@@ -204,6 +219,9 @@ conversationId: number,
       continue;
     }
     if (!turnLooksLikeHeartbeatTurn(turnMessages)) {
+      continue;
+    }
+    if (isNoReplyContent(msg.content) && !turnHasExactHeartbeatPoll(turnMessages)) {
       continue;
     }
 
