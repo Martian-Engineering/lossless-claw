@@ -37,6 +37,27 @@ export type DoctorSummaryStats = {
   byConversation: Map<number, DoctorConversationCounts>;
 };
 
+/** Repeated high-token message identity cluster reported by doctor. */
+export type DoctorReplayResidueCluster = {
+  conversationId: number;
+  sessionId: string;
+  sessionKey: string | null;
+  role: string;
+  identityHash: string | null;
+  repeatCount: number;
+  totalTokenCount: number;
+  tokenPressure: number;
+  representativeMessageIds: number[];
+};
+
+/** Aggregate stats for duplicate transcript replay residue diagnostics. */
+export type DoctorReplayResidueStats = {
+  clusters: DoctorReplayResidueCluster[];
+  clusterCount: number;
+  repeatedMessageCount: number;
+  tokenPressure: number;
+};
+
 export type DoctorTargetRecord = {
   conversationId: number;
   summaryId: string;
@@ -61,6 +82,27 @@ type DoctorTargetRow = {
   created_at: string;
   child_count: number | null;
 };
+
+type DoctorReplayResidueClusterRow = {
+  conversation_id: number;
+  session_id: string;
+  session_key: string | null;
+  role: string;
+  identity_hash: string | null;
+  content: string;
+  repeat_count: number;
+  total_token_count: number;
+  max_token_count: number;
+};
+
+type DoctorReplayResidueMessageIdRow = {
+  message_id: number;
+};
+
+const DOCTOR_REPLAY_MIN_REPEAT_COUNT = 2;
+const DOCTOR_REPLAY_MIN_MESSAGE_TOKENS = 1_000;
+const DOCTOR_REPLAY_MAX_CLUSTERS = 10;
+const DOCTOR_REPLAY_MAX_REPRESENTATIVE_IDS = 5;
 
 /**
  * Detect broken summary markers that doctor should flag or repair.
@@ -277,5 +319,96 @@ export function getDoctorSummaryStats(
     fallback,
     emergency,
     byConversation,
+  };
+}
+
+/**
+ * Scan one conversation for repeated high-token message identities.
+ */
+export function getDoctorReplayResidueStats(
+  db: DatabaseSync,
+  conversationId: number,
+): DoctorReplayResidueStats {
+  // Group by exact role/content plus the stored identity hash so hash
+  // collisions cannot merge unrelated persisted messages.
+  const rows = db
+    .prepare(
+      `SELECT
+         m.conversation_id,
+         c.session_id,
+         c.session_key,
+         m.role,
+         NULLIF(m.identity_hash, '') AS identity_hash,
+         m.content,
+         COUNT(*) AS repeat_count,
+         COALESCE(SUM(CASE WHEN m.token_count > 0 THEN m.token_count ELSE 0 END), 0) AS total_token_count,
+         COALESCE(MAX(CASE WHEN m.token_count > 0 THEN m.token_count ELSE 0 END), 0) AS max_token_count
+       FROM messages m
+       JOIN conversations c ON c.conversation_id = m.conversation_id
+       WHERE m.conversation_id = ?
+         AND LENGTH(m.content) > 0
+       GROUP BY
+         m.conversation_id,
+         c.session_id,
+         c.session_key,
+         m.role,
+         COALESCE(m.identity_hash, ''),
+         m.content
+       HAVING repeat_count >= ?
+          AND max_token_count >= ?
+       ORDER BY
+         (total_token_count - max_token_count) DESC,
+         repeat_count DESC,
+         m.conversation_id ASC
+       LIMIT ?`,
+    )
+    .all(
+      conversationId,
+      DOCTOR_REPLAY_MIN_REPEAT_COUNT,
+      DOCTOR_REPLAY_MIN_MESSAGE_TOKENS,
+      DOCTOR_REPLAY_MAX_CLUSTERS,
+    ) as DoctorReplayResidueClusterRow[];
+
+  const idStatement = db.prepare(
+    `SELECT message_id
+     FROM messages
+     WHERE conversation_id = ?
+       AND role = ?
+       AND COALESCE(identity_hash, '') = COALESCE(?, '')
+       AND content = ?
+     ORDER BY message_id ASC
+     LIMIT ?`,
+  );
+
+  const clusters = rows.map((row): DoctorReplayResidueCluster => {
+    const totalTokenCount = Math.max(0, Math.floor(row.total_token_count ?? 0));
+    const maxTokenCount = Math.max(0, Math.floor(row.max_token_count ?? 0));
+    // Keep large payloads out of the user-facing report; ids are enough for
+    // maintainers to inspect the exact rows from an offline database copy.
+    const representativeRows = idStatement.all(
+      row.conversation_id,
+      row.role,
+      row.identity_hash,
+      row.content,
+      DOCTOR_REPLAY_MAX_REPRESENTATIVE_IDS,
+    ) as DoctorReplayResidueMessageIdRow[];
+    return {
+      conversationId: row.conversation_id,
+      sessionId: row.session_id,
+      sessionKey: row.session_key ?? null,
+      role: row.role,
+      identityHash: row.identity_hash ?? null,
+      repeatCount: Math.max(0, Math.floor(row.repeat_count ?? 0)),
+      totalTokenCount,
+      tokenPressure: Math.max(0, totalTokenCount - maxTokenCount),
+      representativeMessageIds: representativeRows.map((message) => message.message_id),
+    };
+  });
+
+  return {
+    clusters,
+    clusterCount: clusters.length,
+    repeatedMessageCount: clusters.reduce((sum, cluster) => sum + cluster.repeatCount, 0),
+    tokenPressure: clusters.reduce((sum, cluster) => sum + cluster.tokenPressure, 0),
   };
 }
