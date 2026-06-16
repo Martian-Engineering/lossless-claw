@@ -3,7 +3,11 @@ import { describe, expect, it } from "vitest";
 import { getLcmDbFeatures } from "../src/db/features.js";
 import { runLcmMigrations } from "../src/db/migration.js";
 import { ConversationStore } from "../src/store/conversation-store.js";
-import { buildMessageIdentityHash } from "../src/store/message-identity.js";
+import { canonicalizeOpenClawInboundMetadataIdentityContent } from "../src/openclaw-inbound-metadata.js";
+import {
+  buildMessageIdentityHash,
+  buildMessageIdentityKey,
+} from "../src/store/message-identity.js";
 
 function createStoreFixture() {
   const db = new DatabaseSync(":memory:");
@@ -17,6 +21,144 @@ function createStoreFixture() {
 }
 
 describe("ConversationStore message identity lookups", () => {
+  it("canonicalizes OpenClaw inbound metadata only for user identity", () => {
+    const first = openClawInboundMetadataContent({
+      messageId: "telegram-1",
+      senderName: "Syu",
+      text: "please keep this context",
+    });
+    const second = openClawInboundMetadataContent({
+      messageId: "telegram-2",
+      senderName: "Syu",
+      text: "please keep this context",
+    });
+
+    expect(buildMessageIdentityHash("user", first)).toBe(
+      buildMessageIdentityHash("user", second),
+    );
+    expect(buildMessageIdentityKey("user", first)).toBe(
+      "user\u0000please keep this context",
+    );
+    expect(buildMessageIdentityHash("assistant", first)).not.toBe(
+      buildMessageIdentityHash("assistant", second),
+    );
+  });
+
+  it("does not strip ordinary user-authored text that resembles an inbound metadata heading", () => {
+    const ordinaryText = [
+      "Conversation info (untrusted metadata):",
+      "```text",
+      "this is not an OpenClaw JSON metadata block",
+      "```",
+      "",
+      "please keep this whole note",
+    ].join("\n");
+
+    expect(
+      canonicalizeOpenClawInboundMetadataIdentityContent("user", ordinaryText),
+    ).toBe(ordinaryText);
+  });
+
+  it("does not strip valid JSON blocks without OpenClaw metadata keys", () => {
+    const ordinaryText = [
+      "Conversation info (untrusted metadata):",
+      "```json",
+      JSON.stringify({ example: true }),
+      "```",
+      "",
+      "please keep this whole note",
+    ].join("\n");
+
+    expect(
+      canonicalizeOpenClawInboundMetadataIdentityContent("user", ordinaryText),
+    ).toBe(ordinaryText);
+    expect(buildMessageIdentityKey("user", ordinaryText)).toBe(
+      `user\u0000${ordinaryText}`,
+    );
+  });
+
+  it("does not strip non-object JSON blocks", () => {
+    const contents = [
+      [
+        "Conversation info (untrusted metadata):",
+        "```json",
+        JSON.stringify(["message_id", "telegram-1"]),
+        "```",
+        "",
+        "please keep this whole note",
+      ].join("\n"),
+      [
+        "Sender (untrusted metadata):",
+        "```json",
+        JSON.stringify("Syu"),
+        "```",
+        "",
+        "please keep this whole note",
+      ].join("\n"),
+    ];
+
+    for (const content of contents) {
+      expect(
+        canonicalizeOpenClawInboundMetadataIdentityContent("user", content),
+      ).toBe(content);
+    }
+  });
+
+  it("does not strip metadata-only content without real user text", () => {
+    const metadataOnly = [
+      "Conversation info (untrusted metadata):",
+      "```json",
+      JSON.stringify({
+        chat_id: "telegram:chat-1",
+        message_id: "telegram-1",
+        timestamp: "2026-06-16T00:00:00.000Z",
+      }),
+      "```",
+      "",
+    ].join("\n");
+
+    expect(
+      canonicalizeOpenClawInboundMetadataIdentityContent("user", metadataOnly),
+    ).toBe(metadataOnly);
+  });
+
+  it("stores the raw OpenClaw metadata-prefixed content while hashing canonical identity", async () => {
+    const { db, store } = createStoreFixture();
+    const rawContent = openClawInboundMetadataContent({
+      messageId: "telegram-raw",
+      senderName: "Syu",
+      text: "please keep this context",
+    });
+    const sameCanonicalContent = openClawInboundMetadataContent({
+      messageId: "telegram-other",
+      senderName: "Syu",
+      text: "please keep this context",
+    });
+
+    try {
+      const conversation = await store.createConversation({ sessionId: "identity-raw-content" });
+      await store.createMessage({
+        conversationId: conversation.conversationId,
+        seq: 0,
+        role: "user",
+        content: rawContent,
+        tokenCount: 1,
+      });
+
+      const stored = await store.getMessages(conversation.conversationId);
+      expect(stored[0]?.content).toBe(rawContent);
+      await expect(
+        store.countMessagesByIdentityHash(
+          conversation.conversationId,
+          "user",
+          buildMessageIdentityHash("user", sameCanonicalContent),
+        ),
+      ).resolves.toBe(1);
+    } finally {
+      db.close();
+    }
+  });
+
   it("finds an exact match even when many rows share the same identity hash", async () => {
     const { db, store } = createStoreFixture();
 
@@ -58,3 +200,27 @@ describe("ConversationStore message identity lookups", () => {
     }
   });
 });
+
+function openClawInboundMetadataContent(params: {
+  messageId: string;
+  senderName: string;
+  text: string;
+}): string {
+  return [
+    "Conversation info (untrusted metadata):",
+    "```json",
+    JSON.stringify({
+      chat_id: "telegram:chat-1",
+      message_id: params.messageId,
+      timestamp: "2026-06-16T00:00:00.000Z",
+    }),
+    "```",
+    "",
+    "Sender (untrusted metadata):",
+    "```json",
+    JSON.stringify({ name: params.senderName }),
+    "```",
+    "",
+    params.text,
+  ].join("\n");
+}

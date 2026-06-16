@@ -34,6 +34,31 @@ import {
 } from "./helpers.js";
 
 afterEach(cleanupEngineTestState);
+
+function openClawInboundMetadataContent(params: {
+  messageId: string;
+  senderName: string;
+  text: string;
+}): string {
+  return [
+    "Conversation info (untrusted metadata):",
+    "```json",
+    JSON.stringify({
+      chat_id: "telegram:chat-1",
+      message_id: params.messageId,
+      timestamp: "2026-06-16T00:00:00.000Z",
+    }),
+    "```",
+    "",
+    "Sender (untrusted metadata):",
+    "```json",
+    JSON.stringify({ name: params.senderName }),
+    "```",
+    "",
+    params.text,
+  ].join("\n");
+}
+
 describe("LcmContextEngine.bootstrap", () => {
   it("imports only active leaf-path messages from SessionManager context", async () => {
     const sessionFile = createSessionFilePath("branched");
@@ -2579,6 +2604,73 @@ describe("LcmContextEngine.bootstrap", () => {
       reason: "reconciled missing session messages",
     });
     expect(reconcileSpy).not.toHaveBeenCalled();
+  });
+
+  it("keeps append-only bootstrap moving when OpenClaw inbound metadata changes around the same user text", async () => {
+    const tempDir = mkdtempSync(join(tmpdir(), "lossless-claw-engine-"));
+    tempDirs.push(tempDir);
+    const dbPath = join(tempDir, "lcm.db");
+    const sessionFile = createSessionFilePath("append-only-openclaw-inbound-metadata");
+    const initialContent = openClawInboundMetadataContent({
+      messageId: "telegram-1",
+      senderName: "Syu",
+      text: "please keep this context",
+    });
+    writeLeafTranscriptMessages(sessionFile, [
+      makeMessage({ role: "user", content: initialContent }),
+    ]);
+
+    const engine = createEngineAtDatabasePath(dbPath);
+    const sessionId = "bootstrap-append-only-openclaw-inbound-metadata";
+
+    const first = await engine.bootstrap({ sessionId, sessionFile });
+    expect(first).toEqual({ bootstrapped: true, importedMessages: 1 });
+
+    const conversation = await engine.getConversationStore().getConversationBySessionId(sessionId);
+    expect(conversation).not.toBeNull();
+    const storedBefore = await engine.getConversationStore().getMessages(conversation!.conversationId);
+    expect(storedBefore[0]?.content).toBe(initialContent);
+
+    const volatileContent = openClawInboundMetadataContent({
+      messageId: "telegram-2",
+      senderName: "Syu",
+      text: "please keep this context",
+    });
+    const rawDb = createLcmDatabaseConnection(dbPath);
+    try {
+      rawDb
+        .prepare(`UPDATE messages SET content = ? WHERE conversation_id = ?`)
+        .run(volatileContent, conversation!.conversationId);
+    } finally {
+      closeLcmConnection(rawDb);
+    }
+
+    const reconcileSpy = vi.spyOn(engine.getTranscriptReconciler(), "reconcileSessionTail");
+    appendFileSync(
+      sessionFile,
+      `${JSON.stringify({
+        message: { role: "assistant", content: [{ type: "text", text: "tail assistant" }] },
+      })}\n`,
+      "utf8",
+    );
+
+    const second = await engine.bootstrap({ sessionId, sessionFile });
+    expect(second).toEqual({
+      bootstrapped: true,
+      importedMessages: 1,
+      reason: "reconciled missing session messages",
+    });
+    expect(reconcileSpy).not.toHaveBeenCalled();
+
+    const storedAfter = await engine.getConversationStore().getMessages(conversation!.conversationId);
+    expect(storedAfter.map((message) => message.content)).toEqual([
+      volatileContent,
+      "tail assistant",
+    ]);
+    const checkpoint = await engine
+      .getSummaryStore()
+      .getConversationBootstrapState(conversation!.conversationId);
+    expect(checkpoint?.lastProcessedOffset).toBe(statSync(sessionFile).size);
   });
 
   it("falls back to full reconciliation when append-only suffix overlaps persisted history", async () => {

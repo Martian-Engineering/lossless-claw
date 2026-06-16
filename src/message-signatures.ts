@@ -5,6 +5,7 @@
  */
 import { buildMessageParts, toStoredMessage, type StoredMessage } from "./message-content.js";
 import type { AgentMessage } from "./openclaw-bridge.js";
+import { canonicalizeOpenClawInboundMetadataIdentityContent } from "./openclaw-inbound-metadata.js";
 import type { CreateMessagePartInput } from "./store/conversation-store.js";
 import { extractToolResultIdForPairing } from "./tool-pairing.js";
 import { extractBootstrapMessageCandidate } from "./transcript.js";
@@ -14,8 +15,12 @@ export function createBootstrapEntryHash(message: StoredMessage | null): string 
   if (!message) {
     return null;
   }
+  const content = canonicalizeOpenClawInboundMetadataIdentityContent(
+    message.role,
+    message.content,
+  );
   return createHash("sha256")
-    .update(JSON.stringify({ role: message.role, content: message.content }))
+    .update(JSON.stringify({ role: message.role, content }))
     .digest("hex");
 }
 
