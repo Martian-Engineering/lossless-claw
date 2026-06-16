@@ -156,11 +156,13 @@ export function filterSyntheticHeartbeatMessages(
   };
 }
 
-export function turnLooksLikeHeartbeatTurn(turnMessages: Array<{ content: string }>): boolean {
+export function turnLooksLikeHeartbeatTurn(
+  turnMessages: Array<{ role?: string; content: string }>,
+): boolean {
   return turnMessages.some((message) => {
     const normalized = message.content.trim().toLowerCase();
     return (
-      normalized === OPENCLAW_HEARTBEAT_POLL ||
+      (message.role === "user" && normalized === OPENCLAW_HEARTBEAT_POLL) ||
       normalized.includes(HEARTBEAT_TURN_MARKER)
     );
   });

@@ -4451,6 +4451,40 @@ describe("LcmContextEngine afterTurn", () => {
     ]);
   });
 
+  it("afterTurn keeps HEARTBEAT_OK turns durable when non-user content quotes the exact poll", async () => {
+    const engine = createEngine();
+    const sessionId = "after-turn-heartbeat-ok-tool-quoted-poll-durable";
+    const sessionKey = "agent:main:test:after-turn-heartbeat-ok-tool-quoted-poll-durable";
+    const sessionFile = createSessionFilePath("after-turn-heartbeat-ok-tool-quoted-poll-durable");
+    const transcriptMessages = [
+      makeMessage({ role: "user", content: "Explain this control token" }),
+      makeMessage({ role: "tool", content: OPENCLAW_HEARTBEAT_POLL }),
+      makeMessage({ role: "assistant", content: "HEARTBEAT_OK" }),
+    ];
+    writeLeafTranscriptMessages(sessionFile, transcriptMessages);
+
+    await engine.afterTurn({
+      sessionId,
+      sessionKey,
+      sessionFile,
+      messages: transcriptMessages,
+      prePromptMessageCount: 0,
+      tokenBudget: 4096,
+    });
+
+    const conversation = await engine.getConversationStore().getConversationForSession({
+      sessionId,
+      sessionKey,
+    });
+    expect(conversation).not.toBeNull();
+    const stored = await engine.getConversationStore().getMessages(conversation!.conversationId);
+    expect(stored.map((message) => message.content)).toEqual([
+      "Explain this control token",
+      OPENCLAW_HEARTBEAT_POLL,
+      "HEARTBEAT_OK",
+    ]);
+  });
+
   it("afterTurn append-only reconcile skips exact heartbeat poll NO_REPLY turns without the heartbeat flag", async () => {
     const engine = createEngine();
     const sessionId = "after-turn-exact-heartbeat-no-reply-append-only";
