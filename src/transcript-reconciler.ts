@@ -42,6 +42,7 @@ import {
   extractRawBlockSignatureFromPartMetadata,
   extractRawIdsFromPartMetadata,
 } from "./replay-metadata.js";
+import { extractDedupKey } from "./live-dedup-key.js";
 import { buildMessageIdentityHash } from "./store/message-identity.js";
 import {
   getTranscriptEntryId,
@@ -349,6 +350,7 @@ export class TranscriptReconciler {
     existingDbCount: number;
     sessionContext: string;
     startedAt: number;
+    preIngestedKeys?: Set<string>;
   }): Promise<TranscriptReconcileResult | null> {
     const { conversationId, historicalMessages, entryIds, sessionContext, startedAt } = params;
 
@@ -437,6 +439,13 @@ export class TranscriptReconciler {
       }
       // Entry-id-verified imports are exact (the id is proven absent), so the
       // same-second replay flood heuristic does not apply.
+      // Content-independent dedup: skip messages already ingested via the live path.
+      if (params.preIngestedKeys) {
+        const dedupKey = extractDedupKey(message);
+        if (dedupKey && params.preIngestedKeys.has(dedupKey)) {
+          continue;
+        }
+      }
       const result = await this.host.ingestSingle({
         sessionId: params.sessionId,
         sessionKey: params.sessionKey,
@@ -542,6 +551,9 @@ export class TranscriptReconciler {
     // never unbounded — set ONLY together with a proven non-anchoring frontier.
     allowFullNonAnchoringFrontierImport?: boolean;
     noAnchorImportReason?: string;
+    // Content-independent dedup keys from the live-ingest path so transcript
+    // reconcile can skip messages that were already persisted with raw content.
+    preIngestedKeys?: Set<string>;
   }): Promise<TranscriptReconcileResult> {
     const { sessionId, conversationId, historicalMessages } = params;
     const startedAt = Date.now();
@@ -580,6 +592,7 @@ export class TranscriptReconciler {
         existingDbCount,
         sessionContext,
         startedAt,
+        preIngestedKeys: params.preIngestedKeys,
       });
       if (entryIdResult) {
         return entryIdResult;
@@ -688,6 +701,7 @@ export class TranscriptReconciler {
             existingDbCount,
             sessionContext,
             startedAt,
+            preIngestedKeys: params.preIngestedKeys,
           });
         }
         this.host.deps.log.debug(
@@ -738,6 +752,7 @@ export class TranscriptReconciler {
       sessionKey: params.sessionKey,
       messages: importableTail,
       replayGuardExemptPrefixLength: missingTailFiltered.replayGuardExemptPrefixLength,
+      preIngestedKeys: params.preIngestedKeys,
     });
 
     if (importCapped) {
@@ -778,6 +793,7 @@ export class TranscriptReconciler {
     existingDbCount: number;
     sessionContext: string;
     startedAt: number;
+    preIngestedKeys?: Set<string>;
   }): Promise<TranscriptReconcileResult> {
     const { sessionId, conversationId, historicalMessages, existingDbCount } = params;
     const { startedAt, sessionContext } = params;
@@ -944,6 +960,13 @@ export class TranscriptReconciler {
           }));
         if (adopted) {
           adoptedMessages += 1;
+          continue;
+        }
+      }
+      // Content-independent dedup: skip messages already ingested via the live path.
+      if (params.preIngestedKeys) {
+        const dedupKey = extractDedupKey(message);
+        if (dedupKey && params.preIngestedKeys.has(dedupKey)) {
           continue;
         }
       }
@@ -1481,9 +1504,17 @@ export class TranscriptReconciler {
     sessionKey?: string;
     messages: AgentMessage[];
     replayGuardExemptPrefixLength: number;
+    preIngestedKeys?: Set<string>;
   }): Promise<number> {
     let importedMessages = 0;
     for (const [index, message] of params.messages.entries()) {
+      // Content-independent dedup: skip messages already ingested via the live path.
+      if (params.preIngestedKeys) {
+        const dedupKey = extractDedupKey(message);
+        if (dedupKey && params.preIngestedKeys.has(dedupKey)) {
+          continue;
+        }
+      }
       const result = await this.host.ingestSingle({
         sessionId: params.sessionId,
         sessionKey: params.sessionKey,
@@ -1644,6 +1675,7 @@ export class TranscriptReconciler {
     conversation: ConversationRecord;
     checkpoint: Awaited<ReturnType<SummaryStore["getConversationBootstrapState"]>>;
     transcriptEpochShrank: boolean;
+    preIngestedKeys?: Set<string>;
   }): Promise<TranscriptReconcileResult | null> {
     const { conversation, checkpoint, transcriptEpochShrank } = params;
     if (
@@ -1703,6 +1735,7 @@ export class TranscriptReconciler {
             allowNoAnchorImport: placeholderFrontierIsNonAnchoring,
             allowFullNonAnchoringFrontierImport: placeholderFrontierIsNonAnchoring,
             noAnchorImportReason: "placeholder-checkpoint-recovery",
+            preIngestedKeys: params.preIngestedKeys,
           });
           await this.recordImportAndRefreshCheckpoint({
             conversationId: conversation.conversationId,
@@ -1740,6 +1773,7 @@ export class TranscriptReconciler {
             sessionKey: params.sessionKey,
             messages: replayFilteredMessages,
             replayGuardExemptPrefixLength: replayFiltered.replayGuardExemptPrefixLength,
+            preIngestedKeys: params.preIngestedKeys,
           });
           await this.recordImportAndRefreshCheckpoint({
             conversationId: conversation.conversationId,
@@ -1779,6 +1813,7 @@ export class TranscriptReconciler {
     sessionFileState: { size: number; mtimeMs: number } | undefined;
     sessionFileStatError: unknown;
     transcriptEpochShrank: boolean;
+    preIngestedKeys?: Set<string>;
   }): Promise<TranscriptReconcileResult> {
     const {
       queueKey,
@@ -2059,6 +2094,7 @@ export class TranscriptReconciler {
         : declaredEpochRollover && reason === "append-only-ineligible"
           ? "declared-epoch-rollover"
           : reason,
+      preIngestedKeys: params.preIngestedKeys,
     });
     if (reconcile.blockedByImportCap) {
       // Capped passes import a bounded chunk of anchored backlog; report
@@ -2108,6 +2144,7 @@ export class TranscriptReconciler {
     sessionFile: string;
     isHeartbeat?: boolean;
     allowNoAnchorImportOnCheckpointMissing?: boolean;
+    preIngestedKeys?: Set<string>;
   }): Promise<TranscriptReconcileResult> {
     const queueKey = this.host.resolveSessionQueueKey(params.sessionId, params.sessionKey);
     await this.host.conversationStore.withTransaction(async () => {
@@ -2169,6 +2206,7 @@ export class TranscriptReconciler {
       conversation,
       checkpoint,
       transcriptEpochShrank,
+      preIngestedKeys: params.preIngestedKeys,
     });
     if (appendOnlyResult) {
       return appendOnlyResult;
@@ -2185,6 +2223,7 @@ export class TranscriptReconciler {
       sessionFileState,
       sessionFileStatError,
       transcriptEpochShrank,
+      preIngestedKeys: params.preIngestedKeys,
     });
   }
 
@@ -2208,6 +2247,7 @@ export class TranscriptReconciler {
     sessionFile: string;
     isHeartbeat?: boolean;
     allowNoAnchorImportOnCheckpointMissing?: boolean;
+    preIngestedKeys?: Set<string>;
   }): Promise<TranscriptReconcileResult> {
     const queueKey = this.host.resolveSessionQueueKey(params.sessionId, params.sessionKey);
     return await this.host.withSessionQueue(

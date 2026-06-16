@@ -73,6 +73,7 @@ import { createBootstrapEntryHash, readBootstrapMessageFromJsonLine } from "./me
 import { PROMPT_RECALL_MAX_MESSAGES, PROMPT_RECALL_SEARCH_CANDIDATE_LIMIT, buildPromptRecallProjectionFingerprint, extractPromptRecallIdentifiers, extractPromptRecallSnippet, findPromptRecallIdentifierIndex, isPromptRecallEligibleRole, normalizePromptRecallCoverageText, normalizePromptRecallText, renderPromptRecallMessage } from "./prompt-recall.js";
 import { listTranscriptToolResultEntryIdsByCallId } from "./replay-metadata.js";
 import { estimateSessionTokenCountForAfterTurn, extractRuntimePromptTokenCount } from "./token-accounting.js";
+import { extractDedupKeys } from "./live-dedup-key.js";
 import { asRecord, formatDurationMs, resolvePositiveInteger } from "./value-utils.js";
 
 type AgentMessage = Parameters<ContextEngine["ingest"]>[0]["message"];
@@ -2793,73 +2794,20 @@ export class LcmContextEngine implements ContextEngine {
       blockedByImportCap: false,
       hasOverlap: true,
     };
-    try {
-      transcriptReconcileResult = await this.transcriptReconciler.reconcileTranscriptTailForAfterTurn({
-        sessionId: params.sessionId,
-        sessionKey: params.sessionKey,
-        sessionFile: params.sessionFile,
-        isHeartbeat: params.isHeartbeat,
-      });
-    } catch (err) {
-      this.deps.log.warn(
-        `[lcm] afterTurn: transcript reconcile failed for ${sessionLabel}: ${describeLogError(err)}`,
-      );
-      // Fail closed: without reconcile proof, the initialized in-sync default
-      // would persist this batch and refresh the checkpoint to EOF, advancing
-      // past transcript history that was never reconciled. Skipping persistence
-      // loses nothing — the transcript retains the turn and a later successful
-      // reconcile imports it.
-      transcriptReconcileResult = {
-        importedMessages: 0,
-        blockedByImportCap: false,
-        hasOverlap: false,
-      };
-    }
-    const transcriptReconcileUnsafeToAdvance =
-      transcriptReconcileResult.blockedByImportCap ||
-      (!transcriptReconcileResult.hasOverlap && transcriptReconcileResult.importedMessages === 0);
-    const transcriptReconcileBlockedByAmbiguousRollover =
-      transcriptReconcileResult.blockedReason === "ambiguous-session-key-runtime-rollover" ||
-      // Rotated-fresh skips this turn the same way: the replacement
-      // conversation is empty, so telemetry/compaction work below would run
-      // against it for nothing; the next turn binds and reconciles normally.
-      transcriptReconcileResult.blockedReason === "ambiguous-rollover-rotated-fresh-transcript";
-    let dedupedNewMessages: AgentMessage[] = [];
-    if (transcriptReconcileUnsafeToAdvance) {
-      if (newMessages.length > 0 || params.autoCompactionSummary) {
-        this.deps.log.warn(
-          `[lcm] afterTurn: transcript reconcile did not cover the transcript frontier; skipping afterTurn persistence to avoid creating a future anchor past unreconciled transcript history ${sessionLabel}`,
-        );
-      }
-      if (transcriptReconcileBlockedByAmbiguousRollover) {
-        await runRuntimeAutoRotate();
-        return;
-      }
-    } else if (transcriptReconcileResult.transcriptCovered) {
-      // The transcript reconcile read the file to its frontier, so the DB
-      // tail is exact — use precise alignment instead of the heuristic
-      // dedup stack, and persist only what the transcript flush has not
-      // delivered yet.
-      dedupedNewMessages = await this.batchDeduplicator.alignRuntimeBatchAgainstCoveredFrontier(
-        params.sessionId,
-        params.sessionKey,
-        newMessages,
-      );
-      if (newMessages.length > 0 && dedupedNewMessages.length < newMessages.length) {
-        this.deps.log.debug(
-          `[lcm] afterTurn: transcript covered the frontier; runtime batch aligned to ${dedupedNewMessages.length}/${newMessages.length} unflushed messages ${sessionLabel}`,
-        );
-      }
-    } else {
-      dedupedNewMessages = await this.batchDeduplicator.deduplicateAfterTurnBatch(
-        params.sessionId,
-        params.sessionKey,
-        newMessages,
-        {
-          oversizedNoOverlap: transcriptReconcileResult.importedMessages > 0 ? "ingest" : "skip",
-        },
-      );
-    }
+
+    // ====== Phase 1: dedup + live ingest FIRST (before reconcile) ======
+    // Live messages carry raw (unredacted) content — ingest them immediately
+    // so the DB holds the high-quality original.  Collect dedup keys so the
+    // later transcript reconcile (which reads redacted content from the file)
+    // can skip messages that were already persisted by this path.
+
+    const dedupedNewMessages = await this.batchDeduplicator.deduplicateAfterTurnBatch(
+      params.sessionId,
+      params.sessionKey,
+      newMessages,
+      { oversizedNoOverlap: "ingest" },
+    );
+
     const summaryCoveredMessages: AgentMessage[] = [];
     const summaryDedupedNewMessages: AgentMessage[] = [];
     if (params.autoCompactionSummary) {
@@ -2884,38 +2832,31 @@ export class LcmContextEngine implements ContextEngine {
       );
     }
 
-    const ingestBatch: AgentMessage[] = [];
-    if (!transcriptReconcileUnsafeToAdvance && params.autoCompactionSummary) {
-      ingestBatch.push({
+    const ingestBatchMessages: AgentMessage[] = [];
+    if (params.autoCompactionSummary) {
+      ingestBatchMessages.push({
         role: "user",
         content: params.autoCompactionSummary,
       } as AgentMessage);
     }
+    ingestBatchMessages.push(...summaryDedupedNewMessages);
 
-    ingestBatch.push(...summaryDedupedNewMessages);
-    if (ingestBatch.length === 0) {
-      // Nothing to ingest in *this* afterTurn call — but the conversation may
-      // still be over threshold from prior turns, especially when the host
-      // path (e.g. afterTurnTranscriptReconcile, or external `engine.ingest`
-      // calls during the turn) already imported the new messages before
-      // afterTurn's dedup ran. Log and fall through to compaction evaluation
-      // rather than early-returning, otherwise compaction would never fire
-      // once dedup begins consistently swallowing new turn deltas.
-      this.deps.log.debug(
-        `[lcm] afterTurn: nothing to ingest ${sessionLabel} newMessages=${newMessages.length} (continuing to compaction evaluation; transcript reconcile may have already ingested) duration=${formatDurationMs(Date.now() - startedAt)}`,
-      );
-    } else {
+    // Collect content-independent dedup keys so the downstream reconcile can
+    // skip messages that were already ingested via this live path.
+    const preIngestedKeys = extractDedupKeys(ingestBatchMessages);
+
+    // --- live ingest ---
+    if (ingestBatchMessages.length > 0) {
       try {
         await this.ingestBatch({
           sessionId: params.sessionId,
           sessionKey: params.sessionKey,
-          messages: ingestBatch,
+          messages: ingestBatchMessages,
           isHeartbeat: params.isHeartbeat === true,
         });
       } catch (err) {
-        // Never compact a stale or partially ingested frontier.
         this.deps.log.error(
-          `[lcm] afterTurn: ingest failed, skipping compaction: ${describeLogError(err)}`,
+          `[lcm] afterTurn: live ingest failed, skipping compaction: ${describeLogError(err)}`,
         );
         this.sessionRotation.logAutoRotateSessionFileDecision({
           phase: "runtime",
@@ -2932,6 +2873,54 @@ export class LcmContextEngine implements ContextEngine {
         return;
       }
     }
+
+    // ====== Phase 2: transcript reconcile AFTER live ingest ======
+    // The transcript file stores redacted content — reconcile reads it and
+    // imports any messages that were NOT already ingested by the live path
+    // above, using the content-independent dedup keys to skip duplicates.
+    try {
+      transcriptReconcileResult = await this.transcriptReconciler.reconcileTranscriptTailForAfterTurn({
+        sessionId: params.sessionId,
+        sessionKey: params.sessionKey,
+        sessionFile: params.sessionFile,
+        isHeartbeat: params.isHeartbeat,
+        preIngestedKeys,
+      });
+    } catch (err) {
+      this.deps.log.warn(
+        `[lcm] afterTurn: transcript reconcile failed for ${sessionLabel}: ${describeLogError(err)}`,
+      );
+      // Fail closed: live messages are already persisted above.  Without
+      // reconcile proof we skip compaction to avoid advancing past
+      // unreconciled transcript history.
+      transcriptReconcileResult = {
+        importedMessages: 0,
+        blockedByImportCap: false,
+        hasOverlap: false,
+      };
+    }
+
+    const transcriptReconcileUnsafeToAdvance =
+      transcriptReconcileResult.blockedByImportCap ||
+      (!transcriptReconcileResult.hasOverlap && transcriptReconcileResult.importedMessages === 0);
+    const transcriptReconcileBlockedByAmbiguousRollover =
+      transcriptReconcileResult.blockedReason === "ambiguous-session-key-runtime-rollover" ||
+      transcriptReconcileResult.blockedReason === "ambiguous-rollover-rotated-fresh-transcript";
+
+    if (transcriptReconcileUnsafeToAdvance) {
+      if (transcriptReconcileBlockedByAmbiguousRollover) {
+        // Live messages are already ingested — auto-rotate so the next turn
+        // binds to the correct conversation.
+        await runRuntimeAutoRotate();
+      }
+      // Live messages already persisted above; only skip compaction.
+      this.deps.log.warn(
+        `[lcm] afterTurn: transcript reconcile did not cover the frontier; live messages already ingested, skipping compaction to avoid creating a future anchor past unreconciled transcript history ${sessionLabel}`,
+      );
+      return;
+    }
+
+    const ingestBatch = ingestBatchMessages;
 
     if (batchLooksLikeHeartbeatAckTurn(ingestBatch)) {
       try {
