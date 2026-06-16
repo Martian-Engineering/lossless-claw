@@ -4167,6 +4167,33 @@ describe("LcmContextEngine afterTurn", () => {
     expect(conversation).toBeNull();
   });
 
+  it("afterTurn keeps exact heartbeat poll NO_REPLY first-contact turns non-durable", async () => {
+    const engine = createEngine();
+    const sessionId = "after-turn-exact-heartbeat-no-reply-first-contact";
+    const sessionKey = "agent:main:test:after-turn-exact-heartbeat-no-reply-first-contact";
+    const sessionFile = createSessionFilePath("after-turn-exact-heartbeat-no-reply-first-contact");
+    const heartbeatMessages = [
+      makeMessage({ role: "user", content: OPENCLAW_HEARTBEAT_POLL }),
+      makeMessage({ role: "assistant", content: "NO_REPLY" }),
+    ];
+    writeLeafTranscriptMessages(sessionFile, heartbeatMessages);
+
+    await engine.afterTurn({
+      sessionId,
+      sessionKey,
+      sessionFile,
+      messages: heartbeatMessages,
+      prePromptMessageCount: 0,
+      tokenBudget: 4096,
+    });
+
+    const conversation = await engine.getConversationStore().getConversationForSession({
+      sessionId,
+      sessionKey,
+    });
+    expect(conversation).toBeNull();
+  });
+
   it("afterTurn first-contact import keeps real history while skipping exact heartbeat poll traffic", async () => {
     const engine = createEngine();
     const sessionId = "after-turn-exact-heartbeat-first-contact-mixed";
@@ -4202,6 +4229,50 @@ describe("LcmContextEngine afterTurn", () => {
       "real user",
       "real assistant",
     ]);
+  });
+
+  it("afterTurn append-only reconcile skips exact heartbeat poll NO_REPLY turns without the heartbeat flag", async () => {
+    const engine = createEngine();
+    const sessionId = "after-turn-exact-heartbeat-no-reply-append-only";
+    const sessionKey = "agent:main:test:after-turn-exact-heartbeat-no-reply-append-only";
+    const sessionFile = createSessionFilePath("after-turn-exact-heartbeat-no-reply-append-only");
+    const sm = SessionManager.open(sessionFile);
+    appendSessionMessage(sm, makeMessage({ role: "user", content: "seed user" }));
+    appendSessionMessage(sm, makeMessage({ role: "assistant", content: "seed assistant" }));
+
+    const first = await engine.bootstrap({ sessionId, sessionKey, sessionFile });
+    expect(first.bootstrapped).toBe(true);
+
+    appendSessionMessage(sm, makeMessage({ role: "user", content: OPENCLAW_HEARTBEAT_POLL }));
+    appendSessionMessage(sm, makeMessage({ role: "assistant", content: "NO_REPLY" }));
+
+    const conversation = await engine.getConversationStore().getConversationForSession({
+      sessionId,
+      sessionKey,
+    });
+    expect(conversation).not.toBeNull();
+
+    await engine.afterTurn({
+      sessionId,
+      sessionKey,
+      sessionFile,
+      messages: [
+        makeMessage({ role: "user", content: OPENCLAW_HEARTBEAT_POLL }),
+        makeMessage({ role: "assistant", content: "NO_REPLY" }),
+      ],
+      prePromptMessageCount: 0,
+      tokenBudget: 4096,
+    });
+
+    const stored = await engine.getConversationStore().getMessages(conversation!.conversationId);
+    expect(stored.map((message) => message.content)).toEqual([
+      "seed user",
+      "seed assistant",
+    ]);
+    const checkpoint = await engine
+      .getSummaryStore()
+      .getConversationBootstrapState(conversation!.conversationId);
+    expect(checkpoint?.lastProcessedOffset).toBe(statSync(sessionFile).size);
   });
 
   it("afterTurn heartbeat flag skips append-only transcript deltas and advances the checkpoint", async () => {

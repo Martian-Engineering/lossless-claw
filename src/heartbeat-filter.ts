@@ -36,7 +36,7 @@ export function isAssistantControlAckContent(content: string): boolean {
 }
 
 /**
- * Synthetic heartbeat traffic (poll prompts and HEARTBEAT_OK acks) recurs
+ * Synthetic heartbeat traffic (poll prompts and control acks) recurs
  * identically in every session, so it can never discriminate lineage in
  * the ambiguous-rollover freshness check.
  */
@@ -45,7 +45,7 @@ export function isHeartbeatNoiseContent(role: string, content: string): boolean 
   if (role === "user" && normalized === OPENCLAW_HEARTBEAT_POLL) {
     return true;
   }
-  return role === "assistant" && normalized === HEARTBEAT_OK_TOKEN;
+  return role === "assistant" && isAssistantControlAckContent(normalized);
 }
 
 export function batchLooksLikeHeartbeatAckTurn(messages: AgentMessage[]): boolean {
@@ -63,12 +63,16 @@ export function batchLooksLikeHeartbeatAckTurn(messages: AgentMessage[]): boolea
     if (stored.role === "user" && normalized === OPENCLAW_HEARTBEAT_POLL) {
       sawExactHeartbeatPoll = true;
     }
-    if (!sawHeartbeatAck && stored.role === "assistant" && isHeartbeatOkContent(stored.content)) {
+    if (
+      !sawHeartbeatAck &&
+      stored.role === "assistant" &&
+      isAssistantControlAckContent(stored.content)
+    ) {
       sawHeartbeatAck = true;
     }
     if (
       normalized !== OPENCLAW_HEARTBEAT_POLL &&
-      !(stored.role === "assistant" && isHeartbeatOkContent(stored.content))
+      !(stored.role === "assistant" && isAssistantControlAckContent(stored.content))
     ) {
       sawNonExactPollTurnContent = true;
     }
@@ -100,7 +104,7 @@ export function filterSyntheticHeartbeatMessages(
 
   for (let index = 0; index < messages.length; index += 1) {
     const stored = toStoredMessage(messages[index]!);
-    if (stored.role !== "assistant" || !isHeartbeatOkContent(stored.content)) {
+    if (stored.role !== "assistant" || !isAssistantControlAckContent(stored.content)) {
       continue;
     }
 
