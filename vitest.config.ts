@@ -1,6 +1,6 @@
 import { mkdtempSync, mkdirSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { join, resolve } from "node:path";
 import { defineConfig } from "vitest/config";
 
 const testHome = mkdtempSync(join(tmpdir(), "lossless-claw-vitest-home-"));
@@ -10,10 +10,19 @@ const testDbPath = join(testOpenClawDir, "lcm.db");
 mkdirSync(testOpenClawDir, { recursive: true });
 
 export default defineConfig({
+  resolve: {
+    alias: {
+      "openclaw/plugin-sdk/redact": resolve(
+        __dirname,
+        "test/__stubs__/openclaw-plugin-sdk-redact.ts",
+      ),
+    },
+  },
   test: {
     dir: "test",
     include: ["**/*.test.ts"],
     exclude: ["**/.worktrees/**"],
+    setupFiles: ["./test/setup.ts"],
     env: {
       HOME: testHome,
     },

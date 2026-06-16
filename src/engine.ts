@@ -1491,6 +1491,28 @@ function filterPersistableMessages(messages: AgentMessage[]): AgentMessage[] {
   return messages.filter(hasPersistableMessageRole);
 }
 
+// ── Transcript redaction bridge ──────────────────────────────────────
+// The host exposes redactTranscriptMessage through openclaw/plugin-sdk/redact
+// so LCM can apply the same redaction rules as the transcript writing layer.
+// This ensures identity_hash consistency between the transcript reconcile
+// path (reads redacted content from file) and the live dedup path.
+let redactTranscriptMessageFn: ((message: AgentMessage) => AgentMessage) | null | undefined;
+
+async function loadRedactTranscriptMessage(): Promise<
+  ((message: AgentMessage) => AgentMessage) | undefined
+> {
+  if (redactTranscriptMessageFn !== undefined) return redactTranscriptMessageFn ?? undefined;
+  try {
+    const mod = await import("openclaw/plugin-sdk/redact");
+    const fn = mod.redactTranscriptMessage as unknown as (message: AgentMessage) => AgentMessage;
+    redactTranscriptMessageFn = fn;
+    return fn;
+  } catch {
+    redactTranscriptMessageFn = null;
+    return undefined;
+  }
+}
+
 type StoredMessage = {
   role: "user" | "assistant" | "system" | "tool";
   content: string;
@@ -9098,6 +9120,14 @@ export class LcmContextEngine implements ContextEngine {
     const newMessages = filterPersistableMessages(
       params.messages.slice(params.prePromptMessageCount),
     );
+    // Apply transcript-level redaction so identity_hash calculation matches
+    // the transcript reconcile path (which reads redacted content from file).
+    // Without this, the same message would produce different hashes on the
+    // two paths and dedup would fail to detect duplicates.
+    const redactMessage = await loadRedactTranscriptMessage();
+    const sanitizedNewMessages = redactMessage
+      ? newMessages.map((m) => redactMessage(m))
+      : newMessages;
     let transcriptReconcileResult: TranscriptReconcileResult = {
       importedMessages: 0,
       blockedByImportCap: false,
@@ -9135,7 +9165,7 @@ export class LcmContextEngine implements ContextEngine {
       dedupedNewMessages = await this.deduplicateAfterTurnBatch(
         params.sessionId,
         params.sessionKey,
-        newMessages,
+        sanitizedNewMessages,
         {
           oversizedNoOverlap: transcriptReconcileResult.importedMessages > 0 ? "ingest" : "skip",
         },
