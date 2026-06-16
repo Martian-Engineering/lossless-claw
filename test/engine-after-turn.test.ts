@@ -10,6 +10,7 @@ import type { LcmConfig } from "../src/db/config.js";
 import { closeLcmConnection, createLcmDatabaseConnection } from "../src/db/connection.js";
 import { LcmContextEngine } from "../src/engine.js";
 import { estimateSerializedMessageTokens, estimateSerializedMessagesTokens, estimateTokens } from "../src/estimate-tokens.js";
+import { OPENCLAW_HEARTBEAT_POLL } from "../src/heartbeat-filter.js";
 import type { AgentMessage } from "../src/openclaw-bridge.js";
 import { applyScopedDoctorRepair } from "../src/plugin/lcm-doctor-apply.js";
 import { detectDoctorMarker } from "../src/plugin/lcm-doctor-shared.js";
@@ -3800,7 +3801,7 @@ describe("LcmContextEngine afterTurn", () => {
     );
   });
 
-  it("afterTurn prunes heartbeat-shaped ACK turns before compaction even without the heartbeat flag", async () => {
+  it("afterTurn keeps heartbeat-shaped ACK turns non-durable before compaction even without the heartbeat flag", async () => {
     const infoLog = vi.fn();
     const debugLog = vi.fn();
     const engine = createEngineWithDepsOverrides({
@@ -3844,17 +3845,14 @@ describe("LcmContextEngine afterTurn", () => {
     });
 
     const conversation = await engine.getConversationStore().getConversationBySessionId(sessionId);
-    expect(conversation).not.toBeNull();
-
-    const stored = await engine.getConversationStore().getMessages(conversation!.conversationId);
-    expect(stored).toHaveLength(0);
+    expect(conversation).toBeNull();
     expect(evaluateLeafTriggerSpy).not.toHaveBeenCalled();
     expect(compactSpy).not.toHaveBeenCalled();
-    expect(infoLog).toHaveBeenCalledWith(
-      expect.stringContaining(
-        `heartbeat ack messages for conversation=${conversation!.conversationId} session=${sessionId} sessionKey=${sessionKey}`,
+    expect(
+      infoLog.mock.calls.some((call) =>
+        String(call[0]).includes("heartbeat ack messages"),
       ),
-    );
+    ).toBe(false);
   });
 
   it("afterTurn heartbeat flag skips non-empty transcript imports", async () => {
@@ -3884,8 +3882,80 @@ describe("LcmContextEngine afterTurn", () => {
     expect(conversation).toBeNull();
   });
 
-  it("afterTurn heartbeat flag skips append-only transcript deltas and advances the checkpoint", async () => {
+  it("afterTurn keeps exact heartbeat poll first-contact turns non-durable", async () => {
     const engine = createEngine();
+    const sessionId = "after-turn-exact-heartbeat-first-contact";
+    const sessionKey = "agent:main:test:after-turn-exact-heartbeat-first-contact";
+    const sessionFile = createSessionFilePath("after-turn-exact-heartbeat-first-contact");
+    const heartbeatMessages = [
+      makeMessage({ role: "user", content: OPENCLAW_HEARTBEAT_POLL }),
+      makeMessage({ role: "assistant", content: "HEARTBEAT_OK" }),
+    ];
+    writeLeafTranscriptMessages(sessionFile, heartbeatMessages);
+
+    await engine.afterTurn({
+      sessionId,
+      sessionKey,
+      sessionFile,
+      messages: heartbeatMessages,
+      prePromptMessageCount: 0,
+      tokenBudget: 4096,
+    });
+
+    const conversation = await engine.getConversationStore().getConversationForSession({
+      sessionId,
+      sessionKey,
+    });
+    expect(conversation).toBeNull();
+  });
+
+  it("afterTurn first-contact import keeps real history while skipping exact heartbeat poll traffic", async () => {
+    const engine = createEngine();
+    const sessionId = "after-turn-exact-heartbeat-first-contact-mixed";
+    const sessionKey = "agent:main:test:after-turn-exact-heartbeat-first-contact-mixed";
+    const sessionFile = createSessionFilePath("after-turn-exact-heartbeat-first-contact-mixed");
+    const transcriptMessages = [
+      makeMessage({ role: "user", content: "real user" }),
+      makeMessage({ role: "assistant", content: "real assistant" }),
+      makeMessage({ role: "user", content: OPENCLAW_HEARTBEAT_POLL }),
+      makeMessage({ role: "assistant", content: "HEARTBEAT_OK" }),
+    ];
+    writeLeafTranscriptMessages(sessionFile, transcriptMessages);
+
+    await engine.afterTurn({
+      sessionId,
+      sessionKey,
+      sessionFile,
+      messages: [
+        makeMessage({ role: "user", content: OPENCLAW_HEARTBEAT_POLL }),
+        makeMessage({ role: "assistant", content: "HEARTBEAT_OK" }),
+      ],
+      prePromptMessageCount: 0,
+      tokenBudget: 4096,
+    });
+
+    const conversation = await engine.getConversationStore().getConversationForSession({
+      sessionId,
+      sessionKey,
+    });
+    expect(conversation).not.toBeNull();
+    const stored = await engine.getConversationStore().getMessages(conversation!.conversationId);
+    expect(stored.map((message) => message.content)).toEqual([
+      "real user",
+      "real assistant",
+    ]);
+  });
+
+  it("afterTurn heartbeat flag skips append-only transcript deltas and advances the checkpoint", async () => {
+    const warnLog = vi.fn();
+    const engine = createEngineWithDepsOverrides({
+      log: {
+        info: vi.fn(),
+        warn: warnLog,
+        error: vi.fn(),
+        debug: vi.fn(),
+      },
+    });
     const sessionId = "after-turn-heartbeat-flag-append-only-skip";
     const sessionKey = "agent:main:test:after-turn-heartbeat-flag-append-only-skip";
     const sessionFile = createSessionFilePath("after-turn-heartbeat-flag-append-only-skip");
@@ -3916,11 +3986,22 @@ describe("LcmContextEngine afterTurn", () => {
       sessionId,
       sessionKey,
       sessionFile,
-      messages: [makeMessage({ role: "assistant", content: "HEARTBEAT_OK" })],
+      messages: [
+        makeMessage({ role: "user", content: OPENCLAW_HEARTBEAT_POLL }),
+        makeMessage({ role: "assistant", content: "seed assistant" }),
+        makeMessage({ role: "assistant", content: "HEARTBEAT_OK" }),
+      ],
       isHeartbeat: true,
       prePromptMessageCount: 0,
       tokenBudget: 4096,
     });
+    expect(
+      warnLog.mock.calls.some((call) =>
+        String(call[0]).includes(
+          "runtime batch does not align with the covered transcript frontier",
+        ),
+      ),
+    ).toBe(false);
 
     const conversation = await engine.getConversationStore().getConversationForSession({
       sessionId,
@@ -3932,6 +4013,10 @@ describe("LcmContextEngine afterTurn", () => {
       "seed user",
       "seed assistant",
     ]);
+    const checkpointAfterHeartbeat = await engine
+      .getSummaryStore()
+      .getConversationBootstrapState(conversation!.conversationId);
+    expect(checkpointAfterHeartbeat?.lastProcessedOffset).toBe(statSync(sessionFile).size);
 
     appendSessionMessage(sm, makeMessage({ role: "user", content: "real user" }));
     appendSessionMessage(sm, makeMessage({ role: "assistant", content: "real assistant" }));
@@ -3952,5 +4037,255 @@ describe("LcmContextEngine afterTurn", () => {
       "real user",
       "real assistant",
     ]);
+  });
+
+  it("afterTurn heartbeat flag keeps unrecognized append-only heartbeat deltas non-durable", async () => {
+    const engine = createEngine();
+    const sessionId = "after-turn-heartbeat-flag-unrecognized-append-only";
+    const sessionKey = "agent:main:test:after-turn-heartbeat-flag-unrecognized-append-only";
+    const sessionFile = createSessionFilePath("after-turn-heartbeat-flag-unrecognized-append-only");
+    const sm = SessionManager.open(sessionFile);
+    appendSessionMessage(sm, makeMessage({ role: "user", content: "seed user" }));
+    appendSessionMessage(sm, makeMessage({ role: "assistant", content: "seed assistant" }));
+
+    const first = await engine.bootstrap({ sessionId, sessionKey, sessionFile });
+    expect(first.bootstrapped).toBe(true);
+
+    appendSessionMessage(sm, makeMessage({ role: "user", content: "control prompt" }));
+    appendSessionMessage(sm, makeMessage({ role: "assistant", content: "not a durable reply" }));
+
+    const conversation = await engine.getConversationStore().getConversationForSession({
+      sessionId,
+      sessionKey,
+    });
+    expect(conversation).not.toBeNull();
+
+    await engine.afterTurn({
+      sessionId,
+      sessionKey,
+      sessionFile,
+      messages: [
+        makeMessage({ role: "user", content: "control prompt" }),
+        makeMessage({ role: "assistant", content: "not a durable reply" }),
+      ],
+      isHeartbeat: true,
+      prePromptMessageCount: 0,
+      tokenBudget: 4096,
+    });
+
+    const stored = await engine.getConversationStore().getMessages(conversation!.conversationId);
+    expect(stored.map((message) => message.content)).toEqual([
+      "seed user",
+      "seed assistant",
+    ]);
+    const checkpoint = await engine
+      .getSummaryStore()
+      .getConversationBootstrapState(conversation!.conversationId);
+    expect(checkpoint?.lastProcessedOffset).toBe(statSync(sessionFile).size);
+  });
+
+  it("afterTurn heartbeat flag imports real append-only prefix before a flagged control suffix", async () => {
+    const engine = createEngine();
+    const sessionId = "after-turn-heartbeat-flag-real-prefix";
+    const sessionKey = "agent:main:test:after-turn-heartbeat-flag-real-prefix";
+    const sessionFile = createSessionFilePath("after-turn-heartbeat-flag-real-prefix");
+    const sm = SessionManager.open(sessionFile);
+    appendSessionMessage(sm, makeMessage({ role: "user", content: "seed user" }));
+    appendSessionMessage(sm, makeMessage({ role: "assistant", content: "seed assistant" }));
+
+    const first = await engine.bootstrap({ sessionId, sessionKey, sessionFile });
+    expect(first.bootstrapped).toBe(true);
+
+    appendSessionMessage(sm, makeMessage({ role: "user", content: "real user" }));
+    appendSessionMessage(sm, makeMessage({ role: "assistant", content: "real assistant" }));
+    appendSessionMessage(sm, makeMessage({ role: "user", content: "control prompt" }));
+    appendSessionMessage(sm, makeMessage({ role: "assistant", content: "not a durable reply" }));
+
+    const conversation = await engine.getConversationStore().getConversationForSession({
+      sessionId,
+      sessionKey,
+    });
+    expect(conversation).not.toBeNull();
+
+    await engine.afterTurn({
+      sessionId,
+      sessionKey,
+      sessionFile,
+      messages: [
+        makeMessage({ role: "user", content: "control prompt" }),
+        makeMessage({ role: "assistant", content: "not a durable reply" }),
+      ],
+      isHeartbeat: true,
+      prePromptMessageCount: 0,
+      tokenBudget: 4096,
+    });
+
+    const stored = await engine.getConversationStore().getMessages(conversation!.conversationId);
+    expect(stored.map((message) => message.content)).toEqual([
+      "seed user",
+      "seed assistant",
+      "real user",
+      "real assistant",
+    ]);
+    const checkpoint = await engine
+      .getSummaryStore()
+      .getConversationBootstrapState(conversation!.conversationId);
+    expect(checkpoint?.lastProcessedOffset).toBe(statSync(sessionFile).size);
+  });
+
+  it("afterTurn append-only reconcile skips heartbeat control entries while importing mixed real deltas", async () => {
+    const engine = createEngine();
+    const sessionId = "after-turn-heartbeat-mixed-append-only";
+    const sessionKey = "agent:main:test:after-turn-heartbeat-mixed-append-only";
+    const sessionFile = createSessionFilePath("after-turn-heartbeat-mixed-append-only");
+    const sm = SessionManager.open(sessionFile);
+    appendSessionMessage(sm, makeMessage({ role: "user", content: "seed user" }));
+    appendSessionMessage(sm, makeMessage({ role: "assistant", content: "seed assistant" }));
+
+    const first = await engine.bootstrap({ sessionId, sessionKey, sessionFile });
+    expect(first.bootstrapped).toBe(true);
+
+    appendSessionMessage(sm, makeMessage({ role: "user", content: OPENCLAW_HEARTBEAT_POLL }));
+    appendSessionMessage(sm, makeMessage({ role: "assistant", content: "HEARTBEAT_OK" }));
+    appendSessionMessage(sm, makeMessage({ role: "user", content: "real user" }));
+    appendSessionMessage(sm, makeMessage({ role: "assistant", content: "real assistant" }));
+
+    const conversation = await engine.getConversationStore().getConversationForSession({
+      sessionId,
+      sessionKey,
+    });
+    expect(conversation).not.toBeNull();
+
+    await engine.afterTurn({
+      sessionId,
+      sessionKey,
+      sessionFile,
+      messages: [makeMessage({ role: "assistant", content: "real assistant" })],
+      prePromptMessageCount: 0,
+      tokenBudget: 4096,
+    });
+
+    const stored = await engine.getConversationStore().getMessages(conversation!.conversationId);
+    expect(stored.map((message) => message.content)).toEqual([
+      "seed user",
+      "seed assistant",
+      "real user",
+      "real assistant",
+    ]);
+    const checkpoint = await engine
+      .getSummaryStore()
+      .getConversationBootstrapState(conversation!.conversationId);
+    expect(checkpoint?.lastProcessedOffset).toBe(statSync(sessionFile).size);
+  });
+
+  it("afterTurn keeps durable runtime messages when only the transcript delta is heartbeat control", async () => {
+    const engine = createEngine();
+    const sessionId = "after-turn-heartbeat-runtime-real-remainder";
+    const sessionKey = "agent:main:test:after-turn-heartbeat-runtime-real-remainder";
+    const sessionFile = createSessionFilePath("after-turn-heartbeat-runtime-real-remainder");
+    const sm = SessionManager.open(sessionFile);
+    appendSessionMessage(sm, makeMessage({ role: "user", content: "seed user" }));
+    appendSessionMessage(sm, makeMessage({ role: "assistant", content: "seed assistant" }));
+
+    const first = await engine.bootstrap({ sessionId, sessionKey, sessionFile });
+    expect(first.bootstrapped).toBe(true);
+
+    appendSessionMessage(sm, makeMessage({ role: "user", content: OPENCLAW_HEARTBEAT_POLL }));
+    appendSessionMessage(sm, makeMessage({ role: "assistant", content: "HEARTBEAT_OK" }));
+
+    const conversation = await engine.getConversationStore().getConversationForSession({
+      sessionId,
+      sessionKey,
+    });
+    expect(conversation).not.toBeNull();
+
+    await engine.afterTurn({
+      sessionId,
+      sessionKey,
+      sessionFile,
+      messages: [
+        makeMessage({ role: "user", content: OPENCLAW_HEARTBEAT_POLL }),
+        makeMessage({ role: "assistant", content: "HEARTBEAT_OK" }),
+        makeMessage({ role: "assistant", content: "real runtime assistant" }),
+      ],
+      prePromptMessageCount: 0,
+      tokenBudget: 4096,
+    });
+
+    const stored = await engine.getConversationStore().getMessages(conversation!.conversationId);
+    expect(stored.map((message) => message.content)).toEqual([
+      "seed user",
+      "seed assistant",
+      "real runtime assistant",
+    ]);
+  });
+
+  it("afterTurn full-read reconcile propagates heartbeat control disposition after checkpoint loss", async () => {
+    const warnLog = vi.fn();
+    const engine = createEngineWithDepsOverrides({
+      log: {
+        info: vi.fn(),
+        warn: warnLog,
+        error: vi.fn(),
+        debug: vi.fn(),
+      },
+    });
+    const sessionId = "after-turn-heartbeat-full-read-control-skip";
+    const sessionKey = "agent:main:test:after-turn-heartbeat-full-read-control-skip";
+    const sessionFile = createSessionFilePath("after-turn-heartbeat-full-read-control-skip");
+    const sm = SessionManager.open(sessionFile);
+    appendSessionMessage(sm, makeMessage({ role: "user", content: "seed user" }));
+    appendSessionMessage(sm, makeMessage({ role: "assistant", content: "seed assistant" }));
+
+    const first = await engine.bootstrap({ sessionId, sessionKey, sessionFile });
+    expect(first.bootstrapped).toBe(true);
+
+    const conversation = await engine.getConversationStore().getConversationForSession({
+      sessionId,
+      sessionKey,
+    });
+    expect(conversation).not.toBeNull();
+    const config = getEngineConfig(engine);
+    const db = createLcmDatabaseConnection(config.databasePath);
+    try {
+      db.prepare(`DELETE FROM conversation_bootstrap_state WHERE conversation_id = ?`).run(
+        conversation!.conversationId,
+      );
+    } finally {
+      closeLcmConnection(db);
+    }
+
+    appendSessionMessage(sm, makeMessage({ role: "user", content: OPENCLAW_HEARTBEAT_POLL }));
+    appendSessionMessage(sm, makeMessage({ role: "assistant", content: "HEARTBEAT_OK" }));
+
+    await engine.afterTurn({
+      sessionId,
+      sessionKey,
+      sessionFile,
+      messages: [
+        makeMessage({ role: "user", content: OPENCLAW_HEARTBEAT_POLL }),
+        makeMessage({ role: "assistant", content: "seed assistant" }),
+        makeMessage({ role: "assistant", content: "HEARTBEAT_OK" }),
+      ],
+      prePromptMessageCount: 0,
+      tokenBudget: 4096,
+    });
+
+    expect(
+      warnLog.mock.calls.some((call) =>
+        String(call[0]).includes(
+          "runtime batch does not align with the covered transcript frontier",
+        ),
+      ),
+    ).toBe(false);
+    const stored = await engine.getConversationStore().getMessages(conversation!.conversationId);
+    expect(stored.map((message) => message.content)).toEqual([
+      "seed user",
+      "seed assistant",
+    ]);
+    const checkpoint = await engine
+      .getSummaryStore()
+      .getConversationBootstrapState(conversation!.conversationId);
+    expect(checkpoint?.lastProcessedOffset).toBe(statSync(sessionFile).size);
   });
 });

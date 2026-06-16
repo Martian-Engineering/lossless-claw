@@ -66,7 +66,11 @@ import {
 import { describeAssembledPrefixChange, formatOverflowDiagnosticsForLog, shouldLogOverflowDiagnostics, type AssemblePrefixSnapshot, type BootstrapImportObservation } from "./assemble-debug.js";
 import { appendForkBoundedLiveSuffixWithinBudget, buildDegradedLiveAssembleResult, buildForkBoundedLiveFallback, clampMessagesToSerializedBudget, resolveDeferredAssemblyPressure } from "./assemble-fallback.js";
 import { resolveBootstrapMaxTokens, trimBootstrapMessagesToBudget } from "./bootstrap-budget.js";
-import { batchLooksLikeHeartbeatAckTurn, pruneHeartbeatOkTurns } from "./heartbeat-filter.js";
+import {
+  batchLooksLikeHeartbeatAckTurn,
+  filterSyntheticHeartbeatMessages,
+  pruneHeartbeatOkTurns,
+} from "./heartbeat-filter.js";
 import { appendUncoveredVolatileLiveInputsWithinBudget, isVolatileLiveInputMessage, messageContentCoveredBySummary, resolveProtectedFreshTailAssembledIndexes } from "./live-coverage.js";
 import { buildMessageParts, extractMessageContent, filterPersistableMessages, hasPersistableMessageRole, isOpenClawRuntimeContextLeak, toStoredMessage } from "./message-content.js";
 import { createBootstrapEntryHash, readBootstrapMessageFromJsonLine } from "./message-signatures.js";
@@ -2824,6 +2828,8 @@ export class LcmContextEngine implements ContextEngine {
       // conversation is empty, so telemetry/compaction work below would run
       // against it for nothing; the next turn binds and reconciles normally.
       transcriptReconcileResult.blockedReason === "ambiguous-rollover-rotated-fresh-transcript";
+    const transcriptOnlyNonDurableControl =
+      transcriptReconcileResult.runtimeBatchDisposition === "skip-non-durable-control";
     let dedupedNewMessages: AgentMessage[] = [];
     if (transcriptReconcileUnsafeToAdvance) {
       if (newMessages.length > 0 || params.autoCompactionSummary) {
@@ -2835,6 +2841,19 @@ export class LcmContextEngine implements ContextEngine {
         await runRuntimeAutoRotate();
         return;
       }
+    } else if (transcriptOnlyNonDurableControl) {
+      const runtimeFiltered = filterSyntheticHeartbeatMessages(newMessages);
+      if (runtimeFiltered.skipped > 0) {
+        this.deps.log.debug(
+          `[lcm] afterTurn: skipped ${runtimeFiltered.skipped}/${newMessages.length} runtime heartbeat/control messages already reconciled as non-durable transcript traffic ${sessionLabel} skippedTranscriptMessages=${transcriptReconcileResult.nonDurableTranscriptMessages ?? 0}`,
+        );
+      }
+      dedupedNewMessages =
+        await this.batchDeduplicator.alignRuntimeBatchAgainstCoveredFrontier(
+          params.sessionId,
+          params.sessionKey,
+          runtimeFiltered.messages,
+        );
     } else if (transcriptReconcileResult.transcriptCovered) {
       // The transcript reconcile read the file to its frontier, so the DB
       // tail is exact — use precise alignment instead of the heuristic
@@ -2885,7 +2904,10 @@ export class LcmContextEngine implements ContextEngine {
     }
 
     const ingestBatch: AgentMessage[] = [];
-    if (!transcriptReconcileUnsafeToAdvance && params.autoCompactionSummary) {
+    if (
+      !transcriptReconcileUnsafeToAdvance &&
+      params.autoCompactionSummary
+    ) {
       ingestBatch.push({
         role: "user",
         content: params.autoCompactionSummary,

@@ -20,7 +20,7 @@ import type { LcmDependencies } from "./types.js";
 import { readFileSync } from "node:fs";
 import { stat } from "node:fs/promises";
 import { trimBootstrapMessagesToBudget, resolveBootstrapMaxTokens } from "./bootstrap-budget.js";
-import { batchLooksLikeHeartbeatAckTurn, filterSyntheticHeartbeatMessages } from "./heartbeat-filter.js";
+import { filterSyntheticHeartbeatMessages } from "./heartbeat-filter.js";
 import {
   buildMessageParts,
   isLikelyInjectedDeliveryOnlyTranscript,
@@ -380,11 +380,21 @@ export class TranscriptReconciler {
 
     const anchorIndex = selection.anchorIndex;
     const candidates = selection.missingIndexes.map((index) => historicalMessages[index]!);
-    const missingTail = this.filterSyntheticHeartbeatTranscriptMessages({
+    const heartbeatFilteredMissingTail = this.filterSyntheticHeartbeatTranscriptMessagesWithStats({
       messages: candidates,
       sessionContext,
       source: "reconcileSessionTail entry-id",
     });
+    const missingTail = heartbeatFilteredMissingTail.messages;
+    if (missingTail.length === 0 && heartbeatFilteredMissingTail.skipped > 0) {
+      return {
+        blockedByImportCap: false,
+        importedMessages: 0,
+        hasOverlap: true,
+        runtimeBatchDisposition: "skip-non-durable-control",
+        nonDurableTranscriptMessages: heartbeatFilteredMissingTail.skipped,
+      };
+    }
 
     // Entry-id anchored backlogs are exact — lineage is proven by the id
     // anchor and every import is individually id-verified — so a backlog
@@ -709,11 +719,21 @@ export class TranscriptReconciler {
       source: "reconcileSessionTail",
       priorMessages: historicalMessages.slice(0, anchorIndex + 1),
     });
-    const missingTail = this.filterSyntheticHeartbeatTranscriptMessages({
+    const heartbeatFilteredMissingTail = this.filterSyntheticHeartbeatTranscriptMessagesWithStats({
       messages: missingTailFiltered.messages,
       sessionContext,
       source: "reconcileSessionTail",
     });
+    const missingTail = heartbeatFilteredMissingTail.messages;
+    if (missingTail.length === 0 && heartbeatFilteredMissingTail.skipped > 0) {
+      return {
+        blockedByImportCap: false,
+        importedMessages: 0,
+        hasOverlap: true,
+        runtimeBatchDisposition: "skip-non-durable-control",
+        nonDurableTranscriptMessages: heartbeatFilteredMissingTail.skipped,
+      };
+    }
 
     // Anchored missing tails are this conversation's own continuation
     // (lineage proven by the identity anchor), so a tail larger than the
@@ -802,11 +822,21 @@ export class TranscriptReconciler {
       messages: historicalMessages,
     });
     const persistedIdentityOverlaps = replayAnalysis.overlaps;
-    let noAnchorImportMessages = this.filterSyntheticHeartbeatTranscriptMessages({
+    let noAnchorHeartbeatFiltered = this.filterSyntheticHeartbeatTranscriptMessagesWithStats({
       messages: historicalMessages,
       sessionContext,
       source: "reconcileSessionTail no-anchor",
     });
+    let noAnchorImportMessages = noAnchorHeartbeatFiltered.messages;
+    if (noAnchorImportMessages.length === 0 && noAnchorHeartbeatFiltered.skipped > 0) {
+      return {
+        blockedByImportCap: false,
+        importedMessages: 0,
+        hasOverlap: true,
+        runtimeBatchDisposition: "skip-non-durable-control",
+        nonDurableTranscriptMessages: noAnchorHeartbeatFiltered.skipped,
+      };
+    }
     // A fully id-bearing batch resolves identity overlaps exactly:
     // identity matches adopt the re-issued entry id (host rewrites and
     // rotations re-append the surviving suffix under new ids) and only
@@ -835,11 +865,21 @@ export class TranscriptReconciler {
       }
 
       if (replayAnalysis.firstNonOverlappingIndex > 0) {
-        noAnchorImportMessages = this.filterSyntheticHeartbeatTranscriptMessages({
+        noAnchorHeartbeatFiltered = this.filterSyntheticHeartbeatTranscriptMessagesWithStats({
           messages: historicalMessages.slice(replayAnalysis.firstNonOverlappingIndex),
           sessionContext,
           source: "reconcileSessionTail no-anchor replay-prefix",
         });
+        noAnchorImportMessages = noAnchorHeartbeatFiltered.messages;
+        if (noAnchorImportMessages.length === 0 && noAnchorHeartbeatFiltered.skipped > 0) {
+          return {
+            blockedByImportCap: false,
+            importedMessages: 0,
+            hasOverlap: true,
+            runtimeBatchDisposition: "skip-non-durable-control",
+            nonDurableTranscriptMessages: noAnchorHeartbeatFiltered.skipped,
+          };
+        }
         this.host.deps.log.warn(
           `[lcm] reconcileSessionTail: duplicate transcript replay guard dropped ${replayAnalysis.firstNonOverlappingIndex}/${historicalMessages.length} already-persisted prefix messages for ${sessionContext} before no-anchor import (reason: ${params.noAnchorImportReason ?? "unspecified"})`,
         );
@@ -1560,7 +1600,13 @@ export class TranscriptReconciler {
     isHeartbeat?: boolean;
   }): Promise<TranscriptReconcileResult> {
       if (params.isHeartbeat) {
-        return { importedMessages: 0, blockedByImportCap: false, hasOverlap: true };
+        return {
+          importedMessages: 0,
+          blockedByImportCap: false,
+          hasOverlap: true,
+          transcriptCovered: true,
+          runtimeBatchDisposition: "skip-non-durable-control",
+        };
       }
       // No persisted conversation exists yet. Prefer the transcript over
       // the runtime delta so foreground prompts that are omitted from
@@ -1583,13 +1629,27 @@ export class TranscriptReconciler {
         }
         return { importedMessages: 0, blockedByImportCap: false, hasOverlap: true };
       }
-      if (batchLooksLikeHeartbeatAckTurn(historicalMessages)) {
-        // Not covered: the runtime batch path owns conversation creation
-        // and heartbeat-ack pruning for brand-new sessions.
-        return { importedMessages: 0, blockedByImportCap: false, hasOverlap: true };
+      const initialSessionContext = [
+        `session=${params.sessionId}`,
+        ...(params.sessionKey?.trim() ? [`sessionKey=${params.sessionKey.trim()}`] : []),
+      ].join(" ");
+      const heartbeatFiltered = this.filterSyntheticHeartbeatTranscriptMessagesWithStats({
+        messages: historicalMessages,
+        sessionContext: initialSessionContext,
+        source: "afterTurn initial transcript",
+      });
+      if (heartbeatFiltered.messages.length === 0 && heartbeatFiltered.skipped > 0) {
+        return {
+          importedMessages: 0,
+          blockedByImportCap: false,
+          hasOverlap: true,
+          transcriptCovered: true,
+          runtimeBatchDisposition: "skip-non-durable-control",
+          nonDurableTranscriptMessages: heartbeatFiltered.skipped,
+        };
       }
       const bootstrapMessages = trimBootstrapMessagesToBudget(
-        historicalMessages,
+        heartbeatFiltered.messages,
         resolveBootstrapMaxTokens(this.host.config),
       );
       if (bootstrapMessages.length === 0) {
@@ -1623,7 +1683,7 @@ export class TranscriptReconciler {
       }
       return {
         importedMessages,
-        blockedByImportCap: bootstrapMessages.length < historicalMessages.length,
+        blockedByImportCap: bootstrapMessages.length < heartbeatFiltered.messages.length,
         hasOverlap: true,
         transcriptCovered: true,
       };
@@ -1662,25 +1722,6 @@ export class TranscriptReconciler {
           checkpoint.lastSeenMtimeMs === 0 &&
           checkpoint.lastProcessedOffset === 0 &&
           checkpoint.lastProcessedEntryHash === null;
-        if (params.isHeartbeat) {
-          if (!placeholderCheckpoint) {
-            await this.refreshBootstrapState({
-              conversationId: conversation.conversationId,
-              sessionFile: params.sessionFile,
-            });
-            this.host.deps.log.debug(
-              `[lcm] afterTurn: skipped heartbeat transcript append-only delta and refreshed checkpoint conversation=${conversation.conversationId} sessionFile=${params.sessionFile} appendedMessages=${appended.messages.length}`,
-            );
-          }
-          // Heartbeat turns are never persisted; the append-only delta is
-          // intentionally skipped, so the transcript counts as covered.
-          return {
-            importedMessages: 0,
-            blockedByImportCap: false,
-            hasOverlap: true,
-            transcriptCovered: true,
-          };
-        }
         if (placeholderCheckpoint && appended.messages.length > 0) {
           // #822: a placeholder checkpoint means this conversation was never
           // ingested, so its on-disk transcript is the source of truth and
@@ -1726,7 +1767,33 @@ export class TranscriptReconciler {
           source: "afterTurn transcript reconcile append-only",
           sessionFile: params.sessionFile,
         });
-        const replayFilteredMessages = replayFiltered.messages;
+        const heartbeatFiltered = this.filterSyntheticHeartbeatTranscriptMessagesWithStats({
+          messages: replayFiltered.messages,
+          sessionContext: appendOnlySessionContext,
+          source: "afterTurn transcript reconcile append-only",
+        });
+        const heartbeatFlagFiltered = this.filterHeartbeatFlaggedAppendOnlySuffix({
+          messages: heartbeatFiltered.messages,
+          isHeartbeat: params.isHeartbeat,
+          sessionContext: appendOnlySessionContext,
+        });
+        const replayFilteredMessages = heartbeatFlagFiltered.messages;
+        const skippedNonDurableMessages =
+          heartbeatFiltered.skipped + heartbeatFlagFiltered.skipped;
+        if (replayFilteredMessages.length === 0 && skippedNonDurableMessages > 0) {
+          await this.refreshBootstrapState({
+            conversationId: conversation.conversationId,
+            sessionFile: params.sessionFile,
+          });
+          return {
+            importedMessages: 0,
+            blockedByImportCap: false,
+            hasOverlap: true,
+            transcriptCovered: true,
+            runtimeBatchDisposition: "skip-non-durable-control",
+            nonDurableTranscriptMessages: skippedNonDurableMessages,
+          };
+        }
         const appendOnlyOverlapsPersisted = await this.appendOnlyMessagesOverlapPersistedTranscript({
           conversationId: conversation.conversationId,
           messages: replayFilteredMessages,
@@ -2095,6 +2162,7 @@ export class TranscriptReconciler {
       `[lcm] afterTurn: transcript reconcile slow path (full re-read) conversation=${conversation.conversationId} reason=${reason} sessionFile=${params.sessionFile} historicalMessages=${historicalMessages.length} importedMessages=${reconcile.importedMessages} duration=${formatDurationMs(Date.now() - slowPathStartedAt)}`,
     );
     return {
+      ...reconcile,
       importedMessages: reconcile.importedMessages,
       blockedByImportCap: false,
       hasOverlap: reconcile.hasOverlap,
@@ -2193,13 +2261,53 @@ export class TranscriptReconciler {
     sessionContext: string;
     source: string;
   }): AgentMessage[] {
+    return this.filterSyntheticHeartbeatTranscriptMessagesWithStats(params).messages;
+  }
+
+  /** Filter synthetic heartbeat/control transcript entries and report skipped count. */
+  private filterSyntheticHeartbeatTranscriptMessagesWithStats(params: {
+    messages: AgentMessage[];
+    sessionContext: string;
+    source: string;
+  }): { messages: AgentMessage[]; skipped: number } {
     const filtered = filterSyntheticHeartbeatMessages(params.messages);
     if (filtered.skipped > 0) {
       this.host.deps.log.debug(
         `[lcm] ${params.source}: skipped ${filtered.skipped}/${params.messages.length} synthetic heartbeat transcript messages for ${params.sessionContext}`,
       );
     }
-    return filtered.messages;
+    return filtered;
+  }
+
+  /** For explicit heartbeat turns, skip only the trailing runtime turn. */
+  private filterHeartbeatFlaggedAppendOnlySuffix(params: {
+    messages: AgentMessage[];
+    isHeartbeat?: boolean;
+    sessionContext: string;
+  }): { messages: AgentMessage[]; skipped: number } {
+    if (params.isHeartbeat !== true || params.messages.length === 0) {
+      return { messages: params.messages, skipped: 0 };
+    }
+
+    let turnStart = 0;
+    for (let index = params.messages.length - 1; index >= 0; index -= 1) {
+      const stored = toStoredMessage(params.messages[index]!);
+      if (stored.role === "user") {
+        turnStart = index;
+        break;
+      }
+    }
+
+    const skipped = params.messages.length - turnStart;
+    if (skipped > 0) {
+      this.host.deps.log.debug(
+        `[lcm] afterTurn transcript reconcile append-only: skipped ${skipped}/${params.messages.length} heartbeat-flagged transcript suffix messages for ${params.sessionContext}`,
+      );
+    }
+    return {
+      messages: params.messages.slice(0, turnStart),
+      skipped,
+    };
   }
 
   async reconcileTranscriptTailForAfterTurn(params: {

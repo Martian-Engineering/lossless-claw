@@ -115,4 +115,11 @@ export type TranscriptReconcileResult = {
    * transcript was missing, unreadable, or skipped.
    */
   transcriptCovered?: boolean;
+  /**
+   * The transcript frontier was reconciled, but the reconciled tail contained
+   * only non-durable heartbeat/control traffic. afterTurn should skip the
+   * matching runtime batch instead of asking generic dedup to infer that.
+   */
+  runtimeBatchDisposition?: "skip-non-durable-control";
+  nonDurableTranscriptMessages?: number;
 };

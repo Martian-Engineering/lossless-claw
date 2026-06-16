@@ -37,23 +37,35 @@ export function isHeartbeatNoiseContent(role: string, content: string): boolean 
 }
 
 export function batchLooksLikeHeartbeatAckTurn(messages: AgentMessage[]): boolean {
-  let sawHeartbeatMarker = false;
+  let sawHeartbeatMdMarker = false;
+  let sawExactHeartbeatPoll = false;
   let sawHeartbeatAck = false;
+  let sawNonExactPollTurnContent = false;
 
   for (const message of messages) {
     const stored = toStoredMessage(message);
-    if (!sawHeartbeatMarker && stored.content.toLowerCase().includes(HEARTBEAT_TURN_MARKER)) {
-      sawHeartbeatMarker = true;
+    const normalized = stored.content.trim().toLowerCase();
+    if (!sawHeartbeatMdMarker && normalized.includes(HEARTBEAT_TURN_MARKER)) {
+      sawHeartbeatMdMarker = true;
+    }
+    if (stored.role === "user" && normalized === OPENCLAW_HEARTBEAT_POLL) {
+      sawExactHeartbeatPoll = true;
     }
     if (!sawHeartbeatAck && stored.role === "assistant" && isHeartbeatOkContent(stored.content)) {
       sawHeartbeatAck = true;
     }
-    if (sawHeartbeatMarker && sawHeartbeatAck) {
+    if (
+      normalized !== OPENCLAW_HEARTBEAT_POLL &&
+      !(stored.role === "assistant" && isHeartbeatOkContent(stored.content))
+    ) {
+      sawNonExactPollTurnContent = true;
+    }
+    if (sawHeartbeatMdMarker && sawHeartbeatAck) {
       return true;
     }
   }
 
-  return false;
+  return sawExactHeartbeatPoll && sawHeartbeatAck && !sawNonExactPollTurnContent;
 }
 
 export function filterSyntheticHeartbeatMessages(
@@ -115,9 +127,13 @@ export function filterSyntheticHeartbeatMessages(
 }
 
 export function turnLooksLikeHeartbeatTurn(turnMessages: Array<{ content: string }>): boolean {
-  return turnMessages.some((message) =>
-    message.content.toLowerCase().includes(HEARTBEAT_TURN_MARKER),
-  );
+  return turnMessages.some((message) => {
+    const normalized = message.content.trim().toLowerCase();
+    return (
+      normalized === OPENCLAW_HEARTBEAT_POLL ||
+      normalized.includes(HEARTBEAT_TURN_MARKER)
+    );
+  });
 }
 
 
