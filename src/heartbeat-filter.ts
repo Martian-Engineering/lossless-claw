@@ -9,6 +9,8 @@ import type { ConversationStore } from "./store/conversation-store.js";
 
 export const HEARTBEAT_OK_TOKEN = "heartbeat_ok";
 
+export const NO_REPLY_TOKEN = "no_reply";
+
 export const HEARTBEAT_TURN_MARKER = "heartbeat.md";
 
 export const OPENCLAW_HEARTBEAT_POLL = "[openclaw heartbeat poll]";
@@ -21,6 +23,16 @@ export const OPENCLAW_HEARTBEAT_POLL = "[openclaw heartbeat poll]";
  */
 export function isHeartbeatOkContent(content: string): boolean {
   return content.trim().toLowerCase() === HEARTBEAT_OK_TOKEN;
+}
+
+/**
+ * Assistant-only control acknowledgements are safe to drop only after
+ * transcript reconciliation already classified the matching suffix as
+ * non-durable control traffic.
+ */
+export function isAssistantControlAckContent(content: string): boolean {
+  const normalized = content.trim().toLowerCase();
+  return normalized === HEARTBEAT_OK_TOKEN || normalized === NO_REPLY_TOKEN;
 }
 
 /**

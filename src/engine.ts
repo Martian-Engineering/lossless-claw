@@ -69,6 +69,7 @@ import { resolveBootstrapMaxTokens, trimBootstrapMessagesToBudget } from "./boot
 import {
   batchLooksLikeHeartbeatAckTurn,
   filterSyntheticHeartbeatMessages,
+  isAssistantControlAckContent,
   pruneHeartbeatOkTurns,
 } from "./heartbeat-filter.js";
 import { appendUncoveredVolatileLiveInputsWithinBudget, isVolatileLiveInputMessage, messageContentCoveredBySummary, resolveProtectedFreshTailAssembledIndexes } from "./live-coverage.js";
@@ -2843,16 +2844,25 @@ export class LcmContextEngine implements ContextEngine {
       }
     } else if (transcriptOnlyNonDurableControl) {
       const runtimeFiltered = filterSyntheticHeartbeatMessages(newMessages);
-      if (runtimeFiltered.skipped > 0) {
+      let skippedRuntimeControlMessages = runtimeFiltered.skipped;
+      const runtimeAlignmentMessages = runtimeFiltered.messages.filter((message) => {
+        const stored = toStoredMessage(message);
+        if (stored.role === "assistant" && isAssistantControlAckContent(stored.content)) {
+          skippedRuntimeControlMessages += 1;
+          return false;
+        }
+        return true;
+      });
+      if (skippedRuntimeControlMessages > 0) {
         this.deps.log.debug(
-          `[lcm] afterTurn: skipped ${runtimeFiltered.skipped}/${newMessages.length} runtime heartbeat/control messages already reconciled as non-durable transcript traffic ${sessionLabel} skippedTranscriptMessages=${transcriptReconcileResult.nonDurableTranscriptMessages ?? 0}`,
+          `[lcm] afterTurn: skipped ${skippedRuntimeControlMessages}/${newMessages.length} runtime heartbeat/control messages already reconciled as non-durable transcript traffic ${sessionLabel} skippedTranscriptMessages=${transcriptReconcileResult.nonDurableTranscriptMessages ?? 0}`,
         );
       }
       dedupedNewMessages =
         await this.batchDeduplicator.alignRuntimeBatchAgainstCoveredFrontier(
           params.sessionId,
           params.sessionKey,
-          runtimeFiltered.messages,
+          runtimeAlignmentMessages,
         );
     } else if (transcriptReconcileResult.transcriptCovered) {
       // The transcript reconcile read the file to its frontier, so the DB

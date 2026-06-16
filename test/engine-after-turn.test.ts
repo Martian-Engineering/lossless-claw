@@ -4084,6 +4084,64 @@ describe("LcmContextEngine afterTurn", () => {
     expect(checkpoint?.lastProcessedOffset).toBe(statSync(sessionFile).size);
   });
 
+  for (const controlAck of ["HEARTBEAT_OK", "NO_REPLY"]) {
+    it(`afterTurn skips singleton assistant ${controlAck} runtime batch after non-durable transcript suffix`, async () => {
+      const warnLog = vi.fn();
+      const engine = createEngineWithDepsOverrides({
+        log: {
+          info: vi.fn(),
+          warn: warnLog,
+          error: vi.fn(),
+          debug: vi.fn(),
+        },
+      });
+      const sessionId = `after-turn-heartbeat-singleton-${controlAck.toLowerCase()}`;
+      const sessionKey = `agent:main:test:${sessionId}`;
+      const sessionFile = createSessionFilePath(sessionId);
+      const sm = SessionManager.open(sessionFile);
+      appendSessionMessage(sm, makeMessage({ role: "user", content: "seed user" }));
+      appendSessionMessage(sm, makeMessage({ role: "assistant", content: "seed assistant" }));
+
+      const first = await engine.bootstrap({ sessionId, sessionKey, sessionFile });
+      expect(first.bootstrapped).toBe(true);
+
+      appendSessionMessage(sm, makeMessage({ role: "assistant", content: controlAck }));
+
+      const conversation = await engine.getConversationStore().getConversationForSession({
+        sessionId,
+        sessionKey,
+      });
+      expect(conversation).not.toBeNull();
+
+      await engine.afterTurn({
+        sessionId,
+        sessionKey,
+        sessionFile,
+        messages: [makeMessage({ role: "assistant", content: controlAck })],
+        isHeartbeat: true,
+        prePromptMessageCount: 0,
+        tokenBudget: 4096,
+      });
+
+      expect(
+        warnLog.mock.calls.some((call) =>
+          String(call[0]).includes(
+            "runtime batch does not align with the covered transcript frontier",
+          ),
+        ),
+      ).toBe(false);
+      const stored = await engine.getConversationStore().getMessages(conversation!.conversationId);
+      expect(stored.map((message) => message.content)).toEqual([
+        "seed user",
+        "seed assistant",
+      ]);
+      const checkpoint = await engine
+        .getSummaryStore()
+        .getConversationBootstrapState(conversation!.conversationId);
+      expect(checkpoint?.lastProcessedOffset).toBe(statSync(sessionFile).size);
+    });
+  }
+
   it("afterTurn heartbeat flag imports real append-only prefix before a flagged control suffix", async () => {
     const engine = createEngine();
     const sessionId = "after-turn-heartbeat-flag-real-prefix";
