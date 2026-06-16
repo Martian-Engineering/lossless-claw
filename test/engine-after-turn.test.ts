@@ -1580,6 +1580,59 @@ describe("LcmContextEngine afterTurn", () => {
     expect(advancedState?.lastProcessedOffset).toBeGreaterThan(0);
   });
 
+  it("advances placeholder checkpoints over all-control append-only transcript slices", async () => {
+    const engine = createEngine();
+    const sessionId = "placeholder-heartbeat-control-checkpoint";
+    const sessionKey = "agent:main:test:placeholder-heartbeat-control-checkpoint";
+    const sessionFile = createSessionFilePath("placeholder-heartbeat-control-checkpoint");
+    const sm = SessionManager.open(sessionFile);
+    appendSessionMessage(sm, makeMessage({ role: "user", content: OPENCLAW_HEARTBEAT_POLL }));
+    appendSessionMessage(sm, makeMessage({ role: "assistant", content: "HEARTBEAT_OK" }));
+
+    await engine.ingest({
+      sessionId,
+      sessionKey,
+      message: makeMessage({
+        role: "user",
+        content: "Conversation info (untrusted metadata): placeholder frontier",
+      }),
+    });
+    const conversation = await engine.getConversationStore().getConversationForSession({
+      sessionId,
+      sessionKey,
+    });
+    expect(conversation).not.toBeNull();
+    await engine.getSummaryStore().upsertConversationBootstrapState({
+      conversationId: conversation!.conversationId,
+      sessionFilePath: sessionFile,
+      lastSeenSize: 0,
+      lastSeenMtimeMs: 0,
+      lastProcessedOffset: 0,
+      lastProcessedEntryHash: null,
+    });
+
+    await engine.afterTurn({
+      sessionId,
+      sessionKey,
+      sessionFile,
+      messages: [
+        makeMessage({ role: "user", content: OPENCLAW_HEARTBEAT_POLL }),
+        makeMessage({ role: "assistant", content: "HEARTBEAT_OK" }),
+      ],
+      prePromptMessageCount: 0,
+      tokenBudget: 4096,
+    });
+
+    const stored = await engine.getConversationStore().getMessages(conversation!.conversationId);
+    expect(stored.map((message) => message.content)).toEqual([
+      "Conversation info (untrusted metadata): placeholder frontier",
+    ]);
+    const checkpoint = await engine
+      .getSummaryStore()
+      .getConversationBootstrapState(conversation!.conversationId);
+    expect(checkpoint?.lastProcessedOffset).toBe(statSync(sessionFile).size);
+  });
+
   it("blocks placeholder-checkpoint recovery when raw ids belong to another active conversation", async () => {
     const warnLog = vi.fn();
     const engine = createEngineWithDeps(
@@ -4178,6 +4231,66 @@ describe("LcmContextEngine afterTurn", () => {
       tokenBudget: 4096,
     });
 
+    const stored = await engine.getConversationStore().getMessages(conversation!.conversationId);
+    expect(stored.map((message) => message.content)).toEqual([
+      "seed user",
+      "seed assistant",
+      "real user",
+      "real assistant",
+    ]);
+    const checkpoint = await engine
+      .getSummaryStore()
+      .getConversationBootstrapState(conversation!.conversationId);
+    expect(checkpoint?.lastProcessedOffset).toBe(statSync(sessionFile).size);
+  });
+
+  it("afterTurn filters singleton runtime ack when mixed append-only transcript skips a control suffix", async () => {
+    const warnLog = vi.fn();
+    const engine = createEngineWithDepsOverrides({
+      log: {
+        info: vi.fn(),
+        warn: warnLog,
+        error: vi.fn(),
+        debug: vi.fn(),
+      },
+    });
+    const sessionId = "after-turn-mixed-transcript-singleton-ack";
+    const sessionKey = "agent:main:test:after-turn-mixed-transcript-singleton-ack";
+    const sessionFile = createSessionFilePath("after-turn-mixed-transcript-singleton-ack");
+    const sm = SessionManager.open(sessionFile);
+    appendSessionMessage(sm, makeMessage({ role: "user", content: "seed user" }));
+    appendSessionMessage(sm, makeMessage({ role: "assistant", content: "seed assistant" }));
+
+    const first = await engine.bootstrap({ sessionId, sessionKey, sessionFile });
+    expect(first.bootstrapped).toBe(true);
+
+    appendSessionMessage(sm, makeMessage({ role: "user", content: "real user" }));
+    appendSessionMessage(sm, makeMessage({ role: "assistant", content: "real assistant" }));
+    appendSessionMessage(sm, makeMessage({ role: "user", content: OPENCLAW_HEARTBEAT_POLL }));
+    appendSessionMessage(sm, makeMessage({ role: "assistant", content: "HEARTBEAT_OK" }));
+
+    const conversation = await engine.getConversationStore().getConversationForSession({
+      sessionId,
+      sessionKey,
+    });
+    expect(conversation).not.toBeNull();
+
+    await engine.afterTurn({
+      sessionId,
+      sessionKey,
+      sessionFile,
+      messages: [makeMessage({ role: "assistant", content: "HEARTBEAT_OK" })],
+      prePromptMessageCount: 0,
+      tokenBudget: 4096,
+    });
+
+    expect(
+      warnLog.mock.calls.some((call) =>
+        String(call[0]).includes(
+          "runtime batch does not align with the covered transcript frontier",
+        ),
+      ),
+    ).toBe(false);
     const stored = await engine.getConversationStore().getMessages(conversation!.conversationId);
     expect(stored.map((message) => message.content)).toEqual([
       "seed user",

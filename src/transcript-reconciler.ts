@@ -1750,6 +1750,15 @@ export class TranscriptReconciler {
             sessionFile: params.sessionFile,
             importedMessages: reconcile.importedMessages,
           });
+          if (
+            reconcile.importedMessages === 0 &&
+            reconcile.runtimeBatchDisposition === "skip-non-durable-control"
+          ) {
+            await this.refreshBootstrapState({
+              conversationId: conversation.conversationId,
+              sessionFile: params.sessionFile,
+            });
+          }
           return {
             ...reconcile,
             transcriptCovered: reconcile.hasOverlap || reconcile.importedMessages > 0,
@@ -1818,6 +1827,12 @@ export class TranscriptReconciler {
             blockedByImportCap: false,
             hasOverlap: true,
             transcriptCovered: true,
+            ...(skippedNonDurableMessages > 0
+              ? {
+                  runtimeBatchDisposition: "skip-non-durable-control" as const,
+                  nonDurableTranscriptMessages: skippedNonDurableMessages,
+                }
+              : {}),
           };
         }
       }
