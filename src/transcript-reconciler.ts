@@ -2428,25 +2428,29 @@ export class TranscriptReconciler {
       sessionContext: params.sessionContext,
       source: "afterTurn transcript reconcile placeholder",
     });
-    if (syntheticFiltered.skipped > 0) {
+    if (syntheticFiltered.messages.length === 0) {
       return syntheticFiltered;
     }
 
-    const lastMessage = params.messages[params.messages.length - 1]!;
+    const originalTail = params.messages[params.messages.length - 1]!;
+    const lastMessage = syntheticFiltered.messages[syntheticFiltered.messages.length - 1]!;
+    if (lastMessage !== originalTail) {
+      return syntheticFiltered;
+    }
     const lastStored = toStoredMessage(lastMessage);
     if (
       lastStored.role !== "assistant" ||
       !isAssistantControlAckContent(lastStored.content)
     ) {
-      return { messages: params.messages, skipped: 0 };
+      return syntheticFiltered;
     }
 
     this.host.deps.log.debug(
-      `[lcm] afterTurn transcript reconcile placeholder: skipped 1/${params.messages.length} heartbeat-flagged assistant transcript suffix message for ${params.sessionContext}`,
+      `[lcm] afterTurn transcript reconcile placeholder: skipped 1/${syntheticFiltered.messages.length} heartbeat-flagged assistant transcript suffix message for ${params.sessionContext}`,
     );
     return {
-      messages: params.messages.slice(0, -1),
-      skipped: 1,
+      messages: syntheticFiltered.messages.slice(0, -1),
+      skipped: syntheticFiltered.skipped + 1,
     };
   }
 

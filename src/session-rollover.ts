@@ -7,7 +7,11 @@
  * Extracted from engine.ts (Phase 3 of the engine decomposition).
  */
 import { stat } from "node:fs/promises";
-import { isHeartbeatNoiseContent } from "./heartbeat-filter.js";
+import {
+  isHeartbeatNoiseContent,
+  NO_REPLY_TOKEN,
+  OPENCLAW_HEARTBEAT_POLL,
+} from "./heartbeat-filter.js";
 import { describeLogError } from "./lcm-log.js";
 import { isLikelyInjectedDeliveryOnlyTranscript, toStoredMessage } from "./message-content.js";
 import { createBootstrapEntryHash, messageIdentity } from "./message-signatures.js";
@@ -33,6 +37,44 @@ const AMBIGUOUS_ROLLOVER_OVERLAP_WINDOW = 50;
  * traffic before freezing).
  */
 const AMBIGUOUS_ROLLOVER_OVERLAP_WIDE_WINDOW = 500;
+
+type RolloverIdentityMessage = {
+  role: string;
+  content: string;
+};
+
+function isExactHeartbeatNoReplyTurnMessage(
+  messages: RolloverIdentityMessage[],
+  index: number,
+): boolean {
+  const message = messages[index];
+  if (
+    !message ||
+    message.role !== "assistant" ||
+    message.content.trim().toLowerCase() !== NO_REPLY_TOKEN
+  ) {
+    return false;
+  }
+  for (let cursor = index - 1; cursor >= 0; cursor -= 1) {
+    const previous = messages[cursor]!;
+    if (previous.role !== "user") {
+      continue;
+    }
+    return previous.content.trim().toLowerCase() === OPENCLAW_HEARTBEAT_POLL;
+  }
+  return false;
+}
+
+function isRolloverHeartbeatNoiseMessage(
+  messages: RolloverIdentityMessage[],
+  index: number,
+): boolean {
+  const message = messages[index]!;
+  return (
+    isHeartbeatNoiseContent(message.role, message.content) ||
+    isExactHeartbeatNoReplyTurnMessage(messages, index)
+  );
+}
 
 export type AmbiguousSessionKeyRuntimeRollover = {
   conversationId: number;
@@ -321,15 +363,18 @@ export class SessionRolloverDetector {
     // entire recent window was heartbeat polls, false-blocking the heal).
     // Empty stored content (pure tool rows) is likewise skipped.
     const collectDiscriminatingIdentities = async (window: number): Promise<Set<string>> => {
-      const records = await this.conversationStore.getLastMessages(
+      const recordsWithContext = await this.conversationStore.getLastMessages(
         params.conversationId,
-        window,
+        window + 1,
       );
+      const comparisonStart = Math.max(0, recordsWithContext.length - window);
+      const records = recordsWithContext.slice(comparisonStart);
       const counts = new Map<string, number>();
-      for (const record of records) {
+      for (const [index, record] of records.entries()) {
+        const contextIndex = comparisonStart + index;
         if (
           record.content.trim().length === 0 ||
-          isHeartbeatNoiseContent(record.role, record.content)
+          isRolloverHeartbeatNoiseMessage(recordsWithContext, contextIndex)
         ) {
           continue;
         }
@@ -368,11 +413,11 @@ export class SessionRolloverDetector {
       };
     }
     let checkedCandidateIdentity = false;
-    for (const message of params.candidateMessages) {
-      const stored = toStoredMessage(message);
+    const candidateRecords = params.candidateMessages.map((message) => toStoredMessage(message));
+    for (const [index, stored] of candidateRecords.entries()) {
       if (
         stored.content.trim().length === 0 ||
-        isHeartbeatNoiseContent(stored.role, stored.content)
+        isRolloverHeartbeatNoiseMessage(candidateRecords, index)
       ) {
         continue;
       }

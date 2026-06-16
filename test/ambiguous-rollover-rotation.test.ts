@@ -21,6 +21,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import type { LcmConfig } from "../src/db/config.js";
 import { closeLcmConnection, createLcmDatabaseConnection } from "../src/db/connection.js";
 import { LcmContextEngine } from "../src/engine.js";
+import { OPENCLAW_HEARTBEAT_POLL } from "../src/heartbeat-filter.js";
 import type { AgentMessage } from "../src/openclaw-bridge.js";
 import type { LcmDependencies } from "../src/types.js";
 import { createTestConfig as createSharedTestConfig, createTestDeps as createSharedTestDeps } from "./helpers.js";
@@ -254,6 +255,165 @@ describe("ambiguous rollover tier-2 fresh-transcript rotation", () => {
     expect(rebound?.conversationId).not.toBe(lane.conversationId);
     const imported = await engine.getConversationStore().getMessages(rebound!.conversationId);
     expect(imported.some((m) => m.content.includes("fresh rolled-session turn"))).toBe(true);
+  });
+
+  it("bootstrap treats exact heartbeat poll NO_REPLY pairs as rollover noise", async () => {
+    const { engine, log, db } = createEngine();
+    await seedHistoricalMessage(engine, {
+      sessionId: OLD_SESSION_ID,
+      sessionKey: SESSION_KEY,
+      message: makeMessage("user", OPENCLAW_HEARTBEAT_POLL, Date.now() - 120_000),
+    });
+    await seedHistoricalMessage(engine, {
+      sessionId: OLD_SESSION_ID,
+      sessionKey: SESSION_KEY,
+      message: makeMessage("assistant", "NO_REPLY", Date.now() - 119_000),
+    });
+    const conversation = await engine
+      .getConversationStore()
+      .getConversationBySessionKey(SESSION_KEY);
+    expect(conversation).not.toBeNull();
+    db.prepare("UPDATE messages SET created_at = datetime('now', '-7 days') WHERE conversation_id = ?").run(
+      conversation!.conversationId,
+    );
+    const trackedFile = createTempFile("old-no-reply-transcript.jsonl", "{}\n");
+    await engine.getSummaryStore().upsertConversationBootstrapState({
+      conversationId: conversation!.conversationId,
+      sessionFilePath: trackedFile,
+      lastSeenSize: 3,
+      lastSeenMtimeMs: Date.now() - 7 * 24 * 60 * 60 * 1000,
+      lastProcessedOffset: 3,
+      lastProcessedEntryHash: "0".repeat(64),
+    });
+
+    const newSessionFile = writeRolledTranscript({
+      name: NEW_SESSION_ID,
+      entries: [
+        { role: "user", text: OPENCLAW_HEARTBEAT_POLL, timestamp: Date.now() + 60_000 },
+        { role: "assistant", text: "NO_REPLY", timestamp: Date.now() + 61_000 },
+      ],
+    });
+    const result = await engine.bootstrap({
+      sessionId: NEW_SESSION_ID,
+      sessionKey: SESSION_KEY,
+      sessionFile: newSessionFile,
+    });
+
+    expect(log.warn).toHaveBeenCalledWith(
+      expect.stringContaining("resolved by fresh-transcript rotation"),
+    );
+    expect(result.bootstrapped).toBe(true);
+    const oldConversation = await engine
+      .getConversationStore()
+      .getConversationBySessionId(OLD_SESSION_ID);
+    expect(oldConversation?.active).toBe(false);
+    const rebound = await engine
+      .getConversationStore()
+      .getConversationBySessionKey(SESSION_KEY);
+    expect(rebound?.sessionId).toBe(NEW_SESSION_ID);
+  });
+
+  it("bootstrap ignores orphaned NO_REPLY at the rollover comparison window boundary", async () => {
+    const { engine, log, db } = createEngine();
+    const oldBase = Date.now() - 120_000;
+    await seedHistoricalMessage(engine, {
+      sessionId: OLD_SESSION_ID,
+      sessionKey: SESSION_KEY,
+      message: makeMessage("user", OPENCLAW_HEARTBEAT_POLL, oldBase),
+    });
+    await seedHistoricalMessage(engine, {
+      sessionId: OLD_SESSION_ID,
+      sessionKey: SESSION_KEY,
+      message: makeMessage("assistant", "NO_REPLY", oldBase + 1),
+    });
+    for (let index = 0; index < 49; index += 1) {
+      await seedHistoricalMessage(engine, {
+        sessionId: OLD_SESSION_ID,
+        sessionKey: SESSION_KEY,
+        message: makeMessage("user", OPENCLAW_HEARTBEAT_POLL, oldBase + index + 2),
+      });
+    }
+    const conversation = await engine
+      .getConversationStore()
+      .getConversationBySessionKey(SESSION_KEY);
+    expect(conversation).not.toBeNull();
+    db.prepare("UPDATE messages SET created_at = datetime('now', '-7 days') WHERE conversation_id = ?").run(
+      conversation!.conversationId,
+    );
+    const trackedFile = createTempFile("old-boundary-no-reply-transcript.jsonl", "{}\n");
+    await engine.getSummaryStore().upsertConversationBootstrapState({
+      conversationId: conversation!.conversationId,
+      sessionFilePath: trackedFile,
+      lastSeenSize: 3,
+      lastSeenMtimeMs: Date.now() - 7 * 24 * 60 * 60 * 1000,
+      lastProcessedOffset: 3,
+      lastProcessedEntryHash: "0".repeat(64),
+    });
+
+    const newSessionFile = writeRolledTranscript({
+      name: NEW_SESSION_ID,
+      entries: [
+        { role: "user", text: OPENCLAW_HEARTBEAT_POLL, timestamp: Date.now() + 60_000 },
+        { role: "assistant", text: "NO_REPLY", timestamp: Date.now() + 61_000 },
+      ],
+    });
+    await engine.bootstrap({
+      sessionId: NEW_SESSION_ID,
+      sessionKey: SESSION_KEY,
+      sessionFile: newSessionFile,
+    });
+
+    expect(log.warn).toHaveBeenCalledWith(
+      expect.stringContaining("resolved by fresh-transcript rotation"),
+    );
+    const rebound = await engine
+      .getConversationStore()
+      .getConversationBySessionKey(SESSION_KEY);
+    expect(rebound?.sessionId).toBe(NEW_SESSION_ID);
+  });
+
+  it("bootstrap keeps candidate-leading durable NO_REPLY comparable", async () => {
+    const { engine, log, db } = createEngine();
+    await seedHistoricalMessage(engine, {
+      sessionId: OLD_SESSION_ID,
+      sessionKey: SESSION_KEY,
+      message: makeMessage("assistant", "NO_REPLY", Date.now() - 120_000),
+    });
+    const conversation = await engine
+      .getConversationStore()
+      .getConversationBySessionKey(SESSION_KEY);
+    expect(conversation).not.toBeNull();
+    db.prepare("UPDATE messages SET created_at = datetime('now', '-7 days') WHERE conversation_id = ?").run(
+      conversation!.conversationId,
+    );
+    const trackedFile = createTempFile("old-durable-no-reply-transcript.jsonl", "{}\n");
+    await engine.getSummaryStore().upsertConversationBootstrapState({
+      conversationId: conversation!.conversationId,
+      sessionFilePath: trackedFile,
+      lastSeenSize: 3,
+      lastSeenMtimeMs: Date.now() - 7 * 24 * 60 * 60 * 1000,
+      lastProcessedOffset: 3,
+      lastProcessedEntryHash: "0".repeat(64),
+    });
+
+    const newSessionFile = writeRolledTranscript({
+      name: NEW_SESSION_ID,
+      entries: [
+        { role: "assistant", text: "NO_REPLY", timestamp: Date.now() + 60_000 },
+        { role: "user", text: "fresh candidate content", timestamp: Date.now() + 61_000 },
+      ],
+    });
+    const result = await engine.bootstrap({
+      sessionId: NEW_SESSION_ID,
+      sessionKey: SESSION_KEY,
+      sessionFile: newSessionFile,
+    });
+
+    expect(result.bootstrapped).toBe(false);
+    expect(result.reason).toBe("ambiguous session-key runtime rollover");
+    expect(log.warn).toHaveBeenCalledWith(
+      expect.stringContaining("freshness=identity-overlap-with-persisted-history"),
+    );
   });
 
   it("afterTurn rotates the lane; the host's next bootstrap imports the transcript", async () => {

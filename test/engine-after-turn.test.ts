@@ -10,7 +10,7 @@ import type { LcmConfig } from "../src/db/config.js";
 import { closeLcmConnection, createLcmDatabaseConnection } from "../src/db/connection.js";
 import { LcmContextEngine } from "../src/engine.js";
 import { estimateSerializedMessageTokens, estimateSerializedMessagesTokens, estimateTokens } from "../src/estimate-tokens.js";
-import { OPENCLAW_HEARTBEAT_POLL } from "../src/heartbeat-filter.js";
+import { isHeartbeatNoiseContent, OPENCLAW_HEARTBEAT_POLL } from "../src/heartbeat-filter.js";
 import type { AgentMessage } from "../src/openclaw-bridge.js";
 import { applyScopedDoctorRepair } from "../src/plugin/lcm-doctor-apply.js";
 import { detectDoctorMarker } from "../src/plugin/lcm-doctor-shared.js";
@@ -34,6 +34,12 @@ import {
 
 afterEach(cleanupEngineTestState);
 describe("LcmContextEngine afterTurn", () => {
+  it("does not treat durable NO_REPLY as context-free heartbeat noise", () => {
+    expect(isHeartbeatNoiseContent("assistant", "NO_REPLY")).toBe(false);
+    expect(isHeartbeatNoiseContent("assistant", "HEARTBEAT_OK")).toBe(true);
+    expect(isHeartbeatNoiseContent("user", OPENCLAW_HEARTBEAT_POLL)).toBe(true);
+  });
+
   it("afterTurn ingests auto-compaction summary and new turn messages", async () => {
     const engine = createEngine();
     const sessionId = "after-turn-ingest";
@@ -1731,6 +1737,115 @@ describe("LcmContextEngine afterTurn", () => {
     expect(stored.map((message) => message.content)).toEqual([
       "durable user",
       "durable assistant",
+    ]);
+    const checkpoint = await engine
+      .getSummaryStore()
+      .getConversationBootstrapState(conversation!.conversationId);
+    expect(checkpoint?.lastProcessedOffset).toBe(statSync(sessionFile).size);
+  });
+
+  it("strips trailing placeholder control suffixes after older synthetic heartbeat traffic", async () => {
+    const engine = createEngine();
+    const sessionId = "placeholder-heartbeat-synthetic-plus-trailing-ack";
+    const sessionKey = "agent:main:test:placeholder-heartbeat-synthetic-plus-trailing-ack";
+    const sessionFile = createSessionFilePath(
+      "placeholder-heartbeat-synthetic-plus-trailing-ack",
+    );
+    const sm = SessionManager.open(sessionFile);
+    appendSessionMessage(sm, makeMessage({ role: "user", content: OPENCLAW_HEARTBEAT_POLL }));
+    appendSessionMessage(sm, makeMessage({ role: "assistant", content: "HEARTBEAT_OK" }));
+    appendSessionMessage(sm, makeMessage({ role: "user", content: "durable user" }));
+    appendSessionMessage(sm, makeMessage({ role: "assistant", content: "HEARTBEAT_OK" }));
+
+    await engine.ingest({
+      sessionId,
+      sessionKey,
+      message: makeMessage({
+        role: "user",
+        content: "Conversation info (untrusted metadata): placeholder frontier",
+      }),
+    });
+    const conversation = await engine.getConversationStore().getConversationForSession({
+      sessionId,
+      sessionKey,
+    });
+    expect(conversation).not.toBeNull();
+    await engine.getSummaryStore().upsertConversationBootstrapState({
+      conversationId: conversation!.conversationId,
+      sessionFilePath: sessionFile,
+      lastSeenSize: 0,
+      lastSeenMtimeMs: 0,
+      lastProcessedOffset: 0,
+      lastProcessedEntryHash: null,
+    });
+
+    await engine.afterTurn({
+      sessionId,
+      sessionKey,
+      sessionFile,
+      messages: [makeMessage({ role: "assistant", content: "HEARTBEAT_OK" })],
+      isHeartbeat: true,
+      prePromptMessageCount: 0,
+      tokenBudget: 4096,
+    });
+
+    const stored = await engine.getConversationStore().getMessages(conversation!.conversationId);
+    expect(stored.map((message) => message.content)).toEqual([
+      "Conversation info (untrusted metadata): placeholder frontier",
+      "durable user",
+    ]);
+    const checkpoint = await engine
+      .getSummaryStore()
+      .getConversationBootstrapState(conversation!.conversationId);
+    expect(checkpoint?.lastProcessedOffset).toBe(statSync(sessionFile).size);
+  });
+
+  it("preserves placeholder durable exact-token messages before later synthetic traffic", async () => {
+    const engine = createEngine();
+    const sessionId = "placeholder-heartbeat-preserve-leading-token";
+    const sessionKey = "agent:main:test:placeholder-heartbeat-preserve-leading-token";
+    const sessionFile = createSessionFilePath("placeholder-heartbeat-preserve-leading-token");
+    const sm = SessionManager.open(sessionFile);
+    appendSessionMessage(sm, makeMessage({ role: "assistant", content: "HEARTBEAT_OK" }));
+    appendSessionMessage(sm, makeMessage({ role: "user", content: OPENCLAW_HEARTBEAT_POLL }));
+    appendSessionMessage(sm, makeMessage({ role: "assistant", content: "HEARTBEAT_OK" }));
+
+    await engine.ingest({
+      sessionId,
+      sessionKey,
+      message: makeMessage({
+        role: "user",
+        content: "Conversation info (untrusted metadata): placeholder frontier",
+      }),
+    });
+    const conversation = await engine.getConversationStore().getConversationForSession({
+      sessionId,
+      sessionKey,
+    });
+    expect(conversation).not.toBeNull();
+    await engine.getSummaryStore().upsertConversationBootstrapState({
+      conversationId: conversation!.conversationId,
+      sessionFilePath: sessionFile,
+      lastSeenSize: 0,
+      lastSeenMtimeMs: 0,
+      lastProcessedOffset: 0,
+      lastProcessedEntryHash: null,
+    });
+
+    await engine.afterTurn({
+      sessionId,
+      sessionKey,
+      sessionFile,
+      messages: [makeMessage({ role: "assistant", content: "HEARTBEAT_OK" })],
+      isHeartbeat: true,
+      prePromptMessageCount: 0,
+      tokenBudget: 4096,
+    });
+
+    const stored = await engine.getConversationStore().getMessages(conversation!.conversationId);
+    expect(stored.map((message) => message.content)).toEqual([
+      "Conversation info (untrusted metadata): placeholder frontier",
+      "HEARTBEAT_OK",
     ]);
     const checkpoint = await engine
       .getSummaryStore()

@@ -40,7 +40,7 @@ export function isAssistantControlAckContent(content: string): boolean {
 }
 
 /**
- * Synthetic heartbeat traffic (poll prompts and control acks) recurs
+ * Synthetic heartbeat traffic (poll prompts and HEARTBEAT_OK acks) recurs
  * identically in every session, so it can never discriminate lineage in
  * the ambiguous-rollover freshness check.
  */
@@ -49,7 +49,7 @@ export function isHeartbeatNoiseContent(role: string, content: string): boolean 
   if (role === "user" && normalized === OPENCLAW_HEARTBEAT_POLL) {
     return true;
   }
-  return role === "assistant" && isAssistantControlAckContent(normalized);
+  return role === "assistant" && normalized === HEARTBEAT_OK_TOKEN;
 }
 
 export function batchLooksLikeHeartbeatAckTurn(messages: AgentMessage[]): boolean {
