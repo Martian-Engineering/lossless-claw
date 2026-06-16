@@ -23,6 +23,7 @@ import { trimBootstrapMessagesToBudget, resolveBootstrapMaxTokens } from "./boot
 import {
   filterSyntheticHeartbeatMessages,
   isAssistantControlAckContent,
+  turnLooksLikeHeartbeatTurn,
 } from "./heartbeat-filter.js";
 import {
   buildMessageParts,
@@ -2349,39 +2350,56 @@ export class TranscriptReconciler {
     }
 
     if (turnStart < 0) {
-      let controlRunStart = params.messages.length;
-      for (let index = params.messages.length - 1; index >= 0; index -= 1) {
-        const stored = toStoredMessage(params.messages[index]!);
-        if (
-          stored.role !== "assistant" ||
-          !isAssistantControlAckContent(stored.content)
-        ) {
-          break;
-        }
-        controlRunStart = index;
-      }
+      return this.filterHeartbeatFlaggedAssistantControlSuffix(params);
+    }
 
-      const skipped = params.messages.length - controlRunStart;
-      if (skipped === 0) {
-        return { messages: params.messages, skipped: 0 };
-      }
+    const turnMessages = params.messages
+      .slice(turnStart)
+      .map((message) => toStoredMessage(message));
+    const lastTurnMessage = turnMessages[turnMessages.length - 1]!;
+    const endsWithControlAck =
+      lastTurnMessage.role === "assistant" &&
+      isAssistantControlAckContent(lastTurnMessage.content);
+    if (endsWithControlAck && turnLooksLikeHeartbeatTurn(turnMessages)) {
+      const skipped = params.messages.length - turnStart;
       this.host.deps.log.debug(
-        `[lcm] afterTurn transcript reconcile append-only: skipped ${skipped}/${params.messages.length} heartbeat-flagged assistant transcript suffix messages for ${params.sessionContext}`,
+        `[lcm] afterTurn transcript reconcile append-only: skipped ${skipped}/${params.messages.length} heartbeat-flagged transcript suffix messages for ${params.sessionContext}`,
       );
       return {
-        messages: params.messages.slice(0, controlRunStart),
+        messages: params.messages.slice(0, turnStart),
         skipped,
       };
     }
 
-    const skipped = params.messages.length - turnStart;
-    if (skipped > 0) {
-      this.host.deps.log.debug(
-        `[lcm] afterTurn transcript reconcile append-only: skipped ${skipped}/${params.messages.length} heartbeat-flagged transcript suffix messages for ${params.sessionContext}`,
-      );
+    return this.filterHeartbeatFlaggedAssistantControlSuffix(params);
+  }
+
+  /** Strip only trailing assistant control acknowledgements from heartbeat-flagged slices. */
+  private filterHeartbeatFlaggedAssistantControlSuffix(params: {
+    messages: AgentMessage[];
+    sessionContext: string;
+  }): { messages: AgentMessage[]; skipped: number } {
+    let controlRunStart = params.messages.length;
+    for (let index = params.messages.length - 1; index >= 0; index -= 1) {
+      const stored = toStoredMessage(params.messages[index]!);
+      if (
+        stored.role !== "assistant" ||
+        !isAssistantControlAckContent(stored.content)
+      ) {
+        break;
+      }
+      controlRunStart = index;
     }
+
+    const skipped = params.messages.length - controlRunStart;
+    if (skipped === 0) {
+      return { messages: params.messages, skipped: 0 };
+    }
+    this.host.deps.log.debug(
+      `[lcm] afterTurn transcript reconcile append-only: skipped ${skipped}/${params.messages.length} heartbeat-flagged assistant transcript suffix messages for ${params.sessionContext}`,
+    );
     return {
-      messages: params.messages.slice(0, turnStart),
+      messages: params.messages.slice(0, controlRunStart),
       skipped,
     };
   }

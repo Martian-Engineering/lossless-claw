@@ -4244,7 +4244,7 @@ describe("LcmContextEngine afterTurn", () => {
     ]);
   });
 
-  it("afterTurn heartbeat flag keeps unrecognized append-only heartbeat deltas non-durable", async () => {
+  it("afterTurn heartbeat flag imports unrecognized append-only deltas", async () => {
     const engine = createEngine();
     const sessionId = "after-turn-heartbeat-flag-unrecognized-append-only";
     const sessionKey = "agent:main:test:after-turn-heartbeat-flag-unrecognized-append-only";
@@ -4282,6 +4282,8 @@ describe("LcmContextEngine afterTurn", () => {
     expect(stored.map((message) => message.content)).toEqual([
       "seed user",
       "seed assistant",
+      "control prompt",
+      "not a durable reply",
     ]);
     const checkpoint = await engine
       .getSummaryStore()
@@ -4361,8 +4363,8 @@ describe("LcmContextEngine afterTurn", () => {
 
     appendSessionMessage(sm, makeMessage({ role: "user", content: "real user" }));
     appendSessionMessage(sm, makeMessage({ role: "assistant", content: "real assistant" }));
-    appendSessionMessage(sm, makeMessage({ role: "user", content: "control prompt" }));
-    appendSessionMessage(sm, makeMessage({ role: "assistant", content: "not a durable reply" }));
+    appendSessionMessage(sm, makeMessage({ role: "user", content: "run heartbeat.md" }));
+    appendSessionMessage(sm, makeMessage({ role: "assistant", content: "NO_REPLY" }));
 
     const conversation = await engine.getConversationStore().getConversationForSession({
       sessionId,
@@ -4375,8 +4377,8 @@ describe("LcmContextEngine afterTurn", () => {
       sessionKey,
       sessionFile,
       messages: [
-        makeMessage({ role: "user", content: "control prompt" }),
-        makeMessage({ role: "assistant", content: "not a durable reply" }),
+        makeMessage({ role: "user", content: "run heartbeat.md" }),
+        makeMessage({ role: "assistant", content: "NO_REPLY" }),
       ],
       isHeartbeat: true,
       prePromptMessageCount: 0,
@@ -4472,6 +4474,96 @@ describe("LcmContextEngine afterTurn", () => {
 
     const stored = await engine.getConversationStore().getMessages(conversation!.conversationId);
     expect(stored.map((message) => message.content)).toEqual(["seed user", "seed assistant"]);
+    const checkpoint = await engine
+      .getSummaryStore()
+      .getConversationBootstrapState(conversation!.conversationId);
+    expect(checkpoint?.lastProcessedOffset).toBe(statSync(sessionFile).size);
+  });
+
+  it("afterTurn heartbeat flag preserves durable user prefixes before a control ack", async () => {
+    const engine = createEngine();
+    const sessionId = "after-turn-heartbeat-user-prefix";
+    const sessionKey = "agent:main:test:after-turn-heartbeat-user-prefix";
+    const sessionFile = createSessionFilePath("after-turn-heartbeat-user-prefix");
+    const sm = SessionManager.open(sessionFile);
+    appendSessionMessage(sm, makeMessage({ role: "user", content: "seed user" }));
+    appendSessionMessage(sm, makeMessage({ role: "assistant", content: "seed assistant" }));
+
+    const first = await engine.bootstrap({ sessionId, sessionKey, sessionFile });
+    expect(first.bootstrapped).toBe(true);
+
+    appendSessionMessage(sm, makeMessage({ role: "user", content: "real question" }));
+    appendSessionMessage(sm, makeMessage({ role: "assistant", content: "HEARTBEAT_OK" }));
+
+    const conversation = await engine.getConversationStore().getConversationForSession({
+      sessionId,
+      sessionKey,
+    });
+    expect(conversation).not.toBeNull();
+
+    await engine.afterTurn({
+      sessionId,
+      sessionKey,
+      sessionFile,
+      messages: [makeMessage({ role: "assistant", content: "HEARTBEAT_OK" })],
+      isHeartbeat: true,
+      prePromptMessageCount: 0,
+      tokenBudget: 4096,
+    });
+
+    const stored = await engine.getConversationStore().getMessages(conversation!.conversationId);
+    expect(stored.map((message) => message.content)).toEqual([
+      "seed user",
+      "seed assistant",
+      "real question",
+    ]);
+    const checkpoint = await engine
+      .getSummaryStore()
+      .getConversationBootstrapState(conversation!.conversationId);
+    expect(checkpoint?.lastProcessedOffset).toBe(statSync(sessionFile).size);
+  });
+
+  it("afterTurn heartbeat flag imports heartbeat-marker turns with durable responses", async () => {
+    const engine = createEngine();
+    const sessionId = "after-turn-heartbeat-marker-durable-response";
+    const sessionKey = "agent:main:test:after-turn-heartbeat-marker-durable-response";
+    const sessionFile = createSessionFilePath("after-turn-heartbeat-marker-durable-response");
+    const sm = SessionManager.open(sessionFile);
+    appendSessionMessage(sm, makeMessage({ role: "user", content: "seed user" }));
+    appendSessionMessage(sm, makeMessage({ role: "assistant", content: "seed assistant" }));
+
+    const first = await engine.bootstrap({ sessionId, sessionKey, sessionFile });
+    expect(first.bootstrapped).toBe(true);
+
+    appendSessionMessage(sm, makeMessage({ role: "user", content: "run heartbeat.md" }));
+    appendSessionMessage(sm, makeMessage({ role: "assistant", content: "durable response" }));
+
+    const conversation = await engine.getConversationStore().getConversationForSession({
+      sessionId,
+      sessionKey,
+    });
+    expect(conversation).not.toBeNull();
+
+    await engine.afterTurn({
+      sessionId,
+      sessionKey,
+      sessionFile,
+      messages: [
+        makeMessage({ role: "user", content: "run heartbeat.md" }),
+        makeMessage({ role: "assistant", content: "durable response" }),
+      ],
+      isHeartbeat: true,
+      prePromptMessageCount: 0,
+      tokenBudget: 4096,
+    });
+
+    const stored = await engine.getConversationStore().getMessages(conversation!.conversationId);
+    expect(stored.map((message) => message.content)).toEqual([
+      "seed user",
+      "seed assistant",
+      "run heartbeat.md",
+      "durable response",
+    ]);
     const checkpoint = await engine
       .getSummaryStore()
       .getConversationBootstrapState(conversation!.conversationId);
