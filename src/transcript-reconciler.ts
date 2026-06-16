@@ -20,7 +20,10 @@ import type { LcmDependencies } from "./types.js";
 import { readFileSync } from "node:fs";
 import { stat } from "node:fs/promises";
 import { trimBootstrapMessagesToBudget, resolveBootstrapMaxTokens } from "./bootstrap-budget.js";
-import { filterSyntheticHeartbeatMessages } from "./heartbeat-filter.js";
+import {
+  filterSyntheticHeartbeatMessages,
+  isAssistantControlAckContent,
+} from "./heartbeat-filter.js";
 import {
   buildMessageParts,
   isLikelyInjectedDeliveryOnlyTranscript,
@@ -1736,11 +1739,35 @@ export class TranscriptReconciler {
             await this.conversationFrontierIsEntirelyNonAnchoring(
               conversation.conversationId,
             );
+          const placeholderSessionContext = this.host.formatSessionLogContext({
+            conversationId: conversation.conversationId,
+            sessionId: params.sessionId,
+            sessionKey: params.sessionKey,
+          });
+          const placeholderHeartbeatFiltered = this.filterHeartbeatFlaggedPlaceholderSuffix({
+            messages: appended.messages,
+            isHeartbeat: params.isHeartbeat,
+            sessionContext: placeholderSessionContext,
+          });
+          if (placeholderHeartbeatFiltered.messages.length === 0) {
+            await this.refreshBootstrapState({
+              conversationId: conversation.conversationId,
+              sessionFile: params.sessionFile,
+            });
+            return {
+              importedMessages: 0,
+              blockedByImportCap: false,
+              hasOverlap: true,
+              transcriptCovered: true,
+              runtimeBatchDisposition: "skip-non-durable-control",
+              nonDurableTranscriptMessages: placeholderHeartbeatFiltered.skipped,
+            };
+          }
           const reconcile = await this.reconcileSessionTail({
             sessionId: params.sessionId,
             sessionKey: params.sessionKey,
             conversationId: conversation.conversationId,
-            historicalMessages: appended.messages,
+            historicalMessages: placeholderHeartbeatFiltered.messages,
             allowNoAnchorImport: placeholderFrontierIsNonAnchoring,
             allowFullNonAnchoringFrontierImport: placeholderFrontierIsNonAnchoring,
             noAnchorImportReason: "placeholder-checkpoint-recovery",
@@ -1761,6 +1788,14 @@ export class TranscriptReconciler {
           }
           return {
             ...reconcile,
+            ...(placeholderHeartbeatFiltered.skipped > 0
+              ? {
+                  runtimeBatchDisposition: "skip-non-durable-control" as const,
+                  nonDurableTranscriptMessages:
+                    (reconcile.nonDurableTranscriptMessages ?? 0) +
+                    placeholderHeartbeatFiltered.skipped,
+                }
+              : {}),
             transcriptCovered: reconcile.hasOverlap || reconcile.importedMessages > 0,
           };
         }
@@ -2322,6 +2357,48 @@ export class TranscriptReconciler {
     return {
       messages: params.messages.slice(0, turnStart),
       skipped,
+    };
+  }
+
+  /**
+   * Placeholder checkpoints read from offset 0, so the slice may include older
+   * unreconciled durable history. Never drop a broad user-started suffix unless
+   * it is a recognized synthetic heartbeat turn; otherwise drop only the final
+   * assistant control ack for explicit heartbeat calls.
+   */
+  private filterHeartbeatFlaggedPlaceholderSuffix(params: {
+    messages: AgentMessage[];
+    isHeartbeat?: boolean;
+    sessionContext: string;
+  }): { messages: AgentMessage[]; skipped: number } {
+    if (params.isHeartbeat !== true || params.messages.length === 0) {
+      return { messages: params.messages, skipped: 0 };
+    }
+
+    const syntheticFiltered = this.filterSyntheticHeartbeatTranscriptMessagesWithStats({
+      messages: params.messages,
+      sessionContext: params.sessionContext,
+      source: "afterTurn transcript reconcile placeholder",
+    });
+    if (syntheticFiltered.skipped > 0) {
+      return syntheticFiltered;
+    }
+
+    const lastMessage = params.messages[params.messages.length - 1]!;
+    const lastStored = toStoredMessage(lastMessage);
+    if (
+      lastStored.role !== "assistant" ||
+      !isAssistantControlAckContent(lastStored.content)
+    ) {
+      return { messages: params.messages, skipped: 0 };
+    }
+
+    this.host.deps.log.debug(
+      `[lcm] afterTurn transcript reconcile placeholder: skipped 1/${params.messages.length} heartbeat-flagged assistant transcript suffix message for ${params.sessionContext}`,
+    );
+    return {
+      messages: params.messages.slice(0, -1),
+      skipped: 1,
     };
   }
 

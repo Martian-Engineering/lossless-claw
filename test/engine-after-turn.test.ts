@@ -1633,6 +1633,158 @@ describe("LcmContextEngine afterTurn", () => {
     expect(checkpoint?.lastProcessedOffset).toBe(statSync(sessionFile).size);
   });
 
+  it("preserves placeholder durable history before assistant-only control suffixes", async () => {
+    const engine = createEngine();
+    const sessionId = "placeholder-heartbeat-flag-assistant-only-checkpoint";
+    const sessionKey = "agent:main:test:placeholder-heartbeat-flag-assistant-only-checkpoint";
+    const sessionFile = createSessionFilePath("placeholder-heartbeat-flag-assistant-only-checkpoint");
+    const sm = SessionManager.open(sessionFile);
+    appendSessionMessage(sm, makeMessage({ role: "user", content: "durable user" }));
+    appendSessionMessage(sm, makeMessage({ role: "assistant", content: "HEARTBEAT_OK" }));
+
+    await engine.ingest({
+      sessionId,
+      sessionKey,
+      message: makeMessage({
+        role: "user",
+        content: "Conversation info (untrusted metadata): placeholder frontier",
+      }),
+    });
+    const conversation = await engine.getConversationStore().getConversationForSession({
+      sessionId,
+      sessionKey,
+    });
+    expect(conversation).not.toBeNull();
+    await engine.getSummaryStore().upsertConversationBootstrapState({
+      conversationId: conversation!.conversationId,
+      sessionFilePath: sessionFile,
+      lastSeenSize: 0,
+      lastSeenMtimeMs: 0,
+      lastProcessedOffset: 0,
+      lastProcessedEntryHash: null,
+    });
+
+    await engine.afterTurn({
+      sessionId,
+      sessionKey,
+      sessionFile,
+      messages: [makeMessage({ role: "assistant", content: "HEARTBEAT_OK" })],
+      isHeartbeat: true,
+      prePromptMessageCount: 0,
+      tokenBudget: 4096,
+    });
+
+    const stored = await engine.getConversationStore().getMessages(conversation!.conversationId);
+    expect(stored.map((message) => message.content)).toEqual([
+      "Conversation info (untrusted metadata): placeholder frontier",
+      "durable user",
+    ]);
+    const checkpoint = await engine
+      .getSummaryStore()
+      .getConversationBootstrapState(conversation!.conversationId);
+    expect(checkpoint?.lastProcessedOffset).toBe(statSync(sessionFile).size);
+  });
+
+  it("does not drop durable assistant tails during heartbeat placeholder recovery", async () => {
+    const engine = createEngine();
+    const sessionId = "placeholder-heartbeat-preserve-assistant-tail";
+    const sessionKey = "agent:main:test:placeholder-heartbeat-preserve-assistant-tail";
+    const sessionFile = createSessionFilePath("placeholder-heartbeat-preserve-assistant-tail");
+    const sm = SessionManager.open(sessionFile);
+    appendSessionMessage(sm, makeMessage({ role: "user", content: "durable user" }));
+    appendSessionMessage(sm, makeMessage({ role: "assistant", content: "durable assistant" }));
+
+    await engine.ingest({
+      sessionId,
+      sessionKey,
+      message: makeMessage({
+        role: "user",
+        content: "Conversation info (untrusted metadata): placeholder frontier",
+      }),
+    });
+    const conversation = await engine.getConversationStore().getConversationForSession({
+      sessionId,
+      sessionKey,
+    });
+    expect(conversation).not.toBeNull();
+    await engine.getSummaryStore().upsertConversationBootstrapState({
+      conversationId: conversation!.conversationId,
+      sessionFilePath: sessionFile,
+      lastSeenSize: 0,
+      lastSeenMtimeMs: 0,
+      lastProcessedOffset: 0,
+      lastProcessedEntryHash: null,
+    });
+
+    await engine.afterTurn({
+      sessionId,
+      sessionKey,
+      sessionFile,
+      messages: [makeMessage({ role: "assistant", content: "HEARTBEAT_OK" })],
+      isHeartbeat: true,
+      prePromptMessageCount: 0,
+      tokenBudget: 4096,
+    });
+
+    const stored = await engine.getConversationStore().getMessages(conversation!.conversationId);
+    expect(stored.map((message) => message.content)).toEqual([
+      "Conversation info (untrusted metadata): placeholder frontier",
+      "durable user",
+      "durable assistant",
+    ]);
+    const checkpoint = await engine
+      .getSummaryStore()
+      .getConversationBootstrapState(conversation!.conversationId);
+    expect(checkpoint?.lastProcessedOffset).toBe(statSync(sessionFile).size);
+  });
+
+  it("does not advance placeholder checkpoints after filtering control noise from unreconciled durable history", async () => {
+    const engine = createEngine();
+    const sessionId = "placeholder-heartbeat-no-anchor-no-advance";
+    const sessionKey = "agent:main:test:placeholder-heartbeat-no-anchor-no-advance";
+    const sessionFile = createSessionFilePath("placeholder-heartbeat-no-anchor-no-advance");
+    const sm = SessionManager.open(sessionFile);
+    appendSessionMessage(sm, makeMessage({ role: "user", content: OPENCLAW_HEARTBEAT_POLL }));
+    appendSessionMessage(sm, makeMessage({ role: "assistant", content: "HEARTBEAT_OK" }));
+    appendSessionMessage(sm, makeMessage({ role: "user", content: "unanchored durable user" }));
+
+    await engine.ingest({
+      sessionId,
+      sessionKey,
+      message: makeMessage({ role: "user", content: "existing real frontier" }),
+    });
+    const conversation = await engine.getConversationStore().getConversationForSession({
+      sessionId,
+      sessionKey,
+    });
+    expect(conversation).not.toBeNull();
+    await engine.getSummaryStore().upsertConversationBootstrapState({
+      conversationId: conversation!.conversationId,
+      sessionFilePath: sessionFile,
+      lastSeenSize: 0,
+      lastSeenMtimeMs: 0,
+      lastProcessedOffset: 0,
+      lastProcessedEntryHash: null,
+    });
+
+    await engine.afterTurn({
+      sessionId,
+      sessionKey,
+      sessionFile,
+      messages: [makeMessage({ role: "assistant", content: "HEARTBEAT_OK" })],
+      isHeartbeat: true,
+      prePromptMessageCount: 0,
+      tokenBudget: 4096,
+    });
+
+    const stored = await engine.getConversationStore().getMessages(conversation!.conversationId);
+    expect(stored.map((message) => message.content)).toEqual(["existing real frontier"]);
+    const checkpoint = await engine
+      .getSummaryStore()
+      .getConversationBootstrapState(conversation!.conversationId);
+    expect(checkpoint?.lastProcessedOffset).toBe(0);
+  });
+
   it("blocks placeholder-checkpoint recovery when raw ids belong to another active conversation", async () => {
     const warnLog = vi.fn();
     const engine = createEngineWithDeps(
