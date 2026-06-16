@@ -2339,13 +2339,39 @@ export class TranscriptReconciler {
       return { messages: params.messages, skipped: 0 };
     }
 
-    let turnStart = 0;
+    let turnStart = -1;
     for (let index = params.messages.length - 1; index >= 0; index -= 1) {
       const stored = toStoredMessage(params.messages[index]!);
       if (stored.role === "user") {
         turnStart = index;
         break;
       }
+    }
+
+    if (turnStart < 0) {
+      let controlRunStart = params.messages.length;
+      for (let index = params.messages.length - 1; index >= 0; index -= 1) {
+        const stored = toStoredMessage(params.messages[index]!);
+        if (
+          stored.role !== "assistant" ||
+          !isAssistantControlAckContent(stored.content)
+        ) {
+          break;
+        }
+        controlRunStart = index;
+      }
+
+      const skipped = params.messages.length - controlRunStart;
+      if (skipped === 0) {
+        return { messages: params.messages, skipped: 0 };
+      }
+      this.host.deps.log.debug(
+        `[lcm] afterTurn transcript reconcile append-only: skipped ${skipped}/${params.messages.length} heartbeat-flagged assistant transcript suffix messages for ${params.sessionContext}`,
+      );
+      return {
+        messages: params.messages.slice(0, controlRunStart),
+        skipped,
+      };
     }
 
     const skipped = params.messages.length - turnStart;
