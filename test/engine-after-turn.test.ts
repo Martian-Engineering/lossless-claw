@@ -5328,4 +5328,54 @@ describe("LcmContextEngine afterTurn", () => {
       .getConversationBootstrapState(conversation!.conversationId);
     expect(checkpoint?.lastProcessedOffset).toBe(statSync(sessionFile).size);
   });
+
+  it("afterTurn full-read heartbeat reconcile skips assistant-only control suffixes", async () => {
+    const engine = createEngine();
+    const sessionId = "after-turn-heartbeat-full-read-assistant-control";
+    const sessionKey = "agent:main:test:after-turn-heartbeat-full-read-assistant-control";
+    const sessionFile = createSessionFilePath("after-turn-heartbeat-full-read-assistant-control");
+    const sm = SessionManager.open(sessionFile);
+    appendSessionMessage(sm, makeMessage({ role: "user", content: "seed user" }));
+    appendSessionMessage(sm, makeMessage({ role: "assistant", content: "seed assistant" }));
+
+    const first = await engine.bootstrap({ sessionId, sessionKey, sessionFile });
+    expect(first.bootstrapped).toBe(true);
+
+    appendSessionMessage(sm, makeMessage({ role: "assistant", content: "HEARTBEAT_OK" }));
+
+    const conversation = await engine.getConversationStore().getConversationForSession({
+      sessionId,
+      sessionKey,
+    });
+    expect(conversation).not.toBeNull();
+    const config = getEngineConfig(engine);
+    const db = createLcmDatabaseConnection(config.databasePath);
+    try {
+      db.prepare(`DELETE FROM conversation_bootstrap_state WHERE conversation_id = ?`).run(
+        conversation!.conversationId,
+      );
+    } finally {
+      closeLcmConnection(db);
+    }
+
+    await engine.afterTurn({
+      sessionId,
+      sessionKey,
+      sessionFile,
+      messages: [makeMessage({ role: "assistant", content: "HEARTBEAT_OK" })],
+      isHeartbeat: true,
+      prePromptMessageCount: 0,
+      tokenBudget: 4096,
+    });
+
+    const stored = await engine.getConversationStore().getMessages(conversation!.conversationId);
+    expect(stored.map((message) => message.content)).toEqual([
+      "seed user",
+      "seed assistant",
+    ]);
+    const checkpoint = await engine
+      .getSummaryStore()
+      .getConversationBootstrapState(conversation!.conversationId);
+    expect(checkpoint?.lastProcessedOffset).toBe(statSync(sessionFile).size);
+  });
 });

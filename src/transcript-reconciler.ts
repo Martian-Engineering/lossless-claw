@@ -1895,6 +1895,7 @@ export class TranscriptReconciler {
     sessionKey?: string;
     sessionFile: string;
     allowNoAnchorImportOnCheckpointMissing?: boolean;
+    isHeartbeat?: boolean;
     queueKey: string;
     conversation: ConversationRecord;
     checkpoint: Awaited<ReturnType<SummaryStore["getConversationBootstrapState"]>>;
@@ -2153,11 +2154,36 @@ export class TranscriptReconciler {
         `[lcm] afterTurn: transcript session header changed (${checkpoint?.sessionHeaderId} -> ${transcriptHeader.sessionHeaderId}); treating as declared epoch rollover conversation=${conversation.conversationId} reason=${reason} sessionFile=${params.sessionFile}`,
       );
     }
+    const fullReadSessionContext = this.host.formatSessionLogContext({
+      conversationId: conversation.conversationId,
+      sessionId: params.sessionId,
+      sessionKey: params.sessionKey,
+    });
+    const heartbeatFlagFiltered = this.filterHeartbeatFlaggedPlaceholderSuffix({
+      messages: historicalMessages,
+      isHeartbeat: params.isHeartbeat,
+      sessionContext: fullReadSessionContext,
+    });
+    if (heartbeatFlagFiltered.messages.length === 0 && heartbeatFlagFiltered.skipped > 0) {
+      await this.refreshBootstrapState({
+        conversationId: conversation.conversationId,
+        sessionFile: params.sessionFile,
+      });
+      rememberSlowReadState();
+      return {
+        importedMessages: 0,
+        blockedByImportCap: false,
+        hasOverlap: true,
+        transcriptCovered: true,
+        runtimeBatchDisposition: "skip-non-durable-control",
+        nonDurableTranscriptMessages: heartbeatFlagFiltered.skipped,
+      };
+    }
     const reconcile = await this.reconcileSessionTail({
       sessionId: params.sessionId,
       sessionKey: params.sessionKey,
       conversationId: conversation.conversationId,
-      historicalMessages,
+      historicalMessages: heartbeatFlagFiltered.messages,
       lastProcessedEntryId: declaredEpochRollover
         ? null
         : checkpoint?.lastProcessedEntryId ?? null,
@@ -2218,6 +2244,13 @@ export class TranscriptReconciler {
     );
     return {
       ...reconcile,
+      ...(heartbeatFlagFiltered.skipped > 0
+        ? {
+            runtimeBatchDisposition: "skip-non-durable-control" as const,
+            nonDurableTranscriptMessages:
+              (reconcile.nonDurableTranscriptMessages ?? 0) + heartbeatFlagFiltered.skipped,
+          }
+        : {}),
       importedMessages: reconcile.importedMessages,
       blockedByImportCap: false,
       hasOverlap: reconcile.hasOverlap,
@@ -2301,6 +2334,7 @@ export class TranscriptReconciler {
       sessionId: params.sessionId,
       sessionKey: params.sessionKey,
       sessionFile: params.sessionFile,
+      isHeartbeat: params.isHeartbeat,
       allowNoAnchorImportOnCheckpointMissing: params.allowNoAnchorImportOnCheckpointMissing,
       queueKey,
       conversation,
