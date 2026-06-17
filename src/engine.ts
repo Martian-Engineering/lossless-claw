@@ -1795,9 +1795,9 @@ export class LcmContextEngine implements ContextEngine {
               });
             if (!hasFrontierAnchor) {
               // Tier-2 resolution: a provably fresh new transcript means
-              // this is a legitimate reset; archive the old conversation
-              // and fall through so getOrCreateConversation below binds the
-              // new session and the initial import ingests its transcript.
+              // this is a legitimate reset. Rebind the existing conversation
+              // and import the new transcript immediately while the freshness
+              // proof is still in hand.
               const rotatedForFreshTranscript =
                 await this.sessionRolloverDetector.rotateAmbiguousRolloverForProvablyFreshTranscript({
                   phase: "bootstrap",
@@ -1819,6 +1819,35 @@ export class LcmContextEngine implements ContextEngine {
                   reason: AMBIGUOUS_SESSION_KEY_RUNTIME_ROLLOVER_REASON,
                 };
               }
+              const reconcile =
+                await this.transcriptReconciler.importFreshAmbiguousRolloverTranscript({
+                  sessionId: params.sessionId,
+                  sessionKey: params.sessionKey,
+                  sessionFile: params.sessionFile,
+                  conversationId: ambiguousRollover.conversationId,
+                  historicalMessages: preloadedHistoricalMessages,
+                });
+              if (reconcile.blockedByImportCap) {
+                return {
+                  bootstrapped: false,
+                  importedMessages: reconcile.importedMessages,
+                  reason: "reconcile import capped",
+                };
+              }
+              if (reconcile.importedMessages > 0) {
+                return {
+                  bootstrapped: true,
+                  importedMessages: reconcile.importedMessages,
+                  reason: "reconciled missing session messages",
+                };
+              }
+              return {
+                bootstrapped: false,
+                importedMessages: 0,
+                reason: reconcile.hasOverlap
+                  ? "conversation already up to date"
+                  : "conversation already has messages",
+              };
             }
           }
 
@@ -2820,9 +2849,8 @@ export class LcmContextEngine implements ContextEngine {
       (!transcriptReconcileResult.hasOverlap && transcriptReconcileResult.importedMessages === 0);
     const transcriptReconcileBlockedByAmbiguousRollover =
       transcriptReconcileResult.blockedReason === "ambiguous-session-key-runtime-rollover" ||
-      // Rotated-fresh skips this turn the same way: the replacement
-      // conversation is empty, so telemetry/compaction work below would run
-      // against it for nothing; the next turn binds and reconciles normally.
+      // Fresh-rebind should import immediately; if it cannot, skip this turn
+      // rather than advancing past an unreconciled transcript frontier.
       transcriptReconcileResult.blockedReason === "ambiguous-rollover-rotated-fresh-transcript";
     let dedupedNewMessages: AgentMessage[] = [];
     if (transcriptReconcileUnsafeToAdvance) {

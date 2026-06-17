@@ -537,10 +537,15 @@ export class TranscriptReconciler {
     lastProcessedEntryId?: string | null;
     skipContentAnchorScan?: boolean;
     allowNoAnchorImport?: boolean;
-    // Lift the no-anchor import cap because the persisted frontier was proven to
-    // hold no real conversation content (#822). Bounded by the transcript length,
-    // never unbounded — set ONLY together with a proven non-anchoring frontier.
+    // Lift the no-anchor import cap because the caller proved a full new-epoch
+    // import is safe. Bounded by the transcript length, never unbounded.
     allowFullNonAnchoringFrontierImport?: boolean;
+    // Fresh rollover proof establishes timestamped non-overlap already; generic
+    // replay-prefix dropping would discard valid repeated template turns.
+    skipNoAnchorReplayGuard?: boolean;
+    // Fresh rollover entry ids are new epoch rows, not restamped identities from
+    // the preserved pre-rebind history.
+    skipNoAnchorEntryIdAdoption?: boolean;
     noAnchorImportReason?: string;
   }): Promise<TranscriptReconcileResult> {
     const { sessionId, conversationId, historicalMessages } = params;
@@ -685,6 +690,8 @@ export class TranscriptReconciler {
             historicalMessages,
             noAnchorImportReason: params.noAnchorImportReason,
             allowFullNonAnchoringFrontierImport: params.allowFullNonAnchoringFrontierImport,
+            skipNoAnchorReplayGuard: params.skipNoAnchorReplayGuard,
+            skipNoAnchorEntryIdAdoption: params.skipNoAnchorEntryIdAdoption,
             existingDbCount,
             sessionContext,
             startedAt,
@@ -759,6 +766,75 @@ export class TranscriptReconciler {
   }
 
   /**
+   * Import a transcript after the ambiguous-rollover freshness proof has already
+   * shown it is a new runtime epoch for the same session key. That proof replaces
+   * content anchoring here: recurring template text from the old lane must not
+   * make us skip the beginning of the fresh transcript.
+   */
+  async importFreshAmbiguousRolloverTranscript(params: {
+    sessionId: string;
+    sessionKey?: string;
+    sessionFile: string;
+    conversationId: number;
+    historicalMessages: AgentMessage[];
+  }): Promise<TranscriptReconcileResult> {
+    const existingCount = await this.host.conversationStore.getMessageCount(params.conversationId);
+    if (existingCount === 0) {
+      let importedMessages = 0;
+      for (const message of params.historicalMessages) {
+        const result = await this.host.ingestSingle({
+          sessionId: params.sessionId,
+          sessionKey: params.sessionKey,
+          message,
+          createdAt: resolveTranscriptMessageCreatedAt(message),
+          skipReplayTimestampFloodGuard: true,
+        });
+        if (result.ingested) {
+          importedMessages += 1;
+        }
+      }
+      await this.host.conversationStore.markConversationBootstrapped(params.conversationId);
+      await this.recordImportAndRefreshCheckpoint({
+        conversationId: params.conversationId,
+        sessionFile: params.sessionFile,
+        importedMessages,
+      });
+      return {
+        importedMessages,
+        blockedByImportCap: false,
+        hasOverlap: true,
+        transcriptCovered: importedMessages > 0,
+      };
+    }
+
+    const reconcile = await this.reconcileSessionTail({
+      sessionId: params.sessionId,
+      sessionKey: params.sessionKey,
+      conversationId: params.conversationId,
+      historicalMessages: params.historicalMessages,
+      skipContentAnchorScan: true,
+      allowNoAnchorImport: true,
+      allowFullNonAnchoringFrontierImport: true,
+      skipNoAnchorReplayGuard: true,
+      skipNoAnchorEntryIdAdoption: true,
+      noAnchorImportReason: "fresh-ambiguous-rollover-rebind",
+    });
+    if (!reconcile.blockedByImportCap && reconcile.importedMessages > 0) {
+      await this.host.conversationStore.markConversationBootstrapped(params.conversationId);
+      await this.recordImportAndRefreshCheckpoint({
+        conversationId: params.conversationId,
+        sessionFile: params.sessionFile,
+        importedMessages: reconcile.importedMessages,
+      });
+      return { ...reconcile, transcriptCovered: true };
+    }
+    return {
+      ...reconcile,
+      transcriptCovered: reconcile.hasOverlap || reconcile.importedMessages > 0,
+    };
+  }
+
+  /**
    * No-anchor recovery: the transcript shares no anchor with persisted
    * history, but the caller has lineage evidence (path mismatch, declared
    * epoch rollover, same-path shrink, checkpoint recovery) that this file is
@@ -775,6 +851,8 @@ export class TranscriptReconciler {
     historicalMessages: AgentMessage[];
     noAnchorImportReason?: string;
     allowFullNonAnchoringFrontierImport?: boolean;
+    skipNoAnchorReplayGuard?: boolean;
+    skipNoAnchorEntryIdAdoption?: boolean;
     existingDbCount: number;
     sessionContext: string;
     startedAt: number;
@@ -818,7 +896,11 @@ export class TranscriptReconciler {
       noAnchorImportMessages.length > 0 &&
       noAnchorImportMessages.every((message) => getTranscriptEntryId(message) !== null);
     const replayThreshold = Math.max(3, Math.ceil(historicalMessages.length * 0.5));
-    if (!allEntryIdBearing && persistedIdentityOverlaps >= replayThreshold) {
+    if (
+      !params.skipNoAnchorReplayGuard &&
+      !allEntryIdBearing &&
+      persistedIdentityOverlaps >= replayThreshold
+    ) {
       if (replayAnalysis.firstNonOverlappingIndex < 0) {
         this.host.deps.log.warn(
           `[lcm] reconcileSessionTail: duplicate transcript replay blocked for ${sessionContext} - ${persistedIdentityOverlaps}/${historicalMessages.length} candidate messages already exist (reason: ${params.noAnchorImportReason ?? "unspecified"}). Aborting to prevent replay flood.`,
@@ -927,24 +1009,26 @@ export class TranscriptReconciler {
         if (alreadyPersisted) {
           continue;
         }
-        const stored = toStoredMessage(message);
-        const adopted =
-          (await this.host.conversationStore.adoptTranscriptEntryId(
-            conversationId,
-            stored.role,
-            stored.content,
-            entryId,
-          )) ||
-          (await this.adoptStaleTranscriptEntryId({
-            conversationId,
-            leafEntryIds: noAnchorLeafEntryIds,
-            role: stored.role,
-            content: stored.content,
-            entryId,
-          }));
-        if (adopted) {
-          adoptedMessages += 1;
-          continue;
+        if (!params.skipNoAnchorEntryIdAdoption) {
+          const stored = toStoredMessage(message);
+          const adopted =
+            (await this.host.conversationStore.adoptTranscriptEntryId(
+              conversationId,
+              stored.role,
+              stored.content,
+              entryId,
+            )) ||
+            (await this.adoptStaleTranscriptEntryId({
+              conversationId,
+              leafEntryIds: noAnchorLeafEntryIds,
+              role: stored.role,
+              content: stored.content,
+              entryId,
+            }));
+          if (adopted) {
+            adoptedMessages += 1;
+            continue;
+          }
         }
       }
       const result = await this.host.ingestSingle({
@@ -1891,10 +1975,9 @@ export class TranscriptReconciler {
             checkpointEntryHash: activeBootstrapState?.lastProcessedEntryHash,
           });
         if (!hasFrontierAnchor) {
-          // Tier-2 resolution: archive the frozen conversation and
-          // create the replacement now. This turn's persistence is
-          // skipped (unsafe-to-advance), and the next turn reconciles
-          // the full transcript into the fresh conversation.
+          // Tier-2 resolution: rebind the frozen conversation and import the
+          // fresh transcript now. The freshness proof is the extra safety signal
+          // that lets the no-anchor path ingest the full id-less transcript.
           const rotatedForFreshTranscript =
             await this.rolloverDetector.rotateAmbiguousRolloverForProvablyFreshTranscript({
               phase: "afterTurn",
@@ -1904,12 +1987,19 @@ export class TranscriptReconciler {
               createReplacement: true,
             });
           if (rotatedForFreshTranscript) {
-            return {
-              importedMessages: 0,
-              blockedByImportCap: false,
-              blockedReason: "ambiguous-rollover-rotated-fresh-transcript",
-              hasOverlap: false,
-            };
+            const reconcile = await this.importFreshAmbiguousRolloverTranscript({
+              sessionId: params.sessionId,
+              sessionKey: params.sessionKey,
+              sessionFile: params.sessionFile,
+              conversationId: ambiguousRollover.conversationId,
+              historicalMessages,
+            });
+            return reconcile.blockedByImportCap
+              ? {
+                  ...reconcile,
+                  blockedReason: "ambiguous-rollover-rotated-fresh-transcript",
+                }
+              : reconcile;
           }
           this.rolloverDetector.logAmbiguousSessionKeyRuntimeRollover({
             phase: "afterTurn",
