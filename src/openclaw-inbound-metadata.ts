@@ -1,5 +1,5 @@
 const OPENCLAW_INBOUND_METADATA_BLOCK_RE =
-  /^(Conversation info \(untrusted metadata\)|Sender \(untrusted metadata\)):\r?\n```json\r?\n([\s\S]*?)\r?\n```\s*/;
+  /^(Conversation info \(untrusted metadata\)|Sender \(untrusted metadata\)):\r?\n```json\r?\n([\s\S]*?)\r?\n```/;
 
 const CONVERSATION_INFO_KEYS = new Set([
   "chat_id",
@@ -30,6 +30,12 @@ const CONVERSATION_INFO_KEYS = new Set([
   "history_truncated",
 ]);
 
+const VOLATILE_CONVERSATION_INFO_KEYS = new Set([
+  "message_id",
+  "reply_to_id",
+  "timestamp",
+]);
+
 const SENDER_INFO_KEYS = new Set([
   "label",
   "id",
@@ -39,6 +45,9 @@ const SENDER_INFO_KEYS = new Set([
   "e164",
 ]);
 
+/**
+ * Canonicalizes OpenClaw's injected inbound metadata preamble for user-message identity input.
+ */
 export function canonicalizeOpenClawInboundMetadataIdentityContent(
   role: string,
   content: string,
@@ -47,42 +56,109 @@ export function canonicalizeOpenClawInboundMetadataIdentityContent(
     return content;
   }
 
-  let remaining = content;
-  let strippedBlock = false;
-  for (;;) {
-    const candidate = remaining.trimStart();
-    const match = OPENCLAW_INBOUND_METADATA_BLOCK_RE.exec(candidate);
-    if (!match) {
-      break;
-    }
-    if (!isOpenClawInboundMetadataRecord(match[1] ?? "", match[2] ?? "")) {
-      return content;
-    }
-    remaining = candidate.slice(match[0].length);
-    strippedBlock = true;
+  const conversationCandidate = content.trimStart();
+  const conversationMatch = OPENCLAW_INBOUND_METADATA_BLOCK_RE.exec(conversationCandidate);
+  const conversationHeading = conversationMatch?.[1] ?? "";
+  const conversationRecord = conversationMatch
+    ? parseOpenClawInboundMetadataRecord(conversationHeading, conversationMatch[2] ?? "")
+    : null;
+  const canonicalConversationJson = conversationRecord
+    ? canonicalizeMetadataJson(conversationRecord, VOLATILE_CONVERSATION_INFO_KEYS)
+    : null;
+  if (
+    !conversationMatch ||
+    conversationHeading !== "Conversation info (untrusted metadata)" ||
+    !canonicalConversationJson
+  ) {
+    return content;
   }
 
-  return strippedBlock && remaining.trim().length > 0 ? remaining : content;
+  let remaining = conversationCandidate.slice(conversationMatch[0].length);
+  const canonicalBlocks = [
+    formatCanonicalMetadataBlock(conversationHeading, canonicalConversationJson),
+  ];
+  const senderCandidate = remaining.trimStart();
+  const senderMatch = OPENCLAW_INBOUND_METADATA_BLOCK_RE.exec(senderCandidate);
+  const senderHeading = senderMatch?.[1] ?? "";
+  const senderRecord = senderMatch
+    ? parseOpenClawInboundMetadataRecord(senderHeading, senderMatch[2] ?? "")
+    : null;
+  const canonicalSenderJson = senderRecord
+    ? canonicalizeMetadataJson(senderRecord, new Set())
+    : null;
+  if (
+    senderMatch &&
+    senderHeading === "Sender (untrusted metadata)" &&
+    canonicalSenderJson
+  ) {
+    remaining = stripMetadataSeparator(senderCandidate.slice(senderMatch[0].length));
+    canonicalBlocks.push(formatCanonicalMetadataBlock(senderHeading, canonicalSenderJson));
+  } else {
+    remaining = stripMetadataSeparator(remaining);
+  }
+
+  return remaining.trim().length > 0 ? `${canonicalBlocks.join("\n\n")}\n\n${remaining}` : content;
 }
 
-function isOpenClawInboundMetadataRecord(heading: string, json: string): boolean {
+function parseOpenClawInboundMetadataRecord(
+  heading: string,
+  json: string,
+): Record<string, unknown> | null {
   let parsed: unknown;
   try {
     parsed = JSON.parse(json);
   } catch {
-    return false;
+    return null;
   }
 
   if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
-    return false;
+    return null;
   }
 
   const knownKeys = getKnownKeysForHeading(heading);
   if (!knownKeys) {
-    return false;
+    return null;
   }
 
-  return Object.keys(parsed).some((key) => knownKeys.has(key));
+  return Object.keys(parsed).some((key) => knownKeys.has(key))
+    ? (parsed as Record<string, unknown>)
+    : null;
+}
+
+function canonicalizeMetadataJson(
+  record: Record<string, unknown>,
+  volatileKeys: Set<string>,
+): string | null {
+  const stableEntries = Object.entries(record)
+    .filter(([key]) => !volatileKeys.has(key))
+    .map(([key, value]) => [key, canonicalizeJsonValue(value)] as const)
+    .sort(([left], [right]) => left.localeCompare(right));
+  if (stableEntries.length === 0) {
+    return null;
+  }
+  return JSON.stringify(Object.fromEntries(stableEntries));
+}
+
+function canonicalizeJsonValue(value: unknown): unknown {
+  if (Array.isArray(value)) {
+    return value.map((item) => canonicalizeJsonValue(item));
+  }
+  if (!value || typeof value !== "object") {
+    return value;
+  }
+  return Object.fromEntries(
+    Object.entries(value as Record<string, unknown>)
+      .map(([key, nestedValue]) => [key, canonicalizeJsonValue(nestedValue)] as const)
+      .sort(([left], [right]) => left.localeCompare(right)),
+  );
+}
+
+function formatCanonicalMetadataBlock(heading: string, json: string): string {
+  return [heading + ":", "```json", json, "```"].join("\n");
+}
+
+function stripMetadataSeparator(content: string): string {
+  return content.replace(/^[ \t]*(?:\r?\n)(?:[ \t]*(?:\r?\n))?/, "");
 }
 
 function getKnownKeysForHeading(heading: string): Set<string> | undefined {

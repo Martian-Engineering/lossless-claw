@@ -1,5 +1,7 @@
 import type { DatabaseSync } from "node:sqlite";
+import { createHash } from "node:crypto";
 import { getLcmDbFeatures } from "./features.js";
+import { canonicalizeOpenClawInboundMetadataIdentityContent } from "../openclaw-inbound-metadata.js";
 import { buildMessageIdentityHash } from "../store/message-identity.js";
 import { parseUtcTimestampOrNull } from "../store/parse-utc-timestamp.js";
 
@@ -42,6 +44,14 @@ type MessageIdentityBackfillRow = {
   content: string;
 };
 
+type OpenClawMetadataIdentityRepairRow = {
+  message_id: number;
+  conversation_id: number;
+  role: string;
+  content: string;
+  identity_hash: string | null;
+};
+
 type FtsTableSpec = {
   tableName: string;
   createSql: string;
@@ -54,6 +64,7 @@ const VERSIONED_BACKFILL_STEPS = {
   backfillSummaryDepths: 1,
   backfillSummaryMetadata: 1,
   backfillToolCallColumns: 1,
+  repairOpenClawMetadataIdentityState: 1,
 } as const;
 
 type VersionedBackfillStepName = keyof typeof VERSIONED_BACKFILL_STEPS;
@@ -445,6 +456,79 @@ function backfillMessageIdentityHashes(
       }
       throw error;
     }
+    lastProcessedMessageId = rows[rows.length - 1]?.message_id ?? lastProcessedMessageId;
+  }
+}
+
+function buildLegacyRawMessageIdentityHash(role: string, content: string): string {
+  return createHash("sha256")
+    .update(role)
+    .update("\u0000")
+    .update(content)
+    .digest("hex");
+}
+
+function buildBootstrapEntryHash(role: string, content: string): string {
+  return createHash("sha256")
+    .update(JSON.stringify({ role, content }))
+    .digest("hex");
+}
+
+function buildCanonicalBootstrapEntryHash(role: string, content: string): string {
+  return buildBootstrapEntryHash(
+    role,
+    canonicalizeOpenClawInboundMetadataIdentityContent(role, content),
+  );
+}
+
+function repairOpenClawMetadataIdentityState(db: DatabaseSync): void {
+  const selectStmt = db.prepare(
+    `SELECT message_id, conversation_id, role, content, identity_hash
+     FROM messages
+     WHERE message_id > ? AND role = 'user'
+     ORDER BY message_id
+     LIMIT ?`,
+  );
+  const updateIdentityStmt = db.prepare(
+    `UPDATE messages SET identity_hash = ? WHERE message_id = ?`,
+  );
+  const updateCheckpointStmt = db.prepare(
+    `UPDATE conversation_bootstrap_state
+     SET last_processed_entry_hash = ?
+     WHERE conversation_id = ? AND last_processed_entry_hash = ?`,
+  );
+  let lastProcessedMessageId = 0;
+
+  while (true) {
+    const rows = selectStmt.all(
+      lastProcessedMessageId,
+      1_000,
+    ) as OpenClawMetadataIdentityRepairRow[];
+    if (rows.length === 0) {
+      return;
+    }
+
+    for (const row of rows) {
+      const canonicalContent = canonicalizeOpenClawInboundMetadataIdentityContent(
+        row.role,
+        row.content,
+      );
+      if (canonicalContent === row.content) {
+        continue;
+      }
+
+      const legacyMessageHash = buildLegacyRawMessageIdentityHash(row.role, row.content);
+      if (row.identity_hash === legacyMessageHash) {
+        updateIdentityStmt.run(buildMessageIdentityHash(row.role, row.content), row.message_id);
+      }
+
+      updateCheckpointStmt.run(
+        buildCanonicalBootstrapEntryHash(row.role, row.content),
+        row.conversation_id,
+        buildBootstrapEntryHash(row.role, row.content),
+      );
+    }
+
     lastProcessedMessageId = rows[rows.length - 1]?.message_id ?? lastProcessedMessageId;
   }
 }
@@ -1274,6 +1358,9 @@ export function runLcmMigrations(
     runMigrationStep("ensureMessagePartsTable", log, () => ensureMessagePartsTable(db));
     runMigrationStep("backfillMessageIdentityHashes", log, () =>
       backfillMessageIdentityHashes(db, { managesOwnTransaction: false }),
+    );
+    runVersionedBackfillStep(db, "repairOpenClawMetadataIdentityState", log, () =>
+      repairOpenClawMetadataIdentityState(db),
     );
     runMigrationStep("createMessagesIdentityHashIndex", log, () =>
       db.exec(
