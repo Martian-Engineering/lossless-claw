@@ -2316,10 +2316,57 @@ describe("lcm command", () => {
 
     expect(result.text).toContain("🩺 Lossless Claw Doctor Apply");
     expect(result.text).toContain("scope: this conversation only");
-    expect(result.text).toContain("detected summaries: 0");
+    expect(result.text).toContain("repair targets: 0");
     expect(result.text).toContain("repaired summaries: 0");
     expect(result.text).toContain("result: clean; no writes ran");
     expect(summarize).not.toHaveBeenCalled();
+  });
+
+  it("does not block doctor apply solely because the conversation has many unrelated messages", async () => {
+    const summarize = vi.fn(async () => "small scoped repair");
+    const fixture = createCommandFixture({ summarize: summarize as LcmSummarizeFn });
+    tempDirs.add(fixture.tempDir);
+    dbPaths.add(fixture.dbPath);
+
+    const currentConversation = await fixture.conversationStore.createConversation({
+      sessionId: "doctor-apply-large-message-count",
+      sessionKey: "agent:main:telegram:direct:doctor-apply-large-message-count",
+    });
+    const messages = await fixture.conversationStore.createMessagesBulk(
+      Array.from({ length: 1_001 }, (_, index) => ({
+        conversationId: currentConversation.conversationId,
+        seq: index,
+        role: index % 2 === 0 ? "user" : "assistant",
+        content: `unrelated message ${index}`,
+        tokenCount: 1,
+      })),
+    );
+    await fixture.summaryStore.insertSummary({
+      summaryId: "sum_large_message_count",
+      conversationId: currentConversation.conversationId,
+      kind: "leaf",
+      depth: 0,
+      content: `broken leaf\n${"[Truncated from 512 tokens]"}`,
+      tokenCount: 11,
+      sourceMessageTokenCount: 1,
+    });
+    await fixture.summaryStore.linkSummaryToMessages("sum_large_message_count", [
+      messages[0].messageId,
+    ]);
+
+    const result = await fixture.command.handler(
+      createCommandContext("doctor apply", {
+        sessionKey: "agent:main:telegram:direct:doctor-apply-large-message-count",
+      }),
+    );
+
+    const repaired = await fixture.summaryStore.getSummary("sum_large_message_count");
+    expect(result.text).toContain("repair targets: 1");
+    expect(result.text).toContain("repaired summaries: 1");
+    expect(result.text).not.toContain("Safety preflight");
+    expect(result.text).not.toContain("message count");
+    expect(summarize).toHaveBeenCalledTimes(1);
+    expect(repaired?.content).toBe("small scoped repair");
   });
 
   it("blocks doctor apply for large scoped repairs before summarizer or writes run", async () => {
@@ -2355,7 +2402,9 @@ describe("lcm command", () => {
     expect(result.text).toContain("**🧯 Safety preflight**");
     expect(result.text).toContain("status: blocked");
     expect(result.text).toContain("mode: read-only; no summary rewrites ran");
-    expect(result.text).toContain("detected summaries: 26");
+    expect(result.text).toContain("repair targets: 26");
+    expect(result.text).toContain("repair input tokens: 0");
+    expect(result.text).toContain("repair target source tokens: 0");
     expect(result.text).toContain("doctor target count 26 exceeds safe inline limit 25");
     expect(result.text).toContain("`/lossless doctor apply confirm-offline`");
     expect(summarize).not.toHaveBeenCalled();
@@ -2422,10 +2471,98 @@ describe("lcm command", () => {
 
     const unchanged = await fixture.summaryStore.getSummary("sum_pending_maintenance");
     expect(result.text).toContain("status: blocked");
+    expect(result.text).toContain("repair targets: 1");
+    expect(result.text).toContain("repair input tokens: 7");
+    expect(result.text).toContain("repair target source tokens: 7");
     expect(result.text).toContain("compaction maintenance is pending (budget-trigger)");
-    expect(result.text).toContain("observed token count 96,001 exceeds 75% of repair budget 128,000");
+    expect(result.text).not.toContain("observed token count");
+    expect(result.text).not.toContain("message count");
     expect(summarize).not.toHaveBeenCalled();
     expect(unchanged?.content).toContain("[Truncated from 512 tokens]");
+  });
+
+  it("reports condensed doctor repair input separately from target source coverage", async () => {
+    const summarize = vi.fn(async () => "should not run");
+    const fixture = createCommandFixture({ summarize: summarize as LcmSummarizeFn });
+    tempDirs.add(fixture.tempDir);
+    dbPaths.add(fixture.dbPath);
+
+    const currentConversation = await fixture.conversationStore.createConversation({
+      sessionId: "doctor-apply-condensed-metrics",
+      sessionKey: "agent:main:telegram:direct:doctor-apply-condensed-metrics",
+    });
+    const messages = await fixture.conversationStore.createMessagesBulk([
+      {
+        conversationId: currentConversation.conversationId,
+        seq: 0,
+        role: "user",
+        content: "first condensed source",
+        tokenCount: 100,
+      },
+      {
+        conversationId: currentConversation.conversationId,
+        seq: 1,
+        role: "assistant",
+        content: "second condensed source",
+        tokenCount: 200,
+      },
+    ]);
+    await fixture.summaryStore.insertSummary({
+      summaryId: "sum_condensed_metrics_child",
+      conversationId: currentConversation.conversationId,
+      kind: "leaf",
+      depth: 0,
+      content: "healthy child summary",
+      tokenCount: 12,
+      sourceMessageTokenCount: 300,
+    });
+    await fixture.summaryStore.linkSummaryToMessages("sum_condensed_metrics_child", [
+      messages[0].messageId,
+      messages[1].messageId,
+    ]);
+    await fixture.summaryStore.insertSummary({
+      summaryId: "sum_condensed_metrics_parent",
+      conversationId: currentConversation.conversationId,
+      kind: "condensed",
+      depth: 1,
+      content: FALLBACK_DIRECTIVE_SUMMARY_MARKER,
+      tokenCount: 8,
+      sourceMessageTokenCount: 300,
+      descendantTokenCount: 12,
+    });
+    await fixture.summaryStore.linkSummaryToParents("sum_condensed_metrics_parent", [
+      "sum_condensed_metrics_child",
+    ]);
+    fixture.db
+      .prepare(
+        `INSERT INTO conversation_compaction_maintenance (
+           conversation_id,
+           pending,
+           requested_at,
+           reason,
+           running,
+           updated_at
+         ) VALUES (?, 1, ?, ?, 0, datetime('now'))`,
+      )
+      .run(
+        currentConversation.conversationId,
+        "2026-04-12T00:00:00.000Z",
+        "budget-trigger",
+      );
+
+    const result = await fixture.command.handler(
+      createCommandContext("doctor apply", {
+        sessionKey: "agent:main:telegram:direct:doctor-apply-condensed-metrics",
+      }),
+    );
+
+    expect(result.text).toContain("status: blocked");
+    expect(result.text).toContain("repair targets: 1");
+    expect(result.text).toContain("repair input tokens: 12");
+    expect(result.text).toContain("repair target source tokens: 300");
+    expect(result.text).toContain("compaction maintenance is pending (budget-trigger)");
+    expect(result.text).not.toContain("observed token count");
+    expect(summarize).not.toHaveBeenCalled();
   });
 
   it("blocks doctor apply when a broken leaf summary points at oversized raw source tokens", async () => {
@@ -2466,8 +2603,11 @@ describe("lcm command", () => {
 
     const unchanged = await fixture.summaryStore.getSummary("sum_raw_source_tokens");
     expect(result.text).toContain("status: blocked");
-    expect(result.text).toContain("detected summaries: 1");
-    expect(result.text).toContain("observed token count 120,000 exceeds 75% of repair budget 128,000");
+    expect(result.text).toContain("repair targets: 1");
+    expect(result.text).toContain("repair input tokens: 120,000");
+    expect(result.text).toContain("repair target source tokens: 120,000");
+    expect(result.text).toContain("repair input token count 120,000 exceeds 75% of repair budget 128,000");
+    expect(result.text).not.toContain("observed token count");
     expect(summarize).not.toHaveBeenCalled();
     expect(unchanged?.content).toContain("[Truncated from 512 tokens]");
   });
@@ -2621,7 +2761,7 @@ describe("lcm command", () => {
     const repairedEmergency = await fixture.summaryStore.getSummary("sum_emergency_fix");
     const repairedParent = await fixture.summaryStore.getSummary("sum_parent_fix");
 
-    expect(result.text).toContain("detected summaries: 3");
+    expect(result.text).toContain("repair targets: 3");
     expect(result.text).toContain("emergency-fallback summaries: 1");
     expect(result.text).toContain("repaired summaries: 3");
     expect(result.text).toContain("result: repaired 3 summary(s) in place");

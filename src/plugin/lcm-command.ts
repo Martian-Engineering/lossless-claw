@@ -42,7 +42,6 @@ import { FocusBriefStore, hashFocusSourceContext } from "../store/focus-brief-st
 const VISIBLE_COMMAND = "/lossless";
 const HIDDEN_ALIAS = "/lcm";
 const ROTATE_DATABASE_LOCK_TIMEOUT_MS = 30_000;
-const DOCTOR_APPLY_LARGE_MESSAGE_THRESHOLD = 1_000;
 const DOCTOR_APPLY_LARGE_TARGET_THRESHOLD = 25;
 const DOCTOR_APPLY_BUDGET_PRESSURE_RATIO = 0.75;
 
@@ -81,6 +80,10 @@ type CurrentConversationResolution =
     };
 type DoctorApplyOptions = {
   confirmOffline: boolean;
+};
+type DoctorApplyRepairMetrics = {
+  repairInputTokenCount: number;
+  repairTargetSourceTokenCount: number;
 };
 type RolloverSplitApplyOptions = {
   confirm: boolean;
@@ -646,39 +649,98 @@ function resolveStatusAssemblyTokenBudget(
   );
 }
 
+function buildTargetSummaryValuesSql(summaryIds: string[]): string {
+  return summaryIds.map(() => "(?)").join(", ");
+}
+
+function loadDoctorApplyRepairMetrics(
+  db: DatabaseSync,
+  doctor: DoctorSummaryStats,
+): DoctorApplyRepairMetrics {
+  const summaryIds = [...new Set(doctor.candidates.map((candidate) => candidate.summaryId))];
+  if (summaryIds.length === 0) {
+    return {
+      repairInputTokenCount: 0,
+      repairTargetSourceTokenCount: 0,
+    };
+  }
+
+  const targetValuesSql = buildTargetSummaryValuesSql(summaryIds);
+
+  // Repair input mirrors lcm-doctor-apply: leaf targets read linked messages,
+  // while condensed targets read their immediate child summaries.
+  const repairInputRow = db
+    .prepare(
+      `WITH target_summaries(summary_id) AS (VALUES ${targetValuesSql})
+       SELECT COALESCE(SUM(input_tokens), 0) AS token_count
+       FROM (
+         SELECT t.summary_id, COALESCE(SUM(m.token_count), 0) AS input_tokens
+         FROM target_summaries t
+         JOIN summaries target ON target.summary_id = t.summary_id
+         JOIN summary_messages sm ON sm.summary_id = t.summary_id
+         JOIN messages m ON m.message_id = sm.message_id
+         WHERE target.kind = 'leaf' OR COALESCE(target.depth, 0) = 0
+         GROUP BY t.summary_id
+         UNION ALL
+         SELECT t.summary_id, COALESCE(SUM(child.token_count), 0) AS input_tokens
+         FROM target_summaries t
+         JOIN summaries target ON target.summary_id = t.summary_id
+         JOIN summary_parents sp ON sp.summary_id = t.summary_id
+         JOIN summaries child ON child.summary_id = sp.parent_summary_id
+         WHERE NOT (target.kind = 'leaf' OR COALESCE(target.depth, 0) = 0)
+         GROUP BY t.summary_id
+       ) repair_inputs`,
+    )
+    .get(...summaryIds) as { token_count: number | null } | undefined;
+
+  // Source coverage expands each target's summary tree to linked raw messages
+  // and deduplicates messages shared by multiple target roots.
+  const sourceCoverageRow = db
+    .prepare(
+      `WITH RECURSIVE
+       target_summaries(summary_id) AS (VALUES ${targetValuesSql}),
+       target_tree(summary_id) AS (
+         SELECT summary_id FROM target_summaries
+         UNION
+         SELECT sp.parent_summary_id
+         FROM target_tree tree
+         JOIN summary_parents sp ON sp.summary_id = tree.summary_id
+       ),
+       covered_messages AS (
+         SELECT DISTINCT sm.message_id
+         FROM target_tree tree
+         JOIN summary_messages sm ON sm.summary_id = tree.summary_id
+       )
+       SELECT COALESCE(SUM(m.token_count), 0) AS token_count
+       FROM covered_messages covered
+       JOIN messages m ON m.message_id = covered.message_id`,
+    )
+    .get(...summaryIds) as { token_count: number | null } | undefined;
+
+  return {
+    repairInputTokenCount: Math.max(0, Math.floor(repairInputRow?.token_count ?? 0)),
+    repairTargetSourceTokenCount: Math.max(0, Math.floor(sourceCoverageRow?.token_count ?? 0)),
+  };
+}
+
 function buildDoctorApplySafetyPreflight(params: {
   config: LcmConfig;
-  stats: LcmConversationStatusStats;
   doctor: DoctorSummaryStats;
+  repairMetrics: DoctorApplyRepairMetrics;
   maintenance: ConversationCompactionMaintenanceRecord | null;
 }): { blocked: boolean; reasons: string[]; tokenBudget: number; tokenThreshold: number } {
   const tokenBudget = resolveLifecycleCompactionTokenBudget(params.config);
   const tokenThreshold = Math.floor(tokenBudget * DOCTOR_APPLY_BUDGET_PRESSURE_RATIO);
   const reasons: string[] = [];
-  const maintenanceObservedTokens = Math.max(
-    params.maintenance?.currentTokenCount ?? 0,
-    params.maintenance?.projectedTokenCount ?? 0,
-  );
-  const observedTokens = Math.max(
-    params.stats.contextTokenCount,
-    params.stats.summarizedSourceTokens,
-    params.stats.compressedTokenCount,
-    maintenanceObservedTokens,
-  );
 
   if (params.doctor.total > DOCTOR_APPLY_LARGE_TARGET_THRESHOLD) {
     reasons.push(
       `doctor target count ${formatNumber(params.doctor.total)} exceeds safe inline limit ${formatNumber(DOCTOR_APPLY_LARGE_TARGET_THRESHOLD)}`,
     );
   }
-  if (params.stats.messageCount > DOCTOR_APPLY_LARGE_MESSAGE_THRESHOLD) {
+  if (params.repairMetrics.repairInputTokenCount > tokenThreshold) {
     reasons.push(
-      `message count ${formatNumber(params.stats.messageCount)} exceeds safe inline limit ${formatNumber(DOCTOR_APPLY_LARGE_MESSAGE_THRESHOLD)}`,
-    );
-  }
-  if (observedTokens > tokenThreshold) {
-    reasons.push(
-      `observed token count ${formatNumber(observedTokens)} exceeds ${formatNumber(Math.round(DOCTOR_APPLY_BUDGET_PRESSURE_RATIO * 100))}% of repair budget ${formatNumber(tokenBudget)}`,
+      `repair input token count ${formatNumber(params.repairMetrics.repairInputTokenCount)} exceeds ${formatNumber(Math.round(DOCTOR_APPLY_BUDGET_PRESSURE_RATIO * 100))}% of repair budget ${formatNumber(tokenBudget)}`,
     );
   }
   if (params.maintenance?.pending) {
@@ -2497,10 +2559,11 @@ async function buildDoctorApplyText(params: {
     params.db,
     current.stats.conversationId,
   );
+  const repairMetrics = loadDoctorApplyRepairMetrics(params.db, stats);
   const preflight = buildDoctorApplySafetyPreflight({
     config: params.config,
-    stats: current.stats,
     doctor: stats,
+    repairMetrics,
     maintenance,
   });
   if (preflight.blocked && params.options?.confirmOffline !== true) {
@@ -2521,9 +2584,10 @@ async function buildDoctorApplyText(params: {
       buildSection("🧯 Safety preflight", [
         buildStatLine("status", "blocked"),
         buildStatLine("mode", "read-only; no summary rewrites ran"),
-        buildStatLine("messages", formatNumber(current.stats.messageCount)),
         buildStatLine("LCM frontier tokens", formatNumber(current.stats.contextTokenCount)),
-        buildStatLine("detected summaries", formatNumber(stats.total)),
+        buildStatLine("repair targets", formatNumber(stats.total)),
+        buildStatLine("repair input tokens", formatNumber(repairMetrics.repairInputTokenCount)),
+        buildStatLine("repair target source tokens", formatNumber(repairMetrics.repairTargetSourceTokenCount)),
         buildStatLine("token threshold", formatNumber(preflight.tokenThreshold)),
         ...preflight.reasons.map((reason) => buildStatLine("reason", reason)),
       ]),
@@ -2601,7 +2665,7 @@ async function buildDoctorApplyText(params: {
       ...(params.options?.confirmOffline === true
         ? [buildStatLine("safety override", "confirm-offline")]
         : []),
-      buildStatLine("detected summaries", formatNumber(stats.total)),
+      buildStatLine("repair targets", formatNumber(stats.total)),
       buildStatLine("old-marker summaries", formatNumber(stats.old)),
       buildStatLine("truncated-marker summaries", formatNumber(stats.truncated)),
       buildStatLine("fallback-marker summaries", formatNumber(stats.fallback)),
