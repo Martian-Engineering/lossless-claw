@@ -296,7 +296,8 @@ function toMessagePartRecord(row: MessagePartRow): MessagePartRecord {
   };
 }
 
-function normalizeMessageContentForFullTextIndex(content: string): string | null {
+/** Normalize persisted message text before indexing it in the message FTS table. */
+export function normalizeMessageContentForFullTextIndex(content: string): string | null {
   if (typeof content !== "string") return null;
   const trimmed = content.trim();
   if (!trimmed) {

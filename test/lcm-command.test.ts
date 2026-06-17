@@ -66,6 +66,137 @@ function createCommandContext(
   };
 }
 
+type CommandFixture = ReturnType<typeof createCommandFixture>;
+
+async function createRolloverConversationData(
+  fixture: CommandFixture,
+  input: {
+    conversationId: number;
+    label: string;
+    transcriptEntryId?: string;
+    includeSummary?: boolean;
+    includeLargeFile?: boolean;
+    includeFocusBrief?: boolean;
+  },
+): Promise<void> {
+  const [message] = await fixture.conversationStore.createMessagesBulk([
+    {
+      conversationId: input.conversationId,
+      seq: 0,
+      role: "user",
+      content: `${input.label} message`,
+      tokenCount: 5,
+      ...(input.transcriptEntryId ? { transcriptEntryId: input.transcriptEntryId } : {}),
+    },
+  ]);
+  await fixture.summaryStore.appendContextMessage(input.conversationId, message.messageId);
+
+  if (input.includeSummary) {
+    const summaryId = `${input.label}_summary`;
+    await fixture.summaryStore.insertSummary({
+      summaryId,
+      conversationId: input.conversationId,
+      kind: "leaf",
+      depth: 0,
+      content: `${input.label} summary`,
+      tokenCount: 3,
+      sourceMessageTokenCount: 5,
+    });
+    await fixture.summaryStore.linkSummaryToMessages(summaryId, [message.messageId]);
+    await fixture.summaryStore.appendContextSummary(input.conversationId, summaryId);
+  }
+
+  if (input.includeLargeFile) {
+    await fixture.summaryStore.insertLargeFile({
+      fileId: `${input.label}_file`,
+      conversationId: input.conversationId,
+      fileName: `${input.label}.txt`,
+      mimeType: "text/plain",
+      byteSize: 64,
+      storageUri: `file:///tmp/${input.label}.txt`,
+      explorationSummary: `${input.label} file summary`,
+    });
+  }
+
+  if (input.includeFocusBrief) {
+    fixture.db
+      .prepare(
+        `INSERT INTO focus_briefs (
+           brief_id,
+           conversation_id,
+           session_key,
+           prompt,
+           content,
+           status
+         ) VALUES (?, ?, ?, ?, ?, 'active')`,
+      )
+      .run(
+        `${input.label}_brief`,
+        input.conversationId,
+        `agent:main:test:${input.label}`,
+        `${input.label} focus prompt`,
+        `${input.label} focus content`,
+      );
+  }
+}
+
+function setConversationTimes(
+  fixture: CommandFixture,
+  conversationId: number,
+  createdAt: string,
+  archivedAt?: string,
+): void {
+  fixture.db
+    .prepare(
+      `UPDATE conversations
+       SET created_at = ?,
+           archived_at = COALESCE(?, archived_at),
+           updated_at = ?
+       WHERE conversation_id = ?`,
+    )
+    .run(createdAt, archivedAt ?? null, archivedAt ?? createdAt, conversationId);
+}
+
+function insertRolloverStateRows(fixture: CommandFixture, sourceId: number, targetId: number): void {
+  fixture.db
+    .prepare(
+      `INSERT INTO conversation_bootstrap_state (
+         conversation_id,
+         session_file_path,
+         last_seen_size,
+         last_seen_mtime_ms,
+         last_processed_offset
+       ) VALUES (?, ?, 10, 20, 30)`,
+    )
+    .run(sourceId, `/tmp/source-${sourceId}.jsonl`);
+  fixture.db
+    .prepare(
+      `INSERT INTO conversation_compaction_telemetry (
+         conversation_id,
+         cache_state
+       ) VALUES (?, 'cold')`,
+    )
+    .run(sourceId);
+  fixture.db
+    .prepare(
+      `INSERT INTO conversation_compaction_maintenance (
+         conversation_id,
+         pending,
+         reason
+       ) VALUES (?, 1, 'old-source-maintenance')`,
+    )
+    .run(sourceId);
+  fixture.db
+    .prepare(
+      `INSERT INTO conversation_compaction_maintenance (
+         conversation_id,
+         pending,
+         reason
+       ) VALUES (?, 0, 'target-maintenance')`,
+    )
+    .run(targetId);
+}
+
 describe("lcm command", () => {
   const tempDirs = new Set<string>();
   const dbPaths = new Set<string>();
@@ -1261,6 +1392,304 @@ describe("lcm command", () => {
     expect(result.text).not.toContain("sum_unknown_clean");
   });
 
+  it("reports whole-DB rollover split memory even when no current conversation is resolved", async () => {
+    const fixture = createCommandFixture();
+    tempDirs.add(fixture.tempDir);
+    dbPaths.add(fixture.dbPath);
+
+    const sessionKey = "agent:main:test:rollover-detect";
+    const archived = await fixture.conversationStore.createConversation({
+      sessionId: "rollover-detect-old",
+      sessionKey,
+    });
+    await createRolloverConversationData(fixture, {
+      conversationId: archived.conversationId,
+      label: "detect_old",
+      includeSummary: true,
+    });
+    await fixture.conversationStore.archiveConversation(archived.conversationId);
+    const active = await fixture.conversationStore.createConversation({
+      sessionId: "rollover-detect-new",
+      sessionKey,
+    });
+    setConversationTimes(fixture, archived.conversationId, "2026-06-17 01:00:00", "2026-06-17 01:05:00");
+    setConversationTimes(fixture, active.conversationId, "2026-06-17 01:06:00");
+
+    const result = await fixture.command.handler(createCommandContext("doctor"));
+
+    expect(result.text).toContain("Summary doctor is conversation-scoped.");
+    expect(result.text).toContain("**⚠️ Rollover split memory**");
+    expect(result.text).toContain("affected safe lanes: 1");
+    expect(result.text).toContain("stranded: 1 messages · 1 summaries · 2 context items");
+    expect(result.text).toContain("repair: `/lossless doctor apply rollover-splits confirm`");
+    expect(result.text).toContain("rollover-detect");
+  });
+
+  it("repairs safe whole-DB rollover splits after confirmation", async () => {
+    const fixture = createCommandFixture();
+    tempDirs.add(fixture.tempDir);
+    dbPaths.add(fixture.dbPath);
+
+    const sessionKey = "agent:main:test:rollover-apply";
+    const firstArchived = await fixture.conversationStore.createConversation({
+      sessionId: "rollover-apply-old-1",
+      sessionKey,
+    });
+    await createRolloverConversationData(fixture, {
+      conversationId: firstArchived.conversationId,
+      label: "oldone",
+      includeSummary: true,
+      includeLargeFile: true,
+      includeFocusBrief: true,
+    });
+    await fixture.conversationStore.archiveConversation(firstArchived.conversationId);
+
+    const secondArchived = await fixture.conversationStore.createConversation({
+      sessionId: "rollover-apply-old-2",
+      sessionKey,
+    });
+    await createRolloverConversationData(fixture, {
+      conversationId: secondArchived.conversationId,
+      label: "oldtwo",
+      includeSummary: true,
+    });
+    await fixture.conversationStore.archiveConversation(secondArchived.conversationId);
+
+    const active = await fixture.conversationStore.createConversation({
+      sessionId: "rollover-apply-new",
+      sessionKey,
+    });
+    await createRolloverConversationData(fixture, {
+      conversationId: active.conversationId,
+      label: "active",
+      includeSummary: true,
+    });
+    const unrelated = await fixture.conversationStore.createConversation({
+      sessionId: "rollover-apply-unrelated",
+      sessionKey: "agent:main:test:rollover-apply-unrelated",
+    });
+    await fixture.conversationStore.createMessagesBulk([
+      {
+        conversationId: unrelated.conversationId,
+        seq: 0,
+        role: "tool",
+        content:
+          "[LCM Tool Output: tool_1]\nCall lcm_describe(id=\"tool_1\") to inspect the full payload.\nExploration Summary:\npayloaddelta retained content",
+        tokenCount: 9,
+      },
+    ]);
+    setConversationTimes(fixture, firstArchived.conversationId, "2026-06-17 01:00:00", "2026-06-17 01:05:00");
+    setConversationTimes(fixture, secondArchived.conversationId, "2026-06-17 01:06:00", "2026-06-17 01:10:00");
+    setConversationTimes(fixture, active.conversationId, "2026-06-17 01:11:00");
+    insertRolloverStateRows(fixture, firstArchived.conversationId, active.conversationId);
+
+    const blocked = await fixture.command.handler(
+      createCommandContext("doctor apply rollover-splits"),
+    );
+    expect(blocked.text).toContain("status: blocked");
+    expect(blocked.text).toContain("read-only; no rollover split repair ran");
+
+    const result = await fixture.command.handler(
+      createCommandContext("doctor apply rollover-splits confirm"),
+    );
+
+    expect(result.text).toContain("status: completed");
+    expect(result.text).toContain("repaired lanes: 1");
+    expect(result.text).toContain("merged: 2 messages · 2 summaries · 4 context items · 1 large files · 1 focus briefs");
+    expect(result.text).toContain("integrity: ok");
+    expect(result.text).toContain("foreign keys: clean");
+    expect(result.text).toContain("backup path:");
+    expect(result.text).not.toContain("backup path: skipped");
+
+    const targetMessages = fixture.db
+      .prepare(
+        `SELECT seq, content
+         FROM messages
+         WHERE conversation_id = ?
+         ORDER BY seq ASC`,
+      )
+      .all(active.conversationId) as Array<{ seq: number; content: string }>;
+    expect(targetMessages).toEqual([
+      { seq: 1, content: "oldone message" },
+      { seq: 2, content: "oldtwo message" },
+      { seq: 3, content: "active message" },
+    ]);
+
+    const targetContext = fixture.db
+      .prepare(
+        `SELECT ordinal, item_type
+         FROM context_items
+         WHERE conversation_id = ?
+         ORDER BY ordinal ASC`,
+      )
+      .all(active.conversationId) as Array<{ ordinal: number; item_type: string }>;
+    expect(targetContext.map((row) => row.ordinal)).toEqual([0, 1, 2, 3, 4, 5]);
+    expect(targetContext.map((row) => row.item_type)).toEqual([
+      "message",
+      "summary",
+      "message",
+      "summary",
+      "message",
+      "summary",
+    ]);
+
+    const counts = fixture.db
+      .prepare(
+        `SELECT
+           (SELECT COUNT(*) FROM summaries WHERE conversation_id = ?) AS summaries,
+           (SELECT COUNT(*) FROM large_files WHERE conversation_id = ?) AS large_files,
+           (SELECT COUNT(*) FROM focus_briefs WHERE conversation_id = ?) AS focus_briefs,
+           (SELECT COUNT(*) FROM messages WHERE conversation_id IN (?, ?)) AS source_messages,
+           (SELECT COUNT(*) FROM context_items WHERE conversation_id IN (?, ?)) AS source_context,
+           (SELECT COUNT(*) FROM conversation_bootstrap_state WHERE conversation_id = ?) AS source_bootstrap,
+           (SELECT COUNT(*) FROM conversation_compaction_telemetry WHERE conversation_id = ?) AS source_telemetry`,
+      )
+      .get(
+        active.conversationId,
+        active.conversationId,
+        active.conversationId,
+        firstArchived.conversationId,
+        secondArchived.conversationId,
+        firstArchived.conversationId,
+        secondArchived.conversationId,
+        firstArchived.conversationId,
+        firstArchived.conversationId,
+      ) as {
+      summaries: number;
+      large_files: number;
+      focus_briefs: number;
+      source_messages: number;
+      source_context: number;
+      source_bootstrap: number;
+      source_telemetry: number;
+    };
+    expect(counts).toEqual({
+      summaries: 3,
+      large_files: 1,
+      focus_briefs: 1,
+      source_messages: 0,
+      source_context: 0,
+      source_bootstrap: 0,
+      source_telemetry: 0,
+    });
+
+    const maintenance = fixture.db
+      .prepare(
+        `SELECT pending, reason, running
+         FROM conversation_compaction_maintenance
+         WHERE conversation_id = ?`,
+      )
+      .get(active.conversationId) as { pending: number; reason: string; running: number };
+    expect(maintenance).toEqual({
+      pending: 1,
+      reason: "doctor-rollover-split-repair",
+      running: 0,
+    });
+
+    const ftsRows = fixture.db
+      .prepare(`SELECT rowid FROM messages_fts WHERE messages_fts MATCH 'oldone'`)
+      .all();
+    expect(ftsRows.length).toBeGreaterThan(0);
+    const retainedFtsRows = fixture.db
+      .prepare(`SELECT rowid FROM messages_fts WHERE messages_fts MATCH 'payloaddelta'`)
+      .all();
+    expect(retainedFtsRows.length).toBeGreaterThan(0);
+    const helperFtsRows = fixture.db
+      .prepare(`SELECT rowid FROM messages_fts WHERE messages_fts MATCH 'lcm_describe'`)
+      .all();
+    expect(helperFtsRows).toEqual([]);
+  });
+
+  it("skips rollover split repair when transcript entry ids collide", async () => {
+    const fixture = createCommandFixture();
+    tempDirs.add(fixture.tempDir);
+    dbPaths.add(fixture.dbPath);
+
+    const sessionKey = "agent:main:test:rollover-collision";
+    const archived = await fixture.conversationStore.createConversation({
+      sessionId: "rollover-collision-old",
+      sessionKey,
+    });
+    await createRolloverConversationData(fixture, {
+      conversationId: archived.conversationId,
+      label: "collision_old",
+      transcriptEntryId: "duplicate-entry-id",
+    });
+    await fixture.conversationStore.archiveConversation(archived.conversationId);
+    const active = await fixture.conversationStore.createConversation({
+      sessionId: "rollover-collision-new",
+      sessionKey,
+    });
+    await createRolloverConversationData(fixture, {
+      conversationId: active.conversationId,
+      label: "collision_active",
+      transcriptEntryId: "duplicate-entry-id",
+    });
+    setConversationTimes(fixture, archived.conversationId, "2026-06-17 02:00:00", "2026-06-17 02:05:00");
+    setConversationTimes(fixture, active.conversationId, "2026-06-17 02:06:00");
+
+    const scan = await fixture.command.handler(createCommandContext("doctor rollover-splits"));
+    expect(scan.text).toContain("affected safe lanes: 0");
+    expect(scan.text).toContain("needs review: 1");
+
+    const result = await fixture.command.handler(
+      createCommandContext("doctor apply rollover-splits confirm"),
+    );
+    expect(result.text).toContain("repaired lanes: 0");
+    expect(result.text).toContain("skipped for review: 1");
+    expect(result.text).toContain("backup path: skipped (no safe rollover splits)");
+
+    const archivedMessageCount = fixture.db
+      .prepare(`SELECT COUNT(*) AS count FROM messages WHERE conversation_id = ?`)
+      .get(archived.conversationId) as { count: number };
+    expect(archivedMessageCount.count).toBe(1);
+  });
+
+  it("ignores isolated cron session-key rollovers", async () => {
+    const fixture = createCommandFixture();
+    tempDirs.add(fixture.tempDir);
+    dbPaths.add(fixture.dbPath);
+
+    const sessionKey = "agent:main:cron:rollover-nightly";
+    const archived = await fixture.conversationStore.createConversation({
+      sessionId: "cron-rollover-old",
+      sessionKey,
+    });
+    await createRolloverConversationData(fixture, {
+      conversationId: archived.conversationId,
+      label: "cron_old",
+      includeSummary: true,
+      includeFocusBrief: true,
+    });
+    await fixture.conversationStore.archiveConversation(archived.conversationId);
+    const active = await fixture.conversationStore.createConversation({
+      sessionId: "cron-rollover-new",
+      sessionKey,
+    });
+    await createRolloverConversationData(fixture, {
+      conversationId: active.conversationId,
+      label: "cron_active",
+    });
+    setConversationTimes(fixture, archived.conversationId, "2026-06-17 03:00:00", "2026-06-17 03:05:00");
+    setConversationTimes(fixture, active.conversationId, "2026-06-17 03:06:00");
+
+    const scan = await fixture.command.handler(createCommandContext("doctor rollover-splits"));
+    expect(scan.text).toContain("result: clean");
+    expect(scan.text).toContain("safe lanes: 0");
+    expect(scan.text).toContain("needs review: 0");
+
+    const result = await fixture.command.handler(
+      createCommandContext("doctor apply rollover-splits confirm"),
+    );
+    expect(result.text).toContain("repaired lanes: 0");
+    expect(result.text).toContain("backup path: skipped (no safe rollover splits)");
+
+    const archivedMessageCount = fixture.db
+      .prepare(`SELECT COUNT(*) AS count FROM messages WHERE conversation_id = ?`)
+      .get(archived.conversationId) as { count: number };
+    expect(archivedMessageCount.count).toBe(1);
+  });
+
   it("reports doctor as unavailable when the current conversation cannot be resolved", async () => {
     const fixture = createCommandFixture();
     tempDirs.add(fixture.tempDir);
@@ -1292,7 +1721,8 @@ describe("lcm command", () => {
     expect(result.text).toContain(
       "No LCM conversation is stored yet for active session key `agent:main:telegram:direct:not-stored` or active session id `doctor-unresolved-missing`.",
     );
-    expect(result.text).toContain("fallback: Doctor is conversation-scoped, so no global scan ran.");
+    expect(result.text).toContain("fallback: Summary doctor is conversation-scoped.");
+    expect(result.text).toContain("**✅ Rollover split memory**");
     expect(result.text).not.toContain("detected summaries:");
     expect(result.text).not.toContain("sum_unresolved_other");
   });
@@ -2864,6 +3294,15 @@ describe("lcm command helpers", () => {
       kind: "doctor",
       apply: true,
       applyOptions: { confirmOffline: true },
+    });
+    expect(__testing.parseLcmCommand("doctor rollover-splits")).toEqual({
+      kind: "doctor_rollover_splits",
+      apply: false,
+    });
+    expect(__testing.parseLcmCommand("doctor apply rollover-splits confirm")).toEqual({
+      kind: "doctor_rollover_splits",
+      apply: true,
+      applyOptions: { confirm: true },
     });
   });
 

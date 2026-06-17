@@ -28,6 +28,12 @@ import {
   type DoctorSummaryStats,
 } from "./lcm-doctor-shared.js";
 import {
+  applyRolloverSplitRepair,
+  scanRolloverSplits,
+  type RolloverSplitCounts,
+  type RolloverSplitExample,
+} from "./lcm-doctor-rollover-splits.js";
+import {
   CompactionMaintenanceStore,
   type ConversationCompactionMaintenanceRecord,
 } from "../store/compaction-maintenance-store.js";
@@ -77,6 +83,9 @@ type CurrentConversationResolution =
 type DoctorApplyOptions = {
   confirmOffline: boolean;
 };
+type RolloverSplitApplyOptions = {
+  confirm: boolean;
+};
 
 type ParsedLcmCommand =
   | { kind: "status" }
@@ -87,6 +96,7 @@ type ParsedLcmCommand =
   | { kind: "refocus" }
   | { kind: "unfocus" }
   | { kind: "doctor"; apply: boolean; applyOptions?: DoctorApplyOptions }
+  | { kind: "doctor_rollover_splits"; apply: boolean; applyOptions?: RolloverSplitApplyOptions }
   | { kind: "doctor_cleaners"; apply: boolean; filterId?: DoctorCleanerId; vacuum: boolean }
   | { kind: "help"; error?: string };
 
@@ -267,6 +277,21 @@ function parseDoctorApplyArgs(tokens: string[]):
   return { ok: true, options: { confirmOffline } };
 }
 
+function parseRolloverSplitApplyArgs(tokens: string[]):
+  | { ok: true; options: RolloverSplitApplyOptions }
+  | { ok: false; error: string } {
+  if (tokens.length === 0) {
+    return { ok: true, options: { confirm: false } };
+  }
+  if (tokens.length === 1 && tokens[0]?.toLowerCase() === "confirm") {
+    return { ok: true, options: { confirm: true } };
+  }
+  return {
+    ok: false,
+    error: `\`${VISIBLE_COMMAND} doctor apply rollover-splits\` accepts optional \`confirm\`.`,
+  };
+}
+
 function parseLcmCommand(rawArgs: string | undefined): ParsedLcmCommand {
   const raw = (rawArgs ?? "").trim();
   if (raw === "") {
@@ -310,6 +335,9 @@ function parseLcmCommand(rawArgs: string | undefined): ParsedLcmCommand {
       if (rest.length === 1 && rest[0]?.toLowerCase() === "clean") {
         return { kind: "doctor_cleaners", apply: false, vacuum: false };
       }
+      if (rest.length === 1 && rest[0]?.toLowerCase() === "rollover-splits") {
+        return { kind: "doctor_rollover_splits", apply: false };
+      }
       if (rest[0]?.toLowerCase() === "clean" && rest[1]?.toLowerCase() === "apply") {
         const parsedApply = parseDoctorCleanerApplyArgs(rest.slice(2));
         return parsedApply.ok
@@ -318,6 +346,16 @@ function parseLcmCommand(rawArgs: string | undefined): ParsedLcmCommand {
               apply: true,
               filterId: parsedApply.filterId,
               vacuum: parsedApply.vacuum,
+            }
+          : { kind: "help", error: parsedApply.error };
+      }
+      if (rest[0]?.toLowerCase() === "apply" && rest[1]?.toLowerCase() === "rollover-splits") {
+        const parsedApply = parseRolloverSplitApplyArgs(rest.slice(2));
+        return parsedApply.ok
+          ? {
+              kind: "doctor_rollover_splits",
+              apply: true,
+              applyOptions: parsedApply.options,
             }
           : { kind: "help", error: parsedApply.error };
       }
@@ -330,7 +368,7 @@ function parseLcmCommand(rawArgs: string | undefined): ParsedLcmCommand {
       return {
         kind: "help",
         error:
-          `\`${VISIBLE_COMMAND} doctor\` accepts no arguments, \`clean\` for global high-confidence junk diagnostics, \`clean apply [filter-id] [vacuum]\` for cleanup, or \`apply [confirm-offline]\` for the scoped summary repair path.`,
+          `\`${VISIBLE_COMMAND} doctor\` accepts no arguments, \`rollover-splits\` for global rollover diagnostics, \`apply rollover-splits [confirm]\` for backup-first split repair, \`clean\` for global high-confidence junk diagnostics, \`clean apply [filter-id] [vacuum]\` for cleanup, or \`apply [confirm-offline]\` for the scoped summary repair path.`,
       };
     case "help":
       return { kind: "help" };
@@ -862,6 +900,14 @@ function buildHelpText(error?: string): string {
       ),
       buildStatLine(formatCommand(`${VISIBLE_COMMAND} doctor`), "Scan for broken or truncated summaries."),
       buildStatLine(
+        formatCommand(`${VISIBLE_COMMAND} doctor rollover-splits`),
+        "Report whole-DB fresh-transcript rollover split memory.",
+      ),
+      buildStatLine(
+        formatCommand(`${VISIBLE_COMMAND} doctor apply rollover-splits confirm`),
+        "Repair all safe rollover split memory groups after creating a DB backup.",
+      ),
+      buildStatLine(
         formatCommand(`${VISIBLE_COMMAND} doctor clean`),
         "Report global high-confidence junk candidates without deleting anything.",
       ),
@@ -1052,6 +1098,7 @@ async function buildDoctorText(params: {
   ctx: PluginCommandContext;
   db: DatabaseSync;
 }): Promise<string> {
+  const rolloverSplits = scanRolloverSplits(params.db);
   const current = await resolveCurrentConversation(params);
 
   if (current.kind === "unavailable") {
@@ -1063,8 +1110,10 @@ async function buildDoctorText(params: {
       buildSection("📍 Current conversation", [
         buildStatLine("status", "unavailable"),
         buildStatLine("reason", current.reason),
-        buildStatLine("fallback", "Doctor is conversation-scoped, so no global scan ran."),
+        buildStatLine("fallback", "Summary doctor is conversation-scoped."),
       ]),
+      "",
+      buildRolloverSplitScanSection(rolloverSplits),
     ].join("\n");
   }
 
@@ -1091,6 +1140,8 @@ async function buildDoctorText(params: {
       buildStatLine("emergency-fallback summaries", formatNumber(stats.emergency)),
       buildStatLine("result", stats.total === 0 ? "clean" : "issues found"),
     ]),
+    "",
+    buildRolloverSplitScanSection(rolloverSplits),
   ];
 
   if (stats.total > 0) {
@@ -1110,6 +1161,60 @@ async function buildDoctorText(params: {
   }
 
   return lines.join("\n");
+}
+
+function formatRolloverCounts(counts: RolloverSplitCounts): string {
+  const parts = [
+    `${formatNumber(counts.messages)} messages`,
+    `${formatNumber(counts.summaries)} summaries`,
+    `${formatNumber(counts.contextItems)} context items`,
+    `${formatNumber(counts.largeFiles)} large files`,
+    `${formatNumber(counts.focusBriefs)} focus briefs`,
+  ];
+  return parts.join(" · ");
+}
+
+function formatRolloverExample(example: RolloverSplitExample): string {
+  const sources = example.sourceConversationIds.map((id) => formatNumber(id)).join(",");
+  return [
+    `${truncateMiddle(example.sessionKey, 44)}: conv ${sources} -> ${formatNumber(example.targetConversationId)}`,
+    formatRolloverCounts(example),
+  ].join(", ");
+}
+
+function buildRolloverSplitScanSection(scan: ReturnType<typeof scanRolloverSplits>): string {
+  if (scan.safe.length === 0 && scan.needsReview.length === 0) {
+    return buildSection("✅ Rollover split memory", [
+      buildStatLine("result", "clean"),
+      buildStatLine("safe lanes", "0"),
+      buildStatLine("needs review", "0"),
+    ]);
+  }
+
+  const lines = [
+    buildStatLine("result", scan.safe.length > 0 ? "safe repairs available" : "review needed"),
+    buildStatLine("affected safe lanes", formatNumber(scan.totals.safeLanes)),
+    buildStatLine("stranded", formatRolloverCounts(scan.totals)),
+    buildStatLine("needs review", formatNumber(scan.totals.needsReviewLanes)),
+    buildStatLine("repair", formatCommand(`${VISIBLE_COMMAND} doctor apply rollover-splits confirm`)),
+  ];
+
+  for (const example of scan.safe.slice(0, 3)) {
+    lines.push(`- ${formatRolloverExample(example)}`);
+  }
+  if (scan.safe.length > 3) {
+    lines.push(`- ... ${formatNumber(scan.safe.length - 3)} more safe lane(s)`);
+  }
+  if (scan.needsReview.length > 0) {
+    lines.push(
+      buildStatLine(
+        "skipped",
+        `${formatNumber(scan.needsReview.length)} lane(s) require manual review before repair`,
+      ),
+    );
+  }
+
+  return buildSection("⚠️ Rollover split memory", lines);
 }
 
 async function buildDoctorCleanersText(params: {
@@ -2262,6 +2367,86 @@ async function buildDoctorCleanersApplyText(params: {
   return lines.join("\n");
 }
 
+async function buildRolloverSplitApplyText(params: {
+  db: DatabaseSync;
+  config: LcmConfig;
+  options?: RolloverSplitApplyOptions;
+}): Promise<string> {
+  const scan = scanRolloverSplits(params.db);
+  const lines = [
+    ...buildHeaderLines(),
+    "",
+    "🩺 Lossless Claw Rollover Split Repair",
+    "",
+    buildSection("🌐 Repair scope", [
+      buildStatLine("safe lanes", formatNumber(scan.totals.safeLanes)),
+      buildStatLine("needs review", formatNumber(scan.totals.needsReviewLanes)),
+      buildStatLine("stranded", formatRolloverCounts(scan.totals)),
+    ]),
+    "",
+  ];
+
+  if (scan.safe.length > 0 && params.options?.confirm !== true) {
+    lines.push(
+      buildSection("🧯 Safety preflight", [
+        buildStatLine("status", "blocked"),
+        buildStatLine("mode", "read-only; no rollover split repair ran"),
+        buildStatLine("reason", "confirmation word required"),
+      ]),
+      "",
+      buildSection("🛠️ Next step", [
+        `Run ${formatCommand(`${VISIBLE_COMMAND} doctor apply rollover-splits confirm`)} to create a backup and repair all safe rollover split groups.`,
+      ]),
+    );
+    return lines.join("\n");
+  }
+
+  let result: Awaited<ReturnType<typeof applyRolloverSplitRepair>>;
+  try {
+    result = await applyRolloverSplitRepair({
+      db: params.db,
+      databasePath: params.config.databasePath,
+    });
+  } catch (error) {
+    lines.push(
+      buildSection("🛠️ Apply", [
+        buildStatLine("status", "failed"),
+        buildStatLine("reason", error instanceof Error ? error.message : "unknown rollover split repair failure"),
+      ]),
+    );
+    return lines.join("\n");
+  }
+
+  if (result.kind === "unavailable") {
+    lines.push(
+      buildSection("🛠️ Apply", [
+        buildStatLine("status", "unavailable"),
+        buildStatLine("reason", result.reason),
+      ]),
+    );
+    return lines.join("\n");
+  }
+
+  lines.push(
+    buildSection("🛠️ Apply", [
+      buildStatLine("status", "completed"),
+      buildStatLine("backup path", result.backupPath),
+      buildStatLine("repaired lanes", formatNumber(result.repairedLanes)),
+      buildStatLine("skipped for review", formatNumber(result.skippedReviewLanes)),
+      buildStatLine("merged", formatRolloverCounts(result.totals)),
+      buildStatLine("integrity", result.verification.integrity),
+      buildStatLine("foreign keys", result.verification.foreignKeys),
+      buildStatLine(
+        "result",
+        result.repairedLanes > 0
+          ? `repaired ${formatNumber(result.repairedLanes)} rollover split lane(s)`
+          : "clean; no writes ran",
+      ),
+    ]),
+  );
+  return lines.join("\n");
+}
+
 async function buildDoctorApplyText(params: {
   ctx: PluginCommandContext;
   db: DatabaseSync;
@@ -2523,6 +2708,24 @@ export function createLcmCommand(params: {
                 }),
               }
             : { text: await buildDoctorText({ ctx, db: await getDb() }) };
+        case "doctor_rollover_splits":
+          return parsed.apply
+            ? {
+                text: await buildRolloverSplitApplyText({
+                  db: await getDb(),
+                  config: params.config,
+                  options: parsed.applyOptions,
+                }),
+              }
+            : {
+                text: [
+                  ...buildHeaderLines(),
+                  "",
+                  "🩺 Lossless Claw Rollover Splits",
+                  "",
+                  buildRolloverSplitScanSection(scanRolloverSplits(await getDb())),
+                ].join("\n"),
+              };
         case "doctor_cleaners":
           return parsed.apply
             ? {
