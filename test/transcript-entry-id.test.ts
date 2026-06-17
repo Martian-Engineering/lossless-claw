@@ -12,6 +12,7 @@ import {
   getTranscriptEntryMeta,
   parseBootstrapJsonl,
   readLeafPathMessages,
+  resolveTranscriptMessageCreatedAt,
 } from "../src/transcript.js";
 import type { LcmDependencies } from "../src/types.js";
 import { createTestConfig, createTestDeps as createSharedTestDeps } from "./helpers.js";
@@ -144,6 +145,39 @@ describe("transcript entry metadata parsing", () => {
     expect(getTranscriptEntryId(messages[0]!)).toBeTruthy();
     expect(getTranscriptEntryId(messages[1]!)).toBeTruthy();
     expect(getTranscriptEntryId(messages[0]!)).not.toBe(getTranscriptEntryId(messages[1]!));
+  });
+
+  it("prefers message timestamps over replay envelope timestamps", () => {
+    const raw = JSON.stringify({
+      type: "message",
+      id: "entry-replayed",
+      timestamp: "2026-06-17T02:26:07.589Z",
+      message: {
+        role: "user",
+        timestamp: Date.parse("2026-06-05T20:16:17.367Z"),
+        content: [{ type: "text", text: "historical user message" }],
+      },
+    });
+
+    const message = parseBootstrapJsonl(raw).messages[0]!;
+    const createdAt = resolveTranscriptMessageCreatedAt(message);
+    expect(createdAt).toBeInstanceOf(Date);
+    expect((createdAt as Date).toISOString()).toBe("2026-06-05T20:16:17.367Z");
+  });
+
+  it("falls back to envelope timestamps for envelope-only transcript entries", () => {
+    const raw = JSON.stringify({
+      type: "message",
+      id: "entry-envelope-only",
+      timestamp: "2026-06-10T18:00:00.000Z",
+      message: {
+        role: "assistant",
+        content: [{ type: "text", text: "recovered assistant message" }],
+      },
+    });
+
+    const message = parseBootstrapJsonl(raw).messages[0]!;
+    expect(resolveTranscriptMessageCreatedAt(message)).toBe("2026-06-10T18:00:00.000Z");
   });
 });
 

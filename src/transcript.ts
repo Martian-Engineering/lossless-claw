@@ -45,11 +45,6 @@ export function getTranscriptEntryId(message: AgentMessage): string | null {
 }
 
 export function resolveTranscriptMessageCreatedAt(message: AgentMessage): Date | string | undefined {
-  const envelopeTimestamp = getTranscriptEntryMeta(message)?.timestamp;
-  if (envelopeTimestamp) {
-    return envelopeTimestamp;
-  }
-
   const raw = message as unknown as Record<string, unknown>;
   const value = raw.timestamp ?? raw.createdAt ?? raw.created_at;
   if (typeof value === "number") {
@@ -62,7 +57,7 @@ export function resolveTranscriptMessageCreatedAt(message: AgentMessage): Date |
   if (typeof value === "string" && value.trim()) {
     return value;
   }
-  return undefined;
+  return getTranscriptEntryMeta(message)?.timestamp ?? undefined;
 }
 
 function normalizeEnvelopeString(value: unknown): string | null {
