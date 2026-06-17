@@ -621,6 +621,30 @@ export class ConversationStore {
       .run(conversationId);
   }
 
+  async rebindConversationSession(
+    conversationId: ConversationId,
+    sessionId: string,
+    sessionKey?: string | null,
+  ): Promise<ConversationRecord | null> {
+    const normalizedSessionId = sessionId.trim();
+    const normalizedSessionKey = sessionKey?.trim() || null;
+    if (!normalizedSessionId) {
+      return this.getConversation(conversationId);
+    }
+    this.db
+      .prepare(
+        `UPDATE conversations
+         SET session_id = ?,
+             session_key = COALESCE(?, session_key),
+             active = 1,
+             archived_at = NULL,
+             updated_at = datetime('now')
+         WHERE conversation_id = ?`,
+      )
+      .run(normalizedSessionId, normalizedSessionKey, conversationId);
+    return this.getConversation(conversationId);
+  }
+
   // ── Message operations ────────────────────────────────────────────────────
 
   async createMessage(input: CreateMessageInput): Promise<MessageRecord> {

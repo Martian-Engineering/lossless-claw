@@ -10,7 +10,7 @@
  * Policy under test: when the new transcript is PROVABLY FRESH — zero
  * identity overlap with the frozen conversation's recent persisted history
  * and every timestamped entry postdating its last persisted message — the
- * rollover resolves by archive-and-rotate. Freshness is content+time
+ * rollover resolves by rebind-in-place. Freshness is content+time
  * evidence, never transcript size, so lanes frozen for days (aged, with
  * accumulated history) still heal. Anything short of proof stays frozen.
  */
@@ -218,7 +218,7 @@ async function seedHistoricalMessage(
 }
 
 describe("ambiguous rollover tier-2 fresh-transcript rotation", () => {
-  it("bootstrap heals an aged frozen lane: archives it and imports the rolled transcript", async () => {
+  it("bootstrap heals an aged frozen lane: rebinds it and imports the rolled transcript", async () => {
     const { engine, log, db } = createEngine();
     const lane = await seedFrozenLane(engine, db);
 
@@ -233,30 +233,28 @@ describe("ambiguous rollover tier-2 fresh-transcript rotation", () => {
     });
 
     expect(log.warn).toHaveBeenCalledWith(
-      expect.stringContaining("resolved by fresh-transcript rotation"),
+      expect.stringContaining("resolved by fresh-transcript rebind"),
     );
     expect(result.bootstrapped).toBe(true);
     expect(result.importedMessages).toBeGreaterThan(0);
 
-    // Old conversation archived, fully preserved.
-    const oldConversation = await engine
-      .getConversationStore()
-      .getConversationBySessionId(OLD_SESSION_ID);
-    expect(oldConversation?.active).toBe(false);
+    // Existing conversation id is rebound to the new session, fully preserving history.
     const preserved = await engine.getConversationStore().getMessages(lane.conversationId);
-    expect(preserved.map((m) => m.content)).toEqual(lane.persistedContents);
+    expect(preserved.slice(0, lane.persistedContents.length).map((m) => m.content)).toEqual(
+      lane.persistedContents,
+    );
 
-    // The key now binds the new session, with the transcript imported.
+    // The key now binds the new session on the same conversation id, with the transcript imported.
     const rebound = await engine
       .getConversationStore()
       .getConversationBySessionKey(SESSION_KEY);
     expect(rebound?.sessionId).toBe(NEW_SESSION_ID);
-    expect(rebound?.conversationId).not.toBe(lane.conversationId);
-    const imported = await engine.getConversationStore().getMessages(rebound!.conversationId);
+    expect(rebound?.conversationId).toBe(lane.conversationId);
+    const imported = await engine.getConversationStore().getMessages(lane.conversationId);
     expect(imported.some((m) => m.content.includes("fresh rolled-session turn"))).toBe(true);
   });
 
-  it("afterTurn rotates the lane; the host's next bootstrap imports the transcript", async () => {
+  it("afterTurn rebinds the lane; the host's next bootstrap imports the transcript", async () => {
     const { engine, log, db } = createEngine();
     const lane = await seedFrozenLane(engine, db);
 
@@ -281,7 +279,7 @@ describe("ambiguous rollover tier-2 fresh-transcript rotation", () => {
     });
 
     expect(log.warn).toHaveBeenCalledWith(
-      expect.stringContaining("resolved by fresh-transcript rotation"),
+      expect.stringContaining("resolved by fresh-transcript rebind"),
     );
     const reboundAfterFirst = await engine
       .getConversationStore()
@@ -302,7 +300,9 @@ describe("ambiguous rollover tier-2 fresh-transcript rotation", () => {
     expect(persisted.some((m) => m.content.includes("fresh rolled-session turn"))).toBe(true);
 
     const preserved = await engine.getConversationStore().getMessages(lane.conversationId);
-    expect(preserved.map((m) => m.content)).toEqual(lane.persistedContents);
+    expect(preserved.slice(0, lane.persistedContents.length).map((m) => m.content)).toEqual(
+      lane.persistedContents,
+    );
   });
 
   it("stays frozen when the rolled transcript overlaps the lane's persisted history", async () => {
@@ -410,7 +410,7 @@ describe("ambiguous rollover tier-2 fresh-transcript rotation", () => {
       expect.stringContaining("freshness=delivery-only-synthetic-transcript"),
     );
     expect(log.warn).not.toHaveBeenCalledWith(
-      expect.stringContaining("resolved by fresh-transcript rotation"),
+      expect.stringContaining("resolved by fresh-transcript rebind"),
     );
     const conversation = await engine
       .getConversationStore()
@@ -451,7 +451,7 @@ describe("ambiguous rollover tier-2 fresh-transcript rotation", () => {
       expect.stringContaining("freshness=no-comparable-candidate-content"),
     );
     expect(log.warn).not.toHaveBeenCalledWith(
-      expect.stringContaining("resolved by fresh-transcript rotation"),
+      expect.stringContaining("resolved by fresh-transcript rebind"),
     );
     const conversation = await engine
       .getConversationStore()
@@ -502,7 +502,7 @@ describe("ambiguous rollover tier-2 fresh-transcript rotation", () => {
       expect.stringContaining("ambiguous session-key runtime rollover; preserving"),
     );
     expect(log.warn).not.toHaveBeenCalledWith(
-      expect.stringContaining("resolved by fresh-transcript rotation"),
+      expect.stringContaining("resolved by fresh-transcript rebind"),
     );
     const conversation = await engine
       .getConversationStore()
@@ -514,10 +514,10 @@ describe("ambiguous rollover tier-2 fresh-transcript rotation", () => {
     ).resolves.toEqual([]);
   });
 
-  it("reports a lifecycle no-op honestly instead of claiming the lane healed", async () => {
+  it("rebinds even an empty lifecycle row instead of creating a replacement", async () => {
     const { engine, log } = createEngine();
-    // Empty conversation pinned to the old session: applySessionReplacement
-    // treats a fresh lifecycle row as a no-op, so rotation cannot land.
+    // Empty conversation pinned to the old session: rebind it in-place so
+    // even lifecycle edge cases preserve the conversation id.
     const conversation = await engine
       .getConversationStore()
       .getOrCreateConversation(OLD_SESSION_ID, { sessionKey: SESSION_KEY });
@@ -550,11 +550,13 @@ describe("ambiguous rollover tier-2 fresh-transcript rotation", () => {
     });
 
     expect(log.warn).toHaveBeenCalledWith(
-      expect.stringContaining("rotation had no effect"),
+      expect.stringContaining("resolved by fresh-transcript rebind"),
     );
-    expect(log.warn).not.toHaveBeenCalledWith(
-      expect.stringContaining("resolved by fresh-transcript rotation"),
-    );
+    const rebound = await engine
+      .getConversationStore()
+      .getConversationBySessionKey(SESSION_KEY);
+    expect(rebound?.conversationId).toBe(conversation.conversationId);
+    expect(rebound?.sessionId).toBe(NEW_SESSION_ID);
   });
   it("heals a heartbeat-idle lane on time evidence alone (live conv-1 shape)", async () => {
     const { engine, log, db } = createEngine();
@@ -611,18 +613,20 @@ describe("ambiguous rollover tier-2 fresh-transcript rotation", () => {
     });
 
     expect(log.warn).toHaveBeenCalledWith(
-      expect.stringContaining("resolved by fresh-transcript rotation"),
+      expect.stringContaining("resolved by fresh-transcript rebind"),
     );
     expect(result.bootstrapped).toBe(true);
     const rebound = await engine
       .getConversationStore()
       .getConversationBySessionKey(SESSION_KEY);
     expect(rebound?.sessionId).toBe(NEW_SESSION_ID);
-    // The heartbeat history is archived intact, not deleted.
+    // The heartbeat history remains intact on the same conversation id.
     const preserved = await engine
       .getConversationStore()
       .getMessages(conversation!.conversationId);
-    expect(preserved).toHaveLength(60);
+    expect(preserved.slice(0, 60).map((m) => m.content)).toEqual(
+      heartbeatContents.map((entry) => entry.content),
+    );
   });
 
   it("heartbeat polls and recurring template content never block the heal", async () => {
@@ -668,12 +672,13 @@ describe("ambiguous rollover tier-2 fresh-transcript rotation", () => {
     });
 
     expect(log.warn).toHaveBeenCalledWith(
-      expect.stringContaining("resolved by fresh-transcript rotation"),
+      expect.stringContaining("resolved by fresh-transcript rebind"),
     );
     expect(result.bootstrapped).toBe(true);
     const rebound = await engine
       .getConversationStore()
       .getConversationBySessionKey(SESSION_KEY);
     expect(rebound?.sessionId).toBe(NEW_SESSION_ID);
+    expect(rebound?.conversationId).toBe(lane.conversationId);
   });
 });

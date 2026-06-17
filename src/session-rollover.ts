@@ -401,11 +401,12 @@ export class SessionRolloverDetector {
   /**
    * Tier-2 resolution for ambiguous session-key runtime rollovers
    * (lossless-claw-30b.8): a provably fresh new transcript means the
-   * rollover is a legitimate reset, not a foreign transcript sharing the
-   * key. Archive the old conversation (fully preserved and queryable) so
-   * the new session can bind and bootstrap normally instead of leaving the
-   * lane frozen outside LCM indefinitely. Returns true when rotated;
-   * false leaves the existing freeze-and-preserve behavior in place.
+   * rollover is a legitimate runtime session-file reset, not a foreign
+   * transcript sharing the key. Rebind the existing conversation row so all
+   * summaries, messages, frontier rows, and metadata keep the same
+   * conversation id while the new session can bootstrap normally. Returns
+   * true when rebound; false leaves the existing freeze-and-preserve
+   * behavior in place.
    */
   async rotateAmbiguousRolloverForProvablyFreshTranscript(params: {
     phase: "bootstrap" | "assemble" | "afterTurn";
@@ -433,34 +434,20 @@ export class SessionRolloverDetector {
       return false;
     }
 
-    await this.applySessionReplacement({
-      reason: `${params.phase} ambiguous rollover fresh-transcript rotation`,
-      sessionId: params.rollover.activeSessionId,
-      sessionKey: params.rollover.sessionKey,
-      nextSessionId: params.sessionId,
-      nextSessionKey: params.rollover.sessionKey,
-      createReplacement: params.createReplacement,
-    });
-    // Postcondition: applySessionReplacement has internal no-op paths (e.g.
-    // a fresh lifecycle row is left in place). Claiming "resolved" while the
-    // key is still bound to the old session would hide a live freeze behind
-    // healed-looking logs, so verify the binding actually moved.
-    const bindingAfter = await this.conversationStore.getConversationBySessionKey(
+    const rebound = await this.conversationStore.rebindConversationSession(
+      params.rollover.conversationId,
+      params.sessionId,
       params.rollover.sessionKey,
     );
-    if (
-      bindingAfter &&
-      bindingAfter.conversationId === params.rollover.conversationId &&
-      bindingAfter.sessionId === params.rollover.activeSessionId
-    ) {
+    if (!rebound || rebound.sessionId !== params.sessionId || !rebound.active) {
       this.deps.log.warn(
-        `[lcm] ${params.phase}: ambiguous rollover rotation had no effect (lifecycle no-op) conversation=${params.rollover.conversationId} sessionKey=${params.rollover.sessionKey} oldSessionId=${params.rollover.activeSessionId} newSessionId=${params.sessionId}; leaving lane frozen`,
+        `[lcm] ${params.phase}: ambiguous rollover rebind failed conversation=${params.rollover.conversationId} sessionKey=${params.rollover.sessionKey} oldSessionId=${params.rollover.activeSessionId} newSessionId=${params.sessionId}; leaving lane frozen`,
       );
       return false;
     }
 
     this.deps.log.warn(
-      `[lcm] ${params.phase}: ambiguous rollover resolved by fresh-transcript rotation conversation=${params.rollover.conversationId} sessionKey=${params.rollover.sessionKey} oldSessionId=${params.rollover.activeSessionId} newSessionId=${params.sessionId} candidateMessages=${params.candidateMessages.length} lastPersistedAt=${verdict.lastPersistedAt?.toISOString() ?? "none"} firstCandidateAt=${verdict.firstCandidateAt !== null ? new Date(verdict.firstCandidateAt).toISOString() : "none"}`,
+      `[lcm] ${params.phase}: ambiguous rollover resolved by fresh-transcript rebind conversation=${params.rollover.conversationId} sessionKey=${params.rollover.sessionKey} oldSessionId=${params.rollover.activeSessionId} newSessionId=${params.sessionId} candidateMessages=${params.candidateMessages.length} lastPersistedAt=${verdict.lastPersistedAt?.toISOString() ?? "none"} firstCandidateAt=${verdict.firstCandidateAt !== null ? new Date(verdict.firstCandidateAt).toISOString() : "none"}`,
     );
     return true;
   }
