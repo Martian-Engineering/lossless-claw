@@ -16,8 +16,8 @@ export function normalizeIdentityContent(content: string): string {
   if (typeof content !== "string") return content;
   let s = content;
   s = s.replace(/^\s*\[[A-Za-z]{3}\s+\d{4}-\d{2}-\d{2}[^\]]*GMT[^\]]*\]\s*/, "");
-  s = s.replace(/Conversation info \(untrusted metadata\):\s*\{[\s\S]*?\}\s*/g, "");
-  s = s.replace(/Sender \(untrusted metadata\):\s*\{[\s\S]*?\}\s*/g, "");
+  s = s.replace(/Conversation info \(untrusted metadata\):\s*(?:```[a-zA-Z]*\s*[\s\S]*?```|\{[\s\S]*?\})\s*/g, "");
+  s = s.replace(/Sender \(untrusted metadata\):\s*(?:```[a-zA-Z]*\s*[\s\S]*?```|\{[\s\S]*?\})\s*/g, "");
   s = s.replace(/\[message_id:[^\]]*\]\s*/g, "");
   return s.trim();
 }
