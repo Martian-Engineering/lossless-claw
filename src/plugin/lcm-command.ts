@@ -2559,11 +2559,18 @@ async function buildDoctorApplyText(params: {
     params.db,
     current.stats.conversationId,
   );
-  const repairMetrics = loadDoctorApplyRepairMetrics(params.db, stats);
+  const skipRepairMetrics =
+    params.options?.confirmOffline !== true && stats.total > DOCTOR_APPLY_LARGE_TARGET_THRESHOLD;
+  const repairMetrics = skipRepairMetrics
+    ? null
+    : loadDoctorApplyRepairMetrics(params.db, stats);
   const preflight = buildDoctorApplySafetyPreflight({
     config: params.config,
     doctor: stats,
-    repairMetrics,
+    repairMetrics: repairMetrics ?? {
+      repairInputTokenCount: 0,
+      repairTargetSourceTokenCount: 0,
+    },
     maintenance,
   });
   if (preflight.blocked && params.options?.confirmOffline !== true) {
@@ -2586,8 +2593,15 @@ async function buildDoctorApplyText(params: {
         buildStatLine("mode", "read-only; no summary rewrites ran"),
         buildStatLine("LCM frontier tokens", formatNumber(current.stats.contextTokenCount)),
         buildStatLine("repair targets", formatNumber(stats.total)),
-        buildStatLine("repair input tokens", formatNumber(repairMetrics.repairInputTokenCount)),
-        buildStatLine("repair target source tokens", formatNumber(repairMetrics.repairTargetSourceTokenCount)),
+        ...(repairMetrics
+          ? [
+              buildStatLine("repair input tokens", formatNumber(repairMetrics.repairInputTokenCount)),
+              buildStatLine(
+                "repair target source tokens",
+                formatNumber(repairMetrics.repairTargetSourceTokenCount),
+              ),
+            ]
+          : []),
         buildStatLine("token threshold", formatNumber(preflight.tokenThreshold)),
         ...preflight.reasons.map((reason) => buildStatLine("reason", reason)),
       ]),

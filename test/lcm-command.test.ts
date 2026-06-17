@@ -5,6 +5,7 @@ import type { DatabaseSync } from "node:sqlite";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { runLcmMigrations } from "../src/db/migration.js";
 import { getLcmDbFeatures } from "../src/db/features.js";
+import { formatTimestamp } from "../src/compaction.js";
 import { createLcmDatabaseConnection, closeLcmConnection } from "../src/db/connection.js";
 import { resolveLcmConfig } from "../src/db/config.js";
 import { ConversationStore } from "../src/store/conversation-store.js";
@@ -1176,7 +1177,9 @@ describe("lcm command", () => {
 
     expect(result.text).toContain("LCM frontier tokens: 144,291");
     expect(result.text).toContain("budget: 258,000");
-    expect(result.text).toContain("last finished: 2026-06-17 11:52 PDT");
+    expect(result.text).toContain(
+      `last finished: ${formatTimestamp(new Date("2026-06-17T18:52:47.113Z"), fixture.config.timezone)}`,
+    );
     expect(result.text).toContain("lcm health: healthy");
     expect(result.text).not.toContain("assembly budget 128,000");
     expect(result.text).not.toContain("lcm reason: observed token count 144,291");
@@ -1296,7 +1299,9 @@ describe("lcm command", () => {
 
     expect(result.text).toContain("LCM frontier tokens: 8");
     expect(result.text).toContain("state: idle");
-    expect(result.text).toContain("last finished: 2026-04-11 17:07 PDT");
+    expect(result.text).toContain(
+      `last finished: ${formatTimestamp(new Date("2026-04-12T00:07:00.000Z"), fixture.config.timezone)}`,
+    );
     expect(result.text).toContain("budget: 100");
     expect(result.text).not.toContain("observed token count: 150");
     expect(result.text).not.toContain("projected token count: 150");
@@ -2403,8 +2408,8 @@ describe("lcm command", () => {
     expect(result.text).toContain("status: blocked");
     expect(result.text).toContain("mode: read-only; no summary rewrites ran");
     expect(result.text).toContain("repair targets: 26");
-    expect(result.text).toContain("repair input tokens: 0");
-    expect(result.text).toContain("repair target source tokens: 0");
+    expect(result.text).not.toContain("repair input tokens");
+    expect(result.text).not.toContain("repair target source tokens");
     expect(result.text).toContain("doctor target count 26 exceeds safe inline limit 25");
     expect(result.text).toContain("`/lossless doctor apply confirm-offline`");
     expect(summarize).not.toHaveBeenCalled();
