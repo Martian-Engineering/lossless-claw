@@ -37,7 +37,6 @@ import {
   CompactionMaintenanceStore,
   type ConversationCompactionMaintenanceRecord,
 } from "../store/compaction-maintenance-store.js";
-import { CompactionTelemetryStore } from "../store/compaction-telemetry-store.js";
 import { FocusBriefStore, hashFocusSourceContext } from "../store/focus-brief-store.js";
 
 const VISIBLE_COMMAND = "/lossless";
@@ -546,13 +545,6 @@ async function getConversationCompactionMaintenanceByConversationId(
   );
 }
 
-async function getConversationCompactionTelemetryByConversationId(
-  db: DatabaseSync,
-  conversationId: number,
-) {
-  return await new CompactionTelemetryStore(db).getConversationCompactionTelemetry(conversationId);
-}
-
 async function resolveCurrentConversation(params: {
   ctx: PluginCommandContext;
   db: DatabaseSync;
@@ -753,6 +745,57 @@ function buildLcmHealthSummary(params: {
     return { state: "warning", reasons: warningReasons };
   }
   return { state: "healthy", reasons: [] };
+}
+
+function getMaintenanceState(
+  maintenance: ConversationCompactionMaintenanceRecord | null,
+): "pending" | "running" | "idle" {
+  if (maintenance?.pending) return "pending";
+  if (maintenance?.running) return "running";
+  return "idle";
+}
+
+// Keep default status focused on operator action: active work, failure state, or
+// the last successful budget. Detailed token-pressure and cache telemetry stay in
+// logs and maintenance internals instead of the chat command surface.
+function buildMaintenanceSummaryLines(params: {
+  maintenance: ConversationCompactionMaintenanceRecord | null;
+  formatTime: (value: Date | null) => string;
+}): string[] {
+  const maintenance = params.maintenance;
+  const state = getMaintenanceState(maintenance);
+  const lines = [buildStatLine("state", state)];
+  if (!maintenance) {
+    return lines;
+  }
+
+  const active = state === "pending" || state === "running";
+  const failed = Boolean(maintenance.lastFailureSummary);
+  if (active || failed) {
+    if (maintenance.reason) lines.push(buildStatLine("reason", maintenance.reason));
+    if (active && maintenance.requestedAt) {
+      lines.push(buildStatLine("requested at", params.formatTime(maintenance.requestedAt)));
+    }
+    if (maintenance.lastStartedAt) {
+      lines.push(buildStatLine("last started", params.formatTime(maintenance.lastStartedAt)));
+    }
+    if (maintenance.lastFinishedAt && state !== "running") {
+      lines.push(buildStatLine("last finished", params.formatTime(maintenance.lastFinishedAt)));
+    }
+    if (maintenance.lastFailureSummary) {
+      lines.push(buildStatLine("last failure", maintenance.lastFailureSummary));
+    }
+    if (maintenance.nextAttemptAfter) {
+      lines.push(buildStatLine("next retry", params.formatTime(maintenance.nextAttemptAfter)));
+    }
+  } else if (maintenance.lastFinishedAt) {
+    lines.push(buildStatLine("last finished", params.formatTime(maintenance.lastFinishedAt)));
+  }
+
+  if (maintenance.tokenBudget != null) {
+    lines.push(buildStatLine("budget", formatNumber(maintenance.tokenBudget)));
+  }
+  return lines;
 }
 
 // Run the cache-aware focus lifecycle sweep. Focus and unfocus both mutate the
@@ -1009,10 +1052,6 @@ async function buildStatusText(params: {
       params.db,
       current.stats.conversationId,
     );
-    const telemetry = await getConversationCompactionTelemetryByConversationId(
-      params.db,
-      current.stats.conversationId,
-    );
     const lcmHealth = buildLcmHealthSummary({
       config: params.config,
       stats: current.stats,
@@ -1058,42 +1097,10 @@ async function buildStatusText(params: {
     lines.push("", buildSection("🎯 Focus", focusLines));
     lines.push(
       "",
-      buildSection("🛠️ Maintenance", [
-        buildStatLine(
-          "state",
-          maintenance?.pending
-            ? "pending"
-            : maintenance?.running
-              ? "running"
-              : "idle",
-        ),
-        buildStatLine("requested at", formatMaintenanceTime(maintenance?.requestedAt ?? null)),
-        buildStatLine("reason", maintenance?.reason ?? "none"),
-        buildStatLine("last started", formatMaintenanceTime(maintenance?.lastStartedAt ?? null)),
-        buildStatLine("last finished", formatMaintenanceTime(maintenance?.lastFinishedAt ?? null)),
-        buildStatLine("last failure", maintenance?.lastFailureSummary ?? "none"),
-        buildStatLine(
-          "requested token budget",
-          maintenance?.tokenBudget != null ? formatNumber(maintenance.tokenBudget) : "unknown",
-        ),
-        buildStatLine(
-          "observed token count",
-          maintenance?.currentTokenCount != null ? formatNumber(maintenance.currentTokenCount) : "unknown",
-        ),
-        buildStatLine(
-          "projected token count",
-          maintenance?.projectedTokenCount != null ? formatNumber(maintenance.projectedTokenCount) : "unknown",
-        ),
-        buildStatLine(
-          "raw tokens outside tail",
-          maintenance?.rawTokensOutsideTail != null ? formatNumber(maintenance.rawTokensOutsideTail) : "unknown",
-        ),
-        buildStatLine("last api call", formatMaintenanceTime(telemetry?.lastApiCallAt ?? null)),
-        buildStatLine("last cache touch", formatMaintenanceTime(telemetry?.lastCacheTouchAt ?? null)),
-        buildStatLine("cache retention", telemetry?.retention ?? "unknown"),
-        buildStatLine("cache state", telemetry?.cacheState ?? "unknown"),
-        buildStatLine("provider/model", [telemetry?.provider, telemetry?.model].filter(Boolean).join(" / ") || "unknown"),
-      ]),
+      buildSection(
+        "🛠️ Maintenance",
+        buildMaintenanceSummaryLines({ maintenance, formatTime: formatMaintenanceTime }),
+      ),
     );
   } else {
     lines.push(

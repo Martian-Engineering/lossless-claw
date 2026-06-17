@@ -1061,8 +1061,12 @@ describe("lcm command", () => {
     expect(result.text).toContain("state: pending");
     expect(result.text).toContain("reason: budget-trigger");
     expect(result.text).toContain("last failure: provider timeout");
-    expect(result.text).toContain("requested token budget: 128,000");
-    expect(result.text).toContain("observed token count: 96,000");
+    expect(result.text).toContain("budget: 128,000");
+    expect(result.text).not.toContain("observed token count: 96,000");
+    expect(result.text).not.toContain("projected token count");
+    expect(result.text).not.toContain("raw tokens outside tail");
+    expect(result.text).not.toContain("cache state");
+    expect(result.text).not.toContain("provider/model");
   });
 
   it("reports LCM token pressure separately from transport health in status output", async () => {
@@ -1171,10 +1175,19 @@ describe("lcm command", () => {
     );
 
     expect(result.text).toContain("LCM frontier tokens: 144,291");
-    expect(result.text).toContain("requested token budget: 258,000");
+    expect(result.text).toContain("budget: 258,000");
+    expect(result.text).toContain("last finished: 2026-06-17 11:52 PDT");
     expect(result.text).toContain("lcm health: healthy");
     expect(result.text).not.toContain("assembly budget 128,000");
     expect(result.text).not.toContain("lcm reason: observed token count 144,291");
+    expect(result.text).not.toContain("requested at");
+    expect(result.text).not.toContain("reason: threshold");
+    expect(result.text).not.toContain("observed token count");
+    expect(result.text).not.toContain("projected token count");
+    expect(result.text).not.toContain("raw tokens outside tail");
+    expect(result.text).not.toContain("last api call");
+    expect(result.text).not.toContain("cache state");
+    expect(result.text).not.toContain("provider/model");
   });
 
   it("does not surface repair-source pressure in default status output", async () => {
@@ -1283,7 +1296,10 @@ describe("lcm command", () => {
 
     expect(result.text).toContain("LCM frontier tokens: 8");
     expect(result.text).toContain("state: idle");
-    expect(result.text).toContain("observed token count: 150");
+    expect(result.text).toContain("last finished: 2026-04-11 17:07 PDT");
+    expect(result.text).toContain("budget: 100");
+    expect(result.text).not.toContain("observed token count: 150");
+    expect(result.text).not.toContain("projected token count: 150");
     expect(result.text).toContain("lcm health: healthy");
     expect(result.text).not.toContain("lcm reason: observed token count 150");
   });
