@@ -1651,15 +1651,33 @@ function wirePluginHandlers(
   });
 
   api.registerTool(
-    (ctx) => createLcmGrepTool({ deps, getLcm: shared.waitForEngine, sessionKey: ctx.sessionKey }),
+    (ctx) =>
+      createLcmGrepTool({
+        deps,
+        getLcm: shared.waitForEngine,
+        sessionId: ctx.sessionId,
+        sessionKey: ctx.sessionKey,
+      }),
     { name: "lcm_grep" },
   );
   api.registerTool(
-    (ctx) => createLcmDescribeTool({ deps, getLcm: shared.waitForEngine, sessionKey: ctx.sessionKey }),
+    (ctx) =>
+      createLcmDescribeTool({
+        deps,
+        getLcm: shared.waitForEngine,
+        sessionId: ctx.sessionId,
+        sessionKey: ctx.sessionKey,
+      }),
     { name: "lcm_describe" },
   );
   api.registerTool(
-    (ctx) => createLcmExpandTool({ deps, getLcm: shared.waitForEngine, sessionKey: ctx.sessionKey }),
+    (ctx) =>
+      createLcmExpandTool({
+        deps,
+        getLcm: shared.waitForEngine,
+        sessionId: ctx.sessionId,
+        sessionKey: ctx.sessionKey,
+      }),
     { name: "lcm_expand" },
   );
   api.registerTool(
@@ -1667,6 +1685,7 @@ function wirePluginHandlers(
       createLcmExpandQueryTool({
         deps,
         getLcm: shared.waitForEngine,
+        sessionId: ctx.sessionId,
         sessionKey: ctx.sessionKey,
         requesterSessionKey: ctx.sessionKey,
       }),
