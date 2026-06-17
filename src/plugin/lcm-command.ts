@@ -951,6 +951,7 @@ async function buildStatusText(params: {
 }): Promise<string> {
   const status = getLcmStatusStats(params.db);
   const doctor = getDoctorSummaryStats(params.db);
+  const rolloverSplits = scanRolloverSplits(params.db);
   const enabled = resolvePluginEnabled(params.ctx.config);
   const selected = resolvePluginSelected(params.ctx.config);
   const slot = resolveContextEngineSlot(params.ctx.config);
@@ -981,6 +982,10 @@ async function buildStatusText(params: {
     ]),
     "",
   ];
+
+  if (rolloverSplits.safe.length > 0 || rolloverSplits.needsReview.length > 0) {
+    lines.push(buildRolloverSplitScanSection(rolloverSplits), "");
+  }
 
   if (current.kind === "resolved") {
     const conversationDoctor =

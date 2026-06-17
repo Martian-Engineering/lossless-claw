@@ -282,6 +282,42 @@ describe("lcm command", () => {
     expect(result.text).toContain("OpenClaw did not expose an active session key or session id here");
   });
 
+  it("surfaces rollover split memory from the default status command", async () => {
+    const fixture = createCommandFixture();
+    tempDirs.add(fixture.tempDir);
+    dbPaths.add(fixture.dbPath);
+
+    const sessionKey = "agent:main:test:status-rollover-detect";
+    const archived = await fixture.conversationStore.createConversation({
+      sessionId: "status-rollover-old",
+      sessionKey,
+    });
+    await createRolloverConversationData(fixture, {
+      conversationId: archived.conversationId,
+      label: "statusold",
+      includeSummary: true,
+    });
+    await fixture.conversationStore.archiveConversation(archived.conversationId);
+
+    const active = await fixture.conversationStore.createConversation({
+      sessionId: "status-rollover-new",
+      sessionKey,
+    });
+    await createRolloverConversationData(fixture, {
+      conversationId: active.conversationId,
+      label: "statusactive",
+    });
+    setConversationTimes(fixture, archived.conversationId, "2026-06-17 03:00:00", "2026-06-17 03:05:00");
+    setConversationTimes(fixture, active.conversationId, "2026-06-17 03:10:00");
+
+    const result = await fixture.command.handler(createCommandContext());
+
+    expect(result.text).toContain("**⚠️ Rollover split memory**");
+    expect(result.text).toContain("result: safe repairs available");
+    expect(result.text).toContain("affected safe lanes: 1");
+    expect(result.text).toContain("repair: `/lossless doctor apply rollover-splits confirm`");
+  });
+
   it("resolves current conversation stats when the host provides a session key", async () => {
     const fixture = createCommandFixture();
     tempDirs.add(fixture.tempDir);
