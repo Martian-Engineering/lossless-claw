@@ -2660,7 +2660,7 @@ describe("LcmContextEngine.bootstrap", () => {
       importedMessages: 1,
       reason: "reconciled missing session messages",
     });
-    expect(reconcileSpy).not.toHaveBeenCalled();
+    expect(reconcileSpy).toHaveBeenCalledTimes(1);
 
     const storedAfter = await engine.getConversationStore().getMessages(conversation!.conversationId);
     expect(storedAfter.map((message) => message.content)).toEqual([
@@ -3222,6 +3222,140 @@ describe("LcmContextEngine.bootstrap", () => {
       reason: "reconciled missing session messages",
     });
     expect(reconcileSpy).toHaveBeenCalledTimes(1);
+  });
+
+  it("does not anchor hash-only checkpoint recovery on an ambiguous repeated inbound message", async () => {
+    const tempDir = mkdtempSync(join(tmpdir(), "lossless-claw-engine-"));
+    tempDirs.push(tempDir);
+    const dbPath = join(tempDir, "lcm.db");
+    const sessionFile = createSessionFilePath("ambiguous-canonical-checkpoint");
+    const sm = SessionManager.open(sessionFile);
+    appendSessionMessage(sm, {
+      role: "user",
+      content: [{ type: "text", text: openClawInboundMetadataContent({
+        messageId: "telegram-1",
+        senderName: "Syu",
+        text: "repeat me",
+      }) }],
+    } as AgentMessage);
+    appendSessionMessage(sm, {
+      role: "assistant",
+      content: [{ type: "text", text: "middle assistant" }],
+    } as AgentMessage);
+    appendSessionMessage(sm, {
+      role: "user",
+      content: [{ type: "text", text: openClawInboundMetadataContent({
+        messageId: "telegram-2",
+        senderName: "Syu",
+        text: "repeat me",
+      }) }],
+    } as AgentMessage);
+
+    const engine = createEngineAtDatabasePath(dbPath);
+    const sessionId = "ambiguous-canonical-checkpoint";
+    const first = await engine.bootstrap({ sessionId, sessionFile });
+    expect(first.bootstrapped).toBe(true);
+
+    const conversation = await engine.getConversationStore().getConversationBySessionId(sessionId);
+    expect(conversation).not.toBeNull();
+
+    const rawDb = createLcmDatabaseConnection(dbPath);
+    try {
+      rawDb
+        .prepare(
+          `DELETE FROM context_items
+           WHERE conversation_id = ?
+             AND message_id IN (
+               SELECT message_id FROM messages WHERE conversation_id = ? AND seq > 1
+             )`,
+        )
+        .run(conversation!.conversationId, conversation!.conversationId);
+      rawDb
+        .prepare(
+          `DELETE FROM message_parts
+           WHERE message_id IN (
+             SELECT message_id FROM messages WHERE conversation_id = ? AND seq > 1
+           )`,
+        )
+        .run(conversation!.conversationId);
+      rawDb
+        .prepare(
+          `DELETE FROM messages
+           WHERE conversation_id = ?
+             AND seq > 1`,
+        )
+        .run(conversation!.conversationId);
+      rawDb
+        .prepare(
+          `UPDATE conversation_bootstrap_state
+           SET last_processed_entry_id = NULL,
+               last_seen_size = 0,
+               last_seen_mtime_ms = 0
+           WHERE conversation_id = ?`,
+        )
+        .run(conversation!.conversationId);
+      rawDb
+        .prepare(
+          `UPDATE messages
+           SET transcript_entry_id = NULL
+           WHERE conversation_id = ?`,
+        )
+        .run(conversation!.conversationId);
+    } finally {
+      closeLcmConnection(rawDb);
+    }
+
+    const secondEngine = createEngineAtDatabasePath(dbPath);
+    const second = await secondEngine.bootstrap({ sessionId, sessionFile });
+
+    expect(second.importedMessages).toBe(2);
+    const stored = await secondEngine.getConversationStore().getMessages(conversation!.conversationId);
+    expect(stored.map((message) => message.content)).toEqual([
+      openClawInboundMetadataContent({
+        messageId: "telegram-1",
+        senderName: "Syu",
+        text: "repeat me",
+      }),
+      "middle assistant",
+      openClawInboundMetadataContent({
+        messageId: "telegram-2",
+        senderName: "Syu",
+        text: "repeat me",
+      }),
+    ]);
+  });
+
+  it("does not count distinct OpenClaw metadata variants as no-anchor replay overlaps", async () => {
+    const engine = createEngine();
+    const conversation = await engine
+      .getConversationStore()
+      .createConversation({ sessionId: "no-anchor-openclaw-overlap" });
+    const persisted = openClawInboundMetadataContent({
+      messageId: "telegram-1",
+      senderName: "Syu",
+      text: "repeat me",
+    });
+    await engine.getConversationStore().createMessage({
+      conversationId: conversation.conversationId,
+      seq: 0,
+      role: "user",
+      content: persisted,
+      tokenCount: 1,
+    });
+
+    const candidate = openClawInboundMetadataContent({
+      messageId: "telegram-2",
+      senderName: "Syu",
+      text: "repeat me",
+    });
+    const analysis = await engine
+      .getTranscriptReconciler()
+      .analyzePersistedTranscriptIdentityOverlaps({
+        conversationId: conversation.conversationId,
+        messages: [makeMessage({ role: "user", content: candidate })],
+      });
+
+    expect(analysis).toEqual({ overlaps: 0, firstNonOverlappingIndex: 0 });
   });
 
   it("reconciles missing structured tool-call tail when prior empty tool content exists", async () => {

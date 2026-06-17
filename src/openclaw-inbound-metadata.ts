@@ -56,7 +56,8 @@ export function canonicalizeOpenClawInboundMetadataIdentityContent(
     return content;
   }
 
-  const conversationCandidate = content.trimStart();
+  const { prelude, metadataCandidate } = splitOpenClawInboundMetadataPrelude(content);
+  const conversationCandidate = metadataCandidate.trimStart();
   const conversationMatch = OPENCLAW_INBOUND_METADATA_BLOCK_RE.exec(conversationCandidate);
   const conversationHeading = conversationMatch?.[1] ?? "";
   const conversationRecord = conversationMatch
@@ -97,7 +98,30 @@ export function canonicalizeOpenClawInboundMetadataIdentityContent(
     remaining = stripMetadataSeparator(remaining);
   }
 
-  return remaining.trim().length > 0 ? `${canonicalBlocks.join("\n\n")}\n\n${remaining}` : content;
+  return remaining.trim().length > 0
+    ? `${prelude}${canonicalBlocks.join("\n\n")}\n\n${remaining}`
+    : content;
+}
+
+function splitOpenClawInboundMetadataPrelude(content: string): {
+  prelude: string;
+  metadataCandidate: string;
+} {
+  const trimmed = content.trimStart();
+  if (trimmed.startsWith("Conversation info (untrusted metadata):")) {
+    return { prelude: "", metadataCandidate: trimmed };
+  }
+
+  const deliveryPrelude = /^Delivery:[\s\S]*?\r?\n\r?\n(?=Conversation info \(untrusted metadata\):)/.exec(
+    trimmed,
+  );
+  if (!deliveryPrelude) {
+    return { prelude: "", metadataCandidate: trimmed };
+  }
+  return {
+    prelude: deliveryPrelude[0],
+    metadataCandidate: trimmed.slice(deliveryPrelude[0].length),
+  };
 }
 
 function parseOpenClawInboundMetadataRecord(

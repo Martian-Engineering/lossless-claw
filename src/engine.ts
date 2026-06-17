@@ -70,6 +70,7 @@ import { batchLooksLikeHeartbeatAckTurn, pruneHeartbeatOkTurns } from "./heartbe
 import { appendUncoveredVolatileLiveInputsWithinBudget, isVolatileLiveInputMessage, messageContentCoveredBySummary, resolveProtectedFreshTailAssembledIndexes } from "./live-coverage.js";
 import { buildMessageParts, extractMessageContent, filterPersistableMessages, hasPersistableMessageRole, isOpenClawRuntimeContextLeak, toStoredMessage } from "./message-content.js";
 import { createBootstrapEntryHash, readBootstrapMessageFromJsonLine } from "./message-signatures.js";
+import { canonicalizeOpenClawInboundMetadataIdentityContent } from "./openclaw-inbound-metadata.js";
 import { PROMPT_RECALL_MAX_MESSAGES, PROMPT_RECALL_SEARCH_CANDIDATE_LIMIT, buildPromptRecallProjectionFingerprint, extractPromptRecallIdentifiers, extractPromptRecallSnippet, findPromptRecallIdentifierIndex, isPromptRecallEligibleRole, normalizePromptRecallCoverageText, normalizePromptRecallText, renderPromptRecallMessage } from "./prompt-recall.js";
 import { listTranscriptToolResultEntryIdsByCallId } from "./replay-metadata.js";
 import { estimateSessionTokenCountForAfterTurn, extractRuntimePromptTokenCount } from "./token-accounting.js";
@@ -1938,6 +1939,13 @@ export class LcmContextEngine implements ContextEngine {
                 })
               : null;
             const frontierHash = latestDbHash ?? bootstrapState.lastProcessedEntryHash;
+            const latestDbHashNeedsEntryId =
+              latestDbMessage
+                ? canonicalizeOpenClawInboundMetadataIdentityContent(
+                    latestDbMessage.role,
+                    latestDbMessage.content,
+                  ) !== latestDbMessage.content
+                : false;
             // Short-circuit before the expensive backward scan: the fast-path can
             // only succeed when the current frontier still matches the checkpoint.
             // A freshly rotated row may have no DB messages yet, so in that case
@@ -1945,7 +1953,9 @@ export class LcmContextEngine implements ContextEngine {
             // frontier no longer matches, skip straight to the async full-read
             // slow path below and avoid a backward scan that cannot succeed.
             const canTryAppendOnlyFastPath =
-              frontierHash !== null && frontierHash === bootstrapState.lastProcessedEntryHash;
+              frontierHash !== null &&
+              frontierHash === bootstrapState.lastProcessedEntryHash &&
+              (!latestDbHashNeedsEntryId || bootstrapState.lastProcessedEntryId !== null);
 
             const tailEntryRaw = canTryAppendOnlyFastPath
               ? await readLastJsonlEntryBeforeOffset(

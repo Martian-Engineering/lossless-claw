@@ -47,6 +47,28 @@ describe("ConversationStore message identity lookups", () => {
     );
   });
 
+  it("canonicalizes OpenClaw inbound metadata after a delivery prelude", () => {
+    const first = openClawInboundMetadataContent({
+      messageId: "telegram-1",
+      senderName: "Syu",
+      text: "please keep this context",
+      deliveryPrelude: "Delivery:\nRoute this inbound message through the Telegram channel.",
+    });
+    const second = openClawInboundMetadataContent({
+      messageId: "telegram-2",
+      senderName: "Syu",
+      text: "please keep this context",
+      deliveryPrelude: "Delivery:\nRoute this inbound message through the Telegram channel.",
+    });
+
+    expect(buildMessageIdentityHash("user", first)).toBe(
+      buildMessageIdentityHash("user", second),
+    );
+    const canonical = canonicalizeOpenClawInboundMetadataIdentityContent("user", first);
+    expect(canonical).toContain("Delivery:\nRoute this inbound message through the Telegram channel.");
+    expect(canonical).not.toContain("telegram-1");
+  });
+
   it("does not strip ordinary user-authored text that resembles an inbound metadata heading", () => {
     const ordinaryText = [
       "Conversation info (untrusted metadata):",
@@ -311,8 +333,10 @@ function openClawInboundMetadataContent(params: {
   messageId: string;
   senderName: string;
   text: string;
+  deliveryPrelude?: string;
 }): string {
   return [
+    ...(params.deliveryPrelude ? [params.deliveryPrelude, ""] : []),
     "Conversation info (untrusted metadata):",
     "```json",
     JSON.stringify({

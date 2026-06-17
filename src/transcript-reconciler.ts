@@ -161,17 +161,16 @@ export class TranscriptReconciler {
 
     for (const [index, message] of params.messages.entries()) {
       const stored = toStoredMessage(message);
-      const identityHash = buildMessageIdentityHash(stored.role, stored.content);
-      const key = `${stored.role}\u0000${identityHash}`;
+      const key = `${stored.role}\u0000${stored.content}`;
       const seen = (seenCounts.get(key) ?? 0) + 1;
       seenCounts.set(key, seen);
 
       let existing = existingCounts.get(key);
       if (existing === undefined) {
-        existing = await this.host.conversationStore.countMessagesByIdentityHash(
+        existing = await this.host.conversationStore.countMessagesByIdentity(
           params.conversationId,
           stored.role,
-          identityHash,
+          stored.content,
         );
         existingCounts.set(key, existing);
       }
@@ -672,12 +671,23 @@ export class TranscriptReconciler {
       const checkpointEntryHash = params.checkpointEntryHash;
       if (checkpointEntryHash) {
         // Externalized bootstrap rows no longer match raw JSONL content, so
-        // fall back to the raw transcript checkpoint before declaring no overlap.
+        // fall back to the transcript checkpoint before declaring no overlap.
+        // Refuse duplicate hash matches: canonical OpenClaw metadata can make
+        // repeated same-text inbound entries share a hash, and anchoring the
+        // later occurrence would skip intervening transcript history.
+        let checkpointHashAnchorIndex = -1;
+        let checkpointHashAmbiguous = false;
         for (let index = storedHistoricalMessages.length - 1; index >= 0; index--) {
           if (createBootstrapEntryHash(storedHistoricalMessages[index]) === checkpointEntryHash) {
-            anchorIndex = index;
-            break;
+            if (checkpointHashAnchorIndex >= 0) {
+              checkpointHashAmbiguous = true;
+              break;
+            }
+            checkpointHashAnchorIndex = index;
           }
+        }
+        if (!checkpointHashAmbiguous) {
+          anchorIndex = checkpointHashAnchorIndex;
         }
       }
 
