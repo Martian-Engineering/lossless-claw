@@ -1600,6 +1600,74 @@ describe("lcm command", () => {
     expect(helperFtsRows).toEqual([]);
   });
 
+  it("repairs rollover splits when unrelated foreign key issues already exist", async () => {
+    const fixture = createCommandFixture();
+    tempDirs.add(fixture.tempDir);
+    dbPaths.add(fixture.dbPath);
+
+    const sessionKey = "agent:main:test:rollover-preexisting-fk";
+    const archived = await fixture.conversationStore.createConversation({
+      sessionId: "rollover-preexisting-fk-old",
+      sessionKey,
+    });
+    await createRolloverConversationData(fixture, {
+      conversationId: archived.conversationId,
+      label: "oldfk",
+      includeSummary: true,
+    });
+    await fixture.conversationStore.archiveConversation(archived.conversationId);
+
+    const active = await fixture.conversationStore.createConversation({
+      sessionId: "rollover-preexisting-fk-new",
+      sessionKey,
+    });
+    await createRolloverConversationData(fixture, {
+      conversationId: active.conversationId,
+      label: "activefk",
+      includeSummary: true,
+    });
+    setConversationTimes(fixture, archived.conversationId, "2026-06-17 02:00:00", "2026-06-17 02:05:00");
+    setConversationTimes(fixture, active.conversationId, "2026-06-17 02:10:00");
+
+    // Simulate an unrelated live-DB orphan that predates rollover repair.
+    fixture.db.exec(`PRAGMA foreign_keys = OFF`);
+    fixture.db
+      .prepare(
+        `INSERT INTO message_parts (
+           part_id,
+           message_id,
+           session_id,
+           part_type,
+           ordinal,
+           text_content
+         ) VALUES ('orphan-preexisting-part', 9999999, 'orphan-session', 'text', 0, 'orphaned')`,
+      )
+      .run();
+    fixture.db.exec(`PRAGMA foreign_keys = ON`);
+
+    const beforeIssues = fixture.db.prepare(`PRAGMA foreign_key_check`).all();
+    expect(beforeIssues).toHaveLength(1);
+
+    const result = await fixture.command.handler(
+      createCommandContext("doctor apply rollover-splits confirm"),
+    );
+
+    expect(result.text).toContain("status: completed");
+    expect(result.text).toContain("repaired lanes: 1");
+    expect(result.text).toContain("foreign keys: unchanged (1 foreign key issue(s) pre-existing)");
+
+    const targetMessages = fixture.db
+      .prepare(
+        `SELECT content
+         FROM messages
+         WHERE conversation_id = ?
+         ORDER BY seq ASC`,
+      )
+      .all(active.conversationId) as Array<{ content: string }>;
+    expect(targetMessages.map((row) => row.content)).toEqual(["oldfk message", "activefk message"]);
+    expect(fixture.db.prepare(`PRAGMA foreign_key_check`).all()).toEqual(beforeIssues);
+  });
+
   it("skips rollover split repair when transcript entry ids collide", async () => {
     const fixture = createCommandFixture();
     tempDirs.add(fixture.tempDir);

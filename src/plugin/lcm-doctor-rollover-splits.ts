@@ -76,6 +76,13 @@ type DuplicateRow = {
   count: number;
 };
 
+type ForeignKeyViolationRow = {
+  table?: string;
+  rowid?: number | null;
+  parent?: string;
+  fkid?: number;
+};
+
 const HANDLED_CONVERSATION_ID_TABLES = new Set([
   "conversations",
   "messages",
@@ -536,9 +543,41 @@ function rebuildFtsTables(db: DatabaseSync): void {
   }
 }
 
-function verifyForeignKeys(db: DatabaseSync): string {
-  const rows = db.prepare(`PRAGMA foreign_key_check`).all();
-  return rows.length === 0 ? "clean" : `${rows.length} foreign key issue(s)`;
+function formatForeignKeyIssueCount(count: number): string {
+  return `${count} foreign key issue(s)`;
+}
+
+function loadForeignKeyViolationKeys(db: DatabaseSync): string[] {
+  const rows = db.prepare(`PRAGMA foreign_key_check`).all() as ForeignKeyViolationRow[];
+  return rows
+    .map((row) => [row.table ?? "", row.rowid ?? "", row.parent ?? "", row.fkid ?? ""].join("\u0000"))
+    .sort();
+}
+
+function verifyForeignKeys(db: DatabaseSync, baselineViolations: string[]): string {
+  const currentViolations = loadForeignKeyViolationKeys(db);
+  if (currentViolations.length === 0) {
+    return "clean";
+  }
+
+  const baseline = new Set(baselineViolations);
+  const newViolations = currentViolations.filter((violation) => !baseline.has(violation));
+  if (newViolations.length > 0) {
+    return formatForeignKeyIssueCount(currentViolations.length);
+  }
+
+  if (currentViolations.length === baselineViolations.length) {
+    return `unchanged (${formatForeignKeyIssueCount(currentViolations.length)} pre-existing)`;
+  }
+  return `improved (${formatForeignKeyIssueCount(currentViolations.length)} remain; no new issues)`;
+}
+
+function hasNewForeignKeyViolations(status: string): boolean {
+  return (
+    status !== "clean" &&
+    !status.startsWith("unchanged (") &&
+    !status.endsWith("no new issues)")
+  );
 }
 
 function verifyIntegrity(db: DatabaseSync): string {
@@ -656,6 +695,7 @@ export async function applyRolloverSplitRepair(params: {
     };
   }
 
+  const baselineForeignKeyViolations = loadForeignKeyViolationKeys(params.db);
   let verification = { integrity: "unknown", foreignKeys: "unknown" };
   await withDatabaseTransaction(params.db, "BEGIN IMMEDIATE", () => {
     const safeGroups = loadSafeGroups(params.db);
@@ -666,12 +706,12 @@ export async function applyRolloverSplitRepair(params: {
 
     verification = {
       integrity: verifyIntegrity(params.db),
-      foreignKeys: verifyForeignKeys(params.db),
+      foreignKeys: verifyForeignKeys(params.db, baselineForeignKeyViolations),
     };
     if (verification.integrity !== "ok") {
       throw new Error(`SQLite integrity_check failed: ${verification.integrity}`);
     }
-    if (verification.foreignKeys !== "clean") {
+    if (hasNewForeignKeyViolations(verification.foreignKeys)) {
       throw new Error(`SQLite foreign_key_check failed: ${verification.foreignKeys}`);
     }
     verifyRepairedTargets(
