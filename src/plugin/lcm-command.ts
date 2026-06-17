@@ -633,10 +633,25 @@ async function resolveRuntimeSessionId(params: {
   return normalizeIdentity(params.current.stats.sessionId);
 }
 
+function normalizePositiveInteger(value: number | null | undefined): number | null {
+  return typeof value === "number" && Number.isFinite(value) && value > 0
+    ? Math.floor(value)
+    : null;
+}
+
 function resolveLifecycleCompactionTokenBudget(config: LcmConfig): number {
-  return config.maxAssemblyTokenBudget && config.maxAssemblyTokenBudget > 0
-    ? Math.floor(config.maxAssemblyTokenBudget)
-    : 128_000;
+  return normalizePositiveInteger(config.maxAssemblyTokenBudget) ?? 128_000;
+}
+
+function resolveStatusAssemblyTokenBudget(
+  config: LcmConfig,
+  maintenance: ConversationCompactionMaintenanceRecord | null,
+): number {
+  return (
+    normalizePositiveInteger(config.maxAssemblyTokenBudget)
+    ?? normalizePositiveInteger(maintenance?.tokenBudget)
+    ?? 128_000
+  );
 }
 
 function buildDoctorApplySafetyPreflight(params: {
@@ -696,17 +711,16 @@ function buildLcmHealthSummary(params: {
   stats: LcmConversationStatusStats;
   maintenance: ConversationCompactionMaintenanceRecord | null;
 }): { state: "healthy" | "warning" | "degraded"; reasons: string[] } {
-  const tokenBudget = resolveLifecycleCompactionTokenBudget(params.config);
+  const tokenBudget = resolveStatusAssemblyTokenBudget(
+    params.config,
+    params.maintenance,
+  );
   const warningThreshold = Math.floor(tokenBudget * DOCTOR_APPLY_BUDGET_PRESSURE_RATIO);
   const activeMaintenance = params.maintenance?.pending || params.maintenance?.running;
   const assemblyObservedTokens = Math.max(
     params.stats.contextTokenCount,
     activeMaintenance ? params.maintenance?.currentTokenCount ?? 0 : 0,
     activeMaintenance ? params.maintenance?.projectedTokenCount ?? 0 : 0,
-  );
-  const repairSurfaceTokens = Math.max(
-    params.stats.summarizedSourceTokens,
-    params.stats.compressedTokenCount,
   );
   const degradedReasons: string[] = [];
   const warningReasons: string[] = [];
@@ -726,11 +740,6 @@ function buildLcmHealthSummary(params: {
   } else if (assemblyObservedTokens > warningThreshold) {
     warningReasons.push(
       `observed token count ${formatNumber(assemblyObservedTokens)} exceeds ${formatNumber(Math.round(DOCTOR_APPLY_BUDGET_PRESSURE_RATIO * 100))}% of assembly budget ${formatNumber(tokenBudget)}`,
-    );
-  }
-  if (repairSurfaceTokens > warningThreshold) {
-    warningReasons.push(
-      `repair source token count ${formatNumber(repairSurfaceTokens)} exceeds ${formatNumber(Math.round(DOCTOR_APPLY_BUDGET_PRESSURE_RATIO * 100))}% of assembly budget ${formatNumber(tokenBudget)}`,
     );
   }
   if (params.maintenance?.lastFailureSummary) {
@@ -1030,7 +1039,7 @@ async function buildStatusText(params: {
         ),
         buildStatLine("stored summary tokens", formatNumber(current.stats.storedSummaryTokens)),
         buildStatLine("summarized source tokens", formatNumber(current.stats.summarizedSourceTokens)),
-        buildStatLine("tokens in context", formatNumber(current.stats.contextTokenCount)),
+        buildStatLine("LCM frontier tokens", formatNumber(current.stats.contextTokenCount)),
         buildStatLine(
           "compression ratio",
           formatCompressionRatio(current.stats.contextTokenCount, current.stats.compressedTokenCount),
@@ -2506,7 +2515,7 @@ async function buildDoctorApplyText(params: {
         buildStatLine("status", "blocked"),
         buildStatLine("mode", "read-only; no summary rewrites ran"),
         buildStatLine("messages", formatNumber(current.stats.messageCount)),
-        buildStatLine("tokens in context", formatNumber(current.stats.contextTokenCount)),
+        buildStatLine("LCM frontier tokens", formatNumber(current.stats.contextTokenCount)),
         buildStatLine("detected summaries", formatNumber(stats.total)),
         buildStatLine("token threshold", formatNumber(preflight.tokenThreshold)),
         ...preflight.reasons.map((reason) => buildStatLine("reason", reason)),

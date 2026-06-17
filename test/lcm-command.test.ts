@@ -391,7 +391,7 @@ describe("lcm command", () => {
     expect(result.text).toContain("summaries: 2 (1 leaf, 1 condensed)");
     expect(result.text).toContain("stored summary tokens: 12");
     expect(result.text).toContain("summarized source tokens: 21");
-    expect(result.text).toContain("tokens in context: 5");
+    expect(result.text).toContain("LCM frontier tokens: 5");
     expect(result.text).toContain("compression ratio: 1:6");
     expect(result.text).toContain("lcm health: healthy");
     expect(result.text).toContain("transport health: not assessed by Lossless Claw");
@@ -1116,7 +1116,68 @@ describe("lcm command", () => {
     );
   });
 
-  it("warns when repair-source pressure would block doctor apply even if active context is small", async () => {
+  it("uses the last runtime maintenance budget for status health when no cap is configured", async () => {
+    const fixture = createCommandFixture();
+    tempDirs.add(fixture.tempDir);
+    dbPaths.add(fixture.dbPath);
+
+    const conversation = await fixture.conversationStore.createConversation({
+      sessionId: "status-runtime-budget-session",
+      sessionKey: "agent:main:telegram:runtime-budget:1",
+      title: "Runtime budget fixture",
+    });
+    const [message] = await fixture.conversationStore.createMessagesBulk([
+      {
+        conversationId: conversation.conversationId,
+        seq: 0,
+        role: "user",
+        content: "frontier above fallback but below runtime threshold",
+        tokenCount: 144_291,
+      },
+    ]);
+    await fixture.summaryStore.appendContextMessages(conversation.conversationId, [message.messageId]);
+    fixture.db
+      .prepare(
+        `INSERT INTO conversation_compaction_maintenance (
+           conversation_id,
+           pending,
+           requested_at,
+           reason,
+           running,
+           last_started_at,
+           last_finished_at,
+           token_budget,
+           current_token_count,
+           projected_token_count,
+           updated_at
+         ) VALUES (?, 0, ?, ?, 0, ?, ?, ?, ?, ?, datetime('now'))`,
+      )
+      .run(
+        conversation.conversationId,
+        "2026-06-17T18:22:15.729Z",
+        "threshold",
+        "2026-06-17T18:52:47.111Z",
+        "2026-06-17T18:52:47.113Z",
+        258_000,
+        75_448,
+        228_874,
+      );
+
+    const result = await fixture.command.handler(
+      createCommandContext(undefined, {
+        sessionKey: "agent:main:telegram:runtime-budget:1",
+        sessionId: "status-runtime-budget-session",
+      }),
+    );
+
+    expect(result.text).toContain("LCM frontier tokens: 144,291");
+    expect(result.text).toContain("requested token budget: 258,000");
+    expect(result.text).toContain("lcm health: healthy");
+    expect(result.text).not.toContain("assembly budget 128,000");
+    expect(result.text).not.toContain("lcm reason: observed token count 144,291");
+  });
+
+  it("does not surface repair-source pressure in default status output", async () => {
     const fixture = createCommandFixture();
     tempDirs.add(fixture.tempDir);
     dbPaths.add(fixture.dbPath);
@@ -1160,11 +1221,9 @@ describe("lcm command", () => {
       }),
     );
 
-    expect(result.text).toContain("tokens in context: 8");
-    expect(result.text).toContain("lcm health: warning");
-    expect(result.text).toContain(
-      "lcm reason: repair source token count 120,000 exceeds 75% of assembly budget 128,000",
-    );
+    expect(result.text).toContain("LCM frontier tokens: 8");
+    expect(result.text).toContain("lcm health: healthy");
+    expect(result.text).not.toContain("repair source token count");
   });
 
   it("does not treat stale idle maintenance token counts as degraded status", async () => {
@@ -1222,7 +1281,7 @@ describe("lcm command", () => {
       }),
     );
 
-    expect(result.text).toContain("tokens in context: 8");
+    expect(result.text).toContain("LCM frontier tokens: 8");
     expect(result.text).toContain("state: idle");
     expect(result.text).toContain("observed token count: 150");
     expect(result.text).toContain("lcm health: healthy");
@@ -1263,7 +1322,7 @@ describe("lcm command", () => {
     expect(result.text).not.toContain("session id:");
     expect(result.text).toContain("session key: missing");
     expect(result.text).toContain("messages: 1");
-    expect(result.text).toContain("tokens in context: 0");
+    expect(result.text).toContain("LCM frontier tokens: 0");
     expect(result.text).toContain("compression ratio: n/a");
   });
 

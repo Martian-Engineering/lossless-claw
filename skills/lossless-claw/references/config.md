@@ -788,7 +788,7 @@ Design note: stripping happens at compaction time, not at message ingestion.  Th
 
 Useful interpretation notes:
 
-- `tokens in context` is the current LCM frontier token count in the live LCM state.
+- `LCM frontier tokens` is the current LCM frontier token count in the live LCM state.
 - `compression ratio` is shown as a rounded `1:N`, which is easier to read than a tiny percentage for heavily compacted conversations.
 - `/status` may still show a different context number because it reflects the runtime prompt that was actually assembled and sent on the last turn.
 
