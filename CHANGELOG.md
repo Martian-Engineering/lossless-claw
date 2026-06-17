@@ -1,5 +1,21 @@
 # @martian-engineering/lossless-claw
 
+## 0.13.1
+
+### Patch Changes
+
+- [#908](https://github.com/Martian-Engineering/lossless-claw/pull/908) [`612bd99`](https://github.com/Martian-Engineering/lossless-claw/commit/612bd996f53d20ea5107465f8c1a313fa3cb84ff) Thanks [@jalehman](https://github.com/jalehman)! - Prefer transcript message timestamps during import so replayed history preserves message ordering when envelope timestamps are coarse.
+
+- [#901](https://github.com/Martian-Engineering/lossless-claw/pull/901) [`7321e24`](https://github.com/Martian-Engineering/lossless-claw/commit/7321e243ac1e64ec5f44054f136c25d5fe63de7f) Thanks [@SYU8384](https://github.com/SYU8384)! - Canonicalize OpenClaw inbound metadata when computing message identity and bootstrap hashes so volatile message metadata does not stall context continuity while raw transcript content stays lossless.
+
+- [#909](https://github.com/Martian-Engineering/lossless-claw/pull/909) [`286e48f`](https://github.com/Martian-Engineering/lossless-claw/commit/286e48fcb2c702cf5cb2da33dc2f501b4fd08632) Thanks [@jalehman](https://github.com/jalehman)! - Clean up `/lossless` status output by using the last runtime maintenance budget when no explicit assembly cap is configured, renaming the frontier token metric, removing repair-source pressure from default status reasons, and shortening maintenance details to actionable state. Also tighten `/lossless doctor apply` safety output to show scoped repair targets, repair input tokens, and deduplicated repair target source tokens instead of whole-conversation message-count or compressed-source proxies.
+
+- [#906](https://github.com/Martian-Engineering/lossless-claw/pull/906) [`623c087`](https://github.com/Martian-Engineering/lossless-claw/commit/623c087057cf4d5502312ceba1fd1a80f8c80a2e) Thanks [@jalehman](https://github.com/jalehman)! - Add `/lossless doctor` detection and confirmed repair for safe whole-DB fresh-transcript rollover split memory.
+
+- [#907](https://github.com/Martian-Engineering/lossless-claw/pull/907) [`70e65d0`](https://github.com/Martian-Engineering/lossless-claw/commit/70e65d046349f84aadd70d2c1d3b4498c72709f4) Thanks [@jalehman](https://github.com/jalehman)! - Fix default-scoped recall tools so they receive the active OpenClaw runtime session id when resolving the current LCM conversation.
+
+- [#903](https://github.com/Martian-Engineering/lossless-claw/pull/903) [`fad7291`](https://github.com/Martian-Engineering/lossless-claw/commit/fad72915af6ce22bc70ce0e597c7cde16abaec49) Thanks [@jalehman](https://github.com/jalehman)! - Preserve conversation ids during fresh transcript rollover by rebinding the existing LCM conversation to the new runtime session instead of archiving it and creating an empty replacement.
+
 ## 0.13.0
 
 ### Minor Changes
