@@ -41,6 +41,8 @@ import { FocusBriefStore, hashFocusSourceContext } from "../store/focus-brief-st
 
 const VISIBLE_COMMAND = "/lossless";
 const HIDDEN_ALIAS = "/lcm";
+const LOSSLESS_PLUGIN_ID = "lossless-claw";
+const LOSSLESS_NPM_PACKAGE = "@martian-engineering/lossless-claw";
 const ROTATE_DATABASE_LOCK_TIMEOUT_MS = 30_000;
 const DOCTOR_APPLY_LARGE_TARGET_THRESHOLD = 25;
 const DOCTOR_APPLY_BUDGET_PRESSURE_RATIO = 0.75;
@@ -87,6 +89,11 @@ type DoctorApplyRepairMetrics = {
 };
 type RolloverSplitApplyOptions = {
   confirm: boolean;
+};
+type LcmInstallTrackWarning = {
+  kind: "exact-pinned";
+  spec: string;
+  version: string;
 };
 
 type ParsedLcmCommand =
@@ -187,6 +194,147 @@ function buildStatLine(label: string, value: string): string {
 function formatFailureReason(error: unknown): string {
   const message = describeLogError(error).trim();
   return message || "Unknown error";
+}
+
+function readStringField(record: Record<string, unknown> | undefined, key: string): string {
+  const value = record?.[key];
+  return typeof value === "string" ? value.trim() : "";
+}
+
+function listConfigCandidates(ctx: PluginCommandContext, fallbackConfig?: unknown): unknown[] {
+  const candidates: unknown[] = [];
+  if (ctx.config !== undefined) {
+    candidates.push(ctx.config);
+  }
+  if (fallbackConfig !== undefined && fallbackConfig !== ctx.config) {
+    candidates.push(fallbackConfig);
+  }
+  return candidates;
+}
+
+function readEffectiveSelectionConfig(
+  ctx: PluginCommandContext,
+  fallbackConfig?: unknown,
+): unknown {
+  return ctx.config ?? fallbackConfig;
+}
+
+function normalizeLosslessInstallRecord(value: unknown): Record<string, unknown> | undefined {
+  const record = asRecord(value);
+  if (!record) {
+    return undefined;
+  }
+
+  const id = readStringField(record, "id") || readStringField(record, "pluginId");
+  const name = readStringField(record, "name") || readStringField(record, "packageName");
+  const spec =
+    readStringField(record, "spec")
+    || readStringField(record, "installSpec")
+    || readStringField(record, "packageSpec")
+    || readStringField(record, "resolvedSpec");
+  if (
+    (id && id !== LOSSLESS_PLUGIN_ID)
+    || (name && name !== LOSSLESS_PLUGIN_ID && name !== LOSSLESS_NPM_PACKAGE)
+  ) {
+    return undefined;
+  }
+  if (!id && !name && spec && !spec.includes(LOSSLESS_NPM_PACKAGE)) {
+    return undefined;
+  }
+  return record;
+}
+
+function collectLosslessInstallRecords(config: unknown): Record<string, unknown>[] {
+  const root = asRecord(config);
+  const plugins = asRecord(root?.plugins);
+  const entries = asRecord(plugins?.entries);
+  const entry = asRecord(entries?.[LOSSLESS_PLUGIN_ID]);
+  const records: Record<string, unknown>[] = [];
+
+  const pushRecord = (value: unknown): void => {
+    const record = normalizeLosslessInstallRecord(value);
+    if (record) {
+      records.push(record);
+    }
+  };
+
+  pushRecord(entry);
+
+  for (const container of [
+    asRecord(plugins?.installs),
+    asRecord(plugins?.installed),
+    asRecord(plugins?.registry),
+    asRecord(root?.pluginInstalls),
+  ]) {
+    pushRecord(container?.[LOSSLESS_PLUGIN_ID]);
+    pushRecord(container?.[LOSSLESS_NPM_PACKAGE]);
+  }
+
+  for (const list of [plugins?.installs, plugins?.installed, root?.pluginInstalls]) {
+    if (Array.isArray(list)) {
+      for (const item of list) {
+        pushRecord(item);
+      }
+    }
+  }
+
+  return records;
+}
+
+function parseExactLosslessPackageVersion(spec: string): string | null {
+  const trimmed = spec.trim();
+  if (!trimmed.startsWith(`${LOSSLESS_NPM_PACKAGE}@`)) {
+    return null;
+  }
+  const version = trimmed.slice(LOSSLESS_NPM_PACKAGE.length + 1).trim();
+  return /^\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?(?:\+[0-9A-Za-z.-]+)?$/.test(version)
+    ? version
+    : null;
+}
+
+function detectLcmInstallTrackWarning(params: {
+  ctx: PluginCommandContext;
+  fallbackConfig?: unknown;
+}): LcmInstallTrackWarning | null {
+  const selectionConfig = readEffectiveSelectionConfig(params.ctx, params.fallbackConfig);
+  if (!resolvePluginEnabled(selectionConfig) || !resolvePluginSelected(selectionConfig)) {
+    return null;
+  }
+
+  for (const config of listConfigCandidates(params.ctx, params.fallbackConfig)) {
+    for (const record of collectLosslessInstallRecords(config)) {
+      const source = readStringField(record, "source") || readStringField(record, "type");
+      if (source && source !== "npm") {
+        continue;
+      }
+      const spec =
+        readStringField(record, "spec")
+        || readStringField(record, "installSpec")
+        || readStringField(record, "packageSpec")
+        || readStringField(record, "resolvedSpec");
+      const version = parseExactLosslessPackageVersion(spec);
+      if (version) {
+        return { kind: "exact-pinned", spec, version };
+      }
+    }
+  }
+
+  return null;
+}
+
+function buildInstallTrackWarningSection(warning: LcmInstallTrackWarning): string {
+  return buildSection("⚠️ Update track", [
+    buildStatLine("status", warning.kind),
+    buildStatLine("installed spec", formatCommand(warning.spec)),
+    buildStatLine(
+      "impact",
+      "OpenClaw plugin update sync will keep this exact version and will not follow new LCM releases.",
+    ),
+    buildStatLine(
+      "repair",
+      formatCommand(`openclaw plugins update ${LOSSLESS_NPM_PACKAGE}@latest`),
+    ),
+  ]);
 }
 
 function formatCompressionRatio(contextTokens: number, compressedTokens: number): string {
@@ -1062,6 +1210,7 @@ async function buildStatusText(params: {
   ctx: PluginCommandContext;
   db: DatabaseSync;
   config: LcmConfig;
+  openClawConfig?: unknown;
 }): Promise<string> {
   const status = getLcmStatusStats(params.db);
   const doctor = getDoctorSummaryStats(params.db);
@@ -1070,6 +1219,10 @@ async function buildStatusText(params: {
   const selected = resolvePluginSelected(params.ctx.config);
   const slot = resolveContextEngineSlot(params.ctx.config);
   const dbSize = resolveDbSizeLabel(params.config.databasePath);
+  const installTrackWarning = detectLcmInstallTrackWarning({
+    ctx: params.ctx,
+    fallbackConfig: params.openClawConfig,
+  });
   const current = await resolveCurrentConversation({
     ctx: params.ctx,
     db: params.db,
@@ -1085,6 +1238,13 @@ async function buildStatusText(params: {
       buildStatLine("db size", dbSize),
     ]),
     "",
+  ];
+
+  if (installTrackWarning) {
+    lines.push(buildInstallTrackWarningSection(installTrackWarning), "");
+  }
+
+  lines.push(
     buildSection("🌐 Global", [
       buildStatLine("conversations", formatNumber(status.conversationCount)),
       buildStatLine(
@@ -1095,7 +1255,7 @@ async function buildStatusText(params: {
       buildStatLine("summarized source tokens", formatNumber(status.summarizedSourceTokens)),
     ]),
     "",
-  ];
+  );
 
   if (rolloverSplits.safe.length > 0 || rolloverSplits.needsReview.length > 0) {
     lines.push(buildRolloverSplitScanSection(rolloverSplits), "");
@@ -1180,16 +1340,26 @@ async function buildStatusText(params: {
 async function buildDoctorText(params: {
   ctx: PluginCommandContext;
   db: DatabaseSync;
+  openClawConfig?: unknown;
 }): Promise<string> {
   const rolloverSplits = scanRolloverSplits(params.db);
+  const installTrackWarning = detectLcmInstallTrackWarning({
+    ctx: params.ctx,
+    fallbackConfig: params.openClawConfig,
+  });
   const current = await resolveCurrentConversation(params);
 
   if (current.kind === "unavailable") {
-    return [
+    const lines = [
       ...buildHeaderLines(),
       "",
       "🩺 Lossless Claw Doctor",
       "",
+    ];
+    if (installTrackWarning) {
+      lines.push(buildInstallTrackWarningSection(installTrackWarning), "");
+    }
+    lines.push(
       buildSection("📍 Current conversation", [
         buildStatLine("status", "unavailable"),
         buildStatLine("reason", current.reason),
@@ -1197,7 +1367,8 @@ async function buildDoctorText(params: {
       ]),
       "",
       buildRolloverSplitScanSection(rolloverSplits),
-    ].join("\n");
+    );
+    return lines.join("\n");
   }
 
   const stats = getDoctorSummaryStats(params.db, current.stats.conversationId);
@@ -1206,6 +1377,11 @@ async function buildDoctorText(params: {
     "",
     "🩺 Lossless Claw Doctor",
     "",
+  ];
+  if (installTrackWarning) {
+    lines.push(buildInstallTrackWarningSection(installTrackWarning), "");
+  }
+  lines.push(
     buildSection("📍 Current conversation", [
       buildStatLine("conversation id", formatNumber(current.stats.conversationId)),
       buildStatLine(
@@ -1225,7 +1401,7 @@ async function buildDoctorText(params: {
     ]),
     "",
     buildRolloverSplitScanSection(rolloverSplits),
-  ];
+  );
 
   if (stats.total > 0) {
     const summaryList = stats.candidates
@@ -2721,6 +2897,7 @@ async function buildDoctorApplyText(params: {
 export function createLcmCommand(params: {
   db: DatabaseSync | (() => DatabaseSync | Promise<DatabaseSync>);
   config: LcmConfig;
+  openClawConfig?: unknown;
   deps?: LcmDependencies;
   summarize?: LcmSummarizeFn;
   getLcm?: () => Promise<RuntimeCommandEngine>;
@@ -2743,7 +2920,14 @@ export function createLcmCommand(params: {
       const parsed = parseLcmCommand(ctx.args);
       switch (parsed.kind) {
         case "status":
-          return { text: await buildStatusText({ ctx, db: await getDb(), config: params.config }) };
+          return {
+            text: await buildStatusText({
+              ctx,
+              db: await getDb(),
+              config: params.config,
+              openClawConfig: params.openClawConfig,
+            }),
+          };
         case "backup":
           return {
             text: await buildBackupText({
@@ -2806,7 +2990,13 @@ export function createLcmCommand(params: {
                   options: parsed.applyOptions,
                 }),
               }
-            : { text: await buildDoctorText({ ctx, db: await getDb() }) };
+            : {
+                text: await buildDoctorText({
+                  ctx,
+                  db: await getDb(),
+                  openClawConfig: params.openClawConfig,
+                }),
+              };
         case "doctor_rollover_splits":
           return parsed.apply
             ? {

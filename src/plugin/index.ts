@@ -1621,6 +1621,7 @@ function wirePluginHandlers(
   api: ContextEngineCapableOpenClawPluginApi,
   deps: LcmDependencies,
   shared: SharedLcmInit,
+  openClawConfig?: unknown,
 ): void {
   api.on("before_reset", async (event, ctx) => {
     await (await shared.waitForEngine()).handleBeforeReset({
@@ -1696,6 +1697,7 @@ function wirePluginHandlers(
     createLcmCommand({
       db: shared.waitForDatabase,
       config: deps.config,
+      openClawConfig,
       deps,
       getLcm: shared.waitForEngine,
     }),
@@ -1906,7 +1908,7 @@ const lcmPlugin = {
           logStartupMaintenanceSchedulingError,
         );
       }
-      wirePluginHandlers(api, deps, existingInit);
+      wirePluginHandlers(api, deps, existingInit, registrationConfig.openClawConfig);
       return;
     }
 
@@ -2109,7 +2111,7 @@ const lcmPlugin = {
       removeSharedInit(normalizedDbPath);
     });
 
-    wirePluginHandlers(api, deps, nextShared);
+    wirePluginHandlers(api, deps, nextShared, registrationConfig.openClawConfig);
 
     logStartupBannerOnce({
       key: "plugin-loaded",

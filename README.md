@@ -73,13 +73,19 @@ The bundled skill focuses on configuration, diagnostics, architecture, and recal
 Use OpenClaw's plugin installer (recommended):
 
 ```bash
-openclaw plugins install @martian-engineering/lossless-claw
+openclaw plugins install @martian-engineering/lossless-claw@latest
 ```
 
 If you're running from a local OpenClaw checkout, use:
 
 ```bash
-pnpm openclaw plugins install @martian-engineering/lossless-claw
+pnpm openclaw plugins install @martian-engineering/lossless-claw@latest
+```
+
+Use exact versions only for rollback or reproducible canary testing. OpenClaw records an exact install spec such as `@martian-engineering/lossless-claw@0.12.0` as a pinned update track, so OpenClaw plugin update sync will keep that version until you move back to the stable track:
+
+```bash
+openclaw plugins update @martian-engineering/lossless-claw@latest
 ```
 
 For local plugin development, build your working copy first, then link it instead of copying files:

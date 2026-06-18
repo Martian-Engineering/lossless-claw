@@ -141,13 +141,19 @@ Notes on the example:
 Install with OpenClaw's plugin installer:
 
 ```bash
-openclaw plugins install @martian-engineering/lossless-claw
+openclaw plugins install @martian-engineering/lossless-claw@latest
 ```
 
 If you are running from a local OpenClaw checkout:
 
 ```bash
-pnpm openclaw plugins install @martian-engineering/lossless-claw
+pnpm openclaw plugins install @martian-engineering/lossless-claw@latest
+```
+
+Use exact versions only for rollback or reproducible canary testing. OpenClaw treats an exact install spec such as `@martian-engineering/lossless-claw@0.12.0` as pinned, so plugin update sync will not follow newer LCM releases until you return to the moving track:
+
+```bash
+openclaw plugins update @martian-engineering/lossless-claw@latest
 ```
 
 For local plugin development, link a working copy:
