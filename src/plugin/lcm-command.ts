@@ -1,8 +1,9 @@
 import { existsSync, statSync } from "node:fs";
-import type { DatabaseSync } from "node:sqlite";
+import { join } from "node:path";
+import { DatabaseSync } from "node:sqlite";
 import packageJson from "../../package.json" with { type: "json" };
 import { formatTimestamp } from "../compaction.js";
-import type { LcmConfig } from "../db/config.js";
+import { resolveOpenclawStateDir, type LcmConfig } from "../db/config.js";
 import type { RotateSessionStorageWithBackupResult } from "../engine.js";
 import { runDelegatedFocusBrief, runDelegatedRefocusBrief } from "../focus-briefs.js";
 import type { LcmSummarizeFn } from "../summarize.js";
@@ -43,6 +44,7 @@ const VISIBLE_COMMAND = "/lossless";
 const HIDDEN_ALIAS = "/lcm";
 const LOSSLESS_PLUGIN_ID = "lossless-claw";
 const LOSSLESS_NPM_PACKAGE = "@martian-engineering/lossless-claw";
+const INSTALLED_PLUGIN_INDEX_KEY = "installed-plugin-index";
 const ROTATE_DATABASE_LOCK_TIMEOUT_MS = 30_000;
 const DOCTOR_APPLY_LARGE_TARGET_THRESHOLD = 25;
 const DOCTOR_APPLY_BUDGET_PRESSURE_RATIO = 0.75;
@@ -219,6 +221,52 @@ function readEffectiveSelectionConfig(
   return ctx.config ?? fallbackConfig;
 }
 
+function parseJsonRecord(value: string | null | undefined): Record<string, unknown> | undefined {
+  if (!value) {
+    return undefined;
+  }
+  try {
+    return asRecord(JSON.parse(value) as unknown);
+  } catch {
+    return undefined;
+  }
+}
+
+function resolveOpenClawStateSqlitePath(): string | undefined {
+  if (process.env.VITEST && !process.env.OPENCLAW_STATE_DIR?.trim()) {
+    return undefined;
+  }
+  return join(resolveOpenclawStateDir(), "state", "openclaw.sqlite");
+}
+
+/** Read the host's durable install metadata when OpenClaw has not exposed it on command config. */
+function readPersistedOpenClawInstallRecords(): Record<string, unknown> | undefined {
+  const dbPath = resolveOpenClawStateSqlitePath();
+  if (!dbPath || !existsSync(dbPath)) {
+    return undefined;
+  }
+
+  let db: DatabaseSync | undefined;
+  try {
+    db = new DatabaseSync(dbPath, { readOnly: true });
+    const row = db.prepare(
+      `SELECT install_records_json
+         FROM installed_plugin_index
+        WHERE index_key = ?`,
+    ).get(INSTALLED_PLUGIN_INDEX_KEY) as { install_records_json?: string | null } | undefined;
+    return parseJsonRecord(row?.install_records_json);
+  } catch {
+    return undefined;
+  } finally {
+    db?.close();
+  }
+}
+
+function readPersistedOpenClawInstallRecordsConfig(): unknown {
+  const installRecords = readPersistedOpenClawInstallRecords();
+  return installRecords ? { plugins: { installs: installRecords } } : undefined;
+}
+
 function normalizeLosslessInstallRecord(value: unknown): Record<string, unknown> | undefined {
   const record = asRecord(value);
   if (!record) {
@@ -301,7 +349,10 @@ function detectLcmInstallTrackWarning(params: {
     return null;
   }
 
-  for (const config of listConfigCandidates(params.ctx, params.fallbackConfig)) {
+  for (const config of [
+    ...listConfigCandidates(params.ctx, params.fallbackConfig),
+    readPersistedOpenClawInstallRecordsConfig(),
+  ]) {
     for (const record of collectLosslessInstallRecords(config)) {
       const source = readStringField(record, "source") || readStringField(record, "type");
       if (source && source !== "npm") {

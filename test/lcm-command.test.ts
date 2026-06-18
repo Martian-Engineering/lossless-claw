@@ -1,7 +1,7 @@
-import { existsSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import type { DatabaseSync } from "node:sqlite";
+import { DatabaseSync } from "node:sqlite";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { runLcmMigrations } from "../src/db/migration.js";
 import { getLcmDbFeatures } from "../src/db/features.js";
@@ -68,6 +68,38 @@ function createCommandContext(
 }
 
 type CommandFixture = ReturnType<typeof createCommandFixture>;
+
+function writeOpenClawInstallRecord(params: {
+  stateDir: string;
+  pluginId: string;
+  record: Record<string, unknown>;
+}): void {
+  const stateDbDir = join(params.stateDir, "state");
+  mkdirSync(stateDbDir, { recursive: true });
+  const db = new DatabaseSync(join(stateDbDir, "openclaw.sqlite"));
+  try {
+    db.exec(`
+      CREATE TABLE installed_plugin_index (
+        index_key TEXT PRIMARY KEY,
+        install_records_json TEXT NOT NULL,
+        plugins_json TEXT NOT NULL
+      )
+    `);
+    db.prepare(
+      `INSERT INTO installed_plugin_index (
+         index_key,
+         install_records_json,
+         plugins_json
+       ) VALUES (?, ?, ?)`,
+    ).run(
+      "installed-plugin-index",
+      JSON.stringify({ [params.pluginId]: params.record }),
+      "[]",
+    );
+  } finally {
+    db.close();
+  }
+}
 
 async function createRolloverConversationData(
   fixture: CommandFixture,
@@ -204,6 +236,7 @@ describe("lcm command", () => {
 
   afterEach(() => {
     vi.restoreAllMocks();
+    vi.unstubAllEnvs();
     for (const dbPath of dbPaths) {
       closeLcmConnection(dbPath);
     }
@@ -317,6 +350,28 @@ describe("lcm command", () => {
     expect(result.text).toContain("installed spec: `@martian-engineering/lossless-claw@0.12.0`");
     expect(result.text).toContain("impact: OpenClaw plugin update sync will keep this exact version");
     expect(result.text).toContain("repair: `openclaw plugins update @martian-engineering/lossless-claw@latest`");
+  });
+
+  it("warns when status sees an exact npm install spec in OpenClaw's installed plugin index", async () => {
+    const fixture = createCommandFixture();
+    tempDirs.add(fixture.tempDir);
+    dbPaths.add(fixture.dbPath);
+    const stateDir = join(fixture.tempDir, "openclaw-state");
+    vi.stubEnv("OPENCLAW_STATE_DIR", stateDir);
+    writeOpenClawInstallRecord({
+      stateDir,
+      pluginId: "lossless-claw",
+      record: {
+        source: "npm",
+        spec: "@martian-engineering/lossless-claw@0.12.0",
+        version: "0.12.0",
+      },
+    });
+
+    const result = await fixture.command.handler(createCommandContext());
+
+    expect(result.text).toContain("**⚠️ Update track**");
+    expect(result.text).toContain("installed spec: `@martian-engineering/lossless-claw@0.12.0`");
   });
 
   it("does not warn when status sees a moving npm install spec", async () => {
