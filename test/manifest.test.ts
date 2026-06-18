@@ -135,4 +135,11 @@ describe("openclaw.plugin.json manifest drift guard (#570)", () => {
     expect(manifest.kind).toBe("context-engine");
     expect(manifest.activation?.onStartup).toBe(true);
   });
+
+  it("declares both supported runtime slash commands for lazy activation", () => {
+    expect(manifest.commandAliases).toEqual([
+      { name: "lossless", kind: "runtime-slash" },
+      { name: "lcm", kind: "runtime-slash" },
+    ]);
+  });
 });

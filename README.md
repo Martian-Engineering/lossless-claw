@@ -33,27 +33,28 @@ Nothing is lost. Raw messages stay in the database. Summaries link back to their
 
 The plugin now ships a bundled `lossless-claw` skill plus a small plugin command surface for supported OpenClaw chat/native command providers:
 
-- `/lcm` shows version, enablement/selection state, DB path and size, summary counts, and summary-health status
-- `/lcm backup` creates a timestamped backup of the current LCM SQLite database
-- `/lcm rotate` rewrites the active session transcript into a compact tail-preserving form without changing the live OpenClaw session identity or current LCM conversation
-- `/lcm doctor` scans for broken or truncated summaries
-- `/lcm doctor clean` shows read-only high-confidence junk diagnostics for archived subagents, cron sessions, and NULL-key orphaned subagent runs
-- `/lcm status` shows plugin, conversation, and maintenance state including deferred compaction debt
-- `/lossless` is an alias for `/lcm` on supported native command surfaces
+- `/lossless` shows version, enablement/selection state, DB path and size, summary counts, and summary-health status
+- `/lossless backup` creates a timestamped backup of the current LCM SQLite database
+- `/lossless rotate` rewrites the active session transcript into a compact tail-preserving form without changing the live OpenClaw session identity or current LCM conversation
+- `/lossless doctor` scans for broken or truncated summaries
+- `/lossless doctor clean` shows read-only high-confidence junk diagnostics for archived subagents, cron sessions, and NULL-key orphaned subagent runs
+- `/lossless status` shows plugin, conversation, and maintenance state including deferred compaction debt
+- `/lcm` is the shorter alias for `/lossless`
 
 These are plugin slash/native commands, not root shell CLI subcommands. Supported examples:
 
-- `/lcm`
-- `/lcm backup`
-- `/lcm rotate`
-- `/lcm doctor`
-- `/lcm doctor clean`
 - `/lossless`
+- `/lossless backup`
+- `/lossless rotate`
+- `/lossless doctor`
+- `/lossless doctor clean`
+- `/lcm`
 
 Not currently supported as root CLI commands:
 
-- `openclaw lcm`
 - `openclaw lossless`
+- `openclaw lcm`
+- `openclaw /lossless`
 - `openclaw /lcm`
 
 The bundled skill focuses on configuration, diagnostics, architecture, and recall-tool usage. Its reference set lives under `skills/lossless-claw/references/`.
@@ -313,7 +314,7 @@ For large sessions, neither command is a perfect “keep my live agent context, 
 - `/new` keeps writing into the same active LCM conversation row.
 - `/reset` changes OpenClaw session flow, which is heavier than users often want when their real problem is just LCM row size.
 
-`/lcm rotate` fills that gap. Before trimming the transcript, it forces leaf-only compaction for raw context outside the preserved live tail so older transcript messages are represented by LCM summaries. It then replaces one rolling `rotate-latest` SQLite backup, rewrites the current session transcript down to the preserved live tail plus current session settings, and refreshes the bootstrap frontier on the same active LCM conversation so dropped transcript history is not replayed. Existing durable messages, summaries, context items, and conversation identity stay in place; only the transcript backing is compacted. If you want additional timestamped snapshots instead, run `/lcm backup`.
+`/lossless rotate` fills that gap. Before trimming the transcript, it forces leaf-only compaction for raw context outside the preserved live tail so older transcript messages are represented by LCM summaries. It then replaces one rolling `rotate-latest` SQLite backup, rewrites the current session transcript down to the preserved live tail plus current session settings, and refreshes the bootstrap frontier on the same active LCM conversation so dropped transcript history is not replayed. Existing durable messages, summaries, context items, and conversation identity stay in place; only the transcript backing is compacted. If you want additional timestamped snapshots instead, run `/lossless backup`.
 
 `newSessionRetainDepth` (or `LCM_NEW_SESSION_RETAIN_DEPTH`) controls how much summary structure survives `/new`:
 

@@ -3549,6 +3549,23 @@ describe("lcm command", () => {
     expect(result.text).toContain("`/lcm` is accepted as a shorter alias.");
   });
 
+  it("uses the visible /lossless command in subcommand argument errors", async () => {
+    const fixture = createCommandFixture();
+    tempDirs.add(fixture.tempDir);
+    dbPaths.add(fixture.dbPath);
+
+    const status = await fixture.command.handler(createCommandContext("status extra"));
+    const backup = await fixture.command.handler(createCommandContext("backup extra"));
+    const rotate = await fixture.command.handler(createCommandContext("rotate extra"));
+
+    expect(status.text).toContain("`/lossless status` does not accept extra arguments.");
+    expect(backup.text).toContain("`/lossless backup` does not accept extra arguments.");
+    expect(rotate.text).toContain("`/lossless rotate` does not accept extra arguments.");
+    expect(status.text).not.toContain("`/lcm status` does not accept extra arguments.");
+    expect(backup.text).not.toContain("`/lcm backup` does not accept extra arguments.");
+    expect(rotate.text).not.toContain("`/lcm rotate` does not accept extra arguments.");
+  });
+
   it("accepts db as a lazy function and does not invoke it for help", async () => {
     const dbFn = vi.fn((): never => {
       throw new Error("should not be called for help");

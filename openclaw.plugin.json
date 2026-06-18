@@ -5,6 +5,16 @@
   "activation": {
     "onStartup": true
   },
+  "commandAliases": [
+    {
+      "name": "lossless",
+      "kind": "runtime-slash"
+    },
+    {
+      "name": "lcm",
+      "kind": "runtime-slash"
+    }
+  ],
   "skills": [
     "skills/lossless-claw"
   ],

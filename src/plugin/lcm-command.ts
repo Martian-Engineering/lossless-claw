@@ -321,15 +321,24 @@ function parseLcmCommand(rawArgs: string | undefined): ParsedLcmCommand {
     case "status":
       return rest.length === 0
         ? { kind: "status" }
-        : { kind: "help", error: "`/lcm status` does not accept extra arguments." };
+        : {
+            kind: "help",
+            error: `\`${VISIBLE_COMMAND} status\` does not accept extra arguments.`,
+          };
     case "backup":
       return rest.length === 0
         ? { kind: "backup" }
-        : { kind: "help", error: "`/lcm backup` does not accept extra arguments." };
+        : {
+            kind: "help",
+            error: `\`${VISIBLE_COMMAND} backup\` does not accept extra arguments.`,
+          };
     case "rotate":
       return rest.length === 0
         ? { kind: "rotate" }
-        : { kind: "help", error: "`/lcm rotate` does not accept extra arguments." };
+        : {
+            kind: "help",
+            error: `\`${VISIBLE_COMMAND} rotate\` does not accept extra arguments.`,
+          };
     case "doctor":
       if (rest.length === 0) {
         return { kind: "doctor", apply: false };
