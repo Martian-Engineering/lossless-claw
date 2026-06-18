@@ -5,7 +5,10 @@
  */
 import { buildMessageParts, toStoredMessage, type StoredMessage } from "./message-content.js";
 import type { AgentMessage } from "./openclaw-bridge.js";
-import { canonicalizeOpenClawInboundMetadataIdentityContent } from "./openclaw-inbound-metadata.js";
+import {
+  canonicalizeOpenClawInboundMetadataIdentityContent,
+  extractOpenClawInboundBody,
+} from "./openclaw-inbound-metadata.js";
 import type { CreateMessagePartInput } from "./store/conversation-store.js";
 import { extractToolResultIdForPairing } from "./tool-pairing.js";
 import { extractBootstrapMessageCandidate } from "./transcript.js";
@@ -36,7 +39,18 @@ export function readBootstrapMessageFromJsonLine(line: string | null): AgentMess
 }
 
 export function messageIdentity(role: string, content: string): string {
-  return `${role}\u0000${content}`;
+  // In-memory identity for dedup / replay detection / after-turn alignment.
+  // OpenClaw delivers each channel turn in two forms - the live model-facing
+  // copy decorated with injected untrusted-metadata blocks, and the bare
+  // transcript copy - which are the SAME logical message and must align so the
+  // covered-frontier dedup does not persist a duplicate row (issue #912).
+  // Strip the inbound decoration for user content before forming the identity.
+  // This is NOT the persisted identity hash (buildMessageIdentityHash /
+  // canonicalizeOpenClawInboundMetadataIdentityContent / #901); the chat-aware
+  // persisted identity is unchanged, so #901 cross-chat distinction holds.
+  // extractOpenClawInboundBody is a no-op for already-bare content and for
+  // non-user roles, so only the decorated user copy is affected.
+  return `${role}\u0000${extractOpenClawInboundBody(role, content)}`;
 }
 
 export function isBootstrapReplayCandidateMessage(message: AgentMessage): boolean {

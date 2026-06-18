@@ -194,3 +194,43 @@ function getKnownKeysForHeading(heading: string): Set<string> | undefined {
   }
   return undefined;
 }
+
+const OPENCLAW_INBOUND_TIMESTAMP_PREFIX_RE =
+  /^\s*\[[A-Za-z]{3}\s+\d{4}-\d{2}-\d{2}[^\]]*GMT[^\]]*\]\s*/;
+
+const OPENCLAW_UNTRUSTED_BLOCK_HEADER_RE = /^.{1,80}\(untrusted[^)]*\):\s*$/;
+
+/**
+ * Extract the raw user body from an OpenClaw inbound message by dropping every
+ * injected untrusted-metadata block (Conversation info, Sender, Conversation
+ * context, Reply chain/target, Forwarded message context, Thread starter,
+ * Location, ... — the whole family) plus any leading channel timestamp.
+ *
+ * Unlike `canonicalizeOpenClawInboundMetadataIdentityContent` (which preserves
+ * stable metadata so two genuinely different messages keep distinct identity
+ * hashes), this reduces an inbound turn to its body alone. It is used ONLY to
+ * recognize that the bare transcript copy and the decorated model-facing copy
+ * are the same logical turn during flush-lag adoption — it never feeds the
+ * message identity hash, so the chat-aware identity design is unaffected.
+ *
+ * Generic by construction: the builder emits each block as a
+ * "<Label> (untrusted...):" header followed by a fenced JSON body or a list,
+ * with blocks and the body separated by blank lines. Dropping the
+ * header-led segments survives new block types. The one edge is a list entry
+ * that itself contains a blank line; that is safe-by-default (the bodies
+ * simply will not match, so adoption does not fire and nothing is mis-merged).
+ */
+export function extractOpenClawInboundBody(role: string, content: string): string {
+  if (role !== "user" || typeof content !== "string") {
+    return typeof content === "string" ? content : "";
+  }
+  const withoutTimestamp = content.replace(OPENCLAW_INBOUND_TIMESTAMP_PREFIX_RE, "");
+  return withoutTimestamp
+    .split(/\n{2,}/)
+    .filter((segment) => {
+      const firstLine = segment.split("\n", 1)[0] ?? "";
+      return !OPENCLAW_UNTRUSTED_BLOCK_HEADER_RE.test(firstLine);
+    })
+    .join("\n\n")
+    .trim();
+}
