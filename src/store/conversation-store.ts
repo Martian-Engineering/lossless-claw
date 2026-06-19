@@ -1003,6 +1003,40 @@ export class ConversationStore {
     return row?.found === 1;
   }
 
+  /**
+   * Like hasRecentUnstampedMessageByIdentity but ignores transcript_entry_id —
+   * matches any recent row with the same identity hash. Used to dedup
+   * delivery-mirror messages whose text content is already covered by a
+   * prior response entry that has a different transcript entry id.
+   */
+  async hasRecentMessageByIdentity(
+    conversationId: ConversationId,
+    role: MessageRole,
+    content: string,
+    tailWindow: number,
+  ): Promise<boolean> {
+    const identityHash = buildMessageIdentityHash(role, content);
+    const row = this.db
+      .prepare(
+        `SELECT 1 AS found
+       FROM (
+         SELECT message_id, transcript_entry_id, identity_hash, role, content
+         FROM messages
+         WHERE conversation_id = ?
+         ORDER BY seq DESC
+         LIMIT ?
+       )
+       WHERE identity_hash = ?
+         AND role = ?
+         AND content = ?
+       LIMIT 1`,
+      )
+      .get(conversationId, Math.max(1, Math.floor(tailWindow)), identityHash, role, content) as unknown as
+        | { found?: number }
+        | undefined;
+    return row?.found === 1;
+  }
+
   async countMessagesByIdentityHash(
     conversationId: ConversationId,
     role: MessageRole,

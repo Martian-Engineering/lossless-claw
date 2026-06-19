@@ -92,6 +92,14 @@ const MAX_PREVIOUS_ASSEMBLED_SNAPSHOTS = 100;
 const FORK_BOUNDED_BOOTSTRAP_REASON = "fork-bounded bootstrap import";
 const CONTEXT_ENGINE_PROJECTION_EPOCH_VERSION = "summary-prefix-v1";
 const DEFERRED_ASSEMBLY_DEGRADED_PRESSURE_RATIO = 0.75;
+/**
+ * Tail-window size for delivery-mirror dedup in `ingestSingle`.
+ * A delivery-mirror entry is always adjacent to its response entry in the
+ * transcript (response first, then mirror), so a small window suffices.
+ * Kept separate from `FLUSH_LAG_ADOPTION_TAIL_WINDOW` to avoid coupling
+ * unrelated tuning knobs.
+ */
+const DELIVERY_MIRROR_DEDUP_TAIL_WINDOW = 16;
 type CompactionExecutionParams = {
   conversationId: number;
   sessionId: string;
@@ -2588,6 +2596,33 @@ export class LcmContextEngine implements ContextEngine {
       ))
     ) {
       return { ingested: false };
+    }
+
+    // Delivery-mirror dedup: OpenClaw writes two entries per assistant turn —
+    // the model response (with thinking + text) and a delivery-mirror (text
+    // only, model="delivery-mirror"). Both share the same identity_hash
+    // because toStoredMessage strips thinking, but they have different
+    // transcript entry ids, so the entry-id idempotency check above does not
+    // catch the mirror. When the incoming message is a delivery-mirror, skip
+    // it if a recent assistant message with the same identity hash already
+    // exists (the response entry was ingested first).
+    const rawModel = (message as unknown as Record<string, unknown>).model;
+    if (
+      typeof rawModel === "string" &&
+      rawModel === "delivery-mirror" &&
+      stored.role === "assistant" &&
+      stored.content.trim().length > 0
+    ) {
+      if (
+        await this.conversationStore.hasRecentMessageByIdentity(
+          conversationId,
+          stored.role,
+          stored.content,
+          DELIVERY_MIRROR_DEDUP_TAIL_WINDOW,
+        )
+      ) {
+        return { ingested: false };
+      }
     }
 
     let messageForParts = message;
