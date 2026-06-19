@@ -1027,11 +1027,16 @@ export class LcmContextEngine implements ContextEngine {
       kind: "compaction",
       scope: compactionScope,
     });
-    if (manualCompactionRequested) {
+    // Clear summary spend backoff on manual compaction or force compaction.
+    // force:true is used by overflow recovery and other internal paths that
+    // should not be blocked by an active spend backoff.  Without this, a
+    // previous backoff can prevent overflow recovery from compacting, causing
+    // a context-overflow crash loop.
+    if (manualCompactionRequested || force) {
       const clearedBackoffUntil = this.compactionGuards.clearSummarySpendBackoff(summarySpendScopeKey);
       if (clearedBackoffUntil) {
         this.deps.log.info(
-          `[lcm] compact: manual request cleared summary spend backoff conversation=${params.conversationId} ${sessionLabel} scope=${summarySpendScopeKey} previousBackoffUntil=${clearedBackoffUntil.toISOString()}`,
+          `[lcm] compact: ${manualCompactionRequested ? "manual request" : "force compaction"} cleared summary spend backoff conversation=${params.conversationId} ${sessionLabel} scope=${summarySpendScopeKey} previousBackoffUntil=${clearedBackoffUntil.toISOString()}`,
         );
       }
     }
