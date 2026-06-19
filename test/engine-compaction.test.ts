@@ -7,6 +7,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createLcmDatabaseConnection } from "../src/db/connection.js";
 import { LcmContextEngine } from "../src/engine.js";
+import { estimateTokens } from "../src/estimate-tokens.js";
 import type { AgentMessage } from "../src/openclaw-bridge.js";
 import {
   cleanupEngineTestState,
@@ -751,6 +752,7 @@ describe("LcmContextEngine compaction telemetry", () => {
   it("sanitizes directive-shaped text when engine compaction uses emergency fallback", async () => {
     const engine = createEngineWithDeps(
       {
+        fallbackMaxTokens: 96,
         freshTailCount: 0,
         leafMinFanout: 2,
         leafChunkTokens: 1_000,
@@ -810,8 +812,68 @@ describe("LcmContextEngine compaction telemetry", () => {
     expect(summaryRecord?.content).toContain("User fixed the cache key regression.");
     expect(summaryRecord?.content).toContain("The final build passed locally.");
     expect(summaryRecord?.content).toContain("directive-shaped untrusted content omitted");
+    expect(summaryRecord?.content).not.toContain(
+      "[LCM fallback summary; truncated for context management]",
+    );
     expect(summaryRecord?.content).not.toContain(injectedDirective);
     expect(summaryRecord?.content).not.toMatch(directiveFragmentPattern);
+    expect(estimateTokens(summaryRecord?.content ?? "")).toBeLessThanOrEqual(96);
+  });
+
+  it("bounds emergency fallback compaction with configured fallbackMaxTokens", async () => {
+    const engine = createEngineWithDeps(
+      {
+        fallbackMaxTokens: 48,
+        freshTailCount: 0,
+        leafMinFanout: 2,
+        leafChunkTokens: 2_000,
+        incrementalMaxDepth: 0,
+      },
+      {
+        resolveModel: vi.fn(() => {
+          throw new Error("summary model unavailable");
+        }),
+      },
+    );
+    const sessionId = "engine-emergency-fallback-configured-token-cap";
+
+    await engine.ingestBatch({
+      sessionId,
+      messages: [
+        makeMessage({
+          role: "user",
+          content: `EARLY_CONFIGURED_FALLBACK_MARKER ${"source material ".repeat(500)}`,
+        }),
+        makeMessage({
+          role: "assistant",
+          content: `${"assistant context ".repeat(500)} LATE_CONFIGURED_FALLBACK_MARKER`,
+        }),
+      ],
+    });
+
+    const result = await engine.compact({
+      sessionId,
+      sessionFile: createSessionFilePath("engine-emergency-fallback-configured-token-cap"),
+      tokenBudget: 4_096,
+      force: true,
+      legacyParams: { provider: "anthropic", model: "claude-opus-4-5" },
+    });
+
+    expect(result.compacted).toBe(true);
+    const conversation = await engine.getConversationStore().getConversationBySessionId(sessionId);
+    expect(conversation).not.toBeNull();
+    const contextItems = await engine
+      .getSummaryStore()
+      .getContextItems(conversation!.conversationId);
+    const summaryItem = contextItems.find((item) => item.itemType === "summary");
+    expect(summaryItem).toBeDefined();
+    const summaryRecord = await engine.getSummaryStore().getSummary(summaryItem!.summaryId!);
+    expect(summaryRecord?.content).toContain("EARLY_CONFIGURED_FALLBACK_MARKER");
+    expect(summaryRecord?.content).toContain(
+      "[LCM fallback summary; truncated for context management]",
+    );
+    expect(summaryRecord?.content).not.toContain("LATE_CONFIGURED_FALLBACK_MARKER");
+    expect(estimateTokens(summaryRecord?.content ?? "")).toBeLessThanOrEqual(48);
   });
 
   it("passes injected-context strip tags into production compaction", async () => {
