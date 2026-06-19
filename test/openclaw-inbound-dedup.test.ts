@@ -66,6 +66,17 @@ function decoratedFromOtherChat(body: string): string {
   ].join("\n");
 }
 
+function userAuthoredMetadataLookingText(body = "please keep this whole note"): string {
+  return [
+    "Conversation info (untrusted metadata):",
+    "```text",
+    "this is quoted prompt text, not an OpenClaw JSON metadata block",
+    "```",
+    "",
+    body,
+  ].join("\n");
+}
+
 describe("messageIdentity OpenClaw inbound normalization (issue #912)", () => {
   it("gives a decorated user turn the same in-memory identity as its bare body", () => {
     expect(messageIdentity("user", decorated(BODY))).toBe(messageIdentity("user", BODY));
@@ -74,6 +85,35 @@ describe("messageIdentity OpenClaw inbound normalization (issue #912)", () => {
   it("keeps distinct user bodies distinct", () => {
     expect(messageIdentity("user", decorated(BODY))).not.toBe(
       messageIdentity("user", "an entirely different request"),
+    );
+  });
+
+  it("keeps user-authored metadata-looking text distinct from its trailing body", () => {
+    const ordinaryText = userAuthoredMetadataLookingText();
+    expect(messageIdentity("user", ordinaryText)).not.toBe(
+      messageIdentity("user", "please keep this whole note"),
+    );
+  });
+
+  it("keeps decorated user-authored metadata-looking body distinct from its trailing body", () => {
+    const ordinaryText = userAuthoredMetadataLookingText();
+    expect(messageIdentity("user", decorated(ordinaryText))).not.toBe(
+      messageIdentity("user", "please keep this whole note"),
+    );
+    expect(messageIdentity("user", decorated(ordinaryText))).toBe(
+      messageIdentity("user", ordinaryText),
+    );
+  });
+
+  it("keeps user-authored leading whitespace distinct", () => {
+    expect(messageIdentity("user", "  indented code")).not.toBe(
+      messageIdentity("user", "indented code"),
+    );
+  });
+
+  it("keeps timestamp-looking bare user text distinct from the unprefixed body", () => {
+    expect(messageIdentity("user", "[Thu 2026-06-18 14:23 GMT+3] I've updated")).not.toBe(
+      messageIdentity("user", "I've updated"),
     );
   });
 
@@ -140,6 +180,52 @@ describe("alignRuntimeBatchAgainstCoveredFrontier bare-vs-decorated (issue #912)
       db.close();
     }
   });
+
+  it("keeps a new user-authored metadata-looking turn instead of aligning it to the body", async () => {
+    const { db, store } = createStoreFixture();
+    try {
+      const conversation = await store.createConversation({ sessionId: "tg-align-ordinary" });
+      await store.createMessage({
+        conversationId: conversation.conversationId,
+        seq: 0,
+        role: "user",
+        content: "please keep this whole note",
+        tokenCount: 1,
+      });
+      const dedup = new BatchDeduplicator(store, noopDeps);
+      const aligned = await dedup.alignRuntimeBatchAgainstCoveredFrontier(
+        "tg-align-ordinary",
+        undefined,
+        [{ role: "user", content: userAuthoredMetadataLookingText() } as any],
+      );
+      expect(aligned).toHaveLength(1);
+    } finally {
+      db.close();
+    }
+  });
+
+  it("keeps a decorated user-authored metadata-looking body instead of aligning it to the suffix", async () => {
+    const { db, store } = createStoreFixture();
+    try {
+      const conversation = await store.createConversation({ sessionId: "tg-align-decorated-body" });
+      await store.createMessage({
+        conversationId: conversation.conversationId,
+        seq: 0,
+        role: "user",
+        content: "please keep this whole note",
+        tokenCount: 1,
+      });
+      const dedup = new BatchDeduplicator(store, noopDeps);
+      const aligned = await dedup.alignRuntimeBatchAgainstCoveredFrontier(
+        "tg-align-decorated-body",
+        undefined,
+        [{ role: "user", content: decorated(userAuthoredMetadataLookingText()) } as any],
+      );
+      expect(aligned).toHaveLength(1);
+    } finally {
+      db.close();
+    }
+  });
 });
 
 describe("extractOpenClawInboundBody", () => {
@@ -147,9 +233,10 @@ describe("extractOpenClawInboundBody", () => {
     expect(extractOpenClawInboundBody("user", decorated(BODY))).toBe(BODY);
   });
 
-  it("strips a leading channel timestamp (webchat flavor)", () => {
+  it("strips a leading channel timestamp only when validated OpenClaw metadata follows", () => {
+    const withTimestamp = `[Thu 2026-06-18 14:23 GMT+3] ${decorated("I've updated the plugins")}`;
     expect(
-      extractOpenClawInboundBody("user", "[Thu 2026-06-18 14:23 GMT+3] I've updated the plugins"),
+      extractOpenClawInboundBody("user", withTimestamp),
     ).toBe("I've updated the plugins");
   });
 
@@ -172,6 +259,21 @@ describe("extractOpenClawInboundBody", () => {
 
   it("leaves a bare body unchanged", () => {
     expect(extractOpenClawInboundBody("user", "just a plain message")).toBe("just a plain message");
+  });
+
+  it("leaves timestamp-looking bare user text unchanged", () => {
+    const body = "[Thu 2026-06-18 14:23 GMT+3] I've updated the plugins";
+    expect(extractOpenClawInboundBody("user", body)).toBe(body);
+  });
+
+  it("leaves user-authored metadata-looking bare text unchanged", () => {
+    const body = userAuthoredMetadataLookingText();
+    expect(extractOpenClawInboundBody("user", body)).toBe(body);
+  });
+
+  it("preserves user-authored metadata-looking body after real OpenClaw metadata", () => {
+    const body = userAuthoredMetadataLookingText();
+    expect(extractOpenClawInboundBody("user", decorated(body))).toBe(body);
   });
 
   it("does not strip metadata-looking blocks from non-user roles", () => {

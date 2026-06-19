@@ -199,12 +199,14 @@ const OPENCLAW_INBOUND_TIMESTAMP_PREFIX_RE =
   /^\s*\[[A-Za-z]{3}\s+\d{4}-\d{2}-\d{2}[^\]]*GMT[^\]]*\]\s*/;
 
 const OPENCLAW_UNTRUSTED_BLOCK_HEADER_RE = /^.{1,80}\(untrusted[^)]*\):\s*$/;
+const OPENCLAW_GENERATED_CONTEXT_LINE_RE = /^#\d+\s+\S+/;
 
 /**
- * Extract the raw user body from an OpenClaw inbound message by dropping every
- * injected untrusted-metadata block (Conversation info, Sender, Conversation
- * context, Reply chain/target, Forwarded message context, Thread starter,
- * Location, ... — the whole family) plus any leading channel timestamp.
+ * Extract the raw user body from an OpenClaw inbound message by first proving
+ * there is a valid injected metadata preamble, then dropping each leading
+ * untrusted-metadata block (Conversation info, Sender, Conversation context,
+ * Reply chain/target, Forwarded message context, Thread starter, Location, ...
+ * — the whole family) plus any leading channel timestamp before that preamble.
  *
  * Unlike `canonicalizeOpenClawInboundMetadataIdentityContent` (which preserves
  * stable metadata so two genuinely different messages keep distinct identity
@@ -213,24 +215,91 @@ const OPENCLAW_UNTRUSTED_BLOCK_HEADER_RE = /^.{1,80}\(untrusted[^)]*\):\s*$/;
  * are the same logical turn during flush-lag adoption — it never feeds the
  * message identity hash, so the chat-aware identity design is unaffected.
  *
- * Generic by construction: the builder emits each block as a
- * "<Label> (untrusted...):" header followed by a fenced JSON body or a list,
- * with blocks and the body separated by blank lines. Dropping the
- * header-led segments survives new block types. The one edge is a list entry
- * that itself contains a blank line; that is safe-by-default (the bodies
- * simply will not match, so adoption does not fire and nothing is mis-merged).
+ * After the validated Conversation info block, strip only metadata shapes we
+ * can recognize: the optional Sender JSON block and the generated chronological
+ * context list. Bare user text that merely resembles a timestamp or metadata
+ * block is returned exactly unchanged, so adoption fails closed instead of
+ * collapsing distinct messages.
  */
 export function extractOpenClawInboundBody(role: string, content: string): string {
   if (role !== "user" || typeof content !== "string") {
     return typeof content === "string" ? content : "";
   }
-  const withoutTimestamp = content.replace(OPENCLAW_INBOUND_TIMESTAMP_PREFIX_RE, "");
-  return withoutTimestamp
-    .split(/\n{2,}/)
-    .filter((segment) => {
-      const firstLine = segment.split("\n", 1)[0] ?? "";
-      return !OPENCLAW_UNTRUSTED_BLOCK_HEADER_RE.test(firstLine);
-    })
-    .join("\n\n")
-    .trim();
+  const timestampMatch = OPENCLAW_INBOUND_TIMESTAMP_PREFIX_RE.exec(content);
+  const withoutTimestamp = timestampMatch ? content.slice(timestampMatch[0].length) : content;
+  return (
+    extractBodyAfterValidatedOpenClawPreamble(withoutTimestamp) ??
+    extractBodyAfterValidatedOpenClawPreamble(content) ??
+    content
+  );
+}
+
+function extractBodyAfterValidatedOpenClawPreamble(content: string): string | null {
+  const { metadataCandidate } = splitOpenClawInboundMetadataPrelude(content);
+  const conversationCandidate = metadataCandidate.trimStart();
+  const conversationMatch = OPENCLAW_INBOUND_METADATA_BLOCK_RE.exec(conversationCandidate);
+  const conversationHeading = conversationMatch?.[1] ?? "";
+  const conversationRecord = conversationMatch
+    ? parseOpenClawInboundMetadataRecord(conversationHeading, conversationMatch[2] ?? "")
+    : null;
+  if (
+    !conversationMatch ||
+    conversationHeading !== "Conversation info (untrusted metadata)" ||
+    !conversationRecord
+  ) {
+    return null;
+  }
+
+  let remaining = stripMetadataSeparator(
+    conversationCandidate.slice(conversationMatch[0].length),
+  );
+  remaining = stripOptionalSenderBlock(remaining);
+  remaining = stripOptionalGeneratedContextBlock(remaining);
+  return remaining;
+}
+
+function stripOptionalSenderBlock(content: string): string {
+  const senderCandidate = content.trimStart();
+  const senderMatch = OPENCLAW_INBOUND_METADATA_BLOCK_RE.exec(senderCandidate);
+  const senderHeading = senderMatch?.[1] ?? "";
+  const senderRecord = senderMatch
+    ? parseOpenClawInboundMetadataRecord(senderHeading, senderMatch[2] ?? "")
+    : null;
+  if (
+    !senderMatch ||
+    senderHeading !== "Sender (untrusted metadata)" ||
+    !senderRecord
+  ) {
+    return content;
+  }
+  return stripMetadataSeparator(senderCandidate.slice(senderMatch[0].length));
+}
+
+function stripOptionalGeneratedContextBlock(content: string): string {
+  const firstLine = content.split(/\r?\n/, 1)[0] ?? "";
+  if (!OPENCLAW_UNTRUSTED_BLOCK_HEADER_RE.test(firstLine)) {
+    return content;
+  }
+  const nextSegmentMatch = /\r?\n\r?\n/.exec(content);
+  const segment = nextSegmentMatch ? content.slice(0, nextSegmentMatch.index) : content;
+  if (!isGeneratedOpenClawContextSegment(segment)) {
+    return content;
+  }
+  if (!nextSegmentMatch) {
+    return "";
+  }
+  return stripMetadataSeparator(content.slice(nextSegmentMatch.index + nextSegmentMatch[0].length));
+}
+
+function isGeneratedOpenClawContextSegment(segment: string): boolean {
+  const lines = segment.split(/\r?\n/);
+  const firstLine = lines[0] ?? "";
+  if (!OPENCLAW_UNTRUSTED_BLOCK_HEADER_RE.test(firstLine)) {
+    return false;
+  }
+  const bodyLines = lines.slice(1).filter((line) => line.trim().length > 0);
+  return (
+    bodyLines.length > 0 &&
+    bodyLines.every((line) => OPENCLAW_GENERATED_CONTEXT_LINE_RE.test(line))
+  );
 }
