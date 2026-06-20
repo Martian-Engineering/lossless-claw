@@ -1725,6 +1725,78 @@ describe("LcmContextEngine fidelity and token budget", () => {
     expect(advancedState?.lastProcessedOffset).toBeGreaterThan(0);
   });
 
+  it("retries transient ENOENT before preserving an offset-0 afterTurn checkpoint (#916)", async () => {
+    const warnLog = vi.fn();
+    const engine = createEngineWithDeps(
+      {},
+      {
+        log: { info: vi.fn(), warn: warnLog, error: vi.fn(), debug: vi.fn() },
+      },
+    );
+    const sessionId = "after-turn-transient-enoent-retry";
+    const sessionKey = "agent:main:test:after-turn-transient-enoent-retry";
+    const sessionFile = createSessionFilePath("after-turn-transient-enoent-retry");
+
+    await engine.ingest({
+      sessionId,
+      sessionKey,
+      message: makeMessage({ role: "user", content: "first user turn" }),
+    });
+    await engine.ingest({
+      sessionId,
+      sessionKey,
+      message: makeMessage({ role: "assistant", content: "first assistant turn" }),
+    });
+    const conversation = await engine.getConversationStore().getConversationForSession({
+      sessionId,
+      sessionKey,
+    });
+    expect(conversation).not.toBeNull();
+    await engine.getSummaryStore().upsertConversationBootstrapState({
+      conversationId: conversation!.conversationId,
+      sessionFilePath: sessionFile,
+      lastSeenSize: 0,
+      lastSeenMtimeMs: 0,
+      lastProcessedOffset: 0,
+      lastProcessedEntryHash: null,
+    });
+
+    setTimeout(() => {
+      writeLeafTranscript(sessionFile, [
+        { role: "user", content: "first user turn" },
+        { role: "assistant", content: "first assistant turn" },
+        { role: "user", content: "second user turn after reload" },
+        { role: "assistant", content: "second assistant turn after reload" },
+      ]);
+    }, 5);
+
+    await engine.afterTurn({
+      sessionId,
+      sessionKey,
+      sessionFile,
+      messages: [makeMessage({ role: "assistant", content: "second assistant turn after reload" })],
+      prePromptMessageCount: 0,
+      tokenBudget: 4_096,
+    });
+
+    expect(
+      warnLog.mock.calls
+        .map((call) => String(call[0]))
+        .some((message) => message.includes("session file missing; skipping transcript reconcile")),
+    ).toBe(false);
+    const stored = await engine.getConversationStore().getMessages(conversation!.conversationId);
+    expect(stored.map((message) => message.content)).toEqual([
+      "first user turn",
+      "first assistant turn",
+      "second user turn after reload",
+      "second assistant turn after reload",
+    ]);
+    const checkpoint = await engine
+      .getSummaryStore()
+      .getConversationBootstrapState(conversation!.conversationId);
+    expect(checkpoint?.lastProcessedOffset).toBe(statSync(sessionFile).size);
+  });
+
   it("bootstrap imports a bounded path-mismatched transcript with no old anchor as a new epoch", async () => {
     const engine = createEngine();
     const sessionId = "bootstrap-transcript-epoch-no-anchor";

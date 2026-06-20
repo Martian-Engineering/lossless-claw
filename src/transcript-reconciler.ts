@@ -68,6 +68,16 @@ const FLUSH_LAG_ADOPTION_TAIL_WINDOW = 16;
 // rather than scan an arbitrarily large real DB tail (#649 no-proof-no-advance).
 const NON_ANCHORING_FRONTIER_SCAN_LIMIT = 32;
 
+// A hot plugin/runtime reload can race the host session registry and produce a
+// transient ENOENT for a transcript that is still being written. Retry once
+// before taking the sticky missing-file branch so active sessions do not spend a
+// turn preserving an offset-0 checkpoint and skipping durable transcript catchup.
+const TRANSIENT_SESSION_FILE_MISSING_RETRY_MS = 25;
+
+function delay(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
 // No-anchor recovery reasons that can proceed from checkpoint/frontier metadata
 // instead of a content anchor. Block them if raw IDs are already owned by another
 // active conversation.
@@ -2072,6 +2082,7 @@ export class TranscriptReconciler {
         await this.refreshBootstrapState({
           conversationId: conversation.conversationId,
           sessionFile: params.sessionFile,
+          fileStats: sessionFileState,
         });
         rememberSlowReadState();
       } else {
@@ -2189,6 +2200,7 @@ export class TranscriptReconciler {
     await this.refreshBootstrapState({
       conversationId: conversation.conversationId,
       sessionFile: params.sessionFile,
+      fileStats: sessionFileState,
     });
     rememberSlowReadState();
     this.host.deps.log.warn(
@@ -2247,14 +2259,30 @@ export class TranscriptReconciler {
     );
     let sessionFileState: { size: number; mtimeMs: number } | undefined;
     let sessionFileStatError: unknown;
-    try {
+    const captureSessionFileState = async (): Promise<void> => {
       const sessionFileStats = await stat(params.sessionFile);
       sessionFileState = {
         size: sessionFileStats.size,
         mtimeMs: Math.trunc(sessionFileStats.mtimeMs),
       };
+      sessionFileStatError = undefined;
+    };
+    try {
+      await captureSessionFileState();
     } catch (error) {
       sessionFileStatError = error;
+      // A just-reloaded plugin can observe a transient ENOENT while the host is
+      // republishing the active session file path. Retry once before treating an
+      // existing checkpoint as missing/stale; this keeps long-lived writers from
+      // falling into the sticky "preserve offset=0" recovery lane (#916).
+      if (isMissingFileError(error)) {
+        await delay(TRANSIENT_SESSION_FILE_MISSING_RETRY_MS);
+        try {
+          await captureSessionFileState();
+        } catch (retryError) {
+          sessionFileStatError = retryError;
+        }
+      }
       // Leave undefined: without stat proof, do not use append-only guards or slow-read caps.
     }
     const transcriptEpochShrank = checkpointIsPastTranscriptEof(
