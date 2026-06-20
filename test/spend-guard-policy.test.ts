@@ -14,7 +14,7 @@
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { afterEach, describe, expect, it, vi, type Mock } from "vitest";
 import type { LcmConfig } from "../src/db/config.js";
 import { closeLcmConnection, createLcmDatabaseConnection } from "../src/db/connection.js";
 import { LcmContextEngine } from "../src/engine.js";
@@ -57,7 +57,7 @@ function parseAgentSessionKey(sessionKey: string): { agentId: string; suffix: st
   return { agentId: parts[1] ?? "main", suffix: parts.slice(2).join(":") };
 }
 
-type LogMock = { info: ReturnType<typeof vi.fn>; warn: ReturnType<typeof vi.fn>; error: ReturnType<typeof vi.fn>; debug: ReturnType<typeof vi.fn> };
+type LogMock = { info: Mock<(msg: string) => void>; warn: Mock<(msg: string) => void>; error: Mock<(msg: string) => void>; debug: Mock<(msg: string) => void> };
 
 function createTestDeps(config: LcmConfig, log: LogMock): LcmDependencies {
   return createSharedTestDeps(config, {
@@ -73,7 +73,12 @@ function createEngine(configOverrides?: Partial<LcmConfig>): { engine: LcmContex
   const config = { ...createTestConfig(join(tempDir, "lcm.db")), ...configOverrides };
   const db = createLcmDatabaseConnection(config.databasePath);
   dbs.push(db);
-  const log: LogMock = { info: vi.fn(), warn: vi.fn(), error: vi.fn(), debug: vi.fn() };
+  const log: LogMock = {
+    info: vi.fn<(msg: string) => void>(),
+    warn: vi.fn<(msg: string) => void>(),
+    error: vi.fn<(msg: string) => void>(),
+    debug: vi.fn<(msg: string) => void>(),
+  };
   const engine = new LcmContextEngine(createTestDeps(config, log), db);
   engines.push(engine);
   return { engine, log };
