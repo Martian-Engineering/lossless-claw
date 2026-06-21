@@ -9,6 +9,26 @@ const OPENCLAW_ROOM_EVENT_HEADER = "[OpenClaw room event]";
 
 const CONVERSATION_INFO_HEADING = "Conversation info (untrusted metadata):";
 
+const OPENCLAW_INBOUND_TIMESTAMP_PREFIX_RE =
+  /^\s*\[[A-Za-z]{3}\s+\d{4}-\d{2}-\d{2}[^\]]*GMT[^\]]*\]\s*/;
+
+/**
+ * Strip a single leading OpenClaw channel timestamp prefix ("[Sun 2026-06-21
+ * 13:19 GMT+3] ...") from a value if present, returning the remainder. Used for
+ * structural same-turn containment matching: the live current turn's body is
+ * delivered timestamp-prefixed, while the bare persisted store row may be the
+ * same body with or without that prefix. Stripping it on both sides lets the
+ * containment check align them without any knowledge of the surrounding
+ * decoration. A no-op when there is no recognized timestamp prefix.
+ *
+ * The "[<weekday> YYYY-MM-DD ... GMT...]" channel timestamp is the only
+ * structurally-known volatile prefix; nothing else is recognized here.
+ */
+export function stripLeadingOpenClawInboundTimestamp(value: string): string {
+  const match = OPENCLAW_INBOUND_TIMESTAMP_PREFIX_RE.exec(value);
+  return match ? value.slice(match[0].length) : value;
+}
+
 const CONVERSATION_INFO_KEYS = new Set([
   "chat_id",
   "message_id",

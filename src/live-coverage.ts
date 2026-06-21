@@ -7,6 +7,7 @@ import { contentFromParts } from "./assembler.js";
 import { buildMessageParts, toStoredMessage, toSyntheticMessagePartRecord } from "./message-content.js";
 import { createLiveCoverageSignature, hashAgentMessageForAssemblyProtection, messagesHaveSameLiveCoverageSignature } from "./message-signatures.js";
 import type { AgentMessage } from "./openclaw-bridge.js";
+import { stripLeadingOpenClawInboundTimestamp } from "./openclaw-inbound-metadata.js";
 import { estimateAgentMessageTokens } from "./token-accounting.js";
 import { buildToolPairIndexesByAssembledIndex, expandProtectedToolPairIndexes, expandToolPairLiveSortIndexes } from "./tool-pairing.js";
 import { sanitizeToolUseResultPairing } from "./transcript-repair.js";
@@ -467,6 +468,202 @@ export function matchVolatileLiveInputsToCoverageSlots(params: {
   return entryToAssembledIndex;
 }
 
+/**
+ * Structural containment primitive: is the bare body the live content itself, or
+ * its line-aligned trailing segment? This is the only same-turn recognition the
+ * supersede logic uses — it carries NO knowledge of any plugin/decoration tag or
+ * preamble shape. The bare body matches when, after stripping an optional single
+ * leading channel timestamp from both sides:
+ *   1. it equals the (trim-ended) live content, OR
+ *   2. it is the final line of the live content (optionally with a per-line
+ *      leading channel timestamp on that final line), OR
+ *   3. (multi-line bare bodies) it is the trailing segment after a clean line
+ *      boundary, optionally preceded by a single channel timestamp on the same
+ *      final line.
+ * The line boundary is the fail-closed guard: a coincidental mid-line substring
+ * of the live content never matches, so distinct turns are never collapsed.
+ */
+export function liveContentContainsBareBody(params: {
+  liveContent: string;
+  bareContent: string;
+}): boolean {
+  const bareRaw = params.bareContent.trim();
+  if (bareRaw.length === 0) {
+    return false;
+  }
+  // Normalize a leading channel timestamp off the bare body so a bare row
+  // persisted with OR without the "[... GMT ...]" prefix aligns identically.
+  const bare = stripLeadingOpenClawInboundTimestamp(bareRaw).trim();
+  if (bare.length === 0) {
+    return false;
+  }
+  const liveTrimmed = params.liveContent.trimEnd();
+  if (liveTrimmed === bareRaw || stripLeadingOpenClawInboundTimestamp(liveTrimmed) === bare) {
+    return true;
+  }
+  // The bare body is the LAST user line(s) of the decorated live content. Match
+  // the trailing segment after the final newline boundary, also allowing a
+  // per-line leading timestamp on that trailing segment.
+  const lastNewline = liveTrimmed.lastIndexOf("\n");
+  if (lastNewline < 0) {
+    return false;
+  }
+  const trailingLine = liveTrimmed.slice(lastNewline + 1);
+  if (trailingLine === bareRaw || stripLeadingOpenClawInboundTimestamp(trailingLine) === bare) {
+    return true;
+  }
+  // Multi-line bare bodies: require a clean line boundary before the bare body,
+  // optionally with a leading timestamp immediately before it.
+  if (liveTrimmed.endsWith(`\n${bareRaw}`)) {
+    return true;
+  }
+  const timestampedSuffixIndex = liveTrimmed.length - bare.length;
+  if (timestampedSuffixIndex > 0 && liveTrimmed.endsWith(bare)) {
+    const before = liveTrimmed.slice(0, timestampedSuffixIndex);
+    // The text immediately preceding the bare body must be a line boundary,
+    // possibly followed by a single channel timestamp on the same final line.
+    if (/\n[ \t]*$/.test(before)) {
+      return true;
+    }
+    const lineStart = before.lastIndexOf("\n") + 1;
+    const prefixOnFinalLine = before.slice(lineStart);
+    if (
+      prefixOnFinalLine.length > 0 &&
+      stripLeadingOpenClawInboundTimestamp(prefixOnFinalLine).trim().length === 0
+    ) {
+      return true;
+    }
+  }
+  return false;
+}
+
+/**
+ * Recognize whether an assembled user row is a BARE copy of the live current
+ * turn (its persisted face), purely structurally: it must be a line-aligned
+ * trailing segment of the live content AND strictly shorter than it. The
+ * strictly-shorter guard is what distinguishes a bare/timestamped body row
+ * (collapsible) from the decorated live copy itself (equal length, never
+ * collapsed) without any decoration-tag knowledge.
+ */
+function assembledRowIsStructuralBareCurrentTurn(params: {
+  liveContent: string;
+  assembledContent: string;
+}): boolean {
+  if (params.assembledContent === params.liveContent) {
+    // The retained survivor / exact-signature anchor: never a collapsible bare.
+    return false;
+  }
+  if (params.assembledContent.length >= params.liveContent.length) {
+    // A bare body is strictly shorter than the decorated live turn; an equal or
+    // longer row cannot be the bare persisted face of this live copy.
+    return false;
+  }
+  return liveContentContainsBareBody({
+    liveContent: params.liveContent,
+    bareContent: params.assembledContent,
+  });
+}
+
+/**
+ * The current turn is the LAST live user message. Recognize it as a volatile
+ * live input — even when it carries no Telegram/Slack-style preamble and no
+ * recognizable marker (e.g. the webchat memory-blocks-first shape) — whenever it
+ * structurally CONTAINS a bare assembled user body (see liveContentContainsBare
+ * Body). This is the plugin-agnostic generalization of isVolatileLiveInput
+ * Message: instead of matching decoration shapes, it matches the invariant that
+ * the live current turn is the decorated face of a bare store row. Fail-closed:
+ * a last-user message that contains no bare assembled body is NOT recognized
+ * here (so it is only treated as volatile if a marker/preamble gate already says
+ * so).
+ */
+function resolveStructuralCurrentTurnLiveIndex(params: {
+  assembledMessages: AgentMessage[];
+  liveMessages: AgentMessage[];
+}): number | null {
+  for (let liveIndex = params.liveMessages.length - 1; liveIndex >= 0; liveIndex--) {
+    const stored = toStoredMessage(params.liveMessages[liveIndex] as AgentMessage);
+    if (stored.role !== "user") {
+      continue;
+    }
+    if (!stored.content.trim()) {
+      return null;
+    }
+    for (const assembledMessage of params.assembledMessages) {
+      const assembledStored = toStoredMessage(assembledMessage);
+      if (assembledStored.role !== "user") {
+        continue;
+      }
+      if (
+        assembledRowIsStructuralBareCurrentTurn({
+          liveContent: stored.content,
+          assembledContent: assembledStored.content,
+        })
+      ) {
+        return liveIndex;
+      }
+    }
+    // Only the single last user message is the current turn.
+    return null;
+  }
+  return null;
+}
+
+/**
+ * Resolve EVERY assembled bare user row superseded by the live current turn.
+ * The current turn is the structural last-user live message; every bare
+ * assembled row it structurally contains (a plain `body` row, a `[timestamp]
+ * body` row, or a Telegram/Slack decorated copy whose body is the same trailing
+ * segment) must be collapsed onto the single live copy, or the duplication the
+ * store created survives into the model prompt.
+ *
+ * Plugin-agnostic: matched solely via liveContentContainsBareBody + the
+ * strictly-shorter structural guard. A live last-user message that contains no
+ * bare assembled body supersedes nothing (fail-closed), so distinct turns are
+ * never collapsed.
+ *
+ * This deliberately ignores fresh-tail / tool-pair protection: superseding a
+ * bare current-turn row by its richer live copy is a same-turn identity
+ * replacement, not a budget eviction, and the bare row IS the protected fresh
+ * tail. The exact-equal survivor (the live copy's own coverage anchor) is never
+ * collapsed because assembledRowIsStructuralBareCurrentTurn returns false on
+ * equal content.
+ */
+export function resolveStructuralCurrentTurnSupersededIndexes(params: {
+  assembledMessages: AgentMessage[];
+  liveMessages: AgentMessage[];
+}): Set<number> {
+  const superseded = new Set<number>();
+  const currentTurnLiveIndex = resolveStructuralCurrentTurnLiveIndex({
+    assembledMessages: params.assembledMessages,
+    liveMessages: params.liveMessages,
+  });
+  if (currentTurnLiveIndex === null) {
+    return superseded;
+  }
+  const liveStored = toStoredMessage(params.liveMessages[currentTurnLiveIndex] as AgentMessage);
+  for (
+    let assembledIndex = params.assembledMessages.length - 1;
+    assembledIndex >= 0;
+    assembledIndex--
+  ) {
+    const assembledStored = toStoredMessage(params.assembledMessages[assembledIndex] as AgentMessage);
+    if (assembledStored.role !== "user") {
+      continue;
+    }
+    if (
+      assembledRowIsStructuralBareCurrentTurn({
+        liveContent: liveStored.content,
+        assembledContent: assembledStored.content,
+      })
+    ) {
+      superseded.add(assembledIndex);
+      // Do NOT break: one live current turn may supersede MULTIPLE bare rows
+      // (the plain `body` copy AND the `[timestamp] body` copy).
+    }
+  }
+  return superseded;
+}
+
 export function collectUncoveredVolatileLiveInputs(params: {
   assembledMessages: AgentMessage[];
   liveMessages: AgentMessage[];
@@ -475,9 +672,17 @@ export function collectUncoveredVolatileLiveInputs(params: {
   estimatedTokens: number;
   coveredEntriesByAssembledIndex: Map<number, VolatileLiveInputEntry[]>;
 } {
+  const structuralCurrentTurnLiveIndex = resolveStructuralCurrentTurnLiveIndex({
+    assembledMessages: params.assembledMessages,
+    liveMessages: params.liveMessages,
+  });
   const volatileLiveInputs = params.liveMessages
     .map((message, liveIndex) => ({ message, liveIndex }))
-    .filter((entry) => isVolatileLiveInputMessage(entry.message))
+    .filter(
+      (entry) =>
+        isVolatileLiveInputMessage(entry.message) ||
+        entry.liveIndex === structuralCurrentTurnLiveIndex,
+    )
     .map((entry) => ({
       ...entry,
       liveText: normalizeSummaryOverlapText(toStoredMessage(entry.message).content),
@@ -536,19 +741,63 @@ export function appendUncoveredVolatileLiveInputsWithinBudget(params: {
     assembledMessages: params.assembledMessages,
     liveMessages,
   });
+  // Every assembled bare row the live current turn structurally contains must be
+  // collapsed onto the single live copy. Resolved against the original assembled
+  // state, independent of the uncovered append below, so it also fires when the
+  // live current turn is COVERED by an exact-equal assembled row (and so is not
+  // in the uncovered set) but a SECOND bare/timestamped duplicate still remains.
+  const supersededAssembledIndexes = resolveStructuralCurrentTurnSupersededIndexes({
+    assembledMessages: params.assembledMessages,
+    liveMessages,
+  });
   if (uncovered.entries.length === 0) {
+    if (supersededAssembledIndexes.size === 0) {
+      return {
+        messages: params.assembledMessages,
+        estimatedTokens: params.assembledEstimatedTokens,
+        appendedMessages: 0,
+        appendedTokens: 0,
+        evictedMessages: 0,
+        evictedTokens: 0,
+        overBudget: params.assembledEstimatedTokens > params.tokenBudget,
+      };
+    }
+    // No live copy to append, but a duplicate bare row must be dropped so the
+    // already-covered live copy is the only surviving current-turn message.
+    let droppedTokens = 0;
+    for (const index of supersededAssembledIndexes) {
+      droppedTokens += toStoredMessage(params.assembledMessages[index] as AgentMessage).tokenCount;
+    }
+    const collapsedMessages = sanitizeToolUseResultPairing(
+      params.assembledMessages.filter(
+        (_message, index) => !supersededAssembledIndexes.has(index),
+      ),
+      params.log,
+    ) as AgentMessage[];
+    const collapsedEstimatedTokens = estimateAgentMessageTokens(collapsedMessages);
     return {
-      messages: params.assembledMessages,
-      estimatedTokens: params.assembledEstimatedTokens,
+      messages: collapsedMessages,
+      estimatedTokens: collapsedEstimatedTokens,
       appendedMessages: 0,
       appendedTokens: 0,
-      evictedMessages: 0,
-      evictedTokens: 0,
-      overBudget: params.assembledEstimatedTokens > params.tokenBudget,
+      evictedMessages: supersededAssembledIndexes.size,
+      evictedTokens: droppedTokens,
+      overBudget: collapsedEstimatedTokens > params.tokenBudget,
     };
   }
 
-  let retained = params.assembledMessages.map((message, index) => ({ message, index }));
+  // A decorated live current turn is the same logical turn as the BARE
+  // assembled row(s) LCM reconstructed from the store. Drop those bare rows so
+  // the appended live copy replaces them (supersede, not duplicate). Resolved
+  // before the budget loop so the swap is unconditional: it is a per-turn
+  // identity fix, not a budget eviction.
+  let supersededTokens = 0;
+  for (const index of supersededAssembledIndexes) {
+    supersededTokens += toStoredMessage(params.assembledMessages[index] as AgentMessage).tokenCount;
+  }
+  let retained = params.assembledMessages
+    .map((message, index) => ({ message, index }))
+    .filter((entry) => !supersededAssembledIndexes.has(entry.index));
   let appendedEntries = uncovered.entries.slice();
   const toolPairIndexesByIndex = buildToolPairIndexesByAssembledIndex(params.assembledMessages);
   const exactLiveSortIndexes = resolveExactAssembledLiveSortIndexes({
@@ -663,8 +912,10 @@ export function appendUncoveredVolatileLiveInputsWithinBudget(params: {
     estimatedTokens,
     appendedMessages: appendedMessages.length,
     appendedTokens: estimateAgentMessageTokens(appendedMessages),
-    evictedMessages,
-    evictedTokens,
+    // Superseded bare rows are reported as evicted: they were replaced by the
+    // richer live copy that the same turn delivered.
+    evictedMessages: evictedMessages + supersededAssembledIndexes.size,
+    evictedTokens: evictedTokens + supersededTokens,
     overBudget: estimatedTokens > params.tokenBudget,
   };
 }
