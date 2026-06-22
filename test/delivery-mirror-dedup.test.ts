@@ -43,6 +43,14 @@ function makeAssistantMessage(opts: {
   return msg;
 }
 
+function makeUserMessage(text: string): AgentMessage {
+  return {
+    role: "user",
+    content: text,
+    timestamp: Date.now(),
+  } as AgentMessage;
+}
+
 describe("delivery-mirror dedup", () => {
   it("skips delivery-mirror when response with same content already exists", async () => {
     const engine = createEngine();
@@ -112,13 +120,7 @@ describe("delivery-mirror dedup", () => {
     }
   });
 
-  // Edge case: two standalone delivery-mirrors with identical text within the
-  // tail window. The second is silently dropped because
-  // hasRecentMessageByIdentity matches the first. This is an accepted tradeoff:
-  // delivery-mirrors are redundant delivery copies, not primary content, and
-  // the response entry is always ingested. Collapsing repeated identical
-  // standalone mirrors is intentional.
-  it("collapses repeated standalone delivery-mirrors with identical text", async () => {
+  it("ingests repeated standalone delivery-mirrors with identical text", async () => {
     const engine = createEngine();
     const sessionId = randomUUID();
     const text = "Repeated health alert";
@@ -136,7 +138,6 @@ describe("delivery-mirror dedup", () => {
     });
     expect(r1.ingested).toBe(true);
 
-    // Second standalone mirror with same text — skipped (collapsed)
     const mirror2 = makeAssistantMessage({
       text,
       model: "delivery-mirror",
@@ -147,14 +148,69 @@ describe("delivery-mirror dedup", () => {
       sessionKey: undefined,
       message: mirror2,
     });
-    expect(r2.ingested).toBe(false);
+    expect(r2.ingested).toBe(true);
 
     const store = engine.getConversationStore();
     const conversation = await store.getConversationForSession({ sessionId });
     expect(conversation).not.toBeNull();
     if (conversation) {
       const count = await store.getMessageCount(conversation.conversationId);
-      expect(count).toBe(1);
+      expect(count).toBe(2);
+    }
+  });
+
+  it("does not skip repeated mirror text after an intervening turn", async () => {
+    const engine = createEngine();
+    const sessionId = randomUUID();
+    const text = "OK";
+
+    const response = makeAssistantMessage({
+      text,
+      thinking: "first reasoning",
+      entryId: "aabbccdd",
+    });
+    await engine.ingest({
+      sessionId,
+      sessionKey: undefined,
+      message: response,
+    });
+
+    const firstMirror = makeAssistantMessage({
+      text,
+      model: "delivery-mirror",
+      entryId: randomUUID(),
+    });
+    const r1 = await engine.ingest({
+      sessionId,
+      sessionKey: undefined,
+      message: firstMirror,
+    });
+    expect(r1.ingested).toBe(false);
+
+    await engine.ingest({
+      sessionId,
+      sessionKey: undefined,
+      message: makeUserMessage("Please answer again."),
+    });
+
+    const secondMirror = makeAssistantMessage({
+      text,
+      model: "delivery-mirror",
+      entryId: randomUUID(),
+    });
+    const r2 = await engine.ingest({
+      sessionId,
+      sessionKey: undefined,
+      message: secondMirror,
+    });
+    expect(r2.ingested).toBe(true);
+
+    const store = engine.getConversationStore();
+    const conversation = await store.getConversationForSession({ sessionId });
+    expect(conversation).not.toBeNull();
+    if (conversation) {
+      const count = await store.getMessageCount(conversation.conversationId);
+      expect(count).toBe(3);
     }
   });
 

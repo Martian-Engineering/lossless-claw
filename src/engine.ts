@@ -92,14 +92,6 @@ const MAX_PREVIOUS_ASSEMBLED_SNAPSHOTS = 100;
 const FORK_BOUNDED_BOOTSTRAP_REASON = "fork-bounded bootstrap import";
 const CONTEXT_ENGINE_PROJECTION_EPOCH_VERSION = "summary-prefix-v1";
 const DEFERRED_ASSEMBLY_DEGRADED_PRESSURE_RATIO = 0.75;
-/**
- * Tail-window size for delivery-mirror dedup in `ingestSingle`.
- * A delivery-mirror entry is always adjacent to its response entry in the
- * transcript (response first, then mirror), so a small window suffices.
- * Kept separate from `FLUSH_LAG_ADOPTION_TAIL_WINDOW` to avoid coupling
- * unrelated tuning knobs.
- */
-const DELIVERY_MIRROR_DEDUP_TAIL_WINDOW = 16;
 type CompactionExecutionParams = {
   conversationId: number;
   sessionId: string;
@@ -2604,8 +2596,8 @@ export class LcmContextEngine implements ContextEngine {
     // because toStoredMessage strips thinking, but they have different
     // transcript entry ids, so the entry-id idempotency check above does not
     // catch the mirror. When the incoming message is a delivery-mirror, skip
-    // it if a recent assistant message with the same identity hash already
-    // exists (the response entry was ingested first).
+    // it if the immediately previous row is a reasoned assistant response with
+    // the same identity hash (the response entry was ingested first).
     const rawModel = (message as unknown as Record<string, unknown>).model;
     if (
       typeof rawModel === "string" &&
@@ -2614,11 +2606,10 @@ export class LcmContextEngine implements ContextEngine {
       stored.content.trim().length > 0
     ) {
       if (
-        await this.conversationStore.hasRecentMessageByIdentity(
+        await this.conversationStore.hasPreviousReasonedMessageByIdentity(
           conversationId,
           stored.role,
           stored.content,
-          DELIVERY_MIRROR_DEDUP_TAIL_WINDOW,
         )
       ) {
         return { ingested: false };
