@@ -1363,6 +1363,7 @@ describe("LcmContextEngine maintain and assemble budget", () => {
     const conversation = await engine.getConversationStore().getOrCreateConversation(sessionId, {
       sessionKey: undefined,
     });
+    const summaryStore = engine.getSummaryStore();
     await engine.getCompactionMaintenanceStore().requestProactiveCompactionDebt({
       conversationId: conversation.conversationId,
       reason: "threshold",
@@ -1372,10 +1373,24 @@ describe("LcmContextEngine maintain and assemble budget", () => {
     const executeCompactionCoreSpy = vi.spyOn(
       privateEngine,
       "executeCompactionCore",
-    ).mockResolvedValue({
-      ok: true,
-      compacted: true,
-      reason: "compacted",
+    ).mockImplementation(async () => {
+      await summaryStore.insertSummary({
+        summaryId: "sum_emergency_drain_refresh",
+        conversationId: conversation.conversationId,
+        kind: "condensed",
+        depth: 1,
+        content: "fresh emergency drain summary",
+        tokenCount: 10,
+      });
+      await summaryStore.appendContextSummary(
+        conversation.conversationId,
+        "sum_emergency_drain_refresh",
+      );
+      return {
+        ok: true,
+        compacted: true,
+        reason: "compacted",
+      };
     });
 
     const assembleResult = await engine.assemble({
@@ -1398,6 +1413,9 @@ describe("LcmContextEngine maintain and assemble budget", () => {
     expect(maintenance?.pending).toBe(false);
     expect(maintenance?.running).toBe(false);
     expect(assembleResult.messages).toHaveLength(1);
+    expect(log.debug).not.toHaveBeenCalledWith(
+      expect.stringContaining("[lcm] assemble: no context items"),
+    );
     expect(log.warn).toHaveBeenCalledWith(
       expect.stringContaining(
         "[lcm] assemble: emergency deferred compaction debt draining pre-assembly",

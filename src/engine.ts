@@ -3280,22 +3280,33 @@ export class LcmContextEngine implements ContextEngine {
       const maintenance = await this.compactionMaintenanceStore.getConversationCompactionMaintenance(
         conversation.conversationId,
       );
-      const bootstrapState = await this.summaryStore.getConversationBootstrapState(
-        conversation.conversationId,
-      );
-      const forkBoundedBootstrap = bootstrapState?.forkBounded === true;
-      const forkSourceMessageCount = bootstrapState?.forkSourceMessageCount ?? 0;
-      const contextItems = await this.summaryStore.getContextItems(conversation.conversationId);
-      const hasSummaryItems = contextItems.some((item) => item.itemType === "summary");
-      const placeholderBootstrapState =
-        bootstrapState !== null &&
-        bootstrapState.lastSeenSize === 0 &&
-        bootstrapState.lastSeenMtimeMs === 0 &&
-        bootstrapState.lastProcessedOffset === 0 &&
-        bootstrapState.lastProcessedEntryHash === null;
-      const incompleteTranscriptCoverage =
-        !hasSummaryItems &&
-        placeholderBootstrapState;
+      let forkBoundedBootstrap = false;
+      let forkSourceMessageCount = 0;
+      let contextItems: ContextItemRecord[] = [];
+      let hasSummaryItems = false;
+      let placeholderBootstrapState = false;
+      let incompleteTranscriptCoverage = false;
+      // Emergency compaction can rewrite context items before assemble proceeds,
+      // so keep this snapshot refreshable instead of relying on a stale read.
+      const refreshAssemblyContextSnapshot = async (): Promise<void> => {
+        const bootstrapState = await this.summaryStore.getConversationBootstrapState(
+          conversation.conversationId,
+        );
+        forkBoundedBootstrap = bootstrapState?.forkBounded === true;
+        forkSourceMessageCount = bootstrapState?.forkSourceMessageCount ?? 0;
+        contextItems = await this.summaryStore.getContextItems(conversation.conversationId);
+        hasSummaryItems = contextItems.some((item) => item.itemType === "summary");
+        placeholderBootstrapState =
+          bootstrapState !== null &&
+          bootstrapState.lastSeenSize === 0 &&
+          bootstrapState.lastSeenMtimeMs === 0 &&
+          bootstrapState.lastProcessedOffset === 0 &&
+          bootstrapState.lastProcessedEntryHash === null;
+        incompleteTranscriptCoverage =
+          !hasSummaryItems &&
+          placeholderBootstrapState;
+      };
+      await refreshAssemblyContextSnapshot();
       let deferredAssemblyDegradation:
         | {
             reason:
@@ -3358,6 +3369,9 @@ export class LcmContextEngine implements ContextEngine {
               reason: "emergency-debt-exhausted",
               pressure,
             };
+          }
+          if (!latestMaintenance?.pending && !latestMaintenance?.running) {
+            await refreshAssemblyContextSnapshot();
           }
         } else if (pressure.pressureTokenCount > pressureThreshold) {
           deferredAssemblyDegradation = {
