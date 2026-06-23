@@ -120,6 +120,51 @@ describe("delivery-mirror dedup", () => {
     }
   });
 
+  it("skips delivery-mirror after string response with top-level reasoning", async () => {
+    const engine = createEngine();
+    const sessionId = randomUUID();
+    const text = "Hello from a string response";
+
+    const response = {
+      role: "assistant",
+      content: text,
+      reasoning_content: "private top-level reasoning",
+      timestamp: Date.now(),
+    } as AgentMessage;
+    attachTranscriptEntryMeta(response, {
+      entryId: "b1c2d3e4",
+      parentId: null,
+      timestamp: new Date().toISOString(),
+    });
+
+    const r1 = await engine.ingest({
+      sessionId,
+      sessionKey: undefined,
+      message: response,
+    });
+    expect(r1.ingested).toBe(true);
+
+    const mirror = makeAssistantMessage({
+      text,
+      model: "delivery-mirror",
+      entryId: randomUUID(),
+    });
+    const r2 = await engine.ingest({
+      sessionId,
+      sessionKey: undefined,
+      message: mirror,
+    });
+    expect(r2.ingested).toBe(false);
+
+    const store = engine.getConversationStore();
+    const conversation = await store.getConversationForSession({ sessionId });
+    expect(conversation).not.toBeNull();
+    if (conversation) {
+      const count = await store.getMessageCount(conversation.conversationId);
+      expect(count).toBe(1);
+    }
+  });
+
   it("ingests repeated standalone delivery-mirrors with identical text", async () => {
     const engine = createEngine();
     const sessionId = randomUUID();
