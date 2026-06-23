@@ -3395,6 +3395,13 @@ export class LcmContextEngine implements ContextEngine {
         return degraded;
       }
 
+      if (incompleteTranscriptCoverage) {
+        this.deps.log.warn(
+          `[lcm] assemble: bounded live fallback while transcript coverage recovers conversation=${conversation.conversationId} ${sessionLabel} reason=incomplete-transcript-coverage contextItems=${contextItems.length} liveMessages=${liveMessages.length} placeholderBootstrapState=${placeholderBootstrapState} hasSummaryItems=${hasSummaryItems} tokenBudget=${tokenBudget}`,
+        );
+        return boundedLiveFallback("incomplete-transcript-coverage");
+      }
+
       if (contextItems.length === 0) {
         if (forkBoundedBootstrap) {
           const boundedFallback = buildForkBoundedLiveFallback({

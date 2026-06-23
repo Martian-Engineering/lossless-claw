@@ -1014,18 +1014,42 @@ describe("LcmContextEngine maintain and assemble budget", () => {
     const conversation = await engine.getConversationStore().getOrCreateConversation(sessionId, {
       sessionKey: undefined,
     });
-    const [storedMessage] = await engine.getConversationStore().createMessagesBulk([
+    const storedMessages = await engine.getConversationStore().createMessagesBulk([
       {
         conversationId: conversation.conversationId,
         seq: 0,
         role: "user",
-        content: "only metadata anchor, not usable transcript coverage",
+        content: "metadata anchor one, not usable transcript coverage",
+        tokenCount: 12,
+      },
+      {
+        conversationId: conversation.conversationId,
+        seq: 1,
+        role: "assistant",
+        content: "metadata anchor two, not usable transcript coverage",
+        tokenCount: 12,
+      },
+      {
+        conversationId: conversation.conversationId,
+        seq: 2,
+        role: "user",
+        content: "metadata anchor three, not usable transcript coverage",
+        tokenCount: 12,
+      },
+      {
+        conversationId: conversation.conversationId,
+        seq: 3,
+        role: "assistant",
+        content: "metadata anchor four, not usable transcript coverage",
         tokenCount: 12,
       },
     ]);
     await engine
       .getSummaryStore()
-      .appendContextMessages(conversation.conversationId, [storedMessage.messageId]);
+      .appendContextMessages(
+        conversation.conversationId,
+        storedMessages.map((message) => message.messageId),
+      );
     await engine.getSummaryStore().upsertConversationBootstrapState({
       conversationId: conversation.conversationId,
       sessionFilePath: sessionFile,
