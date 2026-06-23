@@ -297,6 +297,39 @@ describe("appendUncoveredVolatileLiveInputsWithinBudget bounds supersede to the 
     expect(current.content).toContain("<active_memory_plugin>");
     expect(current.content).toContain(REPEAT);
   });
+
+  it("preserves a consecutive earlier user turn with the same body in the tail", () => {
+    // Regression from autoreview: consecutive user turns can exist without an
+    // assistant separator. The supersede may collapse only the current-turn
+    // suffix face, not every same-body user row in the trailing run.
+    const REPEAT = "yes";
+    const assembledMessages: AgentMessage[] = [
+      // Earlier, genuinely distinct user turn with the SAME body.
+      { role: "user", content: REPEAT },
+      // Bare current turn reconstructed from the store.
+      { role: "user", content: REPEAT },
+    ] as AgentMessage[];
+    const liveMessages: AgentMessage[] = [
+      // Decorated live copy of the current turn.
+      { role: "user", content: decoratedWebchat(REPEAT) },
+    ] as AgentMessage[];
+
+    const result = appendUncoveredVolatileLiveInputsWithinBudget({
+      assembledMessages,
+      assembledEstimatedTokens: 10,
+      liveMessages,
+      tokenBudget: 1_000_000,
+    });
+
+    const userTurns = result.messages.filter(
+      (message) => (message as { role: string }).role === "user",
+    );
+    expect(userTurns).toHaveLength(2);
+    expect((userTurns[0] as { content: string }).content).toBe(REPEAT);
+    const current = userTurns[userTurns.length - 1] as { content: string };
+    expect(current.content).toContain("<active_memory_plugin>");
+    expect(current.content).toContain(REPEAT);
+  });
 });
 
 describe("engine.assemble preserves webchat decoration + memory (no-preamble, memory-first path)", () => {

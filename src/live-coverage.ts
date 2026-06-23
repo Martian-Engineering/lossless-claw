@@ -564,6 +564,21 @@ function assembledRowIsStructuralBareCurrentTurn(params: {
   });
 }
 
+// Classify the known persisted faces of the live current turn. The suffix scan
+// uses this to stop before deleting a prior consecutive user turn with the same
+// body: the current turn may have one plain bare row and one timestamped row,
+// but a second row with the same face is a distinct earlier turn.
+function structuralBareCurrentTurnFace(params: {
+  liveContent: string;
+  assembledContent: string;
+}): "bare" | "timestamped" | null {
+  if (!assembledRowIsStructuralBareCurrentTurn(params)) {
+    return null;
+  }
+  const trimmed = params.assembledContent.trim();
+  return stripLeadingOpenClawInboundTimestamp(trimmed) === trimmed ? "bare" : "timestamped";
+}
+
 /**
  * The current turn is the LAST live user message. Recognize it as a volatile
  * live input — even when it carries no Telegram/Slack-style preamble and no
@@ -648,16 +663,11 @@ export function resolveStructuralCurrentTurnSupersededIndexes(params: {
     return superseded;
   }
   const liveStored = toStoredMessage(params.liveMessages[currentTurnLiveIndex] as AgentMessage);
-  // Bound the supersede to the current turn's TAIL: the trailing contiguous run
-  // of assembled USER rows. The store double-write this collapses always lands at
-  // the inbound tail — the current turn has no assistant reply after it yet — so
-  // every bare/timestamped face of the current turn lives in this run. We stop at
-  // the first non-user (assistant/tool) message, which is the real turn boundary:
-  // a same-body user row BEHIND it is a genuinely earlier turn and must be
-  // preserved, not collapsed by content match (PR #926 review). We do NOT stop at
-  // a non-matching USER row, because the covered path keeps the exact-equal
-  // decorated survivor at the tail end (a non-match on equal content) and the bare
-  // duplicates to collapse sit behind it within the same inbound run.
+  // Bound the supersede to the current turn's suffix cluster. The current store
+  // double-write can produce one plain bare row and one timestamped row, with an
+  // exact live anchor at the end on covered paths. A second same-face row behind
+  // that cluster is a distinct consecutive user turn and must survive.
+  const seenFaces = new Set<"bare" | "timestamped">();
   for (
     let assembledIndex = params.assembledMessages.length - 1;
     assembledIndex >= 0;
@@ -668,18 +678,20 @@ export function resolveStructuralCurrentTurnSupersededIndexes(params: {
       // End of the trailing user run — never reach back into prior turns.
       break;
     }
-    if (
-      assembledRowIsStructuralBareCurrentTurn({
-        liveContent: liveStored.content,
-        assembledContent: assembledStored.content,
-      })
-    ) {
-      superseded.add(assembledIndex);
-      // Do NOT break on a match: one live current turn may supersede MULTIPLE bare
-      // rows in this tail (the plain `body` copy AND the `[timestamp] body` copy).
+    if (assembledStored.content === liveStored.content) {
+      // Exact live anchor / survivor: part of the current-turn suffix, never
+      // collapsed, and not a boundary for bare faces immediately behind it.
+      continue;
     }
-    // A non-matching user row (e.g. the exact-equal decorated survivor) is skipped
-    // but does NOT end the run.
+    const face = structuralBareCurrentTurnFace({
+      liveContent: liveStored.content,
+      assembledContent: assembledStored.content,
+    });
+    if (face === null || seenFaces.has(face)) {
+      break;
+    }
+    seenFaces.add(face);
+    superseded.add(assembledIndex);
   }
   return superseded;
 }
