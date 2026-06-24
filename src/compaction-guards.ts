@@ -145,9 +145,9 @@ export class CompactionGuards {
 
   /**
    * Clear an open spend backoff for a scope, returning the prior expiry if
-   * one was open. Used by user-initiated compaction: an explicit repair
-   * request is informed consent to spend, so it must not silently no-op
-   * behind a backoff opened by an earlier automatic attempt.
+   * one was open. Used by manual compaction and force-driven recovery:
+   * manual repair is informed consent to spend, and force-driven repair must
+   * not silently no-op behind a backoff opened by an earlier automatic attempt.
    */
   clearSummarySpendBackoff(scopeKey: string): Date | null {
     const state = this.summarySpendGuardStates.get(scopeKey);

@@ -2230,7 +2230,7 @@ describe("LcmContextEngine fidelity and token budget", () => {
     expect(executeSpy).toHaveBeenCalledTimes(1);
   });
 
-  it("poor-reduction spend backoff blocks custom summarizers in the same compaction scope", async () => {
+  it("force compaction clears poor-reduction spend backoff for custom summarizers in the same scope", async () => {
     vi.useFakeTimers({ toFake: ["Date"] });
     vi.setSystemTime(new Date("2026-05-31T12:35:00.000Z"));
     try {
