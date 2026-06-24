@@ -176,7 +176,11 @@ describe("appendUncoveredVolatileLiveInputsWithinBudget supersedes bare + timest
           (message as { content: string }).content === webchatTimestampedBody(WEBCHAT_BODY)),
     );
     expect(bareCopies).toHaveLength(0);
-    expect(result.evictedMessages).toBeGreaterThan(0);
+    // A pure same-turn supersede is identity replacement, not budget eviction: it
+    // is reported as supersededMessages and never inflates evictedMessages (which
+    // gates assembly's prompt-recall drop).
+    expect(result.supersededMessages).toBeGreaterThan(0);
+    expect(result.evictedMessages).toBe(0);
   });
 
   it("collapses the bare + [timestamp] body duplication with NO memory plugins (live = [timestamp] body only)", () => {

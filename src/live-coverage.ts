@@ -762,6 +762,8 @@ export function appendUncoveredVolatileLiveInputsWithinBudget(params: {
   appendedTokens: number;
   evictedMessages: number;
   evictedTokens: number;
+  supersededMessages: number;
+  supersededTokens: number;
   overBudget: boolean;
 } {
   const liveMessages = params.liveMessages.map(normalizeLiveMessageForAssemblyReconciliation);
@@ -791,6 +793,8 @@ export function appendUncoveredVolatileLiveInputsWithinBudget(params: {
         appendedTokens: 0,
         evictedMessages: 0,
         evictedTokens: 0,
+        supersededMessages: 0,
+        supersededTokens: 0,
         overBudget: params.assembledEstimatedTokens > params.tokenBudget,
       };
     }
@@ -812,8 +816,10 @@ export function appendUncoveredVolatileLiveInputsWithinBudget(params: {
       estimatedTokens: collapsedEstimatedTokens,
       appendedMessages: 0,
       appendedTokens: 0,
-      evictedMessages: supersededAssembledIndexes.size,
-      evictedTokens: droppedTokens,
+      evictedMessages: 0,
+      evictedTokens: 0,
+      supersededMessages: supersededAssembledIndexes.size,
+      supersededTokens: droppedTokens,
       overBudget: collapsedEstimatedTokens > params.tokenBudget,
     };
   }
@@ -944,10 +950,14 @@ export function appendUncoveredVolatileLiveInputsWithinBudget(params: {
     estimatedTokens,
     appendedMessages: appendedMessages.length,
     appendedTokens: estimateAgentMessageTokens(appendedMessages),
-    // Superseded bare rows are reported as evicted: they were replaced by the
-    // richer live copy that the same turn delivered.
-    evictedMessages: evictedMessages + supersededAssembledIndexes.size,
-    evictedTokens: evictedTokens + supersededTokens,
+    evictedMessages,
+    evictedTokens,
+    // A same-turn supersede (the richer live copy replacing the bare store face
+    // the same turn delivered) is a per-turn identity fix, not budget eviction.
+    // Reported separately so callers do not read it as context pressure (e.g.
+    // assembly dropping an already-budgeted prompt-recall cue).
+    supersededMessages: supersededAssembledIndexes.size,
+    supersededTokens,
     overBudget: estimatedTokens > params.tokenBudget,
   };
 }
