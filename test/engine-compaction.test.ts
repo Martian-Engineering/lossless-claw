@@ -536,7 +536,7 @@ describe("LcmContextEngine afterTurn dedup guard", () => {
     );
   });
 
-  it("skips oversized no-overlap batches that match the tail around auto-compaction summaries", async () => {
+  it("ingests oversized no-overlap batches that only timestamp-match around auto-compaction summaries", async () => {
     const warnLog = vi.fn();
     const engine = createEngineWithDepsOverrides({
       log: {
@@ -576,9 +576,8 @@ describe("LcmContextEngine afterTurn dedup guard", () => {
       autoCompactionSummary: "[summary] compacted older context",
     });
 
-    // The marked summary row breaks suffix alignment, but the runtime rows
-    // match the persisted tail around that summary. This is a stale replay, not
-    // a live no-overlap turn.
+    // The marked summary row breaks suffix alignment, and timestamp equality
+    // alone cannot distinguish a stale replay from a live no-overlap turn.
     await engine.afterTurn({
       sessionId,
       sessionFile: createSessionFilePath("dedup-oversized-no-overlap-all-persisted-2"),
@@ -598,9 +597,11 @@ describe("LcmContextEngine afterTurn dedup guard", () => {
       "old C",
       "[summary] compacted older context",
       "last D",
+      "old B",
+      "last D",
     ]);
     expect(warnLog).toHaveBeenCalledWith(
-      `[lcm] dedup: oversized, storedCount=5 batchLen=2, no suffix overlap found but batch matches timestamp-proven persisted tail — skipping full batch`,
+      `[lcm] dedup: oversized, storedCount=5 batchLen=2, no overlap found — ingesting full batch`,
     );
   });
 
@@ -636,6 +637,56 @@ describe("LcmContextEngine afterTurn dedup guard", () => {
       messages: [
         { role: "user", content: "deploy?", timestamp: repeatedDeployTimestamp } as AgentMessage,
         { role: "assistant", content: "done", timestamp: repeatedDeployTimestamp + 1000 } as AgentMessage,
+      ],
+      prePromptMessageCount: 0,
+      tokenBudget: 4096,
+    });
+
+    const conversation = await engine.getConversationStore().getConversationBySessionId(sessionId);
+    const stored = await engine.getConversationStore().getMessages(conversation!.conversationId);
+    expect(stored.map((m) => m.content)).toEqual([
+      "deploy?",
+      "done",
+      "later tail",
+      "deploy?",
+      "done",
+    ]);
+    expect(warnLog).toHaveBeenCalledWith(
+      `[lcm] dedup: oversized, storedCount=3 batchLen=2, no overlap found — ingesting full batch`,
+    );
+  });
+
+  it("ingests oversized no-overlap repeated content with same-second timestamps", async () => {
+    const warnLog = vi.fn();
+    const engine = createEngineWithDepsOverrides({
+      log: {
+        info: vi.fn(),
+        warn: warnLog,
+        error: vi.fn(),
+        debug: vi.fn(),
+      },
+    });
+    const sessionId = "dedup-oversized-no-overlap-repeated-same-second";
+    const sharedTimestamp = Date.UTC(2026, 0, 1, 0, 1, 0);
+
+    await engine.afterTurn({
+      sessionId,
+      sessionFile: createSessionFilePath("dedup-oversized-no-overlap-repeated-same-second"),
+      messages: [
+        { role: "user", content: "deploy?", timestamp: sharedTimestamp } as AgentMessage,
+        { role: "assistant", content: "done", timestamp: sharedTimestamp } as AgentMessage,
+        { role: "assistant", content: "later tail", timestamp: sharedTimestamp + 1000 } as AgentMessage,
+      ],
+      prePromptMessageCount: 0,
+      tokenBudget: 4096,
+    });
+
+    await engine.afterTurn({
+      sessionId,
+      sessionFile: createSessionFilePath("dedup-oversized-no-overlap-repeated-same-second-2"),
+      messages: [
+        { role: "user", content: "deploy?", timestamp: sharedTimestamp } as AgentMessage,
+        { role: "assistant", content: "done", timestamp: sharedTimestamp } as AgentMessage,
       ],
       prePromptMessageCount: 0,
       tokenBudget: 4096,
@@ -1091,6 +1142,7 @@ describe("LcmContextEngine afterTurn dedup guard", () => {
       tokenBudget: 4096,
     });
 
+    const getLargeFileContentSpy = vi.spyOn(engine.getSummaryStore(), "getLargeFileContent");
     await engine.afterTurn({
       sessionId,
       sessionFile: createSessionFilePath("dedup-large-file-raw-payload-file-block-replay-2"),
@@ -1110,6 +1162,10 @@ describe("LcmContextEngine afterTurn dedup guard", () => {
     expect(stored[1].content).toContain("[LCM Raw Payload: file_");
     expect(stored[1].content).not.toContain(fileText.slice(0, 64));
     expect(stored[3].content).toBe("new D");
+    expect(getLargeFileContentSpy).toHaveBeenCalledWith(expect.any(String), {
+      largeFilesDir: expect.any(String),
+      maxBytes: Buffer.byteLength(rawContent, "utf8"),
+    });
   });
 
   it("does not read raw payload sidecars when incoming content has no file blocks", async () => {

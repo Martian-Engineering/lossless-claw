@@ -157,8 +157,6 @@ export class BatchDeduplicator {
     const storedBatch = batch.map((m) => toStoredMessage(m));
     const batchHashes = computeBatchIdentityHashes(storedBatch);
     const rawPayloadContents = computeBatchRawPayloadContents(batch, storedBatch);
-    const batchCreatedAtMs = batch.map(resolveMessageCreatedAtMs);
-
     // When the DB already has more messages than the incoming batch,
     // the batch may be a tail-only replay. Try tail-matching first,
     // then fall back to suffix-matching.
@@ -169,7 +167,6 @@ export class BatchDeduplicator {
         storedBatch,
         batchHashes,
         rawPayloadContents,
-        batchCreatedAtMs,
         storedMessageCount,
         lastDbIdentityHash,
         options,
@@ -187,7 +184,6 @@ export class BatchDeduplicator {
         storedBatch,
         batchHashes,
         rawPayloadContents,
-        batchCreatedAtMs,
         storedMessageCount,
         "prefix-mismatch",
         { onNoOverlap: "ingest" },
@@ -239,7 +235,6 @@ export class BatchDeduplicator {
     storedBatch: ReturnType<typeof toStoredMessage>[],
     batchHashes: string[],
     rawPayloadContents: Array<string | null>,
-    batchCreatedAtMs: Array<number | null>,
     storedMessageCount: number,
     lastDbIdentityHash: string,
     options?: { oversizedNoOverlap?: "ingest" | "skip" },
@@ -289,7 +284,6 @@ export class BatchDeduplicator {
       storedBatch,
       batchHashes,
       rawPayloadContents,
-      batchCreatedAtMs,
       storedMessageCount,
       "oversized",
       { onNoOverlap: options?.oversizedNoOverlap ?? "ingest" },
@@ -307,7 +301,6 @@ export class BatchDeduplicator {
     storedBatch: ReturnType<typeof toStoredMessage>[],
     batchHashes: string[],
     rawPayloadContents: Array<string | null>,
-    batchCreatedAtMs: Array<number | null>,
     storedMessageCount: number,
     context: string,
     options?: { onNoOverlap?: "ingest" | "skip" },
@@ -397,76 +390,11 @@ export class BatchDeduplicator {
       return [];
     }
 
-    if (
-      await this.batchMatchesPersistedTailByTimestamp(
-        allStored,
-        allRecentHashes,
-        storedBatch,
-        batchHashes,
-        rawPayloadContents,
-        batchCreatedAtMs,
-      )
-    ) {
-      this.deps.log.warn(
-        `[lcm] dedup: ${context}, storedCount=${storedMessageCount} batchLen=${batch.length}, ` +
-          `no suffix overlap found but batch matches timestamp-proven persisted tail — skipping full batch`,
-      );
-      return [];
-    }
-
     this.deps.log.warn(
       `[lcm] dedup: ${context}, storedCount=${storedMessageCount} batchLen=${batch.length}, ` +
         `no overlap found — ingesting full batch`,
     );
     return batch;
-  }
-
-  private async batchMatchesPersistedTailByTimestamp(
-    storedMessages: MessageRecord[],
-    storedHashes: string[],
-    incomingBatch: StoredMessage[],
-    incomingHashes: string[],
-    incomingRawPayloadContents: Array<string | null>,
-    incomingCreatedAtMs: Array<number | null>,
-  ): Promise<boolean> {
-    if (
-      incomingBatch.length === 0 ||
-      storedMessages.length !== storedHashes.length ||
-      storedMessages.length < incomingBatch.length
-    ) {
-      return false;
-    }
-
-    let storedIndex = storedMessages.length - 1;
-    for (let batchIndex = incomingBatch.length - 1; batchIndex >= 0; batchIndex -= 1) {
-      let matched = false;
-      while (storedIndex >= 0) {
-        const match = await this.matchStoredMessageToIncoming(
-          storedMessages[storedIndex]!,
-          incomingBatch[batchIndex]!,
-          incomingHashes[batchIndex]!,
-          storedHashes[storedIndex]!,
-          incomingRawPayloadContents[batchIndex],
-        );
-        if (
-          match &&
-          match !== "unproven-externalized" &&
-          messageTimestampMatchesPersistedRow(
-            incomingCreatedAtMs[batchIndex],
-            storedMessages[storedIndex]!,
-          )
-        ) {
-          matched = true;
-          storedIndex -= 1;
-          break;
-        }
-        storedIndex -= 1;
-      }
-      if (!matched) {
-        return false;
-      }
-    }
-    return true;
   }
 
   private async matchStoredMessageToIncoming(
@@ -684,6 +612,7 @@ export class BatchDeduplicator {
 
     const storedPayload = await this.summaryStore.getLargeFileContent(reference.fileId, {
       largeFilesDir: this.largeFilesDir,
+      maxBytes: Buffer.byteLength(incomingRawPayloadContent, "utf8"),
     });
     if (!storedPayload) {
       return false;
@@ -819,37 +748,6 @@ function computeBatchRawPayloadContents(
     const rawPayload = serializeRawPayloadContent(message, storedBatch[index]?.content ?? "");
     return rawPayload?.content ?? null;
   });
-}
-
-function resolveMessageCreatedAtMs(message: AgentMessage): number | null {
-  const raw = message as unknown as Record<string, unknown>;
-  const value = raw.timestamp ?? raw.createdAt ?? raw.created_at;
-  if (typeof value === "number") {
-    return Number.isFinite(value) ? Math.floor(value / 1000) * 1000 : null;
-  }
-  if (value instanceof Date) {
-    const time = value.getTime();
-    return Number.isFinite(time) ? Math.floor(time / 1000) * 1000 : null;
-  }
-  if (typeof value === "string" && value.trim()) {
-    const time = Date.parse(value);
-    return Number.isFinite(time) ? Math.floor(time / 1000) * 1000 : null;
-  }
-  return null;
-}
-
-function messageTimestampMatchesPersistedRow(
-  incomingCreatedAtMs: number | null | undefined,
-  storedMessage: MessageRecord,
-): boolean {
-  if (incomingCreatedAtMs == null) {
-    return false;
-  }
-  const storedCreatedAtMs = storedMessage.createdAt.getTime();
-  if (!Number.isFinite(storedCreatedAtMs)) {
-    return false;
-  }
-  return incomingCreatedAtMs <= storedCreatedAtMs;
 }
 
 type ExternalizedReference = {
