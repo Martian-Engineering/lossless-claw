@@ -2186,6 +2186,25 @@ describe("LcmContextEngine afterTurn", () => {
     '[{"sender":"sam.rivera","body":"/new"}]\n' +
     "```\n\n" +
     ":white_check_mark: New session started.";
+  // A 1:1/direct delivery can be real user content even when no explicit bot
+  // mention is needed. The un-addressed relaxation is channel/group-only.
+  const UNADDRESSED_DIRECT_FRONTIER_ROW =
+    "Delivery: Final assistant text is not automatically delivered in this run. " +
+    "Use the `message` tool to send user-visible output.\n\n" +
+    "Conversation info (untrusted metadata):\n" +
+    "```json\n" +
+    "{\n" +
+    '  "chat_id": "dm:D0CHANNEL1",\n' +
+    '  "conversation_label": "sam.rivera",\n' +
+    '  "sender": "sam.rivera",\n' +
+    '  "inbound_event_kind": "user_request",\n' +
+    '  "is_group_chat": false,\n' +
+    '  "explicitly_mentioned_bot": false,\n' +
+    '  "mention_source": "none",\n' +
+    '  "history_count": 0\n' +
+    "}\n" +
+    "```\n\n" +
+    "Please summarize the deploy status.";
   // An ADDRESSED user turn: same Delivery shape, but the metadata says the bot
   // was directly addressed (explicitly_mentioned_bot:true / mention_source:reply)
   // and a real user question trails the metadata. MUST classify as anchoring.
@@ -2502,6 +2521,71 @@ describe("LcmContextEngine afterTurn", () => {
 
     const stored = await engine.getConversationStore().getMessages(conversation!.conversationId);
     expect(stored.map((m) => m.content)).toEqual([ADDRESSED_FRONTIER_ROW]);
+    const state = await engine
+      .getSummaryStore()
+      .getConversationBootstrapState(conversation!.conversationId);
+    expect(state?.lastProcessedOffset).toBe(0);
+  });
+
+  it("afterTurn STILL freezes an unaddressed direct-message frontier without group-channel proof", async () => {
+    // In a direct chat, "not explicitly mentioned" does not prove ambient
+    // channel chatter. The no-anchor relaxation must remain group-only so a DM
+    // frontier with real user content cannot unlock divergent transcript import.
+    const warnLog = vi.fn();
+    const engine = createEngineWithDeps(
+      {},
+      { log: { info: vi.fn(), warn: warnLog, error: vi.fn(), debug: vi.fn() } },
+    );
+    const sessionId = "session-unaddressed-direct-still-freezes";
+    const sessionKey = "agent:agent-two:dm:direct-frontier";
+
+    await engine.ingest({
+      sessionId,
+      sessionKey,
+      message: makeMessage({ role: "user", content: UNADDRESSED_DIRECT_FRONTIER_ROW }),
+    });
+    const conversation = await engine.getConversationStore().getConversationForSession({
+      sessionId,
+      sessionKey,
+    });
+    expect(conversation).not.toBeNull();
+    await engine.getConversationStore().markConversationBootstrapped(conversation!.conversationId);
+
+    const sessionFile = createSessionFilePath("session-unaddressed-direct-still-freezes");
+    const txLine = (role: AgentMessage["role"], text: string) =>
+      `${JSON.stringify({ message: { role, content: [{ type: "text", text }] } })}\n`;
+    writeFileSync(
+      sessionFile,
+      `not-json\n${txLine("user", "divergent direct question")}${txLine(
+        "assistant",
+        "divergent direct answer",
+      )}`,
+      "utf8",
+    );
+
+    await engine.getSummaryStore().upsertConversationBootstrapState({
+      conversationId: conversation!.conversationId,
+      sessionFilePath: sessionFile,
+      lastSeenSize: 0,
+      lastSeenMtimeMs: 0,
+      lastProcessedOffset: 0,
+      lastProcessedEntryHash: null,
+    });
+
+    await engine.afterTurn({
+      sessionId,
+      sessionKey,
+      sessionFile,
+      messages: [makeMessage({ role: "assistant", content: "divergent direct answer" })],
+      prePromptMessageCount: 0,
+      tokenBudget: 4_096,
+    });
+
+    const warns = warnLog.mock.calls.map((c) => String(c[0]));
+    expect(warns.some((m) => m.includes("did not cover the transcript frontier"))).toBe(true);
+
+    const stored = await engine.getConversationStore().getMessages(conversation!.conversationId);
+    expect(stored.map((m) => m.content)).toEqual([UNADDRESSED_DIRECT_FRONTIER_ROW]);
     const state = await engine
       .getSummaryStore()
       .getConversationBootstrapState(conversation!.conversationId);

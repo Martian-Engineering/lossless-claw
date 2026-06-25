@@ -122,16 +122,17 @@ export function canonicalizeOpenClawInboundMetadataIdentityContent(
  * (untrusted metadata)" block is present (located through the same optional
  * "[OpenClaw room event]" header and "Delivery:" prelude the rest of this
  * module handles) AND the parsed metadata is either an explicit room event, or
- * a clearly un-addressed delivery (explicitly_mentioned_bot === false AND
- * mention_source === "none").
+ * a clearly un-addressed group delivery (is_group_chat === true AND
+ * explicitly_mentioned_bot === false AND mention_source === "none").
  *
  * SAFETY (#824 contamination zone): under-match is the safe direction. Any
  * parse failure, a missing/unexpected flag, an addressed turn
  * (explicitly_mentioned_bot === true or mention_source !== "none"), or a
- * non-user role returns false. The un-addressed case requires BOTH fields; if
- * mention_source is absent we do NOT treat the row as ambient unless the event
- * is an explicit room_event. A real directed turn is never misclassified as
- * ambient regardless of its trailing body.
+ * non-user role returns false. The un-addressed case requires the explicit
+ * group-chat flag plus BOTH mention fields; if any are absent we do NOT treat
+ * the row as ambient unless the event is an explicit room_event. A real
+ * directed turn is never misclassified as ambient regardless of its trailing
+ * body.
  */
 export function isOpenClawAmbientInboundRecord(role: string, content: string): boolean {
   if (role !== "user") {
@@ -161,6 +162,10 @@ export function isOpenClawAmbientInboundRecord(role: string, content: string): b
 
   if (record.inbound_event_kind === "room_event") {
     return true;
+  }
+
+  if (record.is_group_chat !== true) {
+    return false;
   }
 
   const mentioned = record.explicitly_mentioned_bot;
