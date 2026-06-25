@@ -13,6 +13,7 @@ import {
   parseFileBlocks,
   type FileBlock,
 } from "./large-files.js";
+import { liveContentContainsBareBody } from "./live-coverage.js";
 import {
   extractStructuredText,
   RAW_PAYLOAD_EXTERNALIZATION_REASON,
@@ -20,6 +21,8 @@ import {
   toStoredMessage,
   type StoredMessage,
 } from "./message-content.js";
+import { messageIdentity } from "./message-signatures.js";
+import { stripLeadingOpenClawInboundTimestamp } from "./openclaw-inbound-metadata.js";
 import type { AgentMessage } from "./openclaw-bridge.js";
 import type { ConversationStore, MessageRecord } from "./store/conversation-store.js";
 import { buildMessageIdentityHash } from "./store/message-identity.js";
@@ -59,6 +62,52 @@ export class BatchDeduplicator {
    *    replay snapshot — fail closed, because a covered transcript read will
    *    deliver anything real on the next turn idempotently.
    */
+  /**
+   * A runtime batch row is covered by a persisted frontier row when their
+   * identities match, OR when the runtime copy is the DECORATED face of the
+   * persisted bare body of the same turn. OpenClaw delivers the current turn
+   * twice — the transcript persists the BARE body, while the runtime array
+   * carries a per-turn DECORATED copy (a "Conversation info" wrapper or a
+   * leading channel timestamp). Their identities differ, so the afterTurn batch
+   * would persist the decorated copy as a second row (the store double-write).
+   * Structural containment (the same fail-closed, line-aligned primitive used at
+   * assembly time — the bare body is the live content's trailing user text, with
+   * an optional leading channel timestamp) recognizes the decorated copy without
+   * hard-coding any decoration shape. User-role only; a genuinely distinct turn
+   * (one that does not line-align-contain the bare body) is never collapsed.
+   */
+  private runtimeRowCoversPersistedFrontierRow(
+    persistedRole: string,
+    persistedContent: string,
+    batchRole: string,
+    batchContent: string,
+  ): boolean {
+    if (
+      messageIdentity(persistedRole, persistedContent) ===
+      messageIdentity(batchRole, batchContent)
+    ) {
+      return true;
+    }
+    if (persistedRole !== "user" || batchRole !== "user") {
+      return false;
+    }
+    if (!liveContentContainsBareBody({ liveContent: batchContent, bareContent: persistedContent })) {
+      return false;
+    }
+    // Fail-closed decoration gate: only collapse when the runtime copy is the
+    // bare body wrapped in RECOGNIZED OpenClaw decoration — a leading channel
+    // timestamp (the copy reduces to the bare body once it is stripped) or an
+    // "(untrusted metadata)" Conversation-info / Sender block. If the extra
+    // leading text is arbitrary user content (a genuinely distinct turn whose
+    // trailing line merely equals a short prior body), keep it — collapsing it
+    // would be silent data loss.
+    const bare = persistedContent.trim();
+    if (stripLeadingOpenClawInboundTimestamp(batchContent).trim() === bare) {
+      return true;
+    }
+    return batchContent.includes("(untrusted metadata)");
+  }
+
   async alignRuntimeBatchAgainstCoveredFrontier(
     sessionId: string,
     sessionKey: string | undefined,
@@ -101,6 +150,22 @@ export class BatchDeduplicator {
           break;
         }
         if (!match) {
+          // Identity_hash / externalized matching found no coverage. Recognize
+          // the OpenClaw store double-write: a runtime row that is the DECORATED
+          // face of the persisted bare body of the same turn — their
+          // identity_hashes differ, so identity dedup cannot see it. Strictly
+          // gated to genuine decoration; a distinct turn is never collapsed.
+          if (
+            this.runtimeRowCoversPersistedFrontierRow(
+              tailMessages[i]!.role,
+              tailMessages[i]!.content,
+              storedBatch[i]!.role,
+              storedBatch[i]!.content,
+            )
+          ) {
+            exactAnchor = true;
+            continue;
+          }
           aligned = false;
           break;
         }
@@ -174,21 +239,37 @@ export class BatchDeduplicator {
       );
     }
 
-    // Aligned-tail check: DB's last message identity_hash must match the
-    // message at the exact replay boundary in the incoming batch.
+    // Aligned-tail check: the DB's last message must align with the message at
+    // the exact replay boundary in the incoming batch. Identity_hash is the
+    // fast path; a hash mismatch still aligns when the boundary row is the
+    // DECORATED face of the bare DB row (the store double-write — same turn,
+    // different identity_hash), which is collapsed under a strict decoration
+    // gate instead of ingested as a duplicate.
     const batchAtBoundaryHash = batchHashes[storedMessageCount - 1]!;
     if (batchAtBoundaryHash !== lastDbIdentityHash) {
-      // Prefix mismatch — attempt suffix fallback before giving up.
-      return this.deduplicateSuffixFallback(
-        conversationId,
-        batch,
-        storedBatch,
-        batchHashes,
-        rawPayloadContents,
-        storedMessageCount,
-        "prefix-mismatch",
-        { onNoOverlap: "ingest" },
-      );
+      const lastDbMessage = await this.conversationStore.getLastMessage(conversationId);
+      const batchAtBoundary = storedBatch[storedMessageCount - 1]!;
+      if (
+        !lastDbMessage ||
+        !this.runtimeRowCoversPersistedFrontierRow(
+          lastDbMessage.role,
+          lastDbMessage.content,
+          batchAtBoundary.role,
+          batchAtBoundary.content,
+        )
+      ) {
+        // Prefix mismatch — attempt suffix fallback before giving up.
+        return this.deduplicateSuffixFallback(
+          conversationId,
+          batch,
+          storedBatch,
+          batchHashes,
+          rawPayloadContents,
+          storedMessageCount,
+          "prefix-mismatch",
+          { onNoOverlap: "ingest" },
+        );
+      }
     }
 
     // Full proof: incoming batch must start with the entire stored transcript
@@ -214,11 +295,25 @@ export class BatchDeduplicator {
         recentDbHashes[i]!,
         rawPayloadContents[i],
       );
-      if (!match) {
-        return batch;
-      }
       if (match === "unproven-externalized") {
         return batch;
+      }
+      if (!match) {
+        // Identity_hash / externalized matching found no coverage. Recognize
+        // the OpenClaw store double-write: the incoming row is the DECORATED
+        // face of the stored bare body of the same turn (different
+        // identity_hash). Strictly gated to genuine decoration; a distinct turn
+        // is never collapsed.
+        if (
+          !this.runtimeRowCoversPersistedFrontierRow(
+            storedMessages[i]!.role,
+            storedMessages[i]!.content,
+            storedBatch[i]!.role,
+            storedBatch[i]!.content,
+          )
+        ) {
+          return batch;
+        }
       }
     }
 
