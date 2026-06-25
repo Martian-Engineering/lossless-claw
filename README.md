@@ -67,7 +67,7 @@ The bundled skill focuses on configuration, diagnostics, architecture, and recal
 - Node.js 22+
 - An LLM provider configured in OpenClaw (used for summarization)
 
-> **Compatibility:** `lossless-claw@0.10.0` and newer require OpenClaw `2026.5.12` or newer for OpenClaw's `api.runtime.llm.complete` summarization capability. Releases that include context-engine memory supplement support require OpenClaw `2026.5.28` or newer for `buildMemorySystemPromptAddition`. If you cannot upgrade OpenClaw yet, stay on `lossless-claw@0.9.4` and remove `0.10.x`-only config such as `sweepMaxDepth`.
+> **Compatibility:** `lossless-claw@0.10.0` and newer require OpenClaw `2026.5.12` or newer for OpenClaw's `api.runtime.llm.complete` summarization capability. Releases that include context-engine memory supplement support require OpenClaw `2026.5.28` or newer for `buildMemorySystemPromptAddition`. Releases with SQLite transcript storage support require OpenClaw `2026.6.11` or newer. If you cannot upgrade OpenClaw yet, stay on `lossless-claw@0.9.4` and remove `0.10.x`-only config such as `sweepMaxDepth`.
 
 ### Install the plugin
 

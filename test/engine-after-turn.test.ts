@@ -59,6 +59,58 @@ describe("LcmContextEngine afterTurn", () => {
     ]);
   });
 
+  it("afterTurn preserves repeated runtime batch content when OpenClaw stores transcripts in SQLite", async () => {
+    const warnLog = vi.fn();
+    const engine = createEngineWithDeps(
+      {},
+      {
+        log: { info: vi.fn(), warn: warnLog, error: vi.fn(), debug: vi.fn() },
+      },
+    );
+    const sessionId = "after-turn-sqlite-runtime-batch";
+    const sessionFile = createSessionFilePath("after-turn-sqlite-runtime-batch-stale");
+
+    await engine.afterTurn({
+      sessionId,
+      sessionFile,
+      messages: [
+        makeMessage({ role: "user", content: "old question" }),
+        makeMessage({ role: "assistant", content: "old answer" }),
+      ],
+      prePromptMessageCount: 0,
+      tokenBudget: 4096,
+    });
+
+    warnLog.mockClear();
+    await engine.afterTurn({
+      sessionId,
+      sessionFile,
+      messages: [
+        makeMessage({ role: "user", content: "old question" }),
+        makeMessage({ role: "assistant", content: "old answer" }),
+      ],
+      prePromptMessageCount: 0,
+      tokenBudget: 4096,
+      runtimeContext: { transcriptStorage: { kind: "sqlite" } },
+    });
+
+    const conversation = await engine.getConversationStore().getConversationBySessionId(sessionId);
+    expect(conversation).not.toBeNull();
+
+    const stored = await engine.getConversationStore().getMessages(conversation!.conversationId);
+    expect(stored.map((message) => message.content)).toEqual([
+      "old question",
+      "old answer",
+      "old question",
+      "old answer",
+    ]);
+    const warnings = warnLog.mock.calls.map((call) => String(call[0])).join("\n");
+    expect(warnings).not.toContain("runtime batch does not align");
+    expect(warnings).not.toContain("no overlap found");
+    expect(warnings).not.toContain("bootstrap checkpoint refresh failed");
+    expect(warnings).not.toContain("auto-rotate");
+  });
+
   it("afterTurn keeps auto-compaction summary that matches stored text", async () => {
     const engine = createEngine();
     const sessionId = "after-turn-summary-same-as-stored";

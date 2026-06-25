@@ -92,6 +92,12 @@ const MAX_PREVIOUS_ASSEMBLED_SNAPSHOTS = 100;
 const FORK_BOUNDED_BOOTSTRAP_REASON = "fork-bounded bootstrap import";
 const CONTEXT_ENGINE_PROJECTION_EPOCH_VERSION = "summary-prefix-v1";
 const DEFERRED_ASSEMBLY_DEGRADED_PRESSURE_RATIO = 0.75;
+
+/** Return true when OpenClaw reports SQLite as the authoritative transcript backend. */
+function usesSqliteTranscriptStorage(runtimeContext?: Record<string, unknown>): boolean {
+  const transcriptStorage = asRecord(runtimeContext?.transcriptStorage);
+  return transcriptStorage?.kind === "sqlite";
+}
 type CompactionExecutionParams = {
   conversationId: number;
   sessionId: string;
@@ -2829,7 +2835,11 @@ export class LcmContextEngine implements ContextEngine {
     /** Back-compat param name. */
     legacyCompactionParams?: Record<string, unknown>;
   }): Promise<void> {
+    const sqliteTranscriptStorage = usesSqliteTranscriptStorage(params.runtimeContext);
     const runRuntimeAutoRotate = async (): Promise<void> => {
+      if (sqliteTranscriptStorage) {
+        return;
+      }
       await this.sessionRotation.maybeAutoRotateManagedSessionFile({
         phase: "runtime",
         caller: "after-turn",
@@ -2863,27 +2873,29 @@ export class LcmContextEngine implements ContextEngine {
       blockedByImportCap: false,
       hasOverlap: true,
     };
-    try {
-      transcriptReconcileResult = await this.transcriptReconciler.reconcileTranscriptTailForAfterTurn({
-        sessionId: params.sessionId,
-        sessionKey: params.sessionKey,
-        sessionFile: params.sessionFile,
-        isHeartbeat: params.isHeartbeat,
-      });
-    } catch (err) {
-      this.deps.log.warn(
-        `[lcm] afterTurn: transcript reconcile failed for ${sessionLabel}: ${describeLogError(err)}`,
-      );
-      // Fail closed: without reconcile proof, the initialized in-sync default
-      // would persist this batch and refresh the checkpoint to EOF, advancing
-      // past transcript history that was never reconciled. Skipping persistence
-      // loses nothing — the transcript retains the turn and a later successful
-      // reconcile imports it.
-      transcriptReconcileResult = {
-        importedMessages: 0,
-        blockedByImportCap: false,
-        hasOverlap: false,
-      };
+    if (!sqliteTranscriptStorage) {
+      try {
+        transcriptReconcileResult = await this.transcriptReconciler.reconcileTranscriptTailForAfterTurn({
+          sessionId: params.sessionId,
+          sessionKey: params.sessionKey,
+          sessionFile: params.sessionFile,
+          isHeartbeat: params.isHeartbeat,
+        });
+      } catch (err) {
+        this.deps.log.warn(
+          `[lcm] afterTurn: transcript reconcile failed for ${sessionLabel}: ${describeLogError(err)}`,
+        );
+        // Fail closed: without reconcile proof, the initialized in-sync default
+        // would persist this batch and refresh the checkpoint to EOF, advancing
+        // past transcript history that was never reconciled. Skipping persistence
+        // loses nothing — the transcript retains the turn and a later successful
+        // reconcile imports it.
+        transcriptReconcileResult = {
+          importedMessages: 0,
+          blockedByImportCap: false,
+          hasOverlap: false,
+        };
+      }
     }
     const transcriptReconcileUnsafeToAdvance =
       transcriptReconcileResult.blockedByImportCap ||
@@ -2894,7 +2906,9 @@ export class LcmContextEngine implements ContextEngine {
       // rather than advancing past an unreconciled transcript frontier.
       transcriptReconcileResult.blockedReason === "ambiguous-rollover-rotated-fresh-transcript";
     let dedupedNewMessages: AgentMessage[] = [];
-    if (transcriptReconcileUnsafeToAdvance) {
+    if (sqliteTranscriptStorage) {
+      dedupedNewMessages = newMessages;
+    } else if (transcriptReconcileUnsafeToAdvance) {
       if (newMessages.length > 0 || params.autoCompactionSummary) {
         this.deps.log.warn(
           `[lcm] afterTurn: transcript reconcile did not cover the transcript frontier; skipping afterTurn persistence to avoid creating a future anchor past unreconciled transcript history ${sessionLabel}`,
@@ -3016,15 +3030,17 @@ export class LcmContextEngine implements ContextEngine {
               sessionId: params.sessionId,
               sessionKey: params.sessionKey,
             });
-            try {
-              await this.transcriptReconciler.refreshBootstrapState({
-                conversationId: conversation.conversationId,
-                sessionFile: params.sessionFile,
-              });
-            } catch (err) {
-              this.deps.log.warn(
-                `[lcm] afterTurn: heartbeat pruning checkpoint refresh failed for ${sessionContext}: ${describeLogError(err)}`,
-              );
+            if (!sqliteTranscriptStorage) {
+              try {
+                await this.transcriptReconciler.refreshBootstrapState({
+                  conversationId: conversation.conversationId,
+                  sessionFile: params.sessionFile,
+                });
+              } catch (err) {
+                this.deps.log.warn(
+                  `[lcm] afterTurn: heartbeat pruning checkpoint refresh failed for ${sessionContext}: ${describeLogError(err)}`,
+                );
+              }
             }
             this.deps.log.info(
               `[lcm] afterTurn: pruned ${pruned} heartbeat ack messages for ${sessionContext}`,
@@ -3083,6 +3099,9 @@ export class LcmContextEngine implements ContextEngine {
       return;
     }
     const refreshAfterTurnBootstrapState = async (): Promise<void> => {
+      if (sqliteTranscriptStorage) {
+        return;
+      }
       try {
         await this.transcriptReconciler.refreshBootstrapState({
           conversationId: conversation.conversationId,
