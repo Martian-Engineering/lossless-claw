@@ -10,13 +10,13 @@
 //
 // These tests pin both layers:
 //   1. unit: appendUncoveredVolatileLiveInputsWithinBudget treats the structural
-//      current turn as a volatile live input AND supersedes EVERY matching bare
-//      assembled row (a plain `body` row AND a `[timestamp] body` row),
-//      collapsing them onto the single live copy that carries the decoration.
+//      current turn as a volatile live input and appends the decorated live copy
+//      without deleting ambiguous assembled same-body rows.
 //   2. fail-closed: a live last-user message whose body is not contained in any
-//      bare assembled row supersedes nothing.
+//      bare assembled row is not recognized by the structural path.
 //   3. integration: engine.assemble() with a bare-persisted current turn and a
-//      decorated live copy emits exactly one decorated user message.
+//      decorated live copy emits the decorated user message while preserving
+//      assembled history.
 import { afterEach, describe, expect, it } from "vitest";
 import {
   appendUncoveredVolatileLiveInputsWithinBudget,
@@ -179,7 +179,6 @@ describe("appendUncoveredVolatileLiveInputsWithinBudget preserves structural liv
           (message as { content: string }).content === webchatTimestampedBody(WEBCHAT_BODY)),
     );
     expect(bareCopies).toHaveLength(2);
-    expect(result.supersededMessages).toBe(0);
     expect(result.evictedMessages).toBe(0);
   });
 
@@ -225,11 +224,11 @@ describe("appendUncoveredVolatileLiveInputsWithinBudget preserves structural liv
   });
 });
 
-describe("appendUncoveredVolatileLiveInputsWithinBudget fail-closed: distinct turns are not collapsed", () => {
-  it("does NOT supersede when the live last-user body is not contained in any bare assembled row", () => {
+describe("appendUncoveredVolatileLiveInputsWithinBudget fail-closed: distinct turns are preserved", () => {
+  it("does NOT structurally append when the live last-user body is not contained in any bare assembled row", () => {
     // The live current turn shares decoration shape but its body is a DIFFERENT
     // message than any bare assembled row. Containment fails, so nothing is
-    // superseded; the distinct assembled turn is preserved.
+    // appended by the structural path; the distinct assembled turn is preserved.
     const distinctBody = "a completely different question that was never persisted bare";
     const assembledMessages: AgentMessage[] = [
       { role: "user", content: "earlier persisted turn" },
@@ -258,15 +257,12 @@ describe("appendUncoveredVolatileLiveInputsWithinBudget fail-closed: distinct tu
   });
 });
 
-describe("appendUncoveredVolatileLiveInputsWithinBudget bounds supersede to the current tail", () => {
+describe("appendUncoveredVolatileLiveInputsWithinBudget preserves same-body tail turns", () => {
   it("preserves an earlier user turn whose body equals the current turn body", () => {
-    // Regression for PR #926 review: the supersede must replace only the current
-    // turn's bare face(s) — the trailing contiguous user run — not every assembled
-    // row that happens to share the body. An earlier, genuinely distinct user turn
-    // ("yes") separated from the current turn by an assistant reply must survive
-    // even though the current turn body is also "yes". The store double-write that
-    // this collapses always lands at the inbound tail (no assistant reply after it
-    // yet), so a same-body row BEHIND an assistant message is a different turn.
+    // Regression for PR #926 review: structural same-body matching must not delete
+    // any assembled row. An earlier, genuinely distinct user turn ("yes") separated
+    // from the current turn by an assistant reply must survive even though the
+    // current turn body is also "yes".
     const REPEAT = "yes";
     const assembledMessages: AgentMessage[] = [
       // Earlier, genuinely distinct user turn with the SAME body.

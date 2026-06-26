@@ -3746,7 +3746,7 @@ export class LcmContextEngine implements ContextEngine {
       }
       if (volatileLiveInputAppend.appendedMessages > 0) {
         this.deps.log.warn(
-          `[lcm] assemble: appended unpersisted volatile live input conversation=${conversation.conversationId} ${sessionLabel} appendedMessages=${volatileLiveInputAppend.appendedMessages} appendedTokens=${volatileLiveInputAppend.appendedTokens} evictedMessages=${volatileLiveInputAppend.evictedMessages} evictedTokens=${volatileLiveInputAppend.evictedTokens} supersededMessages=${volatileLiveInputAppend.supersededMessages} supersededTokens=${volatileLiveInputAppend.supersededTokens} overBudget=${volatileLiveInputAppend.overBudget}`,
+          `[lcm] assemble: appended unpersisted volatile live input conversation=${conversation.conversationId} ${sessionLabel} appendedMessages=${volatileLiveInputAppend.appendedMessages} appendedTokens=${volatileLiveInputAppend.appendedTokens} evictedMessages=${volatileLiveInputAppend.evictedMessages} evictedTokens=${volatileLiveInputAppend.evictedTokens} overBudget=${volatileLiveInputAppend.overBudget}`,
         );
       }
 
@@ -3800,7 +3800,7 @@ export class LcmContextEngine implements ContextEngine {
         : undefined;
       const summaryContextItems = contextItems.filter((item) => item.itemType === "summary").length;
       const volatileLiveInputLog = volatileLiveInputAppend.appendedMessages > 0
-        ? ` volatileLiveInputsAppended=${volatileLiveInputAppend.appendedMessages} volatileLiveInputEvicted=${volatileLiveInputAppend.evictedMessages} volatileLiveInputSuperseded=${volatileLiveInputAppend.supersededMessages} volatileLiveInputOverBudget=${volatileLiveInputAppend.overBudget}`
+        ? ` volatileLiveInputsAppended=${volatileLiveInputAppend.appendedMessages} volatileLiveInputEvicted=${volatileLiveInputAppend.evictedMessages} volatileLiveInputOverBudget=${volatileLiveInputAppend.overBudget}`
         : "";
       const promptRecallLog = budgetedPromptRecallCue
         ? ` promptRecallMatches=${budgetedPromptRecallCue.matchedMessages}`

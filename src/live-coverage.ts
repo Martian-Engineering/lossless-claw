@@ -470,8 +470,8 @@ export function matchVolatileLiveInputsToCoverageSlots(params: {
 
 /**
  * Structural containment primitive: is the bare body the live content itself, or
- * its line-aligned trailing segment? This is the only same-turn recognition the
- * supersede logic uses — it carries NO knowledge of any plugin/decoration tag or
+ * its line-aligned trailing segment? This is the current-turn recognition used
+ * by the append path — it carries NO knowledge of any plugin/decoration tag or
  * preamble shape. The bare body matches when, after stripping an optional single
  * leading channel timestamp from both sides:
  *   1. it equals the (trim-ended) live content, OR
@@ -541,21 +541,17 @@ export function liveContentContainsBareBody(params: {
  * Recognize whether an assembled user row is a BARE copy of the live current
  * turn (its persisted face), purely structurally: it must be a line-aligned
  * trailing segment of the live content AND strictly shorter than it. The
- * strictly-shorter guard is what distinguishes a bare/timestamped body row
- * (collapsible) from the decorated live copy itself (equal length, never
- * collapsed) without any decoration-tag knowledge.
+ * strictly-shorter guard distinguishes a bare/timestamped body row from the
+ * decorated live copy itself without any decoration-tag knowledge.
  */
 function assembledRowIsStructuralBareCurrentTurn(params: {
   liveContent: string;
   assembledContent: string;
 }): boolean {
   if (params.assembledContent === params.liveContent) {
-    // The retained survivor / exact-signature anchor: never a collapsible bare.
     return false;
   }
   if (params.assembledContent.length >= params.liveContent.length) {
-    // A bare body is strictly shorter than the decorated live turn; an equal or
-    // longer row cannot be the bare persisted face of this live copy.
     return false;
   }
   return liveContentContainsBareBody({
@@ -606,22 +602,6 @@ function resolveStructuralCurrentTurnLiveIndex(params: {
     return null;
   }
   return null;
-}
-
-/**
- * Resolve assembled bare user rows superseded by the live current turn.
- *
- * Structural containment can prove that the live decorated current turn should
- * be appended, but it cannot prove that a matching assembled suffix row is the
- * same turn rather than a prior consecutive user turn with the same body. Keep
- * this fail-closed until a stable turn identity is available.
- */
-export function resolveStructuralCurrentTurnSupersededIndexes(params: {
-  assembledMessages: AgentMessage[];
-  liveMessages: AgentMessage[];
-}): Set<number> {
-  void params;
-  return new Set<number>();
 }
 
 export function collectUncoveredVolatileLiveInputs(params: {
@@ -690,8 +670,6 @@ export function appendUncoveredVolatileLiveInputsWithinBudget(params: {
   appendedTokens: number;
   evictedMessages: number;
   evictedTokens: number;
-  supersededMessages: number;
-  supersededTokens: number;
   overBudget: boolean;
 } {
   const liveMessages = params.liveMessages.map(normalizeLiveMessageForAssemblyReconciliation);
@@ -703,62 +681,19 @@ export function appendUncoveredVolatileLiveInputsWithinBudget(params: {
     assembledMessages: params.assembledMessages,
     liveMessages,
   });
-  // Structural same-body rows are ambiguous without a stable turn id. Preserve
-  // assembled rows and rely on the uncovered live append to keep the decorated
-  // current turn available to the model.
-  const supersededAssembledIndexes = resolveStructuralCurrentTurnSupersededIndexes({
-    assembledMessages: params.assembledMessages,
-    liveMessages,
-  });
   if (uncovered.entries.length === 0) {
-    if (supersededAssembledIndexes.size === 0) {
-      return {
-        messages: params.assembledMessages,
-        estimatedTokens: params.assembledEstimatedTokens,
-        appendedMessages: 0,
-        appendedTokens: 0,
-        evictedMessages: 0,
-        evictedTokens: 0,
-        supersededMessages: 0,
-        supersededTokens: 0,
-        overBudget: params.assembledEstimatedTokens > params.tokenBudget,
-      };
-    }
-    // No live copy to append, but a duplicate bare row must be dropped so the
-    // already-covered live copy is the only surviving current-turn message.
-    let droppedTokens = 0;
-    for (const index of supersededAssembledIndexes) {
-      droppedTokens += toStoredMessage(params.assembledMessages[index] as AgentMessage).tokenCount;
-    }
-    const collapsedMessages = sanitizeToolUseResultPairing(
-      params.assembledMessages.filter(
-        (_message, index) => !supersededAssembledIndexes.has(index),
-      ),
-      params.log,
-    ) as AgentMessage[];
-    const collapsedEstimatedTokens = estimateAgentMessageTokens(collapsedMessages);
     return {
-      messages: collapsedMessages,
-      estimatedTokens: collapsedEstimatedTokens,
+      messages: params.assembledMessages,
+      estimatedTokens: params.assembledEstimatedTokens,
       appendedMessages: 0,
       appendedTokens: 0,
       evictedMessages: 0,
       evictedTokens: 0,
-      supersededMessages: supersededAssembledIndexes.size,
-      supersededTokens: droppedTokens,
-      overBudget: collapsedEstimatedTokens > params.tokenBudget,
+      overBudget: params.assembledEstimatedTokens > params.tokenBudget,
     };
   }
 
-  // Kept for explicit accounting if a future stable turn identity makes
-  // same-turn supersede provable. Today this remains empty for lossless behavior.
-  let supersededTokens = 0;
-  for (const index of supersededAssembledIndexes) {
-    supersededTokens += toStoredMessage(params.assembledMessages[index] as AgentMessage).tokenCount;
-  }
-  let retained = params.assembledMessages
-    .map((message, index) => ({ message, index }))
-    .filter((entry) => !supersededAssembledIndexes.has(entry.index));
+  let retained = params.assembledMessages.map((message, index) => ({ message, index }));
   let appendedEntries = uncovered.entries.slice();
   const toolPairIndexesByIndex = buildToolPairIndexesByAssembledIndex(params.assembledMessages);
   const exactLiveSortIndexes = resolveExactAssembledLiveSortIndexes({
@@ -875,12 +810,6 @@ export function appendUncoveredVolatileLiveInputsWithinBudget(params: {
     appendedTokens: estimateAgentMessageTokens(appendedMessages),
     evictedMessages,
     evictedTokens,
-    // A same-turn supersede (the richer live copy replacing the bare store face
-    // the same turn delivered) is a per-turn identity fix, not budget eviction.
-    // Reported separately so callers do not read it as context pressure (e.g.
-    // assembly dropping an already-budgeted prompt-recall cue).
-    supersededMessages: supersededAssembledIndexes.size,
-    supersededTokens,
     overBudget: estimatedTokens > params.tokenBudget,
   };
 }
