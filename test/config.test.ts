@@ -929,7 +929,7 @@ describe("resolveLcmConfig", () => {
   it("ships a manifest with fallbackMaxTokens in schema", () => {
     expect(manifest.configSchema.properties.fallbackMaxTokens).toEqual({
       type: "integer",
-      minimum: 1,
+      minimum: 64,
     });
   });
   it("defaults summaryMaxOverageFactor to 3 and maxAssemblyTokenBudget to undefined", () => {
@@ -1050,6 +1050,22 @@ describe("resolveLcmConfig", () => {
       fallbackMaxTokens: 1024,
     });
     expect(config.fallbackMaxTokens).toBe(1024);
+  });
+
+  it("ignores fallbackMaxTokens values below the usable minimum from env and plugin config", () => {
+    const envFallback = resolveLcmConfig({
+      LCM_FALLBACK_MAX_TOKENS: "63",
+    } as NodeJS.ProcessEnv, {
+      fallbackMaxTokens: 1024,
+    });
+    expect(envFallback.fallbackMaxTokens).toBe(1024);
+
+    const defaultFallback = resolveLcmConfig({
+      LCM_FALLBACK_MAX_TOKENS: "-1",
+    } as NodeJS.ProcessEnv, {
+      fallbackMaxTokens: 63,
+    });
+    expect(defaultFallback.fallbackMaxTokens).toBe(512);
   });
 
   it("env vars override summaryMaxOverageFactor and maxAssemblyTokenBudget", () => {

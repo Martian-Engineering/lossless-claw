@@ -823,7 +823,7 @@ describe("LcmContextEngine compaction telemetry", () => {
   it("bounds emergency fallback compaction with configured fallbackMaxTokens", async () => {
     const engine = createEngineWithDeps(
       {
-        fallbackMaxTokens: 48,
+        fallbackMaxTokens: 64,
         freshTailCount: 0,
         leafMinFanout: 2,
         leafChunkTokens: 2_000,
@@ -873,7 +873,7 @@ describe("LcmContextEngine compaction telemetry", () => {
       "[LCM fallback summary; truncated for context management]",
     );
     expect(summaryRecord?.content).not.toContain("LATE_CONFIGURED_FALLBACK_MARKER");
-    expect(estimateTokens(summaryRecord?.content ?? "")).toBeLessThanOrEqual(48);
+    expect(estimateTokens(summaryRecord?.content ?? "")).toBeLessThanOrEqual(64);
   });
 
   it("passes injected-context strip tags into production compaction", async () => {

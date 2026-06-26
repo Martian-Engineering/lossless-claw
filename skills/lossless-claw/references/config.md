@@ -727,6 +727,7 @@ Why it matters:
 | --- | --- |
 | Type | `integer` |
 | Default | `512` |
+| Minimum | `64` |
 | Env | `LCM_FALLBACK_MAX_TOKENS` |
 
 Maximum token budget for deterministic fallback summaries when the LLM summarizer is unavailable.
@@ -735,6 +736,7 @@ Why it matters:
 
 - when the LLM summarizer fails (auth errors, timeout, empty output), Lossless falls back to a purely local truncation-based summary
 - this fallback is bounded by `fallbackMaxTokens` so it cannot balloon the context
+- values below `64` are ignored so the required fallback marker can fit inside the configured budget
 - lower values produce more aggressive truncation; higher values preserve more source text at the cost of larger fallback summaries
 - the default `512` is conservative; raise it if you prefer richer fallback summaries over more aggressive truncation
 

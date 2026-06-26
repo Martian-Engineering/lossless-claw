@@ -15,6 +15,7 @@ import { LcmProviderAuthError } from "./summarize.js";
 import {
   buildDeterministicFallbackSummary,
   FALLBACK_DIRECTIVE_SUMMARY_MARKER,
+  MIN_FALLBACK_MAX_TOKENS,
 } from "./summary-fallback.js";
 
 // ── Public types ─────────────────────────────────────────────────────────────
@@ -104,7 +105,7 @@ export interface CompactionConfig {
   timezone?: string;
   /** Maximum allowed overage factor for summaries relative to target tokens (default 3). */
   summaryMaxOverageFactor: number;
-  /** Maximum token budget for deterministic fallback summaries when the LLM summarizer fails (default 512). */
+  /** Maximum token budget for deterministic fallback summaries when the LLM summarizer fails (default 512, minimum 64). */
   fallbackMaxTokens?: number;
   /** Injected context XML tags to strip before compaction summarization. */
   stripInjectedContextTags?: string[];
@@ -1949,7 +1950,12 @@ export class CompactionEngine {
       };
     }
     const inputTokens = Math.max(1, estimateTokens(sourceText));
-    const fallbackMaxTokens = this.config.fallbackMaxTokens ?? FALLBACK_MAX_TOKENS;
+    const fallbackMaxTokens =
+      typeof this.config.fallbackMaxTokens === "number" &&
+      Number.isFinite(this.config.fallbackMaxTokens) &&
+      this.config.fallbackMaxTokens >= MIN_FALLBACK_MAX_TOKENS
+        ? Math.floor(this.config.fallbackMaxTokens)
+        : FALLBACK_MAX_TOKENS;
     const buildDeterministicFallback = (): { content: string; level: CompactionLevel } => {
       const truncationNote = `[Truncated from ${inputTokens} tokens]`;
       const directiveOmissionNote = [

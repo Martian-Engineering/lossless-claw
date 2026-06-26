@@ -195,7 +195,7 @@
     },
     "fallbackMaxTokens": {
       "label": "Fallback Max Tokens",
-      "help": "Maximum token budget for deterministic fallback summaries when the LLM summarizer fails (default 512)"
+      "help": "Maximum token budget for deterministic fallback summaries when the LLM summarizer fails (default 512, minimum 64)"
     },
     "customInstructions": {
       "label": "Custom Instructions",
@@ -521,7 +521,7 @@
       },
       "fallbackMaxTokens": {
         "type": "integer",
-        "minimum": 1
+        "minimum": 64
       },
       "customInstructions": {
         "type": "string"

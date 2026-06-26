@@ -53,6 +53,7 @@ import { estimateTokens } from "./estimate-tokens.js";
 import {
   buildDeterministicFallbackSummary,
   FALLBACK_DIRECTIVE_SUMMARY_MARKER,
+  MIN_FALLBACK_MAX_TOKENS,
 } from "./summary-fallback.js";
 import { getTranscriptEntryId, readAppendedLeafPathMessages, readLastJsonlEntryBeforeOffset, readLeafPathMessages, readSessionParentSessionReference, resolveTranscriptMessageCreatedAt } from "./transcript.js";
 import { type TranscriptReconcileResult } from "./reconcile-plan.js";
@@ -4325,10 +4326,16 @@ function createEmergencyFallbackSummarize(fallbackMaxTokens?: number): (
   text: string,
   aggressive?: boolean,
 ) => Promise<string> {
+  const resolvedFallbackMaxTokens =
+    typeof fallbackMaxTokens === "number" &&
+    Number.isFinite(fallbackMaxTokens) &&
+    fallbackMaxTokens >= MIN_FALLBACK_MAX_TOKENS
+      ? Math.floor(fallbackMaxTokens)
+      : undefined;
   return async (text: string, aggressive?: boolean): Promise<string> => {
     const targetTokens = aggressive ? 600 : 900;
     const fallbackSummary = buildDeterministicFallbackSummary(text, targetTokens, {
-      maxTokens: fallbackMaxTokens,
+      maxTokens: resolvedFallbackMaxTokens,
     }).trim();
     if (!fallbackSummary) {
       return FALLBACK_SUMMARY_MARKER;

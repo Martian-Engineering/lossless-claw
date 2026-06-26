@@ -630,6 +630,7 @@ describe("createLcmSummarizeFromLegacyParams", () => {
 
   it("falls back deterministically when model returns empty summary output after retry", async () => {
     const deps = makeDeps({
+      config: { ...makeDeps().config, fallbackMaxTokens: 64 },
       complete: vi.fn(async () => ({
         content: [],
       })),
@@ -652,11 +653,13 @@ describe("createLcmSummarizeFromLegacyParams", () => {
 
     expect(summary.length).toBeGreaterThan(0);
     expect(summary).toContain("[LCM fallback summary; truncated for context management]");
+    expect(estimateTokens(summary)).toBeLessThanOrEqual(64);
   });
 
   it("falls back deterministically when the initial summarizer call times out", async () => {
     try {
       const deps = makeDeps({
+        config: { ...makeDeps().config, fallbackMaxTokens: 64 },
         complete: vi.fn(
           () =>
             new Promise<Awaited<ReturnType<LcmDependencies["complete"]>>>(() => {
@@ -681,6 +684,7 @@ describe("createLcmSummarizeFromLegacyParams", () => {
 
       expect(vi.mocked(deps.complete)).toHaveBeenCalledTimes(1);
       expect(summary).toContain("[LCM fallback summary; truncated for context management]");
+      expect(estimateTokens(summary)).toBeLessThanOrEqual(64);
       expect(vi.getTimerCount()).toBe(0);
 
       const diagnostics = getDepsLogText(deps);
@@ -1072,6 +1076,7 @@ describe("createLcmSummarizeFromLegacyParams", () => {
     const deps = makeDeps();
     deps.config = {
       ...deps.config,
+      fallbackMaxTokens: 64,
       fallbackProviders: [{ provider: "openai", model: "gpt-4.1-mini" }],
     } as typeof deps.config;
     deps.resolveModel = vi.fn((modelRef?: string, providerHint?: string) => {
@@ -1095,6 +1100,7 @@ describe("createLcmSummarizeFromLegacyParams", () => {
     const summary = await summarize!("Q".repeat(10_000), false);
 
     expect(summary).toContain("[LCM fallback summary; truncated for context management]");
+    expect(estimateTokens(summary)).toBeLessThanOrEqual(64);
     expect(vi.mocked(deps.complete)).toHaveBeenCalledTimes(2);
 
     const diagnostics = getDepsLogText(deps);

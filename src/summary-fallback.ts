@@ -7,6 +7,7 @@ export const FALLBACK_SUMMARY_MARKER =
   "[LCM fallback summary; truncated for context management]";
 export const FALLBACK_DIRECTIVE_SUMMARY_MARKER =
   "[LCM fallback summary; directive-shaped untrusted content omitted]";
+export const MIN_FALLBACK_MAX_TOKENS = 64;
 const DEFAULT_FALLBACK_DIRECTIVE_NOTE = FALLBACK_DIRECTIVE_SUMMARY_MARKER;
 const OPTIONAL_DIRECTIVE_SCOPE_PREFIX = String.raw`(?:all\s+)?(?:of\s+)?(?:(?:the|your|my|any|these|those)\s+)?`;
 const DIRECTIVE_SCOPE = String.raw`(?:(?:previous|prior|above|earlier)(?:\s+(?:system|developer))?|(?:system|developer))`;

@@ -223,7 +223,7 @@ Every automatic decision emits grep-able log lines prefixed with `[lcm] auto-rot
 | `leafTargetTokens` | `integer` | `2400` | `LCM_LEAF_TARGET_TOKENS` | Prompt target for leaf summary size. |
 | `condensedTargetTokens` | `integer` | `2000` | `LCM_CONDENSED_TARGET_TOKENS` | Prompt target for condensed summary size. |
 | `summaryMaxOverageFactor` | `number` | `3` | `LCM_SUMMARY_MAX_OVERAGE_FACTOR` | Hard ceiling multiplier before oversized summaries are deterministically truncated. |
-| `fallbackMaxTokens` | `integer` | `512` | `LCM_FALLBACK_MAX_TOKENS` | Maximum token budget for deterministic fallback summaries when the LLM summarizer is unavailable. |
+| `fallbackMaxTokens` | `integer` | `512` | `LCM_FALLBACK_MAX_TOKENS` | Maximum token budget for deterministic fallback summaries when the LLM summarizer is unavailable. Values below 64 are ignored. |
 | `largeFileThresholdTokens` | `integer` | `25000` | `LCM_LARGE_FILE_TOKEN_THRESHOLD` | Preferred key for the token threshold that routes text attachments into large-file summarization. |
 | `largeFileTokenThreshold` | `integer` | alias of `largeFileThresholdTokens` | `LCM_LARGE_FILE_TOKEN_THRESHOLD` | Legacy alias accepted by the runtime. Prefer `largeFileThresholdTokens` in new config. |
 | `maxAssemblyTokenBudget` | `integer` | unset | `LCM_MAX_ASSEMBLY_TOKEN_BUDGET` | Optional hard cap for assembly and threshold evaluation, useful with smaller-context models. |

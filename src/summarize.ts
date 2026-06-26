@@ -5,7 +5,10 @@ import type {
   RuntimeLlmModelOverride,
 } from "./types.js";
 import { estimateTokens } from "./estimate-tokens.js";
-import { buildDeterministicFallbackSummary } from "./summary-fallback.js";
+import {
+  buildDeterministicFallbackSummary,
+  MIN_FALLBACK_MAX_TOKENS,
+} from "./summary-fallback.js";
 export { FALLBACK_SUMMARY_MARKER } from "./summary-fallback.js";
 
 export type LcmSummarizeOptions = {
@@ -1539,6 +1542,18 @@ export async function createLcmSummarizeFromLegacyParams(params: {
       leafTargetTokens,
       condensedTargetTokens,
     });
+    const fallbackMaxTokens =
+      typeof params.deps.config.fallbackMaxTokens === "number" &&
+      Number.isFinite(params.deps.config.fallbackMaxTokens) &&
+      params.deps.config.fallbackMaxTokens >= MIN_FALLBACK_MAX_TOKENS
+        ? Math.floor(params.deps.config.fallbackMaxTokens)
+        : undefined;
+    const buildFallbackSummary = (): string =>
+      buildDeterministicFallbackSummary(
+        text,
+        targetTokens,
+        fallbackMaxTokens !== undefined ? { maxTokens: fallbackMaxTokens } : undefined,
+      );
     // maxTokens is the completion hard cap; summary length is governed by the
     // prompt's "Target length" guidance (targetTokens). With summary thinking
     // enabled, reasoning tokens also draw from this cap, so grant headroom
@@ -1716,7 +1731,7 @@ export async function createLcmSummarizeFromLegacyParams(params: {
           params.deps.log.warn(
             `[lcm] summarizer timed out; provider=${provider}; model=${model}; source=fallback`,
           );
-          return buildDeterministicFallbackSummary(text, targetTokens);
+          return buildFallbackSummary();
         }
         break;
       }
@@ -1943,7 +1958,7 @@ export async function createLcmSummarizeFromLegacyParams(params: {
         params.deps.log.error(
           `[lcm] all extraction attempts exhausted; provider=${provider}; model=${model}; source=fallback`,
         );
-        return buildDeterministicFallbackSummary(text, targetTokens);
+        return buildFallbackSummary();
       }
 
       if (summarySource !== "content") {
@@ -1961,7 +1976,7 @@ export async function createLcmSummarizeFromLegacyParams(params: {
     if (lastAuthError) {
       throw lastAuthError;
     }
-    return buildDeterministicFallbackSummary(text, targetTokens);
+    return buildFallbackSummary();
   };
 
   return {
