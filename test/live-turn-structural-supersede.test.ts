@@ -132,12 +132,13 @@ describe("liveContentContainsBareBody (structural containment primitive)", () =>
   });
 });
 
-describe("appendUncoveredVolatileLiveInputsWithinBudget supersedes bare + timestamped-bare dup with decorated copy (webchat, memory-first)", () => {
-  it("collapses a bare + [timestamp] body duplication to ONE decorated current turn", () => {
+describe("appendUncoveredVolatileLiveInputsWithinBudget preserves structural live current turns (webchat, memory-first)", () => {
+  it("appends the decorated current turn and preserves ambiguous assembled faces", () => {
     // Webchat assemble reconstructs the current turn as TWO rows from stripped
     // store copies: a bare `body` row AND a `[timestamp] body` row. The live
-    // decorated copy (memory-blocks-first + [timestamp] body) must supersede
-    // BOTH, leaving exactly one current-turn message carrying the decoration.
+    // decorated copy (memory-blocks-first + [timestamp] body) must be appended
+    // without deleting matching assembled faces. Either face may be a distinct
+    // consecutive user turn, so preserve them fail-closed.
     const assembledMessages: AgentMessage[] = [
       { role: "user", content: "earlier persisted turn" },
       { role: "assistant", content: "earlier reply" },
@@ -161,32 +162,31 @@ describe("appendUncoveredVolatileLiveInputsWithinBudget supersedes bare + timest
     const userTurns = result.messages.filter(
       (message) => (message as { role: string }).role === "user",
     );
-    // Exactly two user turns: the earlier persisted one + the single current turn.
-    expect(userTurns).toHaveLength(2);
+    // Four user turns: the earlier persisted one + both ambiguous assembled faces
+    // + the decorated current turn. This may leave duplicate current faces, but
+    // it cannot delete a distinct historical turn.
+    expect(userTurns).toHaveLength(4);
     const current = userTurns[userTurns.length - 1] as { content: string };
     // Current turn carries the memory/plugin decoration, exactly once.
     expect(current.content).toContain("<active_memory_plugin>");
     expect(current.content).toContain("<relevant-memories>");
     expect(current.content).toContain(WEBCHAT_BODY);
-    // Neither the bare nor the [timestamp]-bare duplicate survives.
+    // Both assembled faces are preserved because neither carries a stable turn id.
     const bareCopies = result.messages.filter(
       (message) =>
         (message as { role: string }).role === "user" &&
         ((message as { content: string }).content === WEBCHAT_BODY ||
           (message as { content: string }).content === webchatTimestampedBody(WEBCHAT_BODY)),
     );
-    expect(bareCopies).toHaveLength(0);
-    // A pure same-turn supersede is identity replacement, not budget eviction: it
-    // is reported as supersededMessages and never inflates evictedMessages (which
-    // gates assembly's prompt-recall drop).
-    expect(result.supersededMessages).toBeGreaterThan(0);
+    expect(bareCopies).toHaveLength(2);
+    expect(result.supersededMessages).toBe(0);
     expect(result.evictedMessages).toBe(0);
   });
 
-  it("collapses the bare + [timestamp] body duplication with NO memory plugins (live = [timestamp] body only)", () => {
+  it("preserves the bare + [timestamp] body duplication with NO memory plugins (live = [timestamp] body only)", () => {
     // With no memory plugins, the live current turn is just `[timestamp] body`.
     // The assembled set still has the bare `body` + `[timestamp] body` dup.
-    // Output must collapse to ONE current-turn copy (the live one), no dup.
+    // Output keeps both current-looking copies because structural dedup is unsafe.
     const assembledMessages: AgentMessage[] = [
       { role: "user", content: "earlier persisted turn" },
       { role: "assistant", content: "earlier reply" },
@@ -209,18 +209,19 @@ describe("appendUncoveredVolatileLiveInputsWithinBudget supersedes bare + timest
         (message as { role: string }).role === "user" &&
         (message as { content: string }).content.includes(WEBCHAT_BODY),
     );
-    // Exactly one current-turn copy, and it is the live [timestamp] body one.
-    expect(currentTurnCopies).toHaveLength(1);
-    expect((currentTurnCopies[0] as { content: string }).content).toBe(
-      webchatTimestampedBody(WEBCHAT_BODY),
-    );
-    // The plain bare row did not survive on its own.
+    expect(currentTurnCopies).toHaveLength(2);
+    expect(
+      currentTurnCopies.some(
+        (message) =>
+          (message as { content: string }).content === webchatTimestampedBody(WEBCHAT_BODY),
+      ),
+    ).toBe(true);
     const plainBare = result.messages.filter(
       (message) =>
         (message as { role: string }).role === "user" &&
         (message as { content: string }).content === WEBCHAT_BODY,
     );
-    expect(plainBare).toHaveLength(0);
+    expect(plainBare).toHaveLength(1);
   });
 });
 
@@ -291,12 +292,11 @@ describe("appendUncoveredVolatileLiveInputsWithinBudget bounds supersede to the 
     const userTurns = result.messages.filter(
       (message) => (message as { role: string }).role === "user",
     );
-    // Two user turns survive: the earlier "yes" + the single decorated current turn.
-    expect(userTurns).toHaveLength(2);
+    // Four user turns survive: the earlier "yes", both ambiguous suffix faces,
+    // and the decorated current turn. Duplicates are preferable to deletion.
+    expect(userTurns).toHaveLength(4);
     // The earlier distinct turn (a plain bare "yes" BEFORE the assistant) is preserved.
     expect((userTurns[0] as { content: string }).content).toBe(REPEAT);
-    // Only the current-turn faces collapsed: exactly one of them was evicted-or-
-    // appended away, never the historical row.
     const current = userTurns[userTurns.length - 1] as { content: string };
     expect(current.content).toContain("<active_memory_plugin>");
     expect(current.content).toContain(REPEAT);
@@ -304,8 +304,8 @@ describe("appendUncoveredVolatileLiveInputsWithinBudget bounds supersede to the 
 
   it("preserves a consecutive earlier user turn with the same body in the tail", () => {
     // Regression from autoreview: consecutive user turns can exist without an
-    // assistant separator. The supersede may collapse only the current-turn
-    // suffix face, not every same-body user row in the trailing run.
+    // assistant separator. Structural recognition may append the live current
+    // turn, but it must not delete same-body user rows in the trailing run.
     const REPEAT = "yes";
     const assembledMessages: AgentMessage[] = [
       // Earlier, genuinely distinct user turn with the SAME body.
@@ -328,16 +328,76 @@ describe("appendUncoveredVolatileLiveInputsWithinBudget bounds supersede to the 
     const userTurns = result.messages.filter(
       (message) => (message as { role: string }).role === "user",
     );
-    expect(userTurns).toHaveLength(2);
+    expect(userTurns).toHaveLength(3);
     expect((userTurns[0] as { content: string }).content).toBe(REPEAT);
+    expect((userTurns[1] as { content: string }).content).toBe(REPEAT);
     const current = userTurns[userTurns.length - 1] as { content: string };
     expect(current.content).toContain("<active_memory_plugin>");
     expect(current.content).toContain(REPEAT);
   });
+
+  it("preserves a timestamped earlier user turn before a bare current turn", () => {
+    // Mixed persisted faces are still ambiguous: `[timestamp] yes` immediately
+    // before current bare `yes` can be historical, not the current turn's other
+    // duplicate face.
+    const REPEAT = "yes";
+    const assembledMessages: AgentMessage[] = [
+      { role: "user", content: webchatTimestampedBody(REPEAT) },
+      { role: "user", content: REPEAT },
+    ] as AgentMessage[];
+    const liveMessages: AgentMessage[] = [
+      { role: "user", content: decoratedWebchat(REPEAT) },
+    ] as AgentMessage[];
+
+    const result = appendUncoveredVolatileLiveInputsWithinBudget({
+      assembledMessages,
+      assembledEstimatedTokens: 10,
+      liveMessages,
+      tokenBudget: 1_000_000,
+    });
+
+    const userContents = result.messages
+      .filter((message) => (message as { role: string }).role === "user")
+      .map((message) => (message as { content: string }).content);
+    expect(userContents).toHaveLength(3);
+    expect(userContents[0]).toBe(webchatTimestampedBody(REPEAT));
+    expect(userContents[1]).toBe(REPEAT);
+    expect(userContents[2]).toContain("<active_memory_plugin>");
+    expect(userContents[2]).toContain(REPEAT);
+  });
+
+  it("preserves a bare earlier user turn before a timestamped current turn", () => {
+    // The opposite face order is equally ambiguous. Keep both assembled rows and
+    // append the decorated live copy.
+    const REPEAT = "yes";
+    const assembledMessages: AgentMessage[] = [
+      { role: "user", content: REPEAT },
+      { role: "user", content: webchatTimestampedBody(REPEAT) },
+    ] as AgentMessage[];
+    const liveMessages: AgentMessage[] = [
+      { role: "user", content: decoratedWebchat(REPEAT) },
+    ] as AgentMessage[];
+
+    const result = appendUncoveredVolatileLiveInputsWithinBudget({
+      assembledMessages,
+      assembledEstimatedTokens: 10,
+      liveMessages,
+      tokenBudget: 1_000_000,
+    });
+
+    const userContents = result.messages
+      .filter((message) => (message as { role: string }).role === "user")
+      .map((message) => (message as { content: string }).content);
+    expect(userContents).toHaveLength(3);
+    expect(userContents[0]).toBe(REPEAT);
+    expect(userContents[1]).toBe(webchatTimestampedBody(REPEAT));
+    expect(userContents[2]).toContain("<active_memory_plugin>");
+    expect(userContents[2]).toContain(REPEAT);
+  });
 });
 
 describe("engine.assemble preserves webchat decoration + memory (no-preamble, memory-first path)", () => {
-  it("emits exactly one decorated user message, collapsing the bare + [timestamp] duplication", async () => {
+  it("emits a decorated user message while preserving the bare assembled row", async () => {
     const engine = createEngine();
     const sessionId = "session-webchat-structural-supersede";
 
@@ -374,11 +434,10 @@ describe("engine.assemble preserves webchat decoration + memory (no-preamble, me
     // Memory decoration present on the assembled current turn.
     expect(rendered.some((content) => content.includes("<active_memory_plugin>"))).toBe(true);
     expect(rendered.some((content) => content.includes("<relevant-memories>"))).toBe(true);
-    // Exactly one user message contains the current-turn body — no bare duplicate.
+    // Both the bare assembled row and the decorated live row contain the body.
     const bodyTurns = rendered.filter((content) => content.includes(WEBCHAT_BODY));
-    expect(bodyTurns).toHaveLength(1);
-    // And the one copy that survives is the decorated one.
-    expect(bodyTurns[0]).toContain("<active_memory_plugin>");
+    expect(bodyTurns).toHaveLength(2);
+    expect(bodyTurns.filter((content) => content.includes("<active_memory_plugin>"))).toHaveLength(1);
   });
 
   it("preserves an earlier same-body user turn through the real ingest->assemble path", async () => {
@@ -422,13 +481,14 @@ describe("engine.assemble preserves webchat decoration + memory (no-preamble, me
         typeof message.content === "string" ? message.content : JSON.stringify(message.content),
       );
     const bodyTurns = userContents.filter((content) => content.includes(REPEAT));
-    // BOTH "yes" turns survive: the earlier bare one + the current decorated one.
-    expect(bodyTurns).toHaveLength(2);
+    // All structurally matching turns survive: earlier bare, current bare, and
+    // current decorated live.
+    expect(bodyTurns).toHaveLength(3);
     // Exactly one carries the live decoration (the current turn).
     expect(bodyTurns.filter((content) => content.includes("<active_memory_plugin>"))).toHaveLength(
       1,
     );
-    // The earlier turn survives as a plain bare body.
-    expect(bodyTurns.some((content) => content === REPEAT)).toBe(true);
+    // Both bare rows survive because the structural path cannot distinguish them.
+    expect(bodyTurns.filter((content) => content === REPEAT)).toHaveLength(2);
   });
 });

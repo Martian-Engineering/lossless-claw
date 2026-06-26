@@ -564,21 +564,6 @@ function assembledRowIsStructuralBareCurrentTurn(params: {
   });
 }
 
-// Classify the known persisted faces of the live current turn. The suffix scan
-// uses this to stop before deleting a prior consecutive user turn with the same
-// body: the current turn may have one plain bare row and one timestamped row,
-// but a second row with the same face is a distinct earlier turn.
-function structuralBareCurrentTurnFace(params: {
-  liveContent: string;
-  assembledContent: string;
-}): "bare" | "timestamped" | null {
-  if (!assembledRowIsStructuralBareCurrentTurn(params)) {
-    return null;
-  }
-  const trimmed = params.assembledContent.trim();
-  return stripLeadingOpenClawInboundTimestamp(trimmed) === trimmed ? "bare" : "timestamped";
-}
-
 /**
  * The current turn is the LAST live user message. Recognize it as a volatile
  * live input — even when it carries no Telegram/Slack-style preamble and no
@@ -624,76 +609,19 @@ function resolveStructuralCurrentTurnLiveIndex(params: {
 }
 
 /**
- * Resolve the assembled bare user rows superseded by the live current turn,
- * bounded to the current turn's TAIL. The current turn is the structural
- * last-user live message; its bare faces (a plain `body` row, a `[timestamp]
- * body` row, or a Telegram/Slack decorated copy whose body is the same trailing
- * segment) must be collapsed onto the single live copy, or the duplication the
- * store created survives into the model prompt.
+ * Resolve assembled bare user rows superseded by the live current turn.
  *
- * Bounded to the trailing contiguous user run: only rows in the inbound tail
- * (after the last assistant/tool message) are eligible. The store double-write
- * always lands there because the current turn has no assistant reply yet, so the
- * bound captures every face on every channel while a same-body row BEHIND an
- * assistant message is recognized as a genuinely earlier turn and preserved
- * (PR #926 review: an earlier "yes" must survive a current "yes").
- *
- * Plugin-agnostic: matched solely via liveContentContainsBareBody + the
- * strictly-shorter structural guard within the tail. A live last-user message
- * that contains no bare assembled body supersedes nothing (fail-closed), so
- * distinct turns are never collapsed.
- *
- * This deliberately ignores fresh-tail / tool-pair protection: superseding a
- * bare current-turn row by its richer live copy is a same-turn identity
- * replacement, not a budget eviction, and the bare row IS the protected fresh
- * tail. The exact-equal survivor (the live copy's own coverage anchor) is never
- * collapsed because assembledRowIsStructuralBareCurrentTurn returns false on
- * equal content.
+ * Structural containment can prove that the live decorated current turn should
+ * be appended, but it cannot prove that a matching assembled suffix row is the
+ * same turn rather than a prior consecutive user turn with the same body. Keep
+ * this fail-closed until a stable turn identity is available.
  */
 export function resolveStructuralCurrentTurnSupersededIndexes(params: {
   assembledMessages: AgentMessage[];
   liveMessages: AgentMessage[];
 }): Set<number> {
-  const superseded = new Set<number>();
-  const currentTurnLiveIndex = resolveStructuralCurrentTurnLiveIndex({
-    assembledMessages: params.assembledMessages,
-    liveMessages: params.liveMessages,
-  });
-  if (currentTurnLiveIndex === null) {
-    return superseded;
-  }
-  const liveStored = toStoredMessage(params.liveMessages[currentTurnLiveIndex] as AgentMessage);
-  // Bound the supersede to the current turn's suffix cluster. The current store
-  // double-write can produce one plain bare row and one timestamped row, with an
-  // exact live anchor at the end on covered paths. A second same-face row behind
-  // that cluster is a distinct consecutive user turn and must survive.
-  const seenFaces = new Set<"bare" | "timestamped">();
-  for (
-    let assembledIndex = params.assembledMessages.length - 1;
-    assembledIndex >= 0;
-    assembledIndex--
-  ) {
-    const assembledStored = toStoredMessage(params.assembledMessages[assembledIndex] as AgentMessage);
-    if (assembledStored.role !== "user") {
-      // End of the trailing user run — never reach back into prior turns.
-      break;
-    }
-    if (assembledStored.content === liveStored.content) {
-      // Exact live anchor / survivor: part of the current-turn suffix, never
-      // collapsed, and not a boundary for bare faces immediately behind it.
-      continue;
-    }
-    const face = structuralBareCurrentTurnFace({
-      liveContent: liveStored.content,
-      assembledContent: assembledStored.content,
-    });
-    if (face === null || seenFaces.has(face)) {
-      break;
-    }
-    seenFaces.add(face);
-    superseded.add(assembledIndex);
-  }
-  return superseded;
+  void params;
+  return new Set<number>();
 }
 
 export function collectUncoveredVolatileLiveInputs(params: {
@@ -775,11 +703,9 @@ export function appendUncoveredVolatileLiveInputsWithinBudget(params: {
     assembledMessages: params.assembledMessages,
     liveMessages,
   });
-  // Every assembled bare row the live current turn structurally contains must be
-  // collapsed onto the single live copy. Resolved against the original assembled
-  // state, independent of the uncovered append below, so it also fires when the
-  // live current turn is COVERED by an exact-equal assembled row (and so is not
-  // in the uncovered set) but a SECOND bare/timestamped duplicate still remains.
+  // Structural same-body rows are ambiguous without a stable turn id. Preserve
+  // assembled rows and rely on the uncovered live append to keep the decorated
+  // current turn available to the model.
   const supersededAssembledIndexes = resolveStructuralCurrentTurnSupersededIndexes({
     assembledMessages: params.assembledMessages,
     liveMessages,
@@ -824,11 +750,8 @@ export function appendUncoveredVolatileLiveInputsWithinBudget(params: {
     };
   }
 
-  // A decorated live current turn is the same logical turn as the BARE
-  // assembled row(s) LCM reconstructed from the store. Drop those bare rows so
-  // the appended live copy replaces them (supersede, not duplicate). Resolved
-  // before the budget loop so the swap is unconditional: it is a per-turn
-  // identity fix, not a budget eviction.
+  // Kept for explicit accounting if a future stable turn identity makes
+  // same-turn supersede provable. Today this remains empty for lossless behavior.
   let supersededTokens = 0;
   for (const index of supersededAssembledIndexes) {
     supersededTokens += toStoredMessage(params.assembledMessages[index] as AgentMessage).tokenCount;
