@@ -3762,9 +3762,12 @@ export class LcmContextEngine implements ContextEngine {
         });
       }
       if (volatileLiveInputAppend.appendedMessages > 0) {
-        this.deps.log.warn(
-          `[lcm] assemble: appended unpersisted volatile live input conversation=${conversation.conversationId} ${sessionLabel} appendedMessages=${volatileLiveInputAppend.appendedMessages} appendedTokens=${volatileLiveInputAppend.appendedTokens} evictedMessages=${volatileLiveInputAppend.evictedMessages} evictedTokens=${volatileLiveInputAppend.evictedTokens} overBudget=${volatileLiveInputAppend.overBudget}`,
-        );
+        const volatileLiveInputAppendLog = `[lcm] assemble: appended unpersisted volatile live input conversation=${conversation.conversationId} ${sessionLabel} appendedMessages=${volatileLiveInputAppend.appendedMessages} appendedTokens=${volatileLiveInputAppend.appendedTokens} evictedMessages=${volatileLiveInputAppend.evictedMessages} evictedTokens=${volatileLiveInputAppend.evictedTokens} overBudget=${volatileLiveInputAppend.overBudget}`;
+        if (volatileLiveInputAppend.overBudget || volatileLiveInputAppend.evictedMessages > 0) {
+          this.deps.log.warn(volatileLiveInputAppendLog);
+        } else {
+          this.deps.log.debug(volatileLiveInputAppendLog);
+        }
       }
 
       // Final budget clamp by serialized (model-boundary) estimate. Internal
