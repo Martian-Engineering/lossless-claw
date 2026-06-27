@@ -340,6 +340,7 @@ export class LcmContextEngine implements ContextEngine {
       version: "0.1.0",
       ownsCompaction: migrationOk,
       turnMaintenanceMode: "background",
+      hasDeferredMaintenance: (params) => this.hasDeferredMaintenance(params),
       hostRequirements: {
         "agent-run": {
           requiredCapabilities: LOSSLESS_AGENT_RUN_REQUIRED_HOST_CAPABILITIES,
@@ -4346,6 +4347,29 @@ export class LcmContextEngine implements ContextEngine {
 
   getCompactionMaintenanceStore(): CompactionMaintenanceStore {
     return this.compactionMaintenanceStore;
+  }
+
+  private async hasDeferredMaintenance(params: {
+    sessionId: string;
+    sessionKey?: string;
+  }): Promise<boolean> {
+    if (this.shouldIgnoreSession({ sessionId: params.sessionId, sessionKey: params.sessionKey })) {
+      return false;
+    }
+    if (this.isStatelessSession(params.sessionKey)) {
+      return false;
+    }
+    const conversation = await this.conversationStore.getConversationForSession({
+      sessionId: params.sessionId,
+      sessionKey: params.sessionKey,
+    });
+    if (!conversation) {
+      return false;
+    }
+    const maintenance = await this.compactionMaintenanceStore.getConversationCompactionMaintenance(
+      conversation.conversationId,
+    );
+    return maintenance?.pending === true || maintenance?.running === true;
   }
 
 }

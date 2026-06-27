@@ -98,7 +98,17 @@ export type ContextEngineInfo = {
   version: string;
   ownsCompaction?: boolean;
   turnMaintenanceMode?: "background" | "inline" | string;
+  hasDeferredMaintenance?: (
+    params: ContextEngineMaintenanceHintParams,
+  ) => boolean | Promise<boolean>;
   hostRequirements?: Partial<Record<ContextEngineOperation, ContextEngineHostRequirements>>;
+};
+
+export type ContextEngineMaintenanceHintParams = {
+  sessionId: string;
+  sessionKey?: string;
+  reason: "turn";
+  runtimeContext?: Record<string, unknown>;
 };
 
 export type ContextEngineOperation = "agent-run" | "manual-compact" | "subagent-spawn";

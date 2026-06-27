@@ -37,6 +37,44 @@ describe("LcmContextEngine metadata", () => {
     expect(engine.info.ownsCompaction).toBe(true);
   });
 
+  it("reports deferred maintenance only when compaction debt is pending", async () => {
+    const engine = createEngine();
+    const sessionId = "session-maintenance-hint";
+    await engine.ingest({
+      sessionId,
+      message: {
+        role: "user",
+        content: "hello",
+        timestamp: Date.now(),
+      },
+    });
+    const conversation = await engine
+      .getConversationStore()
+      .getConversationBySessionId(sessionId);
+    expect(conversation).not.toBeNull();
+
+    await expect(
+      engine.info.hasDeferredMaintenance?.({
+        sessionId,
+        reason: "turn",
+      }),
+    ).resolves.toBe(false);
+
+    await engine.getCompactionMaintenanceStore().requestProactiveCompactionDebt({
+      conversationId: conversation!.conversationId,
+      reason: "threshold",
+      tokenBudget: 1000,
+      currentTokenCount: 1200,
+    });
+
+    await expect(
+      engine.info.hasDeferredMaintenance?.({
+        sessionId,
+        reason: "turn",
+      }),
+    ).resolves.toBe(true);
+  });
+
   it("requires the full native host lifecycle for agent runs", () => {
     const engine = createEngine();
     expect(engine.info.hostRequirements?.["agent-run"]).toEqual({
@@ -1350,4 +1388,3 @@ describe("LcmContextEngine connection lifecycle", () => {
 });
 
 // ── Bootstrap ───────────────────────────────────────────────────────────────
-
