@@ -1088,6 +1088,40 @@ export class ConversationStore {
   }
 
   /**
+   * Tail rows (within the window) of the given role that carry no transcript
+   * entry id — the flush-lagged runtime rows a transcript catch-up may adopt.
+   * Returns id + content so the caller can apply a decoration-invariant match
+   * before stamping, rather than the exact identity_hash + content match the SQL
+   * adopters use. Ordered OLDEST-first so a multi-turn recovery pairs each bare
+   * row with its own decorated twin chronologically, instead of letting a short
+   * earlier turn adopt a later, longer row that merely shares a trailing line.
+   */
+  async listRecentUnstampedMessagesByRole(
+    conversationId: ConversationId,
+    role: MessageRole,
+    tailWindow: number,
+  ): Promise<Array<{ messageId: MessageId; content: string }>> {
+    const rows = this.db
+      .prepare(
+        `SELECT message_id, content
+       FROM (
+         SELECT message_id, content, transcript_entry_id, role, seq
+         FROM messages
+         WHERE conversation_id = ?
+         ORDER BY seq DESC
+         LIMIT ?
+       )
+       WHERE transcript_entry_id IS NULL AND role = ?
+       ORDER BY seq ASC`,
+      )
+      .all(conversationId, Math.max(1, Math.floor(tailWindow)), role) as unknown as Array<{
+      message_id: number;
+      content: string;
+    }>;
+    return rows.map((row) => ({ messageId: row.message_id, content: row.content }));
+  }
+
+  /**
    * Whether the newest persisted row has the same identity hash and preserved
    * reasoning content. Used to dedup adjacent delivery-mirror messages whose
    * text content is already covered by the immediately preceding response entry.

@@ -14,7 +14,7 @@ import type { LcmConfig } from "./db/config.js";
 import type { AgentMessage, IngestResult } from "./openclaw-bridge.js";
 import type { TranscriptReconcileResult } from "./reconcile-plan.js";
 import { SessionRolloverDetector } from "./session-rollover.js";
-import type { ConversationRecord, ConversationStore } from "./store/conversation-store.js";
+import type { ConversationRecord, ConversationStore, MessageRole } from "./store/conversation-store.js";
 import type { SummaryStore } from "./store/summary-store.js";
 import type { LcmDependencies } from "./types.js";
 import { readFileSync } from "node:fs";
@@ -29,6 +29,7 @@ import {
   type StoredMessage,
 } from "./message-content.js";
 import { isOpenClawAmbientInboundRecord } from "./openclaw-inbound-metadata.js";
+import { liveContentIsRecognizedDecoratedBareBody } from "./live-coverage.js";
 import {
   createBootstrapEntryHash,
   createLosslessMessageSignature,
@@ -79,6 +80,16 @@ const CROSS_CONVERSATION_RAW_ID_GUARDED_NO_ANCHOR_REASONS = new Set([
   "checkpoint-missing-recovery",
   "rotate-checkpoint-missing",
   "placeholder-checkpoint-recovery",
+]);
+
+// No-anchor recovery reasons where the runtime may have already persisted the
+// turn as a decorated, still-unstamped row before the transcript caught up. Both
+// "never ingested" recovery lanes (an all-zero placeholder checkpoint, or no
+// checkpoint row at all) reach the same import path, so the bare transcript row
+// is adopted onto that decorated row on either, instead of imported as a duplicate.
+const DECORATION_INVARIANT_ADOPTION_NO_ANCHOR_REASONS = new Set([
+  "placeholder-checkpoint-recovery",
+  "checkpoint-missing-recovery",
 ]);
 
 export type BootstrapCheckpointFileState = {
@@ -1142,6 +1153,26 @@ export class TranscriptReconciler {
             adoptedMessages += 1;
             continue;
           }
+          // A placeholder/checkpoint recovery on a brand-new
+          // conversation re-imports the bare transcript row of a turn the live
+          // afterTurn ingest already persisted as a decorated, still-unstamped
+          // row. The two faces differ on both identity_hash and content, so the
+          // adopters above miss them; stamp the decorated row's id via the
+          // structural decorated-face match instead of importing a duplicate.
+          if (
+            DECORATION_INVARIANT_ADOPTION_NO_ANCHOR_REASONS.has(
+              params.noAnchorImportReason ?? "",
+            ) &&
+            (await this.adoptDecorationInvariantEntryId({
+              conversationId,
+              role: stored.role,
+              bareContent: stored.content,
+              entryId,
+            }))
+          ) {
+            adoptedMessages += 1;
+            continue;
+          }
         }
       }
       const result = await this.host.ingestSingle({
@@ -1180,6 +1211,42 @@ export class TranscriptReconciler {
     // overlap — the caller then refreshes the checkpoint instead of
     // re-entering this path every turn.
     return { blockedByImportCap: false, importedMessages, hasOverlap: adoptedMessages > 0 };
+  }
+
+  /**
+   * Stamp a brand-new transcript entry id onto a recently-persisted,
+   * still-unstamped runtime row that is the DECORATED face of the same turn
+   * (the bare body is its line-aligned trailing segment under recognized
+   * decoration). Keeps the single decorated row and anchors it, instead of
+   * importing the bare transcript copy as a duplicate. Bounded to the flush-lag
+   * tail window so legacy unstamped history is never mis-adopted.
+   */
+  private async adoptDecorationInvariantEntryId(params: {
+    conversationId: number;
+    role: MessageRole;
+    bareContent: string;
+    entryId: string;
+  }): Promise<boolean> {
+    const candidates = await this.host.conversationStore.listRecentUnstampedMessagesByRole(
+      params.conversationId,
+      params.role,
+      FLUSH_LAG_ADOPTION_TAIL_WINDOW,
+    );
+    for (const candidate of candidates) {
+      if (
+        liveContentIsRecognizedDecoratedBareBody({
+          liveContent: candidate.content,
+          bareContent: params.bareContent,
+        }) &&
+        (await this.host.conversationStore.restampTranscriptEntryId(
+          candidate.messageId,
+          params.entryId,
+        ))
+      ) {
+        return true;
+      }
+    }
+    return false;
   }
 
   /**
