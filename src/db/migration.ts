@@ -263,6 +263,195 @@ function ensureFocusBriefTables(db: DatabaseSync): void {
   `);
 }
 
+function repairUnsafeConversationIdentifiers(db: DatabaseSync): void {
+  const maxSafeInteger = Number.MAX_SAFE_INTEGER;
+
+  db.exec(`
+    PRAGMA defer_foreign_keys = ON;
+
+    DROP TABLE IF EXISTS temp.lcm_unsafe_conversation_id_map;
+    CREATE TEMP TABLE lcm_unsafe_conversation_id_map (
+      old_id INTEGER PRIMARY KEY,
+      new_id INTEGER NOT NULL UNIQUE
+    ) WITHOUT ROWID;
+
+    WITH
+      unsafe_conversations AS (
+        SELECT
+          conversation_id AS old_id,
+          ROW_NUMBER() OVER (ORDER BY conversation_id) AS ordinal
+        FROM conversations
+        WHERE conversation_id > ${maxSafeInteger}
+      ),
+      safe_conversation_bounds AS (
+        SELECT COALESCE(MAX(conversation_id), 0) AS max_safe_id
+        FROM conversations
+        WHERE conversation_id <= ${maxSafeInteger}
+      ),
+      unsafe_conversation_count AS (
+        SELECT COUNT(*) AS unsafe_count
+        FROM unsafe_conversations
+      )
+    INSERT INTO temp.lcm_unsafe_conversation_id_map (old_id, new_id)
+    SELECT
+      unsafe_conversations.old_id,
+      safe_conversation_bounds.max_safe_id + unsafe_conversations.ordinal
+    FROM unsafe_conversations
+    CROSS JOIN safe_conversation_bounds
+    CROSS JOIN unsafe_conversation_count
+    WHERE safe_conversation_bounds.max_safe_id + unsafe_conversation_count.unsafe_count <= ${maxSafeInteger};
+
+    DROP TABLE IF EXISTS temp.lcm_unsafe_conversation_id_repair_guard;
+    CREATE TEMP TABLE lcm_unsafe_conversation_id_repair_guard (
+      can_repair INTEGER NOT NULL CHECK (can_repair = 1)
+    );
+    INSERT INTO temp.lcm_unsafe_conversation_id_repair_guard (can_repair)
+    SELECT CASE
+      WHEN (
+        SELECT COUNT(*)
+        FROM temp.lcm_unsafe_conversation_id_map
+      ) = (
+        SELECT COUNT(*)
+        FROM conversations
+        WHERE conversation_id > ${maxSafeInteger}
+      )
+      THEN 1
+      ELSE 0
+    END;
+    DROP TABLE IF EXISTS temp.lcm_unsafe_conversation_id_repair_guard;
+
+    UPDATE messages
+    SET conversation_id = (
+      SELECT new_id
+      FROM temp.lcm_unsafe_conversation_id_map
+      WHERE old_id = messages.conversation_id
+    )
+    WHERE conversation_id IN (
+      SELECT old_id
+      FROM temp.lcm_unsafe_conversation_id_map
+    );
+
+    UPDATE summaries
+    SET conversation_id = (
+      SELECT new_id
+      FROM temp.lcm_unsafe_conversation_id_map
+      WHERE old_id = summaries.conversation_id
+    )
+    WHERE conversation_id IN (
+      SELECT old_id
+      FROM temp.lcm_unsafe_conversation_id_map
+    );
+
+    UPDATE context_items
+    SET conversation_id = (
+      SELECT new_id
+      FROM temp.lcm_unsafe_conversation_id_map
+      WHERE old_id = context_items.conversation_id
+    )
+    WHERE conversation_id IN (
+      SELECT old_id
+      FROM temp.lcm_unsafe_conversation_id_map
+    );
+
+    UPDATE large_files
+    SET conversation_id = (
+      SELECT new_id
+      FROM temp.lcm_unsafe_conversation_id_map
+      WHERE old_id = large_files.conversation_id
+    )
+    WHERE conversation_id IN (
+      SELECT old_id
+      FROM temp.lcm_unsafe_conversation_id_map
+    );
+
+    UPDATE conversation_bootstrap_state
+    SET conversation_id = (
+      SELECT new_id
+      FROM temp.lcm_unsafe_conversation_id_map
+      WHERE old_id = conversation_bootstrap_state.conversation_id
+    )
+    WHERE conversation_id IN (
+      SELECT old_id
+      FROM temp.lcm_unsafe_conversation_id_map
+    );
+
+    UPDATE conversation_compaction_telemetry
+    SET conversation_id = (
+      SELECT new_id
+      FROM temp.lcm_unsafe_conversation_id_map
+      WHERE old_id = conversation_compaction_telemetry.conversation_id
+    )
+    WHERE conversation_id IN (
+      SELECT old_id
+      FROM temp.lcm_unsafe_conversation_id_map
+    );
+
+    UPDATE conversation_compaction_maintenance
+    SET conversation_id = (
+      SELECT new_id
+      FROM temp.lcm_unsafe_conversation_id_map
+      WHERE old_id = conversation_compaction_maintenance.conversation_id
+    )
+    WHERE conversation_id IN (
+      SELECT old_id
+      FROM temp.lcm_unsafe_conversation_id_map
+    );
+
+    UPDATE focus_briefs
+    SET conversation_id = (
+      SELECT new_id
+      FROM temp.lcm_unsafe_conversation_id_map
+      WHERE old_id = focus_briefs.conversation_id
+    )
+    WHERE conversation_id IN (
+      SELECT old_id
+      FROM temp.lcm_unsafe_conversation_id_map
+    );
+
+    UPDATE conversations
+    SET conversation_id = (
+      SELECT new_id
+      FROM temp.lcm_unsafe_conversation_id_map
+      WHERE old_id = conversations.conversation_id
+    )
+    WHERE conversation_id IN (
+      SELECT old_id
+      FROM temp.lcm_unsafe_conversation_id_map
+    );
+
+    UPDATE sqlite_sequence
+    SET seq = (
+      SELECT COALESCE(MAX(conversation_id), 0)
+      FROM conversations
+    )
+    WHERE name = 'conversations'
+      AND (
+        EXISTS (
+          SELECT 1
+          FROM temp.lcm_unsafe_conversation_id_map
+        )
+        OR seq > ${maxSafeInteger}
+      );
+
+    INSERT INTO sqlite_sequence (name, seq)
+    SELECT
+      'conversations',
+      COALESCE(MAX(conversation_id), 0)
+    FROM conversations
+    WHERE EXISTS (
+        SELECT 1
+        FROM temp.lcm_unsafe_conversation_id_map
+      )
+      AND NOT EXISTS (
+        SELECT 1
+        FROM sqlite_sequence
+        WHERE name = 'conversations'
+      );
+
+    DROP TABLE IF EXISTS temp.lcm_unsafe_conversation_id_map;
+  `);
+}
+
 /**
  * Belt-and-suspenders guard: create `message_parts` if it does not yet exist.
  *
@@ -1334,6 +1523,9 @@ export function runLcmMigrations(
       ON conversations (session_id, active, created_at)
     `);
     db.exec(`DROP INDEX IF EXISTS conversations_session_key_idx`);
+    runMigrationStep("repairUnsafeConversationIdentifiers", log, () =>
+      repairUnsafeConversationIdentifiers(db),
+    );
     runMigrationStep("ensureSummaryDepthColumn", log, () => ensureSummaryDepthColumn(db));
     runMigrationStep("ensureSummaryMetadataColumns", log, () =>
       ensureSummaryMetadataColumns(db),

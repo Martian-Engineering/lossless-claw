@@ -1480,4 +1480,207 @@ describe("runLcmMigrations summary depth backfill", () => {
       { step_name: "repairOpenClawMetadataIdentityState", algorithm_version: 1 },
     ]);
   });
+
+  it("remaps unsafe conversation identifiers before later migrations read them", () => {
+    const db = createTestDb("unsafe-conversation-id.db");
+    const unsafeConversationId = "11536543435202597";
+
+    runLcmMigrations(db, { fts5Available: false });
+
+    db.exec(`
+      INSERT INTO conversations (
+        conversation_id,
+        session_id,
+        session_key,
+        active,
+        created_at,
+        updated_at
+      ) VALUES (
+        ${unsafeConversationId},
+        'unsafe-session',
+        'agent:main:faye',
+        1,
+        '2026-06-26 16:41:04',
+        '2026-06-26 16:41:04'
+      );
+
+      INSERT INTO messages (
+        message_id,
+        conversation_id,
+        seq,
+        role,
+        content,
+        token_count,
+        identity_hash,
+        created_at
+      ) VALUES (
+        1,
+        ${unsafeConversationId},
+        1,
+        'user',
+        'Conversation info that should stay queryable',
+        8,
+        'legacy-hash',
+        '2026-06-26 16:41:05'
+      );
+
+      INSERT INTO summaries (
+        summary_id,
+        conversation_id,
+        kind,
+        depth,
+        content,
+        token_count,
+        file_ids
+      ) VALUES (
+        'sum-unsafe',
+        ${unsafeConversationId},
+        'leaf',
+        0,
+        'unsafe summary',
+        4,
+        '[]'
+      );
+
+      INSERT INTO context_items (conversation_id, ordinal, item_type, message_id)
+      VALUES (${unsafeConversationId}, 0, 'message', 1);
+
+      INSERT INTO large_files (
+        file_id,
+        conversation_id,
+        storage_uri
+      ) VALUES (
+        'file-unsafe',
+        ${unsafeConversationId},
+        'file:///tmp/unsafe'
+      );
+
+      INSERT INTO conversation_bootstrap_state (
+        conversation_id,
+        session_file_path,
+        last_seen_size,
+        last_seen_mtime_ms,
+        last_processed_offset
+      ) VALUES (
+        ${unsafeConversationId},
+        '/tmp/unsafe-session.jsonl',
+        42,
+        1000,
+        42
+      );
+
+      INSERT INTO conversation_compaction_telemetry (conversation_id)
+      VALUES (${unsafeConversationId});
+
+      INSERT INTO conversation_compaction_maintenance (conversation_id, pending)
+      VALUES (${unsafeConversationId}, 1);
+
+      INSERT INTO focus_briefs (
+        brief_id,
+        conversation_id,
+        prompt,
+        content,
+        status
+      ) VALUES (
+        'focus-unsafe',
+        ${unsafeConversationId},
+        'prompt',
+        'content',
+        'draft'
+      );
+    `);
+
+    expect(() =>
+      db.prepare(`SELECT conversation_id FROM conversations ORDER BY conversation_id DESC LIMIT 1`).all(),
+    ).toThrow(/Value is too large/);
+
+    runLcmMigrations(db, { fts5Available: false });
+
+    const conversationRow = db
+      .prepare(
+        `SELECT conversation_id, session_id, session_key
+         FROM conversations
+         WHERE session_id = 'unsafe-session'`,
+      )
+      .get() as { conversation_id: number; session_id: string; session_key: string };
+    expect(conversationRow.conversation_id).toBeLessThanOrEqual(Number.MAX_SAFE_INTEGER);
+    expect(conversationRow.session_key).toBe("agent:main:faye");
+
+    const unsafeCounts = db
+      .prepare(
+        `SELECT
+           (SELECT COUNT(*) FROM conversations WHERE conversation_id > ?) AS conversations,
+           (SELECT COUNT(*) FROM messages WHERE conversation_id > ?) AS messages,
+           (SELECT COUNT(*) FROM summaries WHERE conversation_id > ?) AS summaries,
+           (SELECT COUNT(*) FROM context_items WHERE conversation_id > ?) AS context_items,
+           (SELECT COUNT(*) FROM large_files WHERE conversation_id > ?) AS large_files,
+           (SELECT COUNT(*) FROM conversation_bootstrap_state WHERE conversation_id > ?) AS bootstrap_state,
+           (SELECT COUNT(*) FROM conversation_compaction_telemetry WHERE conversation_id > ?) AS telemetry,
+           (SELECT COUNT(*) FROM conversation_compaction_maintenance WHERE conversation_id > ?) AS maintenance,
+           (SELECT COUNT(*) FROM focus_briefs WHERE conversation_id > ?) AS focus_briefs`,
+      )
+      .get(
+        Number.MAX_SAFE_INTEGER,
+        Number.MAX_SAFE_INTEGER,
+        Number.MAX_SAFE_INTEGER,
+        Number.MAX_SAFE_INTEGER,
+        Number.MAX_SAFE_INTEGER,
+        Number.MAX_SAFE_INTEGER,
+        Number.MAX_SAFE_INTEGER,
+        Number.MAX_SAFE_INTEGER,
+        Number.MAX_SAFE_INTEGER,
+      ) as Record<string, number>;
+
+    expect(unsafeCounts).toMatchObject({
+      conversations: 0,
+      messages: 0,
+      summaries: 0,
+      context_items: 0,
+      large_files: 0,
+      bootstrap_state: 0,
+      telemetry: 0,
+      maintenance: 0,
+      focus_briefs: 0,
+    });
+
+    const remappedCounts = db
+      .prepare(
+        `SELECT
+           (SELECT COUNT(*) FROM messages WHERE conversation_id = ?) AS messages,
+           (SELECT COUNT(*) FROM summaries WHERE conversation_id = ?) AS summaries,
+           (SELECT COUNT(*) FROM context_items WHERE conversation_id = ?) AS context_items,
+           (SELECT COUNT(*) FROM large_files WHERE conversation_id = ?) AS large_files,
+           (SELECT COUNT(*) FROM conversation_bootstrap_state WHERE conversation_id = ?) AS bootstrap_state,
+           (SELECT COUNT(*) FROM conversation_compaction_telemetry WHERE conversation_id = ?) AS telemetry,
+           (SELECT COUNT(*) FROM conversation_compaction_maintenance WHERE conversation_id = ?) AS maintenance,
+           (SELECT COUNT(*) FROM focus_briefs WHERE conversation_id = ?) AS focus_briefs`,
+      )
+      .get(
+        conversationRow.conversation_id,
+        conversationRow.conversation_id,
+        conversationRow.conversation_id,
+        conversationRow.conversation_id,
+        conversationRow.conversation_id,
+        conversationRow.conversation_id,
+        conversationRow.conversation_id,
+        conversationRow.conversation_id,
+      ) as Record<string, number>;
+
+    expect(remappedCounts).toMatchObject({
+      messages: 1,
+      summaries: 1,
+      context_items: 1,
+      large_files: 1,
+      bootstrap_state: 1,
+      telemetry: 1,
+      maintenance: 1,
+      focus_briefs: 1,
+    });
+
+    const sequenceRow = db
+      .prepare(`SELECT seq FROM sqlite_sequence WHERE name = 'conversations'`)
+      .get() as { seq: number };
+    expect(sequenceRow.seq).toBe(conversationRow.conversation_id);
+    expect(db.prepare(`PRAGMA foreign_key_check`).all()).toEqual([]);
+  });
 });
