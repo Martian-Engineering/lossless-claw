@@ -65,16 +65,8 @@ function baseConfig(file: string, independentLogFileEnabled = true): LcmConfig {
     summaryTimeoutMs: 60000,
     timezone: "UTC",
     pruneHeartbeatOk: false,
-    transcriptGcEnabled: false,
     enableSummaryThinking: true,
     proactiveThresholdCompactionMode: "deferred",
-    autoRotateSessionFiles: {
-      enabled: true,
-      createBackups: false,
-      sizeBytes: 2097152,
-      startup: "rotate",
-      runtime: "rotate",
-    },
     independentLogFile: {
       enabled: independentLogFileEnabled,
       file,
