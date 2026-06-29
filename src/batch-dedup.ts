@@ -130,7 +130,7 @@ export class BatchDeduplicator {
       // Full overlap (N === batch.length) means every row is already persisted, so
       // failing closed drops nothing new: log at debug. A partial overlap still
       // defers genuinely new rows to the reconcile and stays at warn.
-      if (persistedIdentityOverlaps === batch.length) {
+      if (await this.batchIsFullyPersistedByMultiplicity(conversationId, storedBatch)) {
         this.deps.log.debug(overlapMessage);
       } else {
         this.deps.log.warn(overlapMessage);
@@ -436,6 +436,40 @@ export class BatchDeduplicator {
       }
     }
     return overlaps;
+  }
+
+  // Proves the debug-only case: every incoming occurrence has a distinct
+  // persisted occurrence, so fail-closed cannot be hiding a new duplicate row.
+  private async batchIsFullyPersistedByMultiplicity(
+    conversationId: number,
+    incomingBatch: StoredMessage[],
+  ): Promise<boolean> {
+    const requiredCounts = new Map<
+      string,
+      { role: StoredMessage["role"]; identityHash: string; count: number }
+    >();
+    for (const incoming of incomingBatch) {
+      const identityHash = buildMessageIdentityHash(incoming.role, incoming.content);
+      const key = `${incoming.role}\0${identityHash}`;
+      const current = requiredCounts.get(key);
+      if (current) {
+        current.count += 1;
+      } else {
+        requiredCounts.set(key, { role: incoming.role, identityHash, count: 1 });
+      }
+    }
+
+    for (const required of requiredCounts.values()) {
+      const persistedCount = await this.conversationStore.countMessagesByIdentityHash(
+        conversationId,
+        required.role,
+        required.identityHash,
+      );
+      if (persistedCount < required.count) {
+        return false;
+      }
+    }
+    return true;
   }
 
   private async messagesAreExternalizedEquivalent(
