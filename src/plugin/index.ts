@@ -30,10 +30,12 @@ import type {
   LcmDependencies,
   RuntimeLlmCompleteFn,
   RuntimeLlmModelOverride,
+  SessionTranscriptReadTarget,
   StartupSessionFileCandidate,
+  VisibleSessionTranscriptMessageEntry,
 } from "../types.js";
 
-const MIN_CONTEXT_ENGINE_OPENCLAW_VERSION = "2026.5.28";
+const MIN_CONTEXT_ENGINE_OPENCLAW_VERSION = "2026.6.10";
 
 type ContextEngineCapableOpenClawPluginApi = OpenClawPluginApi & {
   registerContextEngine: (id: string, factory: ContextEngineFactory) => void;
@@ -110,8 +112,19 @@ type MemorySupplementModule = {
   buildMemorySystemPromptAddition?: unknown;
 };
 
+type ReadVisibleSessionTranscriptMessageEntries = (
+  target: SessionTranscriptReadTarget,
+) => Promise<VisibleSessionTranscriptMessageEntry[]>;
+
+type SessionTranscriptRuntimeModule = {
+  readVisibleSessionTranscriptMessageEntries?: unknown;
+};
+
 let buildMemorySystemPromptAdditionPromise:
   | Promise<BuildMemorySystemPromptAddition>
+  | undefined;
+let readVisibleSessionTranscriptMessageEntriesPromise:
+  | Promise<ReadVisibleSessionTranscriptMessageEntries>
   | undefined;
 
 /** Return the OpenClaw helper that renders active memory supplements for context engines. */
@@ -134,8 +147,26 @@ async function loadBuildMemorySystemPromptAdditionModule(): Promise<BuildMemoryS
     }
   }
   throw new Error(
-    "[lcm] OpenClaw buildMemorySystemPromptAddition is unavailable; install OpenClaw >=2026.5.28.",
+    "[lcm] OpenClaw buildMemorySystemPromptAddition is unavailable; install OpenClaw >=2026.6.10.",
     { cause: importErrors[0] },
+  );
+}
+
+/** Return OpenClaw's branch-safe visible transcript projection helper. */
+async function loadReadVisibleSessionTranscriptMessageEntries(): Promise<ReadVisibleSessionTranscriptMessageEntries> {
+  readVisibleSessionTranscriptMessageEntriesPromise ??=
+    loadReadVisibleSessionTranscriptMessageEntriesModule();
+  return readVisibleSessionTranscriptMessageEntriesPromise;
+}
+
+/** Import the transcript projection helper from the supported OpenClaw SDK surface. */
+async function loadReadVisibleSessionTranscriptMessageEntriesModule(): Promise<ReadVisibleSessionTranscriptMessageEntries> {
+  const mod = (await import("openclaw/plugin-sdk/session-transcript-runtime")) as SessionTranscriptRuntimeModule;
+  if (typeof mod.readVisibleSessionTranscriptMessageEntries === "function") {
+    return mod.readVisibleSessionTranscriptMessageEntries as ReadVisibleSessionTranscriptMessageEntries;
+  }
+  throw new Error(
+    "[lcm] OpenClaw readVisibleSessionTranscriptMessageEntries is unavailable; install the SQLite transcript runtime build.",
   );
 }
 
@@ -1532,6 +1563,11 @@ function createLcmDependencies(
       } catch {
         return undefined;
       }
+    },
+    readVisibleSessionTranscriptMessageEntries: async (target) => {
+      const readVisibleSessionTranscriptMessageEntries =
+        await loadReadVisibleSessionTranscriptMessageEntries();
+      return readVisibleSessionTranscriptMessageEntries(target);
     },
     listStartupSessionFileCandidates: async () => {
       const sessionApi = getRuntimeAgentSessionApi(api);
