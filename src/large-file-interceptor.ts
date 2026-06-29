@@ -837,7 +837,6 @@ export class LargeFileInterceptor {
         continue;
       }
 
-      interceptedAny = true;
       const toolName =
         safeString(record.name) ??
         topLevelToolName ??
@@ -850,6 +849,14 @@ export class LargeFileInterceptor {
         safeString(record.call_id) ??
         safeString(record.id) ??
         topLevelToolCallId;
+
+      // lcm_describe is already a drilldown response; re-stubbing adds another hop.
+      if (toolName === "lcm_describe") {
+        rewrittenContent.push(item);
+        continue;
+      }
+
+      interceptedAny = true;
       const externalized = await this.externalizeLargeTextPayload({
         conversationId: params.conversationId,
         content: extractedText,
