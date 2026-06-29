@@ -197,6 +197,25 @@ export function createEngineWithDepsOverrides(overrides: Partial<LcmDependencies
   );
 }
 
+export function createEngineWithDepsOverridesAndDb(
+  overrides: Partial<LcmDependencies>,
+): { engine: LcmContextEngine; db: ReturnType<typeof createLcmDatabaseConnection> } {
+  const tempDir = mkdtempSync(join(tmpdir(), "lossless-claw-engine-"));
+  tempDirs.push(tempDir);
+  const config = createTestConfig(join(tempDir, "lcm.db"));
+  const db = createLcmDatabaseConnection(config.databasePath);
+  return {
+    engine: new LcmContextEngine(
+      {
+        ...createTestDeps(config),
+        ...overrides,
+      },
+      db,
+    ),
+    db,
+  };
+}
+
 export function createEngineAtDatabasePath(databasePath: string): LcmContextEngine {
   const config = createTestConfig(databasePath);
   const db = createLcmDatabaseConnection(config.databasePath);

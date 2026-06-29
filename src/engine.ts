@@ -9,6 +9,8 @@ import type {
   ContextEngineControlResult,
   ContextEngineInfo,
   ContextEngineHostCapability,
+  ContextEngineRuntimeContext,
+  ContextEngineSessionTarget,
   AssembleResult,
   BootstrapResult,
   CompactResult,
@@ -60,14 +62,18 @@ import { FocusBriefStore, type FocusBriefRecord } from "./store/focus-brief-stor
 import { buildToolCallInputMap } from "./tool-pairing.js";
 import { SummaryStore, type ContextItemRecord } from "./store/summary-store.js";
 import { createLcmSummarizeFromLegacyParams, FALLBACK_SUMMARY_MARKER, LcmProviderAuthError, LcmSummarySpendLimitError, type LcmSummarizeFn } from "./summarize.js";
-import type { LcmDependencies } from "./types.js";
+import type {
+  LcmDependencies,
+  SessionTranscriptReadTarget,
+  VisibleSessionTranscriptMessageEntry,
+} from "./types.js";
 import { estimateTokens } from "./estimate-tokens.js";
 import {
   buildDeterministicFallbackSummary,
   FALLBACK_DIRECTIVE_SUMMARY_MARKER,
   MIN_FALLBACK_MAX_TOKENS,
 } from "./summary-fallback.js";
-import { getTranscriptEntryId, readAppendedLeafPathMessages, readLastJsonlEntryBeforeOffset, readLeafPathMessages, readSessionParentSessionReference, resolveTranscriptMessageCreatedAt } from "./transcript.js";
+import { attachTranscriptEntryMeta, getTranscriptEntryId, readAppendedLeafPathMessages, readLastJsonlEntryBeforeOffset, readLeafPathMessages, readSessionParentSessionReference, resolveTranscriptMessageCreatedAt } from "./transcript.js";
 import { type TranscriptReconcileResult } from "./reconcile-plan.js";
 import { checkpointIsPastTranscriptEof, TranscriptReconciler } from "./transcript-reconciler.js";
 import { AMBIGUOUS_SESSION_KEY_RUNTIME_ROLLOVER_REASON, SessionRolloverDetector } from "./session-rollover.js";
@@ -226,6 +232,47 @@ function buildLiveToolOutputFileId(params: {
   hash.update("\0");
   hash.update(params.content);
   return `file_${hash.digest("hex").slice(0, 16)}`;
+}
+
+function normalizedTargetString(value: unknown): string | undefined {
+  return typeof value === "string" && value.trim().length > 0 ? value.trim() : undefined;
+}
+
+function resolveSessionTranscriptReadTarget(params: {
+  sessionId: string;
+  sessionKey?: string;
+  sessionTarget?: ContextEngineSessionTarget;
+  runtimeContext?: ContextEngineRuntimeContext;
+}): SessionTranscriptReadTarget | undefined {
+  const target = params.sessionTarget ?? params.runtimeContext?.sessionTarget;
+  const sessionId = normalizedTargetString(target?.sessionId) ?? params.sessionId.trim();
+  const sessionKey = normalizedTargetString(target?.sessionKey) ?? normalizedTargetString(params.sessionKey);
+  if (!sessionId || !sessionKey) {
+    return undefined;
+  }
+  const agentId = normalizedTargetString(target?.agentId);
+  const storePath = normalizedTargetString(target?.storePath);
+  const threadId =
+    typeof target?.threadId === "string" || typeof target?.threadId === "number"
+      ? target.threadId
+      : undefined;
+  return {
+    sessionId,
+    sessionKey,
+    ...(agentId ? { agentId } : {}),
+    ...(storePath ? { storePath } : {}),
+    ...(threadId !== undefined ? { threadId } : {}),
+  };
+}
+
+function messageFromVisibleTranscriptEntry(
+  entry: VisibleSessionTranscriptMessageEntry,
+): AgentMessage {
+  return attachTranscriptEntryMeta(entry.message, {
+    entryId: entry.entryId,
+    parentId: entry.parentId,
+    timestamp: entry.createdAt ?? null,
+  });
 }
 
 
@@ -1775,6 +1822,155 @@ export class LcmContextEngine implements ContextEngine {
     }
   }
 
+  private async bootstrapFromVisibleTranscriptProjection(params: {
+    sessionId: string;
+    sessionKey?: string;
+    target: SessionTranscriptReadTarget;
+    startedAt: number;
+    sessionLabel: string;
+  }): Promise<BootstrapResult> {
+    const readVisibleSessionTranscriptMessageEntries =
+      this.deps.readVisibleSessionTranscriptMessageEntries;
+    if (!readVisibleSessionTranscriptMessageEntries) {
+      return {
+        bootstrapped: false,
+        importedMessages: 0,
+        reason: "visible transcript projection unavailable",
+      };
+    }
+
+    const result = await this.withSessionQueue(
+      this.resolveSessionQueueKey(params.sessionId, params.sessionKey),
+      async () =>
+        this.conversationStore.withTransaction(async () => {
+          const entries = await readVisibleSessionTranscriptMessageEntries(params.target);
+          const historicalMessages = entries.map(messageFromVisibleTranscriptEntry);
+          const conversation = await this.conversationStore.getOrCreateConversation(params.sessionId, {
+            sessionKey: params.sessionKey,
+          });
+          const conversationId = conversation.conversationId;
+          const existingCount = await this.conversationStore.getMessageCount(conversationId);
+
+          if (existingCount === 0) {
+            const bootstrapMessages = trimBootstrapMessagesToBudget(
+              historicalMessages,
+              resolveBootstrapMaxTokens(this.config),
+            );
+            if (bootstrapMessages.length === 0) {
+              await this.conversationStore.markConversationBootstrapped(conversationId);
+              return {
+                bootstrapped: false,
+                importedMessages: 0,
+                reason: "no visible transcript messages in session",
+              };
+            }
+
+            let importedMessages = 0;
+            for (const message of bootstrapMessages) {
+              const result = await this.ingestSingle({
+                sessionId: params.sessionId,
+                sessionKey: params.sessionKey,
+                message,
+                createdAt: resolveTranscriptMessageCreatedAt(message),
+                skipReplayTimestampFloodGuard: true,
+              });
+              if (result.ingested) {
+                importedMessages += 1;
+              }
+            }
+            await this.conversationStore.markConversationBootstrapped(conversationId);
+
+            if (this.config.pruneHeartbeatOk) {
+              const pruned = await pruneHeartbeatOkTurns(this.conversationStore, conversationId);
+              if (pruned > 0) {
+                this.deps.log.info(
+                  `[lcm] bootstrap: pruned ${pruned} HEARTBEAT_OK messages from conversation ${conversationId}`,
+                );
+              }
+            }
+
+            this.deps.log.debug(
+              `[lcm] bootstrap: sqlite projection initial import conversation=${conversationId} ${params.sessionLabel} importedMessages=${importedMessages} sourceMessages=${historicalMessages.length} duration=${formatDurationMs(Date.now() - params.startedAt)}`,
+            );
+            return {
+              bootstrapped: importedMessages > 0,
+              importedMessages,
+            };
+          }
+
+          const reconcile = await this.transcriptReconciler.reconcileSessionTail({
+            sessionId: params.sessionId,
+            sessionKey: params.sessionKey,
+            conversationId,
+            historicalMessages,
+            checkpointEntryHash: undefined,
+            lastProcessedEntryId: undefined,
+          });
+          this.deps.log.debug(
+            `[lcm] bootstrap: sqlite projection reconcile finished conversation=${conversationId} ${params.sessionLabel} importedMessages=${reconcile.importedMessages} overlap=${reconcile.hasOverlap} blockedByImportCap=${reconcile.blockedByImportCap} duration=${formatDurationMs(Date.now() - params.startedAt)}`,
+          );
+
+          if (reconcile.blockedByImportCap) {
+            return {
+              bootstrapped: false,
+              importedMessages: reconcile.importedMessages,
+              reason:
+                reconcile.blockedReason === "cross-conversation-raw-id"
+                  ? "reconcile duplicate raw ids"
+                  : reconcile.blockedReason === "duplicate-transcript-replay"
+                    ? "reconcile duplicate transcript replay"
+                    : "reconcile import capped",
+            };
+          }
+
+          if (!conversation.bootstrappedAt) {
+            await this.conversationStore.markConversationBootstrapped(conversationId);
+          }
+
+          if (reconcile.importedMessages > 0) {
+            return {
+              bootstrapped: true,
+              importedMessages: reconcile.importedMessages,
+              reason: "reconciled missing session messages",
+            };
+          }
+
+          if (conversation.bootstrappedAt) {
+            return {
+              bootstrapped: false,
+              importedMessages: 0,
+              reason: "already bootstrapped",
+            };
+          }
+
+          return {
+            bootstrapped: false,
+            importedMessages: 0,
+            reason: reconcile.hasOverlap
+              ? "conversation already up to date"
+              : "conversation already has messages",
+          };
+        }),
+      { operationName: "bootstrap", context: params.sessionLabel },
+    );
+
+    const conversation = await this.conversationStore.getConversationForSession({
+      sessionId: params.sessionId,
+      sessionKey: params.sessionKey,
+    });
+    if (conversation) {
+      this.recordRecentBootstrapImport(
+        conversation.conversationId,
+        result.importedMessages,
+        result.reason ?? null,
+      );
+    }
+    this.deps.log.debug(
+      `[lcm] bootstrap: done ${params.sessionLabel} bootstrapped=${result.bootstrapped} importedMessages=${result.importedMessages} reason=${result.reason ?? "none"} duration=${formatDurationMs(Date.now() - params.startedAt)}`,
+    );
+    return result;
+  }
+
 
   // ── ContextEngine interface ─────────────────────────────────────────────
 
@@ -1782,17 +1978,22 @@ export class LcmContextEngine implements ContextEngine {
 
   async bootstrap(params: {
     sessionId: string;
-    sessionFile: string;
+    sessionFile?: string;
     sessionKey?: string;
+    sessionTarget?: ContextEngineSessionTarget;
+    runtimeContext?: ContextEngineRuntimeContext;
   }): Promise<BootstrapResult> {
-    if (this.shouldIgnoreSession({ sessionId: params.sessionId, sessionKey: params.sessionKey })) {
+    const transcriptReadTarget = resolveSessionTranscriptReadTarget(params);
+    const sessionId = transcriptReadTarget?.sessionId ?? params.sessionId;
+    const sessionKey = transcriptReadTarget?.sessionKey ?? params.sessionKey;
+    if (this.shouldIgnoreSession({ sessionId, sessionKey })) {
       return {
         bootstrapped: false,
         importedMessages: 0,
         reason: "session excluded by pattern",
       };
     }
-    if (this.isStatelessSession(params.sessionKey)) {
+    if (this.isStatelessSession(sessionKey)) {
       return {
         bootstrapped: false,
         importedMessages: 0,
@@ -1801,14 +2002,31 @@ export class LcmContextEngine implements ContextEngine {
     }
     this.ensureMigrated();
     const startedAt = Date.now();
-    const sessionLabel = formatSessionLabel(params.sessionId, params.sessionKey);
-    const sessionFileStats = await stat(params.sessionFile);
+    const sessionLabel = formatSessionLabel(sessionId, sessionKey);
+    if (transcriptReadTarget && this.deps.readVisibleSessionTranscriptMessageEntries) {
+      return this.bootstrapFromVisibleTranscriptProjection({
+        sessionId,
+        sessionKey,
+        target: transcriptReadTarget,
+        startedAt,
+        sessionLabel,
+      });
+    }
+    if (!params.sessionFile) {
+      return {
+        bootstrapped: false,
+        importedMessages: 0,
+        reason: "no transcript source",
+      };
+    }
+    const sessionFile = params.sessionFile;
+    const sessionFileStats = await stat(sessionFile);
     const sessionFileSize = sessionFileStats.size;
     const sessionFileMtimeMs = Math.trunc(sessionFileStats.mtimeMs);
-    const parentSessionReference = await readSessionParentSessionReference(params.sessionFile);
+    const parentSessionReference = await readSessionParentSessionReference(sessionFile);
 
     const result = await this.withSessionQueue(
-      this.resolveSessionQueueKey(params.sessionId, params.sessionKey),
+      this.resolveSessionQueueKey(sessionId, sessionKey),
       async () =>
         this.conversationStore.withTransaction(async () => {
           const persistBootstrapState = async (
@@ -1821,7 +2039,7 @@ export class LcmContextEngine implements ContextEngine {
           ): Promise<void> => {
             await this.transcriptReconciler.refreshBootstrapState({
               conversationId,
-              sessionFile: params.sessionFile,
+              sessionFile,
               fileStats: {
                 size: sessionFileSize,
                 mtimeMs: sessionFileMtimeMs,
@@ -1841,25 +2059,25 @@ export class LcmContextEngine implements ContextEngine {
 
           await this.sessionRolloverDetector.rotateIsolatedCronConversationIfRuntimeChanged({
             phase: "bootstrap",
-            sessionId: params.sessionId,
-            sessionKey: params.sessionKey,
+            sessionId,
+            sessionKey,
             createReplacement: true,
           });
           await this.sessionRolloverDetector.rotateStaleSessionKeyConversationIfTrackedTranscriptMissing({
             phase: "bootstrap",
-            sessionId: params.sessionId,
-            sessionKey: params.sessionKey,
-            sessionFile: params.sessionFile,
+            sessionId,
+            sessionKey,
+            sessionFile,
           });
           const ambiguousRollover =
             await this.sessionRolloverDetector.findAmbiguousSessionKeyRuntimeRollover({
               phase: "bootstrap",
-              sessionId: params.sessionId,
-              sessionKey: params.sessionKey,
-              sessionFile: params.sessionFile,
+              sessionId,
+              sessionKey,
+              sessionFile,
             });
           if (ambiguousRollover) {
-            preloadedHistoricalMessages = await readLeafPathMessages(params.sessionFile);
+            preloadedHistoricalMessages = await readLeafPathMessages(sessionFile);
             const activeBootstrapState =
               await this.summaryStore.getConversationBootstrapState(
                 ambiguousRollover.conversationId,
@@ -1878,7 +2096,7 @@ export class LcmContextEngine implements ContextEngine {
               const rolloverResolution =
                 await this.sessionRolloverDetector.rotateAmbiguousRolloverForProvablyFreshTranscript({
                   phase: "bootstrap",
-                  sessionId: params.sessionId,
+                  sessionId,
                   rollover: ambiguousRollover,
                   candidateMessages: preloadedHistoricalMessages,
                   createReplacement: false,
@@ -1887,8 +2105,8 @@ export class LcmContextEngine implements ContextEngine {
                 this.sessionRolloverDetector.logAmbiguousSessionKeyRuntimeRollover({
                   phase: "bootstrap",
                   rollover: ambiguousRollover,
-                  sessionId: params.sessionId,
-                  sessionFile: params.sessionFile,
+                  sessionId,
+                  sessionFile,
                   expected: rolloverResolution.preserveExpected,
                 });
                 return {
@@ -1899,9 +2117,9 @@ export class LcmContextEngine implements ContextEngine {
               }
               const reconcile =
                 await this.transcriptReconciler.importFreshAmbiguousRolloverTranscript({
-                  sessionId: params.sessionId,
-                  sessionKey: params.sessionKey,
-                  sessionFile: params.sessionFile,
+                  sessionId,
+                  sessionKey,
+                  sessionFile,
                   conversationId: ambiguousRollover.conversationId,
                   historicalMessages: preloadedHistoricalMessages,
                 });
@@ -1929,8 +2147,8 @@ export class LcmContextEngine implements ContextEngine {
             }
           }
 
-          const conversation = await this.conversationStore.getOrCreateConversation(params.sessionId, {
-            sessionKey: params.sessionKey,
+          const conversation = await this.conversationStore.getOrCreateConversation(sessionId, {
+            sessionKey,
           });
           const conversationId = conversation.conversationId;
           let existingCount = await this.conversationStore.getMessageCount(conversationId);
@@ -1940,12 +2158,12 @@ export class LcmContextEngine implements ContextEngine {
 
           if (
             bootstrapState &&
-            bootstrapState.sessionFilePath !== params.sessionFile
+            bootstrapState.sessionFilePath !== sessionFile
           ) {
             transcriptEpochRotated = true;
             transcriptEpochReason = "path-mismatch";
             this.deps.log.warn(
-              `[lcm] bootstrap: session file rotated conversation=${conversationId} ${sessionLabel} oldFile=${bootstrapState.sessionFilePath} newFile=${params.sessionFile}`,
+              `[lcm] bootstrap: session file rotated conversation=${conversationId} ${sessionLabel} oldFile=${bootstrapState.sessionFilePath} newFile=${sessionFile}`,
             );
             // A rotated session file invalidates every piece of cached state
             // keyed to the old path: the on-disk bootstrap checkpoint row, the
@@ -1957,13 +2175,13 @@ export class LcmContextEngine implements ContextEngine {
           }
           if (
             bootstrapState &&
-            bootstrapState.sessionFilePath === params.sessionFile &&
+            bootstrapState.sessionFilePath === sessionFile &&
             checkpointIsPastTranscriptEof(bootstrapState, sessionFileSize)
           ) {
             transcriptEpochRotated = true;
             transcriptEpochReason = "same-path-shrink";
             this.deps.log.warn(
-              `[lcm] bootstrap: session file shrank past checkpoint conversation=${conversationId} ${sessionLabel} file=${params.sessionFile} checkpointOffset=${bootstrapState.lastProcessedOffset} checkpointSize=${bootstrapState.lastSeenSize} currentSize=${sessionFileSize}`,
+              `[lcm] bootstrap: session file shrank past checkpoint conversation=${conversationId} ${sessionLabel} file=${sessionFile} checkpointOffset=${bootstrapState.lastProcessedOffset} checkpointSize=${bootstrapState.lastSeenSize} currentSize=${sessionFileSize}`,
             );
             this.lastFullReadFileState.delete(conversationId);
             bootstrapState = null;
@@ -1973,7 +2191,7 @@ export class LcmContextEngine implements ContextEngine {
           // successful bootstrap checkpoint, skip reopening and reparsing it.
           if (
             bootstrapState &&
-            bootstrapState.sessionFilePath === params.sessionFile &&
+            bootstrapState.sessionFilePath === sessionFile &&
             bootstrapState.lastSeenSize === sessionFileSize &&
             bootstrapState.lastSeenMtimeMs === sessionFileMtimeMs
           ) {
@@ -1982,7 +2200,7 @@ export class LcmContextEngine implements ContextEngine {
             }
             if (parentSessionReference !== null && !bootstrapState.forkBounded) {
               const historicalMessages =
-                preloadedHistoricalMessages ?? (await readLeafPathMessages(params.sessionFile));
+                preloadedHistoricalMessages ?? (await readLeafPathMessages(sessionFile));
               await persistBootstrapState(conversationId, bootstrapState.lastProcessedEntryHash, {
                 forkBounded: true,
                 forkSourceMessageCount: historicalMessages.length,
@@ -2003,7 +2221,7 @@ export class LcmContextEngine implements ContextEngine {
 
           if (
             bootstrapState &&
-            bootstrapState.sessionFilePath === params.sessionFile &&
+            bootstrapState.sessionFilePath === sessionFile &&
             sessionFileSize > bootstrapState.lastSeenSize &&
             sessionFileMtimeMs >= bootstrapState.lastSeenMtimeMs
           ) {
@@ -2036,7 +2254,7 @@ export class LcmContextEngine implements ContextEngine {
 
             const tailEntryRaw = canTryAppendOnlyFastPath
               ? await readLastJsonlEntryBeforeOffset(
-                  params.sessionFile,
+                  sessionFile,
                   bootstrapState.lastProcessedOffset,
                   true,
                   (message) => createBootstrapEntryHash(toStoredMessage(message)) === frontierHash,
@@ -2053,7 +2271,7 @@ export class LcmContextEngine implements ContextEngine {
               tailEntryHash === bootstrapState.lastProcessedEntryHash
             ) {
               const appended = await readAppendedLeafPathMessages({
-                sessionFile: params.sessionFile,
+                sessionFile,
                 offset: bootstrapState.lastProcessedOffset,
               });
               if (appended.canUseAppendOnly) {
@@ -2063,14 +2281,14 @@ export class LcmContextEngine implements ContextEngine {
 
                 const appendOnlySessionContext = this.formatSessionLogContext({
                   conversationId,
-                  sessionId: params.sessionId,
-                  sessionKey: params.sessionKey,
+                  sessionId,
+                  sessionKey,
                 });
                 const replayFiltered = await this.transcriptReconciler.filterBootstrapReplayMessages({
                   messages: appended.messages,
                   sessionContext: appendOnlySessionContext,
                   source: "bootstrap append-only",
-                  sessionFile: params.sessionFile,
+                  sessionFile,
                 });
                 const replayFilteredMessages = this.transcriptReconciler.filterSyntheticHeartbeatTranscriptMessages({
                   messages: replayFiltered.messages,
@@ -2088,8 +2306,8 @@ export class LcmContextEngine implements ContextEngine {
                   let importedMessages = 0;
                   for (const [index, message] of replayFilteredMessages.entries()) {
                     const ingestResult = await this.ingestSingle({
-                      sessionId: params.sessionId,
-                      sessionKey: params.sessionKey,
+                      sessionId,
+                      sessionKey,
                       message,
                       createdAt: resolveTranscriptMessageCreatedAt(message),
                       skipReplayTimestampFloodGuard:
@@ -2146,7 +2364,7 @@ export class LcmContextEngine implements ContextEngine {
           }
 
           const historicalMessages =
-            preloadedHistoricalMessages ?? (await readLeafPathMessages(params.sessionFile));
+            preloadedHistoricalMessages ?? (await readLeafPathMessages(sessionFile));
           this.deps.log.debug(
             `[lcm] bootstrap: full transcript read conversation=${conversationId} ${sessionLabel} existingCount=${existingCount} historicalMessages=${historicalMessages.length} duration=${formatDurationMs(Date.now() - startedAt)}`,
           );
@@ -2179,8 +2397,8 @@ export class LcmContextEngine implements ContextEngine {
             let importedMessages = 0;
             for (const message of bootstrapMessages) {
               const result = await this.ingestSingle({
-                sessionId: params.sessionId,
-                sessionKey: params.sessionKey,
+                sessionId,
+                sessionKey,
                 message,
                 createdAt: resolveTranscriptMessageCreatedAt(message),
                 skipReplayTimestampFloodGuard: true,
@@ -2227,8 +2445,8 @@ export class LcmContextEngine implements ContextEngine {
           // Existing conversation path: reconcile crash gaps by appending JSONL
           // messages that were never persisted to LCM.
           const reconcile = await this.transcriptReconciler.reconcileSessionTail({
-            sessionId: params.sessionId,
-            sessionKey: params.sessionKey,
+            sessionId,
+            sessionKey,
             conversationId,
             historicalMessages,
             checkpointEntryHash:
@@ -2304,15 +2522,15 @@ export class LcmContextEngine implements ContextEngine {
     if (this.config.pruneHeartbeatOk && result.bootstrapped === false) {
       try {
         const conversation = await this.conversationStore.getConversationForSession({
-          sessionId: params.sessionId,
-          sessionKey: params.sessionKey,
+          sessionId,
+          sessionKey,
         });
         if (conversation) {
           const pruned = await pruneHeartbeatOkTurns(this.conversationStore, conversation.conversationId);
           if (pruned > 0) {
             await this.transcriptReconciler.refreshBootstrapState({
               conversationId: conversation.conversationId,
-              sessionFile: params.sessionFile,
+              sessionFile,
             });
             this.deps.log.info(
               `[lcm] bootstrap: retroactively pruned ${pruned} HEARTBEAT_OK messages from conversation ${conversation.conversationId}`,
@@ -2327,8 +2545,8 @@ export class LcmContextEngine implements ContextEngine {
     }
 
     const conversation = await this.conversationStore.getConversationForSession({
-      sessionId: params.sessionId,
-      sessionKey: params.sessionKey,
+      sessionId,
+      sessionKey,
     });
     if (conversation) {
       this.recordRecentBootstrapImport(
