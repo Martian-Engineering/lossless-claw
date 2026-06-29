@@ -8,6 +8,7 @@ Lossless Context Management plugin for [OpenClaw](https://github.com/openclaw/op
 - [Quick start](#quick-start)
 - [Configuration](#configuration)
 - [Commands And Skill](#commands-and-skill)
+- [Session Migration CLI](#session-migration-cli)
 - [Documentation](#documentation)
 - [Development](#development)
 - [Security](#security)
@@ -56,6 +57,24 @@ Not currently supported as root CLI commands:
 - `openclaw /lcm`
 
 The bundled skill focuses on configuration, diagnostics, architecture, and recall-tool usage. Its reference set lives under `skills/lossless-claw/references/`.
+
+## Session Migration CLI
+
+`lossless-claw-migrate-sessions` is a one-time shell CLI for backfilling OpenClaw JSONL session files into `lcm.db` after lossless-claw was disabled, missing, or installed after sessions already existed. It is not a background replay loop and it does not run summarization.
+
+Run it in dry-run mode first:
+
+```bash
+npx --package @martian-engineering/lossless-claw@latest lossless-claw-migrate-sessions --state-dir ~/.openclaw
+```
+
+Apply the import only after reviewing the dry-run output:
+
+```bash
+npx --package @martian-engineering/lossless-claw@latest lossless-claw-migrate-sessions --state-dir ~/.openclaw --apply
+```
+
+The command defaults to `${OPENCLAW_STATE_DIR:-~/.openclaw}` and `${OPENCLAW_STATE_DIR:-~/.openclaw}/lcm.db`. `--apply` creates a timestamped SQLite backup before writing when the database already exists. Use `--file <path>` or repeatable `--sessions-dir <path>` for targeted imports, `--since <iso-date>` or `--limit <n>` to narrow a batch, and `--json` for machine-readable output.
 
 ## Quick start
 

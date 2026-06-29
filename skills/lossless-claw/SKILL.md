@@ -15,7 +15,8 @@ Start here:
 4. If they suspect summary corruption or truncation, use `/lossless doctor`.
 5. If they want high-confidence junk/session cleanup guidance, use `/lossless doctor clean` before recommending any deletes.
 6. If they ask how `/new` or `/reset` interacts with LCM, read the session-lifecycle reference before answering.
-7. Load the relevant reference file instead of improvising details from memory.
+7. If they ask how to import old or past OpenClaw conversation data into Lossless, read the session-lifecycle reference before answering.
+8. Load the relevant reference file instead of improvising details from memory.
 
 Reference map:
 
@@ -24,12 +25,13 @@ Reference map:
 - Diagnostics and summary-health workflow: `references/diagnostics.md`
 - Recall tools and when to use them: `references/recall-tools.md`
 - `/new` and `/reset` behavior with current lossless-claw session mapping: `references/session-lifecycle.md`
+- `/new`, `/reset`, and past-session import behavior with current lossless-claw session mapping: `references/session-lifecycle.md`
 
 Working rules:
 
 - Prioritize explaining why a setting matters, not just what it does.
 - Prefer the native plugin command surface for MVP workflows (`/lossless`, with `/lcm` as alias).
 - Do not assume the Go TUI is installed.
-- Do not recommend advanced rewrite/backfill/transplant/dissolve flows unless the user explicitly asks for non-MVP internals.
+- Do not recommend advanced rewrite/backfill/transplant/dissolve flows unless the user explicitly asks for non-MVP internals. If the user specifically asks to import old or past OpenClaw conversation data into Lossless, recommend the packaged session migration CLI instead of TUI backfill/surgery flows.
 - For exact evidence retrieval from compacted history, guide the user toward recall tools instead of guessing from summaries.
 - When users compare `/lossless` to `/status`, explain that they report different layers: `/lossless` shows LCM-side frontier/summary metrics, while `/status` shows the last assembled runtime prompt snapshot.
