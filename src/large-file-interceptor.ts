@@ -850,10 +850,7 @@ export class LargeFileInterceptor {
         safeString(record.id) ??
         topLevelToolCallId;
 
-      // The lcm_describe tool returns the original content of an already-
-      // externalized file. Wrapping that output in another externalized stub
-      // makes the drilldown useless and forces the agent to call lcm_describe
-      // again just to read what it just asked for.
+      // lcm_describe is already a drilldown response; re-stubbing adds another hop.
       if (toolName === "lcm_describe") {
         rewrittenContent.push(item);
         continue;
