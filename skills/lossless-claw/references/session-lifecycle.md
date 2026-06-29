@@ -1,4 +1,4 @@
-# Session lifecycle (`/new`, `/reset`, and `/lossless rotate`)
+# Session lifecycle (`/new` and `/reset`)
 
 This reference describes the current behavior on `main`.
 
@@ -7,7 +7,6 @@ This reference describes the current behavior on `main`.
 For stock `lossless-claw` on current main:
 
 - OpenClaw handles `/new` and `/reset` as session-reset operations.
-- `lossless-claw` handles `/lossless rotate` (`/lcm rotate`) as transcript maintenance on the current conversation.
 - `lossless-claw` prefers **`sessionKey`** as the stable identity for an LCM conversation.
 - `/reset` archives the active conversation and creates a fresh active row for the same stable `sessionKey`.
 - Cron scheduler keys (`agent:<agent>:cron:<job>...`) are isolated per runtime run when a new `sessionId` reuses the same `sessionKey`.
@@ -25,7 +24,6 @@ So today:
 - `/reset` archives the active LCM conversation row and creates a fresh active row
 - ordinary chat/thread LCM history may continue in the same row across runtime `sessionId` changes when the stable `sessionKey` continues
 - cron scheduler keys create fresh LCM rows per runtime run so prior runs do not enter the new run's assembled context
-- `/lossless rotate` keeps that same conversation row, summaries, and context items in place while compacting only the live transcript backing
 
 ## Why
 
@@ -39,18 +37,9 @@ That behavior preserves continuity across session resets for the same chat ident
 
 Cron keys are the exception: when an active cron conversation exists for the same `sessionKey` but a different runtime `sessionId`, lossless-claw archives the prior active row and starts a fresh one for the new run. Prior messages remain persisted on the archived conversation.
 
-## `/lossless rotate`
+## Active Transcript Storage
 
-`/lossless rotate` is distinct from `/new` and `/reset`.
-
-- it does **not** create a fresh LCM conversation row
-- it does **not** archive the current conversation
-- it **does** create or replace the rolling `rotate-latest` SQLite backup first
-- it **does** rewrite the current transcript into a compact suffix-preserving form
-- it **does** refresh bootstrap state on the same conversation so dropped transcript history is not replayed
-- it **does** preserve the current conversation id, summary DAG, and active context items
-
-This makes rotate the lightweight option when the problem is transcript bloat rather than LCM conversation structure.
+Lossless-claw no longer exposes `/lossless rotate` and no longer rewrites active OpenClaw transcripts for session maintenance. SQLite-backed OpenClaw owns active transcript storage. Lossless preserves its own durable conversation, summary, and recall data in the LCM SQLite database.
 
 ## Important limitation
 
@@ -68,7 +57,7 @@ When answering users:
 
 - do not promise that `/new` clears LCM history
 - explain that `/reset` archives the active LCM row and starts a fresh one for the same stable `sessionKey`
-- explain that `/lossless rotate` compacts the current transcript without splitting the LCM conversation
+- explain that active transcript retention and rewriting belong to SQLite-backed OpenClaw, not Lossless
 - explain that ordinary current stock behavior follows `sessionKey` continuity
 - explain that cron scheduler session keys are isolated per runtime run while preserving archived prior runs
 - if they need a truly separate LCM history, use a different session key context (for example a different chat/thread/binding) or explicit non-MVP migration/surgery tools

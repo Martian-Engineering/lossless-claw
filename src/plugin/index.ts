@@ -32,7 +32,6 @@ import type {
   RuntimeLlmModelOverride,
   RuntimeCompactionDelegateFn,
   SessionTranscriptReadTarget,
-  StartupSessionFileCandidate,
   VisibleSessionTranscriptMessageEntry,
 } from "../types.js";
 import { listConfiguredAgentIds, normalizeAgentId } from "./openclaw-agent-ids.js";
@@ -1353,11 +1352,6 @@ function createLcmDependencies(
   }
 
   logStartupBannerOnce({
-    key: "transcript-gc-enabled",
-    log: (message) => (log.hostInfo ?? log.info)(message),
-    message: `[lcm] Transcript GC ${config.transcriptGcEnabled ? "enabled" : "disabled"} (default false)`,
-  });
-  logStartupBannerOnce({
     key: "proactive-threshold-compaction-mode",
     log: (message) => (log.hostInfo ?? log.info)(message),
     message: `[lcm] Proactive threshold compaction mode: ${config.proactiveThresholdCompactionMode} (default deferred)`,
@@ -1617,81 +1611,6 @@ function createLcmDependencies(
         await loadReadVisibleSessionTranscriptMessageEntries();
       return readVisibleSessionTranscriptMessageEntries(target);
     },
-    listStartupSessionFileCandidates: async () => {
-      const sessionApi = getRuntimeAgentSessionApi(api);
-      if (!sessionApi) {
-        return [];
-      }
-
-      let cfg: unknown = registrationConfig.openClawConfig;
-      try {
-        const liveConfig = readRuntimeConfigSnapshot(api);
-        if (liveConfig !== undefined) {
-          cfg = liveConfig;
-        }
-      } catch {
-        // Fall back to the registration config snapshot when live config is unavailable.
-      }
-
-      const sessionConfig = isRecord(cfg) && isRecord(cfg.session) ? cfg.session : undefined;
-      const storeConfig = getStringField(sessionConfig, "store");
-      const candidates: StartupSessionFileCandidate[] = [];
-      const seen = new Set<string>();
-
-      for (const agentId of listConfiguredAgentIds(cfg)) {
-        let storePath: string;
-        let store: Record<string, RuntimeSessionStoreEntry | undefined>;
-        try {
-          storePath = sessionApi.resolveStorePath(storeConfig, { agentId });
-          store = sessionApi.loadSessionStore(storePath);
-        } catch {
-          continue;
-        }
-
-        for (const [rawSessionKey, rawEntry] of Object.entries(store)) {
-          const sessionKey = rawSessionKey.trim();
-          if (!sessionKey || !isRecord(rawEntry)) {
-            continue;
-          }
-          const parsed = parseAgentSessionKey(sessionKey);
-          if (parsed?.agentId && normalizeAgentId(parsed.agentId) !== agentId) {
-            continue;
-          }
-          const sessionId = getStringField(rawEntry, "sessionId");
-          if (!sessionId) {
-            continue;
-          }
-
-          let sessionFile: string;
-          try {
-            sessionFile = sessionApi.resolveSessionFilePath(sessionId, rawEntry, {
-              agentId,
-              storePath,
-            }).trim();
-          } catch {
-            continue;
-          }
-          if (!sessionFile) {
-            continue;
-          }
-
-          const dedupeKey = `${sessionId}\0${sessionKey}\0${sessionFile}`;
-          if (seen.has(dedupeKey)) {
-            continue;
-          }
-          seen.add(dedupeKey);
-          candidates.push({
-            sessionId,
-            sessionKey,
-            sessionFile,
-            agentId,
-            storePath,
-          });
-        }
-      }
-
-      return candidates;
-    },
     agentLaneSubagent: "subagent",
     log,
   };
@@ -1816,17 +1735,6 @@ const lcmPlugin = {
     const dbPath = deps.config.databasePath;
     const normalizedDbPath = normalizePath(dbPath);
     const allowStartupMaintenance = canRunStartupMaintenance(api);
-
-    /** Start the non-blocking startup scan for oversized LCM-managed transcripts. */
-    function scheduleStartupAutoRotate(nextEngine: LcmContextEngine): void {
-      void nextEngine.autoRotateManagedSessionFilesAtStartup({
-        listStartupSessionFileCandidates: deps.listStartupSessionFileCandidates,
-      }).catch((error) => {
-        deps.log.warn(
-          `[lcm] auto-rotate: phase=startup action=warn durationMs=0 reason=startup-scan-failed error=${describeLogError(error).replace(/\s+/g, "_")}`,
-        );
-      });
-    }
 
     /** Recover session-store totalTokens for active conversations after restart. */
     async function recoverStartupSessionTotalTokens(nextEngine: LcmContextEngine): Promise<void> {
@@ -1970,7 +1878,6 @@ const lcmPlugin = {
 
     /** Schedule all startup maintenance with this registration's runtime surfaces. */
     function scheduleStartupMaintenance(nextEngine: LcmContextEngine): void {
-      scheduleStartupAutoRotate(nextEngine);
       scheduleStartupSessionTotalTokensRecovery(nextEngine);
     }
 
