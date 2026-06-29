@@ -66,6 +66,17 @@ function decoratedWebchat(body: string): string {
   ].join("\n");
 }
 
+function metadataDecorated(body: string): string {
+  return [
+    "Conversation info (untrusted metadata):",
+    "```json",
+    JSON.stringify({ chat_id: "telegram:100000001", sender: "sam.rivera" }, null, 2),
+    "```",
+    "",
+    body,
+  ].join("\n");
+}
+
 afterEach(cleanupEngineTestState);
 
 describe("stripLeadingOpenClawInboundTimestamp", () => {
@@ -222,6 +233,33 @@ describe("appendUncoveredVolatileLiveInputsWithinBudget preserves structural liv
     );
     expect(plainBare).toHaveLength(1);
   });
+
+  it("appends a decorated current turn with a multi-line timestamped body", () => {
+    const multilineBody = "first line\nsecond line";
+    const assembledMessages: AgentMessage[] = [
+      { role: "user", content: "earlier persisted turn" },
+      { role: "assistant", content: "earlier reply" },
+      { role: "user", content: multilineBody },
+    ] as AgentMessage[];
+    const liveMessages: AgentMessage[] = [
+      { role: "user", content: decoratedWebchat(multilineBody) },
+    ] as AgentMessage[];
+
+    const result = appendUncoveredVolatileLiveInputsWithinBudget({
+      assembledMessages,
+      assembledEstimatedTokens: 10,
+      liveMessages,
+      tokenBudget: 1_000_000,
+    });
+
+    const userContents = result.messages
+      .filter((message) => (message as { role: string }).role === "user")
+      .map((message) => (message as { content: string }).content);
+    expect(userContents).toHaveLength(3);
+    expect(userContents[1]).toBe(multilineBody);
+    expect(userContents[2]).toContain("<active_memory_plugin>");
+    expect(userContents[2]).toContain(multilineBody);
+  });
 });
 
 describe("appendUncoveredVolatileLiveInputsWithinBudget fail-closed: distinct turns are preserved", () => {
@@ -299,6 +337,83 @@ describe("appendUncoveredVolatileLiveInputsWithinBudget fail-closed: distinct tu
     ] as AgentMessage[];
     const liveMessages: AgentMessage[] = [
       { role: "user", content: "the bot said (untrusted metadata) to me\nok" },
+    ] as AgentMessage[];
+
+    const result = appendUncoveredVolatileLiveInputsWithinBudget({
+      assembledMessages,
+      assembledEstimatedTokens: 10,
+      liveMessages,
+      tokenBudget: 1_000_000,
+    });
+
+    const okSurvives = result.messages.some(
+      (message) =>
+        (message as { role: string }).role === "user" &&
+        (message as { content: string }).content === "ok",
+    );
+    expect(okSurvives).toBe(true);
+  });
+
+  it("does NOT supersede a metadata-decorated distinct turn whose trailing line equals a bare row", () => {
+    // A recognized metadata block is not a trusted turn identity marker. The
+    // body after the metadata prelude must equal the bare row; merely ending
+    // with the same line is still a distinct live turn.
+    const assembledMessages: AgentMessage[] = [
+      { role: "user", content: "earlier persisted turn" },
+      { role: "assistant", content: "earlier reply" },
+      { role: "user", content: "ok" },
+    ] as AgentMessage[];
+    const liveMessages: AgentMessage[] = [
+      { role: "user", content: metadataDecorated("here is more context\nok") },
+    ] as AgentMessage[];
+
+    const result = appendUncoveredVolatileLiveInputsWithinBudget({
+      assembledMessages,
+      assembledEstimatedTokens: 10,
+      liveMessages,
+      tokenBudget: 1_000_000,
+    });
+
+    const okSurvives = result.messages.some(
+      (message) =>
+        (message as { role: string }).role === "user" &&
+        (message as { content: string }).content === "ok",
+    );
+    expect(okSurvives).toBe(true);
+  });
+
+  it("does NOT supersede a metadata-only same-body turn without timestamp evidence", () => {
+    const assembledMessages: AgentMessage[] = [
+      { role: "user", content: "earlier persisted turn" },
+      { role: "assistant", content: "earlier reply" },
+      { role: "user", content: "ok" },
+    ] as AgentMessage[];
+    const liveMessages: AgentMessage[] = [
+      { role: "user", content: metadataDecorated("ok") },
+    ] as AgentMessage[];
+
+    const result = appendUncoveredVolatileLiveInputsWithinBudget({
+      assembledMessages,
+      assembledEstimatedTokens: 10,
+      liveMessages,
+      tokenBudget: 1_000_000,
+    });
+
+    const userContents = result.messages
+      .filter((message) => (message as { role: string }).role === "user")
+      .map((message) => (message as { content: string }).content);
+    expect(userContents).toContain("ok");
+    expect(userContents).not.toContain(metadataDecorated("ok"));
+  });
+
+  it("does NOT treat leading blank lines as timestamp decoration", () => {
+    const assembledMessages: AgentMessage[] = [
+      { role: "user", content: "earlier persisted turn" },
+      { role: "assistant", content: "earlier reply" },
+      { role: "user", content: "ok" },
+    ] as AgentMessage[];
+    const liveMessages: AgentMessage[] = [
+      { role: "user", content: "\n\nok" },
     ] as AgentMessage[];
 
     const result = appendUncoveredVolatileLiveInputsWithinBudget({

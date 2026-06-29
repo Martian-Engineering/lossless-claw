@@ -415,7 +415,7 @@ describe("afterTurn covered-frontier alignment", () => {
     expect(messages.map((message) => message.content)).toEqual(["nice! thank you!"]);
   });
 
-  it("collapses a conv-info-wrapped runtime copy onto the bare transcript row", async () => {
+  it("keeps a conv-info-only runtime copy without trusted timestamp evidence", async () => {
     const sessionFile = createSessionFilePath("decorated-convinfo-dup");
     const header = JSON.stringify({
       type: "session",
@@ -453,7 +453,10 @@ describe("afterTurn covered-frontier alignment", () => {
       .getConversationStore()
       .getConversationForSession({ sessionId });
     const messages = await engine.getConversationStore().getMessages(conversation!.conversationId);
-    expect(messages.map((message) => message.content)).toEqual(["Hey there! hows it going?"]);
+    expect(messages.map((message) => message.content)).toEqual([
+      "Hey there! hows it going?",
+      decorated,
+    ]);
   });
 
   it("keeps a genuinely distinct runtime turn even when it shares a trailing word", async () => {

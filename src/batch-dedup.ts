@@ -66,14 +66,14 @@ export class BatchDeduplicator {
    * identities match, OR when the runtime copy is the DECORATED face of the
    * persisted bare body of the same turn. OpenClaw delivers the current turn
    * twice — the transcript persists the BARE body, while the runtime array
-   * carries a per-turn DECORATED copy (a genuine "(untrusted metadata)" block or
-   * a leading channel timestamp). Their identities differ, so the afterTurn
+   * carries a per-turn DECORATED copy (for example, a leading channel
+   * timestamp). Their identities differ, so the afterTurn
    * batch would otherwise persist the decorated copy as a second row (the store
    * double-write). liveContentIsRecognizedDecoratedBareBody collapses it only
    * when the runtime copy structurally contains the bare body AND carries
-   * recognized decoration (a structurally-validated metadata block or a channel
-   * timestamp) — user-role only. A genuinely distinct turn, or one that merely
-   * quotes "(untrusted metadata)" prose, is never collapsed (silent data loss).
+   * recognized timestamp decoration — user-role only. A genuinely distinct
+   * turn, or one that merely quotes or authors metadata-shaped prose, is never
+   * collapsed (silent data loss).
    */
   private runtimeRowCoversPersistedFrontierRow(
     persistedRole: string,
@@ -336,7 +336,7 @@ export class BatchDeduplicator {
       if (tailMessages.length === batch.length && tailHashes.length === batch.length) {
         let tailMatch = true;
         for (let i = 0; i < batch.length; i++) {
-          const match = await this.matchStoredMessageToIncoming(
+          const match = await this.matchStoredMessageToIncomingOrDecoratedCoverage(
             tailMessages[i]!,
             storedBatch[i]!,
             batchHashes[i]!,
@@ -404,7 +404,7 @@ export class BatchDeduplicator {
     let ambiguousExternalizedOverlap = false;
 
     for (let k = batch.length - 1; k >= 0; k--) {
-      const lastMatch = await this.matchStoredMessageToIncoming(
+      const lastMatch = await this.matchStoredMessageToIncomingOrDecoratedCoverage(
         lastStoredMessage,
         storedBatch[k]!,
         batchHashes[k]!,
@@ -420,9 +420,9 @@ export class BatchDeduplicator {
       const matchLen = Math.min(k + 1, allRecentHashes.length);
       const startDb = allRecentHashes.length - matchLen;
       let suffixMatch = true;
-      let exactAnchor = lastMatch === "exact";
+      let exactAnchor = lastMatch === "exact" || lastMatch === "decorated";
       for (let j = 0; j < matchLen; j++) {
-        const match = await this.matchStoredMessageToIncoming(
+        const match = await this.matchStoredMessageToIncomingOrDecoratedCoverage(
           allStored[startDb + j]!,
           storedBatch[k - matchLen + 1 + j]!,
           batchHashes[k - matchLen + 1 + j]!,
@@ -438,13 +438,17 @@ export class BatchDeduplicator {
           suffixMatch = false;
           break;
         }
-        exactAnchor ||= match === "exact";
+        exactAnchor ||= match === "exact" || match === "decorated";
       }
       const newSlice = batch.slice(k + 1);
       // Outside the transcript-covered path, an externalized-only anchor is
       // ambiguous: it may be a replay prefix or a new turn that repeats the
       // same upload. Require an exact anchor before trimming.
-      if (suffixMatch && exactAnchor && (newSlice.length > 0 || matchLen > 1)) {
+      if (
+        suffixMatch &&
+        exactAnchor &&
+        (newSlice.length > 0 || matchLen > 1 || lastMatch === "decorated")
+      ) {
         this.deps.log.debug(
           `[lcm] dedup: ${context} suffix-match at batch[${k}], ` +
             `returning ${newSlice.length} new messages ` +
@@ -479,6 +483,33 @@ export class BatchDeduplicator {
         `no overlap found — ingesting full batch`,
     );
     return batch;
+  }
+
+  private async matchStoredMessageToIncomingOrDecoratedCoverage(
+    storedMessage: MessageRecord,
+    incoming: StoredMessage,
+    incomingHash: string,
+    storedHash: string,
+    incomingRawPayloadContent?: string | null,
+  ): Promise<"exact" | "externalized" | "unproven-externalized" | "decorated" | null> {
+    const match = await this.matchStoredMessageToIncoming(
+      storedMessage,
+      incoming,
+      incomingHash,
+      storedHash,
+      incomingRawPayloadContent,
+    );
+    if (match) {
+      return match;
+    }
+    return this.runtimeRowCoversPersistedFrontierRow(
+      storedMessage.role,
+      storedMessage.content,
+      incoming.role,
+      incoming.content,
+    )
+      ? "decorated"
+      : null;
   }
 
   private async matchStoredMessageToIncoming(
