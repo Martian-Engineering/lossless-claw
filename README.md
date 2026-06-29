@@ -117,7 +117,7 @@ The command defaults to `${OPENCLAW_STATE_DIR:-~/.openclaw}` and `${OPENCLAW_STA
 - Node.js 22+
 - An LLM provider configured in OpenClaw (used for summarization)
 
-> **Compatibility:** `lossless-claw@0.10.0` and newer require OpenClaw `2026.5.12` or newer for OpenClaw's `api.runtime.llm.complete` summarization capability. Releases that include context-engine memory supplement support require OpenClaw `2026.5.28` or newer for `buildMemorySystemPromptAddition`. If you cannot upgrade OpenClaw yet, stay on `lossless-claw@0.9.4` and remove `0.10.x`-only config such as `sweepMaxDepth`.
+> **Compatibility:** current `lossless-claw` releases require OpenClaw `2026.6.10` or newer for the SQLite transcript runtime APIs used during session bootstrap. If you cannot upgrade OpenClaw yet, stay on an older compatible `lossless-claw` release pinned to your OpenClaw version.
 
 ### Install the plugin
 
