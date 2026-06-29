@@ -230,6 +230,64 @@ describe("runSessionMigration", () => {
     }
   });
 
+  it("adopts transcript entry ids onto existing identity-matching rows instead of duplicating them", async () => {
+    const root = tempRoot();
+    writeAgentSession(root, "session-a.jsonl", [
+      sessionHeader("session-a"),
+      messageEntry("m1", null, "user", "already persisted"),
+      messageEntry("m2", "m1", "assistant", "existing reply"),
+    ]);
+    const dbPath = migratedDb(root);
+    const { db, conversationStore } = openMigratedDb(dbPath);
+    try {
+      const conversation = await conversationStore.getOrCreateConversation("session-a");
+      await conversationStore.createMessage({
+        conversationId: conversation.conversationId,
+        seq: 1,
+        role: "user",
+        content: "already persisted",
+        tokenCount: 2,
+      });
+      await conversationStore.createMessage({
+        conversationId: conversation.conversationId,
+        seq: 2,
+        role: "assistant",
+        content: "existing reply",
+        tokenCount: 2,
+      });
+    } finally {
+      closeLcmConnection(db);
+    }
+
+    const result = await runSessionMigration({ dbPath, stateDir: root, apply: true });
+
+    expect(result.importedMessages).toBe(0);
+    expect(result.files[0]).toMatchObject({
+      status: "up-to-date",
+      skippedMessages: 2,
+    });
+
+    const reopened = openMigratedDb(dbPath);
+    try {
+      const conversation = await reopened.conversationStore.getConversationForSession({ sessionId: "session-a" });
+      expect(await reopened.conversationStore.getMessageCount(conversation!.conversationId)).toBe(2);
+      const rows = reopened.db
+        .prepare(
+          `SELECT content, transcript_entry_id
+           FROM messages
+           WHERE conversation_id = ?
+           ORDER BY seq`,
+        )
+        .all(conversation!.conversationId) as Array<{ content: string; transcript_entry_id: string | null }>;
+      expect(rows).toEqual([
+        { content: "already persisted", transcript_entry_id: "m1" },
+        { content: "existing reply", transcript_entry_id: "m2" },
+      ]);
+    } finally {
+      closeLcmConnection(reopened.db);
+    }
+  });
+
   it("imports only the active leaf path from branched JSONL", async () => {
     const root = tempRoot();
     writeAgentSession(root, "session-a.jsonl", [
