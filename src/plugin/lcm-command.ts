@@ -4,7 +4,6 @@ import { DatabaseSync } from "node:sqlite";
 import packageJson from "../../package.json" with { type: "json" };
 import { formatTimestamp } from "../compaction.js";
 import { resolveOpenclawStateDir, type LcmConfig } from "../db/config.js";
-import type { RotateSessionStorageWithBackupResult } from "../engine.js";
 import { runDelegatedFocusBrief, runDelegatedRefocusBrief } from "../focus-briefs.js";
 import type { LcmSummarizeFn } from "../summarize.js";
 import type { LcmDependencies } from "../types.js";
@@ -50,7 +49,6 @@ const HIDDEN_ALIAS = "/lcm";
 const LOSSLESS_PLUGIN_ID = "lossless-claw";
 const LOSSLESS_NPM_PACKAGE = "@martian-engineering/lossless-claw";
 const INSTALLED_PLUGIN_INDEX_KEY = "installed-plugin-index";
-const ROTATE_DATABASE_LOCK_TIMEOUT_MS = 30_000;
 const DOCTOR_APPLY_LARGE_TARGET_THRESHOLD = 25;
 const DOCTOR_APPLY_BUDGET_PRESSURE_RATIO = 0.75;
 
@@ -107,7 +105,6 @@ type LcmInstallTrackWarning = {
 type ParsedLcmCommand =
   | { kind: "status" }
   | { kind: "backup" }
-  | { kind: "rotate" }
   | { kind: "focus_status" }
   | { kind: "focus_generate"; prompt: string }
   | { kind: "refocus" }
@@ -116,16 +113,6 @@ type ParsedLcmCommand =
   | { kind: "doctor_rollover_splits"; apply: boolean; applyOptions?: RolloverSplitApplyOptions }
   | { kind: "doctor_cleaners"; apply: boolean; filterId?: DoctorCleanerId; vacuum: boolean }
   | { kind: "help"; error?: string };
-
-type RotateCommandEngine = {
-  rotateSessionStorageWithBackup(params: {
-    sessionId?: string;
-    sessionKey?: string;
-    sessionFile: string;
-    lockTimeoutMs: number;
-    runtimeContext?: Record<string, unknown>;
-  }): Promise<RotateSessionStorageWithBackupResult>;
-};
 
 type FocusCompactionCommandEngine = {
   compact(params: {
@@ -140,7 +127,7 @@ type FocusCompactionCommandEngine = {
   }): Promise<CompactResult>;
 };
 
-type RuntimeCommandEngine = RotateCommandEngine & Partial<FocusCompactionCommandEngine>;
+type RuntimeCommandEngine = Partial<FocusCompactionCommandEngine>;
 
 /** Error thrown when a host requests a control operation that cannot run safely. */
 export class LcmProgrammaticControlUnavailableError extends Error {
@@ -622,13 +609,6 @@ function parseLcmCommand(rawArgs: string | undefined): ParsedLcmCommand {
             kind: "help",
             error: `\`${VISIBLE_COMMAND} backup\` does not accept extra arguments.`,
           };
-    case "rotate":
-      return rest.length === 0
-        ? { kind: "rotate" }
-        : {
-            kind: "help",
-            error: `\`${VISIBLE_COMMAND} rotate\` does not accept extra arguments.`,
-          };
     case "doctor":
       if (rest.length === 0) {
         return { kind: "doctor", apply: false };
@@ -676,7 +656,7 @@ function parseLcmCommand(rawArgs: string | undefined): ParsedLcmCommand {
     default:
       return {
         kind: "help",
-        error: `Unknown subcommand \`${head}\`. Supported: status, focus, refocus, unfocus, backup, rotate, doctor, doctor clean, doctor apply, help.`,
+        error: `Unknown subcommand \`${head}\`. Supported: status, focus, refocus, unfocus, backup, doctor, doctor clean, doctor apply, help.`,
       };
   }
 }
@@ -924,12 +904,9 @@ async function resolveRuntimeSessionId(params: {
   deps: LcmDependencies;
   current: Extract<CurrentConversationResolution, { kind: "resolved" }>;
 }): Promise<string | undefined> {
-  const currentSessionId = normalizeIdentity(params.current.stats.sessionId);
   const directSessionId = normalizeIdentity(params.ctx.sessionId);
   if (directSessionId) {
-    return !currentSessionId || directSessionId === currentSessionId
-      ? directSessionId
-      : undefined;
+    return directSessionId;
   }
 
   const sessionKey = normalizeIdentity(params.ctx.sessionKey);
@@ -942,7 +919,7 @@ async function resolveRuntimeSessionId(params: {
     }
   }
 
-  return currentSessionId;
+  return normalizeIdentity(params.current.stats.sessionId);
 }
 
 function normalizePositiveInteger(value: number | null | undefined): number | null {
@@ -1310,10 +1287,6 @@ function buildHelpText(error?: string): string {
         "Create a timestamped backup of the current LCM database.",
       ),
       buildStatLine(
-        formatCommand(`${VISIBLE_COMMAND} rotate`),
-        "Compact the current session transcript while preserving the same LCM conversation and live session identity.",
-      ),
-      buildStatLine(
         formatCommand(`${VISIBLE_COMMAND} focus <prompt>`),
         "Generate an active focus brief with a delegated recall sub-agent.",
       ),
@@ -1362,7 +1335,7 @@ function buildHelpText(error?: string): string {
       buildStatLine("alias", `${formatCommand(HIDDEN_ALIAS)} is accepted as a shorter alias.`),
       buildStatLine("current conversation", "Uses the active LCM session when the host exposes session identity."),
       buildStatLine("`/new`", "Prunes context for the current LCM conversation. It does not split storage."),
-      buildStatLine("`/reset`", "Resets OpenClaw session flow. Use rotate when you only want transcript compaction."),
+      buildStatLine("`/reset`", "Resets OpenClaw session flow."),
     ]),
   ];
   return lines.join("\n");
@@ -1809,225 +1782,19 @@ async function buildBackupText(params: {
   return lines.join("\n");
 }
 
-async function buildRotateText(params: {
-  ctx: PluginCommandContext;
-  db: DatabaseSync;
-  config: LcmConfig;
-  deps?: LcmDependencies;
-  getLcm?: () => Promise<RuntimeCommandEngine>;
-}): Promise<string> {
-  const lines = [
-    ...buildHeaderLines(),
-    "",
-    "🪓 Lossless Claw Rotate",
-    "",
-  ];
-
-  const sessionKey = normalizeIdentity(params.ctx.sessionKey);
-  if (!sessionKey) {
-    lines.push(
-      buildSection("📍 Current conversation", [
-        buildStatLine("status", "unavailable"),
-        buildStatLine(
-          "reason",
-          "OpenClaw must expose the active session key for Lossless Claw to rotate storage safely.",
-        ),
-      ]),
-    );
-    return lines.join("\n");
-  }
-
-  const current = await resolveCurrentConversation({
-    ctx: params.ctx,
-    db: params.db,
-  });
-  if (current.kind === "unavailable") {
-    lines.push(
-      buildSection("📍 Current conversation", [
-        buildStatLine("status", "unavailable"),
-        buildStatLine("reason", current.reason),
-      ]),
-    );
-    return lines.join("\n");
-  }
-
-  if (!params.deps || !params.getLcm) {
-    lines.push(
-      buildSection("🛠️ Rotate", [
-        buildStatLine("status", "unavailable"),
-        buildStatLine("reason", "Rotate requires the runtime-backed LCM engine to be available."),
-      ]),
-    );
-    return lines.join("\n");
-  }
-
-  const sessionId = await resolveRuntimeSessionId({
-    ctx: params.ctx,
-    deps: params.deps,
-    current,
-  });
-  if (!sessionId) {
-    lines.push(
-      buildSection("📍 Current conversation", [
-        buildStatLine("conversation id", formatNumber(current.stats.conversationId)),
-        buildStatLine("session key", formatCommand(truncateMiddle(sessionKey, 44))),
-        buildStatLine("messages", formatNumber(current.stats.messageCount)),
-      ]),
-      "",
-      buildSection("🛠️ Rotate", [
-        buildStatLine("status", "unavailable"),
-        buildStatLine(
-          "reason",
-          "Lossless Claw resolved the active conversation, but OpenClaw did not expose or resolve a runtime session id, so rotate cannot locate the live transcript safely.",
-        ),
-      ]),
-    );
-    return lines.join("\n");
-  }
-
-  const transcriptPath = await params.deps.resolveSessionTranscriptFile({
-    agentId: normalizeIdentity(params.ctx.agentId),
-    sessionId,
-    sessionKey,
-  });
-  if (!transcriptPath || !existsSync(transcriptPath)) {
-    lines.push(
-      buildSection("🛠️ Rotate", [
-        buildStatLine("status", "unavailable"),
-        buildStatLine(
-          "reason",
-          "Lossless Claw could not resolve the active session transcript path, so it cannot rotate the transcript safely.",
-        ),
-      ]),
-    );
-    return lines.join("\n");
-  }
-
-  const unavailableReason = getLcmBackupUnavailableReason(params.config.databasePath);
-  if (unavailableReason) {
-    lines.push(
-      buildSection("🛠️ Rotate", [
-        buildStatLine("status", "unavailable"),
-        buildStatLine("reason", unavailableReason),
-      ]),
-    );
-    return lines.join("\n");
-  }
-
-  let result: RotateSessionStorageWithBackupResult;
-  try {
-    const runtimeContext = readCommandRuntimeContext(params.ctx);
-    result = await (await params.getLcm()).rotateSessionStorageWithBackup({
-      sessionId,
-      sessionKey,
-      sessionFile: transcriptPath,
-      lockTimeoutMs: ROTATE_DATABASE_LOCK_TIMEOUT_MS,
-      ...(runtimeContext ? { runtimeContext } : {}),
-    });
-  } catch (error) {
-    lines.push(
-      buildSection("🛠️ Rotate", [
-        buildStatLine("status", "failed"),
-        buildStatLine("reason", formatFailureReason(error)),
-      ]),
-    );
-    return lines.join("\n");
-  }
-
-  lines.push(
-    buildSection("📍 Current conversation", [
-      buildStatLine(
-        "conversation id",
-        formatNumber(result.currentConversationId ?? current.stats.conversationId),
-      ),
-      buildStatLine("session key", formatCommand(truncateMiddle(sessionKey, 44))),
-      buildStatLine(
-        "messages",
-        formatNumber(result.currentMessageCount ?? current.stats.messageCount),
-      ),
-    ]),
-    "",
-  );
-
-  if (result.kind === "backup_failed") {
-    lines.push(
-      buildSection("💾 Backup", [
-        buildStatLine("status", "failed"),
-        buildStatLine("reason", result.reason),
-      ]),
-    );
-    return lines.join("\n");
-  }
-
-  if (result.kind === "unavailable" && !result.backupPath) {
-    lines.push(
-      buildSection("🛠️ Rotate", [
-        buildStatLine("status", "unavailable"),
-        buildStatLine("reason", result.reason),
-      ]),
-    );
-    return lines.join("\n");
-  }
-
-  lines.push(
-    buildSection("💾 Backup", [
-      buildStatLine("status", "replaced latest"),
-      buildStatLine("backup path", result.backupPath!),
-    ]),
-    "",
-  );
-
-  if (result.kind === "rotate_failed") {
-    lines.push(
-      buildSection("🛠️ Rotate", [
-        buildStatLine("status", "failed"),
-        buildStatLine("reason", result.reason),
-      ]),
-    );
-    return lines.join("\n");
-  }
-
-  if (result.kind === "unavailable") {
-    lines.push(
-      buildSection("🛠️ Rotate", [
-        buildStatLine("status", "unavailable"),
-        buildStatLine("reason", result.reason),
-      ]),
-    );
-    return lines.join("\n");
-  }
-
-  lines.push(
-    buildSection("🛠️ Rotate", [
-      buildStatLine("status", "rotated"),
-      buildStatLine("preserved tail messages", formatNumber(result.preservedTailMessageCount)),
-      buildStatLine("checkpoint bytes", formatNumber(result.checkpointSize)),
-      buildStatLine("bytes removed", formatNumber(result.bytesRemoved)),
-      buildStatLine("transcript", transcriptPath),
-      buildStatLine("mode", "preserved current conversation and rotated transcript tail"),
-    ]),
-    "",
-    buildSection("🧭 Notes", [
-      "Current LCM conversation, summaries, and context items remain in place.",
-      `${formatCommand("/new")} still prunes context only, and ${formatCommand("/reset")} still resets OpenClaw session flow.`,
-    ]),
-  );
-  return lines.join("\n");
-}
-
-export function getLcmProgrammaticControlCapabilities(params?: {
-  deps?: LcmDependencies;
-  getLcm?: () => Promise<RuntimeCommandEngine>;
-}): ContextEngineControlCapabilities {
+export function getLcmProgrammaticControlCapabilities(): ContextEngineControlCapabilities {
   return {
     status: true,
     doctor: true,
-    rotate: Boolean(params?.deps && params.getLcm),
+    rotate: false,
   };
 }
 
-function normalizeControlOperation(operation: unknown): ContextEngineControlOperation {
-  if (operation === "status" || operation === "doctor" || operation === "rotate") {
+function normalizeControlOperation(operation: unknown): Extract<
+  ContextEngineControlOperation,
+  "status" | "doctor"
+> {
+  if (operation === "status" || operation === "doctor") {
     return operation;
   }
   throw new LcmProgrammaticControlUnavailableError(
@@ -2056,38 +1823,6 @@ function buildProgrammaticDoctorWarnings(stats: DoctorSummaryStats): string[] {
   return warnings.slice(0, 10);
 }
 
-function throwControlUnavailable(
-  operation: ContextEngineControlOperation,
-  reasonCode: string,
-): never {
-  throw new LcmProgrammaticControlUnavailableError(operation, reasonCode);
-}
-
-function classifyProgrammaticRotateUnavailableReason(reason: string | undefined): string {
-  const normalized = (reason ?? "").toLowerCase();
-  if (normalized.includes("transcript")) {
-    return "transcript_unavailable";
-  }
-  if (normalized.includes("backup")) {
-    return "backup_unavailable";
-  }
-  if (normalized.includes("transaction") || normalized.includes("database")) {
-    return "database_unavailable";
-  }
-  if (
-    normalized.includes("summar") ||
-    normalized.includes("provider") ||
-    normalized.includes("raw context") ||
-    normalized.includes("circuit breaker")
-  ) {
-    return "summarization_unavailable";
-  }
-  if (normalized.includes("active lossless claw conversation")) {
-    return "conversation_unavailable";
-  }
-  return "unavailable";
-}
-
 export async function runLcmProgrammaticControl(params: {
   operation: ContextEngineControlOperation;
   ctx: PluginCommandContext;
@@ -2110,92 +1845,20 @@ export async function runLcmProgrammaticControl(params: {
     };
   }
 
-  if (operation === "doctor") {
-    if (current.kind === "unavailable") {
-      return {
-        operation: "doctor",
-        ok: false,
-        warnings: ["current conversation unavailable"],
-      };
-    }
-
-    const stats = getDoctorSummaryStats(params.db, current.stats.conversationId);
-    const warnings = buildProgrammaticDoctorWarnings(stats);
+  if (current.kind === "unavailable") {
     return {
       operation: "doctor",
-      ok: warnings.length === 0,
-      warnings,
+      ok: false,
+      warnings: ["current conversation unavailable"],
     };
   }
 
-  const sessionKey = normalizeIdentity(params.ctx.sessionKey);
-  if (!sessionKey) {
-    throwControlUnavailable("rotate", "session_key_unavailable");
-  }
-  if (current.kind === "unavailable") {
-    throwControlUnavailable("rotate", "conversation_unavailable");
-  }
-  if (!params.deps || !params.getLcm) {
-    throwControlUnavailable("rotate", "runtime_unavailable");
-  }
-
-  const sessionId = await resolveRuntimeSessionId({
-    ctx: params.ctx,
-    deps: params.deps,
-    current,
-  });
-  if (!sessionId) {
-    throwControlUnavailable("rotate", "session_id_unavailable");
-  }
-
-  const transcriptPath = await params.deps.resolveSessionTranscriptFile({
-    agentId: normalizeIdentity(params.ctx.agentId),
-    sessionId,
-    sessionKey,
-  });
-  if (!transcriptPath || !existsSync(transcriptPath)) {
-    throwControlUnavailable("rotate", "transcript_unavailable");
-  }
-
-  if (getLcmBackupUnavailableReason(params.config.databasePath)) {
-    throwControlUnavailable("rotate", "backup_unavailable");
-  }
-
-  let result: RotateSessionStorageWithBackupResult;
-  try {
-    const runtimeContext = readCommandRuntimeContext(params.ctx);
-    result = await (await params.getLcm()).rotateSessionStorageWithBackup({
-      sessionId,
-      sessionKey,
-      sessionFile: transcriptPath,
-      lockTimeoutMs: ROTATE_DATABASE_LOCK_TIMEOUT_MS,
-      ...(runtimeContext ? { runtimeContext } : {}),
-    });
-  } catch {
-    throw new LcmProgrammaticControlFailedError("rotate", "runtime_exception");
-  }
-
-  if (result.kind !== "rotated") {
-    throw new LcmProgrammaticControlUnavailableError(
-      "rotate",
-      result.kind === "unavailable"
-        ? classifyProgrammaticRotateUnavailableReason(result.reason)
-        : result.kind,
-    );
-  }
-
-  const rotatedAt = new Date().toISOString();
-  const refreshed = await resolveCurrentConversation({
-    ctx: params.ctx,
-    db: params.db,
-  });
-
+  const stats = getDoctorSummaryStats(params.db, current.stats.conversationId);
+  const warnings = buildProgrammaticDoctorWarnings(stats);
   return {
-    operation: "rotate",
-    messageCount: refreshed.kind === "resolved"
-      ? refreshed.stats.messageCount
-      : result.currentMessageCount ?? current.stats.messageCount,
-    lastRotatedAt: rotatedAt,
+    operation: "doctor",
+    ok: warnings.length === 0,
+    warnings,
   };
 }
 
@@ -3251,7 +2914,6 @@ async function buildDoctorApplyText(params: {
       buildStatLine("truncated-marker summaries", formatNumber(stats.truncated)),
       buildStatLine("fallback-marker summaries", formatNumber(stats.fallback)),
       buildStatLine("emergency-fallback summaries", formatNumber(stats.emergency)),
-      buildStatLine("backup path", result.backupPath ?? "skipped (no writes)"),
       buildStatLine("repaired summaries", formatNumber(result.repaired)),
       buildStatLine("unchanged summaries", formatNumber(result.unchanged)),
       buildStatLine("skipped summaries", formatNumber(result.skipped.length)),
@@ -3330,16 +2992,6 @@ export function createLcmCommand(params: {
             text: await buildBackupText({
               db: await getDb(),
               config: params.config,
-            }),
-          };
-        case "rotate":
-          return {
-            text: await buildRotateText({
-              ctx,
-              db: await getDb(),
-              config: params.config,
-              deps: params.deps,
-              getLcm: params.getLcm,
             }),
           };
         case "focus_status":

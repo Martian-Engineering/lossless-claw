@@ -3,7 +3,6 @@ import { homedir } from "node:os";
 import { join } from "node:path";
 import manifest from "../openclaw.plugin.json" with { type: "json" };
 import {
-  DEFAULT_AUTO_ROTATE_SESSION_FILE_SIZE_BYTES,
   DEFAULT_CRITICAL_BUDGET_PRESSURE_RATIO,
   DEFAULT_SUMMARY_CALL_WINDOW_MS,
   DEFAULT_SUMMARY_MAX_CALLS_PER_WINDOW,
@@ -54,15 +53,7 @@ describe("resolveLcmConfig", () => {
     expect(config.summaryMaxCallsPerWindow).toBe(DEFAULT_SUMMARY_MAX_CALLS_PER_WINDOW);
     expect(config.summarySpendBackoffMs).toBe(DEFAULT_SUMMARY_SPEND_BACKOFF_MS);
     expect(config.pruneHeartbeatOk).toBe(false);
-    expect(config.transcriptGcEnabled).toBe(false);
     expect(config.proactiveThresholdCompactionMode).toBe("deferred");
-    expect(config.autoRotateSessionFiles).toEqual({
-      enabled: true,
-      createBackups: false,
-      sizeBytes: DEFAULT_AUTO_ROTATE_SESSION_FILE_SIZE_BYTES,
-      startup: "rotate",
-      runtime: "rotate",
-    });
     expect(config.cacheAwareCompaction).toEqual({
       enabled: true,
       cacheTTLSeconds: 300,
@@ -114,15 +105,7 @@ describe("resolveLcmConfig", () => {
       leafMinFanout: 4,
       condensedMinFanout: 2,
       pruneHeartbeatOk: true,
-      transcriptGcEnabled: true,
       proactiveThresholdCompactionMode: "inline",
-      autoRotateSessionFiles: {
-        enabled: false,
-        createBackups: true,
-        sizeBytes: 123456,
-        startup: "warn",
-        runtime: "off",
-      },
       enabled: false,
       cacheAwareCompaction: {
         enabled: false,
@@ -175,15 +158,7 @@ describe("resolveLcmConfig", () => {
     expect(config.leafMinFanout).toBe(4);
     expect(config.condensedMinFanout).toBe(2);
     expect(config.pruneHeartbeatOk).toBe(true);
-    expect(config.transcriptGcEnabled).toBe(true);
     expect(config.proactiveThresholdCompactionMode).toBe("inline");
-    expect(config.autoRotateSessionFiles).toEqual({
-      enabled: false,
-      createBackups: true,
-      sizeBytes: 123456,
-      startup: "warn",
-      runtime: "off",
-    });
     expect(config.cacheAwareCompaction).toEqual({
       enabled: false,
       cacheTTLSeconds: 900,
@@ -229,12 +204,6 @@ describe("resolveLcmConfig", () => {
       LCM_IGNORE_SESSION_PATTERNS: "agent:*:cron:*, agent:main:subagent:**",
       LCM_STATELESS_SESSION_PATTERNS: "agent:*:ephemeral:**, agent:main:preview:*",
       LCM_SKIP_STATELESS_SESSIONS: "false",
-      LCM_TRANSCRIPT_GC_ENABLED: "true",
-      LCM_AUTO_ROTATE_SESSION_FILES_ENABLED: "false",
-      LCM_AUTO_ROTATE_SESSION_FILES_CREATE_BACKUPS: "true",
-      LCM_AUTO_ROTATE_SESSION_FILES_SIZE_BYTES: "987654",
-      LCM_AUTO_ROTATE_SESSION_FILES_STARTUP: "warn",
-      LCM_AUTO_ROTATE_SESSION_FILES_RUNTIME: "off",
       LCM_CACHE_AWARE_COMPACTION_ENABLED: "false",
       LCM_CACHE_TTL_SECONDS: "600",
       LCM_MAX_COLD_CACHE_CATCHUP_PASSES: "4",
@@ -271,15 +240,7 @@ describe("resolveLcmConfig", () => {
       ignoreSessionPatterns: ["agent:*:test:*"],
       statelessSessionPatterns: ["agent:*:preview:*"],
       skipStatelessSessions: true,
-      transcriptGcEnabled: false,
       proactiveThresholdCompactionMode: "deferred",
-      autoRotateSessionFiles: {
-        enabled: true,
-        createBackups: false,
-        sizeBytes: 123456,
-        startup: "rotate",
-        runtime: "rotate",
-      },
       enabled: true,
       cacheAwareCompaction: {
         enabled: true,
@@ -305,15 +266,7 @@ describe("resolveLcmConfig", () => {
       "agent:main:preview:*",
     ]);
     expect(config.skipStatelessSessions).toBe(false);
-    expect(config.transcriptGcEnabled).toBe(true);
     expect(config.proactiveThresholdCompactionMode).toBe("inline");
-    expect(config.autoRotateSessionFiles).toEqual({
-      enabled: false,
-      createBackups: true,
-      sizeBytes: 987654,
-      startup: "warn",
-      runtime: "off",
-    });
     expect(config.contextThreshold).toBe(0.9); // env wins
     expect(config.freshTailCount).toBe(64); // env wins
     expect(config.freshTailMaxTokens).toBe(32000); // env wins
@@ -424,13 +377,6 @@ describe("resolveLcmConfig", () => {
       ignoreSessionPatterns: "agent:*:cron:*, agent:main:subagent:**",
       statelessSessionPatterns: "agent:*:ephemeral:**, agent:main:preview:*",
       skipStatelessSessions: "false",
-      autoRotateSessionFiles: {
-        enabled: "false",
-        createBackups: "true",
-        sizeBytes: "4096",
-        startup: "warn",
-        runtime: "off",
-      },
     });
     expect(config.contextThreshold).toBe(0.6);
     expect(config.freshTailCount).toBe(24);
@@ -447,13 +393,6 @@ describe("resolveLcmConfig", () => {
       "agent:main:preview:*",
     ]);
     expect(config.skipStatelessSessions).toBe(false);
-    expect(config.autoRotateSessionFiles).toEqual({
-      enabled: false,
-      createBackups: true,
-      sizeBytes: 4096,
-      startup: "warn",
-      runtime: "off",
-    });
   });
 
   it("ignores invalid plugin config values", () => {
@@ -464,13 +403,6 @@ describe("resolveLcmConfig", () => {
       promptAwareEviction: "maybe",
       newSessionRetainDepth: "nope",
       enabled: "maybe",
-      autoRotateSessionFiles: {
-        enabled: "maybe",
-        createBackups: "maybe",
-        sizeBytes: "not-a-number",
-        startup: "notify",
-        runtime: "compact",
-      },
     });
     expect(config.contextThreshold).toBe(0.75); // falls through to default
     expect(config.freshTailCount).toBe(64); // falls through to default
@@ -478,13 +410,6 @@ describe("resolveLcmConfig", () => {
     expect(config.promptAwareEviction).toBe(false); // falls through to default
     expect(config.newSessionRetainDepth).toBe(2); // falls through to default
     expect(config.enabled).toBe(true); // falls through to default
-    expect(config.autoRotateSessionFiles).toEqual({
-      enabled: true,
-      createBackups: false,
-      sizeBytes: DEFAULT_AUTO_ROTATE_SESSION_FILE_SIZE_BYTES,
-      startup: "rotate",
-      runtime: "rotate",
-    });
   });
 
   it("handles databasePath from plugin config", () => {
@@ -855,12 +780,6 @@ describe("resolveLcmConfig", () => {
     });
   });
 
-  it("ships a manifest with transcriptGcEnabled in schema", () => {
-    expect(manifest.configSchema.properties.transcriptGcEnabled).toEqual({
-      type: "boolean",
-    });
-  });
-
   it("ships a manifest with proactiveThresholdCompactionMode in schema", () => {
     expect(manifest.configSchema.properties.proactiveThresholdCompactionMode).toEqual({
       type: "string",
@@ -868,18 +787,10 @@ describe("resolveLcmConfig", () => {
     });
   });
 
-  it("ships a manifest with autoRotateSessionFiles in schema", () => {
-    expect(manifest.configSchema.properties.autoRotateSessionFiles).toEqual({
-      type: "object",
-      additionalProperties: false,
-      properties: {
-        enabled: { type: "boolean" },
-        createBackups: { type: "boolean" },
-        sizeBytes: { type: "integer", minimum: 1 },
-        startup: { type: "string", enum: ["rotate", "warn", "off"] },
-        runtime: { type: "string", enum: ["rotate", "warn", "off"] },
-      },
-    });
+  it("does not ship transcript rewrite maintenance settings in the manifest schema", () => {
+    const properties = manifest.configSchema.properties as Record<string, unknown>;
+    expect(properties.transcriptGcEnabled).toBeUndefined();
+    expect(properties.autoRotateSessionFiles).toBeUndefined();
   });
 
   it("ships a manifest with independentLogFile in schema", () => {

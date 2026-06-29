@@ -52,7 +52,6 @@ The native OpenClaw command surface provides in-session operations:
 
 - `/lossless` shows version, enablement/selection state, DB path and size, summary counts, and summary-health status
 - `/lossless backup` creates a timestamped backup of the current LCM SQLite database
-- `/lossless rotate` rewrites the active session transcript into a compact tail-preserving form without changing the live OpenClaw session identity or current LCM conversation
 - `/lossless doctor` scans for broken or truncated summaries
 - `/lossless doctor apply` repairs broken summaries in the current conversation after the normal safety preflight
 - `/lossless doctor apply <conversation-id> confirm-offline` repairs a specific conversation after its active channel path has been paused or moved away; targeted repair is restricted to authorized OpenClaw command senders and always requires the explicit offline confirmation
@@ -64,7 +63,6 @@ Supported native command examples:
 
 - `/lossless`
 - `/lossless backup`
-- `/lossless rotate`
 - `/lossless doctor`
 - `/lossless doctor apply 42 confirm-offline`
 - `/lossless doctor clean`
@@ -219,7 +217,6 @@ Add a `lossless-claw` entry under `plugins.entries` in your OpenClaw config:
             "agent:*:**:active-memory:**",
             "agent:*:dreaming-narrative-**"
           ],
-          "transcriptGcEnabled": false,
           "proactiveThresholdCompactionMode": "deferred",
           "summaryModel": "openai/gpt-5.4-mini",
           "expansionModel": "openai/gpt-5.4-mini",
@@ -273,11 +270,9 @@ The `ignoreSessionPatterns` entries in this example are storage exclusions. Matc
 | `LCM_SUMMARY_MAX_CALLS_PER_WINDOW` | `24` | Max model-backed summarization calls per session/window before spend backoff opens |
 | `LCM_SUMMARY_SPEND_BACKOFF_MS` | `1800000` | Cooldown after the summarization spend guard opens |
 | `LCM_PRUNE_HEARTBEAT_OK` | `false` | Retroactively delete `HEARTBEAT_OK` turn cycles from LCM storage |
-| `LCM_TRANSCRIPT_GC_ENABLED` | `false` | Enable transcript rewrite GC during `maintain()` |
 | `LCM_PROACTIVE_THRESHOLD_COMPACTION_MODE` | `deferred` | Choose whether proactive threshold compaction is deferred into maintenance debt or kept inline for legacy behavior |
 | `LCM_CACHE_TTL_SECONDS` | `300` | Cache TTL used by cache-aware deferred compaction when provider/runtime telemetry does not supply a more specific retention window |
 
-Transcript GC rewrites are disabled by default. Set `transcriptGcEnabled` or `LCM_TRANSCRIPT_GC_ENABLED` to turn them on explicitly.
 Deferred proactive compaction is also the default. Set `proactiveThresholdCompactionMode` or `LCM_PROACTIVE_THRESHOLD_COMPACTION_MODE` to `inline` only if you need legacy foreground compaction behavior. In deferred mode, lossless-claw records one coalesced prompt-mutating debt item after the turn, leaves background `maintain()` to process only non-prompt-mutating work while Anthropic cache is still hot, and then consumes that debt pre-assembly once the cache is cold or the prompt is approaching overflow.
 
 ### Expansion model override requirements
@@ -321,7 +316,6 @@ Plugin config equivalents:
 - `ignoreSessionPatterns`
 - `statelessSessionPatterns`
 - `skipStatelessSessions`
-- `transcriptGcEnabled`
 - `newSessionRetainDepth`
 - `summaryModel`
 - `summaryProvider`
@@ -369,12 +363,7 @@ Lossless-claw distinguishes OpenClaw's two session-reset commands:
 - `/new` keeps the active conversation row and all stored summaries, but prunes `context_items` so the next turn rebuilds context from retained summaries instead of the fresh tail.
 - `/reset` archives the active conversation row and creates a new active row for the same stable `sessionKey`, giving the next turn a clean LCM conversation while preserving prior history.
 
-For large sessions, neither command is a perfect “keep my live agent context, but stop writing into this giant active LCM row” tool:
-
-- `/new` keeps writing into the same active LCM conversation row.
-- `/reset` changes OpenClaw session flow, which is heavier than users often want when their real problem is just LCM row size.
-
-`/lossless rotate` fills that gap. Before trimming the transcript, it forces leaf-only compaction for raw context outside the preserved live tail so older transcript messages are represented by LCM summaries. It then replaces one rolling `rotate-latest` SQLite backup, rewrites the current session transcript down to the preserved live tail plus current session settings, and refreshes the bootstrap frontier on the same active LCM conversation so dropped transcript history is not replayed. Existing durable messages, summaries, context items, and conversation identity stay in place; only the transcript backing is compacted. If you want additional timestamped snapshots instead, run `/lossless backup`.
+Lossless-claw no longer rewrites active OpenClaw transcripts for GC or session rotation. SQLite-backed OpenClaw owns active transcript storage; Lossless keeps durable conversation, summary, and recall data in its own SQLite database. If you want an LCM database snapshot before maintenance, run `/lossless backup`.
 
 `newSessionRetainDepth` (or `LCM_NEW_SESSION_RETAIN_DEPTH`) controls how much summary structure survives `/new`:
 
