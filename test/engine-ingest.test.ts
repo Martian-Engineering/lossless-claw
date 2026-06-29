@@ -832,6 +832,96 @@ describe("LcmContextEngine.ingest content extraction", () => {
     });
   });
 
+  it("greps externalized file contents via scope=files", async () => {
+    await withTempHome(async () => {
+      const engine = createEngineWithConfig({ largeFileTokenThreshold: 20 });
+      const sessionId = randomUUID();
+      const uniqueMarker = `UNIQUE_MARKER_${randomUUID().slice(0, 8)}`;
+      const toolOutput = `${"tool output line\n".repeat(80)}${uniqueMarker}\n${"more lines\n".repeat(80)}done`;
+
+      await engine.ingest({
+        sessionId,
+        message: {
+          role: "assistant",
+          content: [
+            {
+              type: "toolCall",
+              id: "call_grep_file",
+              name: "exec",
+              input: { cmd: "cat large.log" },
+            },
+          ],
+        } as AgentMessage,
+      });
+
+      await engine.ingest({
+        sessionId,
+        message: {
+          role: "toolResult",
+          toolCallId: "call_grep_file",
+          toolName: "exec",
+          content: [
+            {
+              type: "tool_result",
+              tool_use_id: "call_grep_file",
+              name: "exec",
+              content: [{ type: "text", text: toolOutput }],
+            },
+          ],
+        } as AgentMessage,
+      });
+
+      const conversation = await engine
+        .getConversationStore()
+        .getConversationBySessionId(sessionId);
+      expect(conversation).not.toBeNull();
+
+      const largeFiles = await engine
+        .getSummaryStore()
+        .getLargeFilesByConversation(conversation!.conversationId);
+      expect(largeFiles).toHaveLength(1);
+      const fileId = largeFiles[0]!.fileId;
+
+      const retrieval = new RetrievalEngine(
+        engine.getConversationStore(),
+        engine.getSummaryStore(),
+      );
+
+      const regexResult = await retrieval.grep({
+        query: uniqueMarker,
+        mode: "regex",
+        scope: "files",
+        conversationId: conversation!.conversationId,
+        largeFilesDir: engine.configView.largeFilesDir,
+      });
+      expect(regexResult.files).toHaveLength(1);
+      expect(regexResult.files[0]!.fileId).toBe(fileId);
+      expect(regexResult.files[0]!.matchedText).toBe(uniqueMarker);
+      expect(regexResult.files[0]!.lineNumber).toBe(81);
+      expect(regexResult.files[0]!.byteOffset).toBe(toolOutput.indexOf(uniqueMarker));
+      expect(regexResult.files[0]!.snippet).toContain(uniqueMarker);
+
+      const fullTextResult = await retrieval.grep({
+        query: uniqueMarker,
+        mode: "full_text",
+        scope: "files",
+        conversationId: conversation!.conversationId,
+        largeFilesDir: engine.configView.largeFilesDir,
+      });
+      expect(fullTextResult.files).toHaveLength(1);
+      expect(fullTextResult.files[0]!.matchedText).toBe(uniqueMarker);
+
+      const fileIdsResult = await retrieval.grep({
+        query: "no-such-pattern-xyz",
+        mode: "regex",
+        scope: "files",
+        fileIds: [fileId],
+        largeFilesDir: engine.configView.largeFilesDir,
+      });
+      expect(fileIdsResult.files).toHaveLength(0);
+    });
+  });
+
   it("externalizes oversized plain-text tool-result blocks from live exec-style messages", async () => {
     await withTempHome(async () => {
       const engine = createEngineWithConfig({ largeFileTokenThreshold: 20 });

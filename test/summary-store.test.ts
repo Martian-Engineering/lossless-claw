@@ -7,6 +7,7 @@ import { runLcmMigrations } from "../src/db/migration.js";
 import { getLcmDbFeatures } from "../src/db/features.js";
 import { ConversationStore } from "../src/store/conversation-store.js";
 import { SummaryStore } from "../src/store/summary-store.js";
+import { RetrievalEngine } from "../src/retrieval.js";
 
 function createStores() {
   const db = new DatabaseSync(":memory:");
@@ -234,6 +235,437 @@ describe("SummaryStore shallow-tree helpers", () => {
           largeFilesDir: safeRoot,
         }),
       ).resolves.toBe(true);
+    } finally {
+      rmSync(safeRoot, { recursive: true, force: true });
+    }
+  });
+
+  it("searches large file contents with regex and reports line numbers", async () => {
+    const { conversationStore, summaryStore } = createStores();
+    const safeRoot = mkdtempSync(join(tmpdir(), "lcm-search-large-files-"));
+    try {
+      const conversation = await conversationStore.createConversation({
+        sessionId: "summary-store-search-large-files",
+        title: "Summary store search large files",
+      });
+      const content = "alpha\nbeta\ngamma\ndelta\n";
+      const payloadPath = join(safeRoot, "content.txt");
+      writeFileSync(payloadPath, content, "utf8");
+
+      await summaryStore.insertLargeFile({
+        fileId: "file_searchable1234",
+        conversationId: conversation.conversationId,
+        fileName: "content.txt",
+        mimeType: "text/plain",
+        byteSize: Buffer.byteLength(content, "utf8"),
+        storageUri: payloadPath,
+      });
+
+      const results = await summaryStore.searchLargeFiles({
+        query: "gamma",
+        mode: "regex",
+        conversationId: conversation.conversationId,
+        largeFilesDir: safeRoot,
+      });
+
+      expect(results).toHaveLength(1);
+      expect(results[0]).toMatchObject({
+        fileId: "file_searchable1234",
+        fileName: "content.txt",
+        matchedText: "gamma",
+        lineNumber: 3,
+        byteOffset: content.indexOf("gamma"),
+      });
+      expect(results[0].snippet).toContain("gamma");
+    } finally {
+      rmSync(safeRoot, { recursive: true, force: true });
+    }
+  });
+
+  it("returns multiple regex matches per file up to the cap", async () => {
+    const { conversationStore, summaryStore } = createStores();
+    const safeRoot = mkdtempSync(join(tmpdir(), "lcm-search-multi-"));
+    try {
+      const conversation = await conversationStore.createConversation({
+        sessionId: "summary-store-search-multi",
+        title: "Summary store search multi",
+      });
+      const content = "hit one\nmiss\nhit two\nmiss\nhit three\n";
+      const payloadPath = join(safeRoot, "multi.txt");
+      writeFileSync(payloadPath, content, "utf8");
+
+      await summaryStore.insertLargeFile({
+        fileId: "file_multi12345678",
+        conversationId: conversation.conversationId,
+        fileName: "multi.txt",
+        mimeType: "text/plain",
+        byteSize: Buffer.byteLength(content, "utf8"),
+        storageUri: payloadPath,
+      });
+
+      const results = await summaryStore.searchLargeFiles({
+        query: "hit\\s\\w+",
+        mode: "regex",
+        conversationId: conversation.conversationId,
+        largeFilesDir: safeRoot,
+      });
+
+      expect(results).toHaveLength(3);
+      expect(results.map((r) => r.matchedText)).toEqual(["hit one", "hit two", "hit three"]);
+      expect(results.map((r) => r.lineNumber)).toEqual([1, 3, 5]);
+    } finally {
+      rmSync(safeRoot, { recursive: true, force: true });
+    }
+  });
+
+  it("filters large file search by fileIds", async () => {
+    const { conversationStore, summaryStore } = createStores();
+    const safeRoot = mkdtempSync(join(tmpdir(), "lcm-search-fileids-"));
+    try {
+      const conversation = await conversationStore.createConversation({
+        sessionId: "summary-store-search-fileids",
+        title: "Summary store search fileIds",
+      });
+      const sharedContent = "needle in haystack";
+
+      for (const [fileId, name] of [
+        ["file_include_12345", "include.txt"],
+        ["file_exclude_67890", "exclude.txt"],
+      ] as const) {
+        const payloadPath = join(safeRoot, name);
+        writeFileSync(payloadPath, sharedContent, "utf8");
+        await summaryStore.insertLargeFile({
+          fileId,
+          conversationId: conversation.conversationId,
+          fileName: name,
+          mimeType: "text/plain",
+          byteSize: Buffer.byteLength(sharedContent, "utf8"),
+          storageUri: payloadPath,
+        });
+      }
+
+      const results = await summaryStore.searchLargeFiles({
+        query: "needle",
+        mode: "regex",
+        conversationId: conversation.conversationId,
+        fileIds: ["file_include_12345"],
+        largeFilesDir: safeRoot,
+      });
+
+      expect(results).toHaveLength(1);
+      expect(results[0].fileId).toBe("file_include_12345");
+    } finally {
+      rmSync(safeRoot, { recursive: true, force: true });
+    }
+  });
+
+  it("respects maxBytesPerFile when searching large files", async () => {
+    const { conversationStore, summaryStore } = createStores();
+    const safeRoot = mkdtempSync(join(tmpdir(), "lcm-search-maxbytes-"));
+    try {
+      const conversation = await conversationStore.createConversation({
+        sessionId: "summary-store-search-maxbytes",
+        title: "Summary store search maxBytes",
+      });
+      const prefix = "aaa\n".repeat(100);
+      const suffix = "ZZZ_FIND_ME_ZZZ";
+      const content = prefix + suffix;
+      const payloadPath = join(safeRoot, "big.txt");
+      writeFileSync(payloadPath, content, "utf8");
+
+      await summaryStore.insertLargeFile({
+        fileId: "file_maxbytes_12345",
+        conversationId: conversation.conversationId,
+        fileName: "big.txt",
+        mimeType: "text/plain",
+        byteSize: Buffer.byteLength(content, "utf8"),
+        storageUri: payloadPath,
+      });
+
+      const results = await summaryStore.searchLargeFiles({
+        query: "ZZZ_FIND_ME_ZZZ",
+        mode: "regex",
+        conversationId: conversation.conversationId,
+        largeFilesDir: safeRoot,
+        maxBytesPerFile: 50,
+      });
+
+      expect(results).toHaveLength(0);
+    } finally {
+      rmSync(safeRoot, { recursive: true, force: true });
+    }
+  });
+
+  it("skips non-text large files when searching contents", async () => {
+    const { conversationStore, summaryStore } = createStores();
+    const safeRoot = mkdtempSync(join(tmpdir(), "lcm-search-binary-"));
+    try {
+      const conversation = await conversationStore.createConversation({
+        sessionId: "summary-store-search-binary",
+        title: "Summary store search binary",
+      });
+      const content = "definitely not an image";
+      const payloadPath = join(safeRoot, "fake.png");
+      writeFileSync(payloadPath, content, "utf8");
+
+      await summaryStore.insertLargeFile({
+        fileId: "file_binary_12345",
+        conversationId: conversation.conversationId,
+        fileName: "fake.png",
+        mimeType: "image/png",
+        byteSize: Buffer.byteLength(content, "utf8"),
+        storageUri: payloadPath,
+      });
+
+      const results = await summaryStore.searchLargeFiles({
+        query: "definitely",
+        mode: "regex",
+        conversationId: conversation.conversationId,
+        largeFilesDir: safeRoot,
+      });
+
+      expect(results).toHaveLength(0);
+    } finally {
+      rmSync(safeRoot, { recursive: true, force: true });
+    }
+  });
+
+  it("searches large files with full_text mode requiring all terms", async () => {
+    const { conversationStore, summaryStore } = createStores();
+    const safeRoot = mkdtempSync(join(tmpdir(), "lcm-search-fulltext-"));
+    try {
+      const conversation = await conversationStore.createConversation({
+        sessionId: "summary-store-search-fulltext",
+        title: "Summary store search fullText",
+      });
+      const content = "quick brown fox jumps over the lazy dog";
+      const payloadPath = join(safeRoot, "animals.txt");
+      writeFileSync(payloadPath, content, "utf8");
+
+      await summaryStore.insertLargeFile({
+        fileId: "file_fulltext_12345",
+        conversationId: conversation.conversationId,
+        fileName: "animals.txt",
+        mimeType: "text/plain",
+        byteSize: Buffer.byteLength(content, "utf8"),
+        storageUri: payloadPath,
+      });
+
+      const allTerms = await summaryStore.searchLargeFiles({
+        query: "quick fox",
+        mode: "full_text",
+        conversationId: conversation.conversationId,
+        largeFilesDir: safeRoot,
+      });
+      expect(allTerms).toHaveLength(1);
+
+      const missingTerm = await summaryStore.searchLargeFiles({
+        query: "quick zebra",
+        mode: "full_text",
+        conversationId: conversation.conversationId,
+        largeFilesDir: safeRoot,
+      });
+      expect(missingTerm).toHaveLength(0);
+    } finally {
+      rmSync(safeRoot, { recursive: true, force: true });
+    }
+  });
+
+  it("stores and returns large file lineCount", async () => {
+    const { conversationStore, summaryStore } = createStores();
+    const conversation = await conversationStore.createConversation({
+      sessionId: "summary-store-line-count",
+      title: "Summary store line count",
+    });
+
+    const record = await summaryStore.insertLargeFile({
+      fileId: "file_linecount_12345",
+      conversationId: conversation.conversationId,
+      fileName: "lines.txt",
+      mimeType: "text/plain",
+      byteSize: 100,
+      lineCount: 42,
+      storageUri: "/tmp/lines.txt",
+      explorationSummary: "line count test",
+    });
+
+    expect(record.lineCount).toBe(42);
+
+    const fetched = await summaryStore.getLargeFile("file_linecount_12345");
+    expect(fetched?.lineCount).toBe(42);
+
+    const byConversation = await summaryStore.getLargeFilesByConversation(conversation.conversationId);
+    expect(byConversation[0]?.lineCount).toBe(42);
+  });
+
+  it("defaults large file lineCount to null when omitted", async () => {
+    const { conversationStore, summaryStore } = createStores();
+    const conversation = await conversationStore.createConversation({
+      sessionId: "summary-store-line-count-null",
+      title: "Summary store line count null",
+    });
+
+    const record = await summaryStore.insertLargeFile({
+      fileId: "file_linecount_null",
+      conversationId: conversation.conversationId,
+      fileName: "legacy.txt",
+      mimeType: "text/plain",
+      byteSize: 100,
+      storageUri: "/tmp/legacy.txt",
+    });
+
+    expect(record.lineCount).toBeNull();
+  });
+
+  it("describes a large file with startLine/endLine range", async () => {
+    const { conversationStore, summaryStore } = createStores();
+    const safeRoot = mkdtempSync(join(tmpdir(), "lcm-describe-range-"));
+    try {
+      const conversation = await conversationStore.createConversation({
+        sessionId: "summary-store-describe-range",
+        title: "Summary store describe range",
+      });
+      const content = ["line one", "line two", "line three", "line four", "line five"].join("\n");
+      const payloadPath = join(safeRoot, "range.txt");
+      writeFileSync(payloadPath, content, "utf8");
+
+      await summaryStore.insertLargeFile({
+        fileId: "file_range_12345",
+        conversationId: conversation.conversationId,
+        fileName: "range.txt",
+        mimeType: "text/plain",
+        byteSize: Buffer.byteLength(content, "utf8"),
+        lineCount: 5,
+        storageUri: payloadPath,
+        explorationSummary: "range test",
+      });
+
+      const retrieval = new RetrievalEngine(conversationStore, summaryStore);
+      const result = await retrieval.describe("file_range_12345", {
+        expandFile: true,
+        startLine: 2,
+        endLine: 4,
+        largeFilesDir: safeRoot,
+      });
+
+      expect(result?.type).toBe("file");
+      expect(result?.file?.content).toBe("line two\nline three\nline four");
+      expect(result?.file?.contentTruncated).toBe(false);
+    } finally {
+      rmSync(safeRoot, { recursive: true, force: true });
+    }
+  });
+
+  it("describes a large file from startLine to end when endLine is omitted", async () => {
+    const { conversationStore, summaryStore } = createStores();
+    const safeRoot = mkdtempSync(join(tmpdir(), "lcm-describe-range-open-"));
+    try {
+      const conversation = await conversationStore.createConversation({
+        sessionId: "summary-store-describe-range-open",
+        title: "Summary store describe range open",
+      });
+      const content = ["alpha", "beta", "gamma", "delta"].join("\n");
+      const payloadPath = join(safeRoot, "open.txt");
+      writeFileSync(payloadPath, content, "utf8");
+
+      await summaryStore.insertLargeFile({
+        fileId: "file_range_open_12345",
+        conversationId: conversation.conversationId,
+        fileName: "open.txt",
+        mimeType: "text/plain",
+        byteSize: Buffer.byteLength(content, "utf8"),
+        lineCount: 4,
+        storageUri: payloadPath,
+        explorationSummary: "open range test",
+      });
+
+      const retrieval = new RetrievalEngine(conversationStore, summaryStore);
+      const result = await retrieval.describe("file_range_open_12345", {
+        expandFile: true,
+        startLine: 3,
+        largeFilesDir: safeRoot,
+      });
+
+      expect(result?.file?.content).toBe("gamma\ndelta");
+      expect(result?.file?.contentTruncated).toBe(false);
+    } finally {
+      rmSync(safeRoot, { recursive: true, force: true });
+    }
+  });
+
+  it("reports truncation when a line-range read cannot reach the requested endLine", async () => {
+    const { conversationStore, summaryStore } = createStores();
+    const safeRoot = mkdtempSync(join(tmpdir(), "lcm-describe-range-trunc-"));
+    try {
+      const conversation = await conversationStore.createConversation({
+        sessionId: "summary-store-describe-range-trunc",
+        title: "Summary store describe range truncation",
+      });
+      const content = ["one", "two", "three", "four", "five"].join("\n");
+      const payloadPath = join(safeRoot, "trunc.txt");
+      writeFileSync(payloadPath, content, "utf8");
+
+      await summaryStore.insertLargeFile({
+        fileId: "file_range_trunc_12345",
+        conversationId: conversation.conversationId,
+        fileName: "trunc.txt",
+        mimeType: "text/plain",
+        byteSize: Buffer.byteLength(content, "utf8"),
+        lineCount: 5,
+        storageUri: payloadPath,
+        explorationSummary: "truncation test",
+      });
+
+      const retrieval = new RetrievalEngine(conversationStore, summaryStore);
+      const result = await retrieval.describe("file_range_trunc_12345", {
+        expandFile: true,
+        startLine: 2,
+        endLine: 10,
+        largeFilesDir: safeRoot,
+      });
+
+      expect(result?.file?.content).toBe("two\nthree\nfour\nfive");
+      expect(result?.file?.contentTruncated).toBe(true);
+    } finally {
+      rmSync(safeRoot, { recursive: true, force: true });
+    }
+  });
+
+  it("preserves complete multi-byte UTF-8 characters at the byte budget boundary", async () => {
+    const { conversationStore, summaryStore } = createStores();
+    const safeRoot = mkdtempSync(join(tmpdir(), "lcm-describe-range-utf8-"));
+    try {
+      const conversation = await conversationStore.createConversation({
+        sessionId: "summary-store-describe-range-utf8",
+        title: "Summary store describe range utf8",
+      });
+      // "中" is U+4E2D, UTF-8: E4 B8 AD (3 bytes). Build lines that end right at a boundary.
+      const lines = ["alpha", "中", "beta", "国", "gamma"];
+      const content = lines.join("\n");
+      const payloadPath = join(safeRoot, "utf8.txt");
+      writeFileSync(payloadPath, content, "utf8");
+
+      await summaryStore.insertLargeFile({
+        fileId: "file_range_utf8_12345",
+        conversationId: conversation.conversationId,
+        fileName: "utf8.txt",
+        mimeType: "text/plain",
+        byteSize: Buffer.byteLength(content, "utf8"),
+        lineCount: lines.length,
+        storageUri: payloadPath,
+        explorationSummary: "utf8 boundary test",
+      });
+
+      const retrieval = new RetrievalEngine(conversationStore, summaryStore);
+      const result = await retrieval.describe("file_range_utf8_12345", {
+        expandFile: true,
+        startLine: 1,
+        endLine: lines.length,
+        largeFilesDir: safeRoot,
+      });
+
+      expect(result?.file?.content).toBe(content);
+      expect(result?.file?.content).not.toContain("\uFFFD");
     } finally {
       rmSync(safeRoot, { recursive: true, force: true });
     }

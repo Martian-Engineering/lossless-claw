@@ -37,8 +37,14 @@ const LcmGrepSchema = Type.Object({
   scope: Type.Optional(
     Type.String({
       description:
-        'What to search: "messages" for raw messages, "summaries" for compacted summaries, "both" for all. Default: "both".',
-      enum: ["messages", "summaries", "both"],
+        'What to search: "messages" for raw messages, "summaries" for compacted summaries, "both" for all, or "files" for externalized large file contents. Default: "both".',
+      enum: ["messages", "summaries", "both", "files"],
+    }),
+  ),
+  fileIds: Type.Optional(
+    Type.Array(Type.String(), {
+      description:
+        'Optional list of file_xxx IDs to restrict the search to when scope="files". If omitted, all large files in the conversation scope are searched.',
     }),
   ),
   conversationId: Type.Optional(
@@ -157,10 +163,12 @@ export function createLcmGrepTool(input: {
     name: "lcm_grep",
     label: "LCM Grep",
     description:
-      "Search compacted conversation history using regex or full-text search. " +
-      "Searches across messages and/or summaries stored by LCM. " +
+      "Search compacted conversation history or externalized file contents using regex or full-text search. " +
+      "Searches across messages, summaries, and/or large files stored by LCM. " +
       "Use this to find specific content that may have been compacted away from " +
-      "active context. In full_text mode, queries use FTS5 AND semantics by default, so keep them short and focused; quoted phrases stay intact and optional sort modes can prioritize relevance for older topics. Returns matching snippets with their summary/message IDs " +
+      "active context, or to search within the full content of externalized files " +
+      "(scope='files') when a previous lcm_describe result was truncated. " +
+      "In full_text mode, queries use FTS5 AND semantics by default, so keep them short and focused; quoted phrases stay intact and optional sort modes can prioritize relevance for older topics. Returns matching snippets with their summary/message/file IDs " +
       "for follow-up with lcm_expand or lcm_describe.",
     parameters: LcmGrepSchema,
     async execute(_toolCallId, params) {
@@ -174,7 +182,10 @@ export function createLcmGrepTool(input: {
       const p = params as Record<string, unknown>;
       const pattern = (p.pattern as string).trim();
       const mode = (p.mode as "regex" | "full_text") ?? "regex";
-      const scope = (p.scope as "messages" | "summaries" | "both") ?? "both";
+      const scope = (p.scope as "messages" | "summaries" | "both" | "files") ?? "both";
+      const fileIds = Array.isArray(p.fileIds)
+        ? p.fileIds.filter((id): id is string => typeof id === "string")
+        : undefined;
       const limit = typeof p.limit === "number" ? Math.trunc(p.limit) : 50;
       const requestedSort = (p.sort as "recency" | "relevance" | "hybrid") ?? "recency";
       const effectiveSort = mode === "full_text" ? requestedSort : "recency";
@@ -225,10 +236,12 @@ export function createLcmGrepTool(input: {
         scope,
         conversationId: conversationScope.conversationId,
         conversationIds: conversationScope.conversationIds,
+        fileIds,
         limit,
         since,
         before,
         sort: effectiveSort,
+        largeFilesDir: lcm.configView?.largeFilesDir,
       });
 
       const lines: string[] = [];
@@ -289,6 +302,25 @@ export function createLcmGrepTool(input: {
         lines.push("");
       }
 
+      const files = result.files ?? [];
+
+      if (files.length > 0) {
+        lines.push("### Files");
+        lines.push("");
+        for (const file of files) {
+          const snippet = truncateSnippet(file.snippet);
+          const nameSuffix = file.fileName ? ` (${file.fileName})` : "";
+          const line = `- [conv=${file.conversationId} ${file.fileId}${nameSuffix}] line ${file.lineNumber}, offset ${file.byteOffset}: \`${file.matchedText}\` ${snippet}`;
+          if (currentChars + line.length > MAX_RESULT_CHARS) {
+            lines.push("*(truncated — more results available)*");
+            break;
+          }
+          lines.push(line);
+          currentChars += line.length;
+        }
+        lines.push("");
+      }
+
       if (result.totalMatches === 0) {
         lines.push("No matches found.");
       }
@@ -298,6 +330,7 @@ export function createLcmGrepTool(input: {
         details: {
           messageCount: result.messages.length,
           summaryCount: result.summaries.length,
+          fileCount: files.length,
           totalMatches: result.totalMatches,
         },
       };

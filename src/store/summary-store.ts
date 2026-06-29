@@ -98,6 +98,7 @@ export type CreateLargeFileInput = {
   fileName?: string;
   mimeType?: string;
   byteSize?: number;
+  lineCount?: number;
   storageUri: string;
   explorationSummary?: string;
 };
@@ -108,6 +109,7 @@ export type LargeFileRecord = {
   fileName: string | null;
   mimeType: string | null;
   byteSize: number | null;
+  lineCount: number | null;
   storageUri: string;
   explorationSummary: string | null;
   createdAt: Date;
@@ -116,6 +118,34 @@ export type LargeFileRecord = {
 export type LargeFileReadOptions = {
   largeFilesDir: string;
   maxBytes?: number;
+};
+
+export type LargeFileSearchInput = {
+  query: string;
+  mode: "regex" | "full_text";
+  conversationId?: number;
+  conversationIds?: number[];
+  fileIds?: string[];
+  since?: Date;
+  before?: Date;
+  limit?: number;
+  largeFilesDir: string;
+  maxBytesPerFile?: number;
+};
+
+export type LargeFileSearchResult = {
+  fileId: string;
+  conversationId: number;
+  fileName: string | null;
+  /** Matched text. */
+  matchedText: string;
+  /** 1-based line number where the match starts. */
+  lineNumber: number;
+  /** 0-based byte offset where the match starts. */
+  byteOffset: number;
+  /** Snippet with surrounding context. */
+  snippet: string;
+  createdAt: Date;
 };
 
 export type UpsertConversationBootstrapStateInput = {
@@ -235,6 +265,7 @@ interface LargeFileRow {
   file_name: string | null;
   mime_type: string | null;
   byte_size: number | null;
+  line_count: number | null;
   storage_uri: string;
   exploration_summary: string | null;
   created_at: string;
@@ -336,10 +367,144 @@ function toLargeFileRecord(row: LargeFileRow): LargeFileRecord {
     fileName: row.file_name,
     mimeType: row.mime_type,
     byteSize: row.byte_size,
+    lineCount: row.line_count,
     storageUri: row.storage_uri,
     explorationSummary: row.exploration_summary,
     createdAt: parseUtcTimestamp(row.created_at),
   };
+}
+
+function isTextLikeMimeType(mimeType: string | null): boolean {
+  if (mimeType == null) {
+    return true;
+  }
+  const lower = mimeType.toLowerCase();
+  if (lower.startsWith("text/")) {
+    return true;
+  }
+  if (
+    lower.includes("json") ||
+    lower.includes("javascript") ||
+    lower.includes("xml") ||
+    lower.includes("yaml") ||
+    lower.includes("yml") ||
+    lower.includes("toml")
+  ) {
+    return true;
+  }
+  return false;
+}
+
+interface FileContentMatch {
+  index: number;
+  length: number;
+  text: string;
+}
+
+function findRegexMatches(content: string, pattern: string, maxMatches: number): FileContentMatch[] {
+  try {
+    const regex = new RegExp(pattern, "g");
+    const matches: FileContentMatch[] = [];
+    let match;
+    while ((match = regex.exec(content)) !== null && matches.length < maxMatches) {
+      matches.push({ index: match.index, length: match[0].length, text: match[0] });
+      if (match.index === regex.lastIndex) {
+        regex.lastIndex++;
+      }
+    }
+    return matches;
+  } catch {
+    return [];
+  }
+}
+
+function findFullTextMatches(content: string, query: string, maxMatches: number): FileContentMatch[] {
+  const terms = parseFullTextTerms(query);
+  if (terms.length === 0) {
+    return [];
+  }
+  const lowerContent = content.toLowerCase();
+  const lowerTerms = terms.map((t) => t.toLowerCase());
+
+  // AND semantics: every term must appear somewhere in the document.
+  for (const term of lowerTerms) {
+    if (!lowerContent.includes(term)) {
+      return [];
+    }
+  }
+
+  const matches: FileContentMatch[] = [];
+  const firstTerm = lowerTerms[0]!;
+  let searchFrom = 0;
+  while (matches.length < maxMatches) {
+    const index = lowerContent.indexOf(firstTerm, searchFrom);
+    if (index === -1) {
+      break;
+    }
+    matches.push({
+      index,
+      length: terms[0].length,
+      text: content.slice(index, index + terms[0].length),
+    });
+    searchFrom = index + 1;
+  }
+  return matches;
+}
+
+function lineNumberAt(content: string, index: number): number {
+  let line = 1;
+  for (let i = 0; i < index && i < content.length; i++) {
+    if (content[i] === "\n") {
+      line++;
+    }
+  }
+  return line;
+}
+
+function parseFullTextTerms(query: string): string[] {
+  const terms: string[] = [];
+  let inQuote = false;
+  let current = "";
+  for (const char of query.trim()) {
+    if (char === '"') {
+      if (inQuote) {
+        if (current.length > 0) {
+          terms.push(current);
+          current = "";
+        }
+        inQuote = false;
+      } else {
+        inQuote = true;
+      }
+      continue;
+    }
+    if (char === " " && !inQuote) {
+      if (current.length > 0) {
+        terms.push(current);
+        current = "";
+      }
+      continue;
+    }
+    current += char;
+  }
+  if (current.length > 0) {
+    terms.push(current);
+  }
+  return terms;
+}
+
+function createSearchSnippet(content: string, index: number, length: number): string {
+  const context = 80;
+  const start = Math.max(0, index - context);
+  const end = Math.min(content.length, index + length + context);
+  let snippet = content.slice(start, end).replace(/\n/g, " ").trim();
+  if (start > 0) {
+    snippet = "..." + snippet;
+  }
+  if (end < content.length) {
+    snippet = snippet + "...";
+  }
+  return snippet;
 }
 
 function toConversationBootstrapStateRecord(
@@ -1524,8 +1689,8 @@ export class SummaryStore {
   async insertLargeFile(input: CreateLargeFileInput): Promise<LargeFileRecord> {
     this.db
       .prepare(
-        `INSERT INTO large_files (file_id, conversation_id, file_name, mime_type, byte_size, storage_uri, exploration_summary)
-       VALUES (?, ?, ?, ?, ?, ?, ?)`,
+        `INSERT INTO large_files (file_id, conversation_id, file_name, mime_type, byte_size, line_count, storage_uri, exploration_summary)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
       )
       .run(
         input.fileId,
@@ -1533,13 +1698,14 @@ export class SummaryStore {
         input.fileName ?? null,
         input.mimeType ?? null,
         input.byteSize ?? null,
+        input.lineCount ?? null,
         input.storageUri,
         input.explorationSummary ?? null,
       );
 
     const row = this.db
       .prepare(
-        `SELECT file_id, conversation_id, file_name, mime_type, byte_size, storage_uri, exploration_summary, created_at
+        `SELECT file_id, conversation_id, file_name, mime_type, byte_size, line_count, storage_uri, exploration_summary, created_at
        FROM large_files WHERE file_id = ?`,
       )
       .get(input.fileId) as unknown as LargeFileRow;
@@ -1550,7 +1716,7 @@ export class SummaryStore {
   async getLargeFile(fileId: string): Promise<LargeFileRecord | null> {
     const row = this.db
       .prepare(
-        `SELECT file_id, conversation_id, file_name, mime_type, byte_size, storage_uri, exploration_summary, created_at
+        `SELECT file_id, conversation_id, file_name, mime_type, byte_size, line_count, storage_uri, exploration_summary, created_at
        FROM large_files WHERE file_id = ?`,
       )
       .get(fileId) as unknown as LargeFileRow | undefined;
@@ -1560,13 +1726,89 @@ export class SummaryStore {
   async getLargeFilesByConversation(conversationId: number): Promise<LargeFileRecord[]> {
     const rows = this.db
       .prepare(
-        `SELECT file_id, conversation_id, file_name, mime_type, byte_size, storage_uri, exploration_summary, created_at
+        `SELECT file_id, conversation_id, file_name, mime_type, byte_size, line_count, storage_uri, exploration_summary, created_at
        FROM large_files
        WHERE conversation_id = ?
        ORDER BY created_at`,
       )
       .all(conversationId) as unknown as LargeFileRow[];
     return rows.map(toLargeFileRecord);
+  }
+
+  /**
+   * Search the contents of persisted large files using regex or simple full-text
+   * matching. Each file is read up to `maxBytesPerFile` (default 512KB) and only
+   * text-like MIME types are scanned.
+   */
+  async searchLargeFiles(input: LargeFileSearchInput): Promise<LargeFileSearchResult[]> {
+    const limit = input.limit ?? 50;
+    const maxBytesPerFile = input.maxBytesPerFile ?? 512_000;
+    const maxMatchesPerFile = 10;
+
+    let files: LargeFileRecord[] = [];
+    if (input.fileIds && input.fileIds.length > 0) {
+      for (const fileId of input.fileIds) {
+        const file = await this.getLargeFile(fileId);
+        if (file) {
+          files.push(file);
+        }
+      }
+    } else if (input.conversationIds && input.conversationIds.length > 0) {
+      for (const conversationId of input.conversationIds) {
+        const convFiles = await this.getLargeFilesByConversation(conversationId);
+        files.push(...convFiles);
+      }
+    } else if (input.conversationId != null) {
+      files = await this.getLargeFilesByConversation(input.conversationId);
+    }
+
+    if (input.since) {
+      files = files.filter((f) => f.createdAt.getTime() >= input.since!.getTime());
+    }
+    if (input.before) {
+      files = files.filter((f) => f.createdAt.getTime() < input.before!.getTime());
+    }
+
+    const results: LargeFileSearchResult[] = [];
+    for (const file of files) {
+      if (results.length >= limit) {
+        break;
+      }
+      if (!isTextLikeMimeType(file.mimeType)) {
+        continue;
+      }
+
+      const content = await this.readValidatedLargeFileContentUpTo(file.storageUri, {
+        largeFilesDir: input.largeFilesDir,
+        maxBytes: maxBytesPerFile,
+      });
+      if (content == null) {
+        continue;
+      }
+
+      const matches =
+        input.mode === "regex"
+          ? findRegexMatches(content, input.query, maxMatchesPerFile)
+          : findFullTextMatches(content, input.query, maxMatchesPerFile);
+
+      for (const match of matches) {
+        if (results.length >= limit) {
+          break;
+        }
+        results.push({
+          fileId: file.fileId,
+          conversationId: file.conversationId,
+          fileName: file.fileName,
+          matchedText: match.text,
+          lineNumber: lineNumberAt(content, match.index),
+          byteOffset: match.index,
+          snippet: createSearchSnippet(content, match.index, match.length),
+          createdAt: file.createdAt,
+        });
+      }
+    }
+
+    return results;
   }
 
   /**
@@ -1689,6 +1931,32 @@ export class SummaryStore {
           return null;
         }
         return await file.readFile({ encoding: "utf8" });
+      } finally {
+        await file.close().catch(() => undefined);
+      }
+    } catch {
+      return null;
+    }
+  }
+
+  private async readValidatedLargeFileContentUpTo(
+    storageUri: string,
+    options: LargeFileReadOptions,
+  ): Promise<string | null> {
+    try {
+      const file = await this.openValidatedLargeFile(storageUri, options);
+      if (!file) {
+        return null;
+      }
+      try {
+        const stats = await file.stat();
+        if (!stats.isFile()) {
+          return null;
+        }
+        const maxBytes = options.maxBytes ?? stats.size;
+        const buffer = Buffer.alloc(Math.min(maxBytes, stats.size));
+        const { bytesRead } = await file.read(buffer, 0, buffer.length, 0);
+        return buffer.subarray(0, bytesRead).toString("utf8");
       } finally {
         await file.close().catch(() => undefined);
       }

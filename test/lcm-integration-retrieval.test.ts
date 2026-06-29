@@ -63,6 +63,7 @@ describe("LCM integration: retrieval", () => {
       fileName: "data.csv",
       mimeType: "text/csv",
       byteSize: 1024,
+      lineCount: 100,
       storageUri: "s3://bucket/data.csv",
       explorationSummary: "CSV with 100 rows of test data.",
     });
@@ -74,6 +75,7 @@ describe("LCM integration: retrieval", () => {
     expect(result!.file).toBeDefined();
     expect(result!.file!.fileName).toBe("data.csv");
     expect(result!.file!.storageUri).toBe("s3://bucket/data.csv");
+    expect(result!.file!.lineCount).toBe(100);
   });
 
   it("describe returns null for unknown IDs", async () => {

@@ -662,6 +662,7 @@ export class LargeFileInterceptor {
       content: params.content,
     });
     const byteSize = Buffer.byteLength(params.content, "utf8");
+    const lineCount = params.content.split(/\r?\n/).length;
     const explorationSummary = await generateExplorationSummary({
       content: params.content,
       fileName: params.fileName,
@@ -675,6 +676,7 @@ export class LargeFileInterceptor {
       fileName: params.fileName,
       mimeType: params.mimeType,
       byteSize,
+      lineCount,
       storageUri,
       explorationSummary,
     });

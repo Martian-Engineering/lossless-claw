@@ -179,6 +179,14 @@ function ensureCompactionTelemetryColumns(db: DatabaseSync): void {
   }
 }
 
+function ensureLargeFilesLineCountColumn(db: DatabaseSync): void {
+  const columns = db.prepare(`PRAGMA table_info(large_files)`).all() as SummaryColumnInfo[];
+  const hasLineCount = columns.some((col) => col.name === "line_count");
+  if (!hasLineCount) {
+    db.exec(`ALTER TABLE large_files ADD COLUMN line_count INTEGER`);
+  }
+}
+
 function ensureCompactionMaintenanceColumns(db: DatabaseSync): void {
   const maintenanceColumns = db
     .prepare(`PRAGMA table_info(conversation_compaction_maintenance)`)
@@ -1174,6 +1182,7 @@ export function runLcmMigrations(
       file_name TEXT,
       mime_type TEXT,
       byte_size INTEGER,
+      line_count INTEGER,
       storage_uri TEXT NOT NULL,
       exploration_summary TEXT,
       created_at TEXT NOT NULL DEFAULT (datetime('now'))
@@ -1384,6 +1393,9 @@ export function runLcmMigrations(
     );
     runMigrationStep("ensureCompactionMaintenanceColumns", log, () =>
       ensureCompactionMaintenanceColumns(db),
+    );
+    runMigrationStep("ensureLargeFilesLineCountColumn", log, () =>
+      ensureLargeFilesLineCountColumn(db),
     );
     runMigrationStep("ensureFocusBriefTables", log, () => ensureFocusBriefTables(db));
     runVersionedBackfillStep(db, "backfillSummaryDepths", log, () => backfillSummaryDepths(db));

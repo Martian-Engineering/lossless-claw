@@ -17,6 +17,8 @@ import type {
   SummaryRecord,
   SummarySearchResult,
   LargeFileRecord,
+  LargeFileSearchInput,
+  LargeFileSearchResult,
 } from "./store/summary-store.js";
 import type { SearchSort } from "./store/full-text-sort.js";
 import { estimateTokens } from "./estimate-tokens.js";
@@ -65,6 +67,7 @@ export interface DescribeResult {
     fileName: string | null;
     mimeType: string | null;
     byteSize: number | null;
+    lineCount: number | null;
     storageUri: string;
     explorationSummary: string | null;
     createdAt: Date;
@@ -83,9 +86,10 @@ export interface DescribeResult {
 export interface GrepInput {
   query: string;
   mode: "regex" | "full_text";
-  scope: "messages" | "summaries" | "both";
+  scope: "messages" | "summaries" | "both" | "files";
   conversationId?: number;
   conversationIds?: number[];
+  fileIds?: string[];
   since?: Date;
   before?: Date;
   limit?: number;
@@ -93,11 +97,14 @@ export interface GrepInput {
    *  "relevance" sorts by FTS5 BM25 rank (full_text mode only).
    *  "hybrid" blends relevance with recency. */
   sort?: SearchSort;
+  /** Required when scope="files". Used to validate file paths before reading. */
+  largeFilesDir?: string;
 }
 
 export interface GrepResult {
   messages: MessageSearchResult[];
   summaries: SummarySearchResult[];
+  files: LargeFileSearchResult[];
   totalMatches: number;
 }
 
@@ -154,7 +161,13 @@ export class RetrievalEngine {
    */
   async describe(
     id: string,
-    options?: { expandFile?: boolean; expandFileMaxBytes?: number; largeFilesDir?: string },
+    options?: {
+      expandFile?: boolean;
+      expandFileMaxBytes?: number;
+      startLine?: number;
+      endLine?: number;
+      largeFilesDir?: string;
+    },
   ): Promise<DescribeResult | null> {
     if (id.startsWith("sum_")) {
       return this.describeSummary(id);
@@ -219,7 +232,13 @@ export class RetrievalEngine {
 
   private async describeFile(
     id: string,
-    options?: { expandFile?: boolean; expandFileMaxBytes?: number; largeFilesDir?: string },
+    options?: {
+      expandFile?: boolean;
+      expandFileMaxBytes?: number;
+      startLine?: number;
+      endLine?: number;
+      largeFilesDir?: string;
+    },
   ): Promise<DescribeResult | null> {
     const file = await this.summaryStore.getLargeFile(id);
     if (!file) {
@@ -238,6 +257,8 @@ export class RetrievalEngine {
     //      can't blow out the agent's context. Override via
     //      `expandFileMaxBytes`. Files over the cap return the head
     //      portion + `contentTruncated: true`.
+    //   4. Line range: optional `startLine`/`endLine` (1-based, inclusive)
+    //      read a specific slice instead of the head cap.
     let content: string | null = null;
     let contentTruncated = false;
     // Wave-3 P3 fix: refuse expansion when largeFilesDir is unset in
@@ -266,7 +287,14 @@ export class RetrievalEngine {
           const fd = openSync(realTarget, "r");
           try {
             const stat = fstatSync(fd);
-            if (stat.size <= maxBytes) {
+            const startLine = typeof options.startLine === "number" ? Math.max(1, Math.trunc(options.startLine)) : undefined;
+            const endLine = typeof options.endLine === "number" ? Math.max(1, Math.trunc(options.endLine)) : undefined;
+
+            if (startLine != null) {
+              const lineRange = readFileLineRange(fd, stat.size, startLine, endLine ?? Number.POSITIVE_INFINITY, maxBytes);
+              content = lineRange.content;
+              contentTruncated = lineRange.truncated;
+            } else if (stat.size <= maxBytes) {
               content = readFileSync(fd, "utf8");
             } else {
               // Read just the head. Wave-3 P1 fix: scan back from the
@@ -274,14 +302,7 @@ export class RetrievalEngine {
               // emit U+FFFD mojibake from a split multi-byte sequence.
               const buf = Buffer.alloc(maxBytes);
               readSync(fd, buf, 0, maxBytes, 0);
-              let safeEnd = maxBytes;
-              while (safeEnd > 0) {
-                const b = buf[safeEnd - 1];
-                if ((b & 0x80) === 0) break;             // ASCII
-                if ((b & 0xc0) === 0xc0) { safeEnd -= 1; break; } // start byte
-                safeEnd -= 1;                             // continuation
-                if (maxBytes - safeEnd > 4) break;        // bounded
-              }
+              const safeEnd = truncateToValidUtf8End(buf, maxBytes);
               content = buf.subarray(0, safeEnd).toString("utf8");
               contentTruncated = true;
             }
@@ -315,6 +336,7 @@ export class RetrievalEngine {
         fileName: file.fileName,
         mimeType: file.mimeType,
         byteSize: file.byteSize,
+        lineCount: file.lineCount,
         storageUri: file.storageUri,
         explorationSummary: file.explorationSummary,
         createdAt: file.createdAt,
@@ -331,7 +353,25 @@ export class RetrievalEngine {
    * Depending on `scope`, searches messages, summaries, or both (in parallel).
    */
   async grep(input: GrepInput): Promise<GrepResult> {
-    const { query, mode, scope, conversationId, conversationIds, since, before, limit, sort } = input;
+    const { query, mode, scope, conversationId, conversationIds, fileIds, since, before, limit, sort, largeFilesDir } = input;
+
+    if (scope === "files") {
+      if (!largeFilesDir) {
+        return { messages: [], summaries: [], files: [], totalMatches: 0 };
+      }
+      const files = await this.summaryStore.searchLargeFiles({
+        query,
+        mode,
+        conversationId,
+        conversationIds,
+        fileIds,
+        since,
+        before,
+        limit,
+        largeFilesDir,
+      });
+      return { messages: [], summaries: [], files, totalMatches: files.length };
+    }
 
     const searchInput = { query, mode, conversationId, conversationIds, since, before, limit, sort };
 
@@ -353,6 +393,7 @@ export class RetrievalEngine {
     return {
       messages,
       summaries,
+      files: [],
       totalMatches: messages.length + summaries.length,
     };
   }
@@ -464,4 +505,87 @@ export class RetrievalEngine {
       }
     }
   }
+}
+
+function truncateToValidUtf8End(buf: Buffer, byteLength: number): number {
+  let safeEnd = byteLength;
+  while (safeEnd > 0) {
+    const b = buf[safeEnd - 1];
+    if ((b & 0x80) === 0) {
+      // ASCII: clean boundary.
+      break;
+    }
+    if ((b & 0xc0) === 0xc0) {
+      // Start byte. Count continuation bytes that follow it in the buffer.
+      const continuationBytes = byteLength - safeEnd;
+      const expectedContinuations =
+        (b & 0xf8) === 0xf0 ? 3 : // 11110xxx -> 4-byte sequence
+        (b & 0xf0) === 0xe0 ? 2 : // 1110xxxx -> 3-byte sequence
+        (b & 0xe0) === 0xc0 ? 1 : // 110xxxxx -> 2-byte sequence
+        -1; // invalid leading pattern
+      if (continuationBytes === expectedContinuations) {
+        // The multi-byte character is fully inside the buffer.
+        break;
+      }
+      // Incomplete sequence: drop the start byte and everything after it.
+      safeEnd -= 1;
+      break;
+    }
+    // Continuation byte: keep walking back to the start byte.
+    safeEnd -= 1;
+    if (byteLength - safeEnd > 4) {
+      // Bounded safety: no valid UTF-8 sequence exceeds 4 bytes.
+      break;
+    }
+  }
+  return safeEnd;
+}
+
+function readFileLineRange(
+  fd: number,
+  fileSize: number,
+  startLine: number,
+  endLine: number,
+  maxBytes: number,
+): { content: string; truncated: boolean } {
+  const readBytes = Math.min(fileSize, maxBytes);
+  const buf = Buffer.alloc(readBytes);
+  let bytesRead = 0;
+  while (bytesRead < readBytes) {
+    const n = readSync(fd, buf, bytesRead, readBytes - bytesRead, bytesRead);
+    if (n === 0) break;
+    bytesRead += n;
+  }
+
+  let safeEnd = truncateToValidUtf8End(buf, bytesRead);
+
+  const text = buf.subarray(0, safeEnd).toString("utf8");
+  const allLines = text.split(/\r?\n/);
+  const startIndex = Math.max(0, startLine - 1);
+  const hasExplicitEndLine = endLine !== Number.POSITIVE_INFINITY;
+  const endIndex = hasExplicitEndLine ? Math.min(allLines.length, endLine) : allLines.length;
+  const selectedLines = allLines.slice(startIndex, endIndex);
+
+  let content = selectedLines.join("\n");
+  // Truncated if we could not read the whole file, or the explicit endLine
+  // sits past EOF, or the selected slice itself exceeds the byte budget.
+  let truncated = bytesRead < fileSize || (hasExplicitEndLine && endLine > allLines.length);
+  if (Buffer.byteLength(content, "utf8") > maxBytes) {
+    let byteCount = 0;
+    let lastIndex = 0;
+    for (let i = 0; i < selectedLines.length; i++) {
+      const lineBytes = Buffer.byteLength(selectedLines[i], "utf8");
+      const sepBytes = i > 0 ? 1 : 0;
+      if (byteCount + sepBytes + lineBytes > maxBytes) {
+        lastIndex = i;
+        break;
+      }
+      byteCount += sepBytes + lineBytes;
+      lastIndex = i + 1;
+    }
+    content = selectedLines.slice(0, lastIndex).join("\n");
+    truncated = true;
+  }
+
+  return { content, truncated };
 }

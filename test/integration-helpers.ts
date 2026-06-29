@@ -567,6 +567,7 @@ export function createMockSummaryStore() {
         fileName: input.fileName ?? null,
         mimeType: input.mimeType ?? null,
         byteSize: input.byteSize ?? null,
+        lineCount: input.lineCount ?? null,
         storageUri: input.storageUri,
         explorationSummary: input.explorationSummary ?? null,
         createdAt: new Date(),

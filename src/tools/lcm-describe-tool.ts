@@ -55,8 +55,8 @@ const LcmDescribeSchema = Type.Object({
         "the original output of an elided tool result that was replaced with a " +
         "[LCM Tool Output: file_xxx | tool=… | N bytes] reference. Capped at " +
         "expandFileMaxBytes (default 32768 = ~8K tokens). Returns content + " +
-        "contentTruncated boolean. Use lcm_grep to search across the full file when " +
-        "it exceeds the cap.",
+        "contentTruncated boolean. Use lcm_grep(scope='files', fileIds=[file_xxx]) to " +
+        "search the full file content when it exceeds the cap.",
     }),
   ),
   expandFileMaxBytes: Type.Optional(
@@ -64,6 +64,24 @@ const LcmDescribeSchema = Type.Object({
       description: "Max bytes of inlined file content when expandFile=true. Default 32768. Hard cap 512000.",
       minimum: 1024,
       maximum: 512_000,
+    }),
+  ),
+  startLine: Type.Optional(
+    Type.Number({
+      description:
+        "1-based start line for a partial file read when expandFile=true. " +
+        "If provided, only lines from startLine to endLine (inclusive) are inlined. " +
+        "Line ranges are read from the first expandFileMaxBytes bytes of the file (hard cap 512KB); " +
+        "use lcm_grep(scope='files', fileIds=[id]) to locate content in larger files before selecting a range.",
+      minimum: 1,
+    }),
+  ),
+  endLine: Type.Optional(
+    Type.Number({
+      description:
+        "1-based end line for a partial file read when expandFile=true. Must be >= startLine. " +
+        "If omitted with startLine, reads through the last line available within the byte budget.",
+      minimum: 1,
     }),
   ),
 });
@@ -120,7 +138,8 @@ export function createLcmDescribeTool(input: {
       "reference in the conversation — that means an older tool result was elided " +
       "for context efficiency. Call lcm_describe(id=file_xxx, expandFile=true) to " +
       "fetch the original output content before answering questions that depend on " +
-      "its specifics.",
+      "its specifics. If the inlined content is truncated, use lcm_grep(scope='files', " +
+      "fileIds=[file_xxx]) to search the full file content.",
     parameters: LcmDescribeSchema,
     async execute(_toolCallId, params) {
       const lcm = input.lcm ?? (await input.getLcm?.());
@@ -160,9 +179,15 @@ export function createLcmDescribeTool(input: {
         typeof p.expandFileMaxBytes === "number" && Number.isFinite(p.expandFileMaxBytes)
           ? p.expandFileMaxBytes
           : undefined;
+      const startLine =
+        typeof p.startLine === "number" && Number.isFinite(p.startLine) ? p.startLine : undefined;
+      const endLine =
+        typeof p.endLine === "number" && Number.isFinite(p.endLine) ? p.endLine : undefined;
       const result = await retrieval.describe(id, {
         expandFile,
         expandFileMaxBytes,
+        startLine,
+        endLine,
         // Optional-chained for test mocks that may not expose configView.
         largeFilesDir: lcm.configView?.largeFilesDir,
       });
@@ -305,6 +330,9 @@ export function createLcmDescribeTool(input: {
         if (f.byteSize != null) {
           lines.push(`**Size:** ${f.byteSize.toLocaleString()} bytes`);
         }
+        if (f.lineCount != null) {
+          lines.push(`**Lines:** ${f.lineCount.toLocaleString()}`);
+        }
         lines.push(`**Created:** ${formatDisplayTime(f.createdAt, timezone)}`);
         if (f.explorationSummary) {
           lines.push("");
@@ -328,7 +356,7 @@ export function createLcmDescribeTool(input: {
             lines.push("");
             lines.push(
               `*Output truncated to ${f.content.length.toLocaleString()} of ${f.byteSize?.toLocaleString() ?? "?"} bytes. ` +
-              `Use lcm_grep against the file id to search the full content.*`,
+                `Use lcm_grep(scope='files', fileIds=['${result.id}']) to search the full content.*`,
             );
           }
         } else if (expandFile) {
