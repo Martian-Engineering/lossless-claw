@@ -72,9 +72,6 @@ export type ContextEngineMaintenanceResult = {
 
 export type ContextEngineMaintenanceRuntimeContext = Record<string, unknown> & {
   allowDeferredCompactionExecution?: boolean;
-  rewriteTranscriptEntries?: (
-    request: Record<string, unknown>,
-  ) => Promise<ContextEngineMaintenanceResult>;
 };
 
 export type IngestResult = {

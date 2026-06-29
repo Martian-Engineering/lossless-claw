@@ -1157,126 +1157,12 @@ describe("LcmContextEngine.ingest content extraction", () => {
     });
   });
 
-  it("lists summarized externalized tool results as transcript GC candidates", async () => {
+  it("maintain() does not rewrite transcript entries for GC", async () => {
     await withTempHome(async () => {
       const engine = createEngineWithConfig({ largeFileTokenThreshold: 20 });
       const sessionId = randomUUID();
+      const sessionFile = createSessionFilePath("transcript-gc-removed");
       const toolOutput = `${"tool output line\n".repeat(160)}done`;
-
-      await engine.ingest({
-        sessionId,
-        message: {
-          role: "assistant",
-          content: [
-            {
-              type: "toolCall",
-              id: "call_gc_candidate",
-              name: "exec",
-              input: { cmd: "pwd" },
-            },
-          ],
-        } as AgentMessage,
-      });
-
-      await engine.ingest({
-        sessionId,
-        message: {
-          role: "toolResult",
-          toolCallId: "call_gc_candidate",
-          toolName: "exec",
-          content: [
-            {
-              type: "tool_result",
-              tool_use_id: "call_gc_candidate",
-              name: "exec",
-              content: [{ type: "text", text: toolOutput }],
-            },
-          ],
-        } as AgentMessage,
-      });
-
-      const conversation = await engine
-        .getConversationStore()
-        .getConversationBySessionId(sessionId);
-      expect(conversation).not.toBeNull();
-
-      const storedMessages = await engine
-        .getConversationStore()
-        .getMessages(conversation!.conversationId);
-      const toolMessage = storedMessages[1];
-      expect(toolMessage?.role).toBe("tool");
-
-      const summaryId = `sum_${randomUUID().replace(/-/g, "").slice(0, 12)}`;
-      await engine.getSummaryStore().insertSummary({
-        summaryId,
-        conversationId: conversation!.conversationId,
-        kind: "leaf",
-        content: "summarized tool output",
-        tokenCount: 16,
-      });
-      await engine.getSummaryStore().linkSummaryToMessages(summaryId, [toolMessage.messageId]);
-      await engine.getSummaryStore().replaceContextRangeWithSummary({
-        conversationId: conversation!.conversationId,
-        startOrdinal: 1,
-        endOrdinal: 1,
-        summaryId,
-      });
-
-      const candidates = await engine
-        .getSummaryStore()
-        .listTranscriptGcCandidates(conversation!.conversationId);
-
-      expect(candidates).toHaveLength(1);
-      expect(candidates[0]).toMatchObject({
-        messageId: toolMessage.messageId,
-        conversationId: conversation!.conversationId,
-        toolCallId: "call_gc_candidate",
-        toolName: "exec",
-      });
-      expect(candidates[0]?.externalizedFileId).toMatch(/^file_[a-f0-9]{16}$/);
-      expect(candidates[0]?.originalByteSize).toBe(Buffer.byteLength(toolOutput, "utf8"));
-    });
-  });
-
-  it("maintain() defers transcript GC until host-approved background maintenance", async () => {
-    await withTempHome(async () => {
-      const engine = createEngineWithConfig({
-        largeFileTokenThreshold: 20,
-        transcriptGcEnabled: true,
-      });
-      const sessionId = randomUUID();
-      const sessionFile = createSessionFilePath("transcript-gc-maintain");
-      const toolOutput = `${"tool output line\n".repeat(160)}done`;
-
-      const sm = SessionManager.open(sessionFile);
-      appendSessionMessage(sm, {
-        role: "assistant",
-        content: [
-          {
-            type: "toolCall",
-            id: "call_gc_rewrite",
-            name: "exec",
-            arguments: { cmd: "pwd" },
-          },
-        ],
-      } as AgentMessage);
-      const toolResultEntryId = appendSessionMessage(sm, {
-        role: "toolResult",
-        toolCallId: "call_gc_rewrite",
-        toolName: "exec",
-        content: [
-          {
-            type: "tool_result",
-            tool_use_id: "call_gc_rewrite",
-            name: "exec",
-            content: [{ type: "text", text: toolOutput }],
-          },
-        ],
-      } as AgentMessage);
-      appendSessionMessage(sm, {
-        role: "assistant",
-        content: [{ type: "text", text: "done" }],
-      } as AgentMessage);
 
       await engine.ingest({
         sessionId,
@@ -1351,22 +1237,6 @@ describe("LcmContextEngine.ingest content extraction", () => {
         rewrittenEntries: request.replacements.length,
       }));
 
-      const deferred = await engine.maintain({
-        sessionId,
-        sessionFile,
-        runtimeContext: {
-          rewriteTranscriptEntries,
-        },
-      });
-
-      expect(deferred).toEqual({
-        changed: false,
-        bytesFreed: 0,
-        rewrittenEntries: 0,
-        reason: "transcript GC deferred until host-approved background maintenance",
-      });
-      expect(rewriteTranscriptEntries).not.toHaveBeenCalled();
-
       const result = await engine.maintain({
         sessionId,
         sessionFile,
@@ -1377,88 +1247,10 @@ describe("LcmContextEngine.ingest content extraction", () => {
       });
 
       expect(result).toEqual({
-        changed: true,
-        bytesFreed: 123,
-        rewrittenEntries: 1,
-      });
-      expect(rewriteTranscriptEntries).toHaveBeenCalledTimes(1);
-      expect(rewriteTranscriptEntries).toHaveBeenCalledWith({
-        replacements: [
-          {
-            entryId: toolResultEntryId,
-            message: expect.objectContaining({
-              role: "toolResult",
-              toolCallId: "call_gc_rewrite",
-              toolName: "exec",
-            }),
-          },
-        ],
-      });
-
-      const replacement = (
-        rewriteTranscriptEntries.mock.calls[0]?.[0] as {
-          replacements?: Array<{ message?: { content?: unknown } }>;
-        }
-      )?.replacements?.[0]?.message;
-      expect(replacement?.content).toEqual([
-        expect.objectContaining({
-          type: "tool_result",
-          tool_use_id: "call_gc_rewrite",
-          name: "exec",
-          output: expect.stringContaining("[LCM Tool Output: file_"),
-        }),
-      ]);
-
-      const bootstrapState = await engine
-        .getSummaryStore()
-        .getConversationBootstrapState(conversation!.conversationId);
-      const sessionFileStats = statSync(sessionFile);
-      expect(bootstrapState).not.toBeNull();
-      expect(bootstrapState?.lastSeenSize).toBe(sessionFileStats.size);
-      expect(bootstrapState?.lastSeenMtimeMs).toBe(Math.trunc(sessionFileStats.mtimeMs));
-      expect(bootstrapState?.lastProcessedOffset).toBe(sessionFileStats.size);
-      expect(bootstrapState?.lastProcessedEntryHash).toMatch(/^[a-f0-9]{64}$/);
-
-      const reconcileSpy = vi.spyOn(engine.getTranscriptReconciler(), "reconcileSessionTail");
-      const bootstrap = await engine.bootstrap({ sessionId, sessionFile });
-      expect(bootstrap).toEqual({
-        bootstrapped: false,
-        importedMessages: 0,
-        reason: "conversation already up to date",
-      });
-      expect(reconcileSpy).not.toHaveBeenCalled();
-    });
-  });
-
-  it("maintain() skips transcript GC when transcriptGcEnabled is false", async () => {
-    await withTempHome(async () => {
-      const engine = createEngineWithConfig({
-        transcriptGcEnabled: false,
-      });
-      const sessionId = randomUUID();
-      const sessionFile = createSessionFilePath("transcript-gc-disabled");
-      const rewriteTranscriptEntries = vi.fn();
-
-      const ingested = await engine.ingest({
-        sessionId,
-        message: makeMessage({ role: "user", content: "keep LCM active" }),
-      });
-
-      expect(ingested).toEqual({ ingested: true });
-
-      const result = await engine.maintain({
-        sessionId,
-        sessionFile,
-        runtimeContext: {
-          rewriteTranscriptEntries,
-        },
-      });
-
-      expect(result).toEqual({
         changed: false,
         bytesFreed: 0,
         rewrittenEntries: 0,
-        reason: "transcript GC disabled",
+        reason: "no deferred maintenance work",
       });
       expect(rewriteTranscriptEntries).not.toHaveBeenCalled();
       expect(await engine.getConversationStore().getConversationBySessionId(sessionId)).not.toBeNull();
@@ -1532,4 +1324,3 @@ describe("LcmContextEngine.ingest content extraction", () => {
     ]);
   });
 });
-

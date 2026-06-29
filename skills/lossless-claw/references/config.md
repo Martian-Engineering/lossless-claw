@@ -315,15 +315,6 @@ Why it matters:
 - lower values externalize more aggressively
 - higher values keep more payload inline but can bloat storage and compaction inputs
 
-### `transcriptGcEnabled`
-
-Controls whether `maintain()` rewrites transcript entries for already-externalized tool results.
-
-Why it matters:
-
-- keep this off unless you want transcript GC to mutate the live session file during maintenance
-- the default is `false`
-
 ### `enableSummaryThinking`
 
 Controls whether the summarization model receives a low reasoning budget.
@@ -350,33 +341,9 @@ Why it matters:
 - `/lossless status` (`/lcm status` alias) surfaces pending/running/last-failure maintenance state so operators can see when compaction is queued
 - after-turn background drain and host-approved `maintain()` consume routine threshold debt; `assemble()` only drains pending threshold debt synchronously as an emergency safeguard when the live prompt estimate is already over budget
 
-### `autoRotateSessionFiles`
+### Active Transcript Storage
 
-Automatically rotates oversized LCM-managed session JSONL files.
-
-Defaults:
-
-- `enabled: true`
-- `createBackups: false`
-- `sizeBytes: 2097152`
-- `startup: "rotate"`
-- `runtime: "rotate"`
-
-Why it matters:
-
-- prevents very large OpenClaw session JSONL files from choking fallback/gateway startup while LCM owns the durable context
-- runtime rotation only creates or replaces the rolling `rotate-latest` DB backup when `createBackups` is `true`; manual `/lossless rotate` always keeps its backup-backed behavior
-- runtime JSONL rewrites run from `afterTurn()` after the host turn completes; `maintain()` skips rotation and leaves it to `afterTurn()` or startup because background maintenance can overlap an embedded model call
-- startup scans OpenClaw's current indexed session stores for configured agents, intersects those candidates with active LCM bootstrap state, and creates one pre-rotation DB backup for the startup batch only when `createBackups` is `true`
-- only runs for active, writable LCM conversations; ignored sessions, stateless sessions, sessions outside the indexed startup candidate set, and sessions without active LCM state are skipped
-- the preserved transcript tail follows the normal rotate behavior controlled by `freshTailCount`
-
-Operational logging:
-
-- every decision is logged with the prefix `[lcm] auto-rotate:`
-- startup emits one compact `action=summary` line with `scanned`, `eligible`, `rotated`, `warned`, `skipped`, `durationMs`, and `bytesRemoved`
-- rotate logs include `phase`, `action`, `sessionId`, `sessionKey`, `sessionFile`, `sizeBytes`, `thresholdBytes`, `durationMs`, `backupPath`, `bytesRemoved`, `preservedTailMessageCount`, and `checkpointSize`
-- real warning logs include the same available context plus `reason` or `error`; quiet startup skips such as missing files, missing bootstrap mappings, and below-threshold files are counted in the summary instead of logged per candidate
+Lossless-claw no longer rewrites active OpenClaw transcripts for transcript GC or session-file rotation. SQLite-backed OpenClaw owns active transcript storage; Lossless stores durable conversation, summary, and recall data in its own SQLite database.
 
 ### `independentLogFile`
 

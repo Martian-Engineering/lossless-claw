@@ -271,10 +271,6 @@
       "label": "Prune HEARTBEAT_OK",
       "help": "Retroactively delete HEARTBEAT_OK turn cycles from LCM storage"
     },
-    "transcriptGcEnabled": {
-      "label": "Transcript GC",
-      "help": "Enable transcript rewrite GC during maintain(); disabled by default"
-    },
     "enableSummaryThinking": {
       "label": "Enable Summary Thinking",
       "help": "Request low reasoning budget from the model during summarization calls"
@@ -282,26 +278,6 @@
     "proactiveThresholdCompactionMode": {
       "label": "Proactive Threshold Compaction Mode",
       "help": "Choose deferred compaction debt by default or keep legacy inline proactive compaction"
-    },
-    "autoRotateSessionFiles.enabled": {
-      "label": "Auto-Rotate Session Files",
-      "help": "Automatically rotate oversized LCM-managed session JSONL files after startup and runtime checks"
-    },
-    "autoRotateSessionFiles.createBackups": {
-      "label": "Auto-Rotate Backups",
-      "help": "Create the rolling rotate-latest SQLite backup before automatic session-file rotation; disabled by default"
-    },
-    "autoRotateSessionFiles.sizeBytes": {
-      "label": "Auto-Rotate Size Bytes",
-      "help": "Session JSONL byte threshold for automatic rotation (default: 2097152)"
-    },
-    "autoRotateSessionFiles.startup": {
-      "label": "Startup Auto-Rotate",
-      "help": "Startup behavior for oversized indexed OpenClaw session files with active LCM state: rotate, warn, or off"
-    },
-    "autoRotateSessionFiles.runtime": {
-      "label": "Runtime Auto-Rotate",
-      "help": "Runtime behavior for oversized current LCM session files: rotate, warn, or off"
     },
     "independentLogFile.enabled": {
       "label": "Independent Log File",
@@ -606,9 +582,6 @@
       "pruneHeartbeatOk": {
         "type": "boolean"
       },
-      "transcriptGcEnabled": {
-        "type": "boolean"
-      },
       "enableSummaryThinking": {
         "type": "boolean"
       },
@@ -618,38 +591,6 @@
           "deferred",
           "inline"
         ]
-      },
-      "autoRotateSessionFiles": {
-        "type": "object",
-        "additionalProperties": false,
-        "properties": {
-          "enabled": {
-            "type": "boolean"
-          },
-          "createBackups": {
-            "type": "boolean"
-          },
-          "sizeBytes": {
-            "type": "integer",
-            "minimum": 1
-          },
-          "startup": {
-            "type": "string",
-            "enum": [
-              "rotate",
-              "warn",
-              "off"
-            ]
-          },
-          "runtime": {
-            "type": "string",
-            "enum": [
-              "rotate",
-              "warn",
-              "off"
-            ]
-          }
-        }
       },
       "independentLogFile": {
         "type": "object",

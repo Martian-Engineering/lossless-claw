@@ -24,7 +24,6 @@ export function resolveOpenclawStateDir(env: NodeJS.ProcessEnv = process.env): s
  * plugin config and status surfaces.
  */
 export const DEFAULT_CRITICAL_BUDGET_PRESSURE_RATIO = 0.90;
-export const DEFAULT_AUTO_ROTATE_SESSION_FILE_SIZE_BYTES = 2 * 1024 * 1024;
 export const DEFAULT_SUMMARY_CALL_WINDOW_MS = 10 * 60 * 1000;
 export const DEFAULT_SUMMARY_MAX_CALLS_PER_WINDOW = 24;
 export const DEFAULT_SUMMARY_SPEND_BACKOFF_MS = 30 * 60 * 1000;
@@ -46,15 +45,6 @@ export type DynamicLeafChunkTokensConfig = {
 };
 
 export type ProactiveThresholdCompactionMode = "deferred" | "inline";
-export type AutoRotateSessionFileMode = "rotate" | "warn" | "off";
-
-export type AutoRotateSessionFilesConfig = {
-  enabled: boolean;
-  createBackups: boolean;
-  sizeBytes: number;
-  startup: AutoRotateSessionFileMode;
-  runtime: AutoRotateSessionFileMode;
-};
 
 export type IndependentLogFileConfig = {
   enabled: boolean;
@@ -161,14 +151,10 @@ export type LcmConfig = {
   timezone: string;
   /** When true, retroactively delete HEARTBEAT_OK turn cycles from LCM storage. */
   pruneHeartbeatOk: boolean;
-  /** When true, maintain() may rewrite transcript entries for transcript GC. */
-  transcriptGcEnabled: boolean;
   /** When true, requests low reasoning from the model for summarization calls. */
   enableSummaryThinking: boolean;
   /** Controls whether proactive threshold compaction runs inline or is deferred. */
   proactiveThresholdCompactionMode: ProactiveThresholdCompactionMode;
-  /** Automatically rotate LCM-managed session JSONL files that exceed a size ceiling. */
-  autoRotateSessionFiles: AutoRotateSessionFilesConfig;
   /** Lossless-owned JSONL log file, written in addition to the OpenClaw runtime logger. */
   independentLogFile: IndependentLogFileConfig;
   /** Hard ceiling for assembly token budget — caps runtime-provided and fallback budgets. */
@@ -322,14 +308,6 @@ function toProactiveThresholdCompactionMode(
 ): ProactiveThresholdCompactionMode | undefined {
   const normalized = toStr(value)?.toLowerCase();
   if (normalized === "inline" || normalized === "deferred") {
-    return normalized;
-  }
-  return undefined;
-}
-
-function toAutoRotateSessionFileMode(value: unknown): AutoRotateSessionFileMode | undefined {
-  const normalized = toStr(value)?.toLowerCase();
-  if (normalized === "rotate" || normalized === "warn" || normalized === "off") {
     return normalized;
   }
   return undefined;
@@ -552,15 +530,10 @@ export function resolveLcmConfigWithDiagnostics(
   const pc = pluginConfig ?? {};
   const cacheAwareCompaction = toRecord(pc.cacheAwareCompaction);
   const dynamicLeafChunkTokens = toRecord(pc.dynamicLeafChunkTokens);
-  const autoRotateSessionFiles = toRecord(pc.autoRotateSessionFiles);
   const independentLogFile = toRecord(pc.independentLogFile);
   const proactiveThresholdCompactionMode = toProactiveThresholdCompactionMode(
     env.LCM_PROACTIVE_THRESHOLD_COMPACTION_MODE,
   ) ?? toProactiveThresholdCompactionMode(pc.proactiveThresholdCompactionMode) ?? "deferred";
-  const autoRotateSessionFileSizeBytes =
-    toPositiveInteger(parseFiniteInt(env.LCM_AUTO_ROTATE_SESSION_FILES_SIZE_BYTES))
-      ?? toPositiveInteger(toNumber(autoRotateSessionFiles?.sizeBytes))
-      ?? DEFAULT_AUTO_ROTATE_SESSION_FILE_SIZE_BYTES;
   const resolvedLeafChunkTokens =
     parseFiniteInt(env.LCM_LEAF_CHUNK_TOKENS)
       ?? toNumber(pc.leafChunkTokens) ?? 20000;
@@ -763,34 +736,11 @@ export function resolveLcmConfigWithDiagnostics(
         env.LCM_PRUNE_HEARTBEAT_OK !== undefined
           ? env.LCM_PRUNE_HEARTBEAT_OK === "true"
           : toBool(pc.pruneHeartbeatOk) ?? false,
-      transcriptGcEnabled:
-        env.LCM_TRANSCRIPT_GC_ENABLED !== undefined
-          ? env.LCM_TRANSCRIPT_GC_ENABLED === "true"
-          : toBool(pc.transcriptGcEnabled) ?? false,
       enableSummaryThinking:
         env.LCM_ENABLE_SUMMARY_THINKING !== undefined
           ? env.LCM_ENABLE_SUMMARY_THINKING === "true"
           : toBool(pc.enableSummaryThinking) ?? true,
       proactiveThresholdCompactionMode,
-      autoRotateSessionFiles: {
-        enabled:
-          env.LCM_AUTO_ROTATE_SESSION_FILES_ENABLED !== undefined
-            ? env.LCM_AUTO_ROTATE_SESSION_FILES_ENABLED !== "false"
-            : toBool(autoRotateSessionFiles?.enabled) ?? true,
-        createBackups:
-          env.LCM_AUTO_ROTATE_SESSION_FILES_CREATE_BACKUPS !== undefined
-            ? env.LCM_AUTO_ROTATE_SESSION_FILES_CREATE_BACKUPS === "true"
-            : toBool(autoRotateSessionFiles?.createBackups) ?? false,
-        sizeBytes: autoRotateSessionFileSizeBytes,
-        startup:
-          toAutoRotateSessionFileMode(env.LCM_AUTO_ROTATE_SESSION_FILES_STARTUP)
-            ?? toAutoRotateSessionFileMode(autoRotateSessionFiles?.startup)
-            ?? "rotate",
-        runtime:
-          toAutoRotateSessionFileMode(env.LCM_AUTO_ROTATE_SESSION_FILES_RUNTIME)
-            ?? toAutoRotateSessionFileMode(autoRotateSessionFiles?.runtime)
-            ?? "rotate",
-      },
       independentLogFile: {
         enabled:
           env.LCM_LOG_FILE_ENABLED !== undefined

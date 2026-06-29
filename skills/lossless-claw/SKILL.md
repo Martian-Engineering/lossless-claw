@@ -14,7 +14,7 @@ Start here:
 3. If they are debugging lossless-claw behavior or failures, check the independent Lossless log before the shared OpenClaw gateway log.
 4. If they suspect summary corruption or truncation, use `/lossless doctor`.
 5. If they want high-confidence junk/session cleanup guidance, use `/lossless doctor clean` before recommending any deletes.
-6. If they ask how `/new`, `/reset`, or `/lossless rotate` interacts with LCM, read the session-lifecycle reference before answering.
+6. If they ask how `/new` or `/reset` interacts with LCM, read the session-lifecycle reference before answering.
 7. Load the relevant reference file instead of improvising details from memory.
 
 Reference map:
@@ -23,7 +23,7 @@ Reference map:
 - Internal model and data flow: `references/architecture.md`
 - Diagnostics and summary-health workflow: `references/diagnostics.md`
 - Recall tools and when to use them: `references/recall-tools.md`
-- `/new`, `/reset`, and `/lossless rotate` behavior with current lossless-claw session mapping: `references/session-lifecycle.md`
+- `/new` and `/reset` behavior with current lossless-claw session mapping: `references/session-lifecycle.md`
 
 Working rules:
 

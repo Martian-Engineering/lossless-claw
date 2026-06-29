@@ -104,14 +104,6 @@ export type ParseAgentSessionKeyFn = (sessionKey: string) => {
 
 export type IsSubagentSessionKeyFn = (sessionKey: string) => boolean;
 
-export type StartupSessionFileCandidate = {
-  sessionId: string;
-  sessionKey: string;
-  sessionFile: string;
-  agentId?: string;
-  storePath?: string;
-};
-
 /** Storage-neutral OpenClaw session identity for transcript reads. */
 export type SessionTranscriptReadTarget = {
   sessionId: string;
@@ -190,9 +182,6 @@ export interface LcmDependencies {
   readVisibleSessionTranscriptMessageEntries?: (
     target: SessionTranscriptReadTarget,
   ) => Promise<VisibleSessionTranscriptMessageEntry[]>;
-
-  /** List OpenClaw-indexed session files that startup recovery may enumerate. */
-  listStartupSessionFileCandidates?: () => Promise<StartupSessionFileCandidate[]>;
 
   /** Agent lane constant for subagents */
   agentLaneSubagent: string;

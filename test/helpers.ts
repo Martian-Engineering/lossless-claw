@@ -12,7 +12,7 @@ import { SessionManager } from "@earendil-works/pi-coding-agent";
 import { expect, vi } from "vitest";
 import type { LcmConfig } from "../src/db/config.js";
 import { closeLcmConnection, createLcmDatabaseConnection } from "../src/db/connection.js";
-import { LcmContextEngine, type RotateSessionStorageResult } from "../src/engine.js";
+import { LcmContextEngine } from "../src/engine.js";
 import type { AgentMessage } from "../src/openclaw-bridge.js";
 import { resetDelegatedExpansionGrantsForTests } from "../src/expansion-auth.js";
 import type { LcmDependencies } from "../src/types.js";
@@ -23,13 +23,6 @@ export function appendSessionMessage(manager: SessionManager, message: AgentMess
   return manager.appendMessage(
     message as unknown as Parameters<SessionManager["appendMessage"]>[0],
   );
-}
-
-export function expectUnavailableRotate(
-  result: RotateSessionStorageResult,
-): Extract<RotateSessionStorageResult, { kind: "unavailable" }> {
-  expect(result.kind).toBe("unavailable");
-  return result as Extract<RotateSessionStorageResult, { kind: "unavailable" }>;
 }
 
 export function getEngineConfig(engine: LcmContextEngine): LcmConfig {
@@ -80,16 +73,8 @@ export function createTestConfig(
     summaryTimeoutMs: 60_000,
     timezone: "UTC",
     pruneHeartbeatOk: false,
-    transcriptGcEnabled: false,
     enableSummaryThinking: true,
     proactiveThresholdCompactionMode: "deferred",
-    autoRotateSessionFiles: {
-      enabled: true,
-      createBackups: false,
-      sizeBytes: 2 * 1024 * 1024,
-      startup: "rotate",
-      runtime: "rotate",
-    },
     independentLogFile: {
       enabled: false,
       maxFileBytes: 100 * 1024 * 1024,

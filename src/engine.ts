@@ -11,12 +11,13 @@ import type {
   AssembleResult,
   BootstrapResult,
   CompactResult,
+  ContextEngineMaintenanceResult,
   IngestBatchResult,
   IngestResult,
   SubagentEndReason,
   SubagentSpawnPreparation,
 } from "./openclaw-bridge.js";
-import { contentFromParts, ContextAssembler, pickToolCallId, pickToolIsError, pickToolName } from "./assembler.js";
+import { ContextAssembler } from "./assembler.js";
 import { CompactionEngine, type CompactionConfig } from "./compaction.js";
 import { BatchDeduplicator } from "./batch-dedup.js";
 import { CompactionGuards } from "./compaction-guards.js";
@@ -65,14 +66,6 @@ import { attachTranscriptEntryMeta, getTranscriptEntryId, readAppendedLeafPathMe
 import { type TranscriptReconcileResult } from "./reconcile-plan.js";
 import { checkpointIsPastTranscriptEof, TranscriptReconciler } from "./transcript-reconciler.js";
 import { AMBIGUOUS_SESSION_KEY_RUNTIME_ROLLOVER_REASON, SessionRolloverDetector } from "./session-rollover.js";
-import {
-  SessionRotationService,
-  type ContextEngineMaintenanceResult,
-  type RotateSessionStorageResult,
-  type RotateSessionStorageWithBackupResult,
-  type TranscriptRewriteReplacement,
-  type TranscriptRewriteRequest,
-} from "./session-rotation.js";
 import { describeAssembledPrefixChange, formatOverflowDiagnosticsForLog, shouldLogOverflowDiagnostics, type AssemblePrefixSnapshot, type BootstrapImportObservation } from "./assemble-debug.js";
 import { appendForkBoundedLiveSuffixWithinBudget, buildDegradedLiveAssembleResult, buildForkBoundedLiveFallback, clampMessagesToSerializedBudget, resolveDeferredAssemblyPressure } from "./assemble-fallback.js";
 import { resolveBootstrapMaxTokens, trimBootstrapMessagesToBudget } from "./bootstrap-budget.js";
@@ -82,7 +75,6 @@ import { buildMessageParts, extractMessageContent, filterPersistableMessages, ha
 import { createBootstrapEntryHash, readBootstrapMessageFromJsonLine } from "./message-signatures.js";
 import { canonicalizeOpenClawInboundMetadataIdentityContent } from "./openclaw-inbound-metadata.js";
 import { PROMPT_RECALL_MAX_MESSAGES, PROMPT_RECALL_SEARCH_CANDIDATE_LIMIT, buildPromptRecallProjectionFingerprint, extractPromptRecallIdentifiers, extractPromptRecallSnippet, findPromptRecallIdentifierIndex, isPromptRecallEligibleRole, normalizePromptRecallCoverageText, normalizePromptRecallText, renderPromptRecallMessage } from "./prompt-recall.js";
-import { listTranscriptToolResultEntryIdsByCallId } from "./replay-metadata.js";
 import { estimateSessionTokenCountForAfterTurn, extractRuntimePromptTokenCount } from "./token-accounting.js";
 import { asRecord, formatDurationMs, resolvePositiveInteger } from "./value-utils.js";
 
@@ -121,9 +113,6 @@ type CompactionExecutionParams = {
 };
 type ContextEngineMaintenanceRuntimeContext = Record<string, unknown> & {
   allowDeferredCompactionExecution?: boolean;
-  rewriteTranscriptEntries?: (
-    request: TranscriptRewriteRequest,
-  ) => Promise<ContextEngineMaintenanceResult>;
 };
 type DeferredCompactionDebtDrainParams = {
   conversationId: number;
@@ -184,8 +173,6 @@ function buildFocusProjectionKey(brief?: FocusBriefRecord | null): string | null
   return hash.digest("hex").slice(0, 32);
 }
 
-
-const TRANSCRIPT_GC_BATCH_SIZE = 12;
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
 
@@ -327,9 +314,6 @@ export class LcmContextEngine implements ContextEngine {
 
   // ── Scoped context-threshold override resolution ─────────────────────────
   private readonly contextThresholdResolver: ContextThresholdResolver;
-
-  // ── Managed session-file rotation ────────────────────────────────────────
-  private readonly sessionRotation: SessionRotationService;
 
   // ── Transcript/DB tail reconciliation ────────────────────────────────────
   private readonly transcriptReconciler: TranscriptReconciler;
@@ -522,33 +506,6 @@ export class LcmContextEngine implements ContextEngine {
       },
       this.sessionRolloverDetector,
     );
-    this.sessionRotation = new SessionRotationService({
-      config: this.config,
-      db: this.db,
-      deps: this.deps,
-      info: this.info,
-      conversationStore: this.conversationStore,
-      summaryStore: this.summaryStore,
-      compaction: this.compaction,
-      compactionGuards: this.compactionGuards,
-      compactionTelemetryStore: this.compactionTelemetryStore,
-      ensureMigrated: () => this.ensureMigrated(),
-      shouldIgnoreSession: (params) => this.shouldIgnoreSession(params),
-      isStatelessSession: (sessionKey) => this.isStatelessSession(sessionKey),
-      resolveSessionQueueKey: (sessionId, sessionKey) =>
-        this.resolveSessionQueueKey(sessionId, sessionKey),
-      withSessionQueue: (queueKey, operation, options) =>
-        this.withSessionQueue(queueKey, operation, options),
-      resolveSummarize: (params) => this.resolveSummarize(params),
-      buildSummarizerLegacyParams: (params) => this.buildSummarizerLegacyParams(params),
-      applyAssemblyBudgetCap: (budget) => this.applyAssemblyBudgetCap(budget),
-      refreshBootstrapState: (params) => this.transcriptReconciler.refreshBootstrapState(params),
-      reconcileTranscriptTailForAfterTurn: (params) =>
-        this.transcriptReconciler.reconcileTranscriptTailForAfterTurn(params),
-      reconcileTranscriptTailForAfterTurnInSessionQueue: (params) =>
-        this.transcriptReconciler.reconcileTranscriptTailForAfterTurnInSessionQueue(params),
-    });
-
     this.retrieval = new RetrievalEngine(this.conversationStore, this.summaryStore);
   }
 
@@ -2503,44 +2460,6 @@ export class LcmContextEngine implements ContextEngine {
     return result;
   }
 
-  /**
-   * Rebuild a compact tool-result message from stored message parts.
-   *
-   * The first transcript-GC pass only rewrites tool results that were already
-   * externalized into large_files during ingest, so the stored placeholder is
-   * the canonical replacement content.
-   */
-  private async buildTranscriptGcReplacementMessage(
-    messageId: number,
-  ): Promise<AgentMessage | null> {
-    const message = await this.conversationStore.getMessageById(messageId);
-    if (!message) {
-      return null;
-    }
-
-    const parts = await this.conversationStore.getMessageParts(messageId);
-    const toolCallId = pickToolCallId(parts);
-    if (!toolCallId) {
-      return null;
-    }
-
-    const content = contentFromParts(parts, "toolResult", message.content);
-    const toolName = pickToolName(parts) ?? "unknown";
-    const isError = pickToolIsError(parts);
-
-    return {
-      role: "toolResult",
-      toolCallId,
-      toolName,
-      content,
-      ...(isError !== undefined ? { isError } : {}),
-    } as AgentMessage;
-  }
-
-  /**
-   * Run transcript GC for summarized tool-result messages that already have a
-   * large_files-backed placeholder stored in LCM.
-   */
   async maintain(params: {
     sessionId: string;
     sessionFile: string;
@@ -2549,19 +2468,7 @@ export class LcmContextEngine implements ContextEngine {
   }): Promise<ContextEngineMaintenanceResult> {
     const hostApprovedRuntimeMaintenance =
       params.runtimeContext?.allowDeferredCompactionExecution === true;
-    const runRuntimeAutoRotate = async (): Promise<void> => {
-      await this.sessionRotation.maybeAutoRotateManagedSessionFile({
-        phase: "runtime",
-        caller: "maintain",
-        sessionId: params.sessionId,
-        sessionKey: params.sessionKey,
-        sessionFile: params.sessionFile,
-        allowSessionFileRewrite: false,
-        rewriteDeferralReason: "runtime-session-file-rewrite-deferred-to-startup-or-manual-rotate",
-      });
-    };
     if (this.shouldIgnoreSession({ sessionId: params.sessionId, sessionKey: params.sessionKey })) {
-      await runRuntimeAutoRotate();
       return {
         changed: false,
         bytesFreed: 0,
@@ -2570,7 +2477,6 @@ export class LcmContextEngine implements ContextEngine {
       };
     }
     if (this.isStatelessSession(params.sessionKey)) {
-      await runRuntimeAutoRotate();
       return {
         changed: false,
         bytesFreed: 0,
@@ -2634,128 +2540,17 @@ export class LcmContextEngine implements ContextEngine {
           );
         }
 
-        if (!this.config.transcriptGcEnabled) {
-          return (
-            deferredCompactionResult ?? {
-              changed: false,
-              bytesFreed: 0,
-              rewrittenEntries: 0,
-              reason: "transcript GC disabled",
-            }
-          );
-        }
-
-        if (!hostApprovedRuntimeMaintenance) {
-          return (
-            deferredCompactionResult ?? {
-              changed: false,
-              bytesFreed: 0,
-              rewrittenEntries: 0,
-              reason: "transcript GC deferred until host-approved background maintenance",
-            }
-          );
-        }
-
-        if (typeof params.runtimeContext?.rewriteTranscriptEntries !== "function") {
-          return (
-            deferredCompactionResult ?? {
-              changed: false,
-              bytesFreed: 0,
-              rewrittenEntries: 0,
-              reason: "runtime rewrite helper unavailable",
-            }
-          );
-        }
-
-        const rewriteTranscriptEntries = params.runtimeContext.rewriteTranscriptEntries;
-        const candidates = await this.summaryStore.listTranscriptGcCandidates(
-          conversation.conversationId,
-          { limit: TRANSCRIPT_GC_BATCH_SIZE },
-        );
-        if (candidates.length === 0) {
-          this.deps.log.debug(
-            `[lcm] maintain: no transcript GC candidates conversation=${conversation.conversationId} ${sessionLabel} duration=${formatDurationMs(Date.now() - startedAt)}`,
-          );
-          return deferredCompactionResult ?? {
+        return (
+          deferredCompactionResult ?? {
             changed: false,
             bytesFreed: 0,
             rewrittenEntries: 0,
-            reason: "no transcript GC candidates",
-          };
-        }
-
-        const transcriptEntryIdsByCallId = await listTranscriptToolResultEntryIdsByCallId(
-          params.sessionFile,
+            reason: "no deferred maintenance work",
+          }
         );
-        const replacements: TranscriptRewriteReplacement[] = [];
-        const seenEntryIds = new Set<string>();
-
-        for (const candidate of candidates) {
-          const entryId = transcriptEntryIdsByCallId.get(candidate.toolCallId);
-          if (!entryId || seenEntryIds.has(entryId)) {
-            continue;
-          }
-
-          const replacementMessage = await this.buildTranscriptGcReplacementMessage(
-            candidate.messageId,
-          );
-          if (!replacementMessage) {
-            continue;
-          }
-
-          seenEntryIds.add(entryId);
-          replacements.push({
-            entryId,
-            message: replacementMessage,
-          });
-        }
-
-        if (replacements.length === 0) {
-          this.deps.log.debug(
-            `[lcm] maintain: no matching transcript entries conversation=${conversation.conversationId} ${sessionLabel} candidates=${candidates.length} duration=${formatDurationMs(Date.now() - startedAt)}`,
-          );
-          return deferredCompactionResult ?? {
-            changed: false,
-            bytesFreed: 0,
-            rewrittenEntries: 0,
-            reason: "no matching transcript entries",
-          };
-        }
-
-        const result = await rewriteTranscriptEntries({
-          replacements,
-        });
-
-        if (result.changed) {
-          try {
-            await this.transcriptReconciler.refreshBootstrapState({
-              conversationId: conversation.conversationId,
-              sessionFile: params.sessionFile,
-            });
-          } catch (e) {
-            this.deps.log.warn(
-              `[lcm] Failed to update bootstrap checkpoint after maintain: ${describeLogError(e)}`,
-            );
-          }
-        }
-
-        const combinedResult = deferredCompactionResult
-          ? {
-              changed: deferredCompactionResult.changed || result.changed,
-              bytesFreed: result.bytesFreed,
-              rewrittenEntries: result.rewrittenEntries,
-              reason: result.reason ?? deferredCompactionResult.reason,
-            }
-          : result;
-
-        this.deps.log.debug(
-          `[lcm] maintain: done conversation=${conversation.conversationId} ${sessionLabel} candidates=${candidates.length} replacements=${replacements.length} changed=${combinedResult.changed} rewrittenEntries=${combinedResult.rewrittenEntries} bytesFreed=${combinedResult.bytesFreed} duration=${formatDurationMs(Date.now() - startedAt)}`,
-        );
-        return combinedResult;
       },
       { operationName: "maintain", context: sessionLabel },
     );
-    await runRuntimeAutoRotate();
     return result;
   }
   private async ingestSingle(params: {
@@ -3064,23 +2859,10 @@ export class LcmContextEngine implements ContextEngine {
     /** Back-compat param name. */
     legacyCompactionParams?: Record<string, unknown>;
   }): Promise<void> {
-    const runRuntimeAutoRotate = async (): Promise<void> => {
-      await this.sessionRotation.maybeAutoRotateManagedSessionFile({
-        phase: "runtime",
-        caller: "after-turn",
-        sessionId: params.sessionId,
-        sessionKey: params.sessionKey,
-        sessionFile: params.sessionFile,
-        allowSessionFileRewrite: false,
-        rewriteDeferralReason: "after-turn-session-file-rewrite-deferred-to-startup-or-manual-rotate",
-      });
-    };
     if (this.shouldIgnoreSession({ sessionId: params.sessionId, sessionKey: params.sessionKey })) {
-      await runRuntimeAutoRotate();
       return;
     }
     if (this.isStatelessSession(params.sessionKey)) {
-      await runRuntimeAutoRotate();
       return;
     }
     this.ensureMigrated();
@@ -3136,7 +2918,6 @@ export class LcmContextEngine implements ContextEngine {
         );
       }
       if (transcriptReconcileBlockedByAmbiguousRollover) {
-        await runRuntimeAutoRotate();
         return;
       }
     } else if (transcriptReconcileResult.transcriptCovered) {
@@ -3221,18 +3002,6 @@ export class LcmContextEngine implements ContextEngine {
         this.deps.log.error(
           `[lcm] afterTurn: ingest failed, skipping compaction: ${describeLogError(err)}`,
         );
-        this.sessionRotation.logAutoRotateSessionFileDecision({
-          phase: "runtime",
-          action: "skip",
-          sessionId: params.sessionId,
-          sessionKey: params.sessionKey,
-          sessionFile: params.sessionFile,
-          thresholdBytes: this.config.autoRotateSessionFiles.sizeBytes,
-          durationMs: 0,
-          reason: "ingest-failed",
-          error: describeLogError(err),
-          level: "warn",
-        });
         return;
       }
     }
@@ -3264,7 +3033,6 @@ export class LcmContextEngine implements ContextEngine {
             this.deps.log.info(
               `[lcm] afterTurn: pruned ${pruned} heartbeat ack messages for ${sessionContext}`,
             );
-            await runRuntimeAutoRotate();
             return;
           }
         }
@@ -3314,7 +3082,6 @@ export class LcmContextEngine implements ContextEngine {
       this.deps.log.debug(
         `[lcm] afterTurn: conversation lookup missed ${sessionLabel} ingestBatch=${ingestBatch.length} duration=${formatDurationMs(Date.now() - startedAt)}`,
       );
-      await runRuntimeAutoRotate();
       return;
     }
     const refreshAfterTurnBootstrapState = async (): Promise<void> => {
@@ -3461,7 +3228,6 @@ export class LcmContextEngine implements ContextEngine {
     this.deps.log.debug(
       `[lcm] afterTurn: done conversation=${conversation.conversationId} ${sessionLabel} newMessages=${newMessages.length} dedupedMessages=${dedupedNewMessages.length} ingestedMessages=${ingestBatch.length} duration=${formatDurationMs(Date.now() - startedAt)}`,
     );
-    await runRuntimeAutoRotate();
   }
 
   private async buildPromptRecallCue(params: {
@@ -4487,31 +4253,6 @@ export class LcmContextEngine implements ContextEngine {
 
   // ── Public accessors for retrieval (used by subagent expansion) ─────────
 
-
-  async autoRotateManagedSessionFilesAtStartup(
-    params?: Parameters<SessionRotationService["autoRotateManagedSessionFilesAtStartup"]>[0],
-  ): ReturnType<SessionRotationService["autoRotateManagedSessionFilesAtStartup"]> {
-    return this.sessionRotation.autoRotateManagedSessionFilesAtStartup(params);
-  }
-
-  async rotateSessionStorage(
-    params: Parameters<SessionRotationService["rotateSessionStorage"]>[0],
-  ): Promise<RotateSessionStorageResult> {
-    return this.sessionRotation.rotateSessionStorage(params);
-  }
-
-  async rotateSessionStorageWhileHoldingDatabaseLock(
-    params: Parameters<SessionRotationService["rotateSessionStorageWhileHoldingDatabaseLock"]>[0],
-  ): Promise<RotateSessionStorageResult> {
-    return this.sessionRotation.rotateSessionStorageWhileHoldingDatabaseLock(params);
-  }
-
-  async rotateSessionStorageWithBackup(
-    params: Parameters<SessionRotationService["rotateSessionStorageWithBackup"]>[0],
-  ): Promise<RotateSessionStorageWithBackupResult> {
-    return this.sessionRotation.rotateSessionStorageWithBackup(params);
-  }
-
   /** @internal Test seam: typed access to the compaction engine. */
   getCompactionEngine(): CompactionEngine {
     return this.compaction;
@@ -4604,8 +4345,6 @@ function createEmergencyFallbackSummarize(fallbackMaxTokens?: number): (
       : `${fallbackSummary}\n${FALLBACK_SUMMARY_MARKER}`;
   };
 }
-
-export type { RotateSessionStorageResult, RotateSessionStorageWithBackupResult } from "./session-rotation.js";
 
 /** @internal Exposed for unit tests only. */
 export const __testing = { readLastJsonlEntryBeforeOffset };

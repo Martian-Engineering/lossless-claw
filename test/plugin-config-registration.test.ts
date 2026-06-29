@@ -331,9 +331,6 @@ describe("lcm plugin registration", () => {
       const dbPath = join(tmpdir(), `lossless-claw-${Date.now()}-${Math.random().toString(16)}.db`);
       dbPaths.add(dbPath);
       const createSpy = vi.spyOn(connectionModule, "createLcmDatabaseConnection");
-      const autoRotateSpy = vi
-        .spyOn(LcmContextEngine.prototype, "autoRotateManagedSessionFilesAtStartup")
-        .mockResolvedValue();
       const { api, getFactory } = buildApi(
         { enabled: true, dbPath },
         { registrationMode },
@@ -347,76 +344,13 @@ describe("lcm plugin registration", () => {
         "Engine initialization is disabled during read-only plugin registration",
       );
       expect(createSpy).not.toHaveBeenCalled();
-      expect(autoRotateSpy).not.toHaveBeenCalled();
     },
   );
-
-  it("schedules startup maintenance when live registration follows read-only registration", () => {
-    const dbPath = join(tmpdir(), `lossless-claw-${Date.now()}-${Math.random().toString(16)}.db`);
-    dbPaths.add(dbPath);
-    const autoRotateSpy = vi
-      .spyOn(LcmContextEngine.prototype, "autoRotateManagedSessionFilesAtStartup")
-      .mockResolvedValue();
-    const first = buildApi(
-      { enabled: true, dbPath },
-      { registrationMode: "discovery" },
-    );
-
-    lcmPlugin.register(first.api);
-    expect(autoRotateSpy).not.toHaveBeenCalled();
-
-    const second = buildApi({ enabled: true, dbPath });
-    lcmPlugin.register(second.api);
-
-    expect(autoRotateSpy).toHaveBeenCalledTimes(1);
-  });
-
-  it("uses live runtime startup APIs after read-only registration", () => {
-    const dbPath = join(tmpdir(), `lossless-claw-${Date.now()}-${Math.random().toString(16)}.db`);
-    dbPaths.add(dbPath);
-    const sessionStorePath = join(
-      tmpdir(),
-      `lossless-claw-session-store-${Date.now()}-${Math.random().toString(16)}.json`,
-    );
-    const autoRotateSpy = vi
-      .spyOn(LcmContextEngine.prototype, "autoRotateManagedSessionFilesAtStartup")
-      .mockResolvedValue();
-    writeFileSync(sessionStorePath, "{}\n", "utf8");
-
-    const first = buildApi(
-      { enabled: true, dbPath },
-      { registrationMode: "discovery" },
-    );
-    lcmPlugin.register(first.api);
-    expect(autoRotateSpy).not.toHaveBeenCalled();
-
-    const second = buildApi(
-      { enabled: true, dbPath },
-      {
-        runtimeConfig: {
-          session: {
-            store: sessionStorePath,
-          },
-        },
-      },
-    );
-    attachSessionStoreApi(second.api, sessionStorePath);
-    lcmPlugin.register(second.api);
-
-    expect(autoRotateSpy).toHaveBeenCalledTimes(1);
-    expect(autoRotateSpy).toHaveBeenCalledWith({
-      listStartupSessionFileCandidates: expect.any(Function),
-    });
-    rmSync(sessionStorePath, { force: true });
-  });
 
   it("does not schedule startup maintenance during CLI runtime inspection", async () => {
     const dbPath = join(tmpdir(), `lossless-claw-${Date.now()}-${Math.random().toString(16)}.db`);
     const originalArgv = process.argv;
     dbPaths.add(dbPath);
-    const autoRotateSpy = vi
-      .spyOn(LcmContextEngine.prototype, "autoRotateManagedSessionFilesAtStartup")
-      .mockResolvedValue();
     const { api, getFactory } = buildApi({ enabled: true, dbPath });
 
     process.argv = ["node", "openclaw", "plugins", "inspect", "lossless-claw", "--runtime"];
@@ -428,7 +362,6 @@ describe("lcm plugin registration", () => {
       await expect(Promise.resolve(factory!())).rejects.toThrow(
         "Engine initialization is disabled during read-only plugin registration",
       );
-      expect(autoRotateSpy).not.toHaveBeenCalled();
     } finally {
       process.argv = originalArgv;
     }
@@ -461,7 +394,7 @@ describe("lcm plugin registration", () => {
     delete (api as unknown as { registerContextEngine?: unknown }).registerContextEngine;
 
     expect(() => lcmPlugin.register(api)).toThrow(
-      /requires OpenClaw >=2026\.5\.28 with api\.registerContextEngine/,
+      /requires OpenClaw >=2026\.6\.10 with api\.registerContextEngine/,
     );
     expect(createSpy).not.toHaveBeenCalled();
     expect(api.registerCommand).not.toHaveBeenCalled();
@@ -536,7 +469,6 @@ describe("lcm plugin registration", () => {
         ignoreSessionPatterns: ["agent:*:cron:**", "agent:main:subagent:**"],
         statelessSessionPatterns: ["agent:*:subagent:**"],
         skipStatelessSessions: true,
-        transcriptGcEnabled: true,
         proactiveThresholdCompactionMode: "inline",
         largeFileThresholdTokens: 12345,
         independentLogFile: {
@@ -577,7 +509,6 @@ describe("lcm plugin registration", () => {
       ignoreSessionPatterns: ["agent:*:cron:**", "agent:main:subagent:**"],
       statelessSessionPatterns: ["agent:*:subagent:**"],
       skipStatelessSessions: true,
-      transcriptGcEnabled: true,
       proactiveThresholdCompactionMode: "inline",
       largeFileTokenThreshold: 12345,
     });
@@ -588,7 +519,6 @@ describe("lcm plugin registration", () => {
     expect(infoLog).toHaveBeenCalledWith(
       `[lcm] Plugin loaded (enabled=true, db=${dbPath}, threshold=0.33, proactiveThresholdCompactionMode=inline)`,
     );
-    expect(infoLog).toHaveBeenCalledWith("[lcm] Transcript GC enabled (default false)");
     expect(infoLog).toHaveBeenCalledWith(
       "[lcm] Proactive threshold compaction mode: inline (default deferred)",
     );
@@ -1028,68 +958,6 @@ describe("lcm plugin registration", () => {
     );
   });
 
-  it("preserves registration config fallback when live runtime config is unavailable for startup scans", async () => {
-    const dbPath = join(tmpdir(), `lossless-claw-${Date.now()}-${Math.random().toString(16)}.db`);
-    dbPaths.add(dbPath);
-    const sessionStorePath = join(
-      tmpdir(),
-      `lossless-claw-session-store-${Date.now()}-${Math.random().toString(16)}.json`,
-    );
-    const sessionId = `alpha-session-${Date.now()}-${Math.random().toString(16).slice(2)}`;
-    const sessionKey = `agent:alpha:chat:${Math.random().toString(16).slice(2)}`;
-    const sessionFile = join(tmpdir(), `${sessionId}.jsonl`);
-
-    writeFileSync(
-      sessionStorePath,
-      `${JSON.stringify({
-        [sessionKey]: {
-          sessionId,
-          sessionFile,
-        },
-      }, null, 2)}\n`,
-      "utf8",
-    );
-
-    const { api, getFactory } = buildApi({ enabled: true, dbPath });
-    api.config = {
-      session: {
-        store: sessionStorePath,
-      },
-      agents: {
-        list: [{ id: "alpha", enabled: true }],
-      },
-    } as OpenClawPluginApi["config"];
-    attachSessionStoreApi(api, sessionStorePath);
-    delete (api.runtime as unknown as { config?: unknown }).config;
-
-    lcmPlugin.register(api);
-
-    const factory = getFactory();
-    expect(factory).toBeTypeOf("function");
-    const engine = factory!() as {
-      deps?: {
-        listStartupSessionFileCandidates: () => Promise<Array<{
-          sessionId: string;
-          sessionKey: string;
-          sessionFile: string;
-          agentId: string;
-          storePath: string;
-        }>>;
-      };
-    };
-
-    await expect(engine.deps?.listStartupSessionFileCandidates()).resolves.toEqual([
-      {
-        sessionId,
-        sessionKey,
-        sessionFile,
-        agentId: "alpha",
-        storePath: sessionStorePath,
-      },
-    ]);
-    rmSync(sessionStorePath, { force: true });
-  });
-
   it("uses runtime OpenClaw defaults when api.pluginConfig is ready before api.config", () => {
     const { api, getFactory, infoLog } = buildApi(
       {
@@ -1196,7 +1064,6 @@ describe("lcm plugin registration", () => {
     const startupBannerMessages = [...firstMessages, ...secondMessages].filter((message) =>
       [
         "[lcm] Plugin loaded (enabled=true, db=",
-        "[lcm] Transcript GC ",
         "[lcm] Proactive threshold compaction mode:",
         "[lcm] Compaction summarization model:",
         "[lcm] Ignoring sessions matching ",
@@ -1206,7 +1073,6 @@ describe("lcm plugin registration", () => {
 
     expect(startupBannerMessages.sort()).toEqual([
       `[lcm] Plugin loaded (enabled=true, db=${dbPath}, threshold=0.33, proactiveThresholdCompactionMode=deferred)`,
-      "[lcm] Transcript GC disabled (default false)",
       "[lcm] Proactive threshold compaction mode: deferred (default deferred)",
       "[lcm] Compaction summarization model: (unconfigured)",
       "[lcm] Ignoring sessions matching 2 pattern(s) from plugin config: agent:*:cron:**, agent:main:subagent:**",
