@@ -56,7 +56,7 @@ async function lookupConversationForSession(input: {
   return store.getConversationBySessionId(normalizedSessionId);
 }
 
-function isIsolatedCronSessionKey(sessionKey?: string): boolean {
+export function isIsolatedCronSessionKey(sessionKey?: string): boolean {
   const trimmed = sessionKey?.trim();
   if (!trimmed) {
     return false;

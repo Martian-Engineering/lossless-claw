@@ -54,6 +54,7 @@ import {
   readTranscriptHeader,
   resolveTranscriptMessageCreatedAt,
 } from "./transcript.js";
+import { isIsolatedCronSessionKey } from "./tools/lcm-conversation-scope.js";
 import { asRecord, formatDurationMs, isMissingFileError, safeString } from "./value-utils.js";
 
 /**
@@ -2143,7 +2144,8 @@ export class TranscriptReconciler {
     let checkpointMissingMetadataFrontier = false;
     if (
       neverIngestedCheckpoint &&
-      conversation.sessionId === params.sessionId &&
+      (conversation.sessionId === params.sessionId ||
+        isIsolatedCronSessionKey(conversation.sessionKey ?? undefined)) &&
       conversation.bootstrappedAt !== null
     ) {
       checkpointMissingMetadataFrontier =
