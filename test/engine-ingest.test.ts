@@ -929,6 +929,77 @@ describe("LcmContextEngine.ingest content extraction", () => {
     });
   });
 
+  it("keeps oversized lcm_describe tool results inline instead of re-externalizing", async () => {
+    await withTempHome(async () => {
+      const engine = createEngineWithConfig({ largeFileTokenThreshold: 20 });
+      const sessionId = randomUUID();
+      const describedOutput = `${"described line\n".repeat(160)}done`;
+
+      await engine.ingest({
+        sessionId,
+        message: {
+          role: "assistant",
+          content: [
+            {
+              type: "toolCall",
+              id: "call_describe",
+              name: "lcm_describe",
+              input: { id: "file_abc37559665143d0", expandFile: true },
+            },
+          ],
+        } as AgentMessage,
+      });
+
+      await engine.ingest({
+        sessionId,
+        message: {
+          role: "toolResult",
+          toolCallId: "call_describe",
+          toolName: "lcm_describe",
+          content: [
+            {
+              type: "tool_result",
+              tool_use_id: "call_describe",
+              name: "lcm_describe",
+              content: [{ type: "text", text: describedOutput }],
+            },
+          ],
+        } as AgentMessage,
+      });
+
+      const conversation = await engine
+        .getConversationStore()
+        .getConversationBySessionId(sessionId);
+      expect(conversation).not.toBeNull();
+
+      const storedMessages = await engine
+        .getConversationStore()
+        .getMessages(conversation!.conversationId);
+      expect(storedMessages).toHaveLength(2);
+
+      // Tool-result content is intentionally stored as empty string; the real
+      // payload lives in message_parts.
+      expect(storedMessages[1].content).toBe("");
+
+      const largeFiles = await engine
+        .getSummaryStore()
+        .getLargeFilesByConversation(conversation!.conversationId);
+      expect(largeFiles).toHaveLength(0);
+
+      const parts = await engine
+        .getConversationStore()
+        .getMessageParts(storedMessages[1].messageId);
+      expect(parts).toHaveLength(1);
+      expect(parts[0].partType).toBe("tool");
+      expect(parts[0].toolName).toBe("lcm_describe");
+      const metadata = JSON.parse(parts[0].metadata ?? "{}") as Record<string, unknown>;
+      expect(metadata).not.toHaveProperty("toolOutputExternalized");
+      expect(metadata).not.toHaveProperty("externalizedFileId");
+      const raw = metadata.raw as { content?: Array<{ text?: string }> };
+      expect(raw.content?.[0]?.text).toBe(describedOutput);
+    });
+  });
+
   it("externalizes structured tool-result image payloads before text externalization", async () => {
     const largeFilesDir = mkdtempSync(join(tmpdir(), "lossless-claw-large-files-"));
     tempDirs.push(largeFilesDir);
