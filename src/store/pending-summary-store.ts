@@ -647,7 +647,7 @@ export class PendingSummaryStore {
         return null;
       }
 
-      this.db
+      const result = this.db
         .prepare(
           `UPDATE pending_summary_nodes
            SET status = 'running',
@@ -669,6 +669,9 @@ export class PendingSummaryStore {
              )`,
         )
         .run(input.leaseOwner, input.leaseExpiresAt.toISOString(), row.node_id, nowIso);
+      if (Number(result.changes ?? 0) === 0) {
+        return null;
+      }
 
       return this.getNode(row.node_id);
     });
@@ -677,11 +680,13 @@ export class PendingSummaryStore {
   /** Mark a running pending node ready with generated content. */
   async markNodeReady(input: {
     nodeId: string;
+    leaseOwner: string;
+    leaseExpiresAt: Date;
     content: string;
     tokenCount: number;
     readyAt?: Date;
-  }): Promise<void> {
-    this.db
+  }): Promise<boolean> {
+    const result = this.db
       .prepare(
         `UPDATE pending_summary_nodes
          SET status = 'ready',
@@ -692,19 +697,30 @@ export class PendingSummaryStore {
              failure_summary = NULL,
              ready_at = COALESCE(?, datetime('now')),
              updated_at = datetime('now')
-         WHERE node_id = ?`,
+         WHERE node_id = ?
+           AND status = 'running'
+           AND lease_owner = ?
+           AND lease_expires_at = ?`,
       )
       .run(
         input.content,
         normalizeNonNegativeInteger(input.tokenCount),
         nullableDateToIso(input.readyAt),
         input.nodeId,
+        input.leaseOwner,
+        input.leaseExpiresAt.toISOString(),
       );
+    return Number(result.changes ?? 0) > 0;
   }
 
   /** Mark a pending node failed and release its lease. */
-  async markNodeFailed(input: { nodeId: string; failureSummary: string }): Promise<void> {
-    this.db
+  async markNodeFailed(input: {
+    nodeId: string;
+    leaseOwner: string;
+    leaseExpiresAt: Date;
+    failureSummary: string;
+  }): Promise<boolean> {
+    const result = this.db
       .prepare(
         `UPDATE pending_summary_nodes
          SET status = 'failed',
@@ -712,9 +728,18 @@ export class PendingSummaryStore {
              lease_expires_at = NULL,
              failure_summary = ?,
              updated_at = datetime('now')
-         WHERE node_id = ?`,
+         WHERE node_id = ?
+           AND status = 'running'
+           AND lease_owner = ?
+           AND lease_expires_at = ?`,
       )
-      .run(input.failureSummary, input.nodeId);
+      .run(
+        input.failureSummary,
+        input.nodeId,
+        input.leaseOwner,
+        input.leaseExpiresAt.toISOString(),
+      );
+    return Number(result.changes ?? 0) > 0;
   }
 
   /** Record the canonical summary id created from a pending node. */
