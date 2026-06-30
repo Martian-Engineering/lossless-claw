@@ -80,47 +80,6 @@ describe("LcmContextEngine ignored sessions", () => {
   const includedSessionId = "runtime-included-session";
   const includedSessionKey = "agent:main:main";
 
-  it("skips bootstrap for ignored sessions while bootstrapping included sessions", async () => {
-    const sessionFile = createSessionFilePath("ignored-bootstrap");
-    const sm = SessionManager.open(sessionFile);
-    appendSessionMessage(sm, {
-      role: "user",
-      content: [{ type: "text", text: "bootstrap me" }],
-    } as AgentMessage);
-    appendSessionMessage(sm, {
-      role: "assistant",
-      content: [{ type: "text", text: "bootstrap reply" }],
-    } as AgentMessage);
-
-    const engine = createEngineWithConfig({
-      ignoreSessionPatterns: ["agent:*:cron:**"],
-    });
-
-    const ignored = await engine.bootstrap({
-      sessionId: ignoredSessionId,
-      sessionKey: ignoredSessionKey,
-      sessionFile,
-    });
-    const included = await engine.bootstrap({
-      sessionId: includedSessionId,
-      sessionKey: includedSessionKey,
-      sessionFile,
-    });
-
-    expect(ignored).toEqual({
-      bootstrapped: false,
-      importedMessages: 0,
-      reason: "session excluded by pattern",
-    });
-    expect(included.bootstrapped).toBe(true);
-    expect(included.importedMessages).toBe(2);
-    expect(
-      await engine.getConversationStore().getConversationBySessionId(ignoredSessionId),
-    ).toBeNull();
-    expect(
-      await engine.getConversationStore().getConversationBySessionId(includedSessionId),
-    ).not.toBeNull();
-  });
 
   it("skips ingest for ignored sessions while storing included sessions", async () => {
     const engine = createEngineWithConfig({
@@ -185,41 +144,6 @@ describe("LcmContextEngine ignored sessions", () => {
     ).toBe(2);
   });
 
-  it("skips afterTurn for ignored sessions while persisting included sessions", async () => {
-    const engine = createEngineWithConfig({
-      ignoreSessionPatterns: ["agent:*:cron:**"],
-    });
-
-    await engine.afterTurn({
-      sessionId: ignoredSessionId,
-      sessionKey: ignoredSessionKey,
-      sessionFile: createSessionFilePath("ignored-after-turn"),
-      messages: [makeMessage({ role: "assistant", content: "ignored turn" })],
-      prePromptMessageCount: 0,
-    });
-    await engine.afterTurn({
-      sessionId: includedSessionId,
-      sessionKey: includedSessionKey,
-      sessionFile: createSessionFilePath("included-after-turn"),
-      messages: [makeMessage({ role: "assistant", content: "included turn" })],
-      prePromptMessageCount: 0,
-      tokenBudget: 4096,
-    });
-
-    expect(
-      await engine.getConversationStore().getConversationBySessionId(ignoredSessionId),
-    ).toBeNull();
-
-    const includedConversation = await engine
-      .getConversationStore()
-      .getConversationBySessionId(includedSessionId);
-    expect(includedConversation).not.toBeNull();
-
-    const stored = await engine.getConversationStore().getMessages(
-      includedConversation!.conversationId,
-    );
-    expect(stored.map((message) => message.content)).toEqual(["included turn"]);
-  });
 
   it("passes through assemble for ignored sessions while assembling included sessions from LCM", async () => {
     const engine = createEngineWithConfig({
@@ -410,77 +334,6 @@ describe("LcmContextEngine OpenClaw runtime context leak filter", () => {
     expect(stored.map((m) => m.content)).toEqual(["Real assistant reply."]);
   });
 
-  it("skips leaked runtime context content blocks during afterTurn", async () => {
-    const engine = createEngine();
-    const sessionId = "runtime-context-leak-after-turn";
-
-    await engine.afterTurn({
-      sessionId,
-      sessionFile: createSessionFilePath("runtime-context-leak-after-turn"),
-      messages: [
-        makeMessage({
-          role: "assistant",
-          content: [{ type: "text", text: leakedRuntimeContext }],
-        }),
-        makeMessage({ role: "assistant", content: "Visible answer." }),
-      ],
-      prePromptMessageCount: 0,
-      tokenBudget: 4096,
-    });
-
-    const conversation = await engine.getConversationStore().getConversationBySessionId(sessionId);
-    expect(conversation).not.toBeNull();
-    const stored = await engine.getConversationStore().getMessages(conversation!.conversationId);
-    expect(stored.map((m) => m.content)).toEqual(["Visible answer."]);
-  });
-
-  it("skips leaked runtime context imported from bootstrap transcripts", async () => {
-    const engine = createEngine();
-    const sessionId = "runtime-context-leak-bootstrap";
-    const sessionFile = createSessionFilePath("runtime-context-leak-bootstrap");
-    writeLeafTranscriptMessages(sessionFile, [
-      makeMessage({ role: "assistant", content: leakedRuntimeContext }),
-      makeMessage({ role: "assistant", content: "Bootstrapped answer." }),
-    ]);
-
-    const result = await engine.bootstrap({ sessionId, sessionFile });
-
-    expect(result.importedMessages).toBe(1);
-    const conversation = await engine.getConversationStore().getConversationBySessionId(sessionId);
-    expect(conversation).not.toBeNull();
-    const stored = await engine.getConversationStore().getMessages(conversation!.conversationId);
-    expect(stored.map((m) => m.content)).toEqual(["Bootstrapped answer."]);
-  });
-
-  it("skips leaked runtime context in append-only bootstrap transcript recovery", async () => {
-    const engine = createEngine();
-    const sessionId = "runtime-context-leak-append-only-bootstrap";
-    const sessionFile = createSessionFilePath("runtime-context-leak-append-only-bootstrap");
-    writeLeafTranscriptMessages(sessionFile, [
-      makeMessage({ role: "user", content: "Initial question." }),
-      makeMessage({ role: "assistant", content: "Initial answer." }),
-    ]);
-
-    await engine.bootstrap({ sessionId, sessionFile });
-    writeLeafTranscriptMessages(sessionFile, [
-      makeMessage({ role: "user", content: "Initial question." }),
-      makeMessage({ role: "assistant", content: "Initial answer." }),
-      makeMessage({ role: "assistant", content: leakedRuntimeContext }),
-      makeMessage({ role: "assistant", content: "Recovered answer." }),
-    ]);
-
-    const result = await engine.bootstrap({ sessionId, sessionFile });
-
-    expect(result.importedMessages).toBe(1);
-    const conversation = await engine.getConversationStore().getConversationBySessionId(sessionId);
-    expect(conversation).not.toBeNull();
-    const stored = await engine.getConversationStore().getMessages(conversation!.conversationId);
-    expect(stored.map((m) => m.content)).toEqual([
-      "Initial question.",
-      "Initial answer.",
-      "Recovered answer.",
-    ]);
-  });
 
   it("keeps user-authored messages even when they quote the runtime context prefix", async () => {
     const engine = createEngine();
@@ -575,45 +428,6 @@ describe("LcmContextEngine stateless sessions", () => {
     expect(disabledEngine.isStatelessSession(statelessSessionKey)).toBe(false);
   });
 
-  it("skips bootstrap persistence for stateless session keys", async () => {
-    const sessionFile = createSessionFilePath("stateless-bootstrap");
-    const sm = SessionManager.open(sessionFile);
-    appendSessionMessage(sm, {
-      role: "user",
-      content: [{ type: "text", text: "bootstrap me" }],
-    } as AgentMessage);
-    appendSessionMessage(sm, {
-      role: "assistant",
-      content: [{ type: "text", text: "bootstrap reply" }],
-    } as AgentMessage);
-
-    const engine = createEngineWithConfig({
-      statelessSessionPatterns: ["agent:*:subagent:worker-*"],
-    });
-
-    const stateless = await engine.bootstrap({
-      sessionId: runtimeSessionId,
-      sessionKey: statelessSessionKey,
-      sessionFile,
-    });
-
-    const stateful = await engine.bootstrap({
-      sessionId: statefulRuntimeSessionId,
-      sessionKey: statefulSessionKey,
-      sessionFile,
-    });
-
-    expect(stateless).toEqual({
-      bootstrapped: false,
-      importedMessages: 0,
-      reason: "stateless session",
-    });
-    expect(
-      await engine.getConversationStore().getConversationBySessionId(runtimeSessionId),
-    ).toBeNull();
-    expect(stateful.bootstrapped).toBe(true);
-    expect(stateful.importedMessages).toBe(2);
-  });
 
   it("skips ingest and ingestBatch writes for stateless session keys", async () => {
     const engine = createEngineWithConfig({

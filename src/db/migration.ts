@@ -378,43 +378,6 @@ function ensureMessageTranscriptEntryIdColumn(db: DatabaseSync): void {
   }
 }
 
-function ensureConversationBootstrapStateForkColumns(db: DatabaseSync): void {
-  const columns = db
-    .prepare(`PRAGMA table_info(conversation_bootstrap_state)`)
-    .all() as SummaryColumnInfo[];
-  const hasForkBounded = columns.some((col) => col.name === "fork_bounded");
-  const hasForkSourceMessageCount = columns.some(
-    (col) => col.name === "fork_source_message_count",
-  );
-
-  if (!hasForkBounded) {
-    db.exec(`ALTER TABLE conversation_bootstrap_state ADD COLUMN fork_bounded INTEGER NOT NULL DEFAULT 0`);
-  }
-  if (!hasForkSourceMessageCount) {
-    db.exec(
-      `ALTER TABLE conversation_bootstrap_state ADD COLUMN fork_source_message_count INTEGER NOT NULL DEFAULT 0`,
-    );
-  }
-}
-
-/**
- * Declared-epoch reconciliation state: the transcript's session header id
- * (rewrites/rotations change it) and the envelope id of the last processed
- * transcript entry (exact resume anchor, immune to content rewriting).
- * See specs/transcript-reconciliation-by-entry-id.md.
- */
-function ensureConversationBootstrapStateEpochColumns(db: DatabaseSync): void {
-  const columns = db
-    .prepare(`PRAGMA table_info(conversation_bootstrap_state)`)
-    .all() as SummaryColumnInfo[];
-  if (!columns.some((col) => col.name === "session_header_id")) {
-    db.exec(`ALTER TABLE conversation_bootstrap_state ADD COLUMN session_header_id TEXT`);
-  }
-  if (!columns.some((col) => col.name === "last_processed_entry_id")) {
-    db.exec(`ALTER TABLE conversation_bootstrap_state ADD COLUMN last_processed_entry_id TEXT`);
-  }
-}
-
 function backfillMessageIdentityHashes(
   db: DatabaseSync,
   options?: { managesOwnTransaction?: boolean },
@@ -468,19 +431,6 @@ function buildLegacyRawMessageIdentityHash(role: string, content: string): strin
     .digest("hex");
 }
 
-function buildBootstrapEntryHash(role: string, content: string): string {
-  return createHash("sha256")
-    .update(JSON.stringify({ role, content }))
-    .digest("hex");
-}
-
-function buildCanonicalBootstrapEntryHash(role: string, content: string): string {
-  return buildBootstrapEntryHash(
-    role,
-    canonicalizeOpenClawInboundMetadataIdentityContent(role, content),
-  );
-}
-
 function repairOpenClawMetadataIdentityState(db: DatabaseSync): void {
   const selectStmt = db.prepare(
     `SELECT message_id, conversation_id, role, content, identity_hash
@@ -491,11 +441,6 @@ function repairOpenClawMetadataIdentityState(db: DatabaseSync): void {
   );
   const updateIdentityStmt = db.prepare(
     `UPDATE messages SET identity_hash = ? WHERE message_id = ?`,
-  );
-  const updateCheckpointStmt = db.prepare(
-    `UPDATE conversation_bootstrap_state
-     SET last_processed_entry_hash = ?
-     WHERE conversation_id = ? AND last_processed_entry_hash = ?`,
   );
   let lastProcessedMessageId = 0;
 
@@ -521,12 +466,6 @@ function repairOpenClawMetadataIdentityState(db: DatabaseSync): void {
       if (row.identity_hash === legacyMessageHash) {
         updateIdentityStmt.run(buildMessageIdentityHash(row.role, row.content), row.message_id);
       }
-
-      updateCheckpointStmt.run(
-        buildCanonicalBootstrapEntryHash(row.role, row.content),
-        row.conversation_id,
-        buildBootstrapEntryHash(row.role, row.content),
-      );
     }
 
     lastProcessedMessageId = rows[rows.length - 1]?.message_id ?? lastProcessedMessageId;
@@ -1179,20 +1118,6 @@ export function runLcmMigrations(
       created_at TEXT NOT NULL DEFAULT (datetime('now'))
     );
 
-    CREATE TABLE IF NOT EXISTS conversation_bootstrap_state (
-      conversation_id INTEGER PRIMARY KEY REFERENCES conversations(conversation_id) ON DELETE CASCADE,
-      session_file_path TEXT NOT NULL,
-      last_seen_size INTEGER NOT NULL,
-      last_seen_mtime_ms INTEGER NOT NULL,
-      last_processed_offset INTEGER NOT NULL,
-      last_processed_entry_hash TEXT,
-      session_header_id TEXT,
-      last_processed_entry_id TEXT,
-      fork_bounded INTEGER NOT NULL DEFAULT 0,
-      fork_source_message_count INTEGER NOT NULL DEFAULT 0,
-      updated_at TEXT NOT NULL DEFAULT (datetime('now'))
-    );
-
     CREATE TABLE IF NOT EXISTS conversation_compaction_telemetry (
       conversation_id INTEGER PRIMARY KEY REFERENCES conversations(conversation_id) ON DELETE CASCADE,
       last_observed_cache_read INTEGER,
@@ -1282,8 +1207,6 @@ export function runLcmMigrations(
     CREATE INDEX IF NOT EXISTS message_parts_type_idx ON message_parts (part_type);
     CREATE INDEX IF NOT EXISTS context_items_conv_idx ON context_items (conversation_id, ordinal);
     CREATE INDEX IF NOT EXISTS large_files_conv_idx ON large_files (conversation_id, created_at);
-    CREATE INDEX IF NOT EXISTS bootstrap_state_path_idx
-      ON conversation_bootstrap_state (session_file_path, updated_at);
     CREATE INDEX IF NOT EXISTS compaction_telemetry_state_idx
       ON conversation_compaction_telemetry (cache_state, updated_at);
     CREATE INDEX IF NOT EXISTS focus_briefs_conversation_status_idx
@@ -1346,12 +1269,6 @@ export function runLcmMigrations(
     // stratification. Idempotent additive ALTER; safe across versions.
     runMigrationStep("ensureMessageLargeContentColumn", log, () =>
       ensureMessageLargeContentColumn(db),
-    );
-    runMigrationStep("ensureConversationBootstrapStateForkColumns", log, () =>
-      ensureConversationBootstrapStateForkColumns(db),
-    );
-    runMigrationStep("ensureConversationBootstrapStateEpochColumns", log, () =>
-      ensureConversationBootstrapStateEpochColumns(db),
     );
     // Belt-and-suspenders: ensure message_parts exists even if the bulk
     // CREATE TABLE block above was interrupted before reaching it.

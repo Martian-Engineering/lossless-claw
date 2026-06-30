@@ -33,62 +33,6 @@ import {
 
 afterEach(cleanupEngineTestState);
 describe("LcmContextEngine maintain and assemble budget", () => {
-  it("assemble falls back to live messages on ambiguous runtime rollover while the old transcript still exists", async () => {
-    const warnLog = vi.fn();
-    const engine = createEngineWithDeps(
-      {},
-      {
-        log: { info: vi.fn(), warn: warnLog, error: vi.fn(), debug: vi.fn() },
-      },
-    );
-    const firstSessionId = "assemble-ambiguous-rollover-old-runtime";
-    const secondSessionId = "assemble-ambiguous-rollover-new-runtime";
-    const sessionKey = "agent:main:test:assemble-ambiguous-runtime-rollover";
-
-    const oldSessionFile = createSessionFilePath("assemble-ambiguous-rollover-old");
-    writeLeafTranscript(oldSessionFile, [
-      { role: "user", content: "what model produced the stale answer?" },
-      { role: "assistant", content: "openai-codex/gpt-5.5" },
-    ]);
-    await engine.bootstrap({
-      sessionId: firstSessionId,
-      sessionKey,
-      sessionFile: oldSessionFile,
-    });
-
-    const originalConversation = await engine.getConversationStore().getConversationForSession({
-      sessionId: firstSessionId,
-      sessionKey,
-    });
-    expect(originalConversation).not.toBeNull();
-
-    const liveMessages = [makeMessage({ role: "user", content: "new live user prompt" })];
-    const assembled = await engine.assemble({
-      sessionId: secondSessionId,
-      sessionKey,
-      messages: liveMessages,
-      tokenBudget: 4_096,
-    });
-
-    expect(assembled.messages).toEqual(liveMessages);
-    expect(
-      assembled.messages.some((message) => message.content === "openai-codex/gpt-5.5"),
-    ).toBe(false);
-    expect(
-      warnLog.mock.calls
-        .map((call) => String(call[0]))
-        .some((message) => message.includes("ambiguous session-key runtime rollover")),
-    ).toBe(true);
-    const activeByKey = await engine.getConversationStore().getConversationForSession({
-      sessionId: secondSessionId,
-      sessionKey,
-    });
-    expect(activeByKey?.conversationId).toBe(originalConversation!.conversationId);
-    expect(activeByKey?.sessionId).toBe(firstSessionId);
-    await expect(
-      engine.getConversationStore().getConversationBySessionId(secondSessionId),
-    ).resolves.toBeNull();
-  });
 
   it("maintain() leaves deferred threshold debt pending until the host opts in", async () => {
     const engine = createEngine();

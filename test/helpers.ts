@@ -15,8 +15,7 @@ import { closeLcmConnection, createLcmDatabaseConnection } from "../src/db/conne
 import { LcmContextEngine } from "../src/engine.js";
 import type { AgentMessage } from "../src/openclaw-bridge.js";
 import { resetDelegatedExpansionGrantsForTests } from "../src/expansion-auth.js";
-import { extractBootstrapMessageCandidate, getTranscriptEntryMeta, readLeafPathRawEntries } from "../src/transcript.js";
-import type { LcmDependencies, VisibleSessionTranscriptMessageEntry } from "../src/types.js";
+import type { LcmDependencies } from "../src/types.js";
 
 export const tempDirs: string[] = [];
 
@@ -120,71 +119,7 @@ export function parseAgentSessionKey(sessionKey: string): { agentId: string; suf
   };
 }
 
-function withTestTranscriptProjectionTarget<T extends {
-  sessionId: string;
-  sessionKey?: string;
-  sessionFile?: string;
-  sessionTarget?: unknown;
-  runtimeContext?: Record<string, unknown>;
-}>(params: T): T {
-  if (!params.sessionFile || params.sessionTarget || params.runtimeContext?.sessionTarget) {
-    return params;
-  }
-  return {
-    ...params,
-    runtimeContext: {
-      ...params.runtimeContext,
-      transcriptStorage: { kind: "sqlite" },
-      sessionTarget: {
-        agentId: "main",
-        sessionId: params.sessionId,
-        sessionKey: params.sessionKey ?? params.sessionId,
-        storePath: params.sessionFile,
-      },
-    },
-  };
-}
-
-async function readVisibleSessionTranscriptMessageEntriesFromTestJsonl(
-  target: { storePath?: string },
-): Promise<VisibleSessionTranscriptMessageEntry[]> {
-  if (!target.storePath) {
-    return [];
-  }
-  const leafPath = await readLeafPathRawEntries(target.storePath);
-  const entries: VisibleSessionTranscriptMessageEntry[] = [];
-  let seq = 0;
-  for (const raw of leafPath.entries) {
-    const message = extractBootstrapMessageCandidate(raw);
-    if (!message) {
-      continue;
-    }
-    const meta = getTranscriptEntryMeta(message);
-    seq += 1;
-    entries.push({
-      entryId: meta?.entryId ?? `test-jsonl-entry-${seq}`,
-      parentId: meta?.parentId ?? null,
-      seq,
-      role: message.role,
-      message,
-      ...(meta?.timestamp ? { createdAt: meta.timestamp } : {}),
-    });
-  }
-  return entries;
-}
-
 export class TestLcmContextEngine extends LcmContextEngine {
-  override async bootstrap(
-    params: Parameters<LcmContextEngine["bootstrap"]>[0],
-  ): ReturnType<LcmContextEngine["bootstrap"]> {
-    return super.bootstrap(withTestTranscriptProjectionTarget(params));
-  }
-
-  override async afterTurn(
-    params: Parameters<LcmContextEngine["afterTurn"]>[0],
-  ): ReturnType<LcmContextEngine["afterTurn"]> {
-    return super.afterTurn(withTestTranscriptProjectionTarget(params));
-  }
 }
 
 export function createTestDeps(
@@ -217,7 +152,7 @@ export function createTestDeps(
     resolveAgentDir: () => process.env.HOME ?? tmpdir(),
     resolveSessionIdFromSessionKey: async () => undefined,
     resolveSessionTranscriptFile: async () => undefined,
-    readVisibleSessionTranscriptMessageEntries: readVisibleSessionTranscriptMessageEntriesFromTestJsonl,
+    readVisibleSessionTranscriptMessageEntries: undefined,
     agentLaneSubagent: "subagent",
     log: {
       info: vi.fn(),

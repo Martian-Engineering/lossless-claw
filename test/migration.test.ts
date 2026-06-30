@@ -6,7 +6,6 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { closeLcmConnection, getLcmConnection } from "../src/db/connection.js";
 import * as features from "../src/db/features.js";
 import { runLcmMigrations } from "../src/db/migration.js";
-import { canonicalizeOpenClawInboundMetadataIdentityContent } from "../src/openclaw-inbound-metadata.js";
 import { buildMessageIdentityHash } from "../src/store/message-identity.js";
 
 const tempDirs: string[] = [];
@@ -32,12 +31,6 @@ function legacyRawMessageIdentityHash(role: string, content: string): string {
     .update(role)
     .update("\u0000")
     .update(content)
-    .digest("hex");
-}
-
-function legacyRawBootstrapEntryHash(role: string, content: string): string {
-  return createHash("sha256")
-    .update(JSON.stringify({ role, content }))
     .digest("hex");
 }
 
@@ -693,7 +686,7 @@ describe("runLcmMigrations summary depth backfill", () => {
     expect(sampledRow.identity_hash).toBe(buildMessageIdentityHash("assistant", "batch message 1204"));
   });
 
-  it("repairs legacy OpenClaw metadata identity hashes and bootstrap checkpoints", () => {
+  it("repairs legacy OpenClaw metadata identity hashes", () => {
     const db = createTestDb("openclaw-metadata-identity-repair.db");
     const rawMetadataContent = openClawInboundMetadataContent({
       messageId: "telegram-legacy",
@@ -721,16 +714,6 @@ describe("runLcmMigrations summary depth backfill", () => {
         created_at TEXT NOT NULL DEFAULT (datetime('now')),
         UNIQUE (conversation_id, seq)
       );
-
-      CREATE TABLE conversation_bootstrap_state (
-        conversation_id INTEGER PRIMARY KEY REFERENCES conversations(conversation_id) ON DELETE CASCADE,
-        session_file_path TEXT NOT NULL,
-        last_seen_size INTEGER NOT NULL,
-        last_seen_mtime_ms INTEGER NOT NULL,
-        last_processed_offset INTEGER NOT NULL,
-        last_processed_entry_hash TEXT,
-        updated_at TEXT NOT NULL DEFAULT (datetime('now'))
-      );
     `);
     db.prepare(`INSERT INTO conversations (conversation_id, session_id) VALUES (?, ?)`).run(
       1,
@@ -749,40 +732,13 @@ describe("runLcmMigrations summary depth backfill", () => {
       1,
       legacyRawMessageIdentityHash("user", rawMetadataContent),
     );
-    db.prepare(
-      `INSERT INTO conversation_bootstrap_state (
-         conversation_id, session_file_path, last_seen_size, last_seen_mtime_ms,
-         last_processed_offset, last_processed_entry_hash
-       ) VALUES (?, ?, ?, ?, ?, ?)`,
-    ).run(
-      1,
-      "/tmp/openclaw-session.jsonl",
-      128,
-      1000,
-      128,
-      legacyRawBootstrapEntryHash("user", rawMetadataContent),
-    );
-
     runLcmMigrations(db, { fts5Available: false });
 
     const messageRow = db
       .prepare(`SELECT identity_hash FROM messages WHERE message_id = ?`)
       .get(1) as { identity_hash: string | null };
-    const checkpointRow = db
-      .prepare(
-        `SELECT last_processed_entry_hash AS lastProcessedEntryHash
-         FROM conversation_bootstrap_state
-         WHERE conversation_id = ?`,
-      )
-      .get(1) as { lastProcessedEntryHash: string | null };
 
     expect(messageRow.identity_hash).toBe(buildMessageIdentityHash("user", rawMetadataContent));
-    expect(checkpointRow.lastProcessedEntryHash).toBe(
-      legacyRawBootstrapEntryHash(
-        "user",
-        canonicalizeOpenClawInboundMetadataIdentityContent("user", rawMetadataContent),
-      ),
-    );
   });
 
   it("skips FTS tables when fts5 is unavailable", () => {
@@ -1049,33 +1005,6 @@ describe("runLcmMigrations summary depth backfill", () => {
       },
     ]);
   });
-  it("creates conversation bootstrap state storage", () => {
-    const tempDir = mkdtempSync(join(tmpdir(), "lossless-claw-migration-"));
-    tempDirs.push(tempDir);
-    const dbPath = join(tempDir, "bootstrap-state.db");
-    const db = getLcmConnection(dbPath);
-
-    runLcmMigrations(db, { fts5Available: false });
-
-    const columns = db.prepare(`PRAGMA table_info(conversation_bootstrap_state)`).all() as Array<{
-      name?: string;
-    }>;
-
-    expect(columns.map((column) => column.name)).toEqual([
-      "conversation_id",
-      "session_file_path",
-      "last_seen_size",
-      "last_seen_mtime_ms",
-      "last_processed_offset",
-      "last_processed_entry_hash",
-      "session_header_id",
-      "last_processed_entry_id",
-      "fork_bounded",
-      "fork_source_message_count",
-      "updated_at",
-    ]);
-  });
-
   it("creates message_parts when the bulk schema create did not", () => {
     const db = createTestDb("missing-message-parts.db");
     let skippedBulkMessagePartsCreate = false;
