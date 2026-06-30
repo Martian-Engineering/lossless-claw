@@ -3094,10 +3094,11 @@ describe("LcmContextEngine afterTurn", () => {
 
   it("afterTurn fails closed on ambiguous runtime rollover while the old transcript still exists", async () => {
     const warnLog = vi.fn();
+    const debugLog = vi.fn();
     const engine = createEngineWithDeps(
       {},
       {
-        log: { info: vi.fn(), warn: warnLog, error: vi.fn(), debug: vi.fn() },
+        log: { info: vi.fn(), warn: warnLog, error: vi.fn(), debug: debugLog },
       },
     );
     const privateEngine = engine as unknown as {
@@ -3163,11 +3164,19 @@ describe("LcmContextEngine afterTurn", () => {
       tokenBudget: 4_096,
     });
 
+    // The new transcript is only transiently unjudgeable (no usable timestamps),
+    // so the preserve is a pending state logged at debug; the freeze/no-merge
+    // guard below is unchanged, and a real conflict would warn on its own turn.
+    expect(
+      debugLog.mock.calls
+        .map((call) => String(call[0]))
+        .some((message) => message.includes("ambiguous session-key runtime rollover; preserving")),
+    ).toBe(true);
     expect(
       warnLog.mock.calls
         .map((call) => String(call[0]))
-        .some((message) => message.includes("ambiguous session-key runtime rollover")),
-    ).toBe(true);
+        .some((message) => message.includes("ambiguous session-key runtime rollover; preserving")),
+    ).toBe(false);
     const stored = await engine.getConversationStore().getMessages(conversation!.conversationId);
     expect(stored.map((message) => message.content)).toEqual([
       "old afterTurn long-lived question",

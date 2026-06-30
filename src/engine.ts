@@ -1817,7 +1817,7 @@ export class LcmContextEngine implements ContextEngine {
               // this is a legitimate reset. Rebind the existing conversation
               // and import the new transcript immediately while the freshness
               // proof is still in hand.
-              const rotatedForFreshTranscript =
+              const rolloverResolution =
                 await this.sessionRolloverDetector.rotateAmbiguousRolloverForProvablyFreshTranscript({
                   phase: "bootstrap",
                   sessionId: params.sessionId,
@@ -1825,12 +1825,13 @@ export class LcmContextEngine implements ContextEngine {
                   candidateMessages: preloadedHistoricalMessages,
                   createReplacement: false,
                 });
-              if (!rotatedForFreshTranscript) {
+              if (!rolloverResolution.rebound) {
                 this.sessionRolloverDetector.logAmbiguousSessionKeyRuntimeRollover({
                   phase: "bootstrap",
                   rollover: ambiguousRollover,
                   sessionId: params.sessionId,
                   sessionFile: params.sessionFile,
+                  expected: rolloverResolution.preserveExpected,
                 });
                 return {
                   bootstrapped: false,
@@ -2913,9 +2914,16 @@ export class LcmContextEngine implements ContextEngine {
     let dedupedNewMessages: AgentMessage[] = [];
     if (transcriptReconcileUnsafeToAdvance) {
       if (newMessages.length > 0 || params.autoCompactionSummary) {
-        this.deps.log.warn(
-          `[lcm] afterTurn: transcript reconcile did not cover the transcript frontier; skipping afterTurn persistence to avoid creating a future anchor past unreconciled transcript history ${sessionLabel}`,
-        );
+        // The ambiguous-rollover defer is the benign self-heal path; the rotate
+        // below re-runs the rebind that imports the frontier. Any other
+        // unsafe-to-advance result is a genuine "skipping past unreconciled
+        // history" event worth a warn.
+        const frontierNotCovered = `[lcm] afterTurn: transcript reconcile did not cover the transcript frontier; skipping afterTurn persistence to avoid creating a future anchor past unreconciled transcript history ${sessionLabel}`;
+        if (transcriptReconcileBlockedByAmbiguousRollover) {
+          this.deps.log.debug(frontierNotCovered);
+        } else {
+          this.deps.log.warn(frontierNotCovered);
+        }
       }
       if (transcriptReconcileBlockedByAmbiguousRollover) {
         await runRuntimeAutoRotate();
@@ -3412,6 +3420,7 @@ export class LcmContextEngine implements ContextEngine {
           phase: "assemble",
           rollover: ambiguousRollover,
           sessionId: params.sessionId,
+          expected: true,
         });
         return safeFallback();
       }
