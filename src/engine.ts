@@ -1689,9 +1689,11 @@ export class LcmContextEngine implements ContextEngine {
     sessionKey?: string;
     conversationId: number;
     historicalMessages: AgentMessage[];
+    requireOverlap?: boolean;
   }): Promise<TranscriptReconcileResult> {
     let importedMessages = 0;
     let hasOverlap = false;
+    const importableMessages: AgentMessage[] = [];
     const entryIds = params.historicalMessages
       .map((message) => getTranscriptEntryId(message))
       .filter((entryId): entryId is string => typeof entryId === "string" && entryId.length > 0);
@@ -1724,6 +1726,19 @@ export class LcmContextEngine implements ContextEngine {
         }
       }
 
+      importableMessages.push(message);
+    }
+
+    if (params.requireOverlap && !hasOverlap) {
+      return {
+        importedMessages: 0,
+        blockedByImportCap: true,
+        blockedReason: "no-overlap-projection",
+        hasOverlap: false,
+      };
+    }
+
+    for (const message of importableMessages) {
       const result = await this.ingestSingle({
         sessionId: params.sessionId,
         sessionKey: params.sessionKey,
@@ -1824,6 +1839,7 @@ export class LcmContextEngine implements ContextEngine {
             sessionKey: params.sessionKey,
             conversationId,
             historicalMessages,
+            requireOverlap: true,
           });
           this.deps.log.debug(
             `[lcm] bootstrap: sqlite projection reconcile finished conversation=${conversationId} ${params.sessionLabel} importedMessages=${reconcile.importedMessages} overlap=${reconcile.hasOverlap} blockedByImportCap=${reconcile.blockedByImportCap} duration=${formatDurationMs(Date.now() - params.startedAt)}`,
@@ -1838,7 +1854,9 @@ export class LcmContextEngine implements ContextEngine {
                   ? "reconcile duplicate raw ids"
                   : reconcile.blockedReason === "duplicate-transcript-replay"
                     ? "reconcile duplicate transcript replay"
-                    : "reconcile import capped",
+                    : reconcile.blockedReason === "no-overlap-projection"
+                      ? "reconcile projection has no overlap"
+                      : "reconcile import capped",
             };
           }
 
@@ -1983,6 +2001,7 @@ export class LcmContextEngine implements ContextEngine {
             sessionKey: params.sessionKey,
             conversationId,
             historicalMessages,
+            requireOverlap: true,
           });
           this.deps.log.debug(
             `[lcm] afterTurn: visible projection reconcile finished conversation=${conversationId} ${params.sessionLabel} importedMessages=${reconcile.importedMessages} overlap=${reconcile.hasOverlap} blockedByImportCap=${reconcile.blockedByImportCap} duration=${formatDurationMs(Date.now() - params.startedAt)}`,

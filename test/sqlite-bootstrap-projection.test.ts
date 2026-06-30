@@ -224,6 +224,156 @@ describe("LcmContextEngine.bootstrap sqlite transcript projection", () => {
     expect(readVisibleSessionTranscriptMessageEntries).toHaveBeenCalledTimes(2);
   });
 
+  it("fails closed instead of appending a no-overlap bootstrap projection to an existing conversation", async () => {
+    const sessionId = "sqlite-bootstrap-no-overlap-session";
+    const sessionKey = "agent:main:sqlite-bootstrap-no-overlap-session";
+    let visibleEntries: VisibleSessionTranscriptMessageEntry[] = [
+      {
+        entryId: "entry-original-user",
+        parentId: null,
+        seq: 1,
+        role: "user",
+        message: { role: "user", content: "original user" } satisfies AgentMessage,
+        createdAt: "2026-06-29T12:10:00.000Z",
+      },
+    ];
+    const readVisibleSessionTranscriptMessageEntries = vi.fn(async () => visibleEntries);
+    const { engine } = createEngineWithDepsOverridesAndDb({
+      readVisibleSessionTranscriptMessageEntries,
+    } satisfies Partial<LcmDependencies>);
+
+    await expect(
+      engine.bootstrap({
+        sessionId,
+        sessionKey,
+        runtimeContext: {
+          transcriptStorage: { kind: "sqlite" },
+          sessionTarget: {
+            agentId: "main",
+            sessionId,
+            sessionKey,
+            storePath: "/tmp/openclaw-agent.sqlite",
+          },
+        },
+      }),
+    ).resolves.toMatchObject({ bootstrapped: true, importedMessages: 1 });
+
+    visibleEntries = [
+      {
+        entryId: "entry-unrelated-user",
+        parentId: null,
+        seq: 1,
+        role: "user",
+        message: { role: "user", content: "unrelated user" } satisfies AgentMessage,
+        createdAt: "2026-06-29T12:11:00.000Z",
+      },
+    ];
+
+    await expect(
+      engine.bootstrap({
+        sessionId,
+        sessionKey,
+        runtimeContext: {
+          transcriptStorage: { kind: "sqlite" },
+          sessionTarget: {
+            agentId: "main",
+            sessionId,
+            sessionKey,
+            storePath: "/tmp/openclaw-agent.sqlite",
+          },
+        },
+      }),
+    ).resolves.toMatchObject({
+      bootstrapped: false,
+      importedMessages: 0,
+      reason: "reconcile projection has no overlap",
+    });
+
+    const conversation = await engine.getConversationStore().getConversationForSession({
+      sessionId,
+      sessionKey,
+    });
+    expect(conversation).not.toBeNull();
+    const messages = await engine.getConversationStore().getMessages(conversation!.conversationId);
+    expect(messages.map((message) => message.content)).toEqual(["original user"]);
+  });
+
+  it("fails closed instead of persisting afterTurn when an existing projection has no overlap", async () => {
+    const sessionId = "sqlite-afterturn-no-overlap-session";
+    const sessionKey = "agent:main:sqlite-afterturn-no-overlap-session";
+    let visibleEntries: VisibleSessionTranscriptMessageEntry[] = [
+      {
+        entryId: "entry-original-user",
+        parentId: null,
+        seq: 1,
+        role: "user",
+        message: { role: "user", content: "original user" } satisfies AgentMessage,
+        createdAt: "2026-06-29T12:15:00.000Z",
+      },
+    ];
+    const readVisibleSessionTranscriptMessageEntries = vi.fn(async () => visibleEntries);
+    const { engine } = createEngineWithDepsOverridesAndDb({
+      readVisibleSessionTranscriptMessageEntries,
+    } satisfies Partial<LcmDependencies>);
+
+    await expect(
+      engine.bootstrap({
+        sessionId,
+        sessionKey,
+        runtimeContext: {
+          transcriptStorage: { kind: "sqlite" },
+          sessionTarget: {
+            agentId: "main",
+            sessionId,
+            sessionKey,
+            storePath: "/tmp/openclaw-agent.sqlite",
+          },
+        },
+      }),
+    ).resolves.toMatchObject({ bootstrapped: true, importedMessages: 1 });
+
+    visibleEntries = [
+      {
+        entryId: "entry-unrelated-user",
+        parentId: null,
+        seq: 1,
+        role: "user",
+        message: { role: "user", content: "unrelated user" } satisfies AgentMessage,
+        createdAt: "2026-06-29T12:16:00.000Z",
+      },
+    ];
+
+    await expect(
+      engine.afterTurn({
+        sessionId,
+        sessionKey,
+        sessionFile: "/tmp/ignored-lossless-sqlite-no-overlap.jsonl",
+        messages: [
+          { role: "user", content: "unrelated user" },
+          { role: "assistant", content: "unrelated assistant" },
+        ] satisfies AgentMessage[],
+        prePromptMessageCount: 1,
+        runtimeContext: {
+          transcriptStorage: { kind: "sqlite" },
+          sessionTarget: {
+            agentId: "main",
+            sessionId,
+            sessionKey,
+            storePath: "/tmp/openclaw-agent.sqlite",
+          },
+        },
+      }),
+    ).resolves.toBeUndefined();
+
+    const conversation = await engine.getConversationStore().getConversationForSession({
+      sessionId,
+      sessionKey,
+    });
+    expect(conversation).not.toBeNull();
+    const messages = await engine.getConversationStore().getMessages(conversation!.conversationId);
+    expect(messages.map((message) => message.content)).toEqual(["original user"]);
+  });
+
   it("does not persist afterTurn runtime messages when the visible projection is unavailable", async () => {
     const sessionId = "sqlite-afterturn-missing-projection";
     const sessionKey = "agent:main:sqlite-afterturn-missing-projection";
