@@ -795,22 +795,11 @@ async function resolveCurrentConversation(params: {
 
 async function resolveRuntimeSessionId(params: {
   ctx: PluginCommandContext;
-  deps: LcmDependencies;
   current: Extract<CurrentConversationResolution, { kind: "resolved" }>;
 }): Promise<string | undefined> {
   const directSessionId = normalizeIdentity(params.ctx.sessionId);
   if (directSessionId) {
     return directSessionId;
-  }
-
-  const sessionKey = normalizeIdentity(params.ctx.sessionKey);
-  if (sessionKey) {
-    const runtimeSessionId = normalizeIdentity(
-      await params.deps.resolveSessionIdFromSessionKey(sessionKey),
-    );
-    if (runtimeSessionId) {
-      return runtimeSessionId;
-    }
   }
 
   return normalizeIdentity(params.current.stats.sessionId);
@@ -1072,7 +1061,6 @@ async function runFocusLifecycleCompaction(params: {
   const sessionKey = params.sessionKey ?? normalizeIdentity(params.ctx.sessionKey);
   const sessionId = await resolveRuntimeSessionId({
     ctx: params.ctx,
-    deps: params.deps,
     current: params.current,
   });
   if (!sessionId) {

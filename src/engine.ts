@@ -1436,7 +1436,7 @@ export class LcmContextEngine implements ContextEngine {
     };
   }
 
-  /** Resolve an LCM conversation id from a session key via the session store. */
+  /** Resolve an LCM conversation id from a session key. */
   private async resolveConversationIdForSessionKey(
     sessionKey: string,
   ): Promise<number | undefined> {
@@ -1451,15 +1451,7 @@ export class LcmContextEngine implements ContextEngine {
       if (bySessionKey) {
         return bySessionKey.conversationId;
       }
-
-      const runtimeSessionId = await this.deps.resolveSessionIdFromSessionKey(trimmedKey);
-      if (!runtimeSessionId) {
-        return undefined;
-      }
-      const conversation = await this.conversationStore.getConversationForSession({
-        sessionId: runtimeSessionId,
-      });
-      return conversation?.conversationId;
+      return undefined;
     } catch {
       return undefined;
     }

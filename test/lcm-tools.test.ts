@@ -62,7 +62,6 @@ function makeDeps(overrides?: Partial<LcmDependencies>): LcmDependencies {
     buildSubagentSystemPrompt: () => "subagent prompt",
     readLatestAssistantReply: () => undefined,
     resolveAgentDir: () => "/tmp/openclaw-agent",
-    resolveSessionIdFromSessionKey: async () => undefined,
     agentLaneSubagent: "subagent",
     log: {
       info: vi.fn(),
@@ -344,7 +343,7 @@ describe("LCM tools session scoping", () => {
     expect(text).toContain("**Mode:** full_text | **Scope:** both | **Sort:** relevance");
   });
 
-  it("lcm_grep resolves conversation scope via sessionKey continuity before sessionId lookup", async () => {
+  it("lcm_grep resolves conversation scope via sessionKey continuity", async () => {
     const retrieval = {
       grep: vi.fn(async () => ({
         messages: [],
@@ -356,9 +355,7 @@ describe("LCM tools session scoping", () => {
     };
 
     const tool = createLcmGrepTool({
-      deps: makeDeps({
-        resolveSessionIdFromSessionKey: vi.fn(async () => "uuid-after-reset"),
-      }),
+      deps: makeDeps(),
       lcm: buildLcmEngine({ retrieval, conversationIdBySessionKey: 42 }) as never,
       sessionKey: "agent:main:main",
     });
@@ -384,9 +381,7 @@ describe("LCM tools session scoping", () => {
     };
 
     const tool = createLcmGrepTool({
-      deps: makeDeps({
-        resolveSessionIdFromSessionKey: vi.fn(async () => "uuid-after-reset"),
-      }),
+      deps: makeDeps(),
       lcm: buildLcmEngine({
         retrieval,
         conversationIdBySessionKey: 42,
@@ -518,9 +513,7 @@ describe("LCM tools session scoping", () => {
     };
 
     const tool = createLcmGrepTool({
-      deps: makeDeps({
-        resolveSessionIdFromSessionKey: vi.fn(async () => "uuid-after-reset"),
-      }),
+      deps: makeDeps(),
       lcm: buildLcmEngine({
         retrieval,
         conversationIdBySessionKey: 42,

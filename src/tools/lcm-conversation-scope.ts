@@ -102,7 +102,7 @@ export async function resolveLcmConversationScope(input: {
   params: Record<string, unknown>;
   sessionId?: string;
   sessionKey?: string;
-  deps?: Pick<LcmDependencies, "isSubagentSessionKey" | "resolveSessionIdFromSessionKey">;
+  deps?: Pick<LcmDependencies, "isSubagentSessionKey">;
 }): Promise<LcmConversationScope> {
   const { lcm, params } = input;
   const explicitSessionKey = input.sessionKey?.trim();
@@ -244,10 +244,7 @@ export async function resolveLcmConversationScope(input: {
     }
   }
 
-  let normalizedSessionId = sessionIdAsSessionKey ? undefined : normalizedInputSessionId;
-  if (!normalizedSessionId && normalizedSessionKey && input.deps) {
-    normalizedSessionId = await input.deps.resolveSessionIdFromSessionKey(normalizedSessionKey);
-  }
+  const normalizedSessionId = sessionIdAsSessionKey ? undefined : normalizedInputSessionId;
   if (!normalizedSessionId && !input.sessionKey?.trim()) {
     return {
       conversationId:

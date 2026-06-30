@@ -215,17 +215,11 @@ describe("LcmContextEngine ignored sessions", () => {
     const childSessionKey = "agent:main:subagent:worker-123";
     const includedParentSessionKey = "agent:main:main";
     const runtimeSessionId = "runtime-parent-session";
-    const engine = createEngineWithDeps(
-      { ignoreSessionPatterns: ["agent:*:cron:**"] },
-      {
-        resolveSessionIdFromSessionKey: vi.fn(async (sessionKey: string) =>
-          sessionKey === includedParentSessionKey ? runtimeSessionId : undefined,
-        ),
-      },
-    );
+    const engine = createEngineWithDeps({ ignoreSessionPatterns: ["agent:*:cron:**"] });
 
     await engine.ingest({
       sessionId: runtimeSessionId,
+      sessionKey: includedParentSessionKey,
       message: makeMessage({ role: "user", content: "parent context" }),
     });
 
@@ -628,14 +622,7 @@ describe("LcmContextEngine stateless sessions", () => {
 
   it("skips delegated grant writes for stateless session keys", async () => {
     const childSessionKey = "agent:main:subagent:child-456";
-    const engine = createEngineWithDeps(
-      { statelessSessionPatterns: ["agent:*:subagent:worker-*"] },
-      {
-        resolveSessionIdFromSessionKey: vi.fn(async (sessionKey: string) =>
-          sessionKey === statefulSessionKey ? runtimeSessionId : undefined,
-        ),
-      },
-    );
+    const engine = createEngineWithDeps({ statelessSessionPatterns: ["agent:*:subagent:worker-*"] });
 
     await engine.ingest({
       sessionId: runtimeSessionId,
@@ -1118,7 +1105,6 @@ describe("LcmContextEngine delegated session continuity", () => {
     const config = createTestConfig(join(tempDir, "lcm.db"));
     const db = createLcmDatabaseConnection(config.databasePath);
     const deps = createTestDeps(config);
-    deps.resolveSessionIdFromSessionKey = vi.fn(async () => "uuid-after-reset");
     const engine = new LcmContextEngine(deps, db);
 
     (engine as unknown as { ensureMigrated(): void }).ensureMigrated();
@@ -1164,4 +1150,3 @@ describe("LcmContextEngine connection lifecycle", () => {
 });
 
 // ── Bootstrap ───────────────────────────────────────────────────────────────
-
