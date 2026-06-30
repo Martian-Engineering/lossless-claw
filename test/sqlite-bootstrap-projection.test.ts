@@ -537,6 +537,126 @@ describe("LcmContextEngine.bootstrap sqlite transcript projection", () => {
     ]);
   });
 
+  it("adopts a recent externalized tail message when the projection catches up", async () => {
+    const sessionId = "sqlite-bootstrap-externalized-adopt-session";
+    const sessionKey = "agent:main:sqlite-bootstrap-externalized-adopt-session";
+    const fileText = `${"line about sqlite transcript projection\n".repeat(160)}closing notes`;
+    const fileMessageContent = `<file name="projection.md" mime="text/markdown">${fileText}</file>`;
+    let visibleEntries: VisibleSessionTranscriptMessageEntry[] = [
+      {
+        entryId: "entry-externalized-anchor",
+        parentId: null,
+        seq: 1,
+        role: "user",
+        message: { role: "user", content: "anchor before file" } satisfies AgentMessage,
+        createdAt: "2026-06-29T12:28:00.000Z",
+      },
+    ];
+    const readVisibleSessionTranscriptMessageEntries = vi.fn(async () => visibleEntries);
+    const { engine, db } = createEngineWithDepsOverridesAndDb(
+      { readVisibleSessionTranscriptMessageEntries } satisfies Partial<LcmDependencies>,
+      { largeFileTokenThreshold: 20 },
+    );
+
+    await expect(
+      engine.bootstrap({
+        sessionId,
+        sessionKey,
+        runtimeContext: {
+          transcriptStorage: { kind: "sqlite" },
+          sessionTarget: {
+            agentId: "main",
+            sessionId,
+            sessionKey,
+            storePath: "/tmp/openclaw-agent.sqlite",
+          },
+        },
+      }),
+    ).resolves.toMatchObject({ bootstrapped: true, importedMessages: 1 });
+
+    await expect(
+      engine.afterTurn({
+        sessionId,
+        sessionKey,
+        sessionFile: "/tmp/ignored-lossless-sqlite-externalized-adopt.jsonl",
+        messages: [
+          { role: "user", content: "anchor before file" },
+          { role: "user", content: fileMessageContent },
+        ] satisfies AgentMessage[],
+        prePromptMessageCount: 1,
+        runtimeContext: {
+          transcriptStorage: { kind: "sqlite" },
+          sessionTarget: {
+            agentId: "main",
+            sessionId,
+            sessionKey,
+            storePath: "/tmp/openclaw-agent.sqlite",
+          },
+        },
+      }),
+    ).resolves.toBeUndefined();
+
+    visibleEntries = [
+      visibleEntries[0]!,
+      {
+        entryId: "entry-externalized-file",
+        parentId: "entry-externalized-anchor",
+        seq: 2,
+        role: "user",
+        message: { role: "user", content: fileMessageContent } satisfies AgentMessage,
+        createdAt: "2026-06-29T12:28:01.000Z",
+      },
+      {
+        entryId: "entry-externalized-tail",
+        parentId: "entry-externalized-file",
+        seq: 3,
+        role: "assistant",
+        message: { role: "assistant", content: "tail after externalized file" } satisfies AgentMessage,
+        createdAt: "2026-06-29T12:28:02.000Z",
+      },
+    ];
+
+    await expect(
+      engine.bootstrap({
+        sessionId,
+        sessionKey,
+        runtimeContext: {
+          transcriptStorage: { kind: "sqlite" },
+          sessionTarget: {
+            agentId: "main",
+            sessionId,
+            sessionKey,
+            storePath: "/tmp/openclaw-agent.sqlite",
+          },
+        },
+      }),
+    ).resolves.toMatchObject({
+      bootstrapped: true,
+      importedMessages: 1,
+      reason: "reconciled missing session messages",
+    });
+
+    const conversation = await engine.getConversationStore().getConversationForSession({
+      sessionId,
+      sessionKey,
+    });
+    expect(conversation).not.toBeNull();
+    const messages = await engine.getConversationStore().getMessages(conversation!.conversationId);
+    expect(messages).toHaveLength(3);
+    expect(messages[1]!.content).toContain("[LCM File: file_");
+    expect(messages[2]!.content).toBe("tail after externalized file");
+    const rows = db
+      .prepare(
+        `SELECT transcript_entry_id FROM messages WHERE conversation_id = ? ORDER BY seq`,
+      )
+      .all(conversation!.conversationId) as Array<{ transcript_entry_id: string | null }>;
+    expect(rows.map((row) => row.transcript_entry_id)).toEqual([
+      "entry-externalized-anchor",
+      "entry-externalized-file",
+      "entry-externalized-tail",
+    ]);
+  });
+
   it("caps existing-conversation projection tail imports after the overlap anchor", async () => {
     const sessionId = "sqlite-bootstrap-import-cap-session";
     const sessionKey = "agent:main:sqlite-bootstrap-import-cap-session";
