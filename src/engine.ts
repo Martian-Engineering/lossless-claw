@@ -653,10 +653,14 @@ export class LcmContextEngine implements ContextEngine {
     params: DeferredCompactionDebtDrainParams & { queueKey: string },
   ): Promise<void> {
     const sessionLabel = formatSessionLabel(params.sessionId, params.sessionKey);
-    if (this.sessionOperationQueues.has(params.queueKey)) {
+    const busyQueue = this.sessionOperationQueues.get(params.queueKey);
+    if (busyQueue) {
       this.deps.log.debug(
         `[lcm] background deferred compaction skipped conversation=${params.conversationId} ${sessionLabel} reason=session-queue-busy debtReason=${params.reason}`,
       );
+      void busyQueue.promise.finally(() => {
+        this.scheduleDeferredCompactionDebtDrain(params);
+      });
       return;
     }
     if (this.deferredCompactionDrains.has(params.queueKey)) {
