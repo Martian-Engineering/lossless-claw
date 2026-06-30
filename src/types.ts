@@ -172,12 +172,6 @@ export interface LcmDependencies {
   /** Resolve runtime session id from an agent session key */
   resolveSessionIdFromSessionKey: (sessionKey: string) => Promise<string | undefined>;
 
-  /** Resolve the current transcript file path for a session identity */
-  resolveSessionTranscriptFile: (params: {
-    sessionId: string;
-    sessionKey?: string;
-  }) => Promise<string | undefined>;
-
   /** Read OpenClaw-owned visible transcript entries for SQLite-backed sessions. */
   readVisibleSessionTranscriptMessageEntries?: (
     target: SessionTranscriptReadTarget,
