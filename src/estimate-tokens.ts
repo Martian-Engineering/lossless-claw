@@ -58,6 +58,12 @@ const OPAQUE_BINARY_PART_TOKEN_ESTIMATE = 1_600;
 /** Strings at least this long are checked for base64-style opaque data. */
 const OPAQUE_BINARY_MIN_CHARS = 4_096;
 
+const TOOL_RESULT_CHARS_PER_TOKEN = 2;
+const JSON_PAYLOAD_CHARS_PER_TOKEN = 3;
+const MESSAGE_BOUNDARY_OVERHEAD_TOKENS = 12;
+const CONTENT_BLOCK_OVERHEAD_TOKENS = 6;
+const MODEL_BOUNDARY_SAFETY_MARGIN = 1.2;
+
 /**
  * Field names that carry binary payloads (image/document sources). Only
  * values under these keys are eligible for fixed-cost substitution: base64
@@ -153,11 +159,85 @@ export function estimateSerializedMessageTokens(message: unknown): number {
       }
     }
   }
-  const estimate = estimateTokens(serialized) + opaqueParts * OPAQUE_BINARY_PART_TOKEN_ESTIMATE;
+  const serializedEstimate =
+    estimateTokens(serialized) + opaqueParts * OPAQUE_BINARY_PART_TOKEN_ESTIMATE;
+  const estimate = Math.max(serializedEstimate, estimateToolResultBoundaryTokens(message));
   if (cacheable) {
     serializedEstimateCache.set(message as object, estimate);
   }
   return estimate;
+}
+
+function estimateBoundaryStringTokens(text: string, charsPerToken: number): number {
+  return Math.ceil(estimateTokens(text) * (4 / charsPerToken));
+}
+
+function estimateBoundaryJsonTokens(value: unknown, charsPerToken: number): number {
+  if (value == null) {
+    return 0;
+  }
+  try {
+    const serialized = JSON.stringify(value);
+    return typeof serialized === "string"
+      ? estimateBoundaryStringTokens(serialized, charsPerToken)
+      : 1;
+  } catch {
+    return 256;
+  }
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function isToolResultMessage(message: unknown): message is Record<string, unknown> {
+  if (!isRecord(message)) {
+    return false;
+  }
+  return message.role === "tool" || message.role === "toolResult" || message.type === "toolResult";
+}
+
+function estimateToolResultBlockTokens(block: unknown): number {
+  if (typeof block === "string") {
+    return estimateBoundaryStringTokens(block, TOOL_RESULT_CHARS_PER_TOKEN);
+  }
+  if (!isRecord(block)) {
+    return estimateBoundaryJsonTokens(block, TOOL_RESULT_CHARS_PER_TOKEN);
+  }
+  if (block.type === "text" && typeof block.text === "string") {
+    return (
+      CONTENT_BLOCK_OVERHEAD_TOKENS +
+      estimateBoundaryStringTokens(block.text, TOOL_RESULT_CHARS_PER_TOKEN)
+    );
+  }
+  return (
+    CONTENT_BLOCK_OVERHEAD_TOKENS +
+    estimateBoundaryJsonTokens(block, TOOL_RESULT_CHARS_PER_TOKEN)
+  );
+}
+
+function estimateToolResultContentTokens(content: unknown): number {
+  if (typeof content === "string") {
+    return estimateBoundaryStringTokens(content, TOOL_RESULT_CHARS_PER_TOKEN);
+  }
+  if (Array.isArray(content)) {
+    return content.reduce((sum, block) => sum + estimateToolResultBlockTokens(block), 0);
+  }
+  if (content !== undefined) {
+    return estimateBoundaryJsonTokens(content, TOOL_RESULT_CHARS_PER_TOKEN);
+  }
+  return 0;
+}
+
+function estimateToolResultBoundaryTokens(message: unknown): number {
+  if (!isToolResultMessage(message)) {
+    return 0;
+  }
+  const tokens =
+    MESSAGE_BOUNDARY_OVERHEAD_TOKENS +
+    estimateToolResultContentTokens(message.content) +
+    estimateBoundaryJsonTokens(message.toolName ?? message.tool_name, JSON_PAYLOAD_CHARS_PER_TOKEN);
+  return Math.ceil(tokens * MODEL_BOUNDARY_SAFETY_MARGIN);
 }
 
 /** Sum of `estimateSerializedMessageTokens` across a message list. */
