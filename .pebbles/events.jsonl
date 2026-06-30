@@ -31,3 +31,4 @@
 {"type":"dep_add","timestamp":"2026-06-30T07:15:30.14745Z","issue_id":"lc-8cb.5","payload":{"dep_type":"blocks","depends_on":"lc-8cb.3"}}
 {"type":"dep_add","timestamp":"2026-06-30T07:15:30.174857Z","issue_id":"lc-8cb.5","payload":{"dep_type":"blocks","depends_on":"lc-8cb.4"}}
 {"type":"dep_add","timestamp":"2026-06-30T07:15:30.202599Z","issue_id":"lc-8cb.6","payload":{"dep_type":"blocks","depends_on":"lc-8cb.5"}}
+{"type":"status_update","timestamp":"2026-06-30T07:16:09.011936Z","issue_id":"lc-8cb.1","payload":{"status":"in_progress"}}
