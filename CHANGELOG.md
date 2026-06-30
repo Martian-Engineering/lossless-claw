@@ -1,5 +1,37 @@
 # @martian-engineering/lossless-claw
 
+## 0.13.2
+
+### Patch Changes
+
+- [#855](https://github.com/Martian-Engineering/lossless-claw/pull/855) [`0681006`](https://github.com/Martian-Engineering/lossless-claw/commit/06810069254aa35d2f013c3ebb02fadc90d0db12) Thanks [@bowenluo718](https://github.com/bowenluo718)! - Prevent `afterTurn` replay batches from duplicating messages whose stored content was rewritten during ingest, such as large-file payload references.
+
+- [#843](https://github.com/Martian-Engineering/lossless-claw/pull/843) [`3a0b485`](https://github.com/Martian-Engineering/lossless-claw/commit/3a0b4851b193fc32c88be3233bce7d6fff82976e) Thanks [@mpz4life](https://github.com/mpz4life)! - Expose `fallbackMaxTokens` as a documented plugin configuration option for deterministic fallback summaries.
+
+- [#920](https://github.com/Martian-Engineering/lossless-claw/pull/920) [`8c95d55`](https://github.com/Martian-Engineering/lossless-claw/commit/8c95d5516950fc778a9f94704eb5f9bde34657f7) Thanks [@jetd1](https://github.com/jetd1)! - Dedup adjacent delivery-mirror messages by content identity in `ingestSingle`. OpenClaw writes two JSONL entries per assistant turn — the model response (with reasoning + text) and a delivery-mirror (text only, `model="delivery-mirror"`). Both share the same `identity_hash` because `toStoredMessage` strips reasoning, but they have different transcript entry ids, so the entry-id idempotency check does not catch the mirror. This skips delivery-mirror ingestion only when the immediately previous assistant message has the same identity and preserved reasoning content, including top-level `reasoning_content` metadata.
+
+- [#919](https://github.com/Martian-Engineering/lossless-claw/pull/919) [`753721f`](https://github.com/Martian-Engineering/lossless-claw/commit/753721fc95b763c95a620f535c6743ba70b1c34a) Thanks [@ralf003](https://github.com/ralf003)! - Allow forced compaction recovery to clear summary spend backoff so overflow repair is not blocked by an earlier failed summary attempt.
+
+- [#940](https://github.com/Martian-Engineering/lossless-claw/pull/940) [`186df03`](https://github.com/Martian-Engineering/lossless-claw/commit/186df03967097d658473835cab3dac973dbf47e6) Thanks [@100yenadmin](https://github.com/100yenadmin)! - Add a packaged `lossless-claw-migrate-sessions` CLI for dry-run-by-default OpenClaw JSONL session backfills into `lcm.db`.
+
+- [#946](https://github.com/Martian-Engineering/lossless-claw/pull/946) [`5d585c7`](https://github.com/Martian-Engineering/lossless-claw/commit/5d585c7a8f6b7f64c21faba50fe3084d05c910f1) Thanks [@mpz4life](https://github.com/mpz4life)! - Keep oversized `lcm_describe` tool results inline instead of wrapping them in another externalized tool-output stub, so drilldown responses return the requested content directly.
+
+- [#914](https://github.com/Martian-Engineering/lossless-claw/pull/914) [`bf7e359`](https://github.com/Martian-Engineering/lossless-claw/commit/bf7e35913f952f6ba8905467fb352dc0d0c84f2d) Thanks [@100yenadmin](https://github.com/100yenadmin)! - Declare the `/lossless` and `/lcm` runtime slash commands in plugin metadata and align command docs around `/lossless` as the primary command.
+
+- [#931](https://github.com/Martian-Engineering/lossless-claw/pull/931) [`74bebd6`](https://github.com/Martian-Engineering/lossless-claw/commit/74bebd61df9c20e24fd8314239f666730b499962) Thanks [@gorkem2020](https://github.com/gorkem2020)! - Recover stuck afterTurn reconciliation for OpenClaw room-event and unaddressed Delivery frontiers so compaction can resume from placeholder or checkpoint-missing sessions.
+
+- [#926](https://github.com/Martian-Engineering/lossless-claw/pull/926) [`789ea5e`](https://github.com/Martian-Engineering/lossless-claw/commit/789ea5e5828cf05c2f986edd954f396e908c3201) Thanks [@gorkem2020](https://github.com/gorkem2020)! - Preserve the decorated live current turn across channels by recognizing it structurally and appending it when the stored transcript only has the bare body. Ambiguous same-body stored rows are kept until a stable turn identity exists, so live-current-turn recovery remains lossless.
+
+- [#943](https://github.com/Martian-Engineering/lossless-claw/pull/943) [`4fe79fa`](https://github.com/Martian-Engineering/lossless-claw/commit/4fe79faf5a40fe06bb8914d7468e48818a7f00d9) Thanks [@gorkem2020](https://github.com/gorkem2020)! - Demote fully redundant afterTurn frontier-overlap fail-closed logs from warn to debug while preserving warnings for partial or under-covered overlap batches.
+
+- [#937](https://github.com/Martian-Engineering/lossless-claw/pull/937) [`a4f5502`](https://github.com/Martian-Engineering/lossless-claw/commit/a4f55020c1b6c1fdda7fd6c5be44494f3a38e842) Thanks [@gorkem2020](https://github.com/gorkem2020)! - Log benign volatile live-input appends at debug instead of warn, while preserving warnings when the append goes over budget or evicts assembled messages.
+
+- [#932](https://github.com/Martian-Engineering/lossless-claw/pull/932) [`f7f3b15`](https://github.com/Martian-Engineering/lossless-claw/commit/f7f3b1554f48a030bf342a44e09ff3be47c0b08a) Thanks [@gorkem2020](https://github.com/gorkem2020)! - Recover base channel sessions that were stuck in afterTurn reconciliation when their raw ids also appeared in same-agent same-channel thread or active-memory fork history.
+
+- [#927](https://github.com/Martian-Engineering/lossless-claw/pull/927) [`c70e4df`](https://github.com/Martian-Engineering/lossless-claw/commit/c70e4df39d8182ef3b62a15e4b71450627a89e52) Thanks [@gorkem2020](https://github.com/gorkem2020)! - Tighten the structural same-turn supersede so it only collapses a runtime or live copy onto a bare persisted row when the bare body is carried under a channel timestamp, rather than whenever the content merely contains the substring "(untrusted metadata)" or ends with a line equal to the bare body. Structured metadata blocks remain untrusted user-facing text until OpenClaw provides a trusted marker, so metadata-only copies are preserved rather than risk silently superseding an earlier user turn. The guard now covers both the store after-turn path and the assembly supersede path.
+
+- [#911](https://github.com/Martian-Engineering/lossless-claw/pull/911) [`e13a1ff`](https://github.com/Martian-Engineering/lossless-claw/commit/e13a1ff7eb22803841013311cdcda0dbf8cffb9c) Thanks [@100yenadmin](https://github.com/100yenadmin)! - Warn from `/lossless` status and doctor when OpenClaw metadata shows lossless-claw installed from an exact npm version, and document `@latest` as the routine install/update track.
+
 ## 0.13.1
 
 ### Patch Changes
