@@ -341,6 +341,15 @@ describe("LcmContextEngine.bootstrap sqlite transcript projection", () => {
         message: { role: "assistant", content: "ok" } satisfies AgentMessage,
       }),
     ).resolves.toMatchObject({ ingested: true });
+    for (let index = 0; index < 9; index += 1) {
+      await expect(
+        engine.ingest({
+          sessionId,
+          sessionKey,
+          message: { role: "user", content: `later filler ${index}` } satisfies AgentMessage,
+        }),
+      ).resolves.toMatchObject({ ingested: true });
+    }
 
     await expect(
       engine.bootstrap({
@@ -368,13 +377,163 @@ describe("LcmContextEngine.bootstrap sqlite transcript projection", () => {
     });
     expect(conversation).not.toBeNull();
     const messages = await engine.getConversationStore().getMessages(conversation!.conversationId);
-    expect(messages.map((message) => message.content)).toEqual(["ok"]);
+    expect(messages.map((message) => message.content)).toEqual([
+      "ok",
+      ...Array.from({ length: 9 }, (_, index) => `later filler ${index}`),
+    ]);
     const rows = db
       .prepare(
         `SELECT transcript_entry_id FROM messages WHERE conversation_id = ? ORDER BY seq`,
       )
       .all(conversation!.conversationId) as Array<{ transcript_entry_id: string | null }>;
-    expect(rows.map((row) => row.transcript_entry_id)).toEqual([null]);
+    expect(rows.map((row) => row.transcript_entry_id)).toEqual(Array(10).fill(null));
+  });
+
+  it("adopts a recent unstamped tail message as the projection anchor", async () => {
+    const sessionId = "sqlite-bootstrap-recent-adopt-session";
+    const sessionKey = "agent:main:sqlite-bootstrap-recent-adopt-session";
+    const readVisibleSessionTranscriptMessageEntries = vi.fn(async () => [
+      {
+        entryId: "entry-recent-ok",
+        parentId: null,
+        seq: 1,
+        role: "assistant",
+        message: { role: "assistant", content: "ok" } satisfies AgentMessage,
+        createdAt: "2026-06-29T12:26:00.000Z",
+      },
+      {
+        entryId: "entry-recent-tail",
+        parentId: "entry-recent-ok",
+        seq: 2,
+        role: "user",
+        message: { role: "user", content: "tail after adoption" } satisfies AgentMessage,
+        createdAt: "2026-06-29T12:26:01.000Z",
+      },
+    ]);
+    const { engine, db } = createEngineWithDepsOverridesAndDb({
+      readVisibleSessionTranscriptMessageEntries,
+    } satisfies Partial<LcmDependencies>);
+
+    await expect(
+      engine.ingest({
+        sessionId,
+        sessionKey,
+        message: { role: "assistant", content: "ok" } satisfies AgentMessage,
+      }),
+    ).resolves.toMatchObject({ ingested: true });
+
+    await expect(
+      engine.bootstrap({
+        sessionId,
+        sessionKey,
+        runtimeContext: {
+          transcriptStorage: { kind: "sqlite" },
+          sessionTarget: {
+            agentId: "main",
+            sessionId,
+            sessionKey,
+            storePath: "/tmp/openclaw-agent.sqlite",
+          },
+        },
+      }),
+    ).resolves.toMatchObject({
+      bootstrapped: true,
+      importedMessages: 1,
+      reason: "reconciled missing session messages",
+    });
+
+    const conversation = await engine.getConversationStore().getConversationForSession({
+      sessionId,
+      sessionKey,
+    });
+    expect(conversation).not.toBeNull();
+    const messages = await engine.getConversationStore().getMessages(conversation!.conversationId);
+    expect(messages.map((message) => message.content)).toEqual(["ok", "tail after adoption"]);
+    const rows = db
+      .prepare(
+        `SELECT transcript_entry_id FROM messages WHERE conversation_id = ? ORDER BY seq`,
+      )
+      .all(conversation!.conversationId) as Array<{ transcript_entry_id: string | null }>;
+    expect(rows.map((row) => row.transcript_entry_id)).toEqual([
+      "entry-recent-ok",
+      "entry-recent-tail",
+    ]);
+  });
+
+  it("caps existing-conversation projection tail imports after the overlap anchor", async () => {
+    const sessionId = "sqlite-bootstrap-import-cap-session";
+    const sessionKey = "agent:main:sqlite-bootstrap-import-cap-session";
+    let visibleEntries: VisibleSessionTranscriptMessageEntry[] = [
+      {
+        entryId: "entry-cap-anchor",
+        parentId: null,
+        seq: 1,
+        role: "assistant",
+        message: { role: "assistant", content: "anchor" } satisfies AgentMessage,
+        createdAt: "2026-06-29T12:27:00.000Z",
+      },
+    ];
+    const readVisibleSessionTranscriptMessageEntries = vi.fn(async () => visibleEntries);
+    const { engine } = createEngineWithDepsOverridesAndDb({
+      readVisibleSessionTranscriptMessageEntries,
+    } satisfies Partial<LcmDependencies>);
+
+    await expect(
+      engine.bootstrap({
+        sessionId,
+        sessionKey,
+        runtimeContext: {
+          transcriptStorage: { kind: "sqlite" },
+          sessionTarget: {
+            agentId: "main",
+            sessionId,
+            sessionKey,
+            storePath: "/tmp/openclaw-agent.sqlite",
+          },
+        },
+      }),
+    ).resolves.toMatchObject({ bootstrapped: true, importedMessages: 1 });
+
+    visibleEntries = [
+      visibleEntries[0]!,
+      ...Array.from({ length: 60 }, (_, index) => ({
+        entryId: `entry-cap-tail-${index}`,
+        parentId: index === 0 ? "entry-cap-anchor" : `entry-cap-tail-${index - 1}`,
+        seq: index + 2,
+        role: "user" as const,
+        message: { role: "user", content: `tail ${index}` } satisfies AgentMessage,
+        createdAt: "2026-06-29T12:27:01.000Z",
+      })),
+    ];
+
+    await expect(
+      engine.bootstrap({
+        sessionId,
+        sessionKey,
+        runtimeContext: {
+          transcriptStorage: { kind: "sqlite" },
+          sessionTarget: {
+            agentId: "main",
+            sessionId,
+            sessionKey,
+            storePath: "/tmp/openclaw-agent.sqlite",
+          },
+        },
+      }),
+    ).resolves.toMatchObject({
+      bootstrapped: false,
+      importedMessages: 50,
+      reason: "reconcile import capped",
+    });
+
+    const conversation = await engine.getConversationStore().getConversationForSession({
+      sessionId,
+      sessionKey,
+    });
+    expect(conversation).not.toBeNull();
+    const messages = await engine.getConversationStore().getMessages(conversation!.conversationId);
+    expect(messages).toHaveLength(51);
+    expect(messages.at(-1)?.content).toBe("tail 49");
   });
 
   it("fails closed instead of appending a no-overlap bootstrap projection to an existing conversation", async () => {
