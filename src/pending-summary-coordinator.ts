@@ -17,7 +17,7 @@ import type {
   PendingSummaryStore,
 } from "./store/pending-summary-store.js";
 import type { ContextItemRecord, SummaryRecord, SummaryStore } from "./store/summary-store.js";
-import type { LcmSummarizeFn } from "./summarize.js";
+import { LcmProviderAuthError, type LcmSummarizeFn } from "./summarize.js";
 
 const PENDING_PROMPT_VERSION = "pending-summary-dag:v1";
 
@@ -48,7 +48,13 @@ export type PendingCompactionCoordinatorResult =
   | { status: "prepared"; batchId: string; nodeId: string }
   | { status: "published"; batchId: string; frontierSummaryIds: string[] }
   | { status: "stale"; batchId: string; reason: string }
-  | { status: "failed"; batchId: string; nodeId: string; failureSummary: string };
+  | {
+      status: "failed";
+      batchId: string;
+      nodeId: string;
+      failureSummary: string;
+      authFailure?: boolean;
+    };
 
 type ProjectionSnapshot = {
   items: PendingSummaryPlannerSnapshotItem[];
@@ -156,6 +162,7 @@ export class PendingCompactionCoordinator {
           depth: node.kind === "condensed" ? node.depth : undefined,
         }),
       estimateTokens,
+      isAuthFailure: (error) => error instanceof LcmProviderAuthError,
     });
     const prepared = await worker.prepareOne({ conversationId: input.conversationId });
     if (prepared.status === "prepared") {
@@ -171,6 +178,7 @@ export class PendingCompactionCoordinator {
         batchId: batch.batchId,
         nodeId: prepared.nodeId,
         failureSummary: prepared.failureSummary,
+        authFailure: prepared.authFailure,
       };
     }
 
@@ -265,10 +273,13 @@ export class PendingCompactionCoordinator {
       );
       return;
     }
-    await this.pendingSummaryStore.linkNodeToChildren(node.nodeId, [
-      ...node.childNodeIds.map((childNodeId) => ({ childNodeId })),
-      ...node.childSummaryIds.map((childSummaryId) => ({ childSummaryId })),
-    ]);
+    await this.pendingSummaryStore.linkNodeToChildren(
+      node.nodeId,
+      node.childLinks ?? [
+        ...node.childNodeIds.map((childNodeId) => ({ childNodeId })),
+        ...node.childSummaryIds.map((childSummaryId) => ({ childSummaryId })),
+      ],
+    );
   }
 
   private async publishIfReady(input: {
@@ -479,6 +490,7 @@ export class PendingCompactionCoordinator {
       sourceMessageIds: [],
       childNodeIds: [],
       childSummaryIds: [],
+      childLinks: [],
     };
   }
 

@@ -128,6 +128,7 @@ describe("pending summary planner", () => {
     expect(condensedNodes[0]).toMatchObject({
       childNodeIds: ["pending-leaf-b"],
       childSummaryIds: ["sum_active_a"],
+      childLinks: [{ childSummaryId: "sum_active_a" }, { childNodeId: "pending-leaf-b" }],
     });
   });
 
@@ -170,6 +171,7 @@ describe("pending summary planner", () => {
     expect(condensedNodes[0]).toMatchObject({
       childNodeIds: ["pending-condensed-a"],
       childSummaryIds: ["sum_active_c"],
+      childLinks: [{ childNodeId: "pending-condensed-a" }, { childSummaryId: "sum_active_c" }],
     });
   });
 

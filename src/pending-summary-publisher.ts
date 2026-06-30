@@ -31,6 +31,10 @@ type ChildSummaryIds = {
   canonicalChildSummaryIds: string[];
 };
 
+type ChildSummaryLink =
+  | { kind: "pending"; childNodeId: string }
+  | { kind: "canonical"; summaryId: string };
+
 type SummaryCoverageMetadata = Pick<
   CreateSummaryInput,
   | "earliestAt"
@@ -229,8 +233,10 @@ export class PendingSummaryPublisher {
       }
       visited.add(node.nodeId);
       requireReadyNode(node);
-      const children = await this.readChildSummaryIds(node.nodeId);
-      for (const childNodeId of children.pendingChildNodeIds) {
+      const children = await this.readChildSummaryLinks(node.nodeId);
+      for (const childNodeId of children
+        .filter((child) => child.kind === "pending")
+        .map((child) => child.childNodeId)) {
         const childNode = await this.pendingSummaryStore.getNode(childNodeId);
         if (!childNode) {
           throw new Error(`Pending child summary node ${childNodeId} was not found`);
@@ -272,17 +278,17 @@ export class PendingSummaryPublisher {
       return;
     }
 
-    const childIds = await this.readChildSummaryIds(node.nodeId);
-    const parentSummaryIds = [
-      ...childIds.pendingChildNodeIds.map((childNodeId) => {
-        const canonicalChildId = canonicalIdsByNodeId.get(childNodeId);
+    const childLinks = await this.readChildSummaryLinks(node.nodeId);
+    const parentSummaryIds = childLinks.map((child) => {
+      if (child.kind === "pending") {
+        const canonicalChildId = canonicalIdsByNodeId.get(child.childNodeId);
         if (!canonicalChildId) {
-          throw new Error(`Missing canonical id for pending child node ${childNodeId}`);
+          throw new Error(`Missing canonical id for pending child node ${child.childNodeId}`);
         }
         return canonicalChildId;
-      }),
-      ...childIds.canonicalChildSummaryIds,
-    ];
+      }
+      return child.summaryId;
+    });
     if (!existing) {
       await this.summaryStore.insertSummary({
         summaryId: canonicalSummaryId,
@@ -353,14 +359,29 @@ export class PendingSummaryPublisher {
   }
 
   private async readChildSummaryIds(nodeId: string): Promise<ChildSummaryIds> {
-    const children = await this.pendingSummaryStore.getNodeChildren(nodeId);
+    const children = await this.readChildSummaryLinks(nodeId);
     return {
       pendingChildNodeIds: children
-        .map((child) => child.childNodeId)
+        .map((child) => (child.kind === "pending" ? child.childNodeId : null))
         .filter((childNodeId): childNodeId is string => typeof childNodeId === "string"),
       canonicalChildSummaryIds: children
-        .map((child) => child.childSummaryId)
+        .map((child) => (child.kind === "canonical" ? child.summaryId : null))
         .filter((childSummaryId): childSummaryId is string => typeof childSummaryId === "string"),
     };
+  }
+
+  private async readChildSummaryLinks(nodeId: string): Promise<ChildSummaryLink[]> {
+    const children = await this.pendingSummaryStore.getNodeChildren(nodeId);
+    const links: ChildSummaryLink[] = [];
+    for (const child of children) {
+      if (typeof child.childNodeId === "string") {
+        links.push({ kind: "pending", childNodeId: child.childNodeId });
+        continue;
+      }
+      if (typeof child.childSummaryId === "string") {
+        links.push({ kind: "canonical", summaryId: child.childSummaryId });
+      }
+    }
+    return links;
   }
 }

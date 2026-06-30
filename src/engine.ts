@@ -975,6 +975,16 @@ export class LcmContextEngine implements ContextEngine {
       customInstructions: params.customInstructions,
       breakerScope,
     });
+    if (
+      resolvedSummarizer.breakerKey &&
+      this.compactionGuards.isCircuitBreakerOpen(resolvedSummarizer.breakerKey)
+    ) {
+      return {
+        ok: true,
+        compacted: false,
+        reason: "circuit breaker open",
+      };
+    }
     const withPublishLock =
       params.sessionQueueHeld === true
         ? undefined
@@ -1027,6 +1037,9 @@ export class LcmContextEngine implements ContextEngine {
         };
       }
       if (lastResult.status === "failed") {
+        if (lastResult.authFailure && resolvedSummarizer.breakerKey) {
+          this.compactionGuards.recordCompactionAuthFailure(resolvedSummarizer.breakerKey);
+        }
         return {
           ok: false,
           compacted: false,
@@ -1071,6 +1084,9 @@ export class LcmContextEngine implements ContextEngine {
           reason: lastResult.reason,
           result: lastResult,
         };
+      }
+      if (lastResult.status === "prepared" && resolvedSummarizer.breakerKey) {
+        this.compactionGuards.recordCompactionSuccess(resolvedSummarizer.breakerKey);
       }
     }
 

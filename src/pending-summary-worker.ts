@@ -31,12 +31,13 @@ export type PendingSummaryPreparationWorkerOptions = {
   loadSourceText: (node: PendingSummaryNodeRecord) => Promise<string>;
   summarize: (sourceText: string, node: PendingSummaryNodeRecord) => Promise<string>;
   estimateTokens: (content: string) => number;
+  isAuthFailure?: (error: unknown) => boolean;
 };
 
 export type PendingSummaryPreparationResult =
   | { status: "idle" }
   | { status: "prepared"; nodeId: string }
-  | { status: "failed"; nodeId: string; failureSummary: string };
+  | { status: "failed"; nodeId: string; failureSummary: string; authFailure?: boolean };
 
 function describeError(error: unknown): string {
   if (error instanceof Error && typeof error.message === "string" && error.message.length > 0) {
@@ -80,6 +81,7 @@ export class PendingSummaryPreparationWorker {
     node: PendingSummaryNodeRecord,
   ) => Promise<string>;
   private readonly estimateTokens: (content: string) => number;
+  private readonly isAuthFailure: (error: unknown) => boolean;
 
   constructor(options: PendingSummaryPreparationWorkerOptions) {
     this.store = options.store;
@@ -89,6 +91,7 @@ export class PendingSummaryPreparationWorker {
     this.loadSourceText = options.loadSourceText;
     this.summarize = options.summarize;
     this.estimateTokens = options.estimateTokens;
+    this.isAuthFailure = options.isAuthFailure ?? (() => false);
   }
 
   /** Prepare one pending summary node for a conversation, if work is claimable. */
@@ -124,6 +127,7 @@ export class PendingSummaryPreparationWorker {
       return { status: "prepared", nodeId: node.nodeId };
     } catch (error) {
       const failureSummary = describeError(error);
+      const authFailure = this.isAuthFailure(error);
       const saved = await this.store.markNodeFailed({
         nodeId: node.nodeId,
         leaseOwner: this.leaseOwner,
@@ -133,7 +137,12 @@ export class PendingSummaryPreparationWorker {
       if (!saved) {
         return { status: "idle" };
       }
-      return { status: "failed", nodeId: node.nodeId, failureSummary };
+      return {
+        status: "failed",
+        nodeId: node.nodeId,
+        failureSummary,
+        ...(authFailure ? { authFailure } : {}),
+      };
     }
   }
 }
