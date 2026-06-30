@@ -239,6 +239,7 @@ export type ContextEngine = {
   afterTurn?(params: {
     sessionId: string;
     sessionKey?: string;
+    sessionTarget?: ContextEngineSessionTarget;
     sessionFile: string;
     messages: AgentMessage[];
     prePromptMessageCount: number;
