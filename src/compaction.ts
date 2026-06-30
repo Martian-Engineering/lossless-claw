@@ -623,6 +623,9 @@ function extractMessagePartSummaryText(part: MessagePartRecord): string {
   return sections.join("\n\n").trim();
 }
 
+/** Store capability required to rehydrate message-parts-backed leaf source. */
+export type LeafSummaryMessageContentStore = Pick<ConversationStore, "getMessageParts">;
+
 /** Identify whether a stored message part represents a media attachment. */
 function isMediaAttachmentPart(part: CreateMessagePartInput | { partType: string; metadata: string | null }): boolean {
   if (MEDIA_ATTACHMENT_PART_TYPES.has(part.partType)) {
@@ -637,6 +640,66 @@ function isMediaAttachmentPart(part: CreateMessagePartInput | { partType: string
         ? ((metadata.raw as Record<string, unknown>).type as string).trim().toLowerCase()
         : "";
   return MEDIA_ATTACHMENT_RAW_TYPES.has(rawType);
+}
+
+function annotateLeafSummaryMediaContent(content: string, parts: MessagePartRecord[]): string {
+  const hasMediaParts = parts.some((part) => isMediaAttachmentPart(part));
+  if (!hasMediaParts) {
+    return content;
+  }
+
+  const partText = parts
+    .filter((part) => !isMediaAttachmentPart(part))
+    .map((part) => (typeof part.textContent === "string" ? part.textContent : ""))
+    .map((text) => stripEmbeddedMediaPayloads(text))
+    .map((text) => text.trim())
+    .filter(Boolean)
+    .join("\n")
+    .trim();
+  const fallbackText = extractMeaningfulMessageText(content);
+  const meaningfulText = (partText || fallbackText).trim();
+
+  if (!meaningfulText) {
+    return "[Media attachment]";
+  }
+  if (meaningfulText.includes("[with media attachment]")) {
+    return meaningfulText;
+  }
+  return `${meaningfulText} [with media attachment]`;
+}
+
+/** Resolve the sanitized message text used as source for leaf summaries. */
+export async function resolveLeafSummaryMessageContent(
+  store: LeafSummaryMessageContentStore,
+  msg: MessageRecord,
+): Promise<string> {
+  const parts = await store.getMessageParts(msg.messageId);
+  const annotatedContent = annotateLeafSummaryMediaContent(msg.content, parts);
+  const storedText = extractMeaningfulMessageText(annotatedContent);
+  if (storedText) {
+    return storedText;
+  }
+
+  if (parts.length === 0) {
+    return "";
+  }
+
+  const rehydrated = contentFromParts(
+    parts.map((part) => ({ ...part })),
+    runtimeRoleForSummary(msg.role),
+    msg.content,
+  );
+  const rehydratedText = extractMeaningfulStructuredText(rehydrated);
+  if (rehydratedText) {
+    return rehydratedText;
+  }
+
+  return parts
+    .map(extractMessagePartSummaryText)
+    .map((text) => text.trim())
+    .filter(Boolean)
+    .join("\n\n")
+    .trim();
 }
 
 // ── CompactionEngine ─────────────────────────────────────────────────────────
@@ -2077,91 +2140,6 @@ export class CompactionEngine {
     return { content: summaryText, level };
   }
 
-  // ── Private: Media Annotation ────────────────────────────────────────────
-
-  /**
-   * Annotate a message's content with media context when it has file/media
-   * attachments. This gives the summarizer enough context to produce a
-   * meaningful summary instead of trying to compress raw file paths.
-   *
-   * - Media-only messages: content is replaced with "[Media attachment]".
-   * - Media-mostly messages: text is preserved and annotated with
-   *   " [with media attachment]".
-   * - Text-only messages: returned unchanged.
-   */
-  private async annotateMediaContent(
-    messageId: number,
-    content: string,
-    preloadedParts?: MessagePartRecord[],
-  ): Promise<string> {
-    const parts = preloadedParts ?? (await this.conversationStore.getMessageParts(messageId));
-    const hasMediaParts = parts.some((part) => isMediaAttachmentPart(part));
-    if (!hasMediaParts) {
-      return content;
-    }
-
-    const partText = parts
-      .filter((part) => !isMediaAttachmentPart(part))
-      .map((part) => (typeof part.textContent === "string" ? part.textContent : ""))
-      .map((text) => stripEmbeddedMediaPayloads(text))
-      .map((text) => text.trim())
-      .filter(Boolean)
-      .join("\n")
-      .trim();
-    const fallbackText = extractMeaningfulMessageText(content);
-    const meaningfulText = (partText || fallbackText).trim();
-
-    if (!meaningfulText) {
-      return "[Media attachment]";
-    }
-    if (meaningfulText.includes("[with media attachment]")) {
-      return meaningfulText;
-    }
-    return `${meaningfulText} [with media attachment]`;
-  }
-
-  /**
-   * Reconstruct the text used by leaf summaries from stored message data.
-   *
-   * Plain `messages.content` is preferred when present, but structured tool
-   * calls/results often store their actual payload in `message_parts` while the
-   * fallback content column is empty. Rehydrating through the assembler helper
-   * keeps compaction aligned with the prompt assembly path.
-   */
-  private async resolveLeafSummaryMessageContent(msg: MessageRecord): Promise<string> {
-    const parts = await this.conversationStore.getMessageParts(msg.messageId);
-    const annotatedContent = await this.annotateMediaContent(
-      msg.messageId,
-      msg.content,
-      parts,
-    );
-    const storedText = extractMeaningfulMessageText(annotatedContent);
-    if (storedText) {
-      return storedText;
-    }
-
-    if (parts.length === 0) {
-      return "";
-    }
-
-    const rehydrated = contentFromParts(
-      parts.map((part) => ({ ...part })),
-      runtimeRoleForSummary(msg.role),
-      msg.content,
-    );
-    const rehydratedText = extractMeaningfulStructuredText(rehydrated);
-    if (rehydratedText) {
-      return rehydratedText;
-    }
-
-    return parts
-      .map(extractMessagePartSummaryText)
-      .map((text) => text.trim())
-      .filter(Boolean)
-      .join("\n\n")
-      .trim();
-  }
-
   // ── Private: Leaf Pass ───────────────────────────────────────────────────
 
   /**
@@ -2185,7 +2163,7 @@ export class CompactionEngine {
       if (msg) {
         messageContents.push({
           messageId: msg.messageId,
-          content: await this.resolveLeafSummaryMessageContent(msg),
+          content: await resolveLeafSummaryMessageContent(this.conversationStore, msg),
           createdAt: msg.createdAt,
           tokenCount: this.resolveMessageTokenCount(msg),
         });
