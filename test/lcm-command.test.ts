@@ -839,7 +839,6 @@ describe("lcm command", () => {
         return typeof latest?.content === "string" ? latest.content : undefined;
       },
       resolveAgentDir: () => fixture.tempDir,
-      resolveSessionIdFromSessionKey: async () => undefined,
       agentLaneSubagent: "subagent",
       log: {
         info: vi.fn(),
@@ -1136,7 +1135,6 @@ describe("lcm command", () => {
         return typeof latest?.content === "string" ? latest.content : undefined;
       },
       resolveAgentDir: () => fixture.tempDir,
-      resolveSessionIdFromSessionKey: async () => undefined,
       agentLaneSubagent: "subagent",
       log: {
         info: vi.fn(),
@@ -1250,7 +1248,6 @@ describe("lcm command", () => {
       buildSubagentSystemPrompt: () => "subagent system prompt",
       readLatestAssistantReply: () => undefined,
       resolveAgentDir: () => fixture.tempDir,
-      resolveSessionIdFromSessionKey: async () => undefined,
       agentLaneSubagent: "subagent",
       log: { info: vi.fn(), warn: vi.fn(), error: vi.fn(), debug: vi.fn() },
     } as unknown as LcmDependencies;
@@ -3501,7 +3498,6 @@ describe("lcm command", () => {
       buildSubagentSystemPrompt: vi.fn(() => "subagent prompt") as LcmDependencies["buildSubagentSystemPrompt"],
       readLatestAssistantReply: vi.fn(() => undefined) as LcmDependencies["readLatestAssistantReply"],
       resolveAgentDir: vi.fn(() => tmpdir()) as LcmDependencies["resolveAgentDir"],
-      resolveSessionIdFromSessionKey: vi.fn(async () => undefined) as LcmDependencies["resolveSessionIdFromSessionKey"],
       agentLaneSubagent: "subagent",
       log: {
         info: vi.fn(),

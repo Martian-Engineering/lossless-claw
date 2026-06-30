@@ -186,9 +186,6 @@ export interface LcmDependencies {
   /** Resolve the OpenClaw agent directory */
   resolveAgentDir: () => string;
 
-  /** Resolve runtime session id from an agent session key */
-  resolveSessionIdFromSessionKey: (sessionKey: string) => Promise<string | undefined>;
-
 
   /** Read OpenClaw-owned visible transcript entries for SQLite-backed sessions. */
   readVisibleSessionTranscriptMessageEntries?: (
