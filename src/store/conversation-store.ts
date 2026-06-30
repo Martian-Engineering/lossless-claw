@@ -174,6 +174,11 @@ export type MessageSearchResult = {
   rank?: number;
 };
 
+export type RecentStaleTranscriptEntryMatch =
+  | { status: "found"; messageId: number; transcriptEntryId: string }
+  | { status: "ambiguous" }
+  | { status: "none" };
+
 // ── DB row shapes (snake_case) ────────────────────────────────────────────────
 
 interface ConversationRow {
@@ -1029,6 +1034,70 @@ export class ConversationStore {
       messageId: row.message_id,
       transcriptEntryId: row.transcript_entry_id,
     }));
+  }
+
+  /**
+   * Return a unique recent identity-and-time matching row whose transcript id is
+   * absent from the current visible projection. This is intentionally
+   * tail-bounded and ambiguity-aware so a reissued transcript id can heal a
+   * flush-lagged row without collapsing older legitimate repeats of the same
+   * message content.
+   */
+  async findUniqueRecentStaleTranscriptEntryIdByIdentityAndCreatedAt(
+    conversationId: ConversationId,
+    role: MessageRole,
+    content: string,
+    createdAt: Date | string | undefined,
+    currentEntryIds: ReadonlySet<string>,
+    tailWindow: number,
+  ): Promise<RecentStaleTranscriptEntryMatch> {
+    const normalizedCreatedAt = formatMessageCreatedAt(createdAt);
+    if (!normalizedCreatedAt) {
+      return { status: "none" };
+    }
+    const identityHash = buildMessageIdentityHash(role, content);
+    const rows = this.db
+      .prepare(
+        `SELECT message_id, transcript_entry_id
+         FROM (
+           SELECT message_id, transcript_entry_id, identity_hash, role, content, created_at
+           FROM messages
+           WHERE conversation_id = ?
+           ORDER BY seq DESC
+           LIMIT ?
+         )
+         WHERE transcript_entry_id IS NOT NULL
+           AND identity_hash = ?
+           AND role = ?
+           AND content = ?
+           AND created_at = ?
+         ORDER BY message_id DESC`,
+      )
+      .all(
+        conversationId,
+        Math.max(1, Math.floor(tailWindow)),
+        identityHash,
+        role,
+        content,
+        normalizedCreatedAt,
+      ) as unknown as Array<{
+      message_id: number;
+      transcript_entry_id: string;
+    }>;
+
+    const candidates = rows.filter((row) => !currentEntryIds.has(row.transcript_entry_id));
+    if (candidates.length === 0) {
+      return { status: "none" };
+    }
+    if (candidates.length > 1) {
+      return { status: "ambiguous" };
+    }
+    const row = candidates[0]!;
+    return {
+      status: "found",
+      messageId: row.message_id,
+      transcriptEntryId: row.transcript_entry_id,
+    };
   }
 
   /**

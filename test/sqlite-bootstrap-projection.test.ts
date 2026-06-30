@@ -2,6 +2,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { cleanupEngineTestState, createEngineWithDepsOverridesAndDb } from "./helpers.js";
 import type { AgentMessage } from "../src/openclaw-bridge.js";
 import type { LcmDependencies, VisibleSessionTranscriptMessageEntry } from "../src/types.js";
+import { attachTranscriptEntryMeta } from "../src/transcript.js";
 
 afterEach(cleanupEngineTestState);
 
@@ -534,6 +535,459 @@ describe("LcmContextEngine.bootstrap sqlite transcript projection", () => {
     expect(rows.map((row) => row.transcript_entry_id)).toEqual([
       "entry-recent-ok",
       "entry-recent-tail",
+    ]);
+  });
+
+  it("restamps a recent stale transcript id instead of duplicating the message", async () => {
+    const sessionId = "sqlite-bootstrap-restamp-stale-id-session";
+    const sessionKey = "agent:main:sqlite-bootstrap-restamp-stale-id-session";
+    const readVisibleSessionTranscriptMessageEntries = vi.fn(async () => [
+      {
+        entryId: "entry-anchor",
+        parentId: null,
+        seq: 1,
+        role: "assistant",
+        message: { role: "assistant", content: "already anchored" } satisfies AgentMessage,
+        createdAt: "2026-06-29T12:26:58.000Z",
+      },
+      {
+        entryId: "entry-current",
+        parentId: "entry-anchor",
+        seq: 2,
+        role: "user",
+        message: { role: "user", content: "same logical turn" } satisfies AgentMessage,
+        createdAt: "2026-06-29T12:27:00.000Z",
+      },
+      {
+        entryId: "entry-after-restamp",
+        parentId: "entry-current",
+        seq: 3,
+        role: "assistant",
+        message: { role: "assistant", content: "tail after restamp" } satisfies AgentMessage,
+        createdAt: "2026-06-29T12:27:01.000Z",
+      },
+    ]);
+    const { engine, db } = createEngineWithDepsOverridesAndDb({
+      readVisibleSessionTranscriptMessageEntries,
+    } satisfies Partial<LcmDependencies>);
+
+    await expect(
+      engine.ingestBatch({
+        sessionId,
+        sessionKey,
+        messages: [
+          attachTranscriptEntryMeta(
+            { role: "assistant", content: "already anchored" } satisfies AgentMessage,
+            {
+              entryId: "entry-anchor",
+              parentId: null,
+              timestamp: "2026-06-29T12:26:58.000Z",
+            },
+          ),
+          attachTranscriptEntryMeta(
+            { role: "user", content: "same logical turn" } satisfies AgentMessage,
+            {
+              entryId: "entry-stale",
+              parentId: null,
+              timestamp: "2026-06-29T12:27:00.000Z",
+            },
+          ),
+        ],
+      }),
+    ).resolves.toMatchObject({ ingestedCount: 2 });
+
+    await expect(
+      engine.bootstrap({
+        sessionId,
+        sessionKey,
+        runtimeContext: {
+          transcriptStorage: { kind: "sqlite" },
+          sessionTarget: {
+            agentId: "main",
+            sessionId,
+            sessionKey,
+            storePath: "/tmp/openclaw-agent.sqlite",
+          },
+        },
+      }),
+    ).resolves.toMatchObject({
+      bootstrapped: true,
+      importedMessages: 1,
+      reason: "reconciled missing session messages",
+    });
+
+    const conversation = await engine.getConversationStore().getConversationForSession({
+      sessionId,
+      sessionKey,
+    });
+    expect(conversation).not.toBeNull();
+    const messages = await engine.getConversationStore().getMessages(conversation!.conversationId);
+    expect(messages.map((message) => message.content)).toEqual([
+      "already anchored",
+      "same logical turn",
+      "tail after restamp",
+    ]);
+    const rows = db
+      .prepare(
+        `SELECT transcript_entry_id FROM messages WHERE conversation_id = ? ORDER BY seq`,
+      )
+      .all(conversation!.conversationId) as Array<{ transcript_entry_id: string | null }>;
+    expect(rows.map((row) => row.transcript_entry_id)).toEqual([
+      "entry-anchor",
+      "entry-current",
+      "entry-after-restamp",
+    ]);
+  });
+
+  it("does not restamp a stale transcript id without an independent overlap anchor", async () => {
+    const sessionId = "sqlite-bootstrap-stale-id-no-overlap-session";
+    const sessionKey = "agent:main:sqlite-bootstrap-stale-id-no-overlap-session";
+    const readVisibleSessionTranscriptMessageEntries = vi.fn(async () => [
+      {
+        entryId: "entry-current-reset",
+        parentId: null,
+        seq: 1,
+        role: "user",
+        message: { role: "user", content: "same repeated content" } satisfies AgentMessage,
+        createdAt: "2026-06-29T12:29:00.000Z",
+      },
+    ]);
+    const { engine, db } = createEngineWithDepsOverridesAndDb({
+      readVisibleSessionTranscriptMessageEntries,
+    } satisfies Partial<LcmDependencies>);
+
+    await expect(
+      engine.ingestBatch({
+        sessionId,
+        sessionKey,
+        messages: [
+          attachTranscriptEntryMeta(
+            { role: "user", content: "same repeated content" } satisfies AgentMessage,
+            {
+              entryId: "entry-stale-reset",
+              parentId: null,
+              timestamp: "2026-06-29T12:28:59.000Z",
+            },
+          ),
+        ],
+      }),
+    ).resolves.toMatchObject({ ingestedCount: 1 });
+
+    await expect(
+      engine.bootstrap({
+        sessionId,
+        sessionKey,
+        runtimeContext: {
+          transcriptStorage: { kind: "sqlite" },
+          sessionTarget: {
+            agentId: "main",
+            sessionId,
+            sessionKey,
+            storePath: "/tmp/openclaw-agent.sqlite",
+          },
+        },
+      }),
+    ).resolves.toMatchObject({
+      bootstrapped: false,
+      importedMessages: 0,
+      reason: "reconcile projection has no overlap",
+    });
+
+    const conversation = await engine.getConversationStore().getConversationForSession({
+      sessionId,
+      sessionKey,
+    });
+    expect(conversation).not.toBeNull();
+    const rows = db
+      .prepare(
+        `SELECT transcript_entry_id FROM messages WHERE conversation_id = ? ORDER BY seq`,
+      )
+      .all(conversation!.conversationId) as Array<{ transcript_entry_id: string | null }>;
+    expect(rows.map((row) => row.transcript_entry_id)).toEqual(["entry-stale-reset"]);
+  });
+
+  it("does not restamp a repeated same-content turn with a different timestamp", async () => {
+    const sessionId = "sqlite-bootstrap-stale-id-repeat-session";
+    const sessionKey = "agent:main:sqlite-bootstrap-stale-id-repeat-session";
+    const readVisibleSessionTranscriptMessageEntries = vi.fn(async () => [
+      {
+        entryId: "entry-repeat-anchor",
+        parentId: null,
+        seq: 1,
+        role: "assistant",
+        message: { role: "assistant", content: "repeat anchor" } satisfies AgentMessage,
+        createdAt: "2026-06-29T12:31:00.000Z",
+      },
+      {
+        entryId: "entry-repeat-current",
+        parentId: "entry-repeat-anchor",
+        seq: 2,
+        role: "user",
+        message: { role: "user", content: "ok" } satisfies AgentMessage,
+        createdAt: "2026-06-29T12:31:05.000Z",
+      },
+    ]);
+    const { engine, db } = createEngineWithDepsOverridesAndDb({
+      readVisibleSessionTranscriptMessageEntries,
+    } satisfies Partial<LcmDependencies>);
+
+    await expect(
+      engine.ingestBatch({
+        sessionId,
+        sessionKey,
+        messages: [
+          attachTranscriptEntryMeta(
+            { role: "assistant", content: "repeat anchor" } satisfies AgentMessage,
+            {
+              entryId: "entry-repeat-anchor",
+              parentId: null,
+              timestamp: "2026-06-29T12:31:00.000Z",
+            },
+          ),
+          attachTranscriptEntryMeta(
+            { role: "user", content: "ok" } satisfies AgentMessage,
+            {
+              entryId: "entry-repeat-stale",
+              parentId: "entry-repeat-anchor",
+              timestamp: "2026-06-29T12:31:01.000Z",
+            },
+          ),
+        ],
+      }),
+    ).resolves.toMatchObject({ ingestedCount: 2 });
+
+    await expect(
+      engine.bootstrap({
+        sessionId,
+        sessionKey,
+        runtimeContext: {
+          transcriptStorage: { kind: "sqlite" },
+          sessionTarget: {
+            agentId: "main",
+            sessionId,
+            sessionKey,
+            storePath: "/tmp/openclaw-agent.sqlite",
+          },
+        },
+      }),
+    ).resolves.toMatchObject({
+      bootstrapped: true,
+      importedMessages: 1,
+      reason: "reconciled missing session messages",
+    });
+
+    const conversation = await engine.getConversationStore().getConversationForSession({
+      sessionId,
+      sessionKey,
+    });
+    expect(conversation).not.toBeNull();
+    const rows = db
+      .prepare(
+        `SELECT content, transcript_entry_id FROM messages WHERE conversation_id = ? ORDER BY seq`,
+      )
+      .all(conversation!.conversationId) as Array<{
+      content: string;
+      transcript_entry_id: string | null;
+    }>;
+    expect(rows).toEqual([
+      { content: "repeat anchor", transcript_entry_id: "entry-repeat-anchor" },
+      { content: "ok", transcript_entry_id: "entry-repeat-stale" },
+      { content: "ok", transcript_entry_id: "entry-repeat-current" },
+    ]);
+  });
+
+  it("blocks stale transcript id restamp for ambiguous same-second repeats", async () => {
+    const sessionId = "sqlite-bootstrap-stale-id-ambiguous-session";
+    const sessionKey = "agent:main:sqlite-bootstrap-stale-id-ambiguous-session";
+    const readVisibleSessionTranscriptMessageEntries = vi.fn(async () => [
+      {
+        entryId: "entry-ambiguous-anchor",
+        parentId: null,
+        seq: 1,
+        role: "assistant",
+        message: { role: "assistant", content: "ambiguous anchor" } satisfies AgentMessage,
+        createdAt: "2026-06-29T12:32:00.000Z",
+      },
+      {
+        entryId: "entry-ambiguous-current",
+        parentId: "entry-ambiguous-anchor",
+        seq: 2,
+        role: "user",
+        message: { role: "user", content: "ok" } satisfies AgentMessage,
+        createdAt: "2026-06-29T12:32:01.000Z",
+      },
+    ]);
+    const { engine, db } = createEngineWithDepsOverridesAndDb({
+      readVisibleSessionTranscriptMessageEntries,
+    } satisfies Partial<LcmDependencies>);
+
+    await expect(
+      engine.ingestBatch({
+        sessionId,
+        sessionKey,
+        messages: [
+          attachTranscriptEntryMeta(
+            { role: "assistant", content: "ambiguous anchor" } satisfies AgentMessage,
+            {
+              entryId: "entry-ambiguous-anchor",
+              parentId: null,
+              timestamp: "2026-06-29T12:32:00.000Z",
+            },
+          ),
+          attachTranscriptEntryMeta(
+            { role: "user", content: "ok" } satisfies AgentMessage,
+            {
+              entryId: "entry-ambiguous-stale-a",
+              parentId: "entry-ambiguous-anchor",
+              timestamp: "2026-06-29T12:32:01.000Z",
+            },
+          ),
+          attachTranscriptEntryMeta(
+            { role: "user", content: "ok" } satisfies AgentMessage,
+            {
+              entryId: "entry-ambiguous-stale-b",
+              parentId: "entry-ambiguous-stale-a",
+              timestamp: "2026-06-29T12:32:01.000Z",
+            },
+          ),
+        ],
+      }),
+    ).resolves.toMatchObject({ ingestedCount: 3 });
+
+    await expect(
+      engine.bootstrap({
+        sessionId,
+        sessionKey,
+        runtimeContext: {
+          transcriptStorage: { kind: "sqlite" },
+          sessionTarget: {
+            agentId: "main",
+            sessionId,
+            sessionKey,
+            storePath: "/tmp/openclaw-agent.sqlite",
+          },
+        },
+      }),
+    ).resolves.toMatchObject({
+      bootstrapped: false,
+      importedMessages: 0,
+      reason: "reconcile stale transcript id ambiguous",
+    });
+
+    const conversation = await engine.getConversationStore().getConversationForSession({
+      sessionId,
+      sessionKey,
+    });
+    expect(conversation).not.toBeNull();
+    const rows = db
+      .prepare(
+        `SELECT content, transcript_entry_id FROM messages WHERE conversation_id = ? ORDER BY seq`,
+      )
+      .all(conversation!.conversationId) as Array<{
+      content: string;
+      transcript_entry_id: string | null;
+    }>;
+    expect(rows).toEqual([
+      { content: "ambiguous anchor", transcript_entry_id: "entry-ambiguous-anchor" },
+      { content: "ok", transcript_entry_id: "entry-ambiguous-stale-a" },
+      { content: "ok", transcript_entry_id: "entry-ambiguous-stale-b" },
+    ]);
+  });
+
+  it("blocks stale transcript id restamp when projection entries are missing before it", async () => {
+    const sessionId = "sqlite-bootstrap-stale-id-gap-session";
+    const sessionKey = "agent:main:sqlite-bootstrap-stale-id-gap-session";
+    const readVisibleSessionTranscriptMessageEntries = vi.fn(async () => [
+      {
+        entryId: "entry-gap-anchor",
+        parentId: null,
+        seq: 1,
+        role: "assistant",
+        message: { role: "assistant", content: "gap anchor" } satisfies AgentMessage,
+        createdAt: "2026-06-29T12:30:00.000Z",
+      },
+      {
+        entryId: "entry-gap-missing",
+        parentId: "entry-gap-anchor",
+        seq: 2,
+        role: "user",
+        message: { role: "user", content: "missing before stale id" } satisfies AgentMessage,
+        createdAt: "2026-06-29T12:30:01.000Z",
+      },
+      {
+        entryId: "entry-gap-current",
+        parentId: "entry-gap-missing",
+        seq: 3,
+        role: "user",
+        message: { role: "user", content: "stale id after gap" } satisfies AgentMessage,
+        createdAt: "2026-06-29T12:30:02.000Z",
+      },
+    ]);
+    const { engine, db } = createEngineWithDepsOverridesAndDb({
+      readVisibleSessionTranscriptMessageEntries,
+    } satisfies Partial<LcmDependencies>);
+
+    await expect(
+      engine.ingestBatch({
+        sessionId,
+        sessionKey,
+        messages: [
+          attachTranscriptEntryMeta(
+            { role: "assistant", content: "gap anchor" } satisfies AgentMessage,
+            {
+              entryId: "entry-gap-anchor",
+              parentId: null,
+              timestamp: "2026-06-29T12:30:00.000Z",
+            },
+          ),
+          attachTranscriptEntryMeta(
+            { role: "user", content: "stale id after gap" } satisfies AgentMessage,
+            {
+              entryId: "entry-gap-stale",
+              parentId: "entry-gap-anchor",
+              timestamp: "2026-06-29T12:30:02.000Z",
+            },
+          ),
+        ],
+      }),
+    ).resolves.toMatchObject({ ingestedCount: 2 });
+
+    await expect(
+      engine.bootstrap({
+        sessionId,
+        sessionKey,
+        runtimeContext: {
+          transcriptStorage: { kind: "sqlite" },
+          sessionTarget: {
+            agentId: "main",
+            sessionId,
+            sessionKey,
+            storePath: "/tmp/openclaw-agent.sqlite",
+          },
+        },
+      }),
+    ).resolves.toMatchObject({
+      bootstrapped: false,
+      importedMessages: 0,
+      reason: "reconcile stale transcript id gap",
+    });
+
+    const conversation = await engine.getConversationStore().getConversationForSession({
+      sessionId,
+      sessionKey,
+    });
+    expect(conversation).not.toBeNull();
+    const rows = db
+      .prepare(
+        `SELECT content, transcript_entry_id FROM messages WHERE conversation_id = ? ORDER BY seq`,
+      )
+      .all(conversation!.conversationId) as Array<{
+      content: string;
+      transcript_entry_id: string | null;
+    }>;
+    expect(rows).toEqual([
+      { content: "gap anchor", transcript_entry_id: "entry-gap-anchor" },
+      { content: "stale id after gap", transcript_entry_id: "entry-gap-stale" },
     ]);
   });
 
