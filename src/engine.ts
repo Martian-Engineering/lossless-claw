@@ -31,6 +31,10 @@ import {
   type ResolvedContextThreshold,
 } from "./context-threshold.js";
 import { LargeFileInterceptor } from "./large-file-interceptor.js";
+import {
+  PendingCompactionCoordinator,
+  type PendingCompactionCoordinatorResult,
+} from "./pending-summary-coordinator.js";
 import { readRuntimeModelContext } from "./runtime-model.js";
 import type { LcmConfig } from "./db/config.js";
 import { getLcmDbFeatures } from "./db/features.js";
@@ -60,6 +64,7 @@ import {
 } from "./store/conversation-store.js";
 import { FocusBriefStore, type FocusBriefRecord } from "./store/focus-brief-store.js";
 import { buildToolCallInputMap } from "./tool-pairing.js";
+import { PendingSummaryStore } from "./store/pending-summary-store.js";
 import { SummaryStore, type ContextItemRecord } from "./store/summary-store.js";
 import { createLcmSummarizeFromLegacyParams, FALLBACK_SUMMARY_MARKER, LcmProviderAuthError, LcmSummarySpendLimitError, type LcmSummarizeFn } from "./summarize.js";
 import type {
@@ -299,6 +304,7 @@ export class LcmContextEngine implements ContextEngine {
 
   private conversationStore: ConversationStore;
   private summaryStore: SummaryStore;
+  private pendingSummaryStore: PendingSummaryStore;
   private focusBriefStore: FocusBriefStore;
   private compactionTelemetryStore: CompactionTelemetryStore;
   private compactionMaintenanceStore: CompactionMaintenanceStore;
@@ -435,6 +441,7 @@ export class LcmContextEngine implements ContextEngine {
       replayFloodThresholdInternal: this.config.replayFloodThresholdInternal,
     });
     this.summaryStore = new SummaryStore(this.db, { fts5Available: this.fts5Available });
+    this.pendingSummaryStore = new PendingSummaryStore(this.db);
     this.largeFileInterceptor = new LargeFileInterceptor(
       this.config,
       this.summaryStore,
@@ -705,10 +712,6 @@ export class LcmContextEngine implements ContextEngine {
     params: DeferredCompactionDebtDrainParams & { queueKey: string },
   ): Promise<void> {
     const sessionLabel = formatSessionLabel(params.sessionId, params.sessionKey);
-    const summarySpendScopeKey = this.compactionGuards.resolveSummarySpendScope({
-      kind: "compaction",
-      scope: this.resolveSessionQueueKey(params.sessionId, params.sessionKey),
-    });
     if (this.sessionOperationQueues.has(params.queueKey)) {
       this.deps.log.debug(
         `[lcm] background deferred compaction skipped conversation=${params.conversationId} ${sessionLabel} reason=session-queue-busy debtReason=${params.reason}`,
@@ -716,51 +719,50 @@ export class LcmContextEngine implements ContextEngine {
       return;
     }
 
-    await this.withSessionQueue(
-      params.queueKey,
-      async () => {
-        const maintenance =
-          await this.compactionMaintenanceStore.getConversationCompactionMaintenance(
-            params.conversationId,
-          );
-        if (!maintenance?.pending && !maintenance?.running) {
-          this.deps.log.debug(
-            `[lcm] background deferred compaction skipped conversation=${params.conversationId} ${sessionLabel} reason=no-pending-debt debtReason=${params.reason}`,
-          );
-          return;
-        }
+    const maintenance =
+      await this.compactionMaintenanceStore.getConversationCompactionMaintenance(
+        params.conversationId,
+      );
+    if (!maintenance?.pending && !maintenance?.running) {
+      this.deps.log.debug(
+        `[lcm] background deferred compaction skipped conversation=${params.conversationId} ${sessionLabel} reason=no-pending-debt debtReason=${params.reason}`,
+      );
+      return;
+    }
 
-        const cappedTokenBudget = this.applyAssemblyBudgetCap(params.tokenBudget);
-        const telemetry =
-          await this.compactionTelemetryStore.getConversationCompactionTelemetry(
-            params.conversationId,
-          );
-        const legacyParams =
-          telemetry?.provider || telemetry?.model
-            ? {
-                ...(telemetry.provider ? { provider: telemetry.provider } : {}),
-                ...(telemetry.model ? { model: telemetry.model } : {}),
-              }
-            : undefined;
-        const result = await this.consumeDeferredCompactionDebt({
-          conversationId: params.conversationId,
-          sessionId: params.sessionId,
-          sessionKey: params.sessionKey,
-          tokenBudget: cappedTokenBudget,
-          currentTokenCount: params.currentTokenCount,
-          legacyParams,
-        });
-        if (result) {
-          this.deps.log.debug(
-            `[lcm] background deferred compaction done conversation=${params.conversationId} ${sessionLabel} changed=${result.changed} reason=${result.reason ?? "none"} debtReason=${maintenance.reason ?? params.reason}`,
-          );
-        }
-      },
-      {
-        operationName: "backgroundDeferredCompaction",
-        context: sessionLabel,
-      },
-    );
+    const cappedTokenBudget = this.applyAssemblyBudgetCap(params.tokenBudget);
+    const telemetry =
+      await this.compactionTelemetryStore.getConversationCompactionTelemetry(
+        params.conversationId,
+      );
+    const legacyParams =
+      telemetry?.provider || telemetry?.model
+        ? {
+            ...(telemetry.provider ? { provider: telemetry.provider } : {}),
+            ...(telemetry.model ? { model: telemetry.model } : {}),
+          }
+        : undefined;
+    const result = await this.consumeDeferredCompactionDebt({
+      conversationId: params.conversationId,
+      sessionId: params.sessionId,
+      sessionKey: params.sessionKey,
+      tokenBudget: cappedTokenBudget,
+      currentTokenCount: params.currentTokenCount,
+      legacyParams,
+    });
+    if (result) {
+      this.deps.log.debug(
+        `[lcm] background deferred compaction done conversation=${params.conversationId} ${sessionLabel} changed=${result.changed} reason=${result.reason ?? "none"} debtReason=${maintenance.reason ?? params.reason}`,
+      );
+    }
+
+    const nextMaintenance =
+      await this.compactionMaintenanceStore.getConversationCompactionMaintenance(
+        params.conversationId,
+      );
+    if (nextMaintenance?.pending && !nextMaintenance.running) {
+      this.scheduleDeferredCompactionDebtDrain(params);
+    }
   }
 
   /**
@@ -898,13 +900,12 @@ export class LcmContextEngine implements ContextEngine {
         }
       }
 
-      const result = await this.executeCompactionCore({
+      const result = await this.executePendingCompactionCore({
         conversationId: params.conversationId,
         sessionId: params.sessionId,
         sessionKey: params.sessionKey,
         tokenBudget: resolvedTokenBudget,
         currentTokenCount: resolvedCurrentTokenCount,
-        compactionTarget: "threshold",
         contextThresholdOverride: resolvedContextThreshold,
         runtimeContext: params.runtimeContext,
         legacyParams: params.legacyParams,
@@ -919,7 +920,8 @@ export class LcmContextEngine implements ContextEngine {
       const compactionExhausted =
         (result as { exhausted?: boolean }).exhausted === true;
       const keepPending =
-        (!result.ok || blockedByAuthCircuitBreaker) && !compactionExhausted;
+        result.pending === true ||
+        ((!result.ok || blockedByAuthCircuitBreaker) && !compactionExhausted);
       const failureSummary = blockedByAuthCircuitBreaker
         ? "summary provider circuit breaker is open"
         : result.ok || compactionExhausted
@@ -962,6 +964,107 @@ export class LcmContextEngine implements ContextEngine {
         reason: error instanceof Error ? error.message : "deferred compaction failed",
       };
     }
+  }
+
+  /** Advance issue-807 pending summary compaction without writing canonical rows early. */
+  private async executePendingCompactionCore(params: {
+    conversationId: number;
+    sessionId: string;
+    sessionKey?: string;
+    tokenBudget?: number;
+    currentTokenCount?: number;
+    contextThresholdOverride?: ResolvedContextThreshold;
+    runtimeContext?: Record<string, unknown>;
+    legacyParams?: Record<string, unknown>;
+    customInstructions?: string;
+  }): Promise<CompactResult & { pending?: boolean }> {
+    const breakerScope = this.resolveSessionQueueKey(params.sessionId, params.sessionKey);
+    const resolvedSummarizer = await this.resolveSummarize({
+      legacyParams: this.buildSummarizerLegacyParams({
+        legacyParams: params.legacyParams,
+        sessionKey: params.sessionKey,
+      }),
+      customInstructions: params.customInstructions,
+      breakerScope,
+    });
+    const coordinator = new PendingCompactionCoordinator({
+      conversationStore: this.conversationStore,
+      summaryStore: this.summaryStore,
+      pendingSummaryStore: this.pendingSummaryStore,
+      summarize: resolvedSummarizer.summarize,
+      model: resolvedSummarizer.summaryModel,
+      leaseOwner: `engine:${params.sessionId}`,
+      config: {
+        freshTailCount: this.config.freshTailCount,
+        freshTailMaxTokens: this.config.freshTailMaxTokens,
+        leafChunkTokens: this.config.leafChunkTokens,
+        condensedMinFanout: this.config.condensedMinFanout,
+        condensedMinSourceTokens: this.config.condensedTargetTokens,
+        condensedChunkTokens: this.config.leafChunkTokens,
+        leaseMs: this.config.summaryTimeoutMs,
+      },
+    });
+
+    let lastResult: PendingCompactionCoordinatorResult | null = null;
+    const maxSteps = Math.max(1, Math.floor(this.config.maxSweepIterations));
+    for (let step = 0; step < maxSteps; step += 1) {
+      lastResult = await coordinator.runOnce({
+        conversationId: params.conversationId,
+        sessionKey: params.sessionKey,
+      });
+      if (lastResult.status === "published") {
+        return {
+          ok: true,
+          compacted: true,
+          reason: "pending summaries published",
+          summaryId: lastResult.frontierSummaryIds[0],
+          result: lastResult,
+        };
+      }
+      if (lastResult.status === "failed") {
+        return {
+          ok: false,
+          compacted: false,
+          reason: lastResult.failureSummary,
+          error: lastResult.failureSummary,
+          result: lastResult,
+        };
+      }
+      if (lastResult.status === "idle") {
+        if (
+          lastResult.reason === "no compactable context outside fresh tail" ||
+          lastResult.reason === "no pending summary nodes planned"
+        ) {
+          return this.executeCompactionCore({
+            conversationId: params.conversationId,
+            sessionId: params.sessionId,
+            sessionKey: params.sessionKey,
+            tokenBudget: params.tokenBudget,
+            currentTokenCount: params.currentTokenCount,
+            contextThresholdOverride: params.contextThresholdOverride,
+            runtimeContext: params.runtimeContext,
+            legacyParams: params.legacyParams,
+            customInstructions: params.customInstructions,
+            compactionTarget: "threshold",
+            force: true,
+          });
+        }
+        return {
+          ok: true,
+          compacted: false,
+          reason: lastResult.reason,
+          result: lastResult,
+        };
+      }
+    }
+
+    return {
+      ok: true,
+      compacted: false,
+      pending: true,
+      reason: "pending summary work remains",
+      result: lastResult,
+    };
   }
 
   /**
@@ -4081,6 +4184,10 @@ export class LcmContextEngine implements ContextEngine {
 
   getSummaryStore(): SummaryStore {
     return this.summaryStore;
+  }
+
+  getPendingSummaryStore(): PendingSummaryStore {
+    return this.pendingSummaryStore;
   }
 
   getFocusBriefStore(): FocusBriefStore {
