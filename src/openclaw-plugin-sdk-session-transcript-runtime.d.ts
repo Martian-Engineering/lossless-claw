@@ -1,8 +1,8 @@
 declare module "openclaw/plugin-sdk/session-transcript-runtime" {
-  import type {
-    SessionTranscriptReadTarget,
-    VisibleSessionTranscriptMessageEntry,
-  } from "./types.js";
+  type SessionTranscriptReadTarget =
+    import("./types.js").SessionTranscriptReadTarget;
+  type VisibleSessionTranscriptMessageEntry =
+    import("./types.js").VisibleSessionTranscriptMessageEntry;
 
   export function readVisibleSessionTranscriptMessageEntries(
     target: SessionTranscriptReadTarget,

@@ -2004,12 +2004,20 @@ export class LcmContextEngine implements ContextEngine {
         this.conversationStore.withTransaction(async () => {
           const entries = await readVisibleSessionTranscriptMessageEntries(params.target!);
           const historicalMessages = entries.map(messageFromVisibleTranscriptEntry);
-          if (params.isHeartbeat || historicalMessages.length === 0) {
+          if (params.isHeartbeat) {
             return {
               importedMessages: 0,
               blockedByImportCap: false,
               hasOverlap: true,
               transcriptCovered: true,
+            };
+          }
+          if (historicalMessages.length === 0) {
+            return {
+              importedMessages: 0,
+              blockedByImportCap: true,
+              hasOverlap: false,
+              transcriptCovered: false,
             };
           }
 
