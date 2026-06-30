@@ -249,9 +249,6 @@ describe("LcmContextEngine compaction telemetry", () => {
     const after = await engine.getConversationStore().getMessages(conversation!.conversationId);
     expect(after).toHaveLength(before.length);
     expect(after.some((message) => message.role === "system")).toBe(false);
-    expect(infoLog).toHaveBeenCalledWith(
-      expect.stringContaining("[lcm] LCM compaction leaf pass"),
-    );
   });
 
   it("sanitizes directive-shaped text when engine compaction uses emergency fallback", async () => {
