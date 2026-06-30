@@ -1,4 +1,5 @@
 import { createHash, randomUUID } from "node:crypto";
+import { stripInjectedContextBlocks } from "./compaction.js";
 import { estimateTokens } from "./estimate-tokens.js";
 import {
   planPendingCondensedNodes,
@@ -29,6 +30,7 @@ export type PendingCompactionCoordinatorConfig = {
   condensedMinSourceTokens: number;
   condensedChunkTokens: number;
   leaseMs?: number;
+  stripInjectedContextTags?: string[];
 };
 
 export type PendingCompactionCoordinatorOptions = {
@@ -94,8 +96,12 @@ function normalizeNonNegativeInteger(value: number | undefined): number {
   return 0;
 }
 
-function formatMessageForSummary(message: MessageRecord): string {
-  return [`[${message.createdAt.toISOString()}]`, message.content.trim()].join("\n").trim();
+function formatMessageForSummary(message: MessageRecord, stripInjectedContextTags?: string[]): string {
+  const content = stripInjectedContextBlocks(
+    message.content,
+    stripInjectedContextTags,
+  ).trim();
+  return [`[${message.createdAt.toISOString()}]`, content].join("\n").trim();
 }
 
 /**
@@ -501,7 +507,7 @@ export class PendingCompactionCoordinator {
       for (const link of messageLinks) {
         const message = await this.conversationStore.getMessageById(link.messageId);
         if (message) {
-          chunks.push(formatMessageForSummary(message));
+          chunks.push(formatMessageForSummary(message, this.config.stripInjectedContextTags));
         }
       }
       return chunks.filter(Boolean).join("\n\n");
