@@ -2062,10 +2062,7 @@ export class CompactionEngine {
   }): Promise<{ content: string; level: CompactionLevel } | null> {
     const sourceText = typeof params.sourceText === "string" ? params.sourceText.trim() : "";
     if (!sourceText) {
-      return {
-        content: "[Truncated from 0 tokens]",
-        level: "fallback",
-      };
+      return null;
     }
     const inputTokens = Math.max(1, estimateTokens(sourceText));
     const fallbackMaxTokens =
@@ -2303,7 +2300,6 @@ export class CompactionEngine {
       );
       return { skipped: "empty-source" };
     }
-
     const fileIds = dedupeOrderedIds(
       messageContents.flatMap((message) => extractFileIdsFromContent(message.content)),
     );
