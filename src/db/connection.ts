@@ -54,9 +54,8 @@ function configureConnection(db: DatabaseSync): DatabaseSync {
   // 64MB page cache (default 2MB is severely undersized for multi-GB databases
   // with concurrent agents). Memory is demand-allocated, released on close.
   db.exec("PRAGMA cache_size = -65536");
-  // NORMAL is officially recommended for WAL mode — crash-safe for app crashes,
-  // only risks data loss on power failure (OS/kernel crash). The bootstrap
-  // process re-ingests any lost transactions from session files.
+  // NORMAL is officially recommended for WAL mode: crash-safe for app crashes,
+  // only risks data loss on power failure (OS/kernel crash).
   db.exec("PRAGMA synchronous = NORMAL");
   // Keep temp tables/indexes in RAM (helps ordinal resequencing).
   db.exec("PRAGMA temp_store = MEMORY");
