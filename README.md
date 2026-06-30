@@ -11,6 +11,7 @@ Lossless Context Management plugin for [OpenClaw](https://github.com/openclaw/op
 - [Session Migration CLI](#session-migration-cli)
 - [Documentation](#documentation)
 - [Development](#development)
+  - [Line endings](#line-endings)
 - [Security](#security)
 - [License](#license)
 
@@ -544,6 +545,22 @@ tui/                        # Interactive terminal UI (Go)
   prompts/                  # Depth-aware prompt templates
 .goreleaser.yml             # GoReleaser config for TUI binary releases
 ```
+
+### Line endings
+
+This repository codifies LF line endings through `.gitattributes` so diffs stay
+stable across macOS, Linux, and Windows development environments.
+
+- Git should store text files with LF endings in the repository.
+- The root `* text=auto eol=lf` rule normalizes newly added text files.
+- Common source, documentation, lockfile, template, and config extensions are
+  listed explicitly so contributors and tooling see the expected policy.
+- Binary assets and SQLite/database files are marked `binary` to avoid unsafe
+  newline conversion.
+- If your editor or operating system prefers CRLF locally, keep the repository
+  rules authoritative and avoid committing CRLF-only rewrites.
+- After changing line-ending rules, prefer a focused normalization commit so
+  future functional changes remain easy to review.
 
 ## Security
 

@@ -1,0 +1,44 @@
+# Normalize text files to LF in the repository.
+# Git will store these files with LF line endings.
+* text=auto eol=lf
+
+# Source files
+*.ts text eol=lf
+*.tsx text eol=lf
+*.js text eol=lf
+*.jsx text eol=lf
+*.mjs text eol=lf
+*.cjs text eol=lf
+*.go text eol=lf
+
+# Documentation and structured data
+*.md text eol=lf
+*.json text eol=lf
+*.jsonl text eol=lf
+*.yaml text eol=lf
+*.yml text eol=lf
+*.toml text eol=lf
+
+# Shell and config files
+*.sh text eol=lf
+*.bash text eol=lf
+*.zsh text eol=lf
+Makefile text eol=lf
+*.tmpl text eol=lf
+*.sql text eol=lf
+
+# Package manager lockfiles
+pnpm-lock.yaml text eol=lf
+package-lock.json text eol=lf
+yarn.lock text eol=lf
+
+# Preserve binary files without line-ending conversion.
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.gif binary
+*.ico binary
+*.pdf binary
+*.db binary
+*.sqlite binary
+*.sqlite3 binary
