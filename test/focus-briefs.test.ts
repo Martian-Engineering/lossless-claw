@@ -25,7 +25,6 @@ function createDeps(
       return typeof latest?.content === "string" ? latest.content : undefined;
     },
     resolveAgentDir: () => "/tmp",
-    resolveSessionIdFromSessionKey: async () => undefined,
     agentLaneSubagent: "subagent",
     log: {
       info: vi.fn(),

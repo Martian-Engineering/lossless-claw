@@ -26,7 +26,6 @@ function createDeps(overrides: Partial<Record<string, unknown>> = {}) {
     buildSubagentSystemPrompt: () => "",
     readLatestAssistantReply: () => undefined,
     resolveAgentDir: () => "/tmp/lcm-test",
-    resolveSessionIdFromSessionKey: async () => undefined,
     agentLaneSubagent: "subagent",
     log: {
       info: () => {},

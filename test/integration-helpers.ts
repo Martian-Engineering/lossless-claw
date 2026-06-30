@@ -745,7 +745,6 @@ export function makeSummarizeDeps(overrides?: Partial<LcmDependencies>): LcmDepe
     buildSubagentSystemPrompt: vi.fn(() => ""),
     readLatestAssistantReply: vi.fn(() => undefined),
     resolveAgentDir: vi.fn(() => "/tmp/openclaw-agent"),
-    resolveSessionIdFromSessionKey: vi.fn(async () => undefined),
     agentLaneSubagent: "subagent",
     log: {
       info: vi.fn(),
@@ -760,4 +759,3 @@ export function makeSummarizeDeps(overrides?: Partial<LcmDependencies>): LcmDepe
 // ═════════════════════════════════════════════════════════════════════════════
 // Test Suite: Ingest -> Assemble
 // ═════════════════════════════════════════════════════════════════════════════
-

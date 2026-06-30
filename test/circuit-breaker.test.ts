@@ -101,7 +101,6 @@ function createTestDeps(config: LcmConfig): LcmDependencies {
       error: () => {},
       debug: () => {},
     },
-    resolveSessionIdFromSessionKey: async () => undefined,
     resolveWorkspaceDir: () => undefined,
   } as unknown as LcmDependencies;
 }
