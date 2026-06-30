@@ -997,6 +997,19 @@ export class SummaryStore {
     });
   }
 
+  async replaceContextRangesWithSummaries(input: {
+    conversationId: number;
+    replacements: Array<{
+      startOrdinal: number;
+      endOrdinal: number;
+      summaryId: string;
+    }>;
+  }): Promise<void> {
+    await this.withTransaction(() => {
+      this.replaceContextRangesWithSummariesInTransaction(input);
+    });
+  }
+
   // Update the context slice in-place while the caller already owns the txn.
   private replaceContextRangeWithSummaryInTransaction(input: {
     conversationId: number;
@@ -1004,31 +1017,68 @@ export class SummaryStore {
     endOrdinal: number;
     summaryId: string;
   }): void {
-    const { conversationId, startOrdinal, endOrdinal, summaryId } = input;
+    this.replaceContextRangesWithSummariesInTransaction({
+      conversationId: input.conversationId,
+      replacements: [
+        {
+          startOrdinal: input.startOrdinal,
+          endOrdinal: input.endOrdinal,
+          summaryId: input.summaryId,
+        },
+      ],
+    });
+  }
 
-    // 1. Delete context items in the range [startOrdinal, endOrdinal]
-    this.db
-      .prepare(
-        `DELETE FROM context_items
-         WHERE conversation_id = ?
-           AND ordinal >= ?
-           AND ordinal <= ?`,
-      )
-      .run(conversationId, startOrdinal, endOrdinal);
+  private replaceContextRangesWithSummariesInTransaction(input: {
+    conversationId: number;
+    replacements: Array<{
+      startOrdinal: number;
+      endOrdinal: number;
+      summaryId: string;
+    }>;
+  }): void {
+    const { conversationId } = input;
+    const replacements = [...input.replacements].sort((a, b) => a.startOrdinal - b.startOrdinal);
+    let previousEndOrdinal = -1;
+    for (const replacement of replacements) {
+      if (replacement.startOrdinal < 0 || replacement.endOrdinal < replacement.startOrdinal) {
+        throw new Error(
+          `Invalid context replacement range ${replacement.startOrdinal}-${replacement.endOrdinal}`,
+        );
+      }
+      if (replacement.startOrdinal <= previousEndOrdinal) {
+        throw new Error("Context replacement ranges must not overlap");
+      }
+      previousEndOrdinal = replacement.endOrdinal;
+    }
 
-    // 2. Insert the replacement summary item at startOrdinal
-    this.db
-      .prepare(
-        `INSERT INTO context_items (conversation_id, ordinal, item_type, summary_id)
-         VALUES (?, ?, 'summary', ?)`,
-      )
-      .run(conversationId, startOrdinal, summaryId);
+    // 1. Delete all covered context items.
+    const deleteStmt = this.db.prepare(
+      `DELETE FROM context_items
+       WHERE conversation_id = ?
+         AND ordinal >= ?
+         AND ordinal <= ?`,
+    );
+    for (const replacement of replacements) {
+      deleteStmt.run(conversationId, replacement.startOrdinal, replacement.endOrdinal);
+    }
+
+    // 2. Insert replacement summary items at their original start ordinals.
+    const insertStmt = this.db.prepare(
+      `INSERT INTO context_items (conversation_id, ordinal, item_type, summary_id)
+       VALUES (?, ?, 'summary', ?)`,
+    );
+    for (const replacement of replacements) {
+      insertStmt.run(conversationId, replacement.startOrdinal, replacement.summaryId);
+    }
 
     // 3. Resequence all ordinals to maintain contiguity (no gaps).
-    //    Pre-compute ranks from a SELECT (safe snapshot), then apply
-    //    via 2-pass UPDATE loop using negative temps to avoid UNIQUE
-    //    constraint violations. The SELECT reads post-delete/insert
-    //    state and provides a consistent snapshot for resequencing.
+    this.resequenceContextItemsInTransaction(conversationId);
+  }
+
+  private resequenceContextItemsInTransaction(conversationId: number): void {
+    // Pre-compute ranks from a SELECT, then apply a 2-pass UPDATE loop using
+    // negative temps to avoid UNIQUE constraint violations.
     const items = this.db
       .prepare(
         `SELECT ordinal FROM context_items
