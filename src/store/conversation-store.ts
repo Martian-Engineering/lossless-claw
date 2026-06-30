@@ -138,6 +138,21 @@ export type ConversationRecord = {
   updatedAt: Date;
 };
 
+/** Normalized provenance for a conversation archive, set at the archive funnel. */
+export type ArchiveCause =
+  | "manual-reset"
+  | "session-deleted"
+  | "session-end"
+  | "rollover-fallback"
+  | "cron-rotation";
+
+// Causes the rollover-split doctor must never auto-restore. Ships with
+// `manual-reset` only: a deliberate operator wipe is rock-solid intent. The other
+// causes are recorded but stay merge-eligible because the safe direction is
+// over-restore (today's behavior); promoting `session-deleted` once the host
+// deletion contract is confirmed is a one-line follow-up.
+export const DELIBERATE_ARCHIVE_CAUSES: ReadonlySet<ArchiveCause> = new Set(["manual-reset"]);
+
 export type MessageSearchInput = {
   conversationId?: ConversationId;
   conversationIds?: ConversationId[];
@@ -610,16 +625,20 @@ export class ConversationStore {
       .run(conversationId);
   }
 
-  async archiveConversation(conversationId: ConversationId): Promise<void> {
+  // Single archive funnel: deliberate archives must flow through here with their
+  // cause. The direct-insert archived-row path (createConversation active:false)
+  // leaves archive_cause NULL = merge-eligible by design.
+  async archiveConversation(conversationId: ConversationId, cause: ArchiveCause): Promise<void> {
     this.db
       .prepare(
         `UPDATE conversations
        SET active = 0,
            archived_at = COALESCE(archived_at, datetime('now')),
+           archive_cause = COALESCE(archive_cause, ?),
            updated_at = datetime('now')
        WHERE conversation_id = ?`,
       )
-      .run(conversationId);
+      .run(cause, conversationId);
   }
 
   async rebindConversationSession(

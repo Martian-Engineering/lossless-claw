@@ -1067,6 +1067,7 @@ export function runLcmMigrations(
       session_key TEXT,
       active INTEGER NOT NULL DEFAULT 1,
       archived_at TEXT,
+      archive_cause TEXT,
       title TEXT,
       bootstrapped_at TEXT,
       created_at TEXT NOT NULL DEFAULT (datetime('now')),
@@ -1317,6 +1318,11 @@ export function runLcmMigrations(
     const hasArchivedAt = conversationColumns.some((col) => col.name === "archived_at");
     if (!hasArchivedAt) {
       db.exec(`ALTER TABLE conversations ADD COLUMN archived_at TEXT`);
+    }
+
+    const hasArchiveCause = conversationColumns.some((col) => col.name === "archive_cause");
+    if (!hasArchiveCause) {
+      db.exec(`ALTER TABLE conversations ADD COLUMN archive_cause TEXT`);
     }
 
     db.exec(`UPDATE conversations SET active = 1 WHERE active IS NULL`);

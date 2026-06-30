@@ -12,7 +12,7 @@ import { describeLogError } from "./lcm-log.js";
 import { isLikelyInjectedDeliveryOnlyTranscript, toStoredMessage } from "./message-content.js";
 import { createBootstrapEntryHash, messageIdentity } from "./message-signatures.js";
 import type { AgentMessage } from "./openclaw-bridge.js";
-import type { ConversationStore } from "./store/conversation-store.js";
+import type { ArchiveCause, ConversationStore } from "./store/conversation-store.js";
 import { getTranscriptEntryMeta } from "./transcript.js";
 import { isMissingFileError } from "./value-utils.js";
 import type { SummaryStore } from "./store/summary-store.js";
@@ -44,6 +44,7 @@ export type AmbiguousSessionKeyRuntimeRollover = {
 /** Engine callback that closes the old conversation and optionally creates its replacement. */
 export type ApplySessionReplacementFn = (params: {
   reason: string;
+  archiveCause: ArchiveCause;
   sessionId?: string;
   sessionKey?: string;
   nextSessionId?: string;
@@ -116,6 +117,7 @@ export class SessionRolloverDetector {
     );
     await this.applySessionReplacement({
       reason: `${params.phase} session-file rollover fallback`,
+      archiveCause: "rollover-fallback",
       sessionId: activeByKey.sessionId,
       sessionKey: normalizedSessionKey,
       nextSessionId: params.sessionId,
@@ -167,6 +169,7 @@ export class SessionRolloverDetector {
     );
     await this.applySessionReplacement({
       reason: `${params.phase} isolated cron session rollover`,
+      archiveCause: "cron-rotation",
       sessionId: activeByKey.sessionId,
       sessionKey: normalizedSessionKey,
       nextSessionId: normalizedSessionId,

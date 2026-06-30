@@ -889,7 +889,7 @@ describe("ConversationStore session reuse", () => {
     const sessionKey = "agent:main:test:archived-lookup";
 
     const archived = await store.getOrCreateConversation(sessionId, { sessionKey });
-    await store.archiveConversation(archived.conversationId);
+    await store.archiveConversation(archived.conversationId, "rollover-fallback");
 
     expect(
       await store.getConversationForSession({
