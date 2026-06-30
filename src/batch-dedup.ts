@@ -226,6 +226,55 @@ export class BatchDeduplicator {
   }
 
   /**
+   * Stamp an entry id onto a recent tail row whose persisted form matches the
+   * incoming transcript message, including side-effect-free externalized-file
+   * equivalence. Returns true only after an unstamped row was updated.
+   */
+  async adoptRecentTranscriptEntryIdForMessage(params: {
+    conversationId: number;
+    message: AgentMessage;
+    transcriptEntryId: string;
+    tailWindow: number;
+  }): Promise<boolean> {
+    const tailWindow = Math.max(1, Math.floor(params.tailWindow));
+    const tail = await this.conversationStore.getLastMessages(params.conversationId, tailWindow);
+    const tailHashes = await this.conversationStore.getRecentMessageIdentityHashes(
+      params.conversationId,
+      tailWindow,
+    );
+    if (tail.length === 0 || tail.length !== tailHashes.length) {
+      return false;
+    }
+
+    const stored = toStoredMessage(params.message);
+    const incomingHash = storedMessageIdentityHash(stored);
+    const incomingRawPayloadContent =
+      serializeRawPayloadContent(params.message, stored.content)?.content ?? null;
+    for (let index = tail.length - 1; index >= 0; index -= 1) {
+      const match = await this.matchStoredMessageToIncoming(
+        tail[index]!,
+        stored,
+        incomingHash,
+        tailHashes[index]!,
+        incomingRawPayloadContent,
+      );
+      if (!match || match === "unproven-externalized") {
+        continue;
+      }
+      if (
+        await this.conversationStore.adoptTranscriptEntryIdForMessage(
+          params.conversationId,
+          tail[index]!.messageId,
+          params.transcriptEntryId,
+        )
+      ) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  /**
    * Handle the case where the DB has more messages than the incoming batch.
    * The batch is likely a tail-only replay after compaction — try to match
    * the entire batch against the tail of stored messages.

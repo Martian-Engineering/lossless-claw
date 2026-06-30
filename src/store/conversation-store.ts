@@ -924,7 +924,25 @@ export class ConversationStore {
         identityHash,
         role,
         content,
-      );
+    );
+    return result.changes > 0;
+  }
+
+  /** Stamp a transcript entry id onto one known unstamped message row. */
+  async adoptTranscriptEntryIdForMessage(
+    conversationId: ConversationId,
+    messageId: MessageId,
+    transcriptEntryId: string,
+  ): Promise<boolean> {
+    const result = this.db
+      .prepare(
+        `UPDATE messages
+         SET transcript_entry_id = ?
+         WHERE conversation_id = ?
+           AND message_id = ?
+           AND transcript_entry_id IS NULL`,
+      )
+      .run(transcriptEntryId, conversationId, messageId);
     return result.changes > 0;
   }
 

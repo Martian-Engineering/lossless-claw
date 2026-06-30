@@ -1713,6 +1713,17 @@ export class LcmContextEngine implements ContextEngine {
           overlapAnchorIndex = index;
           continue;
         }
+        const adoptedExternalized = await this.batchDeduplicator.adoptRecentTranscriptEntryIdForMessage({
+          conversationId: params.conversationId,
+          message,
+          transcriptEntryId: entryId,
+          tailWindow: this.config.freshTailCount,
+        });
+        if (adoptedExternalized) {
+          hasOverlap = true;
+          overlapAnchorIndex = index;
+          continue;
+        }
       }
 
       importableMessages.push({ index, message });

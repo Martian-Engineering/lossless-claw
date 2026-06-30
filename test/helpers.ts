@@ -186,10 +186,11 @@ export function createEngineWithDepsOverrides(overrides: Partial<LcmDependencies
 
 export function createEngineWithDepsOverridesAndDb(
   overrides: Partial<LcmDependencies>,
+  configOverrides: Partial<LcmConfig> = {},
 ): { engine: LcmContextEngine; db: ReturnType<typeof createLcmDatabaseConnection> } {
   const tempDir = mkdtempSync(join(tmpdir(), "lossless-claw-engine-"));
   tempDirs.push(tempDir);
-  const config = createTestConfig(join(tempDir, "lcm.db"));
+  const config = createTestConfig(join(tempDir, "lcm.db"), configOverrides);
   const db = createLcmDatabaseConnection(config.databasePath);
   return {
     engine: new TestLcmContextEngine(
