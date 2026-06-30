@@ -17,6 +17,10 @@ import type { LcmConfig } from "../src/db/config.js";
 import { closeLcmConnection, createLcmDatabaseConnection } from "../src/db/connection.js";
 import { LcmContextEngine } from "../src/engine.js";
 import { estimateSerializedMessagesTokens } from "../src/estimate-tokens.js";
+import {
+  SERIALIZED_OUTPUT_CLAMP_SAFETY_RATIO,
+  clampMessagesToSerializedBudget,
+} from "../src/assemble-fallback.js";
 import type { AgentMessage } from "../src/openclaw-bridge.js";
 import type { LcmDependencies } from "../src/types.js";
 import { createTestConfig as createSharedTestConfig, createTestDeps as createSharedTestDeps } from "./helpers.js";
@@ -120,6 +124,26 @@ function makeHeavyLiveTranscript(pairs: number, payloadChars: number): AgentMess
 }
 
 describe("bounded assemble output", () => {
+  it("clamps near-budget serialized output to leave host renderer headroom", () => {
+    const messages = makeHeavyLiveTranscript(12, 4_000);
+    const serializedTokens = estimateSerializedMessagesTokens(messages);
+    const tokenBudget = Math.ceil(serializedTokens / 0.95);
+
+    expect(serializedTokens).toBeLessThan(tokenBudget);
+    expect(serializedTokens).toBeGreaterThan(
+      Math.floor(tokenBudget * SERIALIZED_OUTPUT_CLAMP_SAFETY_RATIO),
+    );
+
+    const result = clampMessagesToSerializedBudget({ messages, tokenBudget });
+
+    expect(result.clamped).toBe(true);
+    expect(result.serializedTokens).toBeLessThanOrEqual(
+      Math.floor(tokenBudget * SERIALIZED_OUTPUT_CLAMP_SAFETY_RATIO),
+    );
+    expect(result.evictedMessages).toBeGreaterThan(0);
+    expect(result.messages.some((m) => m.role === "user")).toBe(true);
+  });
+
   it("bounds the live fallback when stored coverage trails a heavy live transcript", async () => {
     const engine = createEngine();
     const sessionId = "session-bounded-fallback";
