@@ -77,16 +77,17 @@ export function clampMessagesToSerializedBudget(params: {
   evictedMessages: number;
   overBudget: boolean;
 } {
-  // Trigger only when the serialized estimate actually exceeds the budget;
-  // once eviction is unavoidable, clamp down to the safety target so the
-  // result leaves headroom for host reserve tokens and renderer overhead.
+  // Trigger once the serialized estimate crosses the safety target, not only
+  // the hard budget. The host renderer adds prompt and message-boundary
+  // pressure that this plugin can only approximate, so near-budget assemblies
+  // must leave explicit headroom before OpenClaw performs its final precheck.
   const triggerTokens = Math.max(1, Math.floor(params.tokenBudget));
   const targetTokens = Math.max(
     1,
     Math.floor(params.tokenBudget * SERIALIZED_OUTPUT_CLAMP_SAFETY_RATIO),
   );
   const serializedTokensBefore = estimateSerializedMessagesTokens(params.messages);
-  if (serializedTokensBefore <= triggerTokens || params.messages.length === 0) {
+  if (serializedTokensBefore <= targetTokens || params.messages.length === 0) {
     return {
       messages: params.messages,
       serializedTokens: serializedTokensBefore,
