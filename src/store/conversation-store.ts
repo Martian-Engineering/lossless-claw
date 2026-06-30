@@ -939,6 +939,47 @@ export class ConversationStore {
     return result.changes > 0;
   }
 
+  /** Stamp a transcript entry id onto the newest identity-matching unstamped tail row. */
+  async adoptRecentTranscriptEntryId(
+    conversationId: ConversationId,
+    role: MessageRole,
+    content: string,
+    transcriptEntryId: string,
+    tailWindow: number,
+  ): Promise<boolean> {
+    const identityHash = buildMessageIdentityHash(role, content);
+    const result = this.db
+      .prepare(
+        `UPDATE messages
+         SET transcript_entry_id = ?
+         WHERE message_id = (
+           SELECT message_id
+           FROM (
+             SELECT message_id, transcript_entry_id, identity_hash, role, content
+             FROM messages
+             WHERE conversation_id = ?
+             ORDER BY seq DESC
+             LIMIT ?
+           )
+           WHERE transcript_entry_id IS NULL
+             AND identity_hash = ?
+             AND role = ?
+             AND content = ?
+           ORDER BY message_id DESC
+           LIMIT 1
+         )`,
+      )
+      .run(
+        transcriptEntryId,
+        conversationId,
+        Math.max(1, Math.floor(tailWindow)),
+        identityHash,
+        role,
+        content,
+      );
+    return result.changes > 0;
+  }
+
   /**
    * List identity-matching rows that already carry a transcript entry id,
    * oldest first. The engine compares these ids against the transcript's
