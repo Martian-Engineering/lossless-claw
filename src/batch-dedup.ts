@@ -13,6 +13,7 @@ import {
   parseFileBlocks,
   type FileBlock,
 } from "./large-files.js";
+import { liveContentIsRecognizedDecoratedBareBody } from "./live-coverage.js";
 import {
   extractStructuredText,
   RAW_PAYLOAD_EXTERNALIZATION_REASON,
@@ -20,6 +21,7 @@ import {
   toStoredMessage,
   type StoredMessage,
 } from "./message-content.js";
+import { messageIdentity } from "./message-signatures.js";
 import type { AgentMessage } from "./openclaw-bridge.js";
 import type { ConversationStore, MessageRecord } from "./store/conversation-store.js";
 import { buildMessageIdentityHash } from "./store/message-identity.js";
@@ -59,6 +61,41 @@ export class BatchDeduplicator {
    *    replay snapshot — fail closed, because a covered transcript read will
    *    deliver anything real on the next turn idempotently.
    */
+  /**
+   * A runtime batch row is covered by a persisted frontier row when their
+   * identities match, OR when the runtime copy is the DECORATED face of the
+   * persisted bare body of the same turn. OpenClaw delivers the current turn
+   * twice — the transcript persists the BARE body, while the runtime array
+   * carries a per-turn DECORATED copy (for example, a leading channel
+   * timestamp). Their identities differ, so the afterTurn
+   * batch would otherwise persist the decorated copy as a second row (the store
+   * double-write). liveContentIsRecognizedDecoratedBareBody collapses it only
+   * when the runtime copy structurally contains the bare body AND carries
+   * recognized timestamp decoration — user-role only. A genuinely distinct
+   * turn, or one that merely quotes or authors metadata-shaped prose, is never
+   * collapsed (silent data loss).
+   */
+  private runtimeRowCoversPersistedFrontierRow(
+    persistedRole: string,
+    persistedContent: string,
+    batchRole: string,
+    batchContent: string,
+  ): boolean {
+    if (
+      messageIdentity(persistedRole, persistedContent) ===
+      messageIdentity(batchRole, batchContent)
+    ) {
+      return true;
+    }
+    if (persistedRole !== "user" || batchRole !== "user") {
+      return false;
+    }
+    return liveContentIsRecognizedDecoratedBareBody({
+      liveContent: batchContent,
+      bareContent: persistedContent,
+    });
+  }
+
   async alignRuntimeBatchAgainstCoveredFrontier(
     sessionId: string,
     sessionKey: string | undefined,
@@ -101,6 +138,22 @@ export class BatchDeduplicator {
           break;
         }
         if (!match) {
+          // Identity_hash / externalized matching found no coverage. Recognize
+          // the OpenClaw store double-write: a runtime row that is the DECORATED
+          // face of the persisted bare body of the same turn — their
+          // identity_hashes differ, so identity dedup cannot see it. Strictly
+          // gated to genuine decoration; a distinct turn is never collapsed.
+          if (
+            this.runtimeRowCoversPersistedFrontierRow(
+              tailMessages[i]!.role,
+              tailMessages[i]!.content,
+              storedBatch[i]!.role,
+              storedBatch[i]!.content,
+            )
+          ) {
+            exactAnchor = true;
+            continue;
+          }
           aligned = false;
           break;
         }
@@ -180,21 +233,37 @@ export class BatchDeduplicator {
       );
     }
 
-    // Aligned-tail check: DB's last message identity_hash must match the
-    // message at the exact replay boundary in the incoming batch.
+    // Aligned-tail check: the DB's last message must align with the message at
+    // the exact replay boundary in the incoming batch. Identity_hash is the
+    // fast path; a hash mismatch still aligns when the boundary row is the
+    // DECORATED face of the bare DB row (the store double-write — same turn,
+    // different identity_hash), which is collapsed under a strict decoration
+    // gate instead of ingested as a duplicate.
     const batchAtBoundaryHash = batchHashes[storedMessageCount - 1]!;
     if (batchAtBoundaryHash !== lastDbIdentityHash) {
-      // Prefix mismatch — attempt suffix fallback before giving up.
-      return this.deduplicateSuffixFallback(
-        conversationId,
-        batch,
-        storedBatch,
-        batchHashes,
-        rawPayloadContents,
-        storedMessageCount,
-        "prefix-mismatch",
-        { onNoOverlap: "ingest" },
-      );
+      const lastDbMessage = await this.conversationStore.getLastMessage(conversationId);
+      const batchAtBoundary = storedBatch[storedMessageCount - 1]!;
+      if (
+        !lastDbMessage ||
+        !this.runtimeRowCoversPersistedFrontierRow(
+          lastDbMessage.role,
+          lastDbMessage.content,
+          batchAtBoundary.role,
+          batchAtBoundary.content,
+        )
+      ) {
+        // Prefix mismatch — attempt suffix fallback before giving up.
+        return this.deduplicateSuffixFallback(
+          conversationId,
+          batch,
+          storedBatch,
+          batchHashes,
+          rawPayloadContents,
+          storedMessageCount,
+          "prefix-mismatch",
+          { onNoOverlap: "ingest" },
+        );
+      }
     }
 
     // Full proof: incoming batch must start with the entire stored transcript
@@ -220,11 +289,25 @@ export class BatchDeduplicator {
         recentDbHashes[i]!,
         rawPayloadContents[i],
       );
-      if (!match) {
-        return batch;
-      }
       if (match === "unproven-externalized") {
         return batch;
+      }
+      if (!match) {
+        // Identity_hash / externalized matching found no coverage. Recognize
+        // the OpenClaw store double-write: the incoming row is the DECORATED
+        // face of the stored bare body of the same turn (different
+        // identity_hash). Strictly gated to genuine decoration; a distinct turn
+        // is never collapsed.
+        if (
+          !this.runtimeRowCoversPersistedFrontierRow(
+            storedMessages[i]!.role,
+            storedMessages[i]!.content,
+            storedBatch[i]!.role,
+            storedBatch[i]!.content,
+          )
+        ) {
+          return batch;
+        }
       }
     }
 
@@ -308,7 +391,7 @@ export class BatchDeduplicator {
       if (tailMessages.length === batch.length && tailHashes.length === batch.length) {
         let tailMatch = true;
         for (let i = 0; i < batch.length; i++) {
-          const match = await this.matchStoredMessageToIncoming(
+          const match = await this.matchStoredMessageToIncomingOrDecoratedCoverage(
             tailMessages[i]!,
             storedBatch[i]!,
             batchHashes[i]!,
@@ -376,7 +459,7 @@ export class BatchDeduplicator {
     let ambiguousExternalizedOverlap = false;
 
     for (let k = batch.length - 1; k >= 0; k--) {
-      const lastMatch = await this.matchStoredMessageToIncoming(
+      const lastMatch = await this.matchStoredMessageToIncomingOrDecoratedCoverage(
         lastStoredMessage,
         storedBatch[k]!,
         batchHashes[k]!,
@@ -392,9 +475,9 @@ export class BatchDeduplicator {
       const matchLen = Math.min(k + 1, allRecentHashes.length);
       const startDb = allRecentHashes.length - matchLen;
       let suffixMatch = true;
-      let exactAnchor = lastMatch === "exact";
+      let exactAnchor = lastMatch === "exact" || lastMatch === "decorated";
       for (let j = 0; j < matchLen; j++) {
-        const match = await this.matchStoredMessageToIncoming(
+        const match = await this.matchStoredMessageToIncomingOrDecoratedCoverage(
           allStored[startDb + j]!,
           storedBatch[k - matchLen + 1 + j]!,
           batchHashes[k - matchLen + 1 + j]!,
@@ -410,13 +493,17 @@ export class BatchDeduplicator {
           suffixMatch = false;
           break;
         }
-        exactAnchor ||= match === "exact";
+        exactAnchor ||= match === "exact" || match === "decorated";
       }
       const newSlice = batch.slice(k + 1);
       // Outside the transcript-covered path, an externalized-only anchor is
       // ambiguous: it may be a replay prefix or a new turn that repeats the
       // same upload. Require an exact anchor before trimming.
-      if (suffixMatch && exactAnchor && (newSlice.length > 0 || matchLen > 1)) {
+      if (
+        suffixMatch &&
+        exactAnchor &&
+        (newSlice.length > 0 || matchLen > 1 || lastMatch === "decorated")
+      ) {
         this.deps.log.debug(
           `[lcm] dedup: ${context} suffix-match at batch[${k}], ` +
             `returning ${newSlice.length} new messages ` +
@@ -451,6 +538,33 @@ export class BatchDeduplicator {
         `no overlap found — ingesting full batch`,
     );
     return batch;
+  }
+
+  private async matchStoredMessageToIncomingOrDecoratedCoverage(
+    storedMessage: MessageRecord,
+    incoming: StoredMessage,
+    incomingHash: string,
+    storedHash: string,
+    incomingRawPayloadContent?: string | null,
+  ): Promise<"exact" | "externalized" | "unproven-externalized" | "decorated" | null> {
+    const match = await this.matchStoredMessageToIncoming(
+      storedMessage,
+      incoming,
+      incomingHash,
+      storedHash,
+      incomingRawPayloadContent,
+    );
+    if (match) {
+      return match;
+    }
+    return this.runtimeRowCoversPersistedFrontierRow(
+      storedMessage.role,
+      storedMessage.content,
+      incoming.role,
+      incoming.content,
+    )
+      ? "decorated"
+      : null;
   }
 
   private async matchStoredMessageToIncoming(

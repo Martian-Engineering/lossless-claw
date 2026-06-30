@@ -29,6 +29,52 @@ export function stripLeadingOpenClawInboundTimestamp(value: string): string {
   return match ? value.slice(match[0].length) : value;
 }
 
+/**
+ * True when `content` begins with a genuine OpenClaw injected inbound-metadata
+ * block (after an optional leading channel timestamp and `Delivery:` hint): a
+ * heading line equal to a known untrusted-metadata sentinel ("Conversation info
+ * (untrusted metadata):" / "Sender (untrusted metadata):"), immediately
+ * followed by a ```json fenced body that parses to a non-array object carrying
+ * at least one heading-specific key. That fenced-object-under-a-known-heading
+ * frame is recognized as OpenClaw decoration for heuristic matching, but it is
+ * still untrusted user-facing text until the host provides a trusted marker. A
+ * user who merely quotes or types "(untrusted metadata)" in prose does not
+ * reproduce the structured frame, so their message is not mistaken for
+ * decoration.
+ */
+export function contentBeginsWithOpenClawInboundMetadataBlock(content: string): boolean {
+  return extractBodyAfterOpenClawInboundMetadataBlock(content) !== null;
+}
+
+/**
+ * Returns the user body after a recognized leading OpenClaw inbound metadata
+ * prelude, or null when the content does not begin with one.
+ */
+export function extractBodyAfterOpenClawInboundMetadataBlock(content: string): string | null {
+  const afterTimestamp = stripLeadingOpenClawInboundTimestamp(content.trimStart());
+  const { metadataCandidate } = splitOpenClawInboundMetadataPrelude(afterTimestamp);
+  const firstCandidate = metadataCandidate.trimStart();
+  const firstMatch = OPENCLAW_INBOUND_METADATA_BLOCK_RE.exec(firstCandidate);
+  if (!firstMatch) {
+    return null;
+  }
+  if (parseOpenClawInboundMetadataRecord(firstMatch[1] ?? "", firstMatch[2] ?? "") === null) {
+    return null;
+  }
+
+  let remaining = firstCandidate.slice(firstMatch[0].length);
+  const secondCandidate = remaining.trimStart();
+  const secondMatch = OPENCLAW_INBOUND_METADATA_BLOCK_RE.exec(secondCandidate);
+  if (
+    secondMatch &&
+    parseOpenClawInboundMetadataRecord(secondMatch[1] ?? "", secondMatch[2] ?? "") !== null
+  ) {
+    remaining = secondCandidate.slice(secondMatch[0].length);
+  }
+
+  return stripMetadataSeparator(remaining);
+}
+
 const CONVERSATION_INFO_KEYS = new Set([
   "chat_id",
   "message_id",
