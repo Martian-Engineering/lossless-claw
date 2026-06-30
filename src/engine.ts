@@ -74,7 +74,7 @@ import {
   MIN_FALLBACK_MAX_TOKENS,
 } from "./summary-fallback.js";
 import { attachTranscriptEntryMeta, getTranscriptEntryId, resolveTranscriptMessageCreatedAt } from "./transcript.js";
-import { type TranscriptReconcileResult } from "./reconcile-plan.js";
+import { transcriptImportCap, type TranscriptReconcileResult } from "./reconcile-plan.js";
 import { describeAssembledPrefixChange, formatOverflowDiagnosticsForLog, shouldLogOverflowDiagnostics, type AssemblePrefixSnapshot, type BootstrapImportObservation } from "./assemble-debug.js";
 
 import { buildDegradedLiveAssembleResult, clampMessagesToSerializedBudget, resolveDeferredAssemblyPressure } from "./assemble-fallback.js";
@@ -1793,6 +1793,22 @@ export class LcmContextEngine implements ContextEngine {
         continue;
       }
 
+      if (entryId) {
+        const stored = toStoredMessage(message);
+        const adopted = await this.conversationStore.adoptRecentTranscriptEntryId(
+          params.conversationId,
+          stored.role,
+          stored.content,
+          entryId,
+          this.config.freshTailCount,
+        );
+        if (adopted) {
+          hasOverlap = true;
+          overlapAnchorIndex = index;
+          continue;
+        }
+      }
+
       importableMessages.push({ index, message });
     }
 
@@ -1809,8 +1825,15 @@ export class LcmContextEngine implements ContextEngine {
       hasOverlap
         ? importableMessages.filter((candidate) => candidate.index > overlapAnchorIndex)
         : importableMessages;
+    const importCap = transcriptImportCap(
+      await this.conversationStore.getMessageCount(params.conversationId),
+    );
+    const cappedByImportLimit = anchoredImportableMessages.length > importCap;
+    const messagesToImport = cappedByImportLimit
+      ? anchoredImportableMessages.slice(0, importCap)
+      : anchoredImportableMessages;
 
-    for (const { message } of anchoredImportableMessages) {
+    for (const { message } of messagesToImport) {
       const result = await this.ingestSingle({
         sessionId: params.sessionId,
         sessionKey: params.sessionKey,
@@ -1825,7 +1848,8 @@ export class LcmContextEngine implements ContextEngine {
 
     return {
       importedMessages,
-      blockedByImportCap: false,
+      blockedByImportCap: cappedByImportLimit,
+      ...(cappedByImportLimit ? { blockedReason: "import-cap" as const } : {}),
       hasOverlap,
     };
   }
