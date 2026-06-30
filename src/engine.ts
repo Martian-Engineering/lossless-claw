@@ -1771,7 +1771,8 @@ export class LcmContextEngine implements ContextEngine {
   }): Promise<TranscriptReconcileResult> {
     let importedMessages = 0;
     let hasOverlap = false;
-    const importableMessages: AgentMessage[] = [];
+    let overlapAnchorIndex = -1;
+    const importableMessages: Array<{ index: number; message: AgentMessage }> = [];
     const entryIds = params.historicalMessages
       .map((message) => getTranscriptEntryId(message))
       .filter((entryId): entryId is string => typeof entryId === "string" && entryId.length > 0);
@@ -1783,10 +1784,12 @@ export class LcmContextEngine implements ContextEngine {
           )
         : new Set<string>();
 
-    for (const message of params.historicalMessages) {
+    for (let index = 0; index < params.historicalMessages.length; index += 1) {
+      const message = params.historicalMessages[index]!;
       const entryId = getTranscriptEntryId(message);
       if (entryId && existingEntryIds.has(entryId)) {
         hasOverlap = true;
+        overlapAnchorIndex = index;
         continue;
       }
 
@@ -1800,11 +1803,12 @@ export class LcmContextEngine implements ContextEngine {
         );
         if (adopted) {
           hasOverlap = true;
+          overlapAnchorIndex = index;
           continue;
         }
       }
 
-      importableMessages.push(message);
+      importableMessages.push({ index, message });
     }
 
     if (params.requireOverlap && !hasOverlap) {
@@ -1816,7 +1820,12 @@ export class LcmContextEngine implements ContextEngine {
       };
     }
 
-    for (const message of importableMessages) {
+    const anchoredImportableMessages =
+      hasOverlap
+        ? importableMessages.filter((candidate) => candidate.index > overlapAnchorIndex)
+        : importableMessages;
+
+    for (const { message } of anchoredImportableMessages) {
       const result = await this.ingestSingle({
         sessionId: params.sessionId,
         sessionKey: params.sessionKey,
