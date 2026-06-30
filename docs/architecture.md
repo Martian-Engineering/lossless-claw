@@ -54,7 +54,7 @@ When compaction creates a summary from a range of messages (or summaries), the s
 
 When OpenClaw processes a turn, it calls the context engine's lifecycle hooks:
 
-1. **bootstrap** — On session start, reconciles the JSONL session file with the LCM database. Imports any messages that exist in the file but not in LCM (crash recovery).
+1. **bootstrap** — On session start, imports the host-provided visible transcript projection into the LCM database. On current SQLite hosts this is keyed by the runtime session target instead of Lossless resolving an active transcript file.
 2. **ingest** / **ingestBatch** — Persists new messages to the database and appends them to context_items.
 3. **afterTurn** — After the model responds, ingests new messages, then evaluates whether `contextThreshold` requires compaction.
 
@@ -199,29 +199,23 @@ Files embedded in user messages (typically via `<file>` blocks from tool output)
 
 This prevents a single large file paste from consuming the entire context window while keeping the content accessible.
 
-## Session reconciliation
+## Bootstrap import
 
-LCM handles crash recovery through **bootstrap reconciliation**:
+LCM handles startup continuity through **bootstrap import**:
 
-1. On session start, read the JSONL session file (OpenClaw's ground truth).
-2. Compare against the LCM database.
-3. Find the most recent message that exists in both (the "anchor").
-4. Import any messages after the anchor that are in JSONL but not in LCM.
-5. If an existing session key moves to a different transcript file and no anchor exists, treat the new file as a bounded transcript epoch and import its recoverable messages. The same flood cap used for tail reconciliation prevents large unrelated transcripts from being appended automatically.
-6. Advance the bootstrap checkpoint only after an overlap is found or a bounded epoch import succeeds. No-anchor reads that import nothing leave the old checkpoint in place so a later turn can retry.
+1. On session start, OpenClaw supplies the visible transcript entries for the current runtime session target.
+2. Lossless stores messages that do not already exist in the LCM database, using stable transcript entry ids to avoid replay.
+3. Imported messages are trimmed by `bootstrapMaxTokens` for first-time or fork bootstrap paths so a long parent history cannot flood a child conversation.
+4. The conversation is marked bootstrapped after the visible projection is imported or confirmed already present.
 
-This handles the case where OpenClaw wrote messages to the session file but crashed before LCM could persist them.
+This keeps active runtime storage host-owned. OpenClaw owns SQLite transcript parsing, branch visibility, and session-target resolution; Lossless persists only the conversation, message, summary, and recall rows it needs for compaction.
 
-For forked child sessions, LCM treats a host-copied parent JSONL branch as a
-first-time bootstrap source and imports only the newest messages that fit within
-`bootstrapMaxTokens`. That keeps child LCM state bounded even if the host fork
-payload still contains a long raw parent branch. The remaining fork-continuity
-contract belongs to the host: when lossless-claw advertises the
-`subagent-spawn` requirement for `thread-bootstrap-projection`, OpenClaw should
-bootstrap the child model thread from the context-engine projection rather than
-from the raw copied transcript. If the host cannot provide that capability,
-lossless-claw can preserve bounded durable state, but it cannot stop the host
-from replaying raw JSONL into the model before assembly.
+For forked child sessions, LCM imports only the newest visible entries that fit
+within `bootstrapMaxTokens`. The remaining fork-continuity contract belongs to
+the host: when lossless-claw advertises the `subagent-spawn` requirement for
+`thread-bootstrap-projection`, OpenClaw should bootstrap the child model thread
+from the context-engine projection rather than from unbounded raw parent
+history.
 
 ## Operation serialization
 
