@@ -1,4 +1,4 @@
-import { createHash } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { estimateTokens } from "./estimate-tokens.js";
 import {
   planPendingCondensedNodes,
@@ -193,8 +193,9 @@ export class PendingCompactionCoordinator {
       input.snapshot.sourceProjectionFingerprint,
       this.model,
     ]);
-    const batchId = `pcb_${prefixDigest}`;
-    const nodeIdPrefix = `psn_${prefixDigest}`;
+    const attemptDigest = shortDigest("pending-summary-attempt", [randomUUID()]);
+    const batchId = `pcb_${prefixDigest}_${attemptDigest}`;
+    const nodeIdPrefix = `psn_${prefixDigest}_${attemptDigest}`;
     const canonicalNodes = this.buildCanonicalSummaryPlannerNodes(input.snapshot);
     const leafNodes = planPendingLeafNodes({
       items: input.snapshot.items,
@@ -275,16 +276,30 @@ export class PendingCompactionCoordinator {
     snapshot: ProjectionSnapshot;
   }): Promise<PendingCompactionCoordinatorResult | null> {
     const nodes = await this.pendingSummaryStore.getNodesByBatch(input.batch.batchId);
-    const readyPlannerNodes = nodes
+    const readyPendingPlannerNodes = nodes
       .filter((node) => node.status === "ready" || node.status === "promoted")
       .map((node) => this.pendingRecordToPlannerNode(node));
+    const canonicalPlannerNodes = this.buildCanonicalSummaryPlannerNodes(input.snapshot);
     const frontier = selectPendingPublishFrontier({
-      nodes: readyPlannerNodes,
+      nodes: [...canonicalPlannerNodes, ...readyPendingPlannerNodes],
       startOrdinal: input.batch.compactableStartOrdinal,
       endOrdinal: input.batch.compactableEndOrdinal,
     });
     if (!frontier) {
       return null;
+    }
+    const pendingFrontier = frontier.filter(
+      (node) => typeof node.canonicalSummaryId !== "string",
+    );
+    if (pendingFrontier.length === 0) {
+      await this.pendingSummaryStore.markBatchPublished({
+        batchId: input.batch.batchId,
+      });
+      return {
+        status: "published",
+        batchId: input.batch.batchId,
+        frontierSummaryIds: frontier.map((node) => node.canonicalSummaryId!),
+      };
     }
 
     const publisher = new PendingSummaryPublisher({
@@ -293,13 +308,27 @@ export class PendingCompactionCoordinator {
     });
     const published = await publisher.publishReadyFrontier({
       batchId: input.batch.batchId,
-      frontierNodeIds: frontier.map((node) => node.nodeId),
+      frontierNodeIds: pendingFrontier.map((node) => node.nodeId),
       expectedSourceProjectionFingerprint: input.snapshot.sourceProjectionFingerprint,
     });
+    const publishedByNodeId = new Map(
+      pendingFrontier.map(
+        (node, index) => [node.nodeId, published.frontierSummaryIds[index]!] as const,
+      ),
+    );
     return {
       status: "published",
       batchId: input.batch.batchId,
-      frontierSummaryIds: published.frontierSummaryIds,
+      frontierSummaryIds: frontier.map((node) => {
+        if (typeof node.canonicalSummaryId === "string") {
+          return node.canonicalSummaryId;
+        }
+        const summaryId = publishedByNodeId.get(node.nodeId);
+        if (!summaryId) {
+          throw new Error(`Missing published summary id for pending frontier node ${node.nodeId}`);
+        }
+        return summaryId;
+      }),
     };
   }
 
