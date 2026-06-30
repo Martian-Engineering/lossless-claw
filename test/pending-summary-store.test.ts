@@ -154,14 +154,13 @@ describe("PendingSummaryStore", () => {
       model: "test-model",
     });
 
-    await expect(
-      pendingSummaryStore.claimNextPlannedNode({
-        conversationId: conversation.conversationId,
-        leaseOwner: "worker-a",
-        leaseExpiresAt: new Date("2026-06-30T12:05:00.000Z"),
-        now: new Date("2026-06-30T12:00:00.000Z"),
-      }),
-    ).resolves.toMatchObject({
+    const firstClaim = await pendingSummaryStore.claimNextPlannedNode({
+      conversationId: conversation.conversationId,
+      leaseOwner: "worker-a",
+      leaseExpiresAt: new Date("2026-06-30T12:05:00.000Z"),
+      now: new Date("2026-06-30T12:00:00.000Z"),
+    });
+    expect(firstClaim).toMatchObject({
       nodeId: "node_claim_a",
       status: "running",
       leaseOwner: "worker-a",
@@ -179,22 +178,41 @@ describe("PendingSummaryStore", () => {
     await expect(
       pendingSummaryStore.claimNextPlannedNode({
         conversationId: conversation.conversationId,
-        leaseOwner: "worker-b",
+        leaseOwner: "worker-a",
         leaseExpiresAt: new Date("2026-06-30T12:11:00.000Z"),
         now: new Date("2026-06-30T12:06:00.000Z"),
       }),
     ).resolves.toMatchObject({
       nodeId: "node_claim_a",
       status: "running",
-      leaseOwner: "worker-b",
+      leaseOwner: "worker-a",
       leaseExpiresAt: new Date("2026-06-30T12:11:00.000Z"),
     });
 
-    await pendingSummaryStore.markNodeReady({
-      nodeId: "node_claim_a",
-      content: "ready pending summary",
-      tokenCount: 5,
+    await expect(
+      pendingSummaryStore.markNodeReady({
+        nodeId: "node_claim_a",
+        leaseOwner: "worker-a",
+        leaseExpiresAt: firstClaim!.leaseExpiresAt!,
+        content: "obsolete ready pending summary",
+        tokenCount: 5,
+      }),
+    ).resolves.toBe(false);
+    await expect(pendingSummaryStore.getNode("node_claim_a")).resolves.toMatchObject({
+      status: "running",
+      leaseOwner: "worker-a",
+      content: null,
     });
+
+    await expect(
+      pendingSummaryStore.markNodeReady({
+        nodeId: "node_claim_a",
+        leaseOwner: "worker-a",
+        leaseExpiresAt: new Date("2026-06-30T12:11:00.000Z"),
+        content: "ready pending summary",
+        tokenCount: 5,
+      }),
+    ).resolves.toBe(true);
     await summaryStore.insertSummary({
       summaryId: "sum_canonical_a",
       conversationId: conversation.conversationId,

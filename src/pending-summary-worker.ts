@@ -9,11 +9,18 @@ export type PendingSummaryPreparationStore = {
   }): Promise<PendingSummaryNodeRecord | null>;
   markNodeReady(input: {
     nodeId: string;
+    leaseOwner: string;
+    leaseExpiresAt: Date;
     content: string;
     tokenCount: number;
     readyAt?: Date;
-  }): Promise<void>;
-  markNodeFailed(input: { nodeId: string; failureSummary: string }): Promise<void>;
+  }): Promise<boolean>;
+  markNodeFailed(input: {
+    nodeId: string;
+    leaseOwner: string;
+    leaseExpiresAt: Date;
+    failureSummary: string;
+  }): Promise<boolean>;
 };
 
 export type PendingSummaryPreparationWorkerOptions = {
@@ -96,23 +103,36 @@ export class PendingSummaryPreparationWorker {
     if (!node) {
       return { status: "idle" };
     }
+    if (!node.leaseExpiresAt) {
+      return { status: "idle" };
+    }
 
     try {
       const sourceText = await this.loadSourceText(node);
       const content = await this.summarize(sourceText, node);
-      await this.store.markNodeReady({
+      const saved = await this.store.markNodeReady({
         nodeId: node.nodeId,
+        leaseOwner: this.leaseOwner,
+        leaseExpiresAt: node.leaseExpiresAt,
         content,
         tokenCount: normalizeTokenCount(this.estimateTokens(content)),
         readyAt: this.now(),
       });
+      if (!saved) {
+        return { status: "idle" };
+      }
       return { status: "prepared", nodeId: node.nodeId };
     } catch (error) {
       const failureSummary = describeError(error);
-      await this.store.markNodeFailed({
+      const saved = await this.store.markNodeFailed({
         nodeId: node.nodeId,
+        leaseOwner: this.leaseOwner,
+        leaseExpiresAt: node.leaseExpiresAt,
         failureSummary,
       });
+      if (!saved) {
+        return { status: "idle" };
+      }
       return { status: "failed", nodeId: node.nodeId, failureSummary };
     }
   }

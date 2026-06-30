@@ -122,6 +122,99 @@ describe("PendingCompactionCoordinator", () => {
     await expect(summaryStore.getSummaryParents(summaryId)).resolves.toHaveLength(2);
   });
 
+  it("revalidates the source projection under the publish lock", async () => {
+    const { conversationStore, pendingSummaryStore, summaryStore } = createStores();
+    const conversation = await conversationStore.createConversation({
+      sessionId: "pending-coordinator-stale-session",
+      sessionKey: "agent:main:pending-coordinator-stale",
+    });
+    const messages = await conversationStore.createMessagesBulk([
+      {
+        conversationId: conversation.conversationId,
+        seq: 1,
+        role: "user",
+        content: "old source message one",
+        tokenCount: 4,
+      },
+      {
+        conversationId: conversation.conversationId,
+        seq: 2,
+        role: "assistant",
+        content: "old source message two",
+        tokenCount: 4,
+      },
+      {
+        conversationId: conversation.conversationId,
+        seq: 3,
+        role: "assistant",
+        content: "fresh tail message",
+        tokenCount: 4,
+      },
+    ]);
+    await summaryStore.appendContextMessages(
+      conversation.conversationId,
+      messages.map((message) => message.messageId),
+    );
+
+    let publishLockCount = 0;
+    const coordinator = new PendingCompactionCoordinator({
+      conversationStore,
+      pendingSummaryStore,
+      summaryStore,
+      model: "test-model",
+      leaseOwner: "test-worker",
+      withPublishLock: async (operation) => {
+        publishLockCount += 1;
+        return operation();
+      },
+      config: {
+        freshTailCount: 1,
+        leafChunkTokens: 100,
+        condensedMinFanout: 2,
+        condensedMinSourceTokens: 1,
+        condensedChunkTokens: 100,
+      },
+      summarize: async (sourceText) => `leaf(${sourceText})`,
+    });
+
+    await expect(
+      coordinator.runOnce({
+        conversationId: conversation.conversationId,
+        sessionKey: "agent:main:pending-coordinator-stale",
+      }),
+    ).resolves.toMatchObject({ status: "planned", nodeCount: 1 });
+    await expect(
+      coordinator.runOnce({ conversationId: conversation.conversationId }),
+    ).resolves.toMatchObject({ status: "prepared" });
+
+    const [newMessage] = await conversationStore.createMessagesBulk([
+      {
+        conversationId: conversation.conversationId,
+        seq: 4,
+        role: "user",
+        content: "new foreground message before publish",
+        tokenCount: 5,
+      },
+    ]);
+    await summaryStore.appendContextMessages(conversation.conversationId, [
+      newMessage!.messageId,
+    ]);
+
+    await expect(
+      coordinator.runOnce({ conversationId: conversation.conversationId }),
+    ).resolves.toMatchObject({
+      status: "stale",
+      reason: "source projection fingerprint changed before publish",
+    });
+    expect(publishLockCount).toBe(1);
+    await expect(
+      pendingSummaryStore.getActiveBatchForConversation(conversation.conversationId),
+    ).resolves.toBeNull();
+    await expect(summaryStore.getContextItems(conversation.conversationId)).resolves.toHaveLength(
+      4,
+    );
+  });
+
   it("does not claim a condensed parent before pending children are ready", async () => {
     const { conversationStore, pendingSummaryStore } = createStores();
     const conversation = await conversationStore.createConversation({
@@ -178,16 +271,17 @@ describe("PendingCompactionCoordinator", () => {
       { childNodeId: "leaf_second" },
     ]);
 
-    await expect(
-      pendingSummaryStore.claimNextPlannedNode({
-        conversationId: conversation.conversationId,
-        leaseOwner: "worker",
-        leaseExpiresAt: new Date("2026-06-30T12:05:00.000Z"),
-        now: new Date("2026-06-30T12:00:00.000Z"),
-      }),
-    ).resolves.toMatchObject({ nodeId: "leaf_first" });
+    const firstClaim = await pendingSummaryStore.claimNextPlannedNode({
+      conversationId: conversation.conversationId,
+      leaseOwner: "worker",
+      leaseExpiresAt: new Date("2026-06-30T12:05:00.000Z"),
+      now: new Date("2026-06-30T12:00:00.000Z"),
+    });
+    expect(firstClaim).toMatchObject({ nodeId: "leaf_first" });
     await pendingSummaryStore.markNodeReady({
       nodeId: "leaf_first",
+      leaseOwner: "worker",
+      leaseExpiresAt: firstClaim!.leaseExpiresAt!,
       content: "first ready",
       tokenCount: 2,
     });
