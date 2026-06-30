@@ -90,6 +90,31 @@ describe("archive_cause producers", () => {
     expect(row.archive_cause).toBe("session-deleted");
   });
 
+  it("tags a session_end reset (a real /reset also fires session_end) as manual-reset", async () => {
+    const { engine, db, conversationStore } = setup();
+    const sessionKey = "agent:test:main:session-end-reset";
+    const conversation = await conversationStore.getOrCreateConversation("session-reset-end-old", {
+      sessionKey,
+    });
+    await conversationStore.createMessage({
+      conversationId: conversation.conversationId,
+      seq: 0,
+      role: "user",
+      content: "hello",
+      tokenCount: 3,
+    });
+
+    await engine.handleSessionEnd({
+      reason: "reset",
+      sessionId: "session-reset-end-old",
+      sessionKey,
+    });
+
+    const row = readArchiveState(db, conversation.conversationId);
+    expect(row.active).toBe(0);
+    expect(row.archive_cause).toBe("manual-reset");
+  });
+
   it("tags any other session_end reason as session-end", async () => {
     const { engine, db, conversationStore } = setup();
     const sessionKey = "agent:test:main:ended";
@@ -105,7 +130,7 @@ describe("archive_cause producers", () => {
     });
 
     await engine.handleSessionEnd({
-      reason: "expired",
+      reason: "idle",
       sessionId: "session-end-old",
       sessionKey,
       nextSessionId: "session-end-new",

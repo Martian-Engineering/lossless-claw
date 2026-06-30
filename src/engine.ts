@@ -101,11 +101,15 @@ const FORK_BOUNDED_BOOTSTRAP_REASON = "fork-bounded bootstrap import";
 
 // Host-contract dependency: the deliberate-vs-incidental archive distinction
 // relies on OpenClaw emitting these exact reason strings only for genuine
-// operator actions. If the host renames a reason, the archive-cause mapping in
-// the lifecycle handlers changes silently; the producer mapping test guards it.
+// operator actions. A real /reset surfaces BOTH a before_reset(reason=reset) and
+// a session_end(reason=reset), so both lifecycle handlers must map reset to
+// manual-reset; the COALESCE write makes the order between them irrelevant. If
+// the host renames a reason, the mapping changes silently; the producer mapping
+// test guards it.
 const HOST_BEFORE_RESET_REASON_NEW = "new";
 const HOST_BEFORE_RESET_REASON_RESET = "reset";
 const HOST_SESSION_END_REASON_DELETED = "deleted";
+const HOST_SESSION_END_REASON_RESET = "reset";
 const CONTEXT_ENGINE_PROJECTION_EPOCH_VERSION = "summary-prefix-v1";
 const DEFERRED_ASSEMBLY_DEGRADED_PRESSURE_RATIO = 0.75;
 type CompactionExecutionParams = {
@@ -4274,7 +4278,11 @@ export class LcmContextEngine implements ContextEngine {
           await this.applySessionReplacement({
             reason: `session_end:${reason}`,
             archiveCause:
-              reason === HOST_SESSION_END_REASON_DELETED ? "session-deleted" : "session-end",
+              reason === HOST_SESSION_END_REASON_DELETED
+                ? "session-deleted"
+                : reason === HOST_SESSION_END_REASON_RESET
+                  ? "manual-reset"
+                  : "session-end",
             sessionId: params.sessionId,
             sessionKey: params.sessionKey ?? params.nextSessionKey,
             nextSessionId: params.nextSessionId,
