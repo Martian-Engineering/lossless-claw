@@ -996,7 +996,7 @@ export class LcmContextEngine implements ContextEngine {
           lastResult.reason === "no compactable context outside fresh tail" ||
           lastResult.reason === "no pending summary nodes planned"
         ) {
-          return this.executeCompactionCore({
+          const runLegacyCompaction = () => this.executeCompactionCore({
             conversationId: params.conversationId,
             sessionId: params.sessionId,
             sessionKey: params.sessionKey,
@@ -1009,6 +1009,17 @@ export class LcmContextEngine implements ContextEngine {
             compactionTarget: params.compactionTarget ?? "threshold",
             force: params.force ?? true,
           });
+          if (params.sessionQueueHeld === true) {
+            return runLegacyCompaction();
+          }
+          return this.withSessionQueue(
+            breakerScope,
+            runLegacyCompaction,
+            {
+              operationName: "pendingSummaryLegacyFallback",
+              context: formatSessionLabel(params.sessionId, params.sessionKey),
+            },
+          );
         }
         return {
           ok: true,

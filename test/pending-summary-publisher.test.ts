@@ -12,13 +12,15 @@ function createStores() {
   db.exec("PRAGMA foreign_keys = ON");
   const { fts5Available } = getLcmDbFeatures(db);
   runLcmMigrations(db, { fts5Available });
+  const conversationStore = new ConversationStore(db, { fts5Available });
   const pendingSummaryStore = new PendingSummaryStore(db);
   const summaryStore = new SummaryStore(db, { fts5Available });
   return {
     db,
-    conversationStore: new ConversationStore(db, { fts5Available }),
+    conversationStore,
     pendingSummaryStore,
     publisher: new PendingSummaryPublisher({
+      conversationStore,
       pendingSummaryStore,
       summaryStore,
       canonicalSummaryIdForNode: (node) => `sum_${node.nodeId}`,
@@ -172,11 +174,17 @@ describe("PendingSummaryPublisher", () => {
     await expect(summaryStore.getSummary("sum_leaf_a")).resolves.toMatchObject({
       kind: "leaf",
       content: "leaf summary one two",
+      descendantCount: 0,
+      descendantTokenCount: 0,
+      sourceMessageTokenCount: 8,
     });
     await expect(summaryStore.getSummary("sum_condensed_root")).resolves.toMatchObject({
       kind: "condensed",
       depth: 1,
       content: "condensed summary one two three",
+      descendantCount: 2,
+      descendantTokenCount: 9,
+      sourceMessageTokenCount: 12,
     });
     await expect(summaryStore.getSummaryMessages("sum_leaf_a")).resolves.toEqual([
       messages[0]!.messageId,
