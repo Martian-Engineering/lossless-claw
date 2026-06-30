@@ -966,12 +966,15 @@ describe("createLcmSummarizeFromLegacyParams", () => {
 
     const summary = await summarize!("H".repeat(8_000), false);
 
-    expect(summary).toContain("[LCM fallback summary; truncated for context management]");
-
-    const diagnostics = getDepsLogText(deps);
-    expect(diagnostics).toContain("block_types=reasoning");
-    expect(diagnostics).toContain("content_preview=");
-    expect(diagnostics).not.toContain("PRIVATE_TYPED_REASONING_TRACE");
+    // When no non-reasoning text is collected, reasoning blocks are
+    // used as a fallback source so models that place the entire summary
+    // inside a typed reasoning block (e.g. Ollama extended-thinking
+    // models, #944) produce usable summaries instead of falling
+    // through to the truncation fallback.
+    expect(summary).toBe("PRIVATE_TYPED_REASONING_TRACE");
+    // The summary was extracted successfully on the first attempt, so
+    // no empty-summary diagnostics are generated and no retries occur.
+    expect(vi.mocked(deps.complete)).toHaveBeenCalledTimes(1);
   });
 
   it("does not treat thinking-only completions as summary content", async () => {

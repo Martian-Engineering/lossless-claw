@@ -337,10 +337,14 @@ function shouldAppendDirectTextField(key: string): boolean {
 }
 
 /** Collect text payloads from common provider response shapes. */
-function collectTextLikeFields(value: unknown, out: string[]): void {
+function collectTextLikeFields(
+  value: unknown,
+  out: string[],
+  skipReasoning = true,
+): void {
   if (Array.isArray(value)) {
     for (const entry of value) {
-      collectTextLikeFields(entry, out);
+      collectTextLikeFields(entry, out, skipReasoning);
     }
     return;
   }
@@ -348,7 +352,10 @@ function collectTextLikeFields(value: unknown, out: string[]): void {
     return;
   }
 
-  if (isReasoningLikeType(value.type) || isReasoningLikeType(value.rawType)) {
+  if (
+    skipReasoning &&
+    (isReasoningLikeType(value.type) || isReasoningLikeType(value.rawType))
+  ) {
     return;
   }
 
@@ -367,7 +374,7 @@ function collectTextLikeFields(value: unknown, out: string[]): void {
         }
         continue;
       }
-      collectTextLikeFields(nested, out);
+      collectTextLikeFields(nested, out, skipReasoning);
     }
   }
 }
@@ -403,6 +410,16 @@ function normalizeCompletionSummary(content: unknown): { summary: string; blockT
 
   collectTextLikeFields(content, chunks);
   collectBlockTypes(content, blockTypeSet);
+
+  // Fallback: when no text was collected from non-reasoning blocks (e.g.
+  // Ollama extended-thinking models that place the entire summary inside a
+  // type:"reasoning" block), re-collect including reasoning blocks so the
+  // model's output is not discarded.  See #944.
+  if (chunks.length === 0) {
+    const reasoningChunks: string[] = [];
+    collectTextLikeFields(content, reasoningChunks, false);
+    chunks.push(...reasoningChunks);
+  }
 
   const blockTypes = [...blockTypeSet].sort((a, b) => a.localeCompare(b));
   return {
