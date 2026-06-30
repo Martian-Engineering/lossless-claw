@@ -2596,16 +2596,18 @@ export class LcmContextEngine implements ContextEngine {
     /** Back-compat param name. */
     legacyCompactionParams?: Record<string, unknown>;
   }): Promise<void> {
-    if (this.shouldIgnoreSession({ sessionId: params.sessionId, sessionKey: params.sessionKey })) {
+    const transcriptReadTarget = resolveSessionTranscriptReadTarget(params);
+    const sessionId = transcriptReadTarget?.sessionId ?? params.sessionId;
+    const sessionKey = transcriptReadTarget?.sessionKey ?? params.sessionKey;
+    if (this.shouldIgnoreSession({ sessionId, sessionKey })) {
       return;
     }
-    if (this.isStatelessSession(params.sessionKey)) {
+    if (this.isStatelessSession(sessionKey)) {
       return;
     }
     this.ensureMigrated();
     const startedAt = Date.now();
-    const sessionLabel = formatSessionLabel(params.sessionId, params.sessionKey);
-    const transcriptReadTarget = resolveSessionTranscriptReadTarget(params);
+    const sessionLabel = formatSessionLabel(sessionId, sessionKey);
 
     // Dedup guard: prevent duplicate ingestion when gateway restart replays
     // full history. Run on newMessages BEFORE prepending autoCompactionSummary
@@ -2620,8 +2622,8 @@ export class LcmContextEngine implements ContextEngine {
     };
     try {
       transcriptReconcileResult = await this.reconcileVisibleTranscriptProjectionForAfterTurn({
-        sessionId: params.sessionId,
-        sessionKey: params.sessionKey,
+        sessionId,
+        sessionKey,
         target: transcriptReadTarget,
         isHeartbeat: params.isHeartbeat,
         startedAt,
@@ -2679,8 +2681,8 @@ export class LcmContextEngine implements ContextEngine {
       // dedup stack, and persist only what the transcript flush has not
       // delivered yet.
       dedupedNewMessages = await this.batchDeduplicator.alignRuntimeBatchAgainstCoveredFrontier(
-        params.sessionId,
-        params.sessionKey,
+        sessionId,
+        sessionKey,
         newMessages,
       );
       if (newMessages.length > 0 && dedupedNewMessages.length < newMessages.length) {
@@ -2690,8 +2692,8 @@ export class LcmContextEngine implements ContextEngine {
       }
     } else {
       dedupedNewMessages = await this.batchDeduplicator.deduplicateAfterTurnBatch(
-        params.sessionId,
-        params.sessionKey,
+        sessionId,
+        sessionKey,
         newMessages,
         {
           oversizedNoOverlap: "ingest",
@@ -2745,8 +2747,8 @@ export class LcmContextEngine implements ContextEngine {
     } else {
       try {
         await this.ingestBatch({
-          sessionId: params.sessionId,
-          sessionKey: params.sessionKey,
+          sessionId,
+          sessionKey,
           messages: ingestBatch,
           isHeartbeat: params.isHeartbeat === true,
         });
@@ -2762,17 +2764,17 @@ export class LcmContextEngine implements ContextEngine {
     if (batchLooksLikeHeartbeatAckTurn(ingestBatch)) {
       try {
         const conversation = await this.conversationStore.getConversationForSession({
-          sessionId: params.sessionId,
-          sessionKey: params.sessionKey,
+          sessionId,
+          sessionKey,
         });
         if (conversation) {
-          const pruned = await pruneHeartbeatOkTurns(this.conversationStore, conversation.conversationId);
-          if (pruned > 0) {
-            const sessionContext = this.formatSessionLogContext({
-              conversationId: conversation.conversationId,
-              sessionId: params.sessionId,
-              sessionKey: params.sessionKey,
-            });
+            const pruned = await pruneHeartbeatOkTurns(this.conversationStore, conversation.conversationId);
+            if (pruned > 0) {
+              const sessionContext = this.formatSessionLogContext({
+                conversationId: conversation.conversationId,
+                sessionId,
+                sessionKey,
+              });
             this.deps.log.info(
               `[lcm] afterTurn: pruned ${pruned} heartbeat ack messages for ${sessionContext}`,
             );
@@ -2818,8 +2820,8 @@ export class LcmContextEngine implements ContextEngine {
       );
     }
     const conversation = await this.conversationStore.getConversationForSession({
-      sessionId: params.sessionId,
-      sessionKey: params.sessionKey,
+      sessionId,
+      sessionKey,
     });
     if (!conversation) {
       this.deps.log.debug(
@@ -2873,7 +2875,7 @@ export class LcmContextEngine implements ContextEngine {
 
     try {
       const resolvedContextThreshold = this.contextThresholdResolver.resolve({
-        sessionKey: params.sessionKey,
+        sessionKey,
         runtime: readRuntimeModelContext(
           asRecord(params.runtimeContext),
           asRecord(params.legacyCompactionParams),
@@ -2892,8 +2894,8 @@ export class LcmContextEngine implements ContextEngine {
       );
       this.logContextThresholdSelection({
         conversationId: conversation.conversationId,
-        sessionId: params.sessionId,
-        sessionKey: params.sessionKey,
+        sessionId,
+        sessionKey,
         tokenBudget,
         thresholdTokens: thresholdDecision.threshold,
         resolved: resolvedContextThreshold,
@@ -2907,8 +2909,8 @@ export class LcmContextEngine implements ContextEngine {
       if (this.config.proactiveThresholdCompactionMode === "inline") {
         if (thresholdDecision.shouldCompact) {
           const compactResult = await this.compact({
-            sessionId: params.sessionId,
-            sessionKey: params.sessionKey,
+            sessionId,
+            sessionKey,
             sessionFile: params.sessionFile,
             tokenBudget,
             currentTokenCount: observedCurrentTokenCount,
@@ -2945,8 +2947,8 @@ export class LcmContextEngine implements ContextEngine {
     if (deferredCompactionDrain) {
       this.scheduleDeferredCompactionDebtDrain({
         conversationId: conversation.conversationId,
-        sessionId: params.sessionId,
-        sessionKey: params.sessionKey,
+        sessionId,
+        sessionKey,
         tokenBudget: deferredCompactionDrain.tokenBudget,
         currentTokenCount: deferredCompactionDrain.currentTokenCount,
         reason: deferredCompactionDrain.reason,
