@@ -1420,11 +1420,15 @@ function createLcmDependencies(
       }
     },
     resolveModel: (modelRef, providerHint) => {
-      const raw =
-        (envSnapshot.lcmSummaryModel ||
-         config.summaryModel ||
-         modelRef?.trim() ||
-         envSnapshot.openclawDefaultModel).trim();
+      const explicitModelRef = modelRef?.trim() ?? "";
+      const raw = (
+        explicitModelRef.includes("/")
+          ? explicitModelRef
+          : envSnapshot.lcmSummaryModel ||
+            config.summaryModel ||
+            explicitModelRef ||
+            envSnapshot.openclawDefaultModel
+      ).trim();
       if (!raw) {
         throw new Error("No model configured for LCM summarization.");
       }
