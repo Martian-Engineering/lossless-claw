@@ -15,7 +15,8 @@ import { closeLcmConnection, createLcmDatabaseConnection } from "../src/db/conne
 import { LcmContextEngine } from "../src/engine.js";
 import type { AgentMessage } from "../src/openclaw-bridge.js";
 import { resetDelegatedExpansionGrantsForTests } from "../src/expansion-auth.js";
-import type { LcmDependencies } from "../src/types.js";
+import { extractBootstrapMessageCandidate, getTranscriptEntryMeta, readLeafPathRawEntries } from "../src/transcript.js";
+import type { LcmDependencies, VisibleSessionTranscriptMessageEntry } from "../src/types.js";
 
 export const tempDirs: string[] = [];
 
@@ -120,6 +121,73 @@ export function parseAgentSessionKey(sessionKey: string): { agentId: string; suf
   };
 }
 
+function withTestTranscriptProjectionTarget<T extends {
+  sessionId: string;
+  sessionKey?: string;
+  sessionFile?: string;
+  sessionTarget?: unknown;
+  runtimeContext?: Record<string, unknown>;
+}>(params: T): T {
+  if (!params.sessionFile || params.sessionTarget || params.runtimeContext?.sessionTarget) {
+    return params;
+  }
+  return {
+    ...params,
+    runtimeContext: {
+      ...params.runtimeContext,
+      transcriptStorage: { kind: "sqlite" },
+      sessionTarget: {
+        agentId: "main",
+        sessionId: params.sessionId,
+        sessionKey: params.sessionKey ?? params.sessionId,
+        storePath: params.sessionFile,
+      },
+    },
+  };
+}
+
+async function readVisibleSessionTranscriptMessageEntriesFromTestJsonl(
+  target: { storePath?: string },
+): Promise<VisibleSessionTranscriptMessageEntry[]> {
+  if (!target.storePath) {
+    return [];
+  }
+  const leafPath = await readLeafPathRawEntries(target.storePath);
+  const entries: VisibleSessionTranscriptMessageEntry[] = [];
+  let seq = 0;
+  for (const raw of leafPath.entries) {
+    const message = extractBootstrapMessageCandidate(raw);
+    if (!message) {
+      continue;
+    }
+    const meta = getTranscriptEntryMeta(message);
+    seq += 1;
+    entries.push({
+      entryId: meta?.entryId ?? `test-jsonl-entry-${seq}`,
+      parentId: meta?.parentId ?? null,
+      seq,
+      role: message.role,
+      message,
+      ...(meta?.timestamp ? { createdAt: meta.timestamp } : {}),
+    });
+  }
+  return entries;
+}
+
+export class TestLcmContextEngine extends LcmContextEngine {
+  override async bootstrap(
+    params: Parameters<LcmContextEngine["bootstrap"]>[0],
+  ): ReturnType<LcmContextEngine["bootstrap"]> {
+    return super.bootstrap(withTestTranscriptProjectionTarget(params));
+  }
+
+  override async afterTurn(
+    params: Parameters<LcmContextEngine["afterTurn"]>[0],
+  ): ReturnType<LcmContextEngine["afterTurn"]> {
+    return super.afterTurn(withTestTranscriptProjectionTarget(params));
+  }
+}
+
 export function createTestDeps(
   config: LcmConfig,
   overrides?: Partial<LcmDependencies>,
@@ -150,6 +218,7 @@ export function createTestDeps(
     resolveAgentDir: () => process.env.HOME ?? tmpdir(),
     resolveSessionIdFromSessionKey: async () => undefined,
     resolveSessionTranscriptFile: async () => undefined,
+    readVisibleSessionTranscriptMessageEntries: readVisibleSessionTranscriptMessageEntriesFromTestJsonl,
     agentLaneSubagent: "subagent",
     log: {
       info: vi.fn(),
@@ -166,7 +235,7 @@ export function createEngine(): LcmContextEngine {
   tempDirs.push(tempDir);
   const config = createTestConfig(join(tempDir, "lcm.db"));
   const db = createLcmDatabaseConnection(config.databasePath);
-  return new LcmContextEngine(createTestDeps(config), db);
+  return new TestLcmContextEngine(createTestDeps(config), db);
 }
 
 export function createEngineWithDepsOverrides(overrides: Partial<LcmDependencies>): LcmContextEngine {
@@ -174,7 +243,7 @@ export function createEngineWithDepsOverrides(overrides: Partial<LcmDependencies
   tempDirs.push(tempDir);
   const config = createTestConfig(join(tempDir, "lcm.db"));
   const db = createLcmDatabaseConnection(config.databasePath);
-  return new LcmContextEngine(
+  return new TestLcmContextEngine(
     {
       ...createTestDeps(config),
       ...overrides,
@@ -191,7 +260,7 @@ export function createEngineWithDepsOverridesAndDb(
   const config = createTestConfig(join(tempDir, "lcm.db"));
   const db = createLcmDatabaseConnection(config.databasePath);
   return {
-    engine: new LcmContextEngine(
+    engine: new TestLcmContextEngine(
       {
         ...createTestDeps(config),
         ...overrides,
@@ -205,7 +274,7 @@ export function createEngineWithDepsOverridesAndDb(
 export function createEngineAtDatabasePath(databasePath: string): LcmContextEngine {
   const config = createTestConfig(databasePath);
   const db = createLcmDatabaseConnection(config.databasePath);
-  return new LcmContextEngine(createTestDeps(config), db);
+  return new TestLcmContextEngine(createTestDeps(config), db);
 }
 
 export function createSessionFilePath(name: string): string {
@@ -250,7 +319,7 @@ export function createEngineWithConfig(overrides: Partial<LcmConfig>): LcmContex
     ...overrides,
   };
   const db = createLcmDatabaseConnection(config.databasePath);
-  return new LcmContextEngine(createTestDeps(config), db);
+  return new TestLcmContextEngine(createTestDeps(config), db);
 }
 
 export function createEngineWithDeps(
@@ -264,7 +333,7 @@ export function createEngineWithDeps(
     ...configOverrides,
   };
   const db = createLcmDatabaseConnection(config.databasePath);
-  return new LcmContextEngine(createTestDeps(config, depOverrides), db);
+  return new TestLcmContextEngine(createTestDeps(config, depOverrides), db);
 }
 
 export async function withTempHome<T>(run: (homeDir: string) => Promise<T>): Promise<T> {
