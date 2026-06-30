@@ -147,6 +147,8 @@ class MemorySupplementContextEngine implements ContextEngine {
   readonly prepareSubagentSpawn: ContextEngine["prepareSubagentSpawn"];
   readonly onSubagentEnded: ContextEngine["onSubagentEnded"];
   readonly maintain: ContextEngine["maintain"];
+  readonly getControlCapabilities: ContextEngine["getControlCapabilities"];
+  readonly control: ContextEngine["control"];
   readonly dispose: ContextEngine["dispose"];
 
   constructor(private readonly inner: ContextEngine) {
@@ -155,6 +157,8 @@ class MemorySupplementContextEngine implements ContextEngine {
     const prepareSubagentSpawn = inner.prepareSubagentSpawn?.bind(inner);
     const onSubagentEnded = inner.onSubagentEnded?.bind(inner);
     const maintain = inner.maintain?.bind(inner);
+    const getControlCapabilities = inner.getControlCapabilities?.bind(inner);
+    const control = inner.control?.bind(inner);
     const dispose = inner.dispose?.bind(inner);
     this.info = inner.info;
     this.ingestBatch = ingestBatch ? (params) => ingestBatch(params) : undefined;
@@ -164,6 +168,10 @@ class MemorySupplementContextEngine implements ContextEngine {
       : undefined;
     this.onSubagentEnded = onSubagentEnded ? (params) => onSubagentEnded(params) : undefined;
     this.maintain = maintain ? (params) => maintain(params) : undefined;
+    this.getControlCapabilities = getControlCapabilities
+      ? () => getControlCapabilities()
+      : undefined;
+    this.control = control ? (params) => control(params) : undefined;
     this.dispose = dispose ? () => dispose() : undefined;
   }
 
@@ -1494,7 +1502,7 @@ function createLcmDependencies(
         return undefined;
       }
     },
-    resolveSessionTranscriptFile: async ({ sessionId, sessionKey }) => {
+    resolveSessionTranscriptFile: async ({ agentId: requestedAgentId, sessionId, sessionKey }) => {
       const normalizedSessionId = sessionId.trim();
       if (!normalizedSessionId) {
         return undefined;
@@ -1509,7 +1517,7 @@ function createLcmDependencies(
         const sessionConfig = isRecord(cfg) && isRecord(cfg.session) ? cfg.session : undefined;
         const normalizedSessionKey = sessionKey?.trim();
         const parsed = normalizedSessionKey ? parseAgentSessionKey(normalizedSessionKey) : null;
-        const agentId = normalizeAgentId(parsed?.agentId);
+        const agentId = normalizeAgentId(requestedAgentId ?? parsed?.agentId);
         const storePath = sessionApi.resolveStorePath(getStringField(sessionConfig, "store"), {
           agentId,
         });

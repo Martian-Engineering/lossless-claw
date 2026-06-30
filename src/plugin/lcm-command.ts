@@ -10,6 +10,9 @@ import type { LcmSummarizeFn } from "../summarize.js";
 import type { LcmDependencies } from "../types.js";
 import type {
   CompactResult,
+  ContextEngineControlCapabilities,
+  ContextEngineControlOperation,
+  ContextEngineControlResult,
   OpenClawPluginCommandDefinition,
   PluginCommandContext,
 } from "../openclaw-bridge.js";
@@ -135,6 +138,28 @@ type FocusCompactionCommandEngine = {
 };
 
 type RuntimeCommandEngine = RotateCommandEngine & Partial<FocusCompactionCommandEngine>;
+
+export class LcmProgrammaticControlUnavailableError extends Error {
+  constructor(
+    readonly operation: ContextEngineControlOperation,
+    readonly reasonCode: string,
+    message = "Lossless Claw control operation is unavailable.",
+  ) {
+    super(message);
+    this.name = "LcmProgrammaticControlUnavailableError";
+  }
+}
+
+export class LcmProgrammaticControlFailedError extends Error {
+  constructor(
+    readonly operation: ContextEngineControlOperation,
+    readonly reasonCode: string,
+    message = "Lossless Claw control operation failed.",
+  ) {
+    super(message);
+    this.name = "LcmProgrammaticControlFailedError";
+  }
+}
 
 const DOCTOR_CLEANER_IDS = new Set<DoctorCleanerId>(getDoctorCleanerFilterIds());
 
@@ -1757,6 +1782,7 @@ async function buildRotateText(params: {
   }
 
   const transcriptPath = await params.deps.resolveSessionTranscriptFile({
+    agentId: normalizeIdentity(params.ctx.agentId),
     sessionId,
     sessionKey,
   });
@@ -1883,6 +1909,186 @@ async function buildRotateText(params: {
     ]),
   );
   return lines.join("\n");
+}
+
+export function getLcmProgrammaticControlCapabilities(params?: {
+  deps?: LcmDependencies;
+  getLcm?: () => Promise<RuntimeCommandEngine>;
+}): ContextEngineControlCapabilities {
+  return {
+    status: true,
+    doctor: true,
+    rotate: Boolean(params?.deps && params.getLcm),
+  };
+}
+
+function buildProgrammaticDoctorWarnings(stats: DoctorSummaryStats): string[] {
+  const warnings: string[] = [];
+  if (stats.total > 0) {
+    warnings.push(`${stats.total} summary issue(s) detected`);
+  }
+  if (stats.old > 0) {
+    warnings.push(`${stats.old} old-marker summary issue(s) detected`);
+  }
+  if (stats.truncated > 0) {
+    warnings.push(`${stats.truncated} truncated-marker summary issue(s) detected`);
+  }
+  if (stats.fallback > 0) {
+    warnings.push(`${stats.fallback} fallback-marker summary issue(s) detected`);
+  }
+  if (stats.emergency > 0) {
+    warnings.push(`${stats.emergency} emergency-fallback summary issue(s) detected`);
+  }
+  return warnings.slice(0, 10);
+}
+
+function throwControlUnavailable(
+  operation: ContextEngineControlOperation,
+  reasonCode: string,
+): never {
+  throw new LcmProgrammaticControlUnavailableError(operation, reasonCode);
+}
+
+const programmaticRotateTimestampByConversationId = new Map<number, string>();
+
+function classifyProgrammaticRotateUnavailableReason(reason: string | undefined): string {
+  const normalized = (reason ?? "").toLowerCase();
+  if (normalized.includes("transcript")) {
+    return "transcript_unavailable";
+  }
+  if (normalized.includes("backup")) {
+    return "backup_unavailable";
+  }
+  if (normalized.includes("transaction") || normalized.includes("database")) {
+    return "database_unavailable";
+  }
+  if (
+    normalized.includes("summar") ||
+    normalized.includes("provider") ||
+    normalized.includes("raw context") ||
+    normalized.includes("circuit breaker")
+  ) {
+    return "summarization_unavailable";
+  }
+  if (normalized.includes("active lossless claw conversation")) {
+    return "conversation_unavailable";
+  }
+  return "unavailable";
+}
+
+export async function runLcmProgrammaticControl(params: {
+  operation: ContextEngineControlOperation;
+  ctx: PluginCommandContext;
+  db: DatabaseSync;
+  config: LcmConfig;
+  deps?: LcmDependencies;
+  getLcm?: () => Promise<RuntimeCommandEngine>;
+}): Promise<ContextEngineControlResult> {
+  const current = await resolveCurrentConversation({
+    ctx: params.ctx,
+    db: params.db,
+  });
+
+  if (params.operation === "status") {
+    const conversationId = current.kind === "resolved" ? current.stats.conversationId : undefined;
+    return {
+      operation: "status",
+      active: current.kind === "resolved",
+      messageCount: current.kind === "resolved" ? current.stats.messageCount : 0,
+      lastRotatedAt: conversationId !== undefined
+        ? programmaticRotateTimestampByConversationId.get(conversationId) ?? null
+        : null,
+    };
+  }
+
+  if (params.operation === "doctor") {
+    if (current.kind === "unavailable") {
+      return {
+        operation: "doctor",
+        ok: false,
+        warnings: ["current conversation unavailable"],
+      };
+    }
+
+    const stats = getDoctorSummaryStats(params.db, current.stats.conversationId);
+    const warnings = buildProgrammaticDoctorWarnings(stats);
+    return {
+      operation: "doctor",
+      ok: warnings.length === 0,
+      warnings,
+    };
+  }
+
+  const sessionKey = normalizeIdentity(params.ctx.sessionKey);
+  if (!sessionKey) {
+    throwControlUnavailable("rotate", "session_key_unavailable");
+  }
+  if (current.kind === "unavailable") {
+    throwControlUnavailable("rotate", "conversation_unavailable");
+  }
+  if (!params.deps || !params.getLcm) {
+    throwControlUnavailable("rotate", "runtime_unavailable");
+  }
+
+  const sessionId = await resolveRuntimeSessionId({
+    ctx: params.ctx,
+    deps: params.deps,
+    current,
+  });
+  if (!sessionId) {
+    throwControlUnavailable("rotate", "session_id_unavailable");
+  }
+
+  const transcriptPath = await params.deps.resolveSessionTranscriptFile({
+    agentId: normalizeIdentity(params.ctx.agentId),
+    sessionId,
+    sessionKey,
+  });
+  if (!transcriptPath || !existsSync(transcriptPath)) {
+    throwControlUnavailable("rotate", "transcript_unavailable");
+  }
+
+  if (getLcmBackupUnavailableReason(params.config.databasePath)) {
+    throwControlUnavailable("rotate", "backup_unavailable");
+  }
+
+  let result: RotateSessionStorageWithBackupResult;
+  try {
+    const runtimeContext = readCommandRuntimeContext(params.ctx);
+    result = await (await params.getLcm()).rotateSessionStorageWithBackup({
+      sessionId,
+      sessionKey,
+      sessionFile: transcriptPath,
+      lockTimeoutMs: ROTATE_DATABASE_LOCK_TIMEOUT_MS,
+      ...(runtimeContext ? { runtimeContext } : {}),
+    });
+  } catch {
+    throw new LcmProgrammaticControlFailedError("rotate", "runtime_exception");
+  }
+
+  if (result.kind !== "rotated") {
+    throw new LcmProgrammaticControlUnavailableError(
+      "rotate",
+      result.kind === "unavailable"
+        ? classifyProgrammaticRotateUnavailableReason(result.reason)
+        : result.kind,
+    );
+  }
+
+  const rotatedAt = new Date().toISOString();
+  programmaticRotateTimestampByConversationId.set(current.stats.conversationId, rotatedAt);
+  const refreshed = await resolveCurrentConversation({
+    ctx: params.ctx,
+    db: params.db,
+  });
+
+  return {
+    operation: "rotate",
+    messageCount: refreshed.kind === "resolved"
+      ? refreshed.stats.messageCount
+      : result.currentMessageCount ?? current.stats.messageCount,
+    lastRotatedAt: rotatedAt,
+  };
 }
 
 function formatFocusPreview(content: string, maxChars = 1200): string {

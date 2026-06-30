@@ -103,6 +103,46 @@ export type ContextEngineInfo = {
 
 export type ContextEngineOperation = "agent-run" | "manual-compact" | "subagent-spawn";
 
+export type ContextEngineControlOperation = "status" | "doctor" | "rotate";
+
+export type ContextEngineControlCapabilities = {
+  status: boolean;
+  doctor: boolean;
+  rotate: boolean;
+};
+
+export type ContextEngineControlStatusResult = {
+  operation: "status";
+  active: boolean;
+  messageCount: number;
+  lastRotatedAt: string | null;
+};
+
+export type ContextEngineControlDoctorResult = {
+  operation: "doctor";
+  ok: boolean;
+  warnings: string[];
+};
+
+export type ContextEngineControlRotateResult = {
+  operation: "rotate";
+  messageCount: number;
+  lastRotatedAt: string;
+};
+
+export type ContextEngineControlResult =
+  | ContextEngineControlStatusResult
+  | ContextEngineControlDoctorResult
+  | ContextEngineControlRotateResult;
+
+export type ContextEngineControlRequest = {
+  agentId?: string;
+  operation: ContextEngineControlOperation;
+  sessionId?: string;
+  sessionKey?: string;
+  runtimeContext?: Record<string, unknown>;
+};
+
 export type ContextEngineHostCapability =
   | "bootstrap"
   | "assemble-before-prompt"
@@ -213,6 +253,8 @@ export type ContextEngine = {
     legacyParams?: Record<string, unknown>;
     force?: boolean;
   }): Promise<CompactResult>;
+  getControlCapabilities?(): ContextEngineControlCapabilities | Promise<ContextEngineControlCapabilities>;
+  control?(params: ContextEngineControlRequest): Promise<ContextEngineControlResult>;
   prepareSubagentSpawn?(params: {
     parentSessionId?: string;
     parentSessionKey?: string;
