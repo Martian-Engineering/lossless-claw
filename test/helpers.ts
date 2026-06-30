@@ -151,7 +151,6 @@ export function createTestDeps(
       return undefined;
     },
     resolveAgentDir: () => process.env.HOME ?? tmpdir(),
-    resolveSessionIdFromSessionKey: async () => undefined,
     readVisibleSessionTranscriptMessageEntries: undefined,
     agentLaneSubagent: "subagent",
     log: {

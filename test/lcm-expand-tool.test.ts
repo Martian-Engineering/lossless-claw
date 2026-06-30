@@ -64,7 +64,6 @@ function makeDeps(overrides?: Partial<LcmDependencies>): LcmDependencies {
     buildSubagentSystemPrompt: () => "subagent prompt",
     readLatestAssistantReply: () => undefined,
     resolveAgentDir: () => "/tmp/openclaw-agent",
-    resolveSessionIdFromSessionKey: async () => undefined,
     agentLaneSubagent: "subagent",
     log: {
       info: vi.fn(),

@@ -735,7 +735,6 @@ export function createLcmExpandQueryTool(input: {
           callerSessionKey
         ) {
           scopedConversationId = await resolveRequesterConversationScopeId({
-            deps: input.deps,
             requesterSessionKey: callerSessionKey,
             lcm,
           });
