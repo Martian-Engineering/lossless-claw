@@ -613,7 +613,7 @@ describe("LcmContextEngine.bootstrap sqlite transcript projection", () => {
     expect(messages.at(-1)?.content).toBe("tail 49");
   });
 
-  it("fails closed instead of appending a no-overlap bootstrap projection to an existing conversation", async () => {
+  it("starts a fresh conversation for a no-overlap bootstrap projection after reset", async () => {
     const sessionId = "sqlite-bootstrap-no-overlap-session";
     const sessionKey = "agent:main:sqlite-bootstrap-no-overlap-session";
     let visibleEntries: VisibleSessionTranscriptMessageEntry[] = [
@@ -627,7 +627,7 @@ describe("LcmContextEngine.bootstrap sqlite transcript projection", () => {
       },
     ];
     const readVisibleSessionTranscriptMessageEntries = vi.fn(async () => visibleEntries);
-    const { engine } = createEngineWithDepsOverridesAndDb({
+    const { engine, db } = createEngineWithDepsOverridesAndDb({
       readVisibleSessionTranscriptMessageEntries,
     } satisfies Partial<LcmDependencies>);
 
@@ -673,9 +673,9 @@ describe("LcmContextEngine.bootstrap sqlite transcript projection", () => {
         },
       }),
     ).resolves.toMatchObject({
-      bootstrapped: false,
-      importedMessages: 0,
-      reason: "reconcile projection has no overlap",
+      bootstrapped: true,
+      importedMessages: 1,
+      reason: "fresh sqlite transcript projection",
     });
 
     const conversation = await engine.getConversationStore().getConversationForSession({
@@ -684,7 +684,14 @@ describe("LcmContextEngine.bootstrap sqlite transcript projection", () => {
     });
     expect(conversation).not.toBeNull();
     const messages = await engine.getConversationStore().getMessages(conversation!.conversationId);
-    expect(messages.map((message) => message.content)).toEqual(["original user"]);
+    expect(messages.map((message) => message.content)).toEqual(["unrelated user"]);
+    const rows = db
+      .prepare(
+        `SELECT conversation_id, active FROM conversations WHERE session_key = ? ORDER BY conversation_id`,
+      )
+      .all(sessionKey) as Array<{ conversation_id: number; active: number }>;
+    expect(rows).toHaveLength(2);
+    expect(rows.map((row) => row.active)).toEqual([0, 1]);
   });
 
   it("fails closed instead of persisting afterTurn when an existing projection has no overlap", async () => {
