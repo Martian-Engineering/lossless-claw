@@ -969,6 +969,7 @@ export class LcmContextEngine implements ContextEngine {
         condensedMinSourceTokens: this.config.condensedTargetTokens,
         condensedChunkTokens: this.config.leafChunkTokens,
         leaseMs: this.config.summaryTimeoutMs,
+        stripInjectedContextTags: this.config.stripInjectedContextTags,
       },
     });
 
@@ -1020,7 +1021,7 @@ export class LcmContextEngine implements ContextEngine {
             legacyParams: params.legacyParams,
             customInstructions: params.customInstructions,
             compactionTarget: params.compactionTarget ?? "threshold",
-            force: params.force ?? true,
+            force: params.force === true,
           });
           if (params.sessionQueueHeld === true) {
             return runLegacyCompaction();
