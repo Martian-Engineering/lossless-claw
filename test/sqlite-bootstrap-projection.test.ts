@@ -224,6 +224,99 @@ describe("LcmContextEngine.bootstrap sqlite transcript projection", () => {
     expect(readVisibleSessionTranscriptMessageEntries).toHaveBeenCalledTimes(2);
   });
 
+  it("does not append missing projected entries that precede the overlap anchor", async () => {
+    const sessionId = "sqlite-bootstrap-anchor-prefix-session";
+    const sessionKey = "agent:main:sqlite-bootstrap-anchor-prefix-session";
+    let visibleEntries: VisibleSessionTranscriptMessageEntry[] = [
+      {
+        entryId: "entry-anchor",
+        parentId: "entry-prefix",
+        seq: 2,
+        role: "assistant",
+        message: { role: "assistant", content: "already imported suffix" } satisfies AgentMessage,
+        createdAt: "2026-06-29T12:20:01.000Z",
+      },
+    ];
+    const readVisibleSessionTranscriptMessageEntries = vi.fn(async () => visibleEntries);
+    const { engine } = createEngineWithDepsOverridesAndDb({
+      readVisibleSessionTranscriptMessageEntries,
+    } satisfies Partial<LcmDependencies>);
+
+    await expect(
+      engine.bootstrap({
+        sessionId,
+        sessionKey,
+        runtimeContext: {
+          transcriptStorage: { kind: "sqlite" },
+          sessionTarget: {
+            agentId: "main",
+            sessionId,
+            sessionKey,
+            storePath: "/tmp/openclaw-agent.sqlite",
+          },
+        },
+      }),
+    ).resolves.toMatchObject({ bootstrapped: true, importedMessages: 1 });
+
+    visibleEntries = [
+      {
+        entryId: "entry-prefix",
+        parentId: null,
+        seq: 1,
+        role: "user",
+        message: { role: "user", content: "trimmed older prefix" } satisfies AgentMessage,
+        createdAt: "2026-06-29T12:20:00.000Z",
+      },
+      {
+        entryId: "entry-anchor",
+        parentId: "entry-prefix",
+        seq: 2,
+        role: "assistant",
+        message: { role: "assistant", content: "already imported suffix" } satisfies AgentMessage,
+        createdAt: "2026-06-29T12:20:01.000Z",
+      },
+      {
+        entryId: "entry-tail",
+        parentId: "entry-anchor",
+        seq: 3,
+        role: "user",
+        message: { role: "user", content: "new tail" } satisfies AgentMessage,
+        createdAt: "2026-06-29T12:20:02.000Z",
+      },
+    ];
+
+    await expect(
+      engine.bootstrap({
+        sessionId,
+        sessionKey,
+        runtimeContext: {
+          transcriptStorage: { kind: "sqlite" },
+          sessionTarget: {
+            agentId: "main",
+            sessionId,
+            sessionKey,
+            storePath: "/tmp/openclaw-agent.sqlite",
+          },
+        },
+      }),
+    ).resolves.toMatchObject({
+      bootstrapped: true,
+      importedMessages: 1,
+      reason: "reconciled missing session messages",
+    });
+
+    const conversation = await engine.getConversationStore().getConversationForSession({
+      sessionId,
+      sessionKey,
+    });
+    expect(conversation).not.toBeNull();
+    const messages = await engine.getConversationStore().getMessages(conversation!.conversationId);
+    expect(messages.map((message) => message.content)).toEqual([
+      "already imported suffix",
+      "new tail",
+    ]);
+  });
+
   it("fails closed instead of appending a no-overlap bootstrap projection to an existing conversation", async () => {
     const sessionId = "sqlite-bootstrap-no-overlap-session";
     const sessionKey = "agent:main:sqlite-bootstrap-no-overlap-session";
