@@ -157,6 +157,8 @@ describe("LcmContextEngine afterTurn", () => {
         condensedMinFanout: 2,
         condensedTargetTokens: 1,
         maxSweepIterations: 8,
+        summaryProvider: "anthropic",
+        summaryModel: "claude-opus-4-5",
       },
       { complete },
     );
