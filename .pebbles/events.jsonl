@@ -47,3 +47,6 @@
 {"type":"create","timestamp":"2026-06-30T21:48:13.69636Z","issue_id":"lc-fbe","payload":{"description":"Background deferred compaction drains should not immediately reschedule while a maintenance row is still in nextAttemptAfter backoff; current 952 logs show tight repeated backoff/done lines for conversation 4849.","priority":"2","title":"Fix deferred compaction backoff drain loop","type":"task"}}
 {"type":"status_update","timestamp":"2026-06-30T21:53:27.58735Z","issue_id":"lc-fbe","payload":{"status":"in_progress"}}
 {"type":"close","timestamp":"2026-06-30T21:57:18.581895Z","issue_id":"lc-fbe","payload":{}}
+{"type":"create","timestamp":"2026-06-30T22:06:43.378333Z","issue_id":"lc-512","payload":{"description":"The provider-fallback maintenance test still expects legacy compacted-but-over-target retry debt, but PR 952 pending summaries can fully publish within the step cap and should clear maintenance instead.","priority":"2","title":"Align maintenance test with pending publish result","type":"task"}}
+{"type":"status_update","timestamp":"2026-06-30T22:06:47.967294Z","issue_id":"lc-512","payload":{"status":"in_progress"}}
+{"type":"close","timestamp":"2026-06-30T22:08:08.149637Z","issue_id":"lc-512","payload":{}}
