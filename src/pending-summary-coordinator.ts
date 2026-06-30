@@ -1,5 +1,9 @@
 import { createHash, randomUUID } from "node:crypto";
-import { stripInjectedContextBlocks } from "./compaction.js";
+import {
+  extractMeaningfulMessageText,
+  resolveLeafSummaryMessageContent,
+  stripInjectedContextBlocks,
+} from "./compaction.js";
 import { estimateTokens } from "./estimate-tokens.js";
 import {
   planPendingCondensedNodes,
@@ -96,11 +100,18 @@ function normalizeNonNegativeInteger(value: number | undefined): number {
   return 0;
 }
 
-function formatMessageForSummary(message: MessageRecord, stripInjectedContextTags?: string[]): string {
-  const content = stripInjectedContextBlocks(
-    message.content,
-    stripInjectedContextTags,
+async function formatMessageForSummary(
+  store: Pick<ConversationStore, "getMessageParts">,
+  message: MessageRecord,
+  stripInjectedContextTags?: string[],
+): Promise<string> {
+  const resolved = await resolveLeafSummaryMessageContent(store, message);
+  const content = extractMeaningfulMessageText(
+    stripInjectedContextBlocks(resolved, stripInjectedContextTags),
   ).trim();
+  if (!content) {
+    return "";
+  }
   return [`[${message.createdAt.toISOString()}]`, content].join("\n").trim();
 }
 
@@ -507,7 +518,13 @@ export class PendingCompactionCoordinator {
       for (const link of messageLinks) {
         const message = await this.conversationStore.getMessageById(link.messageId);
         if (message) {
-          chunks.push(formatMessageForSummary(message, this.config.stripInjectedContextTags));
+          chunks.push(
+            await formatMessageForSummary(
+              this.conversationStore,
+              message,
+              this.config.stripInjectedContextTags,
+            ),
+          );
         }
       }
       return chunks.filter(Boolean).join("\n\n");
