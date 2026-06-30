@@ -45,10 +45,14 @@ describe("PendingSummaryPreparationWorker", () => {
         return createNode();
       },
       async markNodeReady(input) {
-        events.push(`ready:${input.nodeId}:${input.content}:${input.tokenCount}`);
+        events.push(
+          `ready:${input.nodeId}:${input.leaseOwner}:${input.content}:${input.tokenCount}`,
+        );
+        return true;
       },
       async markNodeFailed(input) {
-        events.push(`failed:${input.nodeId}:${input.failureSummary}`);
+        events.push(`failed:${input.nodeId}:${input.leaseOwner}:${input.failureSummary}`);
+        return true;
       },
     };
     const worker = new PendingSummaryPreparationWorker({
@@ -77,7 +81,7 @@ describe("PendingSummaryPreparationWorker", () => {
       "claim:end",
       "load:node_worker_a",
       "summarize:node_worker_a:source text",
-      "ready:node_worker_a:prepared summary:2",
+      "ready:node_worker_a:worker-a:prepared summary:2",
     ]);
   });
 
@@ -89,9 +93,11 @@ describe("PendingSummaryPreparationWorker", () => {
       },
       async markNodeReady(input) {
         events.push(`ready:${input.nodeId}`);
+        return true;
       },
       async markNodeFailed(input) {
-        events.push(`failed:${input.nodeId}:${input.failureSummary}`);
+        events.push(`failed:${input.nodeId}:${input.leaseOwner}:${input.failureSummary}`);
+        return true;
       },
     };
     const worker = new PendingSummaryPreparationWorker({
@@ -111,6 +117,37 @@ describe("PendingSummaryPreparationWorker", () => {
       nodeId: "node_worker_a",
       failureSummary: "provider timeout",
     });
-    expect(events).toEqual(["failed:node_worker_a:provider timeout"]);
+    expect(events).toEqual(["failed:node_worker_a:worker-a:provider timeout"]);
+  });
+
+  it("treats a lost lease during ready save as obsolete work", async () => {
+    const events: string[] = [];
+    const store: PendingSummaryPreparationStore = {
+      async claimNextPlannedNode() {
+        return createNode();
+      },
+      async markNodeReady(input) {
+        events.push(`ready:${input.nodeId}:${input.leaseOwner}`);
+        return false;
+      },
+      async markNodeFailed(input) {
+        events.push(`failed:${input.nodeId}:${input.leaseOwner}`);
+        return true;
+      },
+    };
+    const worker = new PendingSummaryPreparationWorker({
+      store,
+      leaseOwner: "worker-a",
+      leaseMs: 60_000,
+      now: () => new Date("2026-06-30T12:00:00.000Z"),
+      loadSourceText: async () => "source text",
+      summarize: async () => "prepared summary",
+      estimateTokens: () => 2,
+    });
+
+    await expect(worker.prepareOne({ conversationId: 42 })).resolves.toEqual({
+      status: "idle",
+    });
+    expect(events).toEqual(["ready:node_worker_a:worker-a"]);
   });
 });
