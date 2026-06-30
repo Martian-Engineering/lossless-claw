@@ -257,7 +257,7 @@ describe("/new soft-reset carry-forward via archive-sibling probe", () => {
     expect(log.info).toHaveBeenCalledWith(
       expect.stringContaining("tracked transcript archived (reset/deleted sibling present)"),
     );
-    expect(log.warn).toHaveBeenCalledWith(
+    expect(log.info).toHaveBeenCalledWith(
       expect.stringContaining("resolved by fresh-transcript rebind"),
     );
     expect(log.warn).not.toHaveBeenCalledWith(
@@ -340,8 +340,13 @@ describe("/new soft-reset carry-forward via archive-sibling probe", () => {
     );
     expect(result.bootstrapped).toBe(false);
     expect(result.reason).toBe("ambiguous session-key runtime rollover");
-    expect(log.warn).not.toHaveBeenCalledWith(
+    expect(log.info).not.toHaveBeenCalledWith(
       expect.stringContaining("resolved by fresh-transcript rebind"),
+    );
+    // A foreign reused-key transcript is a genuine conflict (identity overlap),
+    // so the preserve stays at WARN even though a sibling is present.
+    expect(log.warn).toHaveBeenCalledWith(
+      expect.stringContaining("ambiguous session-key runtime rollover; preserving"),
     );
     expect(log.warn).not.toHaveBeenCalledWith(
       expect.stringContaining("detected reset/rollover without prior lifecycle split"),
@@ -374,7 +379,7 @@ describe("/new soft-reset carry-forward via archive-sibling probe", () => {
     expect(log.info).toHaveBeenCalledWith(
       expect.stringContaining("tracked transcript archived (reset/deleted sibling present)"),
     );
-    expect(log.warn).toHaveBeenCalledWith(
+    expect(log.info).toHaveBeenCalledWith(
       expect.stringContaining("resolved by fresh-transcript rebind"),
     );
     expect(log.warn).not.toHaveBeenCalledWith(
@@ -385,5 +390,72 @@ describe("/new soft-reset carry-forward via archive-sibling probe", () => {
     expect(rebound?.sessionId).toBe(NEW_SESSION_ID);
     const carried = await engine.getSummaryStore().getContextItems(lane.conversationId);
     expect(carried.map((item) => item.summaryId)).toContain("sum_d2");
+  });
+
+  it("a legit single /new is silent: bootstrap preserves at debug while unjudgeable, afterTurn rebinds once the turn lands", async () => {
+    // Drives the REAL afterTurn path (no hand-set signals): the new session file
+    // is EMPTY at bootstrap (no usable timestamps -> transient preserve at debug)
+    // and CONTENT-bearing by afterTurn (the completed turn lands -> judgeable ->
+    // rebind). This is the live conv-56 /new shape; net result is 0 warns.
+    const { engine, log, db } = createEngine({ newSessionRetainDepth: 2 });
+    const lane = await seedSummaryBearingLane(engine, db);
+    await engine.handleBeforeReset({ reason: "new", sessionId: OLD_SESSION_ID, sessionKey: SESSION_KEY });
+    archiveTrackedFile(lane.trackedFile, "reset");
+
+    const newDir = mkdtempSync(join(tmpdir(), "lossless-claw-sibling-grow-"));
+    tempDirs.push(newDir);
+    const newFile = join(newDir, `${NEW_SESSION_ID}.jsonl`);
+
+    // turn-START: file exists but has no usable content yet.
+    writeFileSync(newFile, "");
+    await engine.bootstrap({ sessionId: NEW_SESSION_ID, sessionKey: SESSION_KEY, sessionFile: newFile });
+
+    expect(log.debug).toHaveBeenCalledWith(
+      expect.stringContaining("bootstrap: ambiguous session-key runtime rollover; preserving"),
+    );
+    expect(log.warn).not.toHaveBeenCalledWith(
+      expect.stringContaining("ambiguous session-key runtime rollover; preserving"),
+    );
+
+    // turn-END: the real fresh, postdating, non-overlapping turn lands in the file.
+    const future = Date.now() + 60_000;
+    let parentId: string | null = null;
+    const grown = [
+      { role: "user", text: "brand new post-/new question about something else", ts: future },
+      { role: "assistant", text: "fresh answer after the soft reset", ts: future + 1 },
+    ]
+      .map((e, i) => {
+        const id = `grow-${i}`;
+        const line = JSON.stringify({
+          type: "message",
+          id,
+          parentId,
+          timestamp: new Date(e.ts).toISOString(),
+          message: { role: e.role, content: [{ type: "text", text: e.text }], timestamp: e.ts },
+        });
+        parentId = id;
+        return line;
+      })
+      .join("\n");
+    writeFileSync(newFile, `${grown}\n`);
+    await engine.afterTurn({
+      sessionId: NEW_SESSION_ID,
+      sessionKey: SESSION_KEY,
+      sessionFile: newFile,
+      messages: [makeMessage("user", "brand new post-/new question about something else", future)],
+      prePromptMessageCount: 0,
+      tokenBudget: 10_000,
+    });
+
+    // afterTurn now has judgeable evidence -> rebinds in place (no "preserving").
+    expect(log.info).toHaveBeenCalledWith(
+      expect.stringContaining("afterTurn: ambiguous rollover resolved by fresh-transcript rebind"),
+    );
+    expect(log.warn).not.toHaveBeenCalledWith(
+      expect.stringContaining("ambiguous session-key runtime rollover; preserving"),
+    );
+    const rebound = await engine.getConversationStore().getConversationBySessionKey(SESSION_KEY);
+    expect(rebound?.conversationId).toBe(lane.conversationId);
+    expect(rebound?.sessionId).toBe(NEW_SESSION_ID);
   });
 });
