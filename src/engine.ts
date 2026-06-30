@@ -1,5 +1,4 @@
 import { createHash } from "node:crypto";
-import { open, stat } from "node:fs/promises";
 import { join } from "node:path";
 import type { DatabaseSync } from "node:sqlite";
 import type {
@@ -62,18 +61,16 @@ import {
   FALLBACK_DIRECTIVE_SUMMARY_MARKER,
   MIN_FALLBACK_MAX_TOKENS,
 } from "./summary-fallback.js";
-import { attachTranscriptEntryMeta, getTranscriptEntryId, readAppendedLeafPathMessages, readLastJsonlEntryBeforeOffset, readLeafPathMessages, readSessionParentSessionReference, resolveTranscriptMessageCreatedAt } from "./transcript.js";
+import { attachTranscriptEntryMeta, getTranscriptEntryId, resolveTranscriptMessageCreatedAt } from "./transcript.js";
 import { type TranscriptReconcileResult } from "./reconcile-plan.js";
-import { checkpointIsPastTranscriptEof, TranscriptReconciler } from "./transcript-reconciler.js";
-import { AMBIGUOUS_SESSION_KEY_RUNTIME_ROLLOVER_REASON, SessionRolloverDetector } from "./session-rollover.js";
+import { TranscriptReconciler } from "./transcript-reconciler.js";
+import { SessionRolloverDetector } from "./session-rollover.js";
 import { describeAssembledPrefixChange, formatOverflowDiagnosticsForLog, shouldLogOverflowDiagnostics, type AssemblePrefixSnapshot, type BootstrapImportObservation } from "./assemble-debug.js";
 import { appendForkBoundedLiveSuffixWithinBudget, buildDegradedLiveAssembleResult, buildForkBoundedLiveFallback, clampMessagesToSerializedBudget, resolveDeferredAssemblyPressure } from "./assemble-fallback.js";
 import { resolveBootstrapMaxTokens, trimBootstrapMessagesToBudget } from "./bootstrap-budget.js";
 import { batchLooksLikeHeartbeatAckTurn, pruneHeartbeatOkTurns } from "./heartbeat-filter.js";
 import { appendUncoveredVolatileLiveInputsWithinBudget, isVolatileLiveInputMessage, messageContentCoveredBySummary, resolveProtectedFreshTailAssembledIndexes } from "./live-coverage.js";
 import { buildMessageParts, extractMessageContent, filterPersistableMessages, hasPersistableMessageRole, isOpenClawRuntimeContextLeak, toStoredMessage } from "./message-content.js";
-import { createBootstrapEntryHash, readBootstrapMessageFromJsonLine } from "./message-signatures.js";
-import { canonicalizeOpenClawInboundMetadataIdentityContent } from "./openclaw-inbound-metadata.js";
 import { PROMPT_RECALL_MAX_MESSAGES, PROMPT_RECALL_SEARCH_CANDIDATE_LIMIT, buildPromptRecallProjectionFingerprint, extractPromptRecallIdentifiers, extractPromptRecallSnippet, findPromptRecallIdentifierIndex, isPromptRecallEligibleRole, normalizePromptRecallCoverageText, normalizePromptRecallText, renderPromptRecallMessage } from "./prompt-recall.js";
 import { estimateSessionTokenCountForAfterTurn, extractRuntimePromptTokenCount } from "./token-accounting.js";
 import { asRecord, formatDurationMs, resolvePositiveInteger } from "./value-utils.js";
@@ -288,14 +285,6 @@ export class LcmContextEngine implements ContextEngine {
   private previousAssembledMessagesByConversation = new Map<number, AssemblePrefixSnapshot>();
   private recentBootstrapImportsByConversation = new Map<number, BootstrapImportObservation>();
   private deps: LcmDependencies;
-
-  /**
-   * Tracks file metadata from the last successful full bootstrap read per
-   * conversation. When the session JSONL file has not changed since the last
-   * full read and the conversation is already bootstrapped, the expensive
-   * readLeafPathMessages() call can be skipped entirely.
-   */
-  private lastFullReadFileState = new Map<number, { size: number; mtimeMs: number }>();
 
   // ── Circuit breaker + summary spend guard ───────────────────────────────
   private readonly compactionGuards: CompactionGuards;
@@ -1870,6 +1859,116 @@ export class LcmContextEngine implements ContextEngine {
     return result;
   }
 
+  private async reconcileVisibleTranscriptProjectionForAfterTurn(params: {
+    sessionId: string;
+    sessionKey?: string;
+    target?: SessionTranscriptReadTarget;
+    isHeartbeat?: boolean;
+    startedAt: number;
+    sessionLabel: string;
+  }): Promise<TranscriptReconcileResult> {
+    const readVisibleSessionTranscriptMessageEntries =
+      this.deps.readVisibleSessionTranscriptMessageEntries;
+    if (!params.target || !readVisibleSessionTranscriptMessageEntries) {
+      return {
+        importedMessages: 0,
+        blockedByImportCap: false,
+        hasOverlap: false,
+      };
+    }
+
+    return this.withSessionQueue(
+      this.resolveSessionQueueKey(params.sessionId, params.sessionKey),
+      async () =>
+        this.conversationStore.withTransaction(async () => {
+          const entries = await readVisibleSessionTranscriptMessageEntries(params.target!);
+          const historicalMessages = entries.map(messageFromVisibleTranscriptEntry);
+          if (params.isHeartbeat || historicalMessages.length === 0) {
+            return {
+              importedMessages: 0,
+              blockedByImportCap: false,
+              hasOverlap: true,
+              transcriptCovered: true,
+            };
+          }
+
+          const conversation = await this.conversationStore.getOrCreateConversation(
+            params.sessionId,
+            {
+              sessionKey: params.sessionKey,
+            },
+          );
+          const conversationId = conversation.conversationId;
+          const existingCount = await this.conversationStore.getMessageCount(conversationId);
+
+          if (existingCount === 0) {
+            const bootstrapMessages = trimBootstrapMessagesToBudget(
+              historicalMessages,
+              resolveBootstrapMaxTokens(this.config),
+            );
+            if (bootstrapMessages.length === 0) {
+              this.deps.log.warn(
+                `[lcm] afterTurn: visible transcript projection exceeded bootstrap budget; skipping runtime persistence to avoid anchoring past unreconciled history ${params.sessionLabel} sourceMessages=${historicalMessages.length}`,
+              );
+              return {
+                importedMessages: 0,
+                blockedByImportCap: true,
+                hasOverlap: false,
+              };
+            }
+
+            let importedMessages = 0;
+            for (const message of bootstrapMessages) {
+              const ingestResult = await this.ingestSingle({
+                sessionId: params.sessionId,
+                sessionKey: params.sessionKey,
+                message,
+                createdAt: resolveTranscriptMessageCreatedAt(message),
+                skipReplayTimestampFloodGuard: true,
+              });
+              if (ingestResult.ingested) {
+                importedMessages += 1;
+              }
+            }
+            await this.conversationStore.markConversationBootstrapped(conversationId);
+            this.recordRecentBootstrapImport(
+              conversationId,
+              importedMessages,
+              "imported initial afterTurn visible transcript projection",
+            );
+            this.deps.log.debug(
+              `[lcm] afterTurn: visible projection initial import conversation=${conversationId} ${params.sessionLabel} importedMessages=${importedMessages} sourceMessages=${historicalMessages.length} duration=${formatDurationMs(Date.now() - params.startedAt)}`,
+            );
+            return {
+              importedMessages,
+              blockedByImportCap: bootstrapMessages.length < historicalMessages.length,
+              hasOverlap: true,
+              transcriptCovered: true,
+            };
+          }
+
+          const reconcile = await this.transcriptReconciler.reconcileSessionTail({
+            sessionId: params.sessionId,
+            sessionKey: params.sessionKey,
+            conversationId,
+            historicalMessages,
+            checkpointEntryHash: undefined,
+            lastProcessedEntryId: undefined,
+          });
+          this.deps.log.debug(
+            `[lcm] afterTurn: visible projection reconcile finished conversation=${conversationId} ${params.sessionLabel} importedMessages=${reconcile.importedMessages} overlap=${reconcile.hasOverlap} blockedByImportCap=${reconcile.blockedByImportCap} duration=${formatDurationMs(Date.now() - params.startedAt)}`,
+          );
+          return {
+            ...reconcile,
+            transcriptCovered:
+              !reconcile.blockedByImportCap &&
+              (reconcile.hasOverlap || reconcile.importedMessages > 0),
+          };
+        }),
+      { operationName: "afterTurn", context: params.sessionLabel },
+    );
+  }
+
 
   // ── ContextEngine interface ─────────────────────────────────────────────
 
@@ -1902,562 +2001,20 @@ export class LcmContextEngine implements ContextEngine {
     this.ensureMigrated();
     const startedAt = Date.now();
     const sessionLabel = formatSessionLabel(sessionId, sessionKey);
-    if (transcriptReadTarget && this.deps.readVisibleSessionTranscriptMessageEntries) {
-      return this.bootstrapFromVisibleTranscriptProjection({
-        sessionId,
-        sessionKey,
-        target: transcriptReadTarget,
-        startedAt,
-        sessionLabel,
-      });
-    }
-    if (!params.sessionFile) {
+    if (!transcriptReadTarget || !this.deps.readVisibleSessionTranscriptMessageEntries) {
       return {
         bootstrapped: false,
         importedMessages: 0,
-        reason: "no transcript source",
+        reason: "visible transcript projection unavailable",
       };
     }
-    const sessionFile = params.sessionFile;
-    const sessionFileStats = await stat(sessionFile);
-    const sessionFileSize = sessionFileStats.size;
-    const sessionFileMtimeMs = Math.trunc(sessionFileStats.mtimeMs);
-    const parentSessionReference = await readSessionParentSessionReference(sessionFile);
-
-    const result = await this.withSessionQueue(
-      this.resolveSessionQueueKey(sessionId, sessionKey),
-      async () =>
-        this.conversationStore.withTransaction(async () => {
-          const persistBootstrapState = async (
-            conversationId: number,
-            lastProcessedEntryHash?: string | null,
-            forkState?: {
-              forkBounded: boolean;
-              forkSourceMessageCount: number;
-            },
-          ): Promise<void> => {
-            await this.transcriptReconciler.refreshBootstrapState({
-              conversationId,
-              sessionFile,
-              fileStats: {
-                size: sessionFileSize,
-                mtimeMs: sessionFileMtimeMs,
-              },
-              lastProcessedEntryHash,
-              forkBounded: forkState?.forkBounded,
-              forkSourceMessageCount: forkState?.forkSourceMessageCount,
-            });
-            // Update the file-level cache so subsequent bootstraps against an
-            // unchanged file can skip the full read via the cache guard.
-            this.lastFullReadFileState.set(conversationId, {
-              size: sessionFileSize,
-              mtimeMs: sessionFileMtimeMs,
-            });
-          };
-          let preloadedHistoricalMessages: AgentMessage[] | undefined;
-
-          await this.sessionRolloverDetector.rotateIsolatedCronConversationIfRuntimeChanged({
-            phase: "bootstrap",
-            sessionId,
-            sessionKey,
-            createReplacement: true,
-          });
-          await this.sessionRolloverDetector.rotateStaleSessionKeyConversationIfTrackedTranscriptMissing({
-            phase: "bootstrap",
-            sessionId,
-            sessionKey,
-            sessionFile,
-          });
-          const ambiguousRollover =
-            await this.sessionRolloverDetector.findAmbiguousSessionKeyRuntimeRollover({
-              phase: "bootstrap",
-              sessionId,
-              sessionKey,
-              sessionFile,
-            });
-          if (ambiguousRollover) {
-            preloadedHistoricalMessages = await readLeafPathMessages(sessionFile);
-            const activeBootstrapState =
-              await this.summaryStore.getConversationBootstrapState(
-                ambiguousRollover.conversationId,
-              );
-            const hasFrontierAnchor =
-              await this.sessionRolloverDetector.transcriptContainsCurrentConversationTailAnchor({
-                conversationId: ambiguousRollover.conversationId,
-                historicalMessages: preloadedHistoricalMessages,
-                checkpointEntryHash: activeBootstrapState?.lastProcessedEntryHash,
-              });
-            if (!hasFrontierAnchor) {
-              // Tier-2 resolution: a provably fresh new transcript means
-              // this is a legitimate reset. Rebind the existing conversation
-              // and import the new transcript immediately while the freshness
-              // proof is still in hand.
-              const rotatedForFreshTranscript =
-                await this.sessionRolloverDetector.rotateAmbiguousRolloverForProvablyFreshTranscript({
-                  phase: "bootstrap",
-                  sessionId,
-                  rollover: ambiguousRollover,
-                  candidateMessages: preloadedHistoricalMessages,
-                  createReplacement: false,
-                });
-              if (!rotatedForFreshTranscript) {
-                this.sessionRolloverDetector.logAmbiguousSessionKeyRuntimeRollover({
-                  phase: "bootstrap",
-                  rollover: ambiguousRollover,
-                  sessionId,
-                  sessionFile,
-                });
-                return {
-                  bootstrapped: false,
-                  importedMessages: 0,
-                  reason: AMBIGUOUS_SESSION_KEY_RUNTIME_ROLLOVER_REASON,
-                };
-              }
-              const reconcile =
-                await this.transcriptReconciler.importFreshAmbiguousRolloverTranscript({
-                  sessionId,
-                  sessionKey,
-                  sessionFile,
-                  conversationId: ambiguousRollover.conversationId,
-                  historicalMessages: preloadedHistoricalMessages,
-                });
-              if (reconcile.blockedByImportCap) {
-                return {
-                  bootstrapped: false,
-                  importedMessages: reconcile.importedMessages,
-                  reason: "reconcile import capped",
-                };
-              }
-              if (reconcile.importedMessages > 0) {
-                return {
-                  bootstrapped: true,
-                  importedMessages: reconcile.importedMessages,
-                  reason: "reconciled missing session messages",
-                };
-              }
-              return {
-                bootstrapped: false,
-                importedMessages: 0,
-                reason: reconcile.hasOverlap
-                  ? "conversation already up to date"
-                  : "conversation already has messages",
-              };
-            }
-          }
-
-          const conversation = await this.conversationStore.getOrCreateConversation(sessionId, {
-            sessionKey,
-          });
-          const conversationId = conversation.conversationId;
-          let existingCount = await this.conversationStore.getMessageCount(conversationId);
-          let bootstrapState = await this.summaryStore.getConversationBootstrapState(conversationId);
-          let transcriptEpochRotated = false;
-          let transcriptEpochReason: string | undefined;
-
-          if (
-            bootstrapState &&
-            bootstrapState.sessionFilePath !== sessionFile
-          ) {
-            transcriptEpochRotated = true;
-            transcriptEpochReason = "path-mismatch";
-            this.deps.log.warn(
-              `[lcm] bootstrap: session file rotated conversation=${conversationId} ${sessionLabel} oldFile=${bootstrapState.sessionFilePath} newFile=${sessionFile}`,
-            );
-            // A rotated session file invalidates every piece of cached state
-            // keyed to the old path: the on-disk bootstrap checkpoint row, the
-            // in-memory file-level guard, and any counters derived from the
-            // old file's messages. Clear them all in one place so subsequent
-            // reads treat this conversation as unbootstrapped.
-            this.lastFullReadFileState.delete(conversationId);
-            bootstrapState = null;
-          }
-          if (
-            bootstrapState &&
-            bootstrapState.sessionFilePath === sessionFile &&
-            checkpointIsPastTranscriptEof(bootstrapState, sessionFileSize)
-          ) {
-            transcriptEpochRotated = true;
-            transcriptEpochReason = "same-path-shrink";
-            this.deps.log.warn(
-              `[lcm] bootstrap: session file shrank past checkpoint conversation=${conversationId} ${sessionLabel} file=${sessionFile} checkpointOffset=${bootstrapState.lastProcessedOffset} checkpointSize=${bootstrapState.lastSeenSize} currentSize=${sessionFileSize}`,
-            );
-            this.lastFullReadFileState.delete(conversationId);
-            bootstrapState = null;
-          }
-
-          // If the transcript file is byte-for-byte unchanged from the last
-          // successful bootstrap checkpoint, skip reopening and reparsing it.
-          if (
-            bootstrapState &&
-            bootstrapState.sessionFilePath === sessionFile &&
-            bootstrapState.lastSeenSize === sessionFileSize &&
-            bootstrapState.lastSeenMtimeMs === sessionFileMtimeMs
-          ) {
-            if (!conversation.bootstrappedAt) {
-              await this.conversationStore.markConversationBootstrapped(conversationId);
-            }
-            if (parentSessionReference !== null && !bootstrapState.forkBounded) {
-              const historicalMessages =
-                preloadedHistoricalMessages ?? (await readLeafPathMessages(sessionFile));
-              await persistBootstrapState(conversationId, bootstrapState.lastProcessedEntryHash, {
-                forkBounded: true,
-                forkSourceMessageCount: historicalMessages.length,
-              });
-              this.deps.log.debug(
-                `[lcm] bootstrap: recovered fork-bounded checkpoint metadata conversation=${conversationId} ${sessionLabel} sourceMessages=${historicalMessages.length} duration=${formatDurationMs(Date.now() - startedAt)}`,
-              );
-            }
-            this.deps.log.debug(
-              `[lcm] bootstrap: checkpoint hit conversation=${conversationId} ${sessionLabel} existingCount=${existingCount} duration=${formatDurationMs(Date.now() - startedAt)}`,
-            );
-            return {
-              bootstrapped: false,
-              importedMessages: 0,
-              reason: conversation.bootstrappedAt ? "already bootstrapped" : "conversation already up to date",
-            };
-          }
-
-          if (
-            bootstrapState &&
-            bootstrapState.sessionFilePath === sessionFile &&
-            sessionFileSize > bootstrapState.lastSeenSize &&
-            sessionFileMtimeMs >= bootstrapState.lastSeenMtimeMs
-          ) {
-            const latestDbMessage = await this.conversationStore.getLastMessage(conversationId);
-            const latestDbHash = latestDbMessage
-              ? createBootstrapEntryHash({
-                  role: latestDbMessage.role,
-                  content: latestDbMessage.content,
-                  tokenCount: latestDbMessage.tokenCount,
-                })
-              : null;
-            const frontierHash = latestDbHash ?? bootstrapState.lastProcessedEntryHash;
-            const latestDbHashNeedsEntryId =
-              latestDbMessage
-                ? canonicalizeOpenClawInboundMetadataIdentityContent(
-                    latestDbMessage.role,
-                    latestDbMessage.content,
-                  ) !== latestDbMessage.content
-                : false;
-            // Short-circuit before the expensive backward scan: the fast-path can
-            // only succeed when the current frontier still matches the checkpoint.
-            // A freshly rotated row may have no DB messages yet, so in that case
-            // the stored checkpoint hash acts as the frontier anchor. When the
-            // frontier no longer matches, skip straight to the async full-read
-            // slow path below and avoid a backward scan that cannot succeed.
-            const canTryAppendOnlyFastPath =
-              frontierHash !== null &&
-              frontierHash === bootstrapState.lastProcessedEntryHash &&
-              (!latestDbHashNeedsEntryId || bootstrapState.lastProcessedEntryId !== null);
-
-            const tailEntryRaw = canTryAppendOnlyFastPath
-              ? await readLastJsonlEntryBeforeOffset(
-                  sessionFile,
-                  bootstrapState.lastProcessedOffset,
-                  true,
-                  (message) => createBootstrapEntryHash(toStoredMessage(message)) === frontierHash,
-                )
-              : null;
-            const tailEntryMessage = readBootstrapMessageFromJsonLine(tailEntryRaw);
-            const tailEntryHash = tailEntryMessage
-              ? createBootstrapEntryHash(toStoredMessage(tailEntryMessage))
-              : null;
-
-            if (
-              canTryAppendOnlyFastPath &&
-              tailEntryHash &&
-              tailEntryHash === bootstrapState.lastProcessedEntryHash
-            ) {
-              const appended = await readAppendedLeafPathMessages({
-                sessionFile,
-                offset: bootstrapState.lastProcessedOffset,
-              });
-              if (appended.canUseAppendOnly) {
-                if (!conversation.bootstrappedAt) {
-                  await this.conversationStore.markConversationBootstrapped(conversationId);
-                }
-
-                const appendOnlySessionContext = this.formatSessionLogContext({
-                  conversationId,
-                  sessionId,
-                  sessionKey,
-                });
-                const replayFiltered = await this.transcriptReconciler.filterBootstrapReplayMessages({
-                  messages: appended.messages,
-                  sessionContext: appendOnlySessionContext,
-                  source: "bootstrap append-only",
-                  sessionFile,
-                });
-                const replayFilteredMessages = this.transcriptReconciler.filterSyntheticHeartbeatTranscriptMessages({
-                  messages: replayFiltered.messages,
-                  sessionContext: appendOnlySessionContext,
-                  source: "bootstrap append-only",
-                });
-                const appendOnlyOverlapsPersisted = await this.transcriptReconciler.appendOnlyMessagesOverlapPersistedTranscript({
-                  conversationId,
-                  messages: replayFilteredMessages,
-                  unfilteredMessages: appended.messages,
-                  sessionContext: appendOnlySessionContext,
-                  source: "bootstrap append-only",
-                });
-                if (!appendOnlyOverlapsPersisted) {
-                  let importedMessages = 0;
-                  for (const [index, message] of replayFilteredMessages.entries()) {
-                    const ingestResult = await this.ingestSingle({
-                      sessionId,
-                      sessionKey,
-                      message,
-                      createdAt: resolveTranscriptMessageCreatedAt(message),
-                      skipReplayTimestampFloodGuard:
-                        index < replayFiltered.replayGuardExemptPrefixLength,
-                    });
-                    if (ingestResult.ingested) {
-                      importedMessages += 1;
-                    }
-                  }
-
-                  await persistBootstrapState(conversationId);
-                  this.deps.log.debug(
-                    `[lcm] bootstrap: append-only conversation=${conversationId} ${sessionLabel} existingCount=${existingCount} appendedMessages=${appended.messages.length} replayFilteredMessages=${replayFilteredMessages.length} importedMessages=${importedMessages} duration=${formatDurationMs(Date.now() - startedAt)}`,
-                  );
-
-                  if (importedMessages > 0) {
-                    return {
-                      bootstrapped: true,
-                      importedMessages,
-                      reason: "reconciled missing session messages",
-                    };
-                  }
-
-                  return {
-                    bootstrapped: false,
-                    importedMessages: 0,
-                    reason: conversation.bootstrappedAt ? "already bootstrapped" : "conversation already up to date",
-                  };
-                }
-              }
-            }
-          }
-
-          // File-level cache guard: if the conversation is already bootstrapped
-          // and the JSONL file has not changed since the last successful full read,
-          // skip the expensive readLeafPathMessages entirely.
-          if (conversation.bootstrappedAt && existingCount > 0) {
-            const cached = this.lastFullReadFileState.get(conversationId);
-            if (
-              cached &&
-              cached.size === sessionFileSize &&
-              cached.mtimeMs === sessionFileMtimeMs
-            ) {
-              await persistBootstrapState(conversationId);
-              this.deps.log.debug(
-                `[lcm] bootstrap: skipped full read (file unchanged) conversation=${conversationId} ${sessionLabel} duration=${formatDurationMs(Date.now() - startedAt)}`,
-              );
-              return {
-                bootstrapped: false,
-                importedMessages: 0,
-                reason: "already bootstrapped",
-              };
-            }
-          }
-
-          const historicalMessages =
-            preloadedHistoricalMessages ?? (await readLeafPathMessages(sessionFile));
-          this.deps.log.debug(
-            `[lcm] bootstrap: full transcript read conversation=${conversationId} ${sessionLabel} existingCount=${existingCount} historicalMessages=${historicalMessages.length} duration=${formatDurationMs(Date.now() - startedAt)}`,
-          );
-
-          // First-time import path: no LCM rows yet, so seed directly from the
-          // active leaf context snapshot.
-          if (existingCount === 0) {
-            const bootstrapMessages = trimBootstrapMessagesToBudget(
-              historicalMessages,
-              resolveBootstrapMaxTokens(this.config),
-            );
-            const forkBoundedBootstrap =
-              parentSessionReference !== null && bootstrapMessages.length < historicalMessages.length;
-
-            if (bootstrapMessages.length === 0) {
-              await this.conversationStore.markConversationBootstrapped(conversationId);
-              await persistBootstrapState(conversationId, undefined, {
-                forkBounded: forkBoundedBootstrap,
-                forkSourceMessageCount: historicalMessages.length,
-              });
-              return {
-                bootstrapped: false,
-                importedMessages: 0,
-                reason: forkBoundedBootstrap
-                  ? FORK_BOUNDED_BOOTSTRAP_REASON
-                  : "no leaf-path messages in session",
-              };
-            }
-
-            let importedMessages = 0;
-            for (const message of bootstrapMessages) {
-              const result = await this.ingestSingle({
-                sessionId,
-                sessionKey,
-                message,
-                createdAt: resolveTranscriptMessageCreatedAt(message),
-                skipReplayTimestampFloodGuard: true,
-              });
-              if (result.ingested) {
-                importedMessages += 1;
-              }
-            }
-            await this.conversationStore.markConversationBootstrapped(conversationId);
-
-            // Prune HEARTBEAT_OK turns from the freshly imported data
-            let prunedMessages = 0;
-            if (this.config.pruneHeartbeatOk) {
-              const pruned = await pruneHeartbeatOkTurns(this.conversationStore, conversationId);
-              prunedMessages = pruned;
-              if (pruned > 0) {
-                this.deps.log.info(
-                  `[lcm] bootstrap: pruned ${pruned} HEARTBEAT_OK messages from conversation ${conversationId}`,
-                );
-              }
-            }
-
-            const lastImportedHash =
-              prunedMessages === 0 && bootstrapMessages.length > 0
-                ? createBootstrapEntryHash(
-                    toStoredMessage(bootstrapMessages[bootstrapMessages.length - 1]),
-                  )
-                : undefined;
-            await persistBootstrapState(conversationId, lastImportedHash, {
-              forkBounded: forkBoundedBootstrap,
-              forkSourceMessageCount: historicalMessages.length,
-            });
-            this.deps.log.debug(
-              `[lcm] bootstrap: initial import conversation=${conversationId} ${sessionLabel} importedMessages=${importedMessages} sourceMessages=${historicalMessages.length} forkBounded=${forkBoundedBootstrap} duration=${formatDurationMs(Date.now() - startedAt)}`,
-            );
-
-            return {
-              bootstrapped: true,
-              importedMessages,
-              ...(forkBoundedBootstrap ? { reason: FORK_BOUNDED_BOOTSTRAP_REASON } : {}),
-            };
-          }
-
-          // Existing conversation path: reconcile crash gaps by appending JSONL
-          // messages that were never persisted to LCM.
-          const reconcile = await this.transcriptReconciler.reconcileSessionTail({
-            sessionId,
-            sessionKey,
-            conversationId,
-            historicalMessages,
-            checkpointEntryHash:
-              transcriptEpochReason === "same-path-shrink"
-                ? undefined
-                : bootstrapState?.lastProcessedEntryHash,
-            lastProcessedEntryId:
-              transcriptEpochReason === "same-path-shrink"
-                ? undefined
-                : bootstrapState?.lastProcessedEntryId,
-            skipContentAnchorScan: transcriptEpochReason === "same-path-shrink",
-            allowNoAnchorImport: transcriptEpochRotated,
-            noAnchorImportReason: transcriptEpochReason,
-          });
-          this.deps.log.debug(
-            `[lcm] bootstrap: reconcile finished conversation=${conversationId} ${sessionLabel} importedMessages=${reconcile.importedMessages} overlap=${reconcile.hasOverlap} blockedByImportCap=${reconcile.blockedByImportCap} duration=${formatDurationMs(Date.now() - startedAt)}`,
-          );
-
-          if (reconcile.blockedByImportCap) {
-            // Anchored capped passes import a bounded chunk of backlog;
-            // report the partial progress while keeping the checkpoint
-            // un-advanced so the next pass continues the drain.
-            return {
-              bootstrapped: false,
-              importedMessages: reconcile.importedMessages,
-              reason:
-                reconcile.blockedReason === "cross-conversation-raw-id"
-                  ? "reconcile duplicate raw ids"
-                  : reconcile.blockedReason === "duplicate-transcript-replay"
-                    ? "reconcile duplicate transcript replay"
-                  : "reconcile import capped",
-            };
-          }
-
-          if (!conversation.bootstrappedAt) {
-            await this.conversationStore.markConversationBootstrapped(conversationId);
-          }
-
-          if (reconcile.importedMessages > 0) {
-            await persistBootstrapState(conversationId);
-            return {
-              bootstrapped: true,
-              importedMessages: reconcile.importedMessages,
-              reason: "reconciled missing session messages",
-            };
-          }
-
-          if (reconcile.hasOverlap) {
-            await persistBootstrapState(conversationId);
-          }
-
-          if (conversation.bootstrappedAt) {
-            return {
-              bootstrapped: false,
-              importedMessages: 0,
-              reason: "already bootstrapped",
-            };
-          }
-
-          return {
-            bootstrapped: false,
-            importedMessages: 0,
-            reason: reconcile.hasOverlap
-              ? "conversation already up to date"
-              : "conversation already has messages",
-          };
-        }),
-      { operationName: "bootstrap", context: sessionLabel },
-    );
-
-    // Post-bootstrap pruning: clean HEARTBEAT_OK turns that were already
-    // in the DB from prior bootstrap cycles (before pruning was enabled).
-    if (this.config.pruneHeartbeatOk && result.bootstrapped === false) {
-      try {
-        const conversation = await this.conversationStore.getConversationForSession({
-          sessionId,
-          sessionKey,
-        });
-        if (conversation) {
-          const pruned = await pruneHeartbeatOkTurns(this.conversationStore, conversation.conversationId);
-          if (pruned > 0) {
-            await this.transcriptReconciler.refreshBootstrapState({
-              conversationId: conversation.conversationId,
-              sessionFile,
-            });
-            this.deps.log.info(
-              `[lcm] bootstrap: retroactively pruned ${pruned} HEARTBEAT_OK messages from conversation ${conversation.conversationId}`,
-            );
-          }
-        }
-      } catch (err) {
-        this.deps.log.warn(
-          `[lcm] bootstrap: heartbeat pruning failed: ${describeLogError(err)}`,
-        );
-      }
-    }
-
-    const conversation = await this.conversationStore.getConversationForSession({
+    return this.bootstrapFromVisibleTranscriptProjection({
       sessionId,
       sessionKey,
+      target: transcriptReadTarget,
+      startedAt,
+      sessionLabel,
     });
-    if (conversation) {
-      this.recordRecentBootstrapImport(
-        conversation.conversationId,
-        result.importedMessages,
-        result.reason ?? null,
-      );
-    }
-
-    this.deps.log.debug(
-      `[lcm] bootstrap: done ${sessionLabel} bootstrapped=${result.bootstrapped} importedMessages=${result.importedMessages} reason=${result.reason ?? "none"} duration=${formatDurationMs(Date.now() - startedAt)}`,
-    );
-    return result;
   }
 
   async maintain(params: {
@@ -2847,6 +2404,7 @@ export class LcmContextEngine implements ContextEngine {
   async afterTurn(params: {
     sessionId: string;
     sessionKey?: string;
+    sessionTarget?: ContextEngineSessionTarget;
     sessionFile: string;
     messages: AgentMessage[];
     prePromptMessageCount: number;
@@ -2868,6 +2426,7 @@ export class LcmContextEngine implements ContextEngine {
     this.ensureMigrated();
     const startedAt = Date.now();
     const sessionLabel = formatSessionLabel(params.sessionId, params.sessionKey);
+    const transcriptReadTarget = resolveSessionTranscriptReadTarget(params);
 
     // Dedup guard: prevent duplicate ingestion when gateway restart replays
     // full history. Run on newMessages BEFORE prepending autoCompactionSummary
@@ -2881,15 +2440,17 @@ export class LcmContextEngine implements ContextEngine {
       hasOverlap: true,
     };
     try {
-      transcriptReconcileResult = await this.transcriptReconciler.reconcileTranscriptTailForAfterTurn({
+      transcriptReconcileResult = await this.reconcileVisibleTranscriptProjectionForAfterTurn({
         sessionId: params.sessionId,
         sessionKey: params.sessionKey,
-        sessionFile: params.sessionFile,
+        target: transcriptReadTarget,
         isHeartbeat: params.isHeartbeat,
+        startedAt,
+        sessionLabel,
       });
     } catch (err) {
       this.deps.log.warn(
-        `[lcm] afterTurn: transcript reconcile failed for ${sessionLabel}: ${describeLogError(err)}`,
+        `[lcm] afterTurn: visible transcript projection reconcile failed for ${sessionLabel}: ${describeLogError(err)}`,
       );
       // Fail closed: without reconcile proof, the initialized in-sync default
       // would persist this batch and refresh the checkpoint to EOF, advancing
@@ -3020,16 +2581,6 @@ export class LcmContextEngine implements ContextEngine {
               sessionId: params.sessionId,
               sessionKey: params.sessionKey,
             });
-            try {
-              await this.transcriptReconciler.refreshBootstrapState({
-                conversationId: conversation.conversationId,
-                sessionFile: params.sessionFile,
-              });
-            } catch (err) {
-              this.deps.log.warn(
-                `[lcm] afterTurn: heartbeat pruning checkpoint refresh failed for ${sessionContext}: ${describeLogError(err)}`,
-              );
-            }
             this.deps.log.info(
               `[lcm] afterTurn: pruned ${pruned} heartbeat ack messages for ${sessionContext}`,
             );
@@ -3084,18 +2635,6 @@ export class LcmContextEngine implements ContextEngine {
       );
       return;
     }
-    const refreshAfterTurnBootstrapState = async (): Promise<void> => {
-      try {
-        await this.transcriptReconciler.refreshBootstrapState({
-          conversationId: conversation.conversationId,
-          sessionFile: params.sessionFile,
-        });
-      } catch (err) {
-        this.deps.log.warn(
-          `[lcm] afterTurn: bootstrap checkpoint refresh failed for ${sessionLabel}: ${describeLogError(err)}`,
-        );
-      }
-    };
     const recordAfterTurnCompactionRetry = async (
       reason: string,
       diagnostics?: {
@@ -3120,9 +2659,6 @@ export class LcmContextEngine implements ContextEngine {
         );
       }
     };
-    let shouldRefreshBootstrapState =
-      !transcriptReconcileResult.blockedByImportCap &&
-      (transcriptReconcileResult.hasOverlap || transcriptReconcileResult.importedMessages > 0);
     let deferredCompactionDrain:
       | {
           reason: string;
@@ -3184,7 +2720,6 @@ export class LcmContextEngine implements ContextEngine {
             legacyParams,
           });
           if (!compactResult.ok) {
-            shouldRefreshBootstrapState = false;
             await recordAfterTurnCompactionRetry("threshold", thresholdDiagnostics);
           }
         }
@@ -3208,10 +2743,6 @@ export class LcmContextEngine implements ContextEngine {
       this.deps.log.warn(
         `[lcm] afterTurn: compaction policy check failed for ${sessionLabel}: ${describeLogError(err)}`,
       );
-    }
-
-    if (shouldRefreshBootstrapState) {
-      await refreshAfterTurnBootstrapState();
     }
 
     if (deferredCompactionDrain) {
@@ -4345,6 +3876,3 @@ function createEmergencyFallbackSummarize(fallbackMaxTokens?: number): (
       : `${fallbackSummary}\n${FALLBACK_SUMMARY_MARKER}`;
   };
 }
-
-/** @internal Exposed for unit tests only. */
-export const __testing = { readLastJsonlEntryBeforeOffset };

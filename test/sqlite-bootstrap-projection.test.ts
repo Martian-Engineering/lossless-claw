@@ -1,7 +1,7 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { cleanupEngineTestState, createEngineWithDepsOverridesAndDb } from "./helpers.js";
 import type { AgentMessage } from "../src/openclaw-bridge.js";
-import type { LcmDependencies } from "../src/types.js";
+import type { LcmDependencies, VisibleSessionTranscriptMessageEntry } from "../src/types.js";
 
 afterEach(cleanupEngineTestState);
 
@@ -143,5 +143,120 @@ describe("LcmContextEngine.bootstrap sqlite transcript projection", () => {
     await expect(
       engine.getConversationStore().getMessages(keyedConversation!.conversationId),
     ).resolves.toHaveLength(1);
+  });
+
+  it("reconciles afterTurn from the visible projection and ignores a stale session file", async () => {
+    const sessionId = "sqlite-afterturn-session";
+    const sessionKey = "agent:main:sqlite-afterturn-session";
+    const visibleEntries: VisibleSessionTranscriptMessageEntry[] = [
+      {
+        entryId: "entry-user",
+        parentId: null,
+        seq: 1,
+        role: "user",
+        message: { role: "user", content: "initial user" } satisfies AgentMessage,
+        createdAt: "2026-06-29T12:00:00.000Z",
+      },
+    ];
+    const readVisibleSessionTranscriptMessageEntries = vi.fn(async () => visibleEntries);
+
+    const { engine } = createEngineWithDepsOverridesAndDb({
+      readVisibleSessionTranscriptMessageEntries,
+    } satisfies Partial<LcmDependencies>);
+
+    await expect(
+      engine.bootstrap({
+        sessionId,
+        sessionKey,
+        runtimeContext: {
+          transcriptStorage: { kind: "sqlite" },
+          sessionTarget: {
+            agentId: "main",
+            sessionId,
+            sessionKey,
+            storePath: "/tmp/openclaw-agent.sqlite",
+          },
+        },
+      }),
+    ).resolves.toMatchObject({ bootstrapped: true, importedMessages: 1 });
+
+    visibleEntries.push({
+      entryId: "entry-assistant",
+      parentId: "entry-user",
+      seq: 2,
+      role: "assistant",
+      message: { role: "assistant", content: "projected assistant" } satisfies AgentMessage,
+      createdAt: "2026-06-29T12:00:01.000Z",
+    });
+
+    await expect(
+      engine.afterTurn({
+        sessionId,
+        sessionKey,
+        sessionFile: "/tmp/does-not-exist-lossless-sqlite-afterturn.jsonl",
+        messages: [
+          { role: "user", content: "initial user" },
+          { role: "assistant", content: "projected assistant" },
+        ] satisfies AgentMessage[],
+        prePromptMessageCount: 1,
+        runtimeContext: {
+          transcriptStorage: { kind: "sqlite" },
+          sessionTarget: {
+            agentId: "main",
+            sessionId,
+            sessionKey,
+            storePath: "/tmp/openclaw-agent.sqlite",
+          },
+        },
+      }),
+    ).resolves.toBeUndefined();
+
+    const conversation = await engine.getConversationStore().getConversationForSession({
+      sessionId,
+      sessionKey,
+    });
+    expect(conversation).not.toBeNull();
+    const messages = await engine.getConversationStore().getMessages(conversation!.conversationId);
+    expect(messages.map((message) => message.content)).toEqual([
+      "initial user",
+      "projected assistant",
+    ]);
+    expect(readVisibleSessionTranscriptMessageEntries).toHaveBeenCalledTimes(2);
+  });
+
+  it("does not persist afterTurn runtime messages when the visible projection is unavailable", async () => {
+    const sessionId = "sqlite-afterturn-missing-projection";
+    const sessionKey = "agent:main:sqlite-afterturn-missing-projection";
+    const { engine } = createEngineWithDepsOverridesAndDb({
+      readVisibleSessionTranscriptMessageEntries: undefined,
+    });
+
+    await expect(
+      engine.afterTurn({
+        sessionId,
+        sessionKey,
+        sessionFile: "/tmp/does-not-exist-lossless-sqlite-missing-projection.jsonl",
+        messages: [
+          { role: "user", content: "prompt" },
+          { role: "assistant", content: "must not persist without projection" },
+        ] satisfies AgentMessage[],
+        prePromptMessageCount: 1,
+        runtimeContext: {
+          transcriptStorage: { kind: "sqlite" },
+          sessionTarget: {
+            agentId: "main",
+            sessionId,
+            sessionKey,
+            storePath: "/tmp/openclaw-agent.sqlite",
+          },
+        },
+      }),
+    ).resolves.toBeUndefined();
+
+    const conversation = await engine.getConversationStore().getConversationForSession({
+      sessionId,
+      sessionKey,
+    });
+    expect(conversation).toBeNull();
   });
 });

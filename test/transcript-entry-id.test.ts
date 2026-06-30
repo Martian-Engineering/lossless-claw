@@ -5,7 +5,7 @@ import { SessionManager } from "@earendil-works/pi-coding-agent";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import type { LcmConfig } from "../src/db/config.js";
 import { closeLcmConnection, createLcmDatabaseConnection } from "../src/db/connection.js";
-import { LcmContextEngine } from "../src/engine.js";
+import type { LcmContextEngine } from "../src/engine.js";
 import type { AgentMessage } from "../src/openclaw-bridge.js";
 import {
   getTranscriptEntryId,
@@ -15,7 +15,7 @@ import {
   resolveTranscriptMessageCreatedAt,
 } from "../src/transcript.js";
 import type { LcmDependencies } from "../src/types.js";
-import { createTestConfig, createTestDeps as createSharedTestDeps } from "./helpers.js";
+import { createTestConfig, createTestDeps as createSharedTestDeps, TestLcmContextEngine } from "./helpers.js";
 
 const tempDirs: string[] = [];
 
@@ -43,11 +43,11 @@ function createTestDeps(config: LcmConfig): LcmDependencies {
   });
 }
 
-function createEngine(): LcmContextEngine {
+function createEngine(): TestLcmContextEngine {
   const tempDir = createTempDir("lcm-entry-id-");
   const config = createTestConfig(join(tempDir, "lcm.db"));
   const db = createLcmDatabaseConnection(config.databasePath);
-  return new LcmContextEngine(createTestDeps(config), db);
+  return new TestLcmContextEngine(createTestDeps(config), db);
 }
 
 function createSessionFilePath(name: string): string {
@@ -186,7 +186,7 @@ describe("messages.transcript_entry_id schema", () => {
     const tempDir = createTempDir("lcm-entry-id-schema-");
     const config = createTestConfig(join(tempDir, "lcm.db"));
     const db = createLcmDatabaseConnection(config.databasePath);
-    const engine = new LcmContextEngine(createTestDeps(config), db);
+    const engine = new TestLcmContextEngine(createTestDeps(config), db);
     // Force migrations.
     void engine;
     (engine as unknown as { ensureMigrated: () => void }).ensureMigrated();
@@ -564,86 +564,6 @@ describe("afterTurn covered-frontier alignment", () => {
     expect(messages.at(-1)?.content).toBe("turn 5");
   });
 
-  it("imports a same-path rewritten transcript as a declared epoch rollover", async () => {
-    const sessionFile = createSessionFilePath("declared-epoch-rollover");
-    const headerLine = (headerId: string) =>
-      JSON.stringify({
-        type: "session",
-        version: 3,
-        id: headerId,
-        timestamp: new Date().toISOString(),
-        cwd: process.cwd(),
-      });
-    const entryLine = (id: string, parentId: string | null, role: AgentMessage["role"], text: string) =>
-      JSON.stringify({
-        type: "message",
-        id,
-        parentId,
-        timestamp: new Date().toISOString(),
-        message: { role, content: [{ type: "text", text }] },
-      });
-    writeFileSync(
-      sessionFile,
-      [
-        headerLine("epoch-one-header"),
-        entryLine("old-1", null, "user", "old epoch question"),
-        entryLine("old-2", "old-1", "assistant", "old epoch answer"),
-      ].join("\n") + "\n",
-      "utf8",
-    );
-
-    const warnLog = vi.fn();
-    const tempDir = createTempDir("lcm-entry-id-rollover-");
-    const config = createTestConfig(join(tempDir, "lcm.db"));
-    const deps = createTestDeps(config);
-    deps.log = { info: vi.fn(), warn: warnLog, error: vi.fn(), debug: vi.fn() };
-    const db = createLcmDatabaseConnection(config.databasePath);
-    const engine = new LcmContextEngine(deps, db);
-    const sessionId = "declared-epoch-rollover";
-    await engine.bootstrap({ sessionId, sessionFile });
-
-    const conversation = await engine
-      .getConversationStore()
-      .getConversationForSession({ sessionId });
-    const conversationId = conversation!.conversationId;
-    expect(await engine.getConversationStore().getMessageCount(conversationId)).toBe(2);
-
-    // Rewrite the same path as a brand-new session (new header id, fresh
-    // entry ids, larger than the old file so this is not a shrink).
-    const padding = "x".repeat(160);
-    writeFileSync(
-      sessionFile,
-      [
-        headerLine("epoch-two-header"),
-        entryLine("new-1", null, "user", `new epoch question ${padding}`),
-        entryLine("new-2", "new-1", "assistant", `new epoch answer ${padding}`),
-        entryLine("new-3", "new-2", "user", `new epoch follow-up ${padding}`),
-      ].join("\n") + "\n",
-      "utf8",
-    );
-
-    await engine.afterTurn({
-      sessionId,
-      sessionFile,
-      messages: [],
-      prePromptMessageCount: 0,
-    });
-
-    expect(
-      warnLog.mock.calls.some((call) =>
-        String(call[0]).includes("declared epoch rollover"),
-      ),
-    ).toBe(true);
-    const messages = await engine.getConversationStore().getMessages(conversationId);
-    expect(messages.map((message) => message.content)).toEqual([
-      "old epoch question",
-      "old epoch answer",
-      `new epoch question ${padding}`,
-      `new epoch answer ${padding}`,
-      `new epoch follow-up ${padding}`,
-    ]);
-  });
-
   it("fails closed on a stale replay batch that overlaps persisted history", async () => {
     const sessionFile = createSessionFilePath("covered-stale-replay");
     const manager = SessionManager.open(sessionFile);
@@ -768,58 +688,6 @@ describe("stale entry-id adoption after host history rewrites", () => {
     expect(rows.map((row) => row.transcript_entry_id)).toEqual(["a", "b", "c", "d2", "c2"]);
   });
 
-  it("re-stamps across a declared epoch rollover that kept only re-issued ids", async () => {
-    const sessionFile = createSessionFilePath("stale-id-rollover");
-    const padding = "x".repeat(200);
-    writeFileSync(
-      sessionFile,
-      [
-        headerLine("stale-id-epoch-one"),
-        entryLine("a", null, "user", "q1"),
-        entryLine("b", "a", "assistant", `kept answer ${padding}`),
-        entryLine("c", "b", "user", `kept follow-up ${padding}`),
-      ].join("\n") + "\n",
-      "utf8",
-    );
-
-    const engine = createEngine();
-    const sessionId = "stale-id-rollover";
-    await engine.bootstrap({ sessionId, sessionFile });
-    const conversation = await engine
-      .getConversationStore()
-      .getConversationForSession({ sessionId });
-    const conversationId = conversation!.conversationId;
-    expect(await engine.getConversationStore().getMessageCount(conversationId)).toBe(3);
-
-    // Compaction-successor style rotation after a rewrite: same path, new
-    // header id, and the surviving tail carries re-issued ids only.
-    writeFileSync(
-      sessionFile,
-      [
-        headerLine("stale-id-epoch-two"),
-        entryLine("b2", null, "assistant", `kept answer ${padding}`),
-        entryLine("c2", "b2", "user", `kept follow-up ${padding}`),
-      ].join("\n") + "\n",
-      "utf8",
-    );
-    await engine.afterTurn({
-      sessionId,
-      sessionFile,
-      messages: [],
-      prePromptMessageCount: 0,
-    });
-
-    const rows = await readRows(engine, conversationId);
-    expect(rows.map((row) => row.content)).toEqual([
-      "q1",
-      `kept answer ${padding}`,
-      `kept follow-up ${padding}`,
-    ]);
-    // The surviving rows adopted the successor's re-issued ids; nothing
-    // imported twice.
-    expect(rows.map((row) => row.transcript_entry_id)).toEqual(["a", "b2", "c2"]);
-  });
-
   it("still imports repeated content under a fresh id when the original is live", async () => {
     const sessionFile = createSessionFilePath("stale-id-live-repeat");
     const header = headerLine("stale-id-live-repeat-header");
@@ -862,109 +730,6 @@ describe("stale entry-id adoption after host history rewrites", () => {
     expect(rows.map((row) => row.transcript_entry_id)).toEqual(["a", "b", "c"]);
   });
 
-  it("drains an over-cap id-bearing new epoch via chunked no-anchor import, then entry-id takeover", async () => {
-    const sessionFile = createSessionFilePath("chunked-new-epoch");
-    const entryWithParent = (
-      id: string,
-      parentId: string | null,
-      role: AgentMessage["role"],
-      text: string,
-    ) =>
-      JSON.stringify({
-        type: "message",
-        id,
-        parentId,
-        timestamp: new Date().toISOString(),
-        message: { role, content: [{ type: "text", text }] },
-      });
-    const epochLines = (headerId: string, idPrefix: string, textPrefix: string) => [
-      headerLine(headerId),
-      ...Array.from({ length: 60 }, (_, index) =>
-        entryWithParent(
-          `${idPrefix}${index}`,
-          index === 0 ? null : `${idPrefix}${index - 1}`,
-          index % 2 === 0 ? "user" : "assistant",
-          `${textPrefix} ${index}`,
-        ),
-      ),
-    ];
-    writeFileSync(
-      sessionFile,
-      epochLines("chunked-epoch-one", "a", "old turn").join("\n") + "\n",
-      "utf8",
-    );
-
-    const logLines: string[] = [];
-    const logCapture = (message: unknown) => {
-      logLines.push(String(message));
-    };
-    const tempDir = createTempDir("lcm-chunked-epoch-");
-    const config = createTestConfig(join(tempDir, "lcm.db"));
-    const deps = createTestDeps(config);
-    deps.log = { info: logCapture, warn: logCapture, error: logCapture, debug: logCapture };
-    const engine = new LcmContextEngine(deps, createLcmDatabaseConnection(config.databasePath));
-    const sessionId = "chunked-new-epoch";
-    await engine.bootstrap({ sessionId, sessionFile });
-    const conversation = await engine
-      .getConversationStore()
-      .getConversationForSession({ sessionId });
-    const conversationId = conversation!.conversationId;
-    expect(await engine.getConversationStore().getMessageCount(conversationId)).toBe(60);
-
-    // Declared rollover to an epoch that shares no content with the DB
-    // (e.g. a successor whose kept tail was fully rewritten): no content
-    // anchor exists and 60 id-bearing candidates exceed the cap (50). The
-    // first pass must import a bounded chunk instead of freezing.
-    writeFileSync(
-      sessionFile,
-      epochLines("chunked-epoch-two", "b", "rewritten turn longer text").join("\n") + "\n",
-      "utf8",
-    );
-    await engine.afterTurn({
-      sessionId,
-      sessionFile,
-      messages: [],
-      prePromptMessageCount: 0,
-    });
-
-    expect(
-      logLines.some((line) =>
-        line.includes(
-          "no-anchor entry-id import cap chunking for conversation=1 session=chunked-new-epoch — importing 50/60 new-epoch messages this pass",
-        ),
-      ),
-      "first pass logs the no-anchor chunk",
-    ).toBe(true);
-    const afterFirstPass = await readRows(engine, conversationId);
-    expect(afterFirstPass, "first pass imports exactly one bounded chunk").toHaveLength(110);
-    expect(afterFirstPass[60]?.transcript_entry_id).toBe("b0");
-    expect(afterFirstPass[109]?.transcript_entry_id).toBe("b49");
-
-    // Second pass: the persisted b-ids give the entry-id planner an anchor,
-    // so the remaining backlog drains through the anchored entry-id path.
-    await engine.afterTurn({
-      sessionId,
-      sessionFile,
-      messages: [],
-      prePromptMessageCount: 0,
-    });
-
-    const afterSecondPass = await readRows(engine, conversationId);
-    expect(afterSecondPass, "no duplicates across the chunked drain").toHaveLength(120);
-    expect(afterSecondPass.slice(60).map((row) => row.transcript_entry_id)).toEqual(
-      Array.from({ length: 60 }, (_, index) => `b${index}`),
-    );
-
-    // Third pass is a no-op: everything is persisted and the checkpoint has
-    // advanced past the rollover.
-    await engine.afterTurn({
-      sessionId,
-      sessionFile,
-      messages: [],
-      prePromptMessageCount: 0,
-    });
-    expect(await engine.getConversationStore().getMessageCount(conversationId)).toBe(120);
-  });
 });
 
 // ── lossless-claw-3071: repeated identical content must not defeat the
@@ -1047,65 +812,6 @@ describe("repeated identical tool calls (lossless-claw-3071)", () => {
       .map((call: unknown[]) => String(call[0]))
       .filter((message: string) => message.includes("falling back to full reconciliation"));
     expect(fullReconcileFallbacks).toEqual([]);
-  });
-
-  it("still falls back to full reconciliation when an appended entry id is already persisted", async () => {
-    const sessionFile = createSessionFilePath("repeat-replayed-entry-id");
-    let lines = `${header}\n${entryLine("replay-1", null, "user", "question one")}\n${entryLine(
-      "replay-2",
-      "replay-1",
-      "assistant",
-      "answer one",
-    )}\n`;
-    writeFileSync(sessionFile, lines, "utf8");
-
-    const engine = createEngine();
-    const sessionId = "repeat-replayed-entry-id";
-    await engine.afterTurn({
-      sessionId,
-      sessionFile,
-      messages: [
-        { role: "user", content: [{ type: "text", text: "question one" }] } as AgentMessage,
-        { role: "assistant", content: [{ type: "text", text: "answer one" }] } as AgentMessage,
-      ],
-      prePromptMessageCount: 0,
-    });
-
-    // A replay snapshot re-appends an ALREADY-persisted entry id: that is a
-    // genuine overlap and must still route through full reconciliation
-    // (which dedupes by id) instead of blind append-only ingest.
-    lines += `${entryLine("replay-2", "replay-1", "assistant", "answer one")}\n`;
-    lines += `${entryLine("replay-3", "replay-2", "user", "question two")}\n`;
-    writeFileSync(sessionFile, lines, "utf8");
-    await engine.afterTurn({
-      sessionId,
-      sessionFile,
-      messages: [
-        { role: "user", content: [{ type: "text", text: "question two" }] } as AgentMessage,
-      ],
-      prePromptMessageCount: 0,
-    });
-
-    expect(
-      engineWarn(engine).mock.calls
-        .map((call: unknown[]) => String(call[0]))
-        .some((message: string) =>
-          message.includes("already-persisted transcript entry ids"),
-        ),
-    ).toBe(true);
-
-    const conversation = await engine
-      .getConversationStore()
-      .getConversationForSession({ sessionId });
-    const persisted = await engine
-      .getConversationStore()
-      .getMessages(conversation!.conversationId);
-    // No duplicate rows from the replayed id; the new question imports once.
-    expect(persisted.map((message) => message.content)).toEqual([
-      "question one",
-      "answer one",
-      "question two",
-    ]);
   });
 
   it("legacy unstamped empty-content rows do not false-flag flush-lag adoption", async () => {
