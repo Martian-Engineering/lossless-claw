@@ -3679,6 +3679,38 @@ export class LcmContextEngine implements ContextEngine {
     );
   }
 
+  /** Rebind ordinary host rollover to the same durable conversation lane. */
+  private async applySessionRebind(params: {
+    reason: string;
+    sessionId?: string;
+    sessionKey?: string;
+    nextSessionId?: string;
+    nextSessionKey?: string;
+  }): Promise<void> {
+    const current = await this.conversationStore.getConversationForSession({
+      sessionId: params.sessionId,
+      sessionKey: params.sessionKey ?? params.nextSessionKey,
+    });
+    if (!current?.active) {
+      return;
+    }
+
+    const nextSessionId = params.nextSessionId?.trim() || params.sessionId?.trim() || current.sessionId;
+    if (!nextSessionId) {
+      this.deps.log.warn(`[lcm] ${params.reason} lifecycle rebind skipped: no session identity available`);
+      return;
+    }
+    const nextSessionKey = params.nextSessionKey?.trim() || params.sessionKey?.trim() || current.sessionKey;
+    await this.conversationStore.rebindConversationSession(
+      current.conversationId,
+      nextSessionId,
+      nextSessionKey,
+    );
+    this.deps.log.info(
+      `[lcm] ${params.reason} lifecycle rebound conversation ${current.conversationId}`,
+    );
+  }
+
   /** Apply LCM lifecycle semantics for OpenClaw's /new and /reset commands. */
   async handleBeforeReset(params: {
     reason?: string;
@@ -3757,19 +3789,29 @@ export class LcmContextEngine implements ContextEngine {
       return;
     }
 
-    const createReplacement = reason !== "deleted";
     this.ensureMigrated();
     await this.withSessionQueue(
       this.resolveSessionQueueKey(params.nextSessionId ?? params.sessionId, params.sessionKey ?? params.nextSessionKey),
       async () =>
         this.conversationStore.withTransaction(async () => {
-          await this.applySessionReplacement({
-            reason: `session_end:${reason}`,
+          const lifecycleReason = `session_end:${reason}`;
+          if (reason === "reset" || reason === "deleted") {
+            await this.applySessionReplacement({
+              reason: lifecycleReason,
+              sessionId: params.sessionId,
+              sessionKey: params.sessionKey ?? params.nextSessionKey,
+              nextSessionId: params.nextSessionId,
+              nextSessionKey: params.nextSessionKey,
+              createReplacement: reason !== "deleted",
+            });
+            return;
+          }
+          await this.applySessionRebind({
+            reason: lifecycleReason,
             sessionId: params.sessionId,
-            sessionKey: params.sessionKey ?? params.nextSessionKey,
+            sessionKey: params.sessionKey,
             nextSessionId: params.nextSessionId,
             nextSessionKey: params.nextSessionKey,
-            createReplacement,
           });
         }),
     );
