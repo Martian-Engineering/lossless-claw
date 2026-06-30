@@ -8,7 +8,6 @@ import type { AgentMessage } from "./openclaw-bridge.js";
 import { canonicalizeOpenClawInboundMetadataIdentityContent } from "./openclaw-inbound-metadata.js";
 import type { CreateMessagePartInput } from "./store/conversation-store.js";
 import { extractToolResultIdForPairing } from "./tool-pairing.js";
-import { extractBootstrapMessageCandidate } from "./transcript.js";
 import { createHash } from "node:crypto";
 
 export function createBootstrapEntryHash(message: StoredMessage | null): string | null {
@@ -22,17 +21,6 @@ export function createBootstrapEntryHash(message: StoredMessage | null): string 
   return createHash("sha256")
     .update(JSON.stringify({ role: message.role, content }))
     .digest("hex");
-}
-
-export function readBootstrapMessageFromJsonLine(line: string | null): AgentMessage | null {
-  if (!line) {
-    return null;
-  }
-  try {
-    return extractBootstrapMessageCandidate(JSON.parse(line));
-  } catch {
-    return null;
-  }
 }
 
 export function messageIdentity(role: string, content: string): string {
