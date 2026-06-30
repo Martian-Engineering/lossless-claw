@@ -99,7 +99,6 @@ function createRuntimeCompactionDelegate(log: LcmDependencies["log"]): RuntimeCo
 
 type RuntimeSessionStoreEntry = {
   sessionId?: unknown;
-  sessionFile?: unknown;
   totalTokens?: unknown;
   totalTokensFresh?: unknown;
   inputTokens?: unknown;
@@ -116,11 +115,6 @@ type RuntimeSessionStoreEntry = {
 type RuntimeAgentSessionApi = {
   resolveStorePath: (store?: string, opts?: { agentId?: string }) => string;
   loadSessionStore: (storePath: string) => Record<string, RuntimeSessionStoreEntry | undefined>;
-  resolveSessionFilePath: (
-    sessionId: string,
-    entry?: RuntimeSessionStoreEntry,
-    opts?: { agentId?: string; storePath?: string },
-  ) => string;
 };
 type RuntimeAgentSessionApiCandidate = Partial<RuntimeAgentSessionApi>;
 
@@ -318,8 +312,7 @@ function getRuntimeAgentSessionApi(api: OpenClawPluginApi): RuntimeAgentSessionA
   }
   if (
     typeof sessionApi.resolveStorePath !== "function" ||
-    typeof sessionApi.loadSessionStore !== "function" ||
-    typeof sessionApi.resolveSessionFilePath !== "function"
+    typeof sessionApi.loadSessionStore !== "function"
   ) {
     return undefined;
   }
@@ -1567,45 +1560,7 @@ function createLcmDependencies(
         return undefined;
       }
     },
-    resolveSessionTranscriptFile: async ({ agentId: requestedAgentId, sessionId, sessionKey }) => {
-      const normalizedSessionId = sessionId.trim();
-      if (!normalizedSessionId) {
-        return undefined;
-      }
 
-      try {
-        const sessionApi = getRuntimeAgentSessionApi(api);
-        if (!sessionApi) {
-          return undefined;
-        }
-        const cfg = readRuntimeConfigSnapshot(api);
-        const sessionConfig = isRecord(cfg) && isRecord(cfg.session) ? cfg.session : undefined;
-        const normalizedSessionKey = sessionKey?.trim();
-        const parsed = normalizedSessionKey ? parseAgentSessionKey(normalizedSessionKey) : null;
-        const agentId = normalizeAgentId(parsed?.agentId ?? requestedAgentId);
-        const storePath = sessionApi.resolveStorePath(getStringField(sessionConfig, "store"), {
-          agentId,
-        });
-        const store = sessionApi.loadSessionStore(storePath) as Record<
-          string,
-          { sessionId?: string; sessionFile?: string } | undefined
-        >;
-        const entry =
-          (normalizedSessionKey ? store[normalizedSessionKey] : undefined)
-          ?? Object.values(store).find((candidate) => candidate?.sessionId === normalizedSessionId);
-        const transcriptPath = sessionApi.resolveSessionFilePath(
-          normalizedSessionId,
-          entry,
-          {
-            agentId,
-            storePath,
-          },
-        );
-        return transcriptPath.trim() || undefined;
-      } catch {
-        return undefined;
-      }
-    },
     readVisibleSessionTranscriptMessageEntries: async (target) => {
       const readVisibleSessionTranscriptMessageEntries =
         await loadReadVisibleSessionTranscriptMessageEntries();

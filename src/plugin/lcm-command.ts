@@ -1197,23 +1197,12 @@ async function runFocusLifecycleCompaction(params: {
     };
   }
 
-  let sessionFile = "";
-  try {
-    sessionFile =
-      (await params.deps.resolveSessionTranscriptFile({
-        sessionId,
-        sessionKey,
-      })) ?? "";
-  } catch {
-    sessionFile = "";
-  }
-
   const tokenBudget = resolveLifecycleCompactionTokenBudget(params.config);
   try {
     const result = await engine.compact({
       sessionId,
       sessionKey,
-      sessionFile,
+      sessionFile: "",
       tokenBudget,
       currentTokenCount: params.current.stats.contextTokenCount,
       compactionTarget: "threshold",

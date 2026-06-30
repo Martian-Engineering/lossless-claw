@@ -158,26 +158,18 @@ function buildApi(
   };
 }
 
-/** Attach a file-backed session-store runtime API to a mock plugin API. */
+/** Attach a runtime session-store API to a mock plugin API. */
 function attachSessionStoreApi(api: OpenClawPluginApi, sessionStorePath: string): void {
   (api.runtime as unknown as {
     channel: {
       session: {
         resolveStorePath: (store?: string) => string;
         loadSessionStore: (storePath: string) => Record<string, unknown>;
-        resolveSessionFilePath: (
-          sessionId: string,
-          entry?: { sessionFile?: unknown },
-        ) => string;
       };
     };
   }).channel.session = {
     resolveStorePath: (store?: string) => (typeof store === "string" ? store : sessionStorePath),
     loadSessionStore: (storePath: string) => JSON.parse(readFileSync(storePath, "utf8")) as Record<string, unknown>,
-    resolveSessionFilePath: (runtimeSessionId: string, entry?: { sessionFile?: unknown }) =>
-      typeof entry?.sessionFile === "string" && entry.sessionFile.trim()
-        ? entry.sessionFile
-        : join(tmpdir(), `${runtimeSessionId}.jsonl`),
   };
 }
 
@@ -1239,14 +1231,11 @@ describe("lcm plugin registration", () => {
     );
     const sessionId = `test-session-${Date.now()}-${Math.random().toString(16).slice(2)}`;
     const sessionKey = `agent:main:chat:${Math.random().toString(16).slice(2)}`;
-    const sessionFilePath = join(tmpdir(), `${sessionId}.jsonl`);
-
     writeFileSync(
       sessionStorePath,
       `${JSON.stringify({
         [sessionKey]: {
           sessionId,
-          sessionFile: sessionFilePath,
           totalTokens: null,
           totalTokensFresh: false,
           inputTokens: 1_200,
@@ -1272,19 +1261,11 @@ describe("lcm plugin registration", () => {
         session: {
           resolveStorePath: (store?: string) => string;
           loadSessionStore: (storePath: string) => Record<string, unknown>;
-          resolveSessionFilePath: (
-            sessionId: string,
-            entry?: { sessionFile?: unknown },
-          ) => string;
         };
       };
     }).channel.session = {
       resolveStorePath: (store?: string) => (typeof store === "string" ? store : sessionStorePath),
       loadSessionStore: (storePath: string) => JSON.parse(readFileSync(storePath, "utf8")) as Record<string, unknown>,
-      resolveSessionFilePath: (runtimeSessionId: string, entry?: { sessionFile?: unknown }) =>
-        typeof entry?.sessionFile === "string" && entry.sessionFile.trim()
-          ? entry.sessionFile
-          : join(tmpdir(), `${runtimeSessionId}.jsonl`),
     };
     lcmPlugin.register(first.api);
     const firstFactory = first.getFactory();
@@ -1336,19 +1317,11 @@ describe("lcm plugin registration", () => {
         session: {
           resolveStorePath: (store?: string) => string;
           loadSessionStore: (storePath: string) => Record<string, unknown>;
-          resolveSessionFilePath: (
-            sessionId: string,
-            entry?: { sessionFile?: unknown },
-          ) => string;
         };
       };
     }).channel.session = {
       resolveStorePath: (store?: string) => (typeof store === "string" ? store : sessionStorePath),
       loadSessionStore: (storePath: string) => JSON.parse(readFileSync(storePath, "utf8")) as Record<string, unknown>,
-      resolveSessionFilePath: (runtimeSessionId: string, entry?: { sessionFile?: unknown }) =>
-        typeof entry?.sessionFile === "string" && entry.sessionFile.trim()
-          ? entry.sessionFile
-          : join(tmpdir(), `${runtimeSessionId}.jsonl`),
     };
     lcmPlugin.register(second.api);
     const secondFactory = second.getFactory();
@@ -1392,14 +1365,12 @@ describe("lcm plugin registration", () => {
     );
     const sessionId = `fresh-session-${Date.now()}-${Math.random().toString(16).slice(2)}`;
     const sessionKey = `agent:main:chat:${Math.random().toString(16).slice(2)}`;
-    const sessionFilePath = join(tmpdir(), `${sessionId}.jsonl`);
 
     writeFileSync(
       sessionStorePath,
       `${JSON.stringify({
         [sessionKey]: {
           sessionId,
-          sessionFile: sessionFilePath,
           totalTokens: 50_000,
           totalTokensFresh: true,
           inputTokens: 1_200,
@@ -1496,14 +1467,12 @@ describe("lcm plugin registration", () => {
     const sessionId = `stale-session-${Date.now()}-${Math.random().toString(16).slice(2)}`;
     const sessionKey = `agent:main:chat:${Math.random().toString(16).slice(2)}`;
     const concurrentSessionKey = `agent:main:chat:${Math.random().toString(16).slice(2)}`;
-    const sessionFilePath = join(tmpdir(), `${sessionId}.jsonl`);
 
     writeFileSync(
       sessionStorePath,
       `${JSON.stringify({
         [sessionKey]: {
           sessionId,
-          sessionFile: sessionFilePath,
           totalTokens: null,
           totalTokensFresh: false,
           inputTokens: 1_200,
@@ -1575,10 +1544,6 @@ describe("lcm plugin registration", () => {
         session: {
           resolveStorePath: (store?: string) => string;
           loadSessionStore: (storePath: string) => Record<string, unknown>;
-          resolveSessionFilePath: (
-            sessionId: string,
-            entry?: { sessionFile?: unknown },
-          ) => string;
         };
       };
     }).channel.session = {
@@ -1593,7 +1558,6 @@ describe("lcm plugin registration", () => {
               ...loaded,
               [concurrentSessionKey]: {
                 sessionId: "concurrent-session",
-                sessionFile: join(tmpdir(), "concurrent-session.jsonl"),
                 totalTokens: 12_345,
                 totalTokensFresh: true,
               },
@@ -1603,10 +1567,6 @@ describe("lcm plugin registration", () => {
         }
         return loaded;
       },
-      resolveSessionFilePath: (runtimeSessionId: string, entry?: { sessionFile?: unknown }) =>
-        typeof entry?.sessionFile === "string" && entry.sessionFile.trim()
-          ? entry.sessionFile
-          : join(tmpdir(), `${runtimeSessionId}.jsonl`),
     };
     lcmPlugin.register(second.api);
     const secondFactory = second.getFactory();
