@@ -196,17 +196,6 @@ function setConversationTimes(
 function insertRolloverStateRows(fixture: CommandFixture, sourceId: number, targetId: number): void {
   fixture.db
     .prepare(
-      `INSERT INTO conversation_bootstrap_state (
-         conversation_id,
-         session_file_path,
-         last_seen_size,
-         last_seen_mtime_ms,
-         last_processed_offset
-       ) VALUES (?, ?, 10, 20, 30)`,
-    )
-    .run(sourceId, `/tmp/source-${sourceId}.jsonl`);
-  fixture.db
-    .prepare(
       `INSERT INTO conversation_compaction_telemetry (
          conversation_id,
          cache_state
@@ -1941,7 +1930,6 @@ describe("lcm command", () => {
            (SELECT COUNT(*) FROM focus_briefs WHERE conversation_id = ?) AS focus_briefs,
            (SELECT COUNT(*) FROM messages WHERE conversation_id IN (?, ?)) AS source_messages,
            (SELECT COUNT(*) FROM context_items WHERE conversation_id IN (?, ?)) AS source_context,
-           (SELECT COUNT(*) FROM conversation_bootstrap_state WHERE conversation_id = ?) AS source_bootstrap,
            (SELECT COUNT(*) FROM conversation_compaction_telemetry WHERE conversation_id = ?) AS source_telemetry`,
       )
       .get(
@@ -1953,14 +1941,12 @@ describe("lcm command", () => {
         firstArchived.conversationId,
         secondArchived.conversationId,
         firstArchived.conversationId,
-        firstArchived.conversationId,
       ) as {
       summaries: number;
       large_files: number;
       focus_briefs: number;
       source_messages: number;
       source_context: number;
-      source_bootstrap: number;
       source_telemetry: number;
     };
     expect(counts).toEqual({
@@ -1969,7 +1955,6 @@ describe("lcm command", () => {
       focus_briefs: 1,
       source_messages: 0,
       source_context: 0,
-      source_bootstrap: 0,
       source_telemetry: 0,
     });
 

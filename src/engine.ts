@@ -1,4 +1,5 @@
 import { createHash } from "node:crypto";
+import { readFileSync } from "node:fs";
 import { join } from "node:path";
 import type { DatabaseSync } from "node:sqlite";
 import type {
@@ -75,18 +76,24 @@ import {
 } from "./summary-fallback.js";
 import { attachTranscriptEntryMeta, getTranscriptEntryId, resolveTranscriptMessageCreatedAt } from "./transcript.js";
 import { type TranscriptReconcileResult } from "./reconcile-plan.js";
-import { TranscriptReconciler } from "./transcript-reconciler.js";
-import { SessionRolloverDetector } from "./session-rollover.js";
 import { describeAssembledPrefixChange, formatOverflowDiagnosticsForLog, shouldLogOverflowDiagnostics, type AssemblePrefixSnapshot, type BootstrapImportObservation } from "./assemble-debug.js";
-import { appendForkBoundedLiveSuffixWithinBudget, buildDegradedLiveAssembleResult, buildForkBoundedLiveFallback, clampMessagesToSerializedBudget, forkBoundedLiveSuffixAppendLogLevel, resolveDeferredAssemblyPressure } from "./assemble-fallback.js";
+
+import { buildDegradedLiveAssembleResult, clampMessagesToSerializedBudget, resolveDeferredAssemblyPressure } from "./assemble-fallback.js";
 import { resolveBootstrapMaxTokens, trimBootstrapMessagesToBudget } from "./bootstrap-budget.js";
 import { batchLooksLikeHeartbeatAckTurn, pruneHeartbeatOkTurns } from "./heartbeat-filter.js";
 import { appendUncoveredVolatileLiveInputsWithinBudget, isVolatileLiveInputMessage, messageContentCoveredBySummary, resolveProtectedFreshTailAssembledIndexes } from "./live-coverage.js";
 import { buildMessageParts, extractMessageContent, filterPersistableMessages, hasPersistableMessageRole, isOpenClawRuntimeContextLeak, toStoredMessage } from "./message-content.js";
 import { PROMPT_RECALL_MAX_MESSAGES, PROMPT_RECALL_SEARCH_CANDIDATE_LIMIT, buildPromptRecallProjectionFingerprint, extractPromptRecallIdentifiers, extractPromptRecallSnippet, findPromptRecallIdentifierIndex, isPromptRecallEligibleRole, normalizePromptRecallCoverageText, normalizePromptRecallText, renderPromptRecallMessage } from "./prompt-recall.js";
-import { listTranscriptToolResultEntryIdsByCallId } from "./replay-metadata.js";
-import { extractRuntimePromptTokenCount } from "./token-accounting.js";
-import { asRecord, formatDurationMs, resolvePositiveInteger } from "./value-utils.js";
+import {
+  externalizedReplayMetadataMatches,
+  extractPlainToolReplayTextsById,
+  extractRawBlockIdsFromPartMetadata,
+  extractRawBlockSignatureFromPartMetadata,
+  extractRawIdsFromPartMetadata,
+} from "./replay-metadata.js";
+import { buildMessageIdentityHash } from "./store/message-identity.js";
+import { estimateSessionTokenCountForAfterTurn, extractRuntimePromptTokenCount } from "./token-accounting.js";
+import { asRecord, formatDurationMs, resolvePositiveInteger, safeString } from "./value-utils.js";
 
 type AgentMessage = Parameters<ContextEngine["ingest"]>[0]["message"];
 const LOSSLESS_AGENT_RUN_REQUIRED_HOST_CAPABILITIES: ContextEngineHostCapability[] = [
@@ -110,7 +117,6 @@ const LOSSLESS_AGENT_RUN_CAPTURE_ONLY_HOST_CAPABILITIES: ContextEngineHostCapabi
   "maintain",
 ];
 const MAX_PREVIOUS_ASSEMBLED_SNAPSHOTS = 100;
-const FORK_BOUNDED_BOOTSTRAP_REASON = "fork-bounded bootstrap import";
 
 // Host-contract dependency: the deliberate-vs-incidental archive distinction
 // relies on OpenClaw emitting these exact reason strings only for genuine
@@ -125,15 +131,6 @@ const HOST_SESSION_END_REASON_DELETED = "deleted";
 const HOST_SESSION_END_REASON_RESET = "reset";
 const CONTEXT_ENGINE_PROJECTION_EPOCH_VERSION = "summary-prefix-v1";
 const DEFERRED_ASSEMBLY_DEGRADED_PRESSURE_RATIO = 0.75;
-/**
- * Maximum retry attempts before the assemble emergency drain stops forwarding
- * force=true to consumeDeferredCompactionDebt. After this threshold, the drain
- * falls back to respecting backoff and degrading the live prompt instead of
- * retrying compaction. Set to 3 to limit force retry attempts, matching common
- * retry budget patterns — after 3 consecutive failures, compaction is unlikely
- * to succeed and fallback to degraded live prompt is safer.
- */
-const ASSEMBLE_FORCE_MAX_RETRY_ATTEMPTS = 3;
 type CompactionExecutionParams = {
   conversationId: number;
   sessionId: string;
@@ -338,18 +335,11 @@ export class LcmContextEngine implements ContextEngine {
   // ── After-turn batch replay dedup ────────────────────────────────────────
   private readonly batchDeduplicator: BatchDeduplicator;
 
-  // ── Missed-lifecycle rollover detection ──────────────────────────────────
-  private readonly sessionRolloverDetector: SessionRolloverDetector;
-
   // ── Compaction telemetry + deferred-debt recording ───────────────────────
   private readonly telemetryRecorder: CompactionTelemetryRecorder;
 
   // ── Scoped context-threshold override resolution ─────────────────────────
   private readonly contextThresholdResolver: ContextThresholdResolver;
-
-  // ── Transcript/DB tail reconciliation ────────────────────────────────────
-  private readonly transcriptReconciler: TranscriptReconciler;
-
 
   constructor(deps: LcmDependencies, database: DatabaseSync) {
     this.deps = deps;
@@ -464,12 +454,6 @@ export class LcmContextEngine implements ContextEngine {
       this.config.largeFilesDir,
       this.deps,
     );
-    this.sessionRolloverDetector = new SessionRolloverDetector(
-      this.conversationStore,
-      this.summaryStore,
-      this.deps,
-      (params) => this.applySessionReplacement(params),
-    );
     this.focusBriefStore = new FocusBriefStore(this.db);
     this.compactionTelemetryStore = new CompactionTelemetryStore(this.db);
     this.compactionMaintenanceStore = new CompactionMaintenanceStore(this.db);
@@ -544,25 +528,6 @@ export class LcmContextEngine implements ContextEngine {
       this.summaryStore,
       compactionConfig,
       this.deps.log,
-    );
-    this.transcriptReconciler = new TranscriptReconciler(
-      {
-        config: this.config,
-        db: this.db,
-        deps: this.deps,
-        conversationStore: this.conversationStore,
-        summaryStore: this.summaryStore,
-        shouldIgnoreSession: (params) => this.shouldIgnoreSession(params),
-        resolveSessionQueueKey: (sessionId, sessionKey) =>
-          this.resolveSessionQueueKey(sessionId, sessionKey),
-        withSessionQueue: (queueKey, operation, options) =>
-          this.withSessionQueue(queueKey, operation, options),
-        formatSessionLogContext: (params) => this.formatSessionLogContext(params),
-        recordRecentBootstrapImport: (conversationId, importedMessages, reason) =>
-          this.recordRecentBootstrapImport(conversationId, importedMessages, reason),
-        ingestSingle: (params) => this.ingestSingle(params),
-      },
-      this.sessionRolloverDetector,
     );
     this.retrieval = new RetrievalEngine(this.conversationStore, this.summaryStore);
   }
@@ -818,8 +783,6 @@ export class LcmContextEngine implements ContextEngine {
     currentTokenCount?: number;
     runtimeContext?: ContextEngineMaintenanceRuntimeContext;
     legacyParams?: Record<string, unknown>;
-    /** When true, skip the backoff check — used by assemble emergency drain. */
-    force?: boolean;
   }): Promise<(ContextEngineMaintenanceResult & { exhausted?: boolean }) | null> {
     const maintenance = await this.compactionMaintenanceStore.getConversationCompactionMaintenance(
       params.conversationId,
@@ -834,13 +797,12 @@ export class LcmContextEngine implements ContextEngine {
       scope: this.resolveSessionQueueKey(params.sessionId, params.sessionKey),
     });
 
-    const nextAttemptAfter = maintenance.nextAttemptAfter;
-    const backoffActive =
-      nextAttemptAfter !== null && nextAttemptAfter.getTime() > Date.now();
-
-    if (!params.force && backoffActive) {
+    if (
+      maintenance.nextAttemptAfter !== null &&
+      maintenance.nextAttemptAfter.getTime() > Date.now()
+    ) {
       this.deps.log.debug(
-        `[lcm] maintain: deferred compaction backoff active conversation=${params.conversationId} ${sessionLabel} retryAttempts=${maintenance.retryAttempts} nextAttemptAfter=${nextAttemptAfter.toISOString()} debtReason=${maintenance.reason ?? "null"}`,
+        `[lcm] maintain: deferred compaction backoff active conversation=${params.conversationId} ${sessionLabel} retryAttempts=${maintenance.retryAttempts} nextAttemptAfter=${maintenance.nextAttemptAfter.toISOString()} debtReason=${maintenance.reason ?? "null"}`,
       );
       return {
         changed: false,
@@ -848,12 +810,6 @@ export class LcmContextEngine implements ContextEngine {
         rewrittenEntries: 0,
         reason: "deferred compaction backoff active",
       };
-    }
-
-    if (params.force && backoffActive) {
-      this.deps.log.warn(
-        `[lcm] consumeDeferredCompactionDebt: force=true skipping backoff conversation=${params.conversationId} ${sessionLabel} retryAttempts=${maintenance.retryAttempts} nextAttemptAfter=${nextAttemptAfter.toISOString()}`,
-      );
     }
 
     await this.compactionMaintenanceStore.markProactiveCompactionRunning({
@@ -960,7 +916,6 @@ export class LcmContextEngine implements ContextEngine {
         contextThresholdOverride: resolvedContextThreshold,
         runtimeContext: params.runtimeContext,
         legacyParams: params.legacyParams,
-        force: params.force,
       });
       const blockedByAuthCircuitBreaker = result.reason === "circuit breaker open";
       // #639 Mode 2: terminal compaction exhaustion (no eligible candidates while
@@ -1060,8 +1015,6 @@ export class LcmContextEngine implements ContextEngine {
                 ...(telemetry.model ? { model: telemetry.model } : {}),
               }
             : undefined;
-        const retryAttempts = maintenance?.retryAttempts ?? 0;
-        const forceAllowed = retryAttempts < ASSEMBLE_FORCE_MAX_RETRY_ATTEMPTS;
         const result = await this.consumeDeferredCompactionDebt({
           conversationId: params.conversationId,
           sessionId: params.sessionId,
@@ -1069,7 +1022,6 @@ export class LcmContextEngine implements ContextEngine {
           tokenBudget: cappedTokenBudget,
           currentTokenCount: normalizedCurrentTokenCount,
           legacyParams: deferredLegacyParams,
-          force: forceAllowed,
         });
         drainResult = { exhausted: result?.exhausted === true };
       },
@@ -1814,7 +1766,7 @@ export class LcmContextEngine implements ContextEngine {
     this.recentBootstrapImportsByConversation.set(conversationId, {
       importedMessages: Math.max(0, Math.floor(importedMessages)),
       reason,
-      forkBounded: reason === FORK_BOUNDED_BOOTSTRAP_REASON,
+      forkBounded: false,
       observedAt: new Date(),
     });
     while (this.recentBootstrapImportsByConversation.size > MAX_PREVIOUS_ASSEMBLED_SNAPSHOTS) {
@@ -1824,6 +1776,65 @@ export class LcmContextEngine implements ContextEngine {
       }
       this.recentBootstrapImportsByConversation.delete(oldestConversationId);
     }
+  }
+
+  private async reconcileProjectedTranscriptMessages(params: {
+    sessionId: string;
+    sessionKey?: string;
+    conversationId: number;
+    historicalMessages: AgentMessage[];
+  }): Promise<TranscriptReconcileResult> {
+    let importedMessages = 0;
+    let hasOverlap = false;
+    const entryIds = params.historicalMessages
+      .map((message) => getTranscriptEntryId(message))
+      .filter((entryId): entryId is string => typeof entryId === "string" && entryId.length > 0);
+    const existingEntryIds =
+      entryIds.length > 0
+        ? await this.conversationStore.filterExistingTranscriptEntryIds(
+            params.conversationId,
+            entryIds,
+          )
+        : new Set<string>();
+
+    for (const message of params.historicalMessages) {
+      const entryId = getTranscriptEntryId(message);
+      if (entryId && existingEntryIds.has(entryId)) {
+        hasOverlap = true;
+        continue;
+      }
+
+      if (entryId) {
+        const stored = toStoredMessage(message);
+        const adopted = await this.conversationStore.adoptTranscriptEntryId(
+          params.conversationId,
+          stored.role,
+          stored.content,
+          entryId,
+        );
+        if (adopted) {
+          hasOverlap = true;
+          continue;
+        }
+      }
+
+      const result = await this.ingestSingle({
+        sessionId: params.sessionId,
+        sessionKey: params.sessionKey,
+        message,
+        createdAt: resolveTranscriptMessageCreatedAt(message),
+        skipReplayTimestampFloodGuard: true,
+      });
+      if (result.ingested) {
+        importedMessages += 1;
+      }
+    }
+
+    return {
+      importedMessages,
+      blockedByImportCap: false,
+      hasOverlap,
+    };
   }
 
   private async bootstrapFromVisibleTranscriptProjection(params: {
@@ -1902,13 +1913,11 @@ export class LcmContextEngine implements ContextEngine {
             };
           }
 
-          const reconcile = await this.transcriptReconciler.reconcileSessionTail({
+          const reconcile = await this.reconcileProjectedTranscriptMessages({
             sessionId: params.sessionId,
             sessionKey: params.sessionKey,
             conversationId,
             historicalMessages,
-            checkpointEntryHash: undefined,
-            lastProcessedEntryId: undefined,
           });
           this.deps.log.debug(
             `[lcm] bootstrap: sqlite projection reconcile finished conversation=${conversationId} ${params.sessionLabel} importedMessages=${reconcile.importedMessages} overlap=${reconcile.hasOverlap} blockedByImportCap=${reconcile.blockedByImportCap} duration=${formatDurationMs(Date.now() - params.startedAt)}`,
@@ -2063,13 +2072,11 @@ export class LcmContextEngine implements ContextEngine {
             };
           }
 
-          const reconcile = await this.transcriptReconciler.reconcileSessionTail({
+          const reconcile = await this.reconcileProjectedTranscriptMessages({
             sessionId: params.sessionId,
             sessionKey: params.sessionKey,
             conversationId,
             historicalMessages,
-            checkpointEntryHash: undefined,
-            lastProcessedEntryId: undefined,
           });
           this.deps.log.debug(
             `[lcm] afterTurn: visible projection reconcile finished conversation=${conversationId} ${params.sessionLabel} importedMessages=${reconcile.importedMessages} overlap=${reconcile.hasOverlap} blockedByImportCap=${reconcile.blockedByImportCap} duration=${formatDurationMs(Date.now() - params.startedAt)}`,
@@ -2457,6 +2464,344 @@ export class LcmContextEngine implements ContextEngine {
     );
   }
 
+  private async filterPersistedRawIdReplayBatch(params: {
+    conversationId: number;
+    sessionId: string;
+    sessionKey?: string;
+    messages: AgentMessage[];
+  }): Promise<AgentMessage[]> {
+    const idMatchPredicate = `(
+      json_extract(mp.metadata, '$.raw.id') = ?
+      OR json_extract(mp.metadata, '$.raw.call_id') = ?
+      OR json_extract(mp.metadata, '$.raw.toolCallId') = ?
+      OR json_extract(mp.metadata, '$.raw.tool_call_id') = ?
+      OR json_extract(mp.metadata, '$.raw.toolUseId') = ?
+      OR json_extract(mp.metadata, '$.raw.tool_use_id') = ?
+      OR mp.tool_call_id = ?
+      OR json_extract(mp.metadata, '$.id') = ?
+      OR json_extract(mp.metadata, '$.call_id') = ?
+      OR json_extract(mp.metadata, '$.toolCallId') = ?
+      OR json_extract(mp.metadata, '$.tool_call_id') = ?
+      OR json_extract(mp.metadata, '$.toolUseId') = ?
+      OR json_extract(mp.metadata, '$.tool_use_id') = ?
+    )`;
+    const rawCoverageStmt = this.db.prepare(
+      `SELECT m.message_id AS messageId
+       FROM message_parts mp
+       JOIN messages m ON m.message_id = mp.message_id
+       WHERE m.conversation_id = ?
+         AND m.role = ?
+         AND mp.metadata IS NOT NULL
+         AND json_valid(mp.metadata)
+         AND ${idMatchPredicate}`,
+    );
+    const identityCoverageStmt = this.db.prepare(
+      `SELECT m.message_id AS messageId
+       FROM message_parts mp
+       JOIN messages m ON m.message_id = mp.message_id
+       WHERE m.conversation_id = ?
+         AND m.role = ?
+         AND m.identity_hash = ?
+         AND mp.metadata IS NOT NULL
+         AND json_valid(mp.metadata)
+         AND ${idMatchPredicate}`,
+    );
+    const externalizedCoverageStmt = this.db.prepare(
+      `SELECT
+         m.message_id AS messageId,
+         json_extract(mp.metadata, '$.externalizedFileId') AS fileId,
+         json_extract(mp.metadata, '$.originalByteSize') AS originalByteSize,
+         mp.metadata AS metadata
+       FROM message_parts mp
+       JOIN messages m ON m.message_id = mp.message_id
+       WHERE m.conversation_id = ?
+         AND m.role = ?
+         AND mp.metadata IS NOT NULL
+         AND json_valid(mp.metadata)
+         AND json_extract(mp.metadata, '$.externalizationReason') = 'large_tool_result'
+         AND ${idMatchPredicate}`,
+    );
+    const rawBlockSignatureStmt = this.db.prepare(
+      `SELECT metadata
+       FROM message_parts
+       WHERE message_id = ?
+       ORDER BY ordinal ASC`,
+    );
+
+    const filtered: AgentMessage[] = [];
+    let replayedMessages = 0;
+
+    for (const message of params.messages) {
+      const stored = toStoredMessage(message);
+      const replayIds = new Set<string>();
+      const rawBlockIds = new Set<string>();
+      const rawBlockSignatures: string[] = [];
+      const replayIdsByPart: string[][] = [];
+      let everyPartHasRawBlockId = true;
+      const parts = buildMessageParts({
+        sessionId: params.sessionId,
+        message,
+        fallbackContent: stored.content,
+      });
+      for (const part of parts) {
+        const partRawBlockIds = extractRawBlockIdsFromPartMetadata(part.metadata);
+        if (partRawBlockIds.length === 0) {
+          everyPartHasRawBlockId = false;
+        }
+        for (const rawId of partRawBlockIds) {
+          rawBlockIds.add(rawId);
+        }
+        const rawBlockSignature = extractRawBlockSignatureFromPartMetadata(part.metadata);
+        if (rawBlockSignature) {
+          rawBlockSignatures.push(rawBlockSignature);
+        }
+        const partReplayIds = extractRawIdsFromPartMetadata(part.metadata);
+        replayIdsByPart.push(partReplayIds);
+        for (const rawId of partReplayIds) {
+          replayIds.add(rawId);
+        }
+      }
+
+      if (replayIds.size === 0) {
+        filtered.push(message);
+        continue;
+      }
+
+      const canMatchWithoutIdentity = rawBlockIds.size > 0 && everyPartHasRawBlockId;
+      const matchedIds = canMatchWithoutIdentity ? rawBlockIds : replayIds;
+      const externalizedTextsById = extractPlainToolReplayTextsById(message);
+      const coverageByMessageId = new Map<number, Set<string>>();
+      for (const rawId of matchedIds) {
+        const rawIdArgs = [
+          rawId,
+          rawId,
+          rawId,
+          rawId,
+          rawId,
+          rawId,
+          rawId,
+          rawId,
+          rawId,
+          rawId,
+          rawId,
+          rawId,
+          rawId,
+        ];
+        let rows: Array<{ messageId: number }>;
+        if (canMatchWithoutIdentity) {
+          rows = rawCoverageStmt.all(
+            params.conversationId,
+            stored.role,
+            ...rawIdArgs,
+          ) as Array<{ messageId: number }>;
+        } else {
+          const identityHash = buildMessageIdentityHash(stored.role, stored.content);
+          rows = identityCoverageStmt.all(
+            params.conversationId,
+            stored.role,
+            identityHash,
+            ...rawIdArgs,
+          ) as Array<{ messageId: number }>;
+        }
+        for (const row of rows) {
+          const matchedRawIds = coverageByMessageId.get(row.messageId) ?? new Set<string>();
+          matchedRawIds.add(rawId);
+          coverageByMessageId.set(row.messageId, matchedRawIds);
+        }
+      }
+
+      let alreadyPersisted = false;
+      if (canMatchWithoutIdentity) {
+        for (const [messageId, rawIds] of coverageByMessageId.entries()) {
+          if (rawIds.size !== matchedIds.size) {
+            continue;
+          }
+          const rows = rawBlockSignatureStmt.all(messageId) as Array<{ metadata: string | null }>;
+          if (rows.length !== parts.length) {
+            continue;
+          }
+          let allPartsMatch = true;
+          for (let index = 0; index < rows.length; index += 1) {
+            const persistedMetadata = rows[index]!.metadata;
+            const persistedSignature = extractRawBlockSignatureFromPartMetadata(persistedMetadata);
+            if (
+              persistedSignature === rawBlockSignatures[index] &&
+              externalizedReplayMetadataMatches(persistedMetadata, parts[index]?.metadata)
+            ) {
+              continue;
+            }
+            let externalizedPartMatches = false;
+            for (const rawId of replayIdsByPart[index] ?? []) {
+              if (!extractRawIdsFromPartMetadata(persistedMetadata).includes(rawId)) {
+                continue;
+              }
+              const externalizedText = externalizedTextsById.get(rawId);
+              if (externalizedText === undefined) {
+                continue;
+              }
+              let persistedParsed: unknown;
+              try {
+                persistedParsed = persistedMetadata ? JSON.parse(persistedMetadata) : undefined;
+              } catch {
+                continue;
+              }
+              const persistedRecord = asRecord(persistedParsed);
+              const fileId = safeString(persistedRecord?.externalizedFileId);
+              const originalByteSize = persistedRecord?.originalByteSize;
+              if (
+                !fileId ||
+                Number(originalByteSize) !== Buffer.byteLength(externalizedText, "utf8")
+              ) {
+                continue;
+              }
+              const largeFile = await this.summaryStore.getLargeFile(fileId);
+              if (!largeFile) {
+                continue;
+              }
+              let storedText: string;
+              try {
+                storedText = readFileSync(largeFile.storageUri, "utf8");
+              } catch {
+                continue;
+              }
+              if (
+                storedText === externalizedText &&
+                externalizedReplayMetadataMatches(persistedMetadata, parts[index]?.metadata)
+              ) {
+                externalizedPartMatches = true;
+                break;
+              }
+            }
+            if (!externalizedPartMatches) {
+              allPartsMatch = false;
+              break;
+            }
+          }
+          if (allPartsMatch) {
+            alreadyPersisted = true;
+            break;
+          }
+        }
+      } else {
+        for (const [messageId, rawIds] of coverageByMessageId.entries()) {
+          if (rawIds.size !== matchedIds.size) {
+            continue;
+          }
+          const rows = rawBlockSignatureStmt.all(messageId) as Array<{ metadata: string | null }>;
+          if (
+            rows.length === parts.length &&
+            rows.every((row, index) => row.metadata === (parts[index]?.metadata ?? null))
+          ) {
+            alreadyPersisted = true;
+            break;
+          }
+        }
+      }
+
+      const canUseExternalizedFallback = parts.length === 1 || everyPartHasRawBlockId;
+      if (!alreadyPersisted && canUseExternalizedFallback && externalizedTextsById.size > 0) {
+        const externalizedCoverageByMessageId = new Map<number, Set<string>>();
+        for (const rawId of matchedIds) {
+          const externalizedText = externalizedTextsById.get(rawId);
+          if (externalizedText === undefined) {
+            continue;
+          }
+          const externalizedByteSize = Buffer.byteLength(externalizedText, "utf8");
+          const rawIdArgs = [
+            rawId,
+            rawId,
+            rawId,
+            rawId,
+            rawId,
+            rawId,
+            rawId,
+            rawId,
+            rawId,
+            rawId,
+            rawId,
+            rawId,
+            rawId,
+          ];
+          const rows = externalizedCoverageStmt.all(
+            params.conversationId,
+            stored.role,
+            ...rawIdArgs,
+          ) as Array<{
+            messageId: number;
+            fileId: unknown;
+            originalByteSize: unknown;
+            metadata: string | null;
+          }>;
+          for (const row of rows) {
+            if (
+              typeof row.fileId !== "string" ||
+              Number(row.originalByteSize) !== externalizedByteSize
+            ) {
+              continue;
+            }
+            const largeFile = await this.summaryStore.getLargeFile(row.fileId);
+            if (!largeFile) {
+              continue;
+            }
+            let storedText: string;
+            try {
+              storedText = readFileSync(largeFile.storageUri, "utf8");
+            } catch {
+              continue;
+            }
+            if (
+              storedText !== externalizedText ||
+              !externalizedReplayMetadataMatches(row.metadata, parts[0]?.metadata)
+            ) {
+              continue;
+            }
+            const matchedRawIds =
+              externalizedCoverageByMessageId.get(row.messageId) ?? new Set<string>();
+            matchedRawIds.add(rawId);
+            externalizedCoverageByMessageId.set(row.messageId, matchedRawIds);
+          }
+        }
+        alreadyPersisted = Array.from(externalizedCoverageByMessageId.values()).some(
+          (rawIds) => rawIds.size === matchedIds.size,
+        );
+      }
+
+      if (alreadyPersisted) {
+        replayedMessages += 1;
+      } else {
+        filtered.push(message);
+      }
+    }
+
+    if (replayedMessages > 0) {
+      const sessionContext = this.formatSessionLogContext({
+        conversationId: params.conversationId,
+        sessionId: params.sessionId,
+        sessionKey: params.sessionKey,
+      });
+      this.deps.log.warn(
+        `[lcm] ingestBatch: dropped ${replayedMessages}/${params.messages.length} raw-id replay messages for ${sessionContext}`,
+      );
+    }
+
+    return filtered;
+  }
+
+  private batchHasRawReplayIds(params: { sessionId: string; messages: AgentMessage[] }): boolean {
+    for (const message of params.messages) {
+      const stored = toStoredMessage(message);
+      const parts = buildMessageParts({
+        sessionId: params.sessionId,
+        message,
+        fallbackContent: stored.content,
+      });
+      if (parts.some((part) => extractRawIdsFromPartMetadata(part.metadata).length > 0)) {
+        return true;
+      }
+    }
+    return false;
+  }
+
   async ingestBatch(params: {
     sessionId: string;
     sessionKey?: string;
@@ -2478,19 +2823,16 @@ export class LcmContextEngine implements ContextEngine {
       async () => {
         return this.conversationStore.withTransaction(async () => {
           let messages = params.messages;
-          if (!params.isHeartbeat) {
-            const conversation = await this.conversationStore.getConversationForSession({
-              sessionId: params.sessionId,
+          if (this.batchHasRawReplayIds({ sessionId: params.sessionId, messages })) {
+            const conversation = await this.conversationStore.getOrCreateConversation(params.sessionId, {
               sessionKey: params.sessionKey,
             });
-            if (conversation) {
-              messages = await this.transcriptReconciler.filterPersistedRawIdReplayBatch({
-                conversationId: conversation.conversationId,
-                sessionId: params.sessionId,
-                sessionKey: params.sessionKey,
-                messages: params.messages,
-              });
-            }
+            messages = await this.filterPersistedRawIdReplayBatch({
+              conversationId: conversation.conversationId,
+              sessionId: params.sessionId,
+              sessionKey: params.sessionKey,
+              messages,
+            });
           }
           let ingestedCount = 0;
           for (const message of messages) {
@@ -2611,18 +2953,6 @@ export class LcmContextEngine implements ContextEngine {
       }
       if (transcriptReconcileBlockedByAmbiguousRollover) {
         return;
-      }
-    } else if (transcriptReconcileResult.transcriptUnavailableWithCheckpoint) {
-      dedupedNewMessages =
-        await this.batchDeduplicator.deduplicateAfterTurnBatchAgainstPreservedCheckpoint(
-          params.sessionId,
-          params.sessionKey,
-          newMessages,
-        );
-      if (newMessages.length > 0 && dedupedNewMessages.length < newMessages.length) {
-        this.deps.log.debug(
-          `[lcm] afterTurn: transcript unavailable with preserved checkpoint; runtime batch deduplicated to ${dedupedNewMessages.length}/${newMessages.length} messages ${sessionLabel}`,
-        );
       }
     } else if (transcriptReconcileResult.transcriptCovered) {
       // The transcript reconcile read the file to its frontier, so the DB
@@ -2751,10 +3081,7 @@ export class LcmContextEngine implements ContextEngine {
       );
     }
 
-    const conversation = await this.conversationStore.getConversationForSession({
-      sessionId: params.sessionId,
-      sessionKey: params.sessionKey,
-    });
+    const estimatedContextTokens = estimateSessionTokenCountForAfterTurn(params.messages);
     const runtimePromptTokens = extractRuntimePromptTokenCount(asRecord(params.runtimeContext));
     const suppliedCurrentTokenCount = this.normalizeObservedTokenCount(
       params.currentTokenCount ??
@@ -2764,12 +3091,17 @@ export class LcmContextEngine implements ContextEngine {
         }
       ).currentTokenCount,
     );
-    const observedCurrentTokenCount = runtimePromptTokens ?? suppliedCurrentTokenCount;
+    const observedCurrentTokenCount =
+      runtimePromptTokens ?? suppliedCurrentTokenCount ?? estimatedContextTokens;
     if (runtimePromptTokens !== undefined) {
       this.deps.log.debug(
-        `[lcm] afterTurn: using runtime prompt token count currentTokenCount=${runtimePromptTokens}`,
+        `[lcm] afterTurn: using runtime prompt token count currentTokenCount=${runtimePromptTokens} estimatedTokenCount=${estimatedContextTokens}`,
       );
     }
+    const conversation = await this.conversationStore.getConversationForSession({
+      sessionId: params.sessionId,
+      sessionKey: params.sessionKey,
+    });
     if (!conversation) {
       this.deps.log.debug(
         `[lcm] afterTurn: conversation lookup missed ${sessionLabel} ingestBatch=${ingestBatch.length} duration=${formatDurationMs(Date.now() - startedAt)}`,
@@ -2804,7 +3136,7 @@ export class LcmContextEngine implements ContextEngine {
       | {
           reason: string;
           tokenBudget: number;
-          currentTokenCount?: number;
+          currentTokenCount: number;
         }
       | null = null;
 
@@ -3025,31 +3357,6 @@ export class LcmContextEngine implements ContextEngine {
       const startedAt = Date.now();
       const sessionLabel = formatSessionLabel(params.sessionId, params.sessionKey);
 
-      if (params.sessionKey?.trim()) {
-        await this.withSessionQueue(
-          this.resolveSessionQueueKey(params.sessionId, params.sessionKey),
-          async () =>
-            this.conversationStore.withTransaction(async () => {
-              await this.sessionRolloverDetector.rotateIsolatedCronConversationIfRuntimeChanged({
-                phase: "assemble",
-                sessionId: params.sessionId,
-                sessionKey: params.sessionKey,
-                createReplacement: false,
-              });
-              await this.sessionRolloverDetector.rotateStaleSessionKeyConversationIfTrackedTranscriptMissing({
-                phase: "assemble",
-                sessionId: params.sessionId,
-                sessionKey: params.sessionKey,
-                createReplacement: false,
-              });
-            }),
-          {
-            operationName: "assembleLifecycleGuard",
-            context: sessionLabel,
-          },
-        );
-      }
-
       const conversation = await this.conversationStore.getConversationForSession({
         sessionId: params.sessionId,
         sessionKey: params.sessionKey,
@@ -3061,26 +3368,6 @@ export class LcmContextEngine implements ContextEngine {
         return safeFallback();
       }
 
-      const ambiguousRollover =
-        await this.sessionRolloverDetector.findAmbiguousSessionKeyRuntimeRollover({
-          phase: "assemble",
-          sessionId: params.sessionId,
-          sessionKey: params.sessionKey,
-        });
-      if (ambiguousRollover) {
-        // No tier-2 resolution here: assemble only sees the host's live
-        // window (often just the new prompt), which is not transcript
-        // evidence — judging freshness on it could wrongly archive a
-        // continuing conversation. bootstrap/afterTurn heal with the full
-        // transcript file on the next call.
-        this.sessionRolloverDetector.logAmbiguousSessionKeyRuntimeRollover({
-          phase: "assemble",
-          rollover: ambiguousRollover,
-          sessionId: params.sessionId,
-          expected: true,
-        });
-        return safeFallback();
-      }
 
       // Intercept large tool results in live messages so even degraded
       // fallback paths send stubbed content to the model. The
@@ -3154,9 +3441,7 @@ export class LcmContextEngine implements ContextEngine {
         }
         return { messages: clamp.messages, estimatedTokens: clamp.serializedTokens };
       };
-      let storedContextTokens = await this.summaryStore.getContextTokenCount(
-        conversation.conversationId,
-      );
+      const liveContextTokens = estimateSessionTokenCountForAfterTurn(liveMessages);
       const maintenance = await this.compactionMaintenanceStore.getConversationCompactionMaintenance(
         conversation.conversationId,
       );
@@ -3174,12 +3459,12 @@ export class LcmContextEngine implements ContextEngine {
           tokenBudget * DEFERRED_ASSEMBLY_DEGRADED_PRESSURE_RATIO,
         );
         let pressure = resolveDeferredAssemblyPressure({
-          storedContextTokens,
+          liveContextTokens,
           maintenance,
         });
         if (pressure.pressureTokenCount > tokenBudget) {
           this.deps.log.warn(
-            `[lcm] assemble: emergency deferred compaction debt draining pre-assembly conversation=${conversation.conversationId} ${sessionLabel} storedContextTokens=${pressure.storedContextTokens} projectedTokenCount=${pressure.projectedTokenCount ?? "null"} tokenBudget=${tokenBudget} reason=over-budget`,
+            `[lcm] assemble: emergency deferred compaction debt draining pre-assembly conversation=${conversation.conversationId} ${sessionLabel} currentTokenCount=${pressure.observedContextTokens} projectedTokenCount=${pressure.projectedTokenCount ?? "null"} tokenBudget=${tokenBudget} reason=over-budget`,
           );
           let emergencyDrainResult: { exhausted: boolean } | null = null;
           try {
@@ -3188,23 +3473,20 @@ export class LcmContextEngine implements ContextEngine {
               sessionId: params.sessionId,
               sessionKey: params.sessionKey,
               tokenBudget,
-              currentTokenCount: pressure.storedContextTokens,
+              currentTokenCount: pressure.observedContextTokens,
             });
           } catch (error) {
             this.deps.log.warn(
               `[lcm] assemble: deferred compaction execution failed for ${sessionLabel}: ${describeLogError(error)}`,
             );
           }
-          storedContextTokens = await this.summaryStore.getContextTokenCount(
-            conversation.conversationId,
-          );
           const latestMaintenance =
             await this.compactionMaintenanceStore.getConversationCompactionMaintenance(
               conversation.conversationId,
             );
           if (latestMaintenance?.pending || latestMaintenance?.running) {
             pressure = resolveDeferredAssemblyPressure({
-              storedContextTokens,
+              liveContextTokens,
               maintenance: latestMaintenance,
             });
             if (pressure.pressureTokenCount > pressureThreshold) {
@@ -3229,7 +3511,7 @@ export class LcmContextEngine implements ContextEngine {
           };
         } else {
           this.deps.log.debug(
-            `[lcm] assemble: deferred compaction debt left pending conversation=${conversation.conversationId} ${sessionLabel} storedContextTokens=${pressure.storedContextTokens} projectedTokenCount=${pressure.projectedTokenCount ?? "null"} tokenBudget=${tokenBudget} reason=not-over-budget`,
+            `[lcm] assemble: deferred compaction debt left pending conversation=${conversation.conversationId} ${sessionLabel} currentTokenCount=${pressure.observedContextTokens} projectedTokenCount=${pressure.projectedTokenCount ?? "null"} tokenBudget=${tokenBudget} reason=not-over-budget`,
           );
         }
       }
@@ -3239,30 +3521,13 @@ export class LcmContextEngine implements ContextEngine {
           tokenBudget,
         });
         this.deps.log.warn(
-          `[lcm] assemble: degraded live fallback conversation=${conversation.conversationId} ${sessionLabel} reason=${deferredAssemblyDegradation.reason} storedContextTokens=${deferredAssemblyDegradation.pressure.storedContextTokens} projectedTokenCount=${deferredAssemblyDegradation.pressure.projectedTokenCount ?? "null"} tokenBudget=${tokenBudget} pressureThreshold=${Math.floor(tokenBudget * DEFERRED_ASSEMBLY_DEGRADED_PRESSURE_RATIO)} outputMessages=${degraded.messages.length} estimatedTokens=${degraded.estimatedTokens}`,
+          `[lcm] assemble: degraded live fallback conversation=${conversation.conversationId} ${sessionLabel} reason=${deferredAssemblyDegradation.reason} currentTokenCount=${deferredAssemblyDegradation.pressure.observedContextTokens} projectedTokenCount=${deferredAssemblyDegradation.pressure.projectedTokenCount ?? "null"} tokenBudget=${tokenBudget} pressureThreshold=${Math.floor(tokenBudget * DEFERRED_ASSEMBLY_DEGRADED_PRESSURE_RATIO)} outputMessages=${degraded.messages.length} estimatedTokens=${degraded.estimatedTokens}`,
         );
         return degraded;
       }
 
-      const bootstrapState = await this.summaryStore.getConversationBootstrapState(
-        conversation.conversationId,
-      );
-      const forkBoundedBootstrap = bootstrapState?.forkBounded === true;
-      const forkSourceMessageCount = bootstrapState?.forkSourceMessageCount ?? 0;
       const contextItems = await this.summaryStore.getContextItems(conversation.conversationId);
       if (contextItems.length === 0) {
-        if (forkBoundedBootstrap) {
-          const boundedFallback = buildForkBoundedLiveFallback({
-            liveMessages,
-            forkSourceMessageCount,
-            tokenBudget,
-            bootstrapMaxTokens: resolveBootstrapMaxTokens(this.config),
-          });
-          this.deps.log.debug(
-            `[lcm] assemble: no context items for fork-bounded bootstrap; using bounded live suffix conversation=${conversation.conversationId} ${sessionLabel} outputMessages=${boundedFallback.messages.length} duration=${formatDurationMs(Date.now() - startedAt)}`,
-          );
-          return boundedFallback;
-        }
         this.deps.log.debug(
           `[lcm] assemble: no context items conversation=${conversation.conversationId} ${sessionLabel} duration=${formatDurationMs(Date.now() - startedAt)}`,
         );
@@ -3274,16 +3539,10 @@ export class LcmContextEngine implements ContextEngine {
       // the live path to avoid dropping prompt context.
       const hasSummaryItems = contextItems.some((item) => item.itemType === "summary");
       if (!hasSummaryItems && contextItems.length < liveMessages.length) {
-        if (forkBoundedBootstrap) {
-          this.deps.log.debug(
-            `[lcm] assemble: using bounded fork bootstrap context conversation=${conversation.conversationId} ${sessionLabel} contextItems=${contextItems.length} liveMessages=${liveMessages.length} duration=${formatDurationMs(Date.now() - startedAt)}`,
-          );
-        } else {
-          this.deps.log.debug(
-            `[lcm] assemble: falling back to live context conversation=${conversation.conversationId} ${sessionLabel} contextItems=${contextItems.length} liveMessages=${liveMessages.length} duration=${formatDurationMs(Date.now() - startedAt)}`,
-          );
-          return boundedLiveFallback("coverage-trails-live");
-        }
+        this.deps.log.debug(
+          `[lcm] assemble: falling back to live context conversation=${conversation.conversationId} ${sessionLabel} contextItems=${contextItems.length} liveMessages=${liveMessages.length} duration=${formatDurationMs(Date.now() - startedAt)}`,
+        );
+        return boundedLiveFallback("coverage-trails-live");
       }
 
       const resolvedContextThreshold = this.contextThresholdResolver.resolve({
@@ -3306,42 +3565,13 @@ export class LcmContextEngine implements ContextEngine {
         stubLargeToolPayloads: this.config.stubLargeToolPayloads,
       });
 
-      const forkLiveSuffixAppend = forkBoundedBootstrap
-        ? appendForkBoundedLiveSuffixWithinBudget({
-            assembledMessages: assembled.messages,
-            assembledEstimatedTokens: assembled.estimatedTokens,
-            liveMessages,
-            forkSourceMessageCount,
-            tokenBudget,
-          })
-        : null;
-      const preRecallMessages = forkLiveSuffixAppend?.messages ?? assembled.messages;
-      const preRecallEstimatedTokens =
-        forkLiveSuffixAppend?.estimatedTokens ?? assembled.estimatedTokens;
-      if (forkLiveSuffixAppend && forkLiveSuffixAppend.appendedMessages > 0) {
-        // Appending the fork-bounded live suffix is routine for thread-fork
-        // sessions; only budget pressure needs operator attention.
-        const forkSuffixLogLevel = forkBoundedLiveSuffixAppendLogLevel(forkLiveSuffixAppend);
-        this.deps.log[forkSuffixLogLevel](
-          `[lcm] assemble: appended fork-bounded live suffix conversation=${conversation.conversationId} ${sessionLabel} appendedMessages=${forkLiveSuffixAppend.appendedMessages} appendedTokens=${forkLiveSuffixAppend.appendedTokens} evictedMessages=${forkLiveSuffixAppend.evictedMessages} evictedTokens=${forkLiveSuffixAppend.evictedTokens} overBudget=${forkLiveSuffixAppend.overBudget}`,
-        );
-      }
+
+      const preRecallMessages = assembled.messages;
+      const preRecallEstimatedTokens = assembled.estimatedTokens;
 
       // If assembly produced no messages for a non-empty live session,
       // fail safe to the live context.
       if (preRecallMessages.length === 0 && liveMessages.length > 0) {
-        if (forkBoundedBootstrap) {
-          const boundedFallback = buildForkBoundedLiveFallback({
-            liveMessages,
-            forkSourceMessageCount,
-            tokenBudget,
-            bootstrapMaxTokens: resolveBootstrapMaxTokens(this.config),
-          });
-          this.deps.log.debug(
-            `[lcm] assemble: empty assembled output for fork-bounded bootstrap; using bounded live suffix conversation=${conversation.conversationId} ${sessionLabel} outputMessages=${boundedFallback.messages.length} tokenBudget=${tokenBudget} duration=${formatDurationMs(Date.now() - startedAt)}`,
-          );
-          return boundedFallback;
-        }
         this.deps.log.debug(
           `[lcm] assemble: empty assembled output, using live context conversation=${conversation.conversationId} ${sessionLabel} contextItems=${contextItems.length} tokenBudget=${tokenBudget} duration=${formatDurationMs(Date.now() - startedAt)}`,
         );
@@ -3355,18 +3585,6 @@ export class LcmContextEngine implements ContextEngine {
       // every stored message is role "assistant" or "toolResult".
       const assembledHasUserTurn = preRecallMessages.some((m) => m.role === "user");
       if (!assembledHasUserTurn && liveMessages.length > 0) {
-        if (forkBoundedBootstrap) {
-          const boundedFallback = buildForkBoundedLiveFallback({
-            liveMessages,
-            forkSourceMessageCount,
-            tokenBudget,
-            bootstrapMaxTokens: resolveBootstrapMaxTokens(this.config),
-          });
-          this.deps.log.debug(
-            `[lcm] assemble: fork-bounded context has no user turns; using bounded live suffix conversation=${conversation.conversationId} ${sessionLabel} outputMessages=${boundedFallback.messages.length} duration=${formatDurationMs(Date.now() - startedAt)}`,
-          );
-          return boundedFallback;
-        }
         this.deps.log.debug(
           `[lcm] assemble: assembled context has no user turns, falling back to live context to prevent prefill errors conversation=${conversation.conversationId} ${sessionLabel} assembledMessages=${preRecallMessages.length} duration=${formatDurationMs(Date.now() - startedAt)}`,
         );
@@ -3413,13 +3631,6 @@ export class LcmContextEngine implements ContextEngine {
       if (budgetedPromptRecallCue) {
         protectedAssembledIndexes.add(0);
       }
-      if (forkLiveSuffixAppend) {
-        const promptRecallOffset = budgetedPromptRecallCue ? 1 : 0;
-        for (const index of forkLiveSuffixAppend.protectedIndexes) {
-          protectedAssembledIndexes.add(index + promptRecallOffset);
-        }
-      }
-
       let volatileLiveInputAppend = appendUncoveredVolatileLiveInputsWithinBudget({
         assembledMessages,
         assembledEstimatedTokens,
@@ -3441,11 +3652,6 @@ export class LcmContextEngine implements ContextEngine {
             assembled.debug?.freshTailProtectionMessageHashes ??
             assembled.debug?.preSanitizeFreshTailMessageHashes,
         });
-        if (forkLiveSuffixAppend) {
-          for (const index of forkLiveSuffixAppend.protectedIndexes) {
-            protectedAssembledIndexes.add(index);
-          }
-        }
         volatileLiveInputAppend = appendUncoveredVolatileLiveInputsWithinBudget({
           assembledMessages,
           assembledEstimatedTokens,
@@ -3542,7 +3748,7 @@ export class LcmContextEngine implements ContextEngine {
         const overflowDiagnostics = shouldLogOverflowDiagnostics({
           diagnostics: assembled.debug.overflowDiagnostics,
           assembledTokens: assembled.estimatedTokens,
-          storedContextTokens,
+          liveContextTokens,
         })
           ? ` overflowDiagnostics=${formatOverflowDiagnosticsForLog({
               diagnostics: assembled.debug.overflowDiagnostics,
@@ -3913,7 +4119,6 @@ export class LcmContextEngine implements ContextEngine {
                 ? this.config.newSessionRetainDepth
                 : 2;
             await this.summaryStore.pruneForNewSession(conversation.conversationId, retainDepth);
-            await this.summaryStore.markSoftResetPruned(conversation.conversationId);
             this.deps.log.info(
               `[lcm] /new pruned conversation ${conversation.conversationId} to retain depth ${retainDepth}`,
             );
@@ -4019,16 +4224,6 @@ export class LcmContextEngine implements ContextEngine {
   /** @internal Test seam: typed access to the batch deduplicator service. */
   getBatchDeduplicator(): BatchDeduplicator {
     return this.batchDeduplicator;
-  }
-
-  /** @internal Test seam: typed access to the transcript reconciler service. */
-  getTranscriptReconciler(): TranscriptReconciler {
-    return this.transcriptReconciler;
-  }
-
-  /** @internal Test seam: typed access to the session rollover detector. */
-  getSessionRolloverDetector(): SessionRolloverDetector {
-    return this.sessionRolloverDetector;
   }
 
   /** @internal Test seam: typed access to the large-file interceptor. */
