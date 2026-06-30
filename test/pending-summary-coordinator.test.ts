@@ -373,6 +373,96 @@ describe("PendingCompactionCoordinator", () => {
     ]);
   });
 
+  it("preserves mixed canonical and pending child order when condensing", async () => {
+    const { conversationStore, pendingSummaryStore, summaryStore } = createStores();
+    const conversation = await conversationStore.createConversation({
+      sessionId: "pending-coordinator-mixed-order-session",
+      sessionKey: "agent:main:pending-coordinator-mixed-order",
+    });
+    await summaryStore.insertSummary({
+      summaryId: "sum_order_existing_context",
+      conversationId: conversation.conversationId,
+      kind: "leaf",
+      depth: 0,
+      content: "existing canonical summary",
+      tokenCount: 5,
+      sourceMessageTokenCount: 5,
+    });
+    await summaryStore.appendContextSummary(
+      conversation.conversationId,
+      "sum_order_existing_context",
+    );
+    const messages = await conversationStore.createMessagesBulk([
+      {
+        conversationId: conversation.conversationId,
+        seq: 1,
+        role: "user",
+        content: "raw message after canonical summary",
+        tokenCount: 4,
+      },
+      {
+        conversationId: conversation.conversationId,
+        seq: 2,
+        role: "assistant",
+        content: "fresh tail message",
+        tokenCount: 4,
+      },
+    ]);
+    await summaryStore.appendContextMessages(
+      conversation.conversationId,
+      messages.map((message) => message.messageId),
+    );
+
+    const summarizeInputs: Array<{ isCondensed: boolean; sourceText: string }> = [];
+    const coordinator = new PendingCompactionCoordinator({
+      conversationStore,
+      pendingSummaryStore,
+      summaryStore,
+      model: "test-model",
+      leaseOwner: "test-worker",
+      config: {
+        freshTailCount: 1,
+        leafChunkTokens: 100,
+        condensedMinFanout: 2,
+        condensedMinSourceTokens: 1,
+        condensedChunkTokens: 100,
+      },
+      summarize: async (sourceText, _aggressive, options) => {
+        summarizeInputs.push({
+          isCondensed: options?.isCondensed === true,
+          sourceText,
+        });
+        return options?.isCondensed ? `condensed(${sourceText})` : `leaf(${sourceText})`;
+      },
+    });
+
+    await expect(
+      coordinator.runOnce({
+        conversationId: conversation.conversationId,
+        sessionKey: "agent:main:pending-coordinator-mixed-order",
+      }),
+    ).resolves.toMatchObject({ status: "planned", nodeCount: 2 });
+    await expect(
+      coordinator.runOnce({ conversationId: conversation.conversationId }),
+    ).resolves.toMatchObject({ status: "prepared" });
+    await expect(
+      coordinator.runOnce({ conversationId: conversation.conversationId }),
+    ).resolves.toMatchObject({ status: "prepared" });
+    const published = await coordinator.runOnce({ conversationId: conversation.conversationId });
+    expect(published).toMatchObject({ status: "published" });
+
+    const condensedInput = summarizeInputs.find((input) => input.isCondensed);
+    expect(condensedInput?.sourceText.indexOf("existing canonical summary")).toBeLessThan(
+      condensedInput?.sourceText.indexOf("leaf(") ?? -1,
+    );
+    const contextItems = await summaryStore.getContextItems(conversation.conversationId);
+    const condensedSummaryId = contextItems[0]!.summaryId!;
+    await expect(summaryStore.getSummaryParents(condensedSummaryId)).resolves.toMatchObject([
+      { summaryId: "sum_order_existing_context" },
+      { summaryId: expect.stringMatching(/^sum_/) },
+    ]);
+  });
+
   it("does not claim a condensed parent before pending children are ready", async () => {
     const { conversationStore, pendingSummaryStore } = createStores();
     const conversation = await conversationStore.createConversation({
