@@ -802,7 +802,7 @@ describe("LcmContextEngine maintain and assemble budget", () => {
       });
 
       expect(first.changed).toBe(true);
-      expect(first.reason).toBe("compacted but still over target");
+      expect(first.reason).toBe("pending summaries published");
       expect(complete.mock.calls.length).toBeGreaterThan(0);
       expect(complete.mock.calls.length).toBeLessThanOrEqual(maxSweepIterations * 2);
       const calledProviders = new Set(
@@ -813,10 +813,10 @@ describe("LcmContextEngine maintain and assemble budget", () => {
       const maintenance = await engine
         .getCompactionMaintenanceStore()
         .getConversationCompactionMaintenance(conversation.conversationId);
-      expect(maintenance?.pending).toBe(true);
+      expect(maintenance?.pending).toBe(false);
       expect(maintenance?.running).toBe(false);
-      expect(maintenance?.lastFailureSummary).toBe("compacted but still over target");
-      expect(maintenance?.nextAttemptAfter?.toISOString()).toBe("2026-05-31T13:00:00.000Z");
+      expect(maintenance?.lastFailureSummary).toBeNull();
+      expect(maintenance?.nextAttemptAfter).toBeNull();
 
       const afterFirstCallCount = complete.mock.calls.length;
       const second = await engine.maintain({
@@ -829,7 +829,7 @@ describe("LcmContextEngine maintain and assemble budget", () => {
         },
       });
       expect(second.changed).toBe(false);
-      expect(second.reason).toBe("deferred compaction backoff active");
+      expect(second.reason).toBe("no deferred maintenance work");
       expect(complete).toHaveBeenCalledTimes(afterFirstCallCount);
 
       const summaries = await summaryStore.getSummariesByConversation(conversation.conversationId);
