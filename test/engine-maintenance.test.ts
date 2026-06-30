@@ -392,6 +392,57 @@ describe("LcmContextEngine maintain and assemble budget", () => {
     }
   });
 
+  it("background deferred compaction does not immediately reschedule while retry backoff is active", async () => {
+    vi.useFakeTimers({ toFake: ["Date"] });
+    vi.setSystemTime(new Date("2026-05-31T12:00:00.000Z"));
+    try {
+      const engine = createEngine();
+      const privateEngine = engine as unknown as {
+        drainDeferredCompactionDebtIfIdle: (params: unknown) => Promise<void>;
+        scheduleDeferredCompactionDebtDrain: (params: unknown) => void;
+      };
+      const sessionId = "background-deferred-compaction-backoff-no-spin";
+      const conversation = await engine.getConversationStore().getOrCreateConversation(sessionId, {
+        sessionKey: undefined,
+      });
+      await engine.getCompactionMaintenanceStore().requestProactiveCompactionDebt({
+        conversationId: conversation.conversationId,
+        reason: "threshold",
+        tokenBudget: 4_096,
+        currentTokenCount: 3_500,
+      });
+      await engine.getCompactionMaintenanceStore().markProactiveCompactionRunning({
+        conversationId: conversation.conversationId,
+      });
+      await engine.getCompactionMaintenanceStore().markProactiveCompactionFinished({
+        conversationId: conversation.conversationId,
+        failureSummary: "provider timeout",
+        keepPending: true,
+      });
+      const scheduleSpy = vi
+        .spyOn(privateEngine, "scheduleDeferredCompactionDebtDrain")
+        .mockImplementation(() => undefined);
+
+      await privateEngine.drainDeferredCompactionDebtIfIdle({
+        conversationId: conversation.conversationId,
+        sessionId,
+        tokenBudget: 4_096,
+        currentTokenCount: 3_500,
+        reason: "threshold",
+        queueKey: sessionId,
+      });
+
+      expect(scheduleSpy).not.toHaveBeenCalled();
+      const maintenance = await engine
+        .getCompactionMaintenanceStore()
+        .getConversationCompactionMaintenance(conversation.conversationId);
+      expect(maintenance?.pending).toBe(true);
+      expect(maintenance?.nextAttemptAfter?.toISOString()).toBe("2026-05-31T12:05:00.000Z");
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it("maintain() keeps threshold debt pending when a no-action sweep stops at budget", async () => {
     const engine = createEngine();
     const sessionId = "maintain-deferred-no-action-budget-stop";

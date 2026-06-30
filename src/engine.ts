@@ -714,7 +714,11 @@ export class LcmContextEngine implements ContextEngine {
         await this.compactionMaintenanceStore.getConversationCompactionMaintenance(
           params.conversationId,
         );
-      if (nextMaintenance?.pending && !nextMaintenance.running) {
+      const retryBackoffActive =
+        nextMaintenance?.nextAttemptAfter !== null &&
+        nextMaintenance?.nextAttemptAfter !== undefined &&
+        nextMaintenance.nextAttemptAfter.getTime() > Date.now();
+      if (nextMaintenance?.pending && !nextMaintenance.running && !retryBackoffActive) {
         this.scheduleDeferredCompactionDebtDrain(params);
       }
     } finally {
