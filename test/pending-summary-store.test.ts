@@ -235,4 +235,54 @@ describe("PendingSummaryStore", () => {
       promotedAt: new Date("2026-06-30T12:02:00.000Z"),
     });
   });
+
+  it("does not claim nodes from stale batches", async () => {
+    const { conversationStore, pendingSummaryStore } = createStores();
+    const conversation = await conversationStore.createConversation({
+      sessionId: "pending-summary-stale-claim-session",
+    });
+
+    await pendingSummaryStore.createBatch({
+      batchId: "batch_stale_claim",
+      conversationId: conversation.conversationId,
+      sourceProjectionFingerprint: "projection:v1",
+      compactableStartOrdinal: 0,
+      compactableEndOrdinal: 0,
+      promptVersion: "leaf:v1",
+      model: "test-model",
+    });
+    await pendingSummaryStore.insertNode({
+      nodeId: "node_stale_claim",
+      batchId: "batch_stale_claim",
+      conversationId: conversation.conversationId,
+      kind: "leaf",
+      depth: 0,
+      status: "planned",
+      ordinalStart: 0,
+      ordinalEnd: 0,
+      sourceFingerprint: "source:claim",
+      promptVersion: "leaf:v1",
+      model: "test-model",
+    });
+
+    await pendingSummaryStore.markBatchStale({
+      batchId: "batch_stale_claim",
+      failureSummary: "source projection changed",
+    });
+
+    await expect(pendingSummaryStore.getNode("node_stale_claim")).resolves.toMatchObject({
+      status: "stale",
+      leaseOwner: null,
+      leaseExpiresAt: null,
+      failureSummary: "source projection changed",
+    });
+    await expect(
+      pendingSummaryStore.claimNextPlannedNode({
+        conversationId: conversation.conversationId,
+        leaseOwner: "worker-a",
+        leaseExpiresAt: new Date("2026-06-30T12:05:00.000Z"),
+        now: new Date("2026-06-30T12:00:00.000Z"),
+      }),
+    ).resolves.toBeNull();
+  });
 });

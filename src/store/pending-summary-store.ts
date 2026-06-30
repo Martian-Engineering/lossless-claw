@@ -388,15 +388,29 @@ export class PendingSummaryStore {
 
   /** Mark a pending compaction batch as stale. */
   async markBatchStale(input: { batchId: string; failureSummary?: string | null }): Promise<void> {
-    this.db
-      .prepare(
-        `UPDATE pending_compaction_batches
-         SET status = 'stale',
-             failure_summary = ?,
-             updated_at = datetime('now')
-         WHERE batch_id = ?`,
-      )
-      .run(input.failureSummary ?? null, input.batchId);
+    await this.withTransaction(async () => {
+      this.db
+        .prepare(
+          `UPDATE pending_compaction_batches
+           SET status = 'stale',
+               failure_summary = ?,
+               updated_at = datetime('now')
+           WHERE batch_id = ?`,
+        )
+        .run(input.failureSummary ?? null, input.batchId);
+      this.db
+        .prepare(
+          `UPDATE pending_summary_nodes
+           SET status = 'stale',
+               lease_owner = NULL,
+               lease_expires_at = NULL,
+               failure_summary = ?,
+               updated_at = datetime('now')
+           WHERE batch_id = ?
+             AND status IN ('planned', 'running', 'ready', 'failed')`,
+        )
+        .run(input.failureSummary ?? null, input.batchId);
+    });
   }
 
   /** Insert a pending summary node into a batch. */
@@ -603,33 +617,40 @@ export class PendingSummaryStore {
       const nowIso = (input.now ?? new Date()).toISOString();
       const row = this.db
         .prepare(
-          `SELECT node_id,
-                  batch_id,
-                  conversation_id,
-                  kind,
-                  depth,
-                  status,
-                  ordinal_start,
-                  ordinal_end,
-                  source_fingerprint,
-                  source_context_hash,
-                  content,
-                  token_count,
-                  prompt_version,
-                  model,
-                  canonical_summary_id,
-                  lease_owner,
-                  lease_expires_at,
-                  failure_summary,
-                  created_at,
-                  updated_at,
-                  ready_at,
-                  promoted_at
+          `SELECT pending_summary_nodes.node_id,
+                  pending_summary_nodes.batch_id,
+                  pending_summary_nodes.conversation_id,
+                  pending_summary_nodes.kind,
+                  pending_summary_nodes.depth,
+                  pending_summary_nodes.status,
+                  pending_summary_nodes.ordinal_start,
+                  pending_summary_nodes.ordinal_end,
+                  pending_summary_nodes.source_fingerprint,
+                  pending_summary_nodes.source_context_hash,
+                  pending_summary_nodes.content,
+                  pending_summary_nodes.token_count,
+                  pending_summary_nodes.prompt_version,
+                  pending_summary_nodes.model,
+                  pending_summary_nodes.canonical_summary_id,
+                  pending_summary_nodes.lease_owner,
+                  pending_summary_nodes.lease_expires_at,
+                  pending_summary_nodes.failure_summary,
+                  pending_summary_nodes.created_at,
+                  pending_summary_nodes.updated_at,
+                  pending_summary_nodes.ready_at,
+                  pending_summary_nodes.promoted_at
            FROM pending_summary_nodes
-           WHERE conversation_id = ?
+           JOIN pending_compaction_batches
+             ON pending_compaction_batches.batch_id = pending_summary_nodes.batch_id
+           WHERE pending_summary_nodes.conversation_id = ?
+             AND pending_compaction_batches.status IN ('planning', 'ready', 'publishing')
              AND (
-               status = 'planned'
-               OR (status = 'running' AND lease_expires_at IS NOT NULL AND lease_expires_at <= ?)
+               pending_summary_nodes.status = 'planned'
+               OR (
+                 pending_summary_nodes.status = 'running'
+                 AND lease_expires_at IS NOT NULL
+                 AND lease_expires_at <= ?
+               )
              )
              AND NOT EXISTS (
                SELECT 1
@@ -638,7 +659,9 @@ export class PendingSummaryStore {
                WHERE pc.node_id = pending_summary_nodes.node_id
                  AND child.status NOT IN ('ready', 'promoted')
              )
-           ORDER BY ordinal_start, depth, node_id
+           ORDER BY pending_summary_nodes.ordinal_start,
+                    pending_summary_nodes.depth,
+                    pending_summary_nodes.node_id
            LIMIT 1`,
         )
         .get(input.conversationId, nowIso) as PendingSummaryNodeRow | undefined;
@@ -656,6 +679,12 @@ export class PendingSummaryStore {
                failure_summary = NULL,
                updated_at = datetime('now')
            WHERE node_id = ?
+             AND EXISTS (
+               SELECT 1
+               FROM pending_compaction_batches
+               WHERE pending_compaction_batches.batch_id = pending_summary_nodes.batch_id
+                 AND pending_compaction_batches.status IN ('planning', 'ready', 'publishing')
+             )
              AND (
                status = 'planned'
                OR (status = 'running' AND lease_expires_at IS NOT NULL AND lease_expires_at <= ?)
