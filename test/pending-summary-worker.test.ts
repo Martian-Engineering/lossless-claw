@@ -120,6 +120,74 @@ describe("PendingSummaryPreparationWorker", () => {
     expect(events).toEqual(["failed:node_worker_a:worker-a:provider timeout"]);
   });
 
+  it("marks a claimed node failed when source text is empty", async () => {
+    const events: string[] = [];
+    const store: PendingSummaryPreparationStore = {
+      async claimNextPlannedNode() {
+        return createNode();
+      },
+      async markNodeReady(input) {
+        events.push(`ready:${input.nodeId}`);
+        return true;
+      },
+      async markNodeFailed(input) {
+        events.push(`failed:${input.nodeId}:${input.leaseOwner}:${input.failureSummary}`);
+        return true;
+      },
+    };
+    const worker = new PendingSummaryPreparationWorker({
+      store,
+      leaseOwner: "worker-a",
+      leaseMs: 60_000,
+      now: () => new Date("2026-06-30T12:00:00.000Z"),
+      loadSourceText: async () => "   ",
+      summarize: async () => {
+        throw new Error("should not be called");
+      },
+      estimateTokens: () => 0,
+    });
+
+    await expect(worker.prepareOne({ conversationId: 42 })).resolves.toEqual({
+      status: "failed",
+      nodeId: "node_worker_a",
+      failureSummary: "empty pending summary source",
+    });
+    expect(events).toEqual(["failed:node_worker_a:worker-a:empty pending summary source"]);
+  });
+
+  it("marks a claimed node failed when prepared content is empty", async () => {
+    const events: string[] = [];
+    const store: PendingSummaryPreparationStore = {
+      async claimNextPlannedNode() {
+        return createNode();
+      },
+      async markNodeReady(input) {
+        events.push(`ready:${input.nodeId}`);
+        return true;
+      },
+      async markNodeFailed(input) {
+        events.push(`failed:${input.nodeId}:${input.leaseOwner}:${input.failureSummary}`);
+        return true;
+      },
+    };
+    const worker = new PendingSummaryPreparationWorker({
+      store,
+      leaseOwner: "worker-a",
+      leaseMs: 60_000,
+      now: () => new Date("2026-06-30T12:00:00.000Z"),
+      loadSourceText: async () => "source text",
+      summarize: async () => "   ",
+      estimateTokens: () => 0,
+    });
+
+    await expect(worker.prepareOne({ conversationId: 42 })).resolves.toEqual({
+      status: "failed",
+      nodeId: "node_worker_a",
+      failureSummary: "empty pending summary content",
+    });
+    expect(events).toEqual(["failed:node_worker_a:worker-a:empty pending summary content"]);
+  });
+
   it("treats a lost lease during ready save as obsolete work", async () => {
     const events: string[] = [];
     const store: PendingSummaryPreparationStore = {

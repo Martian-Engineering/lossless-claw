@@ -111,8 +111,14 @@ export class PendingSummaryPreparationWorker {
     }
 
     try {
-      const sourceText = await this.loadSourceText(node);
-      const content = await this.summarize(sourceText, node);
+      const sourceText = (await this.loadSourceText(node)).trim();
+      if (!sourceText) {
+        throw new Error("empty pending summary source");
+      }
+      const content = (await this.summarize(sourceText, node)).trim();
+      if (!content) {
+        throw new Error("empty pending summary content");
+      }
       const saved = await this.store.markNodeReady({
         nodeId: node.nodeId,
         leaseOwner: this.leaseOwner,
