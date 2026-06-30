@@ -310,11 +310,9 @@ function createCondensedParent(
     childNodeIds: children
       .filter((child) => typeof child.canonicalSummaryId !== "string")
       .map((child) => child.nodeId),
-    childSummaryIds: children.flatMap((child) =>
-      typeof child.canonicalSummaryId === "string"
-        ? [child.canonicalSummaryId]
-        : child.childSummaryIds,
-    ),
+    childSummaryIds: children
+      .map((child) => child.canonicalSummaryId)
+      .filter((summaryId): summaryId is string => typeof summaryId === "string"),
   };
 }
 

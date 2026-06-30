@@ -215,6 +215,164 @@ describe("PendingCompactionCoordinator", () => {
     );
   });
 
+  it("replans the same projection after a failed pending preparation", async () => {
+    const { conversationStore, pendingSummaryStore, summaryStore } = createStores();
+    const conversation = await conversationStore.createConversation({
+      sessionId: "pending-coordinator-retry-session",
+      sessionKey: "agent:main:pending-coordinator-retry",
+    });
+    const messages = await conversationStore.createMessagesBulk([
+      {
+        conversationId: conversation.conversationId,
+        seq: 1,
+        role: "user",
+        content: "retry source message one",
+        tokenCount: 4,
+      },
+      {
+        conversationId: conversation.conversationId,
+        seq: 2,
+        role: "assistant",
+        content: "retry source message two",
+        tokenCount: 4,
+      },
+      {
+        conversationId: conversation.conversationId,
+        seq: 3,
+        role: "assistant",
+        content: "fresh tail message",
+        tokenCount: 4,
+      },
+    ]);
+    await summaryStore.appendContextMessages(
+      conversation.conversationId,
+      messages.map((message) => message.messageId),
+    );
+
+    let shouldFail = true;
+    const coordinator = new PendingCompactionCoordinator({
+      conversationStore,
+      pendingSummaryStore,
+      summaryStore,
+      model: "test-model",
+      leaseOwner: "test-worker",
+      config: {
+        freshTailCount: 1,
+        leafChunkTokens: 100,
+        condensedMinFanout: 2,
+        condensedMinSourceTokens: 1,
+        condensedChunkTokens: 100,
+      },
+      summarize: async () => {
+        if (shouldFail) {
+          shouldFail = false;
+          throw new Error("provider timeout");
+        }
+        return "retry pending summary";
+      },
+    });
+
+    const firstPlan = await coordinator.runOnce({
+      conversationId: conversation.conversationId,
+      sessionKey: "agent:main:pending-coordinator-retry",
+    });
+    expect(firstPlan).toMatchObject({ status: "planned" });
+    await expect(
+      coordinator.runOnce({ conversationId: conversation.conversationId }),
+    ).resolves.toMatchObject({ status: "failed", failureSummary: "provider timeout" });
+
+    const secondPlan = await coordinator.runOnce({
+      conversationId: conversation.conversationId,
+      sessionKey: "agent:main:pending-coordinator-retry",
+    });
+    expect(secondPlan).toMatchObject({ status: "planned" });
+    if (firstPlan.status !== "planned" || secondPlan.status !== "planned") {
+      throw new Error("Expected both pending compaction attempts to plan");
+    }
+    expect(secondPlan.batchId).not.toBe(firstPlan.batchId);
+    await expect(
+      coordinator.runOnce({ conversationId: conversation.conversationId }),
+    ).resolves.toMatchObject({ status: "prepared" });
+    await expect(
+      coordinator.runOnce({ conversationId: conversation.conversationId }),
+    ).resolves.toMatchObject({ status: "published" });
+  });
+
+  it("publishes a mixed canonical and pending frontier", async () => {
+    const { conversationStore, pendingSummaryStore, summaryStore } = createStores();
+    const conversation = await conversationStore.createConversation({
+      sessionId: "pending-coordinator-mixed-frontier-session",
+      sessionKey: "agent:main:pending-coordinator-mixed-frontier",
+    });
+    await summaryStore.insertSummary({
+      summaryId: "sum_existing_context",
+      conversationId: conversation.conversationId,
+      kind: "leaf",
+      depth: 0,
+      content: "existing canonical summary",
+      tokenCount: 5,
+    });
+    await summaryStore.appendContextSummary(conversation.conversationId, "sum_existing_context");
+    const messages = await conversationStore.createMessagesBulk([
+      {
+        conversationId: conversation.conversationId,
+        seq: 1,
+        role: "user",
+        content: "raw message beside canonical summary",
+        tokenCount: 4,
+      },
+      {
+        conversationId: conversation.conversationId,
+        seq: 2,
+        role: "assistant",
+        content: "fresh tail message",
+        tokenCount: 4,
+      },
+    ]);
+    await summaryStore.appendContextMessages(
+      conversation.conversationId,
+      messages.map((message) => message.messageId),
+    );
+
+    const coordinator = new PendingCompactionCoordinator({
+      conversationStore,
+      pendingSummaryStore,
+      summaryStore,
+      model: "test-model",
+      leaseOwner: "test-worker",
+      config: {
+        freshTailCount: 1,
+        leafChunkTokens: 100,
+        condensedMinFanout: 99,
+        condensedMinSourceTokens: 1,
+        condensedChunkTokens: 100,
+      },
+      summarize: async (sourceText) => `leaf(${sourceText})`,
+    });
+
+    await expect(
+      coordinator.runOnce({
+        conversationId: conversation.conversationId,
+        sessionKey: "agent:main:pending-coordinator-mixed-frontier",
+      }),
+    ).resolves.toMatchObject({ status: "planned", nodeCount: 1 });
+    await expect(
+      coordinator.runOnce({ conversationId: conversation.conversationId }),
+    ).resolves.toMatchObject({ status: "prepared" });
+    const published = await coordinator.runOnce({ conversationId: conversation.conversationId });
+    expect(published).toMatchObject({
+      status: "published",
+      frontierSummaryIds: ["sum_existing_context", expect.stringMatching(/^sum_/)],
+    });
+
+    const contextItems = await summaryStore.getContextItems(conversation.conversationId);
+    expect(contextItems).toMatchObject([
+      { ordinal: 0, itemType: "summary", summaryId: "sum_existing_context" },
+      { ordinal: 1, itemType: "summary" },
+      { ordinal: 2, itemType: "message", messageId: messages[1]!.messageId },
+    ]);
+  });
+
   it("does not claim a condensed parent before pending children are ready", async () => {
     const { conversationStore, pendingSummaryStore } = createStores();
     const conversation = await conversationStore.createConversation({
