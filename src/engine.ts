@@ -1941,6 +1941,42 @@ export class LcmContextEngine implements ContextEngine {
             `[lcm] bootstrap: sqlite projection reconcile finished conversation=${conversationId} ${params.sessionLabel} importedMessages=${reconcile.importedMessages} overlap=${reconcile.hasOverlap} blockedByImportCap=${reconcile.blockedByImportCap} duration=${formatDurationMs(Date.now() - params.startedAt)}`,
           );
 
+          if (reconcile.blockedReason === "no-overlap-projection" && conversation.bootstrappedAt) {
+            await this.conversationStore.archiveConversation(conversationId);
+            const freshConversation = await this.conversationStore.createConversation({
+              sessionId: params.sessionId,
+              ...(params.sessionKey ? { sessionKey: params.sessionKey } : {}),
+            });
+            const bootstrapMessages = trimBootstrapMessagesToBudget(
+              historicalMessages,
+              resolveBootstrapMaxTokens(this.config),
+            );
+            let importedMessages = 0;
+            for (const message of bootstrapMessages) {
+              const result = await this.ingestSingle({
+                sessionId: params.sessionId,
+                sessionKey: params.sessionKey,
+                message,
+                createdAt: resolveTranscriptMessageCreatedAt(message),
+                skipReplayTimestampFloodGuard: true,
+              });
+              if (result.ingested) {
+                importedMessages += 1;
+              }
+            }
+            await this.conversationStore.markConversationBootstrapped(
+              freshConversation.conversationId,
+            );
+            this.deps.log.info(
+              `[lcm] bootstrap: sqlite projection started fresh conversation=${freshConversation.conversationId} archivedConversation=${conversationId} ${params.sessionLabel} importedMessages=${importedMessages} sourceMessages=${historicalMessages.length}`,
+            );
+            return {
+              bootstrapped: importedMessages > 0,
+              importedMessages,
+              reason: "fresh sqlite transcript projection",
+            };
+          }
+
           if (reconcile.blockedByImportCap) {
             return {
               bootstrapped: false,
