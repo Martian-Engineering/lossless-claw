@@ -89,6 +89,7 @@ const HANDLED_CONVERSATION_ID_TABLES = new Set([
   "summaries",
   "context_items",
   "large_files",
+  "conversation_bootstrap_state",
   "conversation_compaction_telemetry",
   "conversation_compaction_maintenance",
   "focus_briefs",
@@ -479,9 +480,13 @@ function reparentSimpleConversationTables(db: DatabaseSync, group: SafeGroup): v
 function clearSourceStateAndMarkTarget(db: DatabaseSync, group: SafeGroup): void {
   const sourcePlaceholders = placeholders(group.sourceConversationIds);
   for (const table of [
+    "conversation_bootstrap_state",
     "conversation_compaction_maintenance",
     "conversation_compaction_telemetry",
   ]) {
+    if (!hasTable(db, table)) {
+      continue;
+    }
     db.prepare(
       `DELETE FROM ${quoteSqlIdentifier(table)}
        WHERE conversation_id IN (${sourcePlaceholders})`,
