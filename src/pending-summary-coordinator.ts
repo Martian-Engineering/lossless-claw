@@ -303,6 +303,7 @@ export class PendingCompactionCoordinator {
     }
 
     const publisher = new PendingSummaryPublisher({
+      conversationStore: this.conversationStore,
       pendingSummaryStore: this.pendingSummaryStore,
       summaryStore: this.summaryStore,
     });

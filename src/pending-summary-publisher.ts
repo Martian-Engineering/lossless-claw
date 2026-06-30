@@ -1,11 +1,13 @@
 import { createHash } from "node:crypto";
+import type { ConversationStore, MessageRecord } from "./store/conversation-store.js";
 import type {
   PendingSummaryNodeRecord,
   PendingSummaryStore,
 } from "./store/pending-summary-store.js";
-import type { SummaryStore } from "./store/summary-store.js";
+import type { CreateSummaryInput, SummaryRecord, SummaryStore } from "./store/summary-store.js";
 
 export type PendingSummaryPublisherOptions = {
+  conversationStore: ConversationStore;
   pendingSummaryStore: PendingSummaryStore;
   summaryStore: SummaryStore;
   canonicalSummaryIdForNode?: (node: PendingSummaryNodeRecord) => string;
@@ -29,6 +31,15 @@ type ChildSummaryIds = {
   canonicalChildSummaryIds: string[];
 };
 
+type SummaryCoverageMetadata = Pick<
+  CreateSummaryInput,
+  | "earliestAt"
+  | "latestAt"
+  | "descendantCount"
+  | "descendantTokenCount"
+  | "sourceMessageTokenCount"
+>;
+
 function defaultCanonicalSummaryIdForNode(node: PendingSummaryNodeRecord): string {
   const digest = createHash("sha256")
     .update(`${node.batchId}\0${node.nodeId}\0${node.sourceFingerprint}`)
@@ -46,6 +57,26 @@ function requireReadyNode(node: PendingSummaryNodeRecord): void {
   }
 }
 
+function rangeFromDates(dates: Date[]): Pick<SummaryCoverageMetadata, "earliestAt" | "latestAt"> {
+  let earliestAt: Date | undefined;
+  let latestAt: Date | undefined;
+  for (const date of dates) {
+    if (!(date instanceof Date)) {
+      continue;
+    }
+    if (!earliestAt || date < earliestAt) {
+      earliestAt = date;
+    }
+    if (!latestAt || date > latestAt) {
+      latestAt = date;
+    }
+  }
+  return {
+    ...(earliestAt ? { earliestAt } : {}),
+    ...(latestAt ? { latestAt } : {}),
+  };
+}
+
 /**
  * Publishes a ready pending summary frontier into canonical summary tables.
  *
@@ -54,11 +85,13 @@ function requireReadyNode(node: PendingSummaryNodeRecord): void {
  * summaries, and marks pending rows promoted inside one store transaction.
  */
 export class PendingSummaryPublisher {
+  private readonly conversationStore: ConversationStore;
   private readonly pendingSummaryStore: PendingSummaryStore;
   private readonly summaryStore: SummaryStore;
   private readonly canonicalSummaryIdForNode: (node: PendingSummaryNodeRecord) => string;
 
   constructor(options: PendingSummaryPublisherOptions) {
+    this.conversationStore = options.conversationStore;
     this.pendingSummaryStore = options.pendingSummaryStore;
     this.summaryStore = options.summaryStore;
     this.canonicalSummaryIdForNode =
@@ -219,22 +252,22 @@ export class PendingSummaryPublisher {
     canonicalIdsByNodeId: Map<string, string>,
   ): Promise<void> {
     const existing = await this.summaryStore.getSummary(canonicalSummaryId);
-    if (!existing) {
-      await this.summaryStore.insertSummary({
-        summaryId: canonicalSummaryId,
-        conversationId: node.conversationId,
-        kind: node.kind,
-        depth: node.depth,
-        content: node.content ?? "",
-        tokenCount: node.tokenCount ?? 0,
-        model: node.model,
-      });
-    }
-
     if (node.kind === "leaf") {
       const messageIds = (await this.pendingSummaryStore.getNodeMessages(node.nodeId)).map(
         (message) => message.messageId,
       );
+      if (!existing) {
+        await this.summaryStore.insertSummary({
+          summaryId: canonicalSummaryId,
+          conversationId: node.conversationId,
+          kind: node.kind,
+          depth: node.depth,
+          content: node.content ?? "",
+          tokenCount: node.tokenCount ?? 0,
+          model: node.model,
+          ...(await this.buildLeafCoverageMetadata(messageIds)),
+        });
+      }
       await this.summaryStore.linkSummaryToMessages(canonicalSummaryId, messageIds);
       return;
     }
@@ -250,7 +283,73 @@ export class PendingSummaryPublisher {
       }),
       ...childIds.canonicalChildSummaryIds,
     ];
+    if (!existing) {
+      await this.summaryStore.insertSummary({
+        summaryId: canonicalSummaryId,
+        conversationId: node.conversationId,
+        kind: node.kind,
+        depth: node.depth,
+        content: node.content ?? "",
+        tokenCount: node.tokenCount ?? 0,
+        model: node.model,
+        ...(await this.buildCondensedCoverageMetadata(parentSummaryIds)),
+      });
+    }
     await this.summaryStore.linkSummaryToParents(canonicalSummaryId, parentSummaryIds);
+  }
+
+  private async buildLeafCoverageMetadata(
+    messageIds: number[],
+  ): Promise<SummaryCoverageMetadata> {
+    const messages: MessageRecord[] = [];
+    for (const messageId of messageIds) {
+      const message = await this.conversationStore.getMessageById(messageId);
+      if (message) {
+        messages.push(message);
+      }
+    }
+    return {
+      ...rangeFromDates(messages.map((message) => message.createdAt)),
+      descendantCount: 0,
+      descendantTokenCount: 0,
+      sourceMessageTokenCount: messages.reduce(
+        (total, message) => total + Math.max(0, Math.floor(message.tokenCount)),
+        0,
+      ),
+    };
+  }
+
+  private async buildCondensedCoverageMetadata(
+    parentSummaryIds: string[],
+  ): Promise<SummaryCoverageMetadata> {
+    const parents: SummaryRecord[] = [];
+    for (const summaryId of parentSummaryIds) {
+      const summary = await this.summaryStore.getSummary(summaryId);
+      if (summary) {
+        parents.push(summary);
+      }
+    }
+    return {
+      ...rangeFromDates(
+        parents.flatMap((summary) => [
+          summary.earliestAt ?? summary.createdAt,
+          summary.latestAt ?? summary.createdAt,
+        ]),
+      ),
+      descendantCount: parents.reduce(
+        (total, summary) => total + Math.max(0, summary.descendantCount) + 1,
+        0,
+      ),
+      descendantTokenCount: parents.reduce(
+        (total, summary) =>
+          total + Math.max(0, summary.tokenCount) + Math.max(0, summary.descendantTokenCount),
+        0,
+      ),
+      sourceMessageTokenCount: parents.reduce(
+        (total, summary) => total + Math.max(0, summary.sourceMessageTokenCount),
+        0,
+      ),
+    };
   }
 
   private async readChildSummaryIds(nodeId: string): Promise<ChildSummaryIds> {
