@@ -341,6 +341,33 @@ export class PendingSummaryStore {
     return row ? toBatchRecord(row) : null;
   }
 
+  /** Mark a pending compaction batch as published. */
+  async markBatchPublished(input: { batchId: string; publishedAt?: Date }): Promise<void> {
+    this.db
+      .prepare(
+        `UPDATE pending_compaction_batches
+         SET status = 'published',
+             failure_summary = NULL,
+             published_at = COALESCE(?, datetime('now')),
+             updated_at = datetime('now')
+         WHERE batch_id = ?`,
+      )
+      .run(nullableDateToIso(input.publishedAt), input.batchId);
+  }
+
+  /** Mark a pending compaction batch as stale. */
+  async markBatchStale(input: { batchId: string; failureSummary?: string | null }): Promise<void> {
+    this.db
+      .prepare(
+        `UPDATE pending_compaction_batches
+         SET status = 'stale',
+             failure_summary = ?,
+             updated_at = datetime('now')
+         WHERE batch_id = ?`,
+      )
+      .run(input.failureSummary ?? null, input.batchId);
+  }
+
   /** Insert a pending summary node into a batch. */
   async insertNode(input: InsertPendingSummaryNodeInput): Promise<PendingSummaryNodeRecord> {
     const ordinalRange = normalizeOrdinalRange(input.ordinalStart, input.ordinalEnd);
