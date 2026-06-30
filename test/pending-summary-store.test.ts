@@ -124,6 +124,51 @@ describe("PendingSummaryStore", () => {
     ).resolves.toEqual([]);
   });
 
+  it("keeps pending-summary source messages out of deletion cleanup", async () => {
+    const { conversationStore, pendingSummaryStore } = createStores();
+    const conversation = await conversationStore.createConversation({
+      sessionId: "pending-summary-delete-session",
+      sessionKey: "agent:main:pending-summary-delete",
+    });
+    const message = await conversationStore.createMessage({
+      conversationId: conversation.conversationId,
+      seq: 1,
+      role: "user",
+      content: "pending source must remain",
+      tokenCount: 4,
+    });
+    await pendingSummaryStore.createBatch({
+      batchId: "batch_delete_guard",
+      conversationId: conversation.conversationId,
+      sourceProjectionFingerprint: "projection:delete-guard",
+      compactableStartOrdinal: 0,
+      compactableEndOrdinal: 0,
+      promptVersion: "leaf:v1",
+      model: "test-model",
+    });
+    await pendingSummaryStore.insertNode({
+      nodeId: "node_delete_guard",
+      batchId: "batch_delete_guard",
+      conversationId: conversation.conversationId,
+      kind: "leaf",
+      depth: 0,
+      status: "planned",
+      ordinalStart: 0,
+      ordinalEnd: 0,
+      sourceFingerprint: "source:delete-guard",
+      promptVersion: "leaf:v1",
+      model: "test-model",
+    });
+    await pendingSummaryStore.linkNodeToMessages("node_delete_guard", [
+      { messageId: message.messageId },
+    ]);
+
+    await expect(conversationStore.deleteMessages([message.messageId])).resolves.toBe(0);
+    await expect(conversationStore.getMessageById(message.messageId)).resolves.toMatchObject({
+      messageId: message.messageId,
+    });
+  });
+
   it("claims planned nodes with leases and records promotion ids", async () => {
     const { conversationStore, pendingSummaryStore, summaryStore } = createStores();
     const conversation = await conversationStore.createConversation({

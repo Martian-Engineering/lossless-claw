@@ -1369,8 +1369,8 @@ export class ConversationStore {
   /**
    * Delete messages and their associated records (context_items, FTS, message_parts).
    *
-   * Skips messages referenced in summary_messages (already compacted) to avoid
-   * breaking the summary DAG. Returns the count of actually deleted messages.
+   * Skips messages referenced by canonical or pending summaries to avoid
+   * breaking summary DAGs. Returns the count of actually deleted messages.
    */
   async deleteMessages(messageIds: MessageId[]): Promise<number> {
     if (messageIds.length === 0) {
@@ -1381,8 +1381,12 @@ export class ConversationStore {
     for (const messageId of messageIds) {
       // Skip if referenced by a summary (ON DELETE RESTRICT would fail anyway)
       const refRow = this.db
-        .prepare(`SELECT 1 AS found FROM summary_messages WHERE message_id = ? LIMIT 1`)
-        .get(messageId) as unknown as { found: number } | undefined;
+        .prepare(
+          `SELECT 1 AS found
+           WHERE EXISTS (SELECT 1 FROM summary_messages WHERE message_id = ?)
+              OR EXISTS (SELECT 1 FROM pending_summary_node_messages WHERE message_id = ?)`,
+        )
+        .get(messageId, messageId) as unknown as { found: number } | undefined;
       if (refRow) {
         continue;
       }

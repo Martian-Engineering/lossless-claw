@@ -122,6 +122,67 @@ describe("PendingCompactionCoordinator", () => {
     await expect(summaryStore.getSummaryParents(summaryId)).resolves.toHaveLength(2);
   });
 
+  it("prepares leaf source from message parts when stored content is empty", async () => {
+    const { conversationStore, pendingSummaryStore, summaryStore } = createStores();
+    const conversation = await conversationStore.createConversation({
+      sessionId: "pending-coordinator-parts-session",
+      sessionKey: "agent:main:pending-coordinator-parts",
+    });
+    const message = await conversationStore.createMessage({
+      conversationId: conversation.conversationId,
+      seq: 1,
+      role: "tool",
+      content: "",
+      tokenCount: 400,
+    });
+    await conversationStore.createMessageParts(message.messageId, [
+      {
+        sessionId: "pending-coordinator-parts-session",
+        partType: "tool",
+        ordinal: 0,
+        textContent: JSON.stringify({
+          content: [{ type: "text", text: "Pending message-parts source detail." }],
+        }),
+        metadata: JSON.stringify({
+          originalRole: "toolResult",
+          rawType: "function_call_output",
+        }),
+      },
+    ]);
+    await summaryStore.appendContextMessage(conversation.conversationId, message.messageId);
+
+    let summarizedSource = "";
+    const coordinator = new PendingCompactionCoordinator({
+      conversationStore,
+      pendingSummaryStore,
+      summaryStore,
+      model: "test-model",
+      leaseOwner: "test-worker",
+      config: {
+        freshTailCount: 0,
+        leafChunkTokens: 1_000,
+        condensedMinFanout: 2,
+        condensedMinSourceTokens: 1,
+        condensedChunkTokens: 100,
+      },
+      summarize: async (sourceText) => {
+        summarizedSource = sourceText;
+        return "parts-backed pending summary";
+      },
+    });
+
+    await expect(
+      coordinator.runOnce({
+        conversationId: conversation.conversationId,
+        sessionKey: "agent:main:pending-coordinator-parts",
+      }),
+    ).resolves.toMatchObject({ status: "planned", nodeCount: 1 });
+    await expect(
+      coordinator.runOnce({ conversationId: conversation.conversationId }),
+    ).resolves.toMatchObject({ status: "prepared" });
+    expect(summarizedSource).toContain("Pending message-parts source detail.");
+  });
+
   it("revalidates the source projection under the publish lock", async () => {
     const { conversationStore, pendingSummaryStore, summaryStore } = createStores();
     const conversation = await conversationStore.createConversation({
