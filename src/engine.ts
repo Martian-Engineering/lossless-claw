@@ -1776,6 +1776,7 @@ export class LcmContextEngine implements ContextEngine {
     const entryIds = params.historicalMessages
       .map((message) => getTranscriptEntryId(message))
       .filter((entryId): entryId is string => typeof entryId === "string" && entryId.length > 0);
+    const currentEntryIds = new Set(entryIds);
     const existingEntryIds =
       entryIds.length > 0
         ? await this.conversationStore.filterExistingTranscriptEntryIds(
@@ -1817,6 +1818,49 @@ export class LcmContextEngine implements ContextEngine {
           hasOverlap = true;
           overlapAnchorIndex = index;
           continue;
+        }
+        if (hasOverlap) {
+          const staleEntryMatch =
+            await this.conversationStore.findUniqueRecentStaleTranscriptEntryIdByIdentityAndCreatedAt(
+              params.conversationId,
+              stored.role,
+              stored.content,
+              resolveTranscriptMessageCreatedAt(message),
+              currentEntryIds,
+              this.config.freshTailCount,
+            );
+          if (staleEntryMatch.status === "ambiguous") {
+            return {
+              importedMessages: 0,
+              blockedByImportCap: true,
+              blockedReason: "stale-transcript-id-ambiguous",
+              hasOverlap: true,
+            };
+          }
+          if (staleEntryMatch.status === "found") {
+            const hasPendingImportAfterAnchor = importableMessages.some(
+              (candidate) => candidate.index > overlapAnchorIndex,
+            );
+            if (hasPendingImportAfterAnchor) {
+              return {
+                importedMessages: 0,
+                blockedByImportCap: true,
+                blockedReason: "stale-transcript-id-gap",
+                hasOverlap: true,
+              };
+            }
+            const restamped = await this.conversationStore.restampTranscriptEntryId(
+              staleEntryMatch.messageId,
+              entryId,
+            );
+            if (restamped) {
+              // Keep the prior overlap anchor. Promoting this restamped row would
+              // drop any still-missing projection entries between the old anchor
+              // and the reissued-id row when the import list is anchored below.
+              existingEntryIds.add(entryId);
+              continue;
+            }
+          }
         }
       }
 
@@ -1999,7 +2043,11 @@ export class LcmContextEngine implements ContextEngine {
                     ? "reconcile duplicate transcript replay"
                     : reconcile.blockedReason === "no-overlap-projection"
                       ? "reconcile projection has no overlap"
-                      : "reconcile import capped",
+                      : reconcile.blockedReason === "stale-transcript-id-gap"
+                        ? "reconcile stale transcript id gap"
+                        : reconcile.blockedReason === "stale-transcript-id-ambiguous"
+                          ? "reconcile stale transcript id ambiguous"
+                          : "reconcile import capped",
             };
           }
 
