@@ -562,4 +562,41 @@ describe("LcmContextEngine.bootstrap sqlite transcript projection", () => {
     });
     expect(conversation).toBeNull();
   });
+
+  it("does not persist afterTurn runtime messages when the visible projection is empty", async () => {
+    const sessionId = "sqlite-afterturn-empty-projection";
+    const sessionKey = "agent:main:sqlite-afterturn-empty-projection";
+    const readVisibleSessionTranscriptMessageEntries = vi.fn(async () => []);
+    const { engine } = createEngineWithDepsOverridesAndDb({
+      readVisibleSessionTranscriptMessageEntries,
+    } satisfies Partial<LcmDependencies>);
+
+    await expect(
+      engine.afterTurn({
+        sessionId,
+        sessionKey,
+        sessionFile: "/tmp/ignored-lossless-sqlite-empty-projection.jsonl",
+        messages: [
+          { role: "user", content: "prompt" },
+          { role: "assistant", content: "must not persist from empty projection" },
+        ] satisfies AgentMessage[],
+        prePromptMessageCount: 1,
+        runtimeContext: {
+          transcriptStorage: { kind: "sqlite" },
+          sessionTarget: {
+            agentId: "main",
+            sessionId,
+            sessionKey,
+            storePath: "/tmp/openclaw-agent.sqlite",
+          },
+        },
+      }),
+    ).resolves.toBeUndefined();
+
+    const conversation = await engine.getConversationStore().getConversationForSession({
+      sessionId,
+      sessionKey,
+    });
+    expect(conversation).toBeNull();
+  });
 });
