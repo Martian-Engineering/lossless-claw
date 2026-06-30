@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { mkdtempSync, writeFileSync, rmSync } from "node:fs";
+import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
@@ -15,6 +15,7 @@ function makeAuthError(): LcmProviderAuthError {
   });
 }
 import type { LcmConfig } from "../src/db/config.js";
+import type { AgentMessage } from "../src/openclaw-bridge.js";
 import type { LcmDependencies } from "../src/types.js";
 
 function createTestConfig(overrides: Partial<LcmConfig> = {}): LcmConfig {
@@ -110,24 +111,46 @@ function seedSessionFile(dir: string, name: string = randomUUID()) {
   const seededSessionKey = `agent:test:direct:${name}:${seededSessionId}`;
   const seededSessionFile = join(dir, `${name}-${seededSessionId}.jsonl`);
 
-  const messages: string[] = [];
+  const messages: AgentMessage[] = [];
   for (let i = 0; i < 20; i++) {
-    messages.push(JSON.stringify({
+    messages.push({
       role: "user",
       content: `Message ${i}: ${"x".repeat(500)}`,
-    }));
-    messages.push(JSON.stringify({
+    });
+    messages.push({
       role: "assistant",
       content: `Response ${i}: ${"y".repeat(500)}`,
-    }));
+    });
   }
-  writeFileSync(seededSessionFile, messages.join("\n") + "\n");
 
   return {
     sessionId: seededSessionId,
     sessionKey: seededSessionKey,
     sessionFile: seededSessionFile,
+    messages,
   };
+}
+
+async function seedEngineSession(
+  engine: LcmContextEngine,
+  session: ReturnType<typeof seedSessionFile>,
+): Promise<void> {
+  await engine.ingestBatch({
+    sessionId: session.sessionId,
+    sessionKey: session.sessionKey,
+    messages: session.messages,
+  });
+}
+
+function makeCircuitBreakerMessages(count: number): AgentMessage[] {
+  const messages: AgentMessage[] = [];
+  for (let index = 0; index < count; index += 1) {
+    messages.push({
+      role: index % 2 === 0 ? "user" : "assistant",
+      content: [{ type: "text", text: `auth spend message ${index} ${"x".repeat(200)}` }],
+    } as AgentMessage);
+  }
+  return messages;
 }
 
 describe("Circuit Breaker", () => {
@@ -137,15 +160,17 @@ describe("Circuit Breaker", () => {
   let sessionFile: string;
   let sessionId: string;
   let sessionKey: string;
+  let sessionMessages: AgentMessage[];
 
-  beforeEach(() => {
+  beforeEach(async () => {
     tmpDir = mkdtempSync(join(tmpdir(), "lcm-cb-test-"));
-    ({ sessionId, sessionKey, sessionFile } = seedSessionFile(tmpDir));
+    ({ sessionId, sessionKey, sessionFile, messages: sessionMessages } = seedSessionFile(tmpDir));
 
     const config = createTestConfig();
     const deps = createTestDeps(config);
     db = new DatabaseSync(":memory:");
     engine = new LcmContextEngine(deps, db);
+    await engine.ingestBatch({ sessionId, sessionKey, messages: sessionMessages });
   });
 
   afterEach(() => {
@@ -154,9 +179,6 @@ describe("Circuit Breaker", () => {
   });
 
   it("should allow compaction when circuit breaker is closed", async () => {
-    // Bootstrap to seed data
-    await engine.bootstrap({ sessionId, sessionFile, sessionKey });
-    
     // Compact with a working summarizer
     const result = await engine.compact({
       sessionId,
@@ -174,8 +196,6 @@ describe("Circuit Breaker", () => {
   });
 
   it("should trip after N consecutive auth failures", async () => {
-    await engine.bootstrap({ sessionId, sessionFile, sessionKey });
-    
     let callCount = 0;
     const failingSummarizer = async () => {
       callCount++;
@@ -218,21 +238,10 @@ describe("Circuit Breaker", () => {
     const authDb = new DatabaseSync(":memory:");
     const authEngine = new LcmContextEngine(createTestDeps(authConfig), authDb);
     const authSessionFile = join(tmpDir, `auth-spend-${randomUUID()}.jsonl`);
-    writeFileSync(
-      authSessionFile,
-      Array.from({ length: 8 }, (_, index) =>
-        JSON.stringify({
-          message: {
-            role: index % 2 === 0 ? "user" : "assistant",
-            content: [{ type: "text", text: `auth spend message ${index} ${"x".repeat(200)}` }],
-          },
-        }),
-      ).join("\n") + "\n",
-    );
-    await authEngine.bootstrap({
+    await authEngine.ingestBatch({
       sessionId: "auth-spend-session",
       sessionKey: "agent:main:auth-spend",
-      sessionFile: authSessionFile,
+      messages: makeCircuitBreakerMessages(8),
     });
 
     let callCount = 0;
@@ -271,8 +280,6 @@ describe("Circuit Breaker", () => {
   });
 
   it("should auto-reset after cooldown", async () => {
-    await engine.bootstrap({ sessionId, sessionFile, sessionKey });
-    
     const failingSummarizer = async () => {
       throw makeAuthError();
     };
@@ -324,8 +331,6 @@ describe("Circuit Breaker", () => {
   });
 
   it("should reset on successful compaction", async () => {
-    await engine.bootstrap({ sessionId, sessionFile, sessionKey });
-    
     let shouldFail = true;
     const toggleSummarizer = async (text: string) => {
       if (shouldFail) {
@@ -408,8 +413,8 @@ describe("Circuit Breaker", () => {
     const healthySession = seedSessionFile(tmpDir, "healthy-provider");
 
     try {
-      await scopedEngine.bootstrap(brokenSession);
-      await scopedEngine.bootstrap(healthySession);
+      await seedEngineSession(scopedEngine, brokenSession);
+      await seedEngineSession(scopedEngine, healthySession);
 
       await scopedEngine.compact({
         ...brokenSession,
@@ -439,7 +444,7 @@ describe("Circuit Breaker", () => {
     const sweepSession = seedSessionFile(tmpDir, "full-sweep");
 
     try {
-      await sweepEngine.bootstrap(sweepSession);
+      await seedEngineSession(sweepEngine, sweepSession);
 
       let callCount = 0;
       const mixedSummarizer = async (text: string) => {
