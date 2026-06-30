@@ -1161,6 +1161,75 @@ export function runLcmMigrations(
       updated_at TEXT NOT NULL DEFAULT (datetime('now'))
     );
 
+    CREATE TABLE IF NOT EXISTS pending_compaction_batches (
+      batch_id TEXT PRIMARY KEY,
+      conversation_id INTEGER NOT NULL REFERENCES conversations(conversation_id) ON DELETE CASCADE,
+      session_key TEXT,
+      session_target_json TEXT NOT NULL DEFAULT '{}',
+      status TEXT NOT NULL DEFAULT 'planning'
+        CHECK (status IN ('planning', 'ready', 'publishing', 'published', 'stale', 'failed')),
+      source_projection_fingerprint TEXT NOT NULL,
+      compactable_start_ordinal INTEGER NOT NULL,
+      compactable_end_ordinal INTEGER NOT NULL,
+      planned_fresh_tail_start_ordinal INTEGER,
+      prompt_version TEXT NOT NULL DEFAULT 'unknown',
+      model TEXT NOT NULL DEFAULT 'unknown',
+      failure_summary TEXT,
+      created_at TEXT NOT NULL DEFAULT (datetime('now')),
+      updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+      published_at TEXT
+    );
+
+    CREATE TABLE IF NOT EXISTS pending_summary_nodes (
+      node_id TEXT PRIMARY KEY,
+      batch_id TEXT NOT NULL REFERENCES pending_compaction_batches(batch_id) ON DELETE CASCADE,
+      conversation_id INTEGER NOT NULL REFERENCES conversations(conversation_id) ON DELETE CASCADE,
+      kind TEXT NOT NULL CHECK (kind IN ('leaf', 'condensed')),
+      depth INTEGER NOT NULL DEFAULT 0,
+      status TEXT NOT NULL DEFAULT 'planned'
+        CHECK (status IN ('planned', 'running', 'ready', 'promoted', 'stale', 'failed')),
+      ordinal_start INTEGER NOT NULL,
+      ordinal_end INTEGER NOT NULL,
+      source_fingerprint TEXT NOT NULL,
+      source_context_hash TEXT,
+      content TEXT,
+      token_count INTEGER,
+      prompt_version TEXT NOT NULL DEFAULT 'unknown',
+      model TEXT NOT NULL DEFAULT 'unknown',
+      canonical_summary_id TEXT REFERENCES summaries(summary_id) ON DELETE SET NULL,
+      lease_owner TEXT,
+      lease_expires_at TEXT,
+      failure_summary TEXT,
+      created_at TEXT NOT NULL DEFAULT (datetime('now')),
+      updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+      ready_at TEXT,
+      promoted_at TEXT,
+      UNIQUE (batch_id, ordinal_start, ordinal_end, depth, kind),
+      CHECK (ordinal_end >= ordinal_start),
+      CHECK (token_count IS NULL OR token_count >= 0)
+    );
+
+    CREATE TABLE IF NOT EXISTS pending_summary_node_messages (
+      node_id TEXT NOT NULL REFERENCES pending_summary_nodes(node_id) ON DELETE CASCADE,
+      message_id INTEGER NOT NULL REFERENCES messages(message_id) ON DELETE RESTRICT,
+      ordinal INTEGER NOT NULL,
+      transcript_entry_id TEXT,
+      identity_hash TEXT,
+      PRIMARY KEY (node_id, message_id)
+    );
+
+    CREATE TABLE IF NOT EXISTS pending_summary_node_children (
+      node_id TEXT NOT NULL REFERENCES pending_summary_nodes(node_id) ON DELETE CASCADE,
+      ordinal INTEGER NOT NULL,
+      child_node_id TEXT REFERENCES pending_summary_nodes(node_id) ON DELETE CASCADE,
+      child_summary_id TEXT REFERENCES summaries(summary_id) ON DELETE RESTRICT,
+      PRIMARY KEY (node_id, ordinal),
+      CHECK (
+        (child_node_id IS NOT NULL AND child_summary_id IS NULL) OR
+        (child_node_id IS NULL AND child_summary_id IS NOT NULL)
+      )
+    );
+
     CREATE TABLE IF NOT EXISTS focus_briefs (
       brief_id TEXT PRIMARY KEY,
       conversation_id INTEGER NOT NULL REFERENCES conversations(conversation_id) ON DELETE CASCADE,
@@ -1209,6 +1278,18 @@ export function runLcmMigrations(
     CREATE INDEX IF NOT EXISTS large_files_conv_idx ON large_files (conversation_id, created_at);
     CREATE INDEX IF NOT EXISTS compaction_telemetry_state_idx
       ON conversation_compaction_telemetry (cache_state, updated_at);
+    CREATE INDEX IF NOT EXISTS pending_compaction_batches_conv_status_idx
+      ON pending_compaction_batches (conversation_id, status, created_at);
+    CREATE INDEX IF NOT EXISTS pending_summary_nodes_batch_status_idx
+      ON pending_summary_nodes (batch_id, status, ordinal_start);
+    CREATE INDEX IF NOT EXISTS pending_summary_nodes_conv_status_idx
+      ON pending_summary_nodes (conversation_id, status, ordinal_start);
+    CREATE INDEX IF NOT EXISTS pending_summary_node_messages_message_idx
+      ON pending_summary_node_messages (message_id);
+    CREATE INDEX IF NOT EXISTS pending_summary_node_children_child_node_idx
+      ON pending_summary_node_children (child_node_id);
+    CREATE INDEX IF NOT EXISTS pending_summary_node_children_child_summary_idx
+      ON pending_summary_node_children (child_summary_id);
     CREATE INDEX IF NOT EXISTS focus_briefs_conversation_status_idx
       ON focus_briefs (conversation_id, status, created_at);
     CREATE INDEX IF NOT EXISTS focus_brief_sources_summary_idx
