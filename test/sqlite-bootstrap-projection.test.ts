@@ -317,6 +317,66 @@ describe("LcmContextEngine.bootstrap sqlite transcript projection", () => {
     ]);
   });
 
+  it("does not treat duplicate content without entry-id overlap as a projection anchor", async () => {
+    const sessionId = "sqlite-bootstrap-duplicate-content-session";
+    const sessionKey = "agent:main:sqlite-bootstrap-duplicate-content-session";
+    const readVisibleSessionTranscriptMessageEntries = vi.fn(async () => [
+      {
+        entryId: "entry-duplicate-ok",
+        parentId: null,
+        seq: 1,
+        role: "assistant",
+        message: { role: "assistant", content: "ok" } satisfies AgentMessage,
+        createdAt: "2026-06-29T12:25:00.000Z",
+      },
+    ]);
+    const { engine, db } = createEngineWithDepsOverridesAndDb({
+      readVisibleSessionTranscriptMessageEntries,
+    } satisfies Partial<LcmDependencies>);
+
+    await expect(
+      engine.ingest({
+        sessionId,
+        sessionKey,
+        message: { role: "assistant", content: "ok" } satisfies AgentMessage,
+      }),
+    ).resolves.toMatchObject({ ingested: true });
+
+    await expect(
+      engine.bootstrap({
+        sessionId,
+        sessionKey,
+        runtimeContext: {
+          transcriptStorage: { kind: "sqlite" },
+          sessionTarget: {
+            agentId: "main",
+            sessionId,
+            sessionKey,
+            storePath: "/tmp/openclaw-agent.sqlite",
+          },
+        },
+      }),
+    ).resolves.toMatchObject({
+      bootstrapped: false,
+      importedMessages: 0,
+      reason: "reconcile projection has no overlap",
+    });
+
+    const conversation = await engine.getConversationStore().getConversationForSession({
+      sessionId,
+      sessionKey,
+    });
+    expect(conversation).not.toBeNull();
+    const messages = await engine.getConversationStore().getMessages(conversation!.conversationId);
+    expect(messages.map((message) => message.content)).toEqual(["ok"]);
+    const rows = db
+      .prepare(
+        `SELECT transcript_entry_id FROM messages WHERE conversation_id = ? ORDER BY seq`,
+      )
+      .all(conversation!.conversationId) as Array<{ transcript_entry_id: string | null }>;
+    expect(rows.map((row) => row.transcript_entry_id)).toEqual([null]);
+  });
+
   it("fails closed instead of appending a no-overlap bootstrap projection to an existing conversation", async () => {
     const sessionId = "sqlite-bootstrap-no-overlap-session";
     const sessionKey = "agent:main:sqlite-bootstrap-no-overlap-session";
