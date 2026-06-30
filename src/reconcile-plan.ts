@@ -103,6 +103,8 @@ export type TranscriptReconcileResult = {
     | "duplicate-transcript-replay"
     | "ambiguous-session-key-runtime-rollover"
     | "ambiguous-rollover-rotated-fresh-transcript"
+    | "stale-transcript-id-gap"
+    | "stale-transcript-id-ambiguous"
     | "no-overlap-projection";
   importedMessages: number;
   hasOverlap: boolean;
