@@ -1987,10 +1987,7 @@ export class CompactionEngine {
   }): Promise<{ content: string; level: CompactionLevel } | null> {
     const sourceText = typeof params.sourceText === "string" ? params.sourceText.trim() : "";
     if (!sourceText) {
-      return {
-        content: "[Truncated from 0 tokens]",
-        level: "fallback",
-      };
+      return null;
     }
     const inputTokens = Math.max(1, estimateTokens(sourceText));
     const fallbackMaxTokens =
@@ -2207,6 +2204,12 @@ export class CompactionEngine {
       })
       .filter((s): s is string => s !== null)
       .join("\n\n");
+    if (!concatenated.trim()) {
+      this.log.warn(
+        `[lcm] leaf compaction skipped summary write; conversationId=${conversationId}; chunkMessages=${messageContents.length}; sourceMessages=${messageItems.length}; sanitized_source=empty`,
+      );
+      return null;
+    }
     const fileIds = dedupeOrderedIds(
       messageContents.flatMap((message) => extractFileIdsFromContent(message.content)),
     );

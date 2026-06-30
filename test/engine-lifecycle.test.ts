@@ -1078,39 +1078,40 @@ describe("LcmContextEngine session_end lifecycle", () => {
     });
   }
 
-  it("archives the prior active conversation and creates a fresh active row on idle rollover", async () => {
-    const engine = createEngine();
-    (engine as unknown as { ensureMigrated(): void }).ensureMigrated();
-    const store = engine.getConversationStore();
+  for (const reason of ["idle", "daily", "compaction"] as const) {
+    it(`rebinds the active conversation on ordinary ${reason} rollover`, async () => {
+      const engine = createEngine();
+      (engine as unknown as { ensureMigrated(): void }).ensureMigrated();
+      const store = engine.getConversationStore();
 
-    const original = await store.getOrCreateConversation("uuid-1", {
-      sessionKey: "agent:main:main",
+      const original = await store.getOrCreateConversation("uuid-1", {
+        sessionKey: "agent:main:main",
+      });
+      await store.createMessage({
+        conversationId: original.conversationId,
+        seq: 1,
+        role: "user",
+        content: "seed",
+        tokenCount: 5,
+      });
+
+      await engine.handleSessionEnd({
+        reason,
+        sessionId: "uuid-1",
+        sessionKey: "agent:main:main",
+        nextSessionId: "uuid-2",
+      });
+
+      const active = await store.getConversationBySessionKey("agent:main:main");
+      const originalAfterLifecycle = await store.getConversation(original.conversationId);
+
+      expect(active?.conversationId).toBe(original.conversationId);
+      expect(active?.sessionId).toBe("uuid-2");
+      expect(active?.active).toBe(true);
+      expect(originalAfterLifecycle?.active).toBe(true);
+      expect(originalAfterLifecycle?.archivedAt).toBeNull();
     });
-    await store.createMessage({
-      conversationId: original.conversationId,
-      seq: 1,
-      role: "user",
-      content: "seed",
-      tokenCount: 5,
-    });
-
-    await engine.handleSessionEnd({
-      reason: "idle",
-      sessionId: "uuid-1",
-      sessionKey: "agent:main:main",
-      nextSessionId: "uuid-2",
-    });
-
-    const active = await store.getConversationBySessionKey("agent:main:main");
-    const archived = await store.getConversation(original.conversationId);
-
-    expect(active).not.toBeNull();
-    expect(active?.conversationId).not.toBe(original.conversationId);
-    expect(active?.sessionId).toBe("uuid-2");
-    expect(active?.active).toBe(true);
-    expect(archived?.active).toBe(false);
-    expect(archived?.archivedAt).not.toBeNull();
-  });
+  }
 
   it("archives the active conversation without replacement on deleted session_end", async () => {
     const engine = createEngine();
