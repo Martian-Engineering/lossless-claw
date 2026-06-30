@@ -44,3 +44,6 @@
 {"type":"status_update","timestamp":"2026-06-30T07:52:44.396846Z","issue_id":"lc-8cb.6","payload":{"status":"in_progress"}}
 {"type":"close","timestamp":"2026-06-30T07:55:07.473464Z","issue_id":"lc-8cb.6","payload":{}}
 {"type":"close","timestamp":"2026-06-30T07:55:27.296315Z","issue_id":"lc-8cb","payload":{}}
+{"type":"create","timestamp":"2026-06-30T21:48:13.69636Z","issue_id":"lc-fbe","payload":{"description":"Background deferred compaction drains should not immediately reschedule while a maintenance row is still in nextAttemptAfter backoff; current 952 logs show tight repeated backoff/done lines for conversation 4849.","priority":"2","title":"Fix deferred compaction backoff drain loop","type":"task"}}
+{"type":"status_update","timestamp":"2026-06-30T21:53:27.58735Z","issue_id":"lc-fbe","payload":{"status":"in_progress"}}
+{"type":"close","timestamp":"2026-06-30T21:57:18.581895Z","issue_id":"lc-fbe","payload":{}}
