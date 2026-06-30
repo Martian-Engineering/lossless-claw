@@ -63,6 +63,29 @@ export function extractToolResultIdForPairing(message: AgentMessage): string | u
   return undefined;
 }
 
+export function buildToolCallInputMap(
+  messages: AgentMessage[],
+): Map<string, Record<string, unknown>> {
+  const map = new Map<string, Record<string, unknown>>();
+  for (const message of messages) {
+    if (message.role !== "assistant" || !Array.isArray(message.content)) {
+      continue;
+    }
+    for (const block of message.content) {
+      const record = asRecord(block);
+      if (!record || typeof record.type !== "string" || !TOOL_CALL_RAW_TYPES.has(record.type)) {
+        continue;
+      }
+      const id = extractToolPairingIdFromRecord(record);
+      const input = asRecord(record.input) ?? asRecord(record.arguments);
+      if (id && input) {
+        map.set(id, input);
+      }
+    }
+  }
+  return map;
+}
+
 export function expandProtectedToolPairIndexes(params: {
   assembledMessages: AgentMessage[];
   protectedAssembledIndexes: Set<number>;

@@ -7,8 +7,9 @@
  * Extracted from engine.ts (Phase 2 of the engine decomposition).
  */
 import { mkdir, writeFile } from "node:fs/promises";
+import { existsSync, readFileSync } from "node:fs";
 import { createHash, randomUUID } from "node:crypto";
-import { join } from "node:path";
+import { isAbsolute, join } from "node:path";
 import type { LcmConfig } from "./db/config.js";
 import type { SummaryStore } from "./store/summary-store.js";
 import type { AgentMessage } from "./openclaw-bridge.js";
@@ -753,6 +754,7 @@ export class LargeFileInterceptor {
   async interceptLargeToolResults(params: {
     conversationId: number;
     message: AgentMessage;
+    toolCallInputMap?: ReadonlyMap<string, Record<string, unknown>>;
     getFileId?: (input: { content: string; toolName: string; callId?: string }) => string;
   }): Promise<{ rewrittenMessage: AgentMessage; fileIds: string[] } | null> {
     if (
@@ -857,9 +859,32 @@ export class LargeFileInterceptor {
       }
 
       interceptedAny = true;
+
+      // If the read tool output was truncated, recover the full content from disk.
+      // The tool call input carries the original file path; without this recovery
+      // the truncated output gets externalized and the agent can never retrieve
+      // the complete file via lcm_describe.
+      let contentToExternalize = extractedText;
+      if (
+        toolName === "read" &&
+        callId &&
+        params.toolCallInputMap &&
+        isReadToolTruncated(extractedText)
+      ) {
+        const toolInput = params.toolCallInputMap.get(callId);
+        const readPath = toolInput && safeString(toolInput.path);
+        if (readPath && isAbsolute(readPath) && existsSync(readPath)) {
+          try {
+            contentToExternalize = readFileSync(readPath, "utf8");
+          } catch {
+            // Fall back to the truncated text if the file can't be read.
+          }
+        }
+      }
+
       const externalized = await this.externalizeLargeTextPayload({
         conversationId: params.conversationId,
-        content: extractedText,
+        content: contentToExternalize,
         fileId: params.getFileId?.({ content: extractedText, toolName, callId }),
         fileName: `${toolName}.txt`,
         mimeType: "text/plain",
@@ -996,4 +1021,11 @@ export class LargeFileInterceptor {
       },
     };
   }
+}
+
+const READ_CAPPED_RE = /\[Read output capped at/i;
+const READ_TRUNCATED_RE = /\[Truncated:/;
+
+function isReadToolTruncated(text: string): boolean {
+  return READ_CAPPED_RE.test(text) || READ_TRUNCATED_RE.test(text);
 }

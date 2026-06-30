@@ -46,6 +46,7 @@ import { CompactionTelemetryStore } from "./store/compaction-telemetry-store.js"
 import { CompactionMaintenanceStore } from "./store/compaction-maintenance-store.js";
 import { ConversationStore, type ConversationRecord } from "./store/conversation-store.js";
 import { FocusBriefStore, type FocusBriefRecord } from "./store/focus-brief-store.js";
+import { buildToolCallInputMap } from "./tool-pairing.js";
 import { SummaryStore, type ContextItemRecord } from "./store/summary-store.js";
 import { createLcmSummarizeFromLegacyParams, FALLBACK_SUMMARY_MARKER, LcmProviderAuthError, LcmSummarySpendLimitError, type LcmSummarizeFn } from "./summarize.js";
 import type { LcmDependencies } from "./types.js";
@@ -2544,11 +2545,12 @@ export class LcmContextEngine implements ContextEngine {
     sessionId: string;
     sessionKey?: string;
     message: AgentMessage;
+    toolCallInputMap?: ReadonlyMap<string, Record<string, unknown>>;
     isHeartbeat?: boolean;
     createdAt?: Date | string;
     skipReplayTimestampFloodGuard?: boolean;
   }): Promise<IngestResult> {
-    const { sessionId, sessionKey, message, isHeartbeat, createdAt, skipReplayTimestampFloodGuard } = params;
+    const { sessionId, sessionKey, message, toolCallInputMap, isHeartbeat, createdAt, skipReplayTimestampFloodGuard } = params;
     if (isHeartbeat) {
       return { ingested: false };
     }
@@ -2694,6 +2696,7 @@ export class LcmContextEngine implements ContextEngine {
       const intercepted = await this.largeFileInterceptor.interceptLargeToolResults({
         conversationId,
         message: messageForParts,
+        toolCallInputMap,
       });
       if (intercepted) {
         messageForParts = intercepted.rewrittenMessage;
@@ -2805,11 +2808,13 @@ export class LcmContextEngine implements ContextEngine {
             }
           }
           let ingestedCount = 0;
+          const toolCallInputMap = buildToolCallInputMap(messages);
           for (const message of messages) {
             const result = await this.ingestSingle({
               sessionId: params.sessionId,
               sessionKey: params.sessionKey,
               message,
+              toolCallInputMap,
               isHeartbeat: params.isHeartbeat,
               createdAt: resolveTranscriptMessageCreatedAt(message),
             });
@@ -3428,11 +3433,13 @@ export class LcmContextEngine implements ContextEngine {
         // Keep the rewritten view local; OpenClaw owns the live message array.
         const rewrittenMessages = liveMessages.slice();
         let interceptedAny = false;
+        const toolCallInputMap = buildToolCallInputMap(liveMessages);
         for (let i = 0; i < liveMessages.length; i++) {
           const message = liveMessages[i]!;
           const intercepted = await this.largeFileInterceptor.interceptLargeToolResults({
             conversationId: conversation.conversationId,
             message,
+            toolCallInputMap,
             getFileId: ({ content, toolName, callId }) =>
               buildLiveToolOutputFileId({
                 conversationId: conversation.conversationId,
