@@ -341,6 +341,37 @@ export class PendingSummaryStore {
     return row ? toBatchRecord(row) : null;
   }
 
+  /** Load the newest active pending compaction batch for a conversation. */
+  async getActiveBatchForConversation(
+    conversationId: number,
+  ): Promise<PendingCompactionBatchRecord | null> {
+    const row = this.db
+      .prepare(
+        `SELECT batch_id,
+                conversation_id,
+                session_key,
+                session_target_json,
+                status,
+                source_projection_fingerprint,
+                compactable_start_ordinal,
+                compactable_end_ordinal,
+                planned_fresh_tail_start_ordinal,
+                prompt_version,
+                model,
+                failure_summary,
+                created_at,
+                updated_at,
+                published_at
+         FROM pending_compaction_batches
+         WHERE conversation_id = ?
+           AND status IN ('planning', 'ready', 'publishing')
+         ORDER BY created_at DESC, batch_id DESC
+         LIMIT 1`,
+      )
+      .get(conversationId) as PendingCompactionBatchRow | undefined;
+    return row ? toBatchRecord(row) : null;
+  }
+
   /** Mark a pending compaction batch as published. */
   async markBatchPublished(input: { batchId: string; publishedAt?: Date }): Promise<void> {
     this.db
@@ -600,6 +631,13 @@ export class PendingSummaryStore {
                status = 'planned'
                OR (status = 'running' AND lease_expires_at IS NOT NULL AND lease_expires_at <= ?)
              )
+             AND NOT EXISTS (
+               SELECT 1
+               FROM pending_summary_node_children pc
+               JOIN pending_summary_nodes child ON child.node_id = pc.child_node_id
+               WHERE pc.node_id = pending_summary_nodes.node_id
+                 AND child.status NOT IN ('ready', 'promoted')
+             )
            ORDER BY ordinal_start, depth, node_id
            LIMIT 1`,
         )
@@ -621,6 +659,13 @@ export class PendingSummaryStore {
              AND (
                status = 'planned'
                OR (status = 'running' AND lease_expires_at IS NOT NULL AND lease_expires_at <= ?)
+             )
+             AND NOT EXISTS (
+               SELECT 1
+               FROM pending_summary_node_children pc
+               JOIN pending_summary_nodes child ON child.node_id = pc.child_node_id
+               WHERE pc.node_id = pending_summary_nodes.node_id
+                 AND child.status NOT IN ('ready', 'promoted')
              )`,
         )
         .run(input.leaseOwner, input.leaseExpiresAt.toISOString(), row.node_id, nowIso);

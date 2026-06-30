@@ -133,6 +133,64 @@ describe("LcmContextEngine afterTurn", () => {
     expect(deferredDebtLog).not.toContain("rawTokensOutsideTail=null");
   });
 
+  it("background deferred summarization does not block later user-turn ingestion", async () => {
+    let resolveComplete:
+      | ((value: { content: Array<{ type: "text"; text: string }> }) => void)
+      | undefined;
+    let completeStarted!: () => void;
+    const completeStartedPromise = new Promise<void>((resolve) => {
+      completeStarted = resolve;
+    });
+    const completeResultPromise = new Promise<{ content: Array<{ type: "text"; text: string }> }>(
+      (resolve) => {
+        resolveComplete = resolve;
+      },
+    );
+    const complete = vi.fn(async () => {
+      completeStarted();
+      return completeResultPromise;
+    });
+    const engine = createEngineWithDeps(
+      {
+        freshTailCount: 1,
+        leafChunkTokens: 120,
+        condensedMinFanout: 2,
+        condensedTargetTokens: 1,
+        maxSweepIterations: 8,
+      },
+      { complete },
+    );
+    const sessionId = "after-turn-deferred-background-does-not-block-ingest";
+    await seedBacklogContext(engine, sessionId, [100, 100, 100]);
+
+    await engine.afterTurn({
+      sessionId,
+      sessionFile: createSessionFilePath("after-turn-deferred-background-does-not-block-ingest"),
+      messages: [makeMessage({ role: "assistant", content: "fresh projected turn" })],
+      prePromptMessageCount: 0,
+      tokenBudget: 600,
+      runtimeContext: { currentTokenCount: 300 },
+    });
+    expect(complete).not.toHaveBeenCalled();
+
+    await completeStartedPromise;
+    const ingestWhileSummaryRuns = await Promise.race([
+      engine.ingest({
+        sessionId,
+        message: makeMessage({
+          role: "user",
+          content: "this user turn should not wait for the pending summary call",
+        }),
+      }),
+      new Promise<"blocked">((resolve) => setTimeout(() => resolve("blocked"), 50)),
+    ]);
+    expect(ingestWhileSummaryRuns).toMatchObject({ ingested: true });
+
+    resolveComplete?.({
+      content: [{ type: "text", text: "background pending summary" }],
+    });
+  });
+
 
 
   it("afterTurn drains threshold debt even when cache telemetry stays hot", async () => {
