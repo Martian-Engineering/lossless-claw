@@ -39,6 +39,7 @@ export type PendingCompactionCoordinatorOptions = {
   summarize: LcmSummarizeFn;
   model: string;
   leaseOwner: string;
+  withPublishLock?: <T>(operation: () => Promise<T>) => Promise<T>;
 };
 
 export type PendingCompactionCoordinatorResult =
@@ -106,6 +107,7 @@ export class PendingCompactionCoordinator {
   private readonly summarize: LcmSummarizeFn;
   private readonly model: string;
   private readonly leaseOwner: string;
+  private readonly withPublishLock: <T>(operation: () => Promise<T>) => Promise<T>;
 
   constructor(options: PendingCompactionCoordinatorOptions) {
     this.conversationStore = options.conversationStore;
@@ -115,6 +117,7 @@ export class PendingCompactionCoordinator {
     this.summarize = options.summarize;
     this.model = options.model;
     this.leaseOwner = options.leaseOwner;
+    this.withPublishLock = options.withPublishLock ?? ((operation) => operation());
   }
 
   /** Advance a conversation by at most one pending compaction step. */
@@ -129,15 +132,10 @@ export class PendingCompactionCoordinator {
 
     let batch = await this.pendingSummaryStore.getActiveBatchForConversation(input.conversationId);
     if (batch && batch.sourceProjectionFingerprint !== snapshot.sourceProjectionFingerprint) {
-      await this.pendingSummaryStore.markBatchStale({
-        batchId: batch.batchId,
-        failureSummary: "source projection fingerprint changed before publish",
-      });
-      return {
-        status: "stale",
-        batchId: batch.batchId,
-        reason: "source projection fingerprint changed before publish",
-      };
+      const staleResult = await this.withPublishLock(() =>
+        this.publishActiveBatchIfReady(input.conversationId),
+      );
+      return staleResult ?? { status: "idle", reason: "no active pending summary batch" };
     }
     if (!batch) {
       return this.planBatch({
@@ -176,7 +174,9 @@ export class PendingCompactionCoordinator {
       };
     }
 
-    const publishResult = await this.publishIfReady({ batch, snapshot });
+    const publishResult = await this.withPublishLock(() =>
+      this.publishActiveBatchIfReady(input.conversationId),
+    );
     if (publishResult) {
       return publishResult;
     }
@@ -301,6 +301,28 @@ export class PendingCompactionCoordinator {
       batchId: input.batch.batchId,
       frontierSummaryIds: published.frontierSummaryIds,
     };
+  }
+
+  private async publishActiveBatchIfReady(
+    conversationId: number,
+  ): Promise<PendingCompactionCoordinatorResult | null> {
+    const snapshot = await this.buildProjectionSnapshot(conversationId);
+    const batch = await this.pendingSummaryStore.getActiveBatchForConversation(conversationId);
+    if (!batch) {
+      return null;
+    }
+    if (batch.sourceProjectionFingerprint !== snapshot.sourceProjectionFingerprint) {
+      await this.pendingSummaryStore.markBatchStale({
+        batchId: batch.batchId,
+        failureSummary: "source projection fingerprint changed before publish",
+      });
+      return {
+        status: "stale",
+        batchId: batch.batchId,
+        reason: "source projection fingerprint changed before publish",
+      };
+    }
+    return this.publishIfReady({ batch, snapshot });
   }
 
   private async buildProjectionSnapshot(conversationId: number): Promise<ProjectionSnapshot> {
