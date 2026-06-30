@@ -1,4 +1,3 @@
-import { readFileSync } from "node:fs";
 import type { DatabaseSync } from "node:sqlite";
 import { buildMessageParts, toStoredMessage } from "./message-content.js";
 import type { AgentMessage } from "./openclaw-bridge.js";
@@ -16,6 +15,7 @@ import { asRecord, safeString } from "./value-utils.js";
 export async function filterPersistedRawIdReplayBatch(params: {
   db: DatabaseSync;
   summaryStore: SummaryStore;
+  largeFilesDir: string;
   log: { warn(message: string): void };
   sessionContext: string;
   conversationId: number;
@@ -207,18 +207,18 @@ export async function filterPersistedRawIdReplayBatch(params: {
             ) {
               continue;
             }
-            const largeFile = await params.summaryStore.getLargeFile(fileId);
-            if (!largeFile) {
-              continue;
-            }
-            let storedText: string;
+            let contentMatches = false;
             try {
-              storedText = readFileSync(largeFile.storageUri, "utf8");
+              contentMatches = await params.summaryStore.largeFileContentEquals(
+                fileId,
+                externalizedText,
+                { largeFilesDir: params.largeFilesDir },
+              );
             } catch {
               continue;
             }
             if (
-              storedText === externalizedText &&
+              contentMatches &&
               externalizedReplayMetadataMatches(persistedMetadata, parts[index]?.metadata)
             ) {
               externalizedPartMatches = true;
@@ -292,18 +292,18 @@ export async function filterPersistedRawIdReplayBatch(params: {
           ) {
             continue;
           }
-          const largeFile = await params.summaryStore.getLargeFile(row.fileId);
-          if (!largeFile) {
-            continue;
-          }
-          let storedText: string;
+          let contentMatches = false;
           try {
-            storedText = readFileSync(largeFile.storageUri, "utf8");
+            contentMatches = await params.summaryStore.largeFileContentEquals(
+              row.fileId,
+              externalizedText,
+              { largeFilesDir: params.largeFilesDir },
+            );
           } catch {
             continue;
           }
           if (
-            storedText !== externalizedText ||
+            !contentMatches ||
             !externalizedReplayMetadataMatches(row.metadata, parts[0]?.metadata)
           ) {
             continue;

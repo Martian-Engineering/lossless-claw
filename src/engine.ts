@@ -1793,21 +1793,6 @@ export class LcmContextEngine implements ContextEngine {
         continue;
       }
 
-      if (entryId) {
-        const stored = toStoredMessage(message);
-        const adopted = await this.conversationStore.adoptTranscriptEntryId(
-          params.conversationId,
-          stored.role,
-          stored.content,
-          entryId,
-        );
-        if (adopted) {
-          hasOverlap = true;
-          overlapAnchorIndex = index;
-          continue;
-        }
-      }
-
       importableMessages.push({ index, message });
     }
 
@@ -2504,6 +2489,7 @@ export class LcmContextEngine implements ContextEngine {
             messages = await filterPersistedRawIdReplayBatch({
               db: this.db,
               summaryStore: this.summaryStore,
+              largeFilesDir: this.config.largeFilesDir,
               log: this.deps.log,
               sessionContext: this.formatSessionLogContext({
                 conversationId: conversation.conversationId,
