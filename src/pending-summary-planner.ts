@@ -24,6 +24,7 @@ export type PendingSummaryPlannerNode = {
   sourceMessageIds: number[];
   childNodeIds: string[];
   childSummaryIds: string[];
+  childLinks?: Array<{ childNodeId?: string; childSummaryId?: string }>;
 };
 
 export type PlanPendingLeafNodesInput = {
@@ -313,6 +314,11 @@ function createCondensedParent(
     childSummaryIds: children
       .map((child) => child.canonicalSummaryId)
       .filter((summaryId): summaryId is string => typeof summaryId === "string"),
+    childLinks: children.map((child) =>
+      typeof child.canonicalSummaryId === "string"
+        ? { childSummaryId: child.canonicalSummaryId }
+        : { childNodeId: child.nodeId },
+    ),
   };
 }
 
