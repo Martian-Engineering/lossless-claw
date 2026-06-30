@@ -3,6 +3,7 @@ import {
   planPendingCondensedNodes,
   planPendingLeafNodes,
   selectPendingPublishFrontier,
+  type PendingSummaryPlannerNode,
   type PendingSummaryPlannerSnapshotItem,
 } from "../src/pending-summary-planner.js";
 
@@ -127,6 +128,48 @@ describe("pending summary planner", () => {
     expect(condensedNodes[0]).toMatchObject({
       childNodeIds: ["pending-leaf-b"],
       childSummaryIds: ["sum_active_a"],
+    });
+  });
+
+  it("does not duplicate canonical grandchildren in higher condensed layers", () => {
+    const pendingChild: PendingSummaryPlannerNode = {
+      nodeId: "pending-condensed-a",
+      canonicalSummaryId: null,
+      kind: "condensed",
+      depth: 1,
+      ordinalStart: 0,
+      ordinalEnd: 1,
+      tokenCount: 10,
+      sourceFingerprints: ["summary:sum_active_a", "message:11"],
+      sourceMessageIds: [11],
+      childNodeIds: ["pending-leaf-b"],
+      childSummaryIds: ["sum_active_a"],
+    };
+    const canonicalSibling: PendingSummaryPlannerNode = {
+      nodeId: "active-summary-c",
+      canonicalSummaryId: "sum_active_c",
+      kind: "condensed",
+      depth: 1,
+      ordinalStart: 2,
+      ordinalEnd: 2,
+      tokenCount: 5,
+      sourceFingerprints: ["summary:sum_active_c"],
+      sourceMessageIds: [],
+      childNodeIds: [],
+      childSummaryIds: [],
+    };
+
+    const condensedNodes = planPendingCondensedNodes({
+      nodes: [pendingChild, canonicalSibling],
+      condensedMinFanout: 2,
+      condensedMinSourceTokens: 1,
+      condensedChunkTokens: 20,
+      nodeIdPrefix: "condensed",
+    });
+
+    expect(condensedNodes[0]).toMatchObject({
+      childNodeIds: ["pending-condensed-a"],
+      childSummaryIds: ["sum_active_c"],
     });
   });
 
