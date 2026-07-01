@@ -270,6 +270,18 @@ export class PendingCompactionCoordinator {
         item.ordinal > input.batch.compactableEndOrdinal &&
         item.ordinal <= input.snapshot.compactableEndOrdinal!,
     );
+    // A leaf chunk below leafChunkTokens is not useful summary work. Without
+    // this gate, every tiny suffix (e.g. one heartbeat exchange per turn)
+    // re-plans the batch and re-runs condensation each cycle, so suffix growth
+    // must reach the same minimum that triggers leaf preparation at all.
+    const suffixRawTokens = extensionItems.reduce(
+      (total, item) =>
+        item.itemType === "message" ? total + normalizeNonNegativeInteger(item.tokenCount) : total,
+      0,
+    );
+    if (suffixRawTokens < normalizePositiveInteger(this.config.leafChunkTokens, 1)) {
+      return null;
+    }
     const nodeIdPrefix = `psn_${shortDigest("pending-summary-extension", [
       input.batch.batchId,
       input.snapshot.sourceProjectionFingerprint,
