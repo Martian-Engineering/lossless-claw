@@ -239,6 +239,160 @@ describe("PendingSummaryPublisher", () => {
     ]);
   });
 
+  it("reuses an existing canonical summary row and relinks lineage without duplication", async () => {
+    const { db, conversationStore, pendingSummaryStore, publisher, summaryStore } = createStores();
+    const conversation = await conversationStore.createConversation({
+      sessionId: "pending-publish-relink-session",
+      sessionKey: "agent:main:pending-publish-relink",
+    });
+    const messages = await conversationStore.createMessagesBulk([
+      {
+        conversationId: conversation.conversationId,
+        seq: 1,
+        role: "user",
+        content: "relink fact one",
+        tokenCount: 4,
+      },
+      {
+        conversationId: conversation.conversationId,
+        seq: 2,
+        role: "assistant",
+        content: "relink fact two",
+        tokenCount: 4,
+      },
+      {
+        conversationId: conversation.conversationId,
+        seq: 3,
+        role: "user",
+        content: "fresh tail",
+        tokenCount: 3,
+      },
+    ]);
+    await summaryStore.appendContextMessages(
+      conversation.conversationId,
+      messages.map((message) => message.messageId),
+    );
+
+    await pendingSummaryStore.createBatch({
+      batchId: "batch_relink_a",
+      conversationId: conversation.conversationId,
+      sourceProjectionFingerprint: "projection:v1",
+      compactableStartOrdinal: 0,
+      compactableEndOrdinal: 1,
+      promptVersion: "pending:v1",
+      model: "test-model",
+    });
+    await pendingSummaryStore.insertNode({
+      nodeId: "relink_leaf",
+      batchId: "batch_relink_a",
+      conversationId: conversation.conversationId,
+      kind: "leaf",
+      depth: 0,
+      status: "ready",
+      ordinalStart: 0,
+      ordinalEnd: 0,
+      sourceFingerprint: "source:relink-one",
+      content: "pending leaf content that must NOT overwrite the existing row",
+      tokenCount: 5,
+      promptVersion: "pending:v1",
+      model: "test-model",
+    });
+    await pendingSummaryStore.insertNode({
+      nodeId: "relink_leaf_b",
+      batchId: "batch_relink_a",
+      conversationId: conversation.conversationId,
+      kind: "leaf",
+      depth: 0,
+      status: "ready",
+      ordinalStart: 1,
+      ordinalEnd: 1,
+      sourceFingerprint: "source:relink-two",
+      content: "leaf summary two",
+      tokenCount: 4,
+      promptVersion: "pending:v1",
+      model: "test-model",
+    });
+    await pendingSummaryStore.insertNode({
+      nodeId: "relink_root",
+      batchId: "batch_relink_a",
+      conversationId: conversation.conversationId,
+      kind: "condensed",
+      depth: 1,
+      status: "ready",
+      ordinalStart: 0,
+      ordinalEnd: 1,
+      sourceFingerprint: "source:relink-root",
+      content: "condensed relink summary",
+      tokenCount: 6,
+      promptVersion: "pending:v1",
+      model: "test-model",
+    });
+    await pendingSummaryStore.linkNodeToMessages("relink_leaf", [
+      { messageId: messages[0]!.messageId },
+    ]);
+    await pendingSummaryStore.linkNodeToMessages("relink_leaf_b", [
+      { messageId: messages[1]!.messageId },
+    ]);
+    await pendingSummaryStore.linkNodeToChildren("relink_root", [
+      { childNodeId: "relink_leaf" },
+      { childNodeId: "relink_leaf_b" },
+    ]);
+
+    // A canonical row already exists under the id the publisher derives for
+    // relink_leaf (crash-retry shape: insert survived, promotion state did
+    // not). It is even already linked to its message — both the insert and the
+    // link must be skipped/idempotent, not duplicated or overwritten.
+    await summaryStore.insertSummary({
+      summaryId: "sum_relink_leaf",
+      conversationId: conversation.conversationId,
+      kind: "leaf",
+      depth: 0,
+      content: "pre-existing canonical content",
+      tokenCount: 5,
+    });
+    await summaryStore.linkSummaryToMessages("sum_relink_leaf", [messages[0]!.messageId]);
+
+    const result = await publisher.publishReadyFrontier({
+      batchId: "batch_relink_a",
+      frontierNodeIds: ["relink_root"],
+    });
+    expect(result.frontierSummaryIds).toEqual(["sum_relink_root"]);
+    expect(result.canonicalSummaryIds).toEqual([
+      "sum_relink_leaf",
+      "sum_relink_leaf_b",
+      "sum_relink_root",
+    ]);
+
+    // The existing row was reused: single row, original content preserved.
+    const leafRowCount = db
+      .prepare(`SELECT COUNT(*) AS count FROM summaries WHERE summary_id = 'sum_relink_leaf'`)
+      .get() as { count: number };
+    expect(leafRowCount.count).toBe(1);
+    await expect(summaryStore.getSummary("sum_relink_leaf")).resolves.toMatchObject({
+      content: "pre-existing canonical content",
+    });
+
+    // Lineage is complete and not duplicated.
+    const messageLinks = db
+      .prepare(
+        `SELECT COUNT(*) AS count FROM summary_messages WHERE summary_id = 'sum_relink_leaf'`,
+      )
+      .get() as { count: number };
+    expect(messageLinks.count).toBe(1);
+    await expect(summaryStore.getSummaryParents("sum_relink_root")).resolves.toHaveLength(2);
+
+    // Publish outcome matches the fresh-insert path: frontier swapped in,
+    // nodes promoted with their canonical ids.
+    await expect(summaryStore.getContextItems(conversation.conversationId)).resolves.toMatchObject([
+      { ordinal: 0, itemType: "summary", summaryId: "sum_relink_root" },
+      { ordinal: 1, itemType: "message", messageId: messages[2]!.messageId },
+    ]);
+    await expect(pendingSummaryStore.getNode("relink_leaf")).resolves.toMatchObject({
+      status: "promoted",
+      canonicalSummaryId: "sum_relink_leaf",
+    });
+  });
+
   it("marks stale batches without canonical summary writes", async () => {
     const { conversationStore, pendingSummaryStore, publisher, summaryStore } = createStores();
     const conversation = await conversationStore.createConversation({
