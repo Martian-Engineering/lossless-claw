@@ -89,7 +89,7 @@ export async function runPendingSummaryCompactionProof(): Promise<PendingSummary
       seq: 4,
       role: "assistant",
       content: "delta raw fresh tail",
-      tokenCount: 4,
+      tokenCount: 8,
     },
   ]);
   await stores.summaryStore.appendContextMessages(
