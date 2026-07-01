@@ -281,6 +281,122 @@ describe("PendingSummaryStore", () => {
     });
   });
 
+  it("prunes superseded condensed nodes, clears promoted payloads, and expires finished batches", async () => {
+    const { db, conversationStore, pendingSummaryStore, summaryStore } = createStores();
+    const conversation = await conversationStore.createConversation({
+      sessionId: "pending-summary-gc-session",
+      sessionKey: "agent:main:pending-summary-gc",
+    });
+    await pendingSummaryStore.createBatch({
+      batchId: "batch_gc_a",
+      conversationId: conversation.conversationId,
+      sourceProjectionFingerprint: "projection:v1",
+      compactableStartOrdinal: 0,
+      compactableEndOrdinal: 9,
+      promptVersion: "leaf:v1",
+      model: "test-model",
+    });
+    const insertCondensed = (nodeId: string, ordinalEnd: number, status: string) =>
+      pendingSummaryStore
+        .insertNode({
+          nodeId,
+          batchId: "batch_gc_a",
+          conversationId: conversation.conversationId,
+          kind: "condensed",
+          depth: 1,
+          status: "planned",
+          ordinalStart: 0,
+          ordinalEnd,
+          sourceFingerprint: `source:${nodeId}`,
+          promptVersion: "leaf:v1",
+          model: "test-model",
+        })
+        .then(() =>
+          db
+            .prepare(
+              `UPDATE pending_summary_nodes SET status = ?, content = 'payload' WHERE node_id = ?`,
+            )
+            .run(status, nodeId),
+        );
+
+    // Three same-depth, same-start condensed nodes: two superseded by the
+    // widest, one of them protected by a live parent reference.
+    await insertCondensed("node_gc_narrow", 3, "ready");
+    await insertCondensed("node_gc_referenced", 5, "ready");
+    await insertCondensed("node_gc_wide", 9, "ready");
+    await pendingSummaryStore.insertNode({
+      nodeId: "node_gc_parent",
+      batchId: "batch_gc_a",
+      conversationId: conversation.conversationId,
+      kind: "condensed",
+      depth: 2,
+      status: "planned",
+      ordinalStart: 0,
+      ordinalEnd: 9,
+      sourceFingerprint: "source:parent",
+      promptVersion: "leaf:v1",
+      model: "test-model",
+    });
+    await pendingSummaryStore.linkNodeToChildren("node_gc_parent", [
+      { childNodeId: "node_gc_referenced" },
+    ]);
+
+    await expect(pendingSummaryStore.pruneSupersededNodes("batch_gc_a")).resolves.toBe(1);
+    await expect(pendingSummaryStore.getNode("node_gc_narrow")).resolves.toBeNull();
+    await expect(pendingSummaryStore.getNode("node_gc_referenced")).resolves.not.toBeNull();
+    await expect(pendingSummaryStore.getNode("node_gc_wide")).resolves.not.toBeNull();
+
+    // Promoted payloads are dropped while lineage metadata survives.
+    await summaryStore.insertSummary({
+      summaryId: "sum_gc_wide",
+      conversationId: conversation.conversationId,
+      kind: "condensed",
+      depth: 1,
+      content: "canonical gc summary",
+      tokenCount: 5,
+    });
+    db.prepare(
+      `UPDATE pending_summary_nodes
+       SET status = 'promoted', canonical_summary_id = 'sum_gc_wide'
+       WHERE node_id = 'node_gc_wide'`,
+    ).run();
+    await expect(pendingSummaryStore.clearPromotedPayloads("batch_gc_a")).resolves.toBe(1);
+    await expect(pendingSummaryStore.getNode("node_gc_wide")).resolves.toMatchObject({
+      status: "promoted",
+      canonicalSummaryId: "sum_gc_wide",
+      content: null,
+    });
+    await expect(pendingSummaryStore.getNode("node_gc_referenced")).resolves.toMatchObject({
+      content: "payload",
+    });
+
+    // Finished batches past retention are deleted with their nodes; active
+    // and recently finished batches survive.
+    await pendingSummaryStore.createBatch({
+      batchId: "batch_gc_active",
+      conversationId: conversation.conversationId,
+      sourceProjectionFingerprint: "projection:v2",
+      compactableStartOrdinal: 0,
+      compactableEndOrdinal: 1,
+      promptVersion: "leaf:v1",
+      model: "test-model",
+    });
+    db.prepare(
+      `UPDATE pending_compaction_batches
+       SET status = 'published', updated_at = '2026-06-01 00:00:00'
+       WHERE batch_id = 'batch_gc_a'`,
+    ).run();
+    await expect(
+      pendingSummaryStore.deleteFinishedBatches({
+        conversationId: conversation.conversationId,
+        olderThan: new Date("2026-06-08T00:00:00.000Z"),
+      }),
+    ).resolves.toBe(1);
+    await expect(pendingSummaryStore.getBatch("batch_gc_a")).resolves.toBeNull();
+    await expect(pendingSummaryStore.getNode("node_gc_wide")).resolves.toBeNull();
+    await expect(pendingSummaryStore.getBatch("batch_gc_active")).resolves.not.toBeNull();
+  });
+
   it("reclaims failed nodes after their backoff and stops at the retry cap", async () => {
     const { conversationStore, pendingSummaryStore } = createStores();
     const conversation = await conversationStore.createConversation({
