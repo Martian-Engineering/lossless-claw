@@ -38,15 +38,155 @@ type Stores = {
   summaryStore: SummaryStore;
 };
 
-function createStores(): Stores {
+function createStores(): Stores & { db: DatabaseSync } {
   const db = new DatabaseSync(":memory:");
   db.exec("PRAGMA foreign_keys = ON");
   const { fts5Available } = getLcmDbFeatures(db);
   runLcmMigrations(db, { fts5Available });
   return {
+    db,
     conversationStore: new ConversationStore(db, { fts5Available }),
     pendingSummaryStore: new PendingSummaryStore(db),
     summaryStore: new SummaryStore(db, { fts5Available }),
+  };
+}
+
+export type PendingSummaryStaleRecoveryProofReport = {
+  failures: string[];
+  ok: boolean;
+  publishedSummaryContent: string | null;
+  replannedBatchId: string | null;
+  staleBatchId: string | null;
+};
+
+/**
+ * Prove the resilience arc: prepared work whose sources change in place is
+ * rejected as stale (never published), a fresh batch replans the same
+ * projection, and the recovery publish reflects the mutated sources.
+ */
+export async function runPendingSummaryStaleRecoveryProof(): Promise<PendingSummaryStaleRecoveryProofReport> {
+  const { db, ...stores } = createStores();
+  const failures: string[] = [];
+
+  const conversation = await stores.conversationStore.createConversation({
+    sessionId: "pending-summary-stale-proof-session",
+    sessionKey: "agent:main:pending-summary-stale-proof",
+  });
+  const messages = await stores.conversationStore.createMessagesBulk([
+    {
+      conversationId: conversation.conversationId,
+      seq: 1,
+      role: "user",
+      content: "original source alpha",
+      tokenCount: 10,
+    },
+    {
+      conversationId: conversation.conversationId,
+      seq: 2,
+      role: "assistant",
+      content: "original source bravo",
+      tokenCount: 10,
+    },
+    {
+      conversationId: conversation.conversationId,
+      seq: 3,
+      role: "user",
+      content: "fresh tail stays raw",
+      tokenCount: 10,
+    },
+  ]);
+  await stores.summaryStore.appendContextMessages(
+    conversation.conversationId,
+    messages.map((message) => message.messageId),
+  );
+
+  const coordinator = new PendingCompactionCoordinator({
+    ...stores,
+    model: "proof-model",
+    leaseOwner: "proof-worker",
+    config: {
+      freshTailCount: 1,
+      leafChunkTokens: 100,
+      condensedMinFanout: 99,
+      condensedMinSourceTokens: 1,
+      condensedChunkTokens: 100,
+    },
+    summarize: async (sourceText) => `stale-proof summary over:\n${sourceText}`,
+  });
+  const runOnce = () => coordinator.runOnce({ conversationId: conversation.conversationId });
+
+  // Prepare the single leaf covering the two compactable messages.
+  const planned = await runOnce();
+  if (planned.status !== "planned") {
+    failures.push(`expected planned step, got ${planned.status}`);
+    return { failures, ok: false, publishedSummaryContent: null, replannedBatchId: null, staleBatchId: null };
+  }
+  const prepared = await runOnce();
+  if (prepared.status !== "prepared") {
+    failures.push(`expected prepared step, got ${prepared.status}`);
+  }
+
+  // Mutate a summarized source message IN PLACE. The prepared content no
+  // longer matches its sources, so the batch must never publish.
+  db.prepare(`UPDATE messages SET content = ?, token_count = ? WHERE message_id = ?`).run(
+    "mutated source truth",
+    12,
+    messages[0]!.messageId,
+  );
+
+  const staleStep = await runOnce();
+  if (staleStep.status !== "stale") {
+    failures.push(`expected stale step after source mutation, got ${staleStep.status}`);
+  }
+  const staleBatch = await stores.pendingSummaryStore.getBatch(planned.batchId);
+  if (staleBatch?.status !== "stale") {
+    failures.push(`stale batch should be marked stale, got ${staleBatch?.status}`);
+  }
+  const staleNodes = await stores.pendingSummaryStore.getNodesByBatch(planned.batchId);
+  if (!staleNodes.every((node) => node.status === "stale")) {
+    failures.push("all nodes of the stale batch should be marked stale");
+  }
+  if ((await stores.summaryStore.getSummariesByConversation(conversation.conversationId)).length !== 0) {
+    failures.push("stale rejection must not write canonical summaries");
+  }
+
+  // Recovery: a fresh batch replans the same projection and publishes work
+  // built from the mutated sources.
+  const replanned = await runOnce();
+  if (replanned.status !== "planned") {
+    failures.push(`expected replanned step, got ${replanned.status}`);
+    return { failures, ok: false, publishedSummaryContent: null, replannedBatchId: null, staleBatchId: planned.batchId };
+  }
+  if (replanned.batchId === planned.batchId) {
+    failures.push("replan should create a new batch id");
+  }
+  const reprepared = await runOnce();
+  if (reprepared.status !== "prepared") {
+    failures.push(`expected re-prepared step, got ${reprepared.status}`);
+  }
+  const published = await runOnce();
+  if (published.status !== "published") {
+    failures.push(`expected recovery publish, got ${published.status}`);
+  }
+
+  const contextItems = await stores.summaryStore.getContextItems(conversation.conversationId);
+  const summaryItem = contextItems.find((item) => item.itemType === "summary");
+  const publishedSummary = summaryItem?.summaryId
+    ? await stores.summaryStore.getSummary(summaryItem.summaryId)
+    : null;
+  if (!publishedSummary?.content.includes("mutated source truth")) {
+    failures.push("recovery publish should summarize the mutated source content");
+  }
+  if (publishedSummary?.content.includes("original source alpha")) {
+    failures.push("recovery publish must not reuse stale pre-mutation content");
+  }
+
+  return {
+    failures,
+    ok: failures.length === 0,
+    publishedSummaryContent: publishedSummary?.content ?? null,
+    replannedBatchId: replanned.batchId,
+    staleBatchId: planned.batchId,
   };
 }
 
@@ -436,8 +576,9 @@ function validateProof(input: {
 
 if (import.meta.url === pathToFileURL(process.argv[1] ?? "").href) {
   const report = await runPendingSummaryCompactionProof();
-  process.stdout.write(`${JSON.stringify(report, null, 2)}\n`);
-  if (!report.ok) {
+  const staleRecoveryReport = await runPendingSummaryStaleRecoveryProof();
+  process.stdout.write(`${JSON.stringify({ report, staleRecoveryReport }, null, 2)}\n`);
+  if (!report.ok || !staleRecoveryReport.ok) {
     process.exitCode = 1;
   }
 }
