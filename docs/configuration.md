@@ -34,7 +34,9 @@ Most installations only need to override a handful of keys. If you want a comple
     {
       "name": "large-context-models",
       "match": { "modelContextWindowMin": 900000 },
-      "contextThreshold": 0.15
+      "contextThreshold": 0.15,
+      "freshTailCount": 16,
+      "leafChunkTokens": 12000
     },
     {
       "name": "small-context-models",
@@ -204,7 +206,7 @@ Every automatic decision emits grep-able log lines prefixed with `[lcm] auto-rot
 | Key | Type | Default | Env override | Purpose |
 | --- | --- | --- | --- | --- |
 | `contextThreshold` | `number` | `0.75` | `LCM_CONTEXT_THRESHOLD` | Fraction of the active model context window that triggers compaction. |
-| `contextThresholdOverrides` | `Array<{ name?: string; match: object; contextThreshold: number }>` | `[]` | none | Optional ordered rules that override `contextThreshold` by model id, model context-window range, or session glob pattern. |
+| `contextThresholdOverrides` | `Array<{ name?: string; match: object; contextThreshold: number; freshTailCount?: integer; leafChunkTokens?: integer }>` | `[]` | none | Optional ordered rules that override `contextThreshold` and, optionally, `freshTailCount` and `leafChunkTokens` by model id, model context-window range, or session glob pattern. |
 | `freshTailCount` | `integer` | `64` | `LCM_FRESH_TAIL_COUNT` | Number of newest messages always kept raw. |
 | `freshTailMaxTokens` | `integer` | unset | `LCM_FRESH_TAIL_MAX_TOKENS` | Optional token cap for the protected fresh tail. The newest message is always preserved even if it exceeds the cap. |
 | `promptAwareEviction` | `boolean` | `false` | `LCM_PROMPT_AWARE_EVICTION_ENABLED` | When enabled, budget-constrained assembly keeps older evictable items by prompt relevance instead of pure chronology. This improves retrieval under tight budgets, but it can reduce prompt-cache hit rates because the preserved prefix changes as prompts change. |
@@ -299,7 +301,9 @@ Automatic compaction is threshold-only:
 
 Lossless still records prompt-cache telemetry for status and diagnostics, but cache hotness no longer delays threshold debt. Legacy `cacheAwareCompaction.*` and `dynamicLeafChunkTokens.*` settings remain accepted so existing OpenClaw config continues to load, but they do not change automatic compaction behavior.
 
-`contextThresholdOverrides` are optional and never replace the global fallback. Each rule's `match` object can include `model`, `modelContextWindowMin`, `modelContextWindowMax`, and `sessionPattern`; all fields in a rule must match. If several rules match, Lossless picks the highest-specificity rule, then the earliest rule in the array for ties. Exact `model` matches have higher specificity than `sessionPattern` matches, and session-pattern matches have higher specificity than context-window range matches. Threshold selection logs include the chosen threshold, source, rule index/name, token budget, threshold tokens, model, context-window value, and match reason.
+`contextThresholdOverrides` are optional and never replace the global fallback. Each rule's `match` object can include `model`, `modelContextWindowMin`, `modelContextWindowMax`, and `sessionPattern`; all fields in a rule must match. If several rules match, Lossless picks the highest-specificity rule, then the earliest rule in the array for ties. Exact `model` matches have higher specificity than `sessionPattern` matches, and session-pattern matches have higher specificity than context-window range matches. A matching rule may also set `freshTailCount`, which overrides the global fresh-tail count for assembly and threshold compaction, and `leafChunkTokens`, which overrides the global leaf chunk size for matching threshold sweeps. Threshold selection logs include the chosen threshold, source, rule index/name, token budget, threshold tokens, fresh-tail count, leaf chunk size, model, context-window value, and match reason.
+
+Context-window matchers only apply when the OpenClaw host reports explicit model context-window metadata to Lossless. Lossless does not infer `modelContextWindowMin` or `modelContextWindowMax` matches from the active token budget. If an override must affect assemble-time `freshTailCount` on all currently supported OpenClaw hosts, prefer an exact `model` or `sessionPattern` matcher.
 
 Full sweeps first run leaf passes until there are no more eligible raw-message chunks outside the fresh tail. Condensation is then driven by summarized-prefix pressure: the routine condensation phase obeys `sweepMaxDepth`, and if the summarized prefix still exceeds `summaryPrefixTargetTokens`, a pressure phase may use `condensedMinFanoutHard` and condense deeper. Total context pressure starts the sweep, but does not by itself force deeper condensation once the raw prefix has been summarized.
 

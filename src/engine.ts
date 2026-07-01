@@ -806,18 +806,32 @@ export class LcmContextEngine implements ContextEngine {
       const resolvedProjectedTokenCount = this.normalizeObservedTokenCount(
         maintenance.projectedTokenCount ?? undefined,
       );
+      const runtimeResolvedContextThreshold = this.contextThresholdResolver.resolve({
+        sessionKey: params.sessionKey,
+        runtime: readRuntimeModelContext(
+          asRecord(params.runtimeContext),
+          asRecord(params.legacyParams),
+        ),
+      });
       // Prefer the threshold persisted with the debt row: a background drain
       // may lack the runtime model metadata that originally selected it, and
-      // re-resolving could silently flip the compaction decision.
-      const resolvedContextThreshold =
-        persistedContextThresholdOverride(maintenance)
-        ?? this.contextThresholdResolver.resolve({
-          sessionKey: params.sessionKey,
-          runtime: readRuntimeModelContext(
-            asRecord(params.runtimeContext),
-            asRecord(params.legacyParams),
-          ),
-        });
+      // re-resolving could silently flip the compaction decision. New debt rows
+      // also persist selected fresh-tail and leaf chunk sizing; the runtime
+      // fallback only helps older rows written before those columns existed.
+      const persistedContextThreshold = persistedContextThresholdOverride(maintenance);
+      const resolvedContextThreshold = persistedContextThreshold
+        ? {
+            ...persistedContextThreshold,
+            ...(persistedContextThreshold.freshTailCount === undefined &&
+            runtimeResolvedContextThreshold.freshTailCount !== undefined
+              ? { freshTailCount: runtimeResolvedContextThreshold.freshTailCount }
+              : {}),
+            ...(persistedContextThreshold.leafChunkTokens === undefined &&
+            runtimeResolvedContextThreshold.leafChunkTokens !== undefined
+              ? { leafChunkTokens: runtimeResolvedContextThreshold.leafChunkTokens }
+              : {}),
+          }
+        : runtimeResolvedContextThreshold;
 
       const isThresholdDebt = maintenance.reason?.trim() === "threshold";
       if (!isThresholdDebt) {
@@ -825,7 +839,12 @@ export class LcmContextEngine implements ContextEngine {
           params.conversationId,
           resolvedTokenBudget,
           resolvedCurrentTokenCount,
-          { contextThreshold: resolvedContextThreshold.contextThreshold },
+          {
+            contextThreshold: resolvedContextThreshold.contextThreshold,
+            ...(resolvedContextThreshold.freshTailCount !== undefined
+              ? { freshTailCount: resolvedContextThreshold.freshTailCount }
+              : {}),
+          },
         );
         this.logContextThresholdSelection({
           conversationId: params.conversationId,
@@ -1086,6 +1105,9 @@ export class LcmContextEngine implements ContextEngine {
       });
     const decision = await this.compaction.evaluate(conversationId, tokenBudget, observedTokens, {
       contextThreshold: resolvedContextThreshold.contextThreshold,
+      ...(resolvedContextThreshold.freshTailCount !== undefined
+        ? { freshTailCount: resolvedContextThreshold.freshTailCount }
+        : {}),
     });
     const targetTokens =
       params.compactionTarget === "threshold" ? decision.threshold : tokenBudget;
@@ -1202,6 +1224,12 @@ export class LcmContextEngine implements ContextEngine {
           conversationId,
           tokenBudget,
           contextThreshold: resolvedContextThreshold.contextThreshold,
+          ...(resolvedContextThreshold.freshTailCount !== undefined
+            ? { freshTailCount: resolvedContextThreshold.freshTailCount }
+            : {}),
+          ...(resolvedContextThreshold.leafChunkTokens !== undefined
+            ? { leafChunkTokens: resolvedContextThreshold.leafChunkTokens }
+            : {}),
           summarize,
           force: forceThresholdSweep,
           hardTrigger: false,
@@ -1413,6 +1441,12 @@ export class LcmContextEngine implements ContextEngine {
         conversationId,
         tokenBudget,
         contextThreshold: resolvedContextThreshold.contextThreshold,
+        ...(resolvedContextThreshold.freshTailCount !== undefined
+          ? { freshTailCount: resolvedContextThreshold.freshTailCount }
+          : {}),
+        ...(resolvedContextThreshold.leafChunkTokens !== undefined
+          ? { leafChunkTokens: resolvedContextThreshold.leafChunkTokens }
+          : {}),
         targetTokens: convergenceTargetTokens,
         ...(effectiveCurrentTokens !== undefined ? { currentTokens: effectiveCurrentTokens } : {}),
         summarize,
@@ -3170,7 +3204,12 @@ export class LcmContextEngine implements ContextEngine {
         conversation.conversationId,
         tokenBudget,
         observedCurrentTokenCount,
-        { contextThreshold: resolvedContextThreshold.contextThreshold },
+        {
+          contextThreshold: resolvedContextThreshold.contextThreshold,
+          ...(resolvedContextThreshold.freshTailCount !== undefined
+            ? { freshTailCount: resolvedContextThreshold.freshTailCount }
+            : {}),
+        },
       );
       this.logContextThresholdSelection({
         conversationId: conversation.conversationId,
@@ -3338,8 +3377,12 @@ export class LcmContextEngine implements ContextEngine {
     sessionKey?: string;
     messages: AgentMessage[];
     tokenBudget?: number;
+    /** Current model identifier from OpenClaw hosts that predate assemble runtimeContext. */
+    model?: string;
     /** Optional user query for relevance-based eviction (BM25-lite). When absent or unsearchable, falls back to chronological eviction. */
     prompt?: string;
+    /** Optional runtime context for override resolution (model, provider, etc.). */
+    runtimeContext?: Record<string, unknown>;
   }): Promise<AssembleResult> {
     let liveMessages = params.messages;
     // Return a new fallback array so the runtime hook treats this as assembled
@@ -3602,10 +3645,17 @@ export class LcmContextEngine implements ContextEngine {
         }
       }
 
+      const resolvedContextThreshold = this.contextThresholdResolver.resolve({
+        sessionKey: params.sessionKey,
+        runtime: readRuntimeModelContext(asRecord(params.runtimeContext), { model: params.model }),
+      });
+      const assembledFreshTailCount =
+        resolvedContextThreshold.freshTailCount ?? this.config.freshTailCount;
+
       const assembled = await this.assembler.assemble({
         conversationId: conversation.conversationId,
         tokenBudget,
-        freshTailCount: this.config.freshTailCount,
+        freshTailCount: assembledFreshTailCount,
         freshTailMaxTokens: this.config.freshTailMaxTokens,
         promptAwareEviction: this.config.promptAwareEviction,
         prompt: params.prompt,
