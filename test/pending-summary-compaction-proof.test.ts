@@ -51,15 +51,14 @@ describe("pending summary compaction proof harness", () => {
       (checkpoint) => checkpoint.label === "after-tail-growth-extension-plan",
     );
     expect(afterExtensionPlan?.canonicalSummaries).toBe(0);
-    expect(afterExtensionPlan?.pendingNodes).toHaveLength(5);
+    expect(afterExtensionPlan?.pendingNodes).toHaveLength(4);
     expect(
       afterExtensionPlan?.pendingNodes.filter((node) => node.status === "ready"),
     ).toHaveLength(3);
+    // The ready prefix parent is reused, never rebuilt over the tiny suffix.
     expect(
-      afterExtensionPlan?.pendingNodes.some(
-        (node) => node.kind === "condensed" && node.ordinalStart === 0 && node.ordinalEnd === 3,
-      ),
-    ).toBe(true);
+      afterExtensionPlan?.pendingNodes.filter((node) => node.kind === "condensed"),
+    ).toMatchObject([{ ordinalStart: 0, ordinalEnd: 2, status: "ready" }]);
 
     const afterExtensionReady = report.checkpoints.find(
       (checkpoint) => checkpoint.label === "after-extension-ready-no-publish",
@@ -76,7 +75,7 @@ describe("pending summary compaction proof harness", () => {
       afterExtensionReady?.summarizeCalls
         .filter((call) => call.isCondensed)
         .some((call) => call.sourceText.includes("delta raw fresh tail")),
-    ).toBe(true);
+    ).toBe(false);
 
     const afterPublish = report.checkpoints.find(
       (checkpoint) => checkpoint.label === "after-publish",
@@ -84,20 +83,17 @@ describe("pending summary compaction proof harness", () => {
     expect(afterPublish?.canonicalSummaries).toBe(4);
     expect(afterPublish?.contextItems).toMatchObject([
       { ordinal: 0, itemType: "summary" },
-      { ordinal: 1, itemType: "message" },
+      { ordinal: 1, itemType: "summary" },
+      { ordinal: 2, itemType: "message" },
     ]);
     expect(
       afterPublish?.pendingNodes.filter((node) => node.status === "promoted"),
     ).toHaveLength(4);
+    // Every prepared node participates in the published frontier or its
+    // ancestry; nothing is left behind as unused ready work.
     expect(
-      afterPublish?.pendingNodes.some(
-        (node) =>
-          node.status === "ready" &&
-          node.kind === "condensed" &&
-          node.ordinalStart === 0 &&
-          node.ordinalEnd === 2,
-      ),
-    ).toBe(true);
+      afterPublish?.pendingNodes.filter((node) => node.status === "ready"),
+    ).toHaveLength(0);
     expect(report.publishedSummaryId).toMatch(/^sum_/);
   });
 });
