@@ -481,7 +481,11 @@ describe("LcmContextEngine maintain and assemble budget", () => {
       queueKey: sessionId,
     });
 
-    expect(consumeSpy).toHaveBeenCalledTimes(1);
+    expect(consumeSpy).toHaveBeenCalledWith(
+      expect.objectContaining({
+        pendingPublishPolicy: "publish-if-ready",
+      }),
+    );
     expect(scheduleSpy).not.toHaveBeenCalled();
     const maintenance = await engine
       .getCompactionMaintenanceStore()
@@ -532,16 +536,22 @@ describe("LcmContextEngine maintain and assemble budget", () => {
       currentTokenCount: 9_000,
     });
 
-    const prepared = await engine.maintain({
+    const privateEngine = engine as unknown as {
+      executePendingCompactionCore: (params: unknown) => Promise<{
+        compacted: boolean;
+        reason?: string;
+      }>;
+    };
+    const prepared = await privateEngine.executePendingCompactionCore({
+      conversationId: conversation.conversationId,
       sessionId,
-      sessionFile: createSessionFilePath("manual-partial-pending-publish-prepare"),
-      runtimeContext: {
-        allowDeferredCompactionExecution: true,
-        tokenBudget: 4_096,
-        currentTokenCount: 9_000,
-      },
+      tokenBudget: 4_096,
+      currentTokenCount: 9_000,
+      sessionQueueHeld: true,
+      publishPolicy: "prepare-only",
+      maxPendingSteps: 3,
     });
-    expect(prepared.changed).toBe(false);
+    expect(prepared.compacted).toBe(false);
     expect(prepared.reason).toBe("pending summaries ready for publish");
 
     const [newMessage] = await engine.getConversationStore().createMessagesBulk([
@@ -919,8 +929,8 @@ describe("LcmContextEngine maintain and assemble budget", () => {
         },
       });
 
-      expect(first.changed).toBe(false);
-      expect(first.reason).toBe("pending summaries ready for publish");
+      expect(first.changed).toBe(true);
+      expect(first.reason).toBe("pending summaries published");
       expect(complete.mock.calls.length).toBeGreaterThan(0);
       expect(complete.mock.calls.length).toBeLessThanOrEqual(maxSweepIterations * 2);
       const calledProviders = new Set(
@@ -931,28 +941,16 @@ describe("LcmContextEngine maintain and assemble budget", () => {
       const maintenance = await engine
         .getCompactionMaintenanceStore()
         .getConversationCompactionMaintenance(conversation.conversationId);
-      expect(maintenance?.pending).toBe(true);
+      expect(maintenance?.pending).toBe(false);
       expect(maintenance?.running).toBe(false);
       expect(maintenance?.lastFailureSummary).toBeNull();
       expect(maintenance?.nextAttemptAfter).toBeNull();
 
-      const afterFirstCallCount = complete.mock.calls.length;
-      const manual = await engine.compact({
-        sessionId,
-        sessionFile: createSessionFilePath("manual-provider-fallback-unlimited-depth-publish"),
-        tokenBudget: 4_096,
-        currentTokenCount: 9_000,
-        force: true,
-      });
-      expect(manual.compacted).toBe(true);
-      expect(manual.reason).toBe("pending summaries published");
-      expect(complete).toHaveBeenCalledTimes(afterFirstCallCount);
-
-      const maintenanceAfterManual = await engine
+      const maintenanceAfterMaintain = await engine
         .getCompactionMaintenanceStore()
         .getConversationCompactionMaintenance(conversation.conversationId);
-      expect(maintenanceAfterManual?.pending).toBe(false);
-      expect(maintenanceAfterManual?.running).toBe(false);
+      expect(maintenanceAfterMaintain?.pending).toBe(false);
+      expect(maintenanceAfterMaintain?.running).toBe(false);
 
       const summaries = await summaryStore.getSummariesByConversation(conversation.conversationId);
       const markerSummaries = summaries.filter(

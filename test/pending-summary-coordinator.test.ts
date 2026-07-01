@@ -279,19 +279,38 @@ describe("PendingCompactionCoordinator", () => {
         publishPolicy: "prepare-only",
       }),
     ).resolves.toMatchObject({
-      status: "ready",
-      reason: "pending summaries ready for publish",
+      status: "planned",
     });
     expect(publishLockCount).toBe(0);
     await expect(
       pendingSummaryStore.getActiveBatchForConversation(conversation.conversationId),
     ).resolves.not.toBeNull();
+    await expect(
+      coordinator.runOnce({
+        conversationId: conversation.conversationId,
+        publishPolicy: "prepare-only",
+      }),
+    ).resolves.toMatchObject({ status: "prepared" });
+    await expect(
+      coordinator.runOnce({
+        conversationId: conversation.conversationId,
+        publishPolicy: "prepare-only",
+      }),
+    ).resolves.toMatchObject({ status: "prepared" });
+    await expect(
+      coordinator.runOnce({
+        conversationId: conversation.conversationId,
+        publishPolicy: "prepare-only",
+      }),
+    ).resolves.toMatchObject({
+      status: "ready",
+      reason: "pending summaries ready for publish",
+    });
 
     await expect(
       coordinator.runOnce({ conversationId: conversation.conversationId }),
     ).resolves.toMatchObject({
       status: "published",
-      remainingCompactableWork: true,
     });
     expect(publishLockCount).toBe(1);
     await expect(
@@ -300,8 +319,7 @@ describe("PendingCompactionCoordinator", () => {
     const contextItems = await summaryStore.getContextItems(conversation.conversationId);
     expect(contextItems).toMatchObject([
       { ordinal: 0, itemType: "summary" },
-      { ordinal: 1, itemType: "message", messageId: messages[2]!.messageId },
-      { ordinal: 2, itemType: "message", messageId: newMessage!.messageId },
+      { ordinal: 1, itemType: "message", messageId: newMessage!.messageId },
     ]);
   });
 
@@ -551,6 +569,129 @@ describe("PendingCompactionCoordinator", () => {
       { summaryId: "sum_order_existing_context" },
       { summaryId: expect.stringMatching(/^sum_/) },
     ]);
+  });
+
+  it("extends a ready unpublished batch when the compactable prefix grows", async () => {
+    const { conversationStore, pendingSummaryStore, summaryStore } = createStores();
+    const conversation = await conversationStore.createConversation({
+      sessionId: "pending-coordinator-extend-ready-session",
+      sessionKey: "agent:main:pending-coordinator-extend-ready",
+    });
+    const initialMessages = await conversationStore.createMessagesBulk([
+      {
+        conversationId: conversation.conversationId,
+        seq: 1,
+        role: "user",
+        content: "first compactable message",
+        tokenCount: 10,
+      },
+      {
+        conversationId: conversation.conversationId,
+        seq: 2,
+        role: "assistant",
+        content: "second compactable message",
+        tokenCount: 10,
+      },
+      {
+        conversationId: conversation.conversationId,
+        seq: 3,
+        role: "user",
+        content: "initial fresh tail",
+        tokenCount: 10,
+      },
+    ]);
+    await summaryStore.appendContextMessages(
+      conversation.conversationId,
+      initialMessages.map((message) => message.messageId),
+    );
+
+    const coordinator = new PendingCompactionCoordinator({
+      conversationStore,
+      pendingSummaryStore,
+      summaryStore,
+      model: "test-model",
+      leaseOwner: "test-worker",
+      config: {
+        freshTailCount: 1,
+        leafChunkTokens: 100,
+        condensedMinFanout: 99,
+        condensedMinSourceTokens: 1,
+        condensedChunkTokens: 100,
+      },
+      summarize: async (sourceText) => `leaf(${sourceText})`,
+    });
+
+    await expect(
+      coordinator.runOnce({
+        conversationId: conversation.conversationId,
+        sessionKey: "agent:main:pending-coordinator-extend-ready",
+        publishPolicy: "prepare-only",
+      }),
+    ).resolves.toMatchObject({ status: "planned", nodeCount: 1 });
+    await expect(
+      coordinator.runOnce({
+        conversationId: conversation.conversationId,
+        publishPolicy: "prepare-only",
+      }),
+    ).resolves.toMatchObject({ status: "prepared" });
+    await expect(
+      coordinator.runOnce({
+        conversationId: conversation.conversationId,
+        publishPolicy: "prepare-only",
+      }),
+    ).resolves.toMatchObject({ status: "ready" });
+
+    const batchBefore = await pendingSummaryStore.getActiveBatchForConversation(
+      conversation.conversationId,
+    );
+    expect(batchBefore).not.toBeNull();
+    const readyNodesBefore = await pendingSummaryStore.getNodesByBatch(batchBefore!.batchId);
+    expect(readyNodesBefore).toHaveLength(1);
+    expect(readyNodesBefore[0]).toMatchObject({
+      status: "ready",
+      ordinalStart: 0,
+      ordinalEnd: 1,
+    });
+
+    const [newTail] = await conversationStore.createMessagesBulk([
+      {
+        conversationId: conversation.conversationId,
+        seq: 4,
+        role: "assistant",
+        content: "new fresh tail moves prior tail into compactable prefix",
+        tokenCount: 10,
+      },
+    ]);
+    await summaryStore.appendContextMessage(conversation.conversationId, newTail!.messageId);
+
+    await expect(
+      coordinator.runOnce({
+        conversationId: conversation.conversationId,
+        publishPolicy: "prepare-only",
+      }),
+    ).resolves.toMatchObject({ status: "planned", nodeCount: 1 });
+
+    const batchAfter = await pendingSummaryStore.getActiveBatchForConversation(
+      conversation.conversationId,
+    );
+    expect(batchAfter?.batchId).toBe(batchBefore!.batchId);
+    expect(batchAfter?.compactableEndOrdinal).toBe(2);
+    const nodesAfter = await pendingSummaryStore.getNodesByBatch(batchBefore!.batchId);
+    expect(nodesAfter).toHaveLength(2);
+    expect(nodesAfter).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          status: "ready",
+          ordinalStart: 0,
+          ordinalEnd: 1,
+        }),
+        expect.objectContaining({
+          status: "planned",
+          ordinalStart: 2,
+          ordinalEnd: 2,
+        }),
+      ]),
+    );
   });
 
   it("stales condensed pending summaries when a canonical child changes during tail growth", async () => {
