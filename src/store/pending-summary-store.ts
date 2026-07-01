@@ -861,6 +861,86 @@ export class PendingSummaryStore {
     });
   }
 
+  /**
+   * Delete ready condensed nodes made obsolete by a wider ready sibling.
+   *
+   * A node is superseded when another ready/promoted node in the same batch
+   * covers the same start ordinal at the same depth with a strictly wider
+   * range — frontier selection always prefers the wider node. Nodes still
+   * referenced as children by a live parent are kept.
+   */
+  async pruneSupersededNodes(batchId: string): Promise<number> {
+    const result = this.db
+      .prepare(
+        `DELETE FROM pending_summary_nodes
+         WHERE batch_id = ?
+           AND kind = 'condensed'
+           AND status = 'ready'
+           AND EXISTS (
+             SELECT 1
+             FROM pending_summary_nodes wider
+             WHERE wider.batch_id = pending_summary_nodes.batch_id
+               AND wider.node_id != pending_summary_nodes.node_id
+               AND wider.status IN ('ready', 'promoted')
+               AND wider.depth = pending_summary_nodes.depth
+               AND wider.ordinal_start = pending_summary_nodes.ordinal_start
+               AND wider.ordinal_end > pending_summary_nodes.ordinal_end
+           )
+           AND NOT EXISTS (
+             SELECT 1
+             FROM pending_summary_node_children pc
+             JOIN pending_summary_nodes parent ON parent.node_id = pc.node_id
+             WHERE pc.child_node_id = pending_summary_nodes.node_id
+               AND parent.status NOT IN ('stale', 'failed')
+           )`,
+      )
+      .run(batchId);
+    return Number(result.changes ?? 0);
+  }
+
+  /**
+   * Drop heavy summary payloads from promoted nodes after publish.
+   *
+   * Canonical readers use the canonical summary row; the promoted pending row
+   * keeps its canonical_summary_id and metadata for doctor/crash-recovery
+   * lineage, per AN 0002.
+   */
+  async clearPromotedPayloads(batchId: string): Promise<number> {
+    const result = this.db
+      .prepare(
+        `UPDATE pending_summary_nodes
+         SET content = NULL,
+             updated_at = datetime('now')
+         WHERE batch_id = ?
+           AND status = 'promoted'
+           AND content IS NOT NULL`,
+      )
+      .run(batchId);
+    return Number(result.changes ?? 0);
+  }
+
+  /**
+   * Delete finished (stale/failed/published) batches past the retention
+   * window. Node rows and link rows follow via cascade.
+   */
+  async deleteFinishedBatches(input: {
+    conversationId: number;
+    olderThan: Date;
+  }): Promise<number> {
+    // Batch timestamps are written with datetime('now') ("YYYY-MM-DD HH:MM:SS"),
+    // so the cutoff must use the same format to compare lexicographically.
+    const cutoff = input.olderThan.toISOString().replace("T", " ").slice(0, 19);
+    const result = this.db
+      .prepare(
+        `DELETE FROM pending_compaction_batches
+         WHERE conversation_id = ?
+           AND status IN ('stale', 'failed', 'published')
+           AND updated_at <= ?`,
+      )
+      .run(input.conversationId, cutoff);
+    return Number(result.changes ?? 0);
+  }
+
   /** Record the canonical summary id created from a pending node. */
   async markNodePromoted(input: {
     nodeId: string;
