@@ -1720,4 +1720,55 @@ describe("LcmContextEngine fidelity and token budget", () => {
       vi.useRealTimers();
     }
   });
+
+  it("blocks non-force pending compaction while a summary spend backoff is open", async () => {
+    const engine = createEngineWithConfig({
+      summarySpendBackoffMs: 10 * 60 * 1000,
+    });
+    const sessionId = "pending-spend-backoff-block";
+    await engine.ingest({
+      sessionId,
+      message: { role: "user", content: "spend backoff pending block" } as AgentMessage,
+    });
+    const summarize = vi.fn(async () => "custom summary");
+    const privateEngine = engine as unknown as {
+      compaction: {
+        compactUntilUnder: (input: {
+          summarize: (text: string, aggressive?: boolean) => Promise<string>;
+        }) => Promise<unknown>;
+      };
+    };
+    vi.spyOn(privateEngine.compaction, "compactUntilUnder").mockImplementation(async (input) => {
+      await input.summarize("source text for custom summarizer");
+      return {
+        success: false,
+        rounds: 1,
+        finalTokens: 3_500,
+      };
+    });
+
+    // The failed force compaction opens the poor-reduction spend backoff.
+    const first = await engine.compact({
+      sessionId,
+      sessionFile: createSessionFilePath("pending-spend-backoff-block"),
+      tokenBudget: 4_096,
+      currentTokenCount: 4_096,
+      force: true,
+      legacyParams: { summarize },
+    });
+    expect(first.reason).toBe("could not reach target");
+    expect(summarize).toHaveBeenCalledTimes(1);
+
+    // A non-force pass must refuse before spending any summarizer calls.
+    const second = await engine.compact({
+      sessionId,
+      sessionFile: createSessionFilePath("pending-spend-backoff-block-retry"),
+      tokenBudget: 4_096,
+      currentTokenCount: 4_096,
+      legacyParams: { summarize },
+    });
+    expect(second.ok).toBe(false);
+    expect(second.reason).toBe("summary spend backoff open");
+    expect(summarize).toHaveBeenCalledTimes(1);
+  });
 });
