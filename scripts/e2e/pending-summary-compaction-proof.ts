@@ -325,8 +325,8 @@ function validateProof(input: {
   }
 
   const afterExtensionPlan = byLabel.get("after-tail-growth-extension-plan");
-  if (afterExtensionPlan?.pendingNodes.length !== 5) {
-    input.failures.push("after-tail-growth-extension-plan should add one leaf and one condensed parent");
+  if (afterExtensionPlan?.pendingNodes.length !== 4) {
+    input.failures.push("after-tail-growth-extension-plan should add only the suffix leaf");
   }
   if (afterExtensionPlan?.pendingNodes.filter((node) => node.status === "ready").length !== 3) {
     input.failures.push("after-tail-growth-extension-plan should preserve the original ready frontier");
@@ -339,15 +339,13 @@ function validateProof(input: {
     input.failures.push("after-tail-growth-extension-plan should plan the newly compactable suffix leaf");
   }
   if (
-    !afterExtensionPlan?.pendingNodes.some(
-      (node) =>
-        node.kind === "condensed" &&
-        node.status === "planned" &&
-        node.ordinalStart === 0 &&
-        node.ordinalEnd === 3,
+    afterExtensionPlan?.pendingNodes.some(
+      (node) => node.kind === "condensed" && node.status === "planned",
     )
   ) {
-    input.failures.push("after-tail-growth-extension-plan should plan a larger condensed frontier");
+    input.failures.push(
+      "after-tail-growth-extension-plan must not rebuild a condensed parent over the ready prefix",
+    );
   }
 
   const afterExtensionLeaves = byLabel.get("after-extension-leaf-preparation");
@@ -362,13 +360,6 @@ function validateProof(input: {
   ) {
     input.failures.push("after-extension-leaf-preparation should ready the suffix leaf");
   }
-  if (
-    !afterExtensionLeaves?.pendingNodes.some(
-      (node) => node.kind === "condensed" && node.status === "planned" && node.ordinalEnd === 3,
-    )
-  ) {
-    input.failures.push("after-extension-leaf-preparation should leave the larger condensed parent planned");
-  }
 
   const afterExtensionCondensed = byLabel.get("after-extension-condensed-preparation");
   const extensionCondensedCalls =
@@ -381,20 +372,20 @@ function validateProof(input: {
         node.kind === "condensed" &&
         node.status === "ready" &&
         node.ordinalStart === 0 &&
-        node.ordinalEnd === 3,
+        node.ordinalEnd === 2,
     )
   ) {
-    input.failures.push("after-extension-condensed-preparation should ready the larger condensed parent");
+    input.failures.push("after-extension-condensed-preparation should keep the prefix condensed parent ready");
   }
   if (rawLeafCalls.length !== 3) {
     input.failures.push("extension should prepare only the newly compactable suffix leaf");
   }
   if (
-    !extensionCondensedCalls.some((call) =>
+    extensionCondensedCalls.some((call) =>
       call.sourceText.includes("delta raw fresh tail"),
     )
   ) {
-    input.failures.push("larger condensed preparation should include the newly compactable suffix");
+    input.failures.push("extension must not re-summarize a condensed parent for the tiny suffix");
   }
 
   const afterExtensionReady = byLabel.get("after-extension-ready-no-publish");
@@ -407,14 +398,15 @@ function validateProof(input: {
 
   const afterPublish = byLabel.get("after-publish");
   if (afterPublish?.canonicalSummaries !== 4) {
-    input.failures.push("after-publish should promote three leaves plus the larger condensed summary");
+    input.failures.push("after-publish should promote three leaves plus the condensed prefix summary");
   }
   if (
-    afterPublish?.contextItems.length !== 2 ||
+    afterPublish?.contextItems.length !== 3 ||
     afterPublish.contextItems[0]?.itemType !== "summary" ||
-    afterPublish.contextItems[1]?.itemType !== "message"
+    afterPublish.contextItems[1]?.itemType !== "summary" ||
+    afterPublish.contextItems[2]?.itemType !== "message"
   ) {
-    input.failures.push("after-publish should swap covered raw prefix and keep fresh tail raw");
+    input.failures.push("after-publish should swap the mixed-depth frontier and keep fresh tail raw");
   }
   const promotedCoverage = afterPublish?.pendingNodes.filter(
     (node) => node.status === "promoted",
@@ -422,20 +414,23 @@ function validateProof(input: {
   if (
     promotedCoverage?.length !== 4 ||
     !promotedCoverage.some(
-      (node) => node.kind === "condensed" && node.ordinalStart === 0 && node.ordinalEnd === 3,
+      (node) => node.kind === "condensed" && node.ordinalStart === 0 && node.ordinalEnd === 2,
+    ) ||
+    !promotedCoverage.some(
+      (node) => node.kind === "leaf" && node.ordinalStart === 3 && node.ordinalEnd === 3,
     )
   ) {
-    input.failures.push("after-publish should promote the larger frontier and its leaf ancestors");
+    input.failures.push("after-publish should promote the mixed-depth frontier and its leaf ancestors");
   }
   if (
     !input.publishedSummary ||
     input.publishedSummary.kind !== "condensed" ||
     input.publishedSummary.depth !== 1
   ) {
-    input.failures.push("published frontier summary should be the condensed parent");
+    input.failures.push("published frontier summary should be the condensed prefix parent");
   }
-  if (input.publishedParents.length !== 3) {
-    input.failures.push("published condensed summary should link to three leaf parents");
+  if (input.publishedParents.length !== 2) {
+    input.failures.push("published condensed summary should link to its two leaf parents");
   }
 }
 
