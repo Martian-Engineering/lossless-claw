@@ -5,7 +5,6 @@ import { afterEach, describe, expect, it } from "vitest";
 import { closeLcmConnection, createLcmDatabaseConnection } from "../src/db/connection.js";
 import { runLcmMigrations } from "../src/db/migration.js";
 import { ConversationStore } from "../src/store/conversation-store.js";
-import { SummaryStore } from "../src/store/summary-store.js";
 import { runSessionMigration } from "../src/migrate-sessions.js";
 
 const roots: string[] = [];
@@ -67,14 +66,12 @@ function migratedDb(root: string): string {
 function openMigratedDb(dbPath: string): {
   db: ReturnType<typeof createLcmDatabaseConnection>;
   conversationStore: ConversationStore;
-  summaryStore: SummaryStore;
 } {
   const db = createLcmDatabaseConnection(dbPath);
   runLcmMigrations(db);
   return {
     db,
     conversationStore: new ConversationStore(db),
-    summaryStore: new SummaryStore(db),
   };
 }
 
@@ -108,9 +105,9 @@ describe("runSessionMigration", () => {
     expect(existsSync(dbPath)).toBe(false);
   });
 
-  it("imports a fresh session into conversations, messages, parts, context, FTS, and checkpoint state", async () => {
+  it("imports a fresh session into conversations, messages, parts, context, and FTS", async () => {
     const root = tempRoot();
-    const sessionFile = writeAgentSession(root, "session-a.jsonl", [
+    writeAgentSession(root, "session-a.jsonl", [
       sessionHeader("session-a"),
       messageEntry("m1", null, "user", "hello searchable history"),
       messageEntry("m2", "m1", "assistant", "saved reply"),
@@ -131,7 +128,7 @@ describe("runSessionMigration", () => {
       skippedMessages: 0,
     });
 
-    const { db, conversationStore, summaryStore } = openMigratedDb(dbPath);
+    const { db, conversationStore } = openMigratedDb(dbPath);
     try {
       const conversation = await conversationStore.getConversationForSession({ sessionId: "session-a" });
       expect(conversation).not.toBeNull();
@@ -158,14 +155,6 @@ describe("runSessionMigration", () => {
         mode: "full_text",
       });
       expect(search).toHaveLength(1);
-      const checkpoint = await summaryStore.getConversationBootstrapState(conversation!.conversationId);
-      expect(checkpoint).toMatchObject({
-        sessionFilePath: sessionFile,
-        lastSeenSize: expect.any(Number),
-        lastProcessedOffset: expect.any(Number),
-        sessionHeaderId: "session-a",
-        lastProcessedEntryId: "m2",
-      });
     } finally {
       closeLcmConnection(db);
     }
