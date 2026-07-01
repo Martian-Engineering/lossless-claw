@@ -13,6 +13,10 @@ describe("pending summary compaction proof harness", () => {
       "after-leaf-preparation",
       "after-condensed-preparation",
       "after-ready-no-publish",
+      "after-tail-growth-extension-plan",
+      "after-extension-leaf-preparation",
+      "after-extension-condensed-preparation",
+      "after-extension-ready-no-publish",
       "after-publish",
     ]);
     expect(
@@ -43,15 +47,57 @@ describe("pending summary compaction proof harness", () => {
     expect(afterReady?.contextItems.every((item) => item.itemType === "message")).toBe(true);
     expect(afterReady?.pendingNodes.every((node) => node.status === "ready")).toBe(true);
 
+    const afterExtensionPlan = report.checkpoints.find(
+      (checkpoint) => checkpoint.label === "after-tail-growth-extension-plan",
+    );
+    expect(afterExtensionPlan?.canonicalSummaries).toBe(0);
+    expect(afterExtensionPlan?.pendingNodes).toHaveLength(5);
+    expect(
+      afterExtensionPlan?.pendingNodes.filter((node) => node.status === "ready"),
+    ).toHaveLength(3);
+    expect(
+      afterExtensionPlan?.pendingNodes.some(
+        (node) => node.kind === "condensed" && node.ordinalStart === 0 && node.ordinalEnd === 3,
+      ),
+    ).toBe(true);
+
+    const afterExtensionReady = report.checkpoints.find(
+      (checkpoint) => checkpoint.label === "after-extension-ready-no-publish",
+    );
+    expect(afterExtensionReady?.canonicalSummaries).toBe(0);
+    expect(afterExtensionReady?.contextItems.every((item) => item.itemType === "message")).toBe(
+      true,
+    );
+    expect(afterExtensionReady?.pendingNodes.every((node) => node.status === "ready")).toBe(true);
+    expect(
+      afterExtensionReady?.summarizeCalls.filter((call) => !call.isCondensed),
+    ).toHaveLength(3);
+    expect(
+      afterExtensionReady?.summarizeCalls
+        .filter((call) => call.isCondensed)
+        .some((call) => call.sourceText.includes("delta raw fresh tail")),
+    ).toBe(true);
+
     const afterPublish = report.checkpoints.find(
       (checkpoint) => checkpoint.label === "after-publish",
     );
-    expect(afterPublish?.canonicalSummaries).toBe(3);
+    expect(afterPublish?.canonicalSummaries).toBe(4);
     expect(afterPublish?.contextItems).toMatchObject([
       { ordinal: 0, itemType: "summary" },
       { ordinal: 1, itemType: "message" },
     ]);
-    expect(afterPublish?.pendingNodes.every((node) => node.status === "promoted")).toBe(true);
+    expect(
+      afterPublish?.pendingNodes.filter((node) => node.status === "promoted"),
+    ).toHaveLength(4);
+    expect(
+      afterPublish?.pendingNodes.some(
+        (node) =>
+          node.status === "ready" &&
+          node.kind === "condensed" &&
+          node.ordinalStart === 0 &&
+          node.ordinalEnd === 2,
+      ),
+    ).toBe(true);
     expect(report.publishedSummaryId).toMatch(/^sum_/);
   });
 });
