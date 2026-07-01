@@ -104,6 +104,18 @@ describe("PendingCompactionCoordinator", () => {
     ).resolves.toMatchObject({ status: "prepared" });
     expect(summarizeInputs[2]).toContain("leaf(");
 
+    const ready = await coordinator.runOnce({
+      conversationId: conversation.conversationId,
+      publishPolicy: "prepare-only",
+    });
+    expect(ready).toMatchObject({
+      status: "ready",
+      reason: "pending summaries ready for publish",
+    });
+    await expect(summaryStore.getContextItems(conversation.conversationId)).resolves.toHaveLength(
+      4,
+    );
+
     const published = await coordinator.runOnce({ conversationId: conversation.conversationId });
     expect(published).toMatchObject({ status: "published" });
     const contextItems = await summaryStore.getContextItems(conversation.conversationId);
@@ -183,11 +195,11 @@ describe("PendingCompactionCoordinator", () => {
     expect(summarizedSource).toContain("Pending message-parts source detail.");
   });
 
-  it("revalidates the source projection under the publish lock", async () => {
+  it("keeps prepared pending summaries publishable when new tail messages arrive", async () => {
     const { conversationStore, pendingSummaryStore, summaryStore } = createStores();
     const conversation = await conversationStore.createConversation({
-      sessionId: "pending-coordinator-stale-session",
-      sessionKey: "agent:main:pending-coordinator-stale",
+      sessionId: "pending-coordinator-growing-tail-session",
+      sessionKey: "agent:main:pending-coordinator-growing-tail",
     });
     const messages = await conversationStore.createMessagesBulk([
       {
@@ -241,7 +253,7 @@ describe("PendingCompactionCoordinator", () => {
     await expect(
       coordinator.runOnce({
         conversationId: conversation.conversationId,
-        sessionKey: "agent:main:pending-coordinator-stale",
+        sessionKey: "agent:main:pending-coordinator-growing-tail",
       }),
     ).resolves.toMatchObject({ status: "planned", nodeCount: 1 });
     await expect(
@@ -262,18 +274,35 @@ describe("PendingCompactionCoordinator", () => {
     ]);
 
     await expect(
+      coordinator.runOnce({
+        conversationId: conversation.conversationId,
+        publishPolicy: "prepare-only",
+      }),
+    ).resolves.toMatchObject({
+      status: "ready",
+      reason: "pending summaries ready for publish",
+    });
+    expect(publishLockCount).toBe(0);
+    await expect(
+      pendingSummaryStore.getActiveBatchForConversation(conversation.conversationId),
+    ).resolves.not.toBeNull();
+
+    await expect(
       coordinator.runOnce({ conversationId: conversation.conversationId }),
     ).resolves.toMatchObject({
-      status: "stale",
-      reason: "source projection fingerprint changed before publish",
+      status: "published",
+      remainingCompactableWork: true,
     });
     expect(publishLockCount).toBe(1);
     await expect(
       pendingSummaryStore.getActiveBatchForConversation(conversation.conversationId),
     ).resolves.toBeNull();
-    await expect(summaryStore.getContextItems(conversation.conversationId)).resolves.toHaveLength(
-      4,
-    );
+    const contextItems = await summaryStore.getContextItems(conversation.conversationId);
+    expect(contextItems).toMatchObject([
+      { ordinal: 0, itemType: "summary" },
+      { ordinal: 1, itemType: "message", messageId: messages[2]!.messageId },
+      { ordinal: 2, itemType: "message", messageId: newMessage!.messageId },
+    ]);
   });
 
   it("replans the same projection after a failed pending preparation", async () => {
@@ -522,6 +551,113 @@ describe("PendingCompactionCoordinator", () => {
       { summaryId: "sum_order_existing_context" },
       { summaryId: expect.stringMatching(/^sum_/) },
     ]);
+  });
+
+  it("stales condensed pending summaries when a canonical child changes during tail growth", async () => {
+    const { conversationStore, pendingSummaryStore, summaryStore } = createStores();
+    const conversation = await conversationStore.createConversation({
+      sessionId: "pending-coordinator-canonical-child-stale-session",
+      sessionKey: "agent:main:pending-coordinator-canonical-child-stale",
+    });
+    await summaryStore.insertSummary({
+      summaryId: "sum_canonical_child_old",
+      conversationId: conversation.conversationId,
+      kind: "leaf",
+      depth: 0,
+      content: "old canonical child",
+      tokenCount: 5,
+      sourceMessageTokenCount: 5,
+    });
+    await summaryStore.insertSummary({
+      summaryId: "sum_canonical_child_new",
+      conversationId: conversation.conversationId,
+      kind: "leaf",
+      depth: 0,
+      content: "new canonical child",
+      tokenCount: 5,
+      sourceMessageTokenCount: 5,
+    });
+    await summaryStore.appendContextSummary(
+      conversation.conversationId,
+      "sum_canonical_child_old",
+    );
+    const messages = await conversationStore.createMessagesBulk([
+      {
+        conversationId: conversation.conversationId,
+        seq: 1,
+        role: "user",
+        content: "raw message after old canonical child",
+        tokenCount: 4,
+      },
+      {
+        conversationId: conversation.conversationId,
+        seq: 2,
+        role: "assistant",
+        content: "original fresh tail",
+        tokenCount: 4,
+      },
+    ]);
+    await summaryStore.appendContextMessages(
+      conversation.conversationId,
+      messages.map((message) => message.messageId),
+    );
+
+    const coordinator = new PendingCompactionCoordinator({
+      conversationStore,
+      pendingSummaryStore,
+      summaryStore,
+      model: "test-model",
+      leaseOwner: "test-worker",
+      config: {
+        freshTailCount: 1,
+        leafChunkTokens: 100,
+        condensedMinFanout: 2,
+        condensedMinSourceTokens: 1,
+        condensedChunkTokens: 100,
+      },
+      summarize: async (sourceText, _aggressive, options) =>
+        options?.isCondensed ? `condensed(${sourceText})` : `leaf(${sourceText})`,
+    });
+
+    await expect(
+      coordinator.runOnce({
+        conversationId: conversation.conversationId,
+        sessionKey: "agent:main:pending-coordinator-canonical-child-stale",
+      }),
+    ).resolves.toMatchObject({ status: "planned", nodeCount: 2 });
+    await expect(
+      coordinator.runOnce({ conversationId: conversation.conversationId }),
+    ).resolves.toMatchObject({ status: "prepared" });
+    await expect(
+      coordinator.runOnce({ conversationId: conversation.conversationId }),
+    ).resolves.toMatchObject({ status: "prepared" });
+
+    await summaryStore.replaceContextRangeWithSummary({
+      conversationId: conversation.conversationId,
+      startOrdinal: 0,
+      endOrdinal: 0,
+      summaryId: "sum_canonical_child_new",
+    });
+    const [newMessage] = await conversationStore.createMessagesBulk([
+      {
+        conversationId: conversation.conversationId,
+        seq: 3,
+        role: "user",
+        content: "new foreground message",
+        tokenCount: 4,
+      },
+    ]);
+    await summaryStore.appendContextMessage(conversation.conversationId, newMessage!.messageId);
+
+    await expect(
+      coordinator.runOnce({ conversationId: conversation.conversationId }),
+    ).resolves.toMatchObject({
+      status: "stale",
+      reason: "pending batch source changed before publish",
+    });
+    await expect(
+      pendingSummaryStore.getActiveBatchForConversation(conversation.conversationId),
+    ).resolves.toBeNull();
   });
 
   it("does not claim a condensed parent before pending children are ready", async () => {
