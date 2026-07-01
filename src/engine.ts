@@ -1127,7 +1127,13 @@ export class LcmContextEngine implements ContextEngine {
     const pendingManualCompaction =
       (asRecord(params.runtimeContext) ?? asRecord(params.legacyParams))?.manualCompaction === true;
     if (params.force === true || pendingManualCompaction) {
-      this.compactionGuards.clearSummarySpendBackoff(summarySpendScopeKey);
+      const clearedBackoffUntil =
+        this.compactionGuards.clearSummarySpendBackoff(summarySpendScopeKey);
+      if (clearedBackoffUntil) {
+        this.deps.log.info(
+          `[lcm] compact: ${pendingManualCompaction ? "manual request" : "force compaction"} cleared summary spend backoff conversation=${params.conversationId} ${formatSessionLabel(params.sessionId, params.sessionKey)} scope=${summarySpendScopeKey} previousBackoffUntil=${clearedBackoffUntil.toISOString()}`,
+        );
+      }
     } else if (this.compactionGuards.getSummarySpendBackoffUntil(summarySpendScopeKey)) {
       return {
         ok: false,
