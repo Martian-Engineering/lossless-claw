@@ -1625,10 +1625,7 @@ describe("LcmContextEngine.assemble canonical path", () => {
       sessionId,
       messages: [makeMessage({ role: "user", content: "live message" })],
       tokenBudget: 10_000,
-      runtimeContext: {
-        provider: "vllm",
-        model: "qwen3.6-27b",
-      },
+      model: "vllm/qwen3.6-27b",
     });
 
     expect(assembleSpy).toHaveBeenCalledWith(

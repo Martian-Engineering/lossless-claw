@@ -3377,6 +3377,8 @@ export class LcmContextEngine implements ContextEngine {
     sessionKey?: string;
     messages: AgentMessage[];
     tokenBudget?: number;
+    /** Current model identifier from OpenClaw hosts that predate assemble runtimeContext. */
+    model?: string;
     /** Optional user query for relevance-based eviction (BM25-lite). When absent or unsearchable, falls back to chronological eviction. */
     prompt?: string;
     /** Optional runtime context for override resolution (model, provider, etc.). */
@@ -3645,7 +3647,7 @@ export class LcmContextEngine implements ContextEngine {
 
       const resolvedContextThreshold = this.contextThresholdResolver.resolve({
         sessionKey: params.sessionKey,
-        runtime: readRuntimeModelContext(asRecord(params.runtimeContext)),
+        runtime: readRuntimeModelContext(asRecord(params.runtimeContext), { model: params.model }),
       });
       const assembledFreshTailCount =
         resolvedContextThreshold.freshTailCount ?? this.config.freshTailCount;
