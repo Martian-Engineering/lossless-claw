@@ -48,11 +48,19 @@ export type PendingCompactionCoordinatorOptions = {
   withPublishLock?: <T>(operation: () => Promise<T>) => Promise<T>;
 };
 
+export type PendingCompactionPublishPolicy = "prepare-only" | "publish-if-ready";
+
 export type PendingCompactionCoordinatorResult =
   | { status: "idle"; reason: string }
   | { status: "planned"; batchId: string; nodeCount: number }
   | { status: "prepared"; batchId: string; nodeId: string }
-  | { status: "published"; batchId: string; frontierSummaryIds: string[] }
+  | { status: "ready"; batchId: string; reason: "pending summaries ready for publish" }
+  | {
+      status: "published";
+      batchId: string;
+      frontierSummaryIds: string[];
+      remainingCompactableWork?: boolean;
+    }
   | { status: "stale"; batchId: string; reason: string }
   | {
       status: "failed";
@@ -70,6 +78,11 @@ type ProjectionSnapshot = {
   freshTailStartOrdinal: number | null;
   compactableStartOrdinal: number | null;
   compactableEndOrdinal: number | null;
+};
+
+type PublishFrontierSelection = {
+  frontier: PendingSummaryPlannerNode[];
+  pendingFrontier: PendingSummaryPlannerNode[];
 };
 
 function digestText(prefix: string, parts: string[]): string {
@@ -147,25 +160,29 @@ export class PendingCompactionCoordinator {
   async runOnce(input: {
     conversationId: number;
     sessionKey?: string;
+    publishPolicy?: PendingCompactionPublishPolicy;
   }): Promise<PendingCompactionCoordinatorResult> {
+    const publishPolicy = input.publishPolicy ?? "publish-if-ready";
     const snapshot = await this.buildProjectionSnapshot(input.conversationId);
     if (snapshot.compactableStartOrdinal == null || snapshot.compactableEndOrdinal == null) {
       return { status: "idle", reason: "no compactable context outside fresh tail" };
     }
 
     let batch = await this.pendingSummaryStore.getActiveBatchForConversation(input.conversationId);
-    if (batch && batch.sourceProjectionFingerprint !== snapshot.sourceProjectionFingerprint) {
-      const staleResult = await this.withPublishLock(() =>
-        this.publishActiveBatchIfReady(input.conversationId),
-      );
-      return staleResult ?? { status: "idle", reason: "no active pending summary batch" };
-    }
     if (!batch) {
       return this.planBatch({
         conversationId: input.conversationId,
         sessionKey: input.sessionKey,
         snapshot,
       });
+    }
+    const staleReason = await this.getActiveBatchStaleReason({ batch, snapshot });
+    if (staleReason) {
+      await this.pendingSummaryStore.markBatchStale({
+        batchId: batch.batchId,
+        failureSummary: staleReason,
+      });
+      return { status: "stale", batchId: batch.batchId, reason: staleReason };
     }
 
     const worker = new PendingSummaryPreparationWorker({
@@ -197,6 +214,18 @@ export class PendingCompactionCoordinator {
         failureSummary: prepared.failureSummary,
         authFailure: prepared.authFailure,
       };
+    }
+
+    if (publishPolicy === "prepare-only") {
+      const selection = await this.selectPublishFrontier({ batch, snapshot });
+      if (selection) {
+        return {
+          status: "ready",
+          batchId: batch.batchId,
+          reason: "pending summaries ready for publish",
+        };
+      }
+      return { status: "idle", reason: "no claimable pending summary nodes" };
     }
 
     const publishResult = await this.withPublishLock(() =>
@@ -303,22 +332,11 @@ export class PendingCompactionCoordinator {
     batch: PendingCompactionBatchRecord;
     snapshot: ProjectionSnapshot;
   }): Promise<PendingCompactionCoordinatorResult | null> {
-    const nodes = await this.pendingSummaryStore.getNodesByBatch(input.batch.batchId);
-    const readyPendingPlannerNodes = nodes
-      .filter((node) => node.status === "ready" || node.status === "promoted")
-      .map((node) => this.pendingRecordToPlannerNode(node));
-    const canonicalPlannerNodes = this.buildCanonicalSummaryPlannerNodes(input.snapshot);
-    const frontier = selectPendingPublishFrontier({
-      nodes: [...canonicalPlannerNodes, ...readyPendingPlannerNodes],
-      startOrdinal: input.batch.compactableStartOrdinal,
-      endOrdinal: input.batch.compactableEndOrdinal,
-    });
-    if (!frontier) {
+    const selection = await this.selectPublishFrontier(input);
+    if (!selection) {
       return null;
     }
-    const pendingFrontier = frontier.filter(
-      (node) => typeof node.canonicalSummaryId !== "string",
-    );
+    const { frontier, pendingFrontier } = selection;
     if (pendingFrontier.length === 0) {
       await this.pendingSummaryStore.markBatchPublished({
         batchId: input.batch.batchId,
@@ -327,6 +345,7 @@ export class PendingCompactionCoordinator {
         status: "published",
         batchId: input.batch.batchId,
         frontierSummaryIds: frontier.map((node) => node.canonicalSummaryId!),
+        ...(this.hasRemainingCompactableWork(input) ? { remainingCompactableWork: true } : {}),
       };
     }
 
@@ -338,7 +357,7 @@ export class PendingCompactionCoordinator {
     const published = await publisher.publishReadyFrontier({
       batchId: input.batch.batchId,
       frontierNodeIds: pendingFrontier.map((node) => node.nodeId),
-      expectedSourceProjectionFingerprint: input.snapshot.sourceProjectionFingerprint,
+      expectedSourceProjectionFingerprint: input.batch.sourceProjectionFingerprint,
     });
     const publishedByNodeId = new Map(
       pendingFrontier.map(
@@ -348,6 +367,7 @@ export class PendingCompactionCoordinator {
     return {
       status: "published",
       batchId: input.batch.batchId,
+      ...(this.hasRemainingCompactableWork(input) ? { remainingCompactableWork: true } : {}),
       frontierSummaryIds: frontier.map((node) => {
         if (typeof node.canonicalSummaryId === "string") {
           return node.canonicalSummaryId;
@@ -361,6 +381,41 @@ export class PendingCompactionCoordinator {
     };
   }
 
+  private hasRemainingCompactableWork(input: {
+    batch: PendingCompactionBatchRecord;
+    snapshot: ProjectionSnapshot;
+  }): boolean {
+    return (
+      input.snapshot.compactableEndOrdinal != null &&
+      input.batch.compactableEndOrdinal < input.snapshot.compactableEndOrdinal
+    );
+  }
+
+  private async selectPublishFrontier(input: {
+    batch: PendingCompactionBatchRecord;
+    snapshot: ProjectionSnapshot;
+  }): Promise<PublishFrontierSelection | null> {
+    const nodes = await this.pendingSummaryStore.getNodesByBatch(input.batch.batchId);
+    // A publish frontier may mix already-canonical summaries with ready hidden
+    // pending nodes, but it must exactly cover the batch range.
+    const readyPendingPlannerNodes = nodes
+      .filter((node) => node.status === "ready" || node.status === "promoted")
+      .map((node) => this.pendingRecordToPlannerNode(node));
+    const canonicalPlannerNodes = this.buildCanonicalSummaryPlannerNodes(input.snapshot);
+    const frontier = selectPendingPublishFrontier({
+      nodes: [...canonicalPlannerNodes, ...readyPendingPlannerNodes],
+      startOrdinal: input.batch.compactableStartOrdinal,
+      endOrdinal: input.batch.compactableEndOrdinal,
+    });
+    if (!frontier) {
+      return null;
+    }
+    return {
+      frontier,
+      pendingFrontier: frontier.filter((node) => typeof node.canonicalSummaryId !== "string"),
+    };
+  }
+
   private async publishActiveBatchIfReady(
     conversationId: number,
   ): Promise<PendingCompactionCoordinatorResult | null> {
@@ -369,18 +424,128 @@ export class PendingCompactionCoordinator {
     if (!batch) {
       return null;
     }
-    if (batch.sourceProjectionFingerprint !== snapshot.sourceProjectionFingerprint) {
+    const staleReason = await this.getActiveBatchStaleReason({ batch, snapshot });
+    if (staleReason) {
       await this.pendingSummaryStore.markBatchStale({
         batchId: batch.batchId,
-        failureSummary: "source projection fingerprint changed before publish",
+        failureSummary: staleReason,
       });
-      return {
-        status: "stale",
-        batchId: batch.batchId,
-        reason: "source projection fingerprint changed before publish",
-      };
+      return { status: "stale", batchId: batch.batchId, reason: staleReason };
     }
     return this.publishIfReady({ batch, snapshot });
+  }
+
+  private async getActiveBatchStaleReason(input: {
+    batch: PendingCompactionBatchRecord;
+    snapshot: ProjectionSnapshot;
+  }): Promise<string | null> {
+    const currentStart = input.snapshot.compactableStartOrdinal;
+    const currentEnd = input.snapshot.compactableEndOrdinal;
+    // Tail growth is valid: the current compactable range may extend beyond
+    // the batch. Shrinking or moving the range means this batch no longer
+    // targets the same prompt prefix.
+    if (
+      currentStart == null ||
+      currentEnd == null ||
+      input.batch.compactableStartOrdinal < currentStart ||
+      input.batch.compactableEndOrdinal > currentEnd
+    ) {
+      return "pending batch range is no longer compactable";
+    }
+
+    if (
+      input.batch.compactableStartOrdinal === currentStart &&
+      input.batch.compactableEndOrdinal === currentEnd &&
+      input.batch.sourceProjectionFingerprint !== input.snapshot.sourceProjectionFingerprint
+    ) {
+      return "source projection fingerprint changed before publish";
+    }
+
+    const itemsByOrdinal = new Map(input.snapshot.items.map((item) => [item.ordinal, item]));
+    // Publishing rewrites by ordinal range, so gaps inside the planned range
+    // indicate another rewrite already changed the source prefix.
+    for (
+      let ordinal = input.batch.compactableStartOrdinal;
+      ordinal <= input.batch.compactableEndOrdinal;
+      ordinal += 1
+    ) {
+      if (!itemsByOrdinal.has(ordinal)) {
+        return "pending batch source range changed before publish";
+      }
+    }
+
+    const nodes = await this.pendingSummaryStore.getNodesByBatch(input.batch.batchId);
+    const nodesById = new Map(nodes.map((node) => [node.nodeId, node]));
+    const summaryItemsById = new Map(
+      input.snapshot.items
+        .filter((item) => item.itemType === "summary" && typeof item.summaryId === "string")
+        .map((item) => [item.summaryId!, item]),
+    );
+    // Tail growth is safe only when the original prefix still resolves to the
+    // same raw leaf source and canonical summary children.
+    for (const node of nodes) {
+      if (node.kind === "leaf") {
+        const sourceFingerprints = input.snapshot.items
+          .filter(
+            (item) =>
+              item.ordinal >= node.ordinalStart &&
+              item.ordinal <= node.ordinalEnd,
+          )
+          .sort((a, b) => a.ordinal - b.ordinal)
+          .map((item) => item.sourceFingerprint);
+        const sourceContextHash = digestText("pending-node-context", [
+          String(node.ordinalStart),
+          String(node.ordinalEnd),
+          ...sourceFingerprints,
+        ]);
+        if (node.sourceContextHash !== sourceContextHash) {
+          return "pending batch source changed before publish";
+        }
+        continue;
+      }
+
+      const childrenStillCurrent = await this.pendingNodeChildrenStillCurrent({
+        node,
+        nodesById,
+        summaryItemsById,
+      });
+      if (!childrenStillCurrent) {
+        return "pending batch source changed before publish";
+      }
+    }
+
+    return null;
+  }
+
+  private async pendingNodeChildrenStillCurrent(input: {
+    node: PendingSummaryNodeRecord;
+    nodesById: Map<string, PendingSummaryNodeRecord>;
+    summaryItemsById: Map<string, PendingSummaryPlannerSnapshotItem>;
+  }): Promise<boolean> {
+    const children = await this.pendingSummaryStore.getNodeChildren(input.node.nodeId);
+    for (const child of children) {
+      if (child.childNodeId) {
+        if (!input.nodesById.has(child.childNodeId)) {
+          return false;
+        }
+        continue;
+      }
+
+      if (child.childSummaryId) {
+        const summaryItem = input.summaryItemsById.get(child.childSummaryId);
+        if (
+          !summaryItem ||
+          summaryItem.ordinal < input.node.ordinalStart ||
+          summaryItem.ordinal > input.node.ordinalEnd
+        ) {
+          return false;
+        }
+        continue;
+      }
+
+      return false;
+    }
+    return true;
   }
 
   private async buildProjectionSnapshot(conversationId: number): Promise<ProjectionSnapshot> {
