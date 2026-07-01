@@ -799,6 +799,220 @@ describe("PendingCompactionCoordinator", () => {
     ).resolves.toHaveLength(1);
   });
 
+  it("does not rebuild a whole-prefix condensed parent when extending past a ready one", async () => {
+    const { conversationStore, pendingSummaryStore, summaryStore } = createStores();
+    const conversation = await conversationStore.createConversation({
+      sessionId: "pending-coordinator-no-rebuild-session",
+      sessionKey: "agent:main:pending-coordinator-no-rebuild",
+    });
+    const initialMessages = await conversationStore.createMessagesBulk(
+      ["alpha", "bravo", "charlie", "delta"].map((label, index) => ({
+        conversationId: conversation.conversationId,
+        seq: index + 1,
+        role: index % 2 === 0 ? ("user" as const) : ("assistant" as const),
+        content: `${label} compactable message`,
+        tokenCount: 8,
+      })),
+    );
+    await summaryStore.appendContextMessages(
+      conversation.conversationId,
+      initialMessages.map((message) => message.messageId),
+    );
+
+    const condensedInputs: string[] = [];
+    const coordinator = new PendingCompactionCoordinator({
+      conversationStore,
+      pendingSummaryStore,
+      summaryStore,
+      model: "test-model",
+      leaseOwner: "test-worker",
+      config: {
+        freshTailCount: 1,
+        leafChunkTokens: 8,
+        condensedMinFanout: 2,
+        condensedMinSourceTokens: 1,
+        condensedChunkTokens: 400,
+      },
+      summarize: async (sourceText, _aggressive, options) => {
+        if (options?.isCondensed) {
+          condensedInputs.push(sourceText);
+          return `condensed(${sourceText.length})`;
+        }
+        return `leaf(${sourceText.slice(0, 24)})`;
+      },
+    });
+
+    // Initial plan condenses the two 8-token leaves into one depth-1 parent.
+    await expect(
+      coordinator.runOnce({
+        conversationId: conversation.conversationId,
+        publishPolicy: "prepare-only",
+      }),
+    ).resolves.toMatchObject({ status: "planned", nodeCount: 4 });
+    let result: { status: string };
+    do {
+      result = await coordinator.runOnce({
+        conversationId: conversation.conversationId,
+        publishPolicy: "prepare-only",
+      });
+    } while (result.status === "prepared");
+    expect(result.status).toBe("ready");
+    const batch = await pendingSummaryStore.getActiveBatchForConversation(
+      conversation.conversationId,
+    );
+    const readyNodes = await pendingSummaryStore.getNodesByBatch(batch!.batchId);
+    const readyCondensed = readyNodes.filter((node) => node.kind === "condensed");
+    expect(readyCondensed).toHaveLength(1);
+    const wholePrefixEnd = readyCondensed[0]!.ordinalEnd;
+    const condensedCallsAfterInitial = condensedInputs.length;
+
+    // One new chunk of growth: enough to extend, not enough new child work to
+    // satisfy the condensation fanout on its own.
+    const [suffixMessage] = await conversationStore.createMessagesBulk([
+      {
+        conversationId: conversation.conversationId,
+        seq: 5,
+        role: "user",
+        content: "echo suffix message",
+        tokenCount: 8,
+      },
+    ]);
+    await summaryStore.appendContextMessage(conversation.conversationId, suffixMessage!.messageId);
+
+    await expect(
+      coordinator.runOnce({
+        conversationId: conversation.conversationId,
+        publishPolicy: "prepare-only",
+      }),
+    ).resolves.toMatchObject({ status: "planned", nodeCount: 1 });
+    do {
+      result = await coordinator.runOnce({
+        conversationId: conversation.conversationId,
+        publishPolicy: "prepare-only",
+      });
+    } while (result.status === "prepared");
+    expect(result.status).toBe("ready");
+
+    // The extension planned only the suffix leaf: no condensed node covering
+    // the old prefix was rebuilt and no condensed summarize call was spent.
+    const nodesAfterSmallGrowth = await pendingSummaryStore.getNodesByBatch(batch!.batchId);
+    const condensedAfterSmallGrowth = nodesAfterSmallGrowth.filter(
+      (node) => node.kind === "condensed",
+    );
+    expect(condensedAfterSmallGrowth).toHaveLength(1);
+    expect(condensedAfterSmallGrowth[0]!.ordinalEnd).toBe(wholePrefixEnd);
+    expect(condensedInputs.length).toBe(condensedCallsAfterInitial);
+  });
+
+  it("condenses extension growth in layers over the existing ready condensed node", async () => {
+    const { conversationStore, pendingSummaryStore, summaryStore } = createStores();
+    const conversation = await conversationStore.createConversation({
+      sessionId: "pending-coordinator-layered-session",
+      sessionKey: "agent:main:pending-coordinator-layered",
+    });
+    const initialMessages = await conversationStore.createMessagesBulk(
+      ["alpha", "bravo", "charlie", "delta"].map((label, index) => ({
+        conversationId: conversation.conversationId,
+        seq: index + 1,
+        role: index % 2 === 0 ? ("user" as const) : ("assistant" as const),
+        content: `${label} compactable message`,
+        tokenCount: 8,
+      })),
+    );
+    await summaryStore.appendContextMessages(
+      conversation.conversationId,
+      initialMessages.map((message) => message.messageId),
+    );
+
+    const coordinator = new PendingCompactionCoordinator({
+      conversationStore,
+      pendingSummaryStore,
+      summaryStore,
+      model: "test-model",
+      leaseOwner: "test-worker",
+      config: {
+        freshTailCount: 1,
+        leafChunkTokens: 8,
+        condensedMinFanout: 2,
+        condensedMinSourceTokens: 1,
+        condensedChunkTokens: 400,
+      },
+      summarize: async (sourceText, _aggressive, options) =>
+        options?.isCondensed ? `condensed(${sourceText.length})` : `leaf(${sourceText.slice(0, 24)})`,
+    });
+
+    await expect(
+      coordinator.runOnce({
+        conversationId: conversation.conversationId,
+        publishPolicy: "prepare-only",
+      }),
+    ).resolves.toMatchObject({ status: "planned", nodeCount: 4 });
+    let result: { status: string };
+    do {
+      result = await coordinator.runOnce({
+        conversationId: conversation.conversationId,
+        publishPolicy: "prepare-only",
+      });
+    } while (result.status === "prepared");
+    expect(result.status).toBe("ready");
+    const batch = await pendingSummaryStore.getActiveBatchForConversation(
+      conversation.conversationId,
+    );
+    const initialCondensed = (await pendingSummaryStore.getNodesByBatch(batch!.batchId)).find(
+      (node) => node.kind === "condensed",
+    );
+    expect(initialCondensed).toBeDefined();
+
+    // Two chunks of growth: enough new child work to satisfy the fanout.
+    const suffixMessages = await conversationStore.createMessagesBulk(
+      ["echo", "foxtrot"].map((label, index) => ({
+        conversationId: conversation.conversationId,
+        seq: 5 + index,
+        role: index % 2 === 0 ? ("user" as const) : ("assistant" as const),
+        content: `${label} suffix message`,
+        tokenCount: 8,
+      })),
+    );
+    for (const message of suffixMessages) {
+      await summaryStore.appendContextMessage(conversation.conversationId, message.messageId);
+    }
+
+    const extended = await coordinator.runOnce({
+      conversationId: conversation.conversationId,
+      publishPolicy: "prepare-only",
+    });
+    expect(extended).toMatchObject({ status: "planned" });
+
+    // The plan grows in layers: a depth-1 parent over the new leaves only, and
+    // a depth-2 parent over [existing condensed, new parent] — never a rebuilt
+    // depth-1 parent spanning the whole prefix with re-flattened old leaves.
+    const nodes = await pendingSummaryStore.getNodesByBatch(batch!.batchId);
+    const plannedCondensed = nodes.filter(
+      (node) => node.kind === "condensed" && node.status === "planned",
+    );
+    const suffixParent = plannedCondensed.find((node) => node.depth === 1);
+    const layeredParent = plannedCondensed.find((node) => node.depth === 2);
+    expect(suffixParent).toBeDefined();
+    expect(suffixParent!.ordinalStart).toBeGreaterThan(initialCondensed!.ordinalEnd);
+    expect(layeredParent).toBeDefined();
+    expect(layeredParent!.ordinalStart).toBe(initialCondensed!.ordinalStart);
+
+    const layeredChildren = await pendingSummaryStore.getNodeChildren(layeredParent!.nodeId);
+    expect(layeredChildren).toEqual([
+      { childNodeId: initialCondensed!.nodeId, childSummaryId: null },
+      { childNodeId: suffixParent!.nodeId, childSummaryId: null },
+    ]);
+
+    // Preparation still converges to a ready frontier over the layered DAG.
+    do {
+      result = await coordinator.runOnce({
+        conversationId: conversation.conversationId,
+        publishPolicy: "prepare-only",
+      });
+    } while (result.status === "prepared" || result.status === "planned");
+    expect(result.status).toBe("ready");
+  });
+
   it("stales condensed pending summaries when a canonical child changes during tail growth", async () => {
     const { conversationStore, pendingSummaryStore, summaryStore } = createStores();
     const conversation = await conversationStore.createConversation({
