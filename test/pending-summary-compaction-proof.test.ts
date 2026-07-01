@@ -1,5 +1,8 @@
 import { describe, expect, it } from "vitest";
-import { runPendingSummaryCompactionProof } from "../scripts/e2e/pending-summary-compaction-proof.js";
+import {
+  runPendingSummaryCompactionProof,
+  runPendingSummaryStaleRecoveryProof,
+} from "../scripts/e2e/pending-summary-compaction-proof.js";
 
 describe("pending summary compaction proof harness", () => {
   it("demonstrates hidden preparation and atomic publish", async () => {
@@ -95,5 +98,17 @@ describe("pending summary compaction proof harness", () => {
       afterPublish?.pendingNodes.filter((node) => node.status === "ready"),
     ).toHaveLength(0);
     expect(report.publishedSummaryId).toMatch(/^sum_/);
+  });
+
+  it("rejects stale prepared work and recovers through a fresh batch", async () => {
+    const report = await runPendingSummaryStaleRecoveryProof();
+
+    expect(report.failures).toEqual([]);
+    expect(report.ok).toBe(true);
+    expect(report.staleBatchId).toBeTruthy();
+    expect(report.replannedBatchId).toBeTruthy();
+    expect(report.replannedBatchId).not.toBe(report.staleBatchId);
+    expect(report.publishedSummaryContent).toContain("mutated source truth");
+    expect(report.publishedSummaryContent).not.toContain("original source alpha");
   });
 });
