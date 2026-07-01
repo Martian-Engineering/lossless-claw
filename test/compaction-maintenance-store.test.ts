@@ -83,6 +83,7 @@ describe("CompactionMaintenanceStore", () => {
       contextThreshold: 0.15,
       contextThresholdSource: "override",
       contextFreshTailCount: 16,
+      contextLeafChunkTokens: 12000,
     });
 
     const record = await store.getConversationCompactionMaintenance(conversation.conversationId);
@@ -96,6 +97,7 @@ describe("CompactionMaintenanceStore", () => {
       contextThreshold: 0.15,
       contextThresholdSource: "override",
       contextFreshTailCount: 16,
+      contextLeafChunkTokens: 12000,
     });
 
     await store.requestProactiveCompactionDebt({
@@ -114,6 +116,7 @@ describe("CompactionMaintenanceStore", () => {
       contextThreshold: null,
       contextThresholdSource: null,
       contextFreshTailCount: null,
+      contextLeafChunkTokens: null,
     });
   });
 

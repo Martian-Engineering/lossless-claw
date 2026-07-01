@@ -816,8 +816,8 @@ export class LcmContextEngine implements ContextEngine {
       // Prefer the threshold persisted with the debt row: a background drain
       // may lack the runtime model metadata that originally selected it, and
       // re-resolving could silently flip the compaction decision. New debt rows
-      // also persist selected fresh-tail count; the runtime fallback only helps
-      // older rows written before that column existed.
+      // also persist selected fresh-tail and leaf chunk sizing; the runtime
+      // fallback only helps older rows written before those columns existed.
       const persistedContextThreshold = persistedContextThresholdOverride(maintenance);
       const resolvedContextThreshold = persistedContextThreshold
         ? {
@@ -825,6 +825,10 @@ export class LcmContextEngine implements ContextEngine {
             ...(persistedContextThreshold.freshTailCount === undefined &&
             runtimeResolvedContextThreshold.freshTailCount !== undefined
               ? { freshTailCount: runtimeResolvedContextThreshold.freshTailCount }
+              : {}),
+            ...(persistedContextThreshold.leafChunkTokens === undefined &&
+            runtimeResolvedContextThreshold.leafChunkTokens !== undefined
+              ? { leafChunkTokens: runtimeResolvedContextThreshold.leafChunkTokens }
               : {}),
           }
         : runtimeResolvedContextThreshold;
@@ -1223,6 +1227,9 @@ export class LcmContextEngine implements ContextEngine {
           ...(resolvedContextThreshold.freshTailCount !== undefined
             ? { freshTailCount: resolvedContextThreshold.freshTailCount }
             : {}),
+          ...(resolvedContextThreshold.leafChunkTokens !== undefined
+            ? { leafChunkTokens: resolvedContextThreshold.leafChunkTokens }
+            : {}),
           summarize,
           force: forceThresholdSweep,
           hardTrigger: false,
@@ -1436,6 +1443,9 @@ export class LcmContextEngine implements ContextEngine {
         contextThreshold: resolvedContextThreshold.contextThreshold,
         ...(resolvedContextThreshold.freshTailCount !== undefined
           ? { freshTailCount: resolvedContextThreshold.freshTailCount }
+          : {}),
+        ...(resolvedContextThreshold.leafChunkTokens !== undefined
+          ? { leafChunkTokens: resolvedContextThreshold.leafChunkTokens }
           : {}),
         targetTokens: convergenceTargetTokens,
         ...(effectiveCurrentTokens !== undefined ? { currentTokens: effectiveCurrentTokens } : {}),

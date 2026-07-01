@@ -949,6 +949,8 @@ export class CompactionEngine {
     contextThreshold?: number;
     /** Optional per-call override for freshTailCount. */
     freshTailCount?: number;
+    /** Optional per-call override for leafChunkTokens. */
+    leafChunkTokens?: number;
     summarize: CompactionSummarizeFn;
     force?: boolean;
     hardTrigger?: boolean;
@@ -966,6 +968,7 @@ export class CompactionEngine {
   }): Promise<CompactionResult> {
     const { conversationId, tokenBudget, summarize, force, hardTrigger } = input;
     const freshTailCountOverride = input.freshTailCount;
+    const leafChunkTokensOverride = input.leafChunkTokens;
 
     const tokensBefore = await this.summaryStore.getContextTokenCount(conversationId);
     const contextThreshold = resolveContextThreshold(this.config, input.contextThreshold);
@@ -1070,7 +1073,11 @@ export class CompactionEngine {
       if (sweepBudgetExhausted("leaf")) {
         break;
       }
-      const leafChunk = await this.selectOldestLeafChunk(conversationId, undefined, freshTailCountOverride);
+      const leafChunk = await this.selectOldestLeafChunk(
+        conversationId,
+        leafChunkTokensOverride,
+        freshTailCountOverride,
+      );
       if (leafChunk.items.length === 0) {
         break;
       }
@@ -1260,6 +1267,8 @@ export class CompactionEngine {
     contextThreshold?: number;
     /** Optional per-call override for freshTailCount. */
     freshTailCount?: number;
+    /** Optional per-call override for leafChunkTokens. */
+    leafChunkTokens?: number;
     targetTokens?: number;
     currentTokens?: number;
     summarize: CompactionSummarizeFn;
@@ -1274,6 +1283,8 @@ export class CompactionEngine {
     contextThreshold?: number;
     /** Optional per-call override for freshTailCount. */
     freshTailCount?: number;
+    /** Optional per-call override for leafChunkTokens. */
+    leafChunkTokens?: number;
     targetTokens?: number;
     currentTokens?: number;
     summarize: CompactionSummarizeFn;
@@ -1336,6 +1347,9 @@ export class CompactionEngine {
         contextThreshold: input.contextThreshold,
         ...(input.freshTailCount !== undefined
           ? { freshTailCount: input.freshTailCount }
+          : {}),
+        ...(input.leafChunkTokens !== undefined
+          ? { leafChunkTokens: input.leafChunkTokens }
           : {}),
         summarize,
         force: true,

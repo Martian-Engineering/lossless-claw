@@ -2,4 +2,4 @@
 "lossless-claw": patch
 ---
 
-Allow context-threshold override rules to set a model-specific fresh-tail count for assembly and threshold compaction.
+Allow context-threshold override rules to set model-specific fresh-tail and leaf chunk sizing for assembly and threshold compaction.

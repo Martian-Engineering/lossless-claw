@@ -32,7 +32,7 @@ Good default:
 
 ### `contextThresholdOverrides`
 
-Optional ordered rules that choose a different compaction threshold, and optionally a different fresh-tail count, for matching runtime contexts.
+Optional ordered rules that choose a different compaction threshold, and optionally a different fresh-tail count or leaf chunk size, for matching runtime contexts.
 
 Supported match fields:
 
@@ -41,7 +41,7 @@ Supported match fields:
 - `modelContextWindowMax`: match models/windows at or below this token count
 - `sessionPattern`: session-key glob, using the same `*` and `**` semantics as ignored/stateless sessions
 
-Rules are AND-matched: if a rule includes both `model` and `sessionPattern`, both must match. If multiple rules match, Lossless picks the highest-specificity rule, then the earliest rule in the array for ties. If no rule matches, it falls back to global `contextThreshold` and `freshTailCount`. If a matching rule includes `freshTailCount`, Lossless uses that value for assembly and threshold compaction.
+Rules are AND-matched: if a rule includes both `model` and `sessionPattern`, both must match. If multiple rules match, Lossless picks the highest-specificity rule, then the earliest rule in the array for ties. If no rule matches, it falls back to global `contextThreshold`, `freshTailCount`, and `leafChunkTokens`. If a matching rule includes `freshTailCount`, Lossless uses that value for assembly and threshold compaction. If it includes `leafChunkTokens`, Lossless uses that value for matching threshold sweeps.
 
 Example:
 
@@ -53,7 +53,8 @@ Example:
       "name": "large-context-models",
       "match": { "modelContextWindowMin": 900000 },
       "contextThreshold": 0.15,
-      "freshTailCount": 16
+      "freshTailCount": 16,
+      "leafChunkTokens": 12000
     },
     {
       "name": "telegram-sessions",

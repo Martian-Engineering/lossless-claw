@@ -129,6 +129,7 @@ describe("LcmContextEngine maintain and assemble budget", () => {
           match: { modelContextWindowMax: 250_000 },
           contextThreshold: 0.1,
           freshTailCount: 16,
+          leafChunkTokens: 12000,
         },
       ],
     });
@@ -144,6 +145,7 @@ describe("LcmContextEngine maintain and assemble budget", () => {
       contextThreshold: 0.1,
       contextThresholdSource: "override",
       contextFreshTailCount: 16,
+      contextLeafChunkTokens: 12000,
     });
     const privateEngine = engine as unknown as {
       executeCompactionCore: (params: unknown) => Promise<unknown>;
@@ -181,6 +183,7 @@ describe("LcmContextEngine maintain and assemble budget", () => {
           contextThreshold: 0.1,
           source: "override",
           freshTailCount: 16,
+          leafChunkTokens: 12000,
         }),
       }),
     );

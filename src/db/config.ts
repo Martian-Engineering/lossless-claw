@@ -75,6 +75,8 @@ export type ContextThresholdOverride = {
   contextThreshold: number;
   /** Optional override for freshTailCount when this rule matches. */
   freshTailCount?: number;
+  /** Optional override for leafChunkTokens when this rule matches. */
+  leafChunkTokens?: number;
 };
 
 export type LcmConfigSource = "env" | "plugin-config" | "default";
@@ -483,6 +485,9 @@ function toContextThresholdOverrides(value: unknown): ContextThresholdOverride[]
     const overrideFreshTailCount = record.freshTailCount !== undefined
       ? parsePositiveIntegerMatcher(record.freshTailCount, `${path}.freshTailCount`)
       : undefined;
+    const overrideLeafChunkTokens = record.leafChunkTokens !== undefined
+      ? parsePositiveIntegerMatcher(record.leafChunkTokens, `${path}.leafChunkTokens`)
+      : undefined;
 
     return {
       ...(toStr(record.name) ? { name: toStr(record.name) } : {}),
@@ -494,6 +499,7 @@ function toContextThresholdOverrides(value: unknown): ContextThresholdOverride[]
       },
       contextThreshold: parseContextThresholdOverrideThreshold(record.contextThreshold, path),
       ...(overrideFreshTailCount !== undefined ? { freshTailCount: overrideFreshTailCount } : {}),
+      ...(overrideLeafChunkTokens !== undefined ? { leafChunkTokens: overrideLeafChunkTokens } : {}),
     };
   });
 }

@@ -81,11 +81,20 @@ describe("ContextThresholdResolver", () => {
 
   it("matches an exact model id against modelRef or bare model", () => {
     const resolver = new ContextThresholdResolver(0.75, [
-      { match: { model: "openai/gpt-5.5" }, contextThreshold: 0.3 },
+      {
+        match: { model: "openai/gpt-5.5" },
+        contextThreshold: 0.3,
+        leafChunkTokens: 12000,
+      },
     ]);
     expect(
       resolver.resolve({ runtime: readRuntimeModelContext({ provider: "openai", model: "gpt-5.5" }) }),
-    ).toMatchObject({ contextThreshold: 0.3, source: "override", ruleIndex: 0 });
+    ).toMatchObject({
+      contextThreshold: 0.3,
+      source: "override",
+      ruleIndex: 0,
+      leafChunkTokens: 12000,
+    });
     expect(
       resolver.resolve({ runtime: readRuntimeModelContext({ model: "openai/gpt-5.5" }) }),
     ).toMatchObject({ contextThreshold: 0.3, source: "override" });
@@ -186,11 +195,13 @@ describe("persistedContextThresholdOverride", () => {
         contextThreshold: 0.1,
         contextThresholdSource: "override",
         contextFreshTailCount: 16,
+        contextLeafChunkTokens: 12000,
       }),
     ).toMatchObject({
       contextThreshold: 0.1,
       source: "override",
       freshTailCount: 16,
+      leafChunkTokens: 12000,
       reason: "persisted deferred threshold debt",
     });
     expect(
@@ -198,6 +209,7 @@ describe("persistedContextThresholdOverride", () => {
         contextThreshold: 0.5,
         contextThresholdSource: "global",
         contextFreshTailCount: null,
+        contextLeafChunkTokens: null,
       }),
     ).toMatchObject({ contextThreshold: 0.5, source: "global" });
   });
@@ -208,6 +220,7 @@ describe("persistedContextThresholdOverride", () => {
         contextThreshold: null,
         contextThresholdSource: null,
         contextFreshTailCount: null,
+        contextLeafChunkTokens: null,
       }),
     ).toBeUndefined();
   });

@@ -1156,6 +1156,7 @@ describe("LcmContextEngine afterTurn", () => {
           match: { model: "vllm/qwen3.6-27b" },
           contextThreshold: 0.5,
           freshTailCount: 16,
+          leafChunkTokens: 12000,
         },
       ],
     });
@@ -1204,6 +1205,7 @@ describe("LcmContextEngine afterTurn", () => {
       contextThreshold: 0.5,
       contextThresholdSource: "override",
       contextFreshTailCount: 16,
+      contextLeafChunkTokens: 12000,
     });
   });
 
@@ -1214,6 +1216,7 @@ describe("LcmContextEngine afterTurn", () => {
         {
           match: { modelContextWindowMax: 250_000 },
           contextThreshold: 0.1,
+          leafChunkTokens: 12000,
         },
       ],
     });
@@ -1260,6 +1263,7 @@ describe("LcmContextEngine afterTurn", () => {
         contextThresholdOverride: expect.objectContaining({
           contextThreshold: 0.1,
           source: "override",
+          leafChunkTokens: 12000,
         }),
       }),
     );
