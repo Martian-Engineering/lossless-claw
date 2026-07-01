@@ -219,6 +219,13 @@ export class PendingCompactionCoordinator {
     if (publishPolicy === "prepare-only") {
       const selection = await this.selectPublishFrontier({ batch, snapshot });
       if (selection) {
+        const extension = await this.extendReadyBatchIfRangeGrew({
+          batch,
+          snapshot,
+        });
+        if (extension) {
+          return extension;
+        }
         return {
           status: "ready",
           batchId: batch.batchId,
@@ -235,6 +242,97 @@ export class PendingCompactionCoordinator {
       return publishResult;
     }
     return { status: "idle", reason: "no claimable pending summary nodes" };
+  }
+
+  private async extendReadyBatchIfRangeGrew(input: {
+    batch: PendingCompactionBatchRecord;
+    snapshot: ProjectionSnapshot;
+  }): Promise<PendingCompactionCoordinatorResult | null> {
+    if (!this.hasRemainingCompactableWork(input)) {
+      return null;
+    }
+    if (
+      input.snapshot.compactableStartOrdinal == null ||
+      input.snapshot.compactableEndOrdinal == null
+    ) {
+      return null;
+    }
+
+    // Existing ready pending nodes stand in for the already-prepared prefix;
+    // extension planning only creates nodes for newly compactable suffix work
+    // and any new condensed parents that can reuse that prefix.
+    const existingNodes = await this.pendingSummaryStore.getNodesByBatch(input.batch.batchId);
+    const reusablePendingNodes = existingNodes
+      .filter((node) => node.status === "ready" || node.status === "promoted")
+      .map((node) => this.pendingRecordToPlannerNode(node));
+    const extensionItems = input.snapshot.items.filter(
+      (item) =>
+        item.ordinal > input.batch.compactableEndOrdinal &&
+        item.ordinal <= input.snapshot.compactableEndOrdinal!,
+    );
+    const nodeIdPrefix = `psn_${shortDigest("pending-summary-extension", [
+      input.batch.batchId,
+      input.snapshot.sourceProjectionFingerprint,
+      randomUUID(),
+    ])}`;
+    const leafNodes = planPendingLeafNodes({
+      items: extensionItems,
+      freshTailCount: 0,
+      leafChunkTokens: this.config.leafChunkTokens,
+      nodeIdPrefix,
+    });
+    const canonicalNodes = this.buildCanonicalSummaryPlannerNodes(input.snapshot);
+    const condensedNodes = planPendingCondensedNodes({
+      nodes: [...canonicalNodes, ...reusablePendingNodes, ...leafNodes],
+      condensedMinFanout: this.config.condensedMinFanout,
+      condensedMinSourceTokens: this.config.condensedMinSourceTokens,
+      condensedChunkTokens: this.config.condensedChunkTokens,
+      nodeIdPrefix,
+    });
+    const existingNodeKeys = new Set(
+      existingNodes.map((node) =>
+        this.plannerNodeIdentityKey({
+          kind: node.kind,
+          depth: node.depth,
+          ordinalStart: node.ordinalStart,
+          ordinalEnd: node.ordinalEnd,
+        }),
+      ),
+    );
+    const pendingNodes = [...leafNodes, ...condensedNodes].filter(
+      (node) => !existingNodeKeys.has(this.plannerNodeIdentityKey(node)),
+    );
+    if (pendingNodes.length === 0) {
+      return null;
+    }
+
+    await this.pendingSummaryStore.withTransaction(async () => {
+      const updated = await this.pendingSummaryStore.updateBatchPlanningTarget({
+        batchId: input.batch.batchId,
+        sourceProjectionFingerprint: input.snapshot.sourceProjectionFingerprint,
+        compactableStartOrdinal: input.snapshot.compactableStartOrdinal!,
+        compactableEndOrdinal: input.snapshot.compactableEndOrdinal!,
+        plannedFreshTailStartOrdinal: input.snapshot.freshTailStartOrdinal,
+      });
+      if (!updated) {
+        throw new Error(`Pending compaction batch ${input.batch.batchId} is not active for extension`);
+      }
+      for (const node of pendingNodes) {
+        await this.insertPendingNode(input.batch.batchId, input.batch.conversationId, node);
+      }
+    });
+
+    return {
+      status: "planned",
+      batchId: input.batch.batchId,
+      nodeCount: pendingNodes.length,
+    };
+  }
+
+  private plannerNodeIdentityKey(
+    node: Pick<PendingSummaryPlannerNode, "kind" | "depth" | "ordinalStart" | "ordinalEnd">,
+  ): string {
+    return `${node.kind}:${node.depth}:${node.ordinalStart}:${node.ordinalEnd}`;
   }
 
   private async planBatch(input: {

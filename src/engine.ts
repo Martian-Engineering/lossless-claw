@@ -148,6 +148,7 @@ type DeferredCompactionDebtDrainParams = {
   currentTokenCount?: number;
   reason: string;
 };
+type PendingSummaryPreparationDrainParams = DeferredCompactionDebtDrainParams;
 
 function buildContextEngineProjectionEpoch(
   conversationId: number,
@@ -313,6 +314,7 @@ export class LcmContextEngine implements ContextEngine {
     { promise: Promise<void>; refCount: number }
   >();
   private deferredCompactionDrains = new Set<string>();
+  private pendingSummaryPreparationDrains = new Set<string>();
   private previousAssembledMessagesByConversation = new Map<number, AssemblePrefixSnapshot>();
   private recentBootstrapImportsByConversation = new Map<number, BootstrapImportObservation>();
   private deps: LcmDependencies;
@@ -668,6 +670,84 @@ export class LcmContextEngine implements ContextEngine {
     });
   }
 
+  /** Prepare hidden pending summaries later without recording threshold debt. */
+  private schedulePendingSummaryPreparationDrain(
+    params: PendingSummaryPreparationDrainParams,
+  ): void {
+    const queueKey = this.resolveSessionQueueKey(params.sessionId, params.sessionKey);
+    setImmediate(() => {
+      void this.drainPendingSummaryPreparationIfIdle({
+        ...params,
+        queueKey,
+      }).catch((err) => {
+        this.deps.log.warn(
+          `[lcm] background pending summary preparation failed conversation=${params.conversationId} session=${params.sessionId}: ${describeLogError(err)}`,
+        );
+      });
+    });
+  }
+
+  /** Advance below-threshold pending summary preparation only when the session is idle. */
+  private async drainPendingSummaryPreparationIfIdle(
+    params: PendingSummaryPreparationDrainParams & { queueKey: string },
+  ): Promise<void> {
+    const sessionLabel = formatSessionLabel(params.sessionId, params.sessionKey);
+    const busyQueue = this.sessionOperationQueues.get(params.queueKey);
+    if (busyQueue) {
+      this.deps.log.debug(
+        `[lcm] background pending summary preparation skipped conversation=${params.conversationId} ${sessionLabel} reason=session-queue-busy prepReason=${params.reason}`,
+      );
+      void busyQueue.promise.finally(() => {
+        this.schedulePendingSummaryPreparationDrain(params);
+      });
+      return;
+    }
+    if (this.pendingSummaryPreparationDrains.has(params.queueKey)) {
+      this.deps.log.debug(
+        `[lcm] background pending summary preparation skipped conversation=${params.conversationId} ${sessionLabel} reason=drain-already-running prepReason=${params.reason}`,
+      );
+      return;
+    }
+
+    this.pendingSummaryPreparationDrains.add(params.queueKey);
+    try {
+      const cappedTokenBudget = this.applyAssemblyBudgetCap(params.tokenBudget);
+      const telemetry =
+        await this.compactionTelemetryStore.getConversationCompactionTelemetry(
+          params.conversationId,
+        );
+      const legacyParams =
+        telemetry?.provider || telemetry?.model
+          ? {
+              ...(telemetry.provider ? { provider: telemetry.provider } : {}),
+              ...(telemetry.model ? { model: telemetry.model } : {}),
+            }
+          : undefined;
+      const result = await this.executePendingCompactionCore({
+        conversationId: params.conversationId,
+        sessionId: params.sessionId,
+        sessionKey: params.sessionKey,
+        tokenBudget: cappedTokenBudget,
+        currentTokenCount: params.currentTokenCount,
+        legacyParams,
+        sessionQueueHeld: false,
+        publishPolicy: "prepare-only",
+      });
+      this.deps.log.debug(
+        `[lcm] background pending summary preparation done conversation=${params.conversationId} ${sessionLabel} changed=${result.compacted} reason=${result.reason ?? "none"} prepReason=${params.reason}`,
+      );
+      if (
+        result.pending === true &&
+        result.reason !== "pending summaries ready for publish" &&
+        result.reason !== "circuit breaker open"
+      ) {
+        this.schedulePendingSummaryPreparationDrain(params);
+      }
+    } finally {
+      this.pendingSummaryPreparationDrains.delete(params.queueKey);
+    }
+  }
+
   /**
    * Consume durable threshold debt only when the session queue is idle.
    *
@@ -729,7 +809,7 @@ export class LcmContextEngine implements ContextEngine {
         currentTokenCount: params.currentTokenCount,
         legacyParams,
         sessionQueueHeld: false,
-        pendingPublishPolicy: "prepare-only",
+        pendingPublishPolicy: "publish-if-ready",
       });
       if (result) {
         this.deps.log.debug(
@@ -1081,6 +1161,14 @@ export class LcmContextEngine implements ContextEngine {
           lastResult.reason === "no compactable context outside fresh tail" ||
           lastResult.reason === "no pending summary nodes planned"
         ) {
+          if (params.publishPolicy === "prepare-only") {
+            return {
+              ok: true,
+              compacted: false,
+              reason: lastResult.reason,
+              result: lastResult,
+            };
+          }
           const runLegacyCompaction = () => this.executeCompactionCore({
             conversationId: params.conversationId,
             sessionId: params.sessionId,
@@ -2504,7 +2592,7 @@ export class LcmContextEngine implements ContextEngine {
               runtimeContext: params.runtimeContext,
               legacyParams: asRecord(params.runtimeContext),
               sessionQueueHeld: true,
-              pendingPublishPolicy: "prepare-only",
+              pendingPublishPolicy: "publish-if-ready",
             });
           }
         } else if (maintenance?.pending || maintenance?.running) {
@@ -3103,6 +3191,13 @@ export class LcmContextEngine implements ContextEngine {
           currentTokenCount: number;
         }
       | null = null;
+    let pendingSummaryPreparationDrain:
+      | {
+          reason: string;
+          tokenBudget: number;
+          currentTokenCount: number;
+        }
+      | null = null;
 
     try {
       await this.telemetryRecorder.updateCompactionTelemetry({
@@ -3181,6 +3276,22 @@ export class LcmContextEngine implements ContextEngine {
           reason: "threshold",
         };
       }
+      if (!thresholdDecision.shouldCompact) {
+        const leafDecision = await this.compaction.evaluateLeafTrigger(
+          conversation.conversationId,
+          this.config.leafChunkTokens,
+        );
+        this.deps.log.debug(
+          `[lcm] pending-summary-prep: selected phase=afterTurn conversation=${conversation.conversationId} ${sessionLabel} rawTokensOutsideTail=${leafDecision.rawTokensOutsideTail} threshold=${leafDecision.threshold} shouldPrepare=${leafDecision.shouldCompact}`,
+        );
+        if (leafDecision.shouldCompact) {
+          pendingSummaryPreparationDrain = {
+            tokenBudget,
+            currentTokenCount: observedCurrentTokenCount,
+            reason: "leaf-prep",
+          };
+        }
+      }
     } catch (err) {
       this.deps.log.warn(
         `[lcm] afterTurn: compaction policy check failed for ${sessionLabel}: ${describeLogError(err)}`,
@@ -3195,6 +3306,16 @@ export class LcmContextEngine implements ContextEngine {
         tokenBudget: deferredCompactionDrain.tokenBudget,
         currentTokenCount: deferredCompactionDrain.currentTokenCount,
         reason: deferredCompactionDrain.reason,
+      });
+    }
+    if (pendingSummaryPreparationDrain) {
+      this.schedulePendingSummaryPreparationDrain({
+        conversationId: conversation.conversationId,
+        sessionId,
+        sessionKey,
+        tokenBudget: pendingSummaryPreparationDrain.tokenBudget,
+        currentTokenCount: pendingSummaryPreparationDrain.currentTokenCount,
+        reason: pendingSummaryPreparationDrain.reason,
       });
     }
 

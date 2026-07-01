@@ -341,6 +341,41 @@ export class PendingSummaryStore {
     return row ? toBatchRecord(row) : null;
   }
 
+  /** Update the active planning target when a pending batch is extended. */
+  async updateBatchPlanningTarget(input: {
+    batchId: string;
+    sourceProjectionFingerprint: string;
+    compactableStartOrdinal: number;
+    compactableEndOrdinal: number;
+    plannedFreshTailStartOrdinal?: number | null;
+  }): Promise<boolean> {
+    const compactableRange = normalizeOrdinalRange(
+      input.compactableStartOrdinal,
+      input.compactableEndOrdinal,
+    );
+    const result = this.db
+      .prepare(
+        `UPDATE pending_compaction_batches
+         SET source_projection_fingerprint = ?,
+             compactable_start_ordinal = ?,
+             compactable_end_ordinal = ?,
+             planned_fresh_tail_start_ordinal = ?,
+             updated_at = datetime('now')
+         WHERE batch_id = ?
+           AND status IN ('planning', 'ready')`,
+      )
+      .run(
+        input.sourceProjectionFingerprint,
+        compactableRange.start,
+        compactableRange.end,
+        typeof input.plannedFreshTailStartOrdinal === "number"
+          ? normalizeNonNegativeInteger(input.plannedFreshTailStartOrdinal)
+          : null,
+        input.batchId,
+      );
+    return Number(result.changes ?? 0) > 0;
+  }
+
   /** Load the newest active pending compaction batch for a conversation. */
   async getActiveBatchForConversation(
     conversationId: number,
