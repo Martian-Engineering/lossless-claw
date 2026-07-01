@@ -179,6 +179,20 @@ function ensureCompactionTelemetryColumns(db: DatabaseSync): void {
   }
 }
 
+// Adds per-node retry bookkeeping to pending_summary_nodes for DBs created
+// before failed-node retry existed.
+function ensurePendingSummaryNodeRetryColumns(db: DatabaseSync): void {
+  const nodeColumns = db
+    .prepare(`PRAGMA table_info(pending_summary_nodes)`)
+    .all() as SummaryColumnInfo[];
+  if (!nodeColumns.some((col) => col.name === "retry_count")) {
+    db.exec(`ALTER TABLE pending_summary_nodes ADD COLUMN retry_count INTEGER NOT NULL DEFAULT 0`);
+  }
+  if (!nodeColumns.some((col) => col.name === "next_attempt_after")) {
+    db.exec(`ALTER TABLE pending_summary_nodes ADD COLUMN next_attempt_after TEXT`);
+  }
+}
+
 function ensureCompactionMaintenanceColumns(db: DatabaseSync): void {
   const maintenanceColumns = db
     .prepare(`PRAGMA table_info(conversation_compaction_maintenance)`)
@@ -1200,6 +1214,8 @@ export function runLcmMigrations(
       lease_owner TEXT,
       lease_expires_at TEXT,
       failure_summary TEXT,
+      retry_count INTEGER NOT NULL DEFAULT 0,
+      next_attempt_after TEXT,
       created_at TEXT NOT NULL DEFAULT (datetime('now')),
       updated_at TEXT NOT NULL DEFAULT (datetime('now')),
       ready_at TEXT,
@@ -1382,6 +1398,9 @@ export function runLcmMigrations(
     );
     runMigrationStep("ensureCompactionMaintenanceColumns", log, () =>
       ensureCompactionMaintenanceColumns(db),
+    );
+    runMigrationStep("ensurePendingSummaryNodeRetryColumns", log, () =>
+      ensurePendingSummaryNodeRetryColumns(db),
     );
     runMigrationStep("ensureFocusBriefTables", log, () => ensureFocusBriefTables(db));
     runVersionedBackfillStep(db, "backfillSummaryDepths", log, () => backfillSummaryDepths(db));

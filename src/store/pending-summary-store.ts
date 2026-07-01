@@ -3,6 +3,17 @@ import { withDatabaseTransaction } from "../transaction-mutex.js";
 import { parseUtcTimestampOrNull } from "./parse-utc-timestamp.js";
 import type { SummaryKind } from "./summary-store.js";
 
+/**
+ * Preparation attempts per pending node before the batch is treated as
+ * terminally failed. Retried claims use the node's own backoff window.
+ */
+export const MAX_PENDING_NODE_RETRIES = 3;
+
+/** Backoff before a failed pending node may be claimed again. */
+function retryBackoffMs(retryCount: number): number {
+  return Math.min(60_000 * 2 ** Math.max(0, retryCount - 1), 900_000);
+}
+
 export type PendingCompactionBatchStatus =
   | "planning"
   | "ready"
@@ -70,6 +81,8 @@ export type PendingSummaryNodeRecord = {
   leaseOwner: string | null;
   leaseExpiresAt: Date | null;
   failureSummary: string | null;
+  retryCount: number;
+  nextAttemptAfter: Date | null;
   createdAt: Date;
   updatedAt: Date;
   readyAt: Date | null;
@@ -152,6 +165,8 @@ type PendingSummaryNodeRow = {
   lease_owner: string | null;
   lease_expires_at: string | null;
   failure_summary: string | null;
+  retry_count: number;
+  next_attempt_after: string | null;
   created_at: string;
   updated_at: string;
   ready_at: string | null;
@@ -209,6 +224,8 @@ function toNodeRecord(row: PendingSummaryNodeRow): PendingSummaryNodeRecord {
     leaseOwner: row.lease_owner,
     leaseExpiresAt: parseUtcTimestampOrNull(row.lease_expires_at),
     failureSummary: row.failure_summary,
+    retryCount: row.retry_count,
+    nextAttemptAfter: parseUtcTimestampOrNull(row.next_attempt_after),
     createdAt: parseUtcTimestampOrNull(row.created_at) ?? new Date(0),
     updatedAt: parseUtcTimestampOrNull(row.updated_at) ?? new Date(0),
     readyAt: parseUtcTimestampOrNull(row.ready_at),
@@ -516,6 +533,8 @@ export class PendingSummaryStore {
                 lease_owner,
                 lease_expires_at,
                 failure_summary,
+                retry_count,
+                next_attempt_after,
                 created_at,
                 updated_at,
                 ready_at,
@@ -549,6 +568,8 @@ export class PendingSummaryStore {
                 lease_owner,
                 lease_expires_at,
                 failure_summary,
+                retry_count,
+                next_attempt_after,
                 created_at,
                 updated_at,
                 ready_at,
@@ -670,6 +691,8 @@ export class PendingSummaryStore {
                   pending_summary_nodes.lease_owner,
                   pending_summary_nodes.lease_expires_at,
                   pending_summary_nodes.failure_summary,
+                  pending_summary_nodes.retry_count,
+                  pending_summary_nodes.next_attempt_after,
                   pending_summary_nodes.created_at,
                   pending_summary_nodes.updated_at,
                   pending_summary_nodes.ready_at,
@@ -686,6 +709,11 @@ export class PendingSummaryStore {
                  AND lease_expires_at IS NOT NULL
                  AND lease_expires_at <= ?
                )
+               OR (
+                 pending_summary_nodes.status = 'failed'
+                 AND retry_count < ${MAX_PENDING_NODE_RETRIES}
+                 AND (next_attempt_after IS NULL OR next_attempt_after <= ?)
+               )
              )
              AND NOT EXISTS (
                SELECT 1
@@ -699,7 +727,7 @@ export class PendingSummaryStore {
                     pending_summary_nodes.node_id
            LIMIT 1`,
         )
-        .get(input.conversationId, nowIso) as PendingSummaryNodeRow | undefined;
+        .get(input.conversationId, nowIso, nowIso) as PendingSummaryNodeRow | undefined;
 
       if (!row) {
         return null;
@@ -723,6 +751,11 @@ export class PendingSummaryStore {
              AND (
                status = 'planned'
                OR (status = 'running' AND lease_expires_at IS NOT NULL AND lease_expires_at <= ?)
+               OR (
+                 status = 'failed'
+                 AND retry_count < ${MAX_PENDING_NODE_RETRIES}
+                 AND (next_attempt_after IS NULL OR next_attempt_after <= ?)
+               )
              )
              AND NOT EXISTS (
                SELECT 1
@@ -732,7 +765,7 @@ export class PendingSummaryStore {
                  AND child.status NOT IN ('ready', 'promoted')
              )`,
         )
-        .run(input.leaseOwner, input.leaseExpiresAt.toISOString(), row.node_id, nowIso);
+        .run(input.leaseOwner, input.leaseExpiresAt.toISOString(), row.node_id, nowIso, nowIso);
       if (Number(result.changes ?? 0) === 0) {
         return null;
       }
@@ -759,6 +792,8 @@ export class PendingSummaryStore {
              lease_owner = NULL,
              lease_expires_at = NULL,
              failure_summary = NULL,
+             retry_count = 0,
+             next_attempt_after = NULL,
              ready_at = COALESCE(?, datetime('now')),
              updated_at = datetime('now')
          WHERE node_id = ?
@@ -777,33 +812,53 @@ export class PendingSummaryStore {
     return Number(result.changes ?? 0) > 0;
   }
 
-  /** Mark a pending node failed and release its lease. */
+  /**
+   * Mark a pending node failed and release its lease.
+   *
+   * Each failure increments the node's retry count and stamps the exponential
+   * backoff window after which `claimNextPlannedNode` may claim it again.
+   */
   async markNodeFailed(input: {
     nodeId: string;
     leaseOwner: string;
     leaseExpiresAt: Date;
     failureSummary: string;
+    now?: Date;
   }): Promise<boolean> {
-    const result = this.db
-      .prepare(
-        `UPDATE pending_summary_nodes
-         SET status = 'failed',
-             lease_owner = NULL,
-             lease_expires_at = NULL,
-             failure_summary = ?,
-             updated_at = datetime('now')
-         WHERE node_id = ?
-           AND status = 'running'
-           AND lease_owner = ?
-           AND lease_expires_at = ?`,
-      )
-      .run(
-        input.failureSummary,
-        input.nodeId,
-        input.leaseOwner,
-        input.leaseExpiresAt.toISOString(),
+    return this.withTransaction(async () => {
+      const node = await this.getNode(input.nodeId);
+      if (!node) {
+        return false;
+      }
+      const nextRetryCount = node.retryCount + 1;
+      const nextAttemptAfter = new Date(
+        (input.now ?? new Date()).getTime() + retryBackoffMs(nextRetryCount),
       );
-    return Number(result.changes ?? 0) > 0;
+      const result = this.db
+        .prepare(
+          `UPDATE pending_summary_nodes
+           SET status = 'failed',
+               lease_owner = NULL,
+               lease_expires_at = NULL,
+               failure_summary = ?,
+               retry_count = ?,
+               next_attempt_after = ?,
+               updated_at = datetime('now')
+           WHERE node_id = ?
+             AND status = 'running'
+             AND lease_owner = ?
+             AND lease_expires_at = ?`,
+        )
+        .run(
+          input.failureSummary,
+          nextRetryCount,
+          nextAttemptAfter.toISOString(),
+          input.nodeId,
+          input.leaseOwner,
+          input.leaseExpiresAt.toISOString(),
+        );
+      return Number(result.changes ?? 0) > 0;
+    });
   }
 
   /** Record the canonical summary id created from a pending node. */
