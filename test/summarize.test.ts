@@ -966,14 +966,54 @@ describe("createLcmSummarizeFromLegacyParams", () => {
 
     const summary = await summarize!("H".repeat(8_000), false);
 
-    // When no non-reasoning text is collected, reasoning blocks are
-    // used as a fallback source so models that place the entire summary
-    // inside a typed reasoning block (e.g. Ollama extended-thinking
-    // models, #944) produce usable summaries instead of falling
-    // through to the truncation fallback.
-    expect(summary).toBe("PRIVATE_TYPED_REASONING_TRACE");
-    // The summary was extracted successfully on the first attempt, so
-    // no empty-summary diagnostics are generated and no retries occur.
+    // Reasoning-only blocks without an accompanying text-type block are
+    // treated as private diagnostics, not summary content. The fallback
+    // only activates when the response contains both reasoning and text
+    // blocks (model intended text output), per #944.
+    expect(summary).toContain("[LCM fallback summary; truncated for context management]");
+
+    const diagnostics = getDepsLogText(deps);
+    expect(diagnostics).toContain("block_types=reasoning");
+    expect(diagnostics).toContain("content_preview=");
+    expect(diagnostics).not.toContain("PRIVATE_TYPED_REASONING_TRACE");
+  });
+
+  it("recovers summary from reasoning blocks when a text block is also present (#944)", async () => {
+    // Ollama extended-thinking models place the entire summary inside a
+    // type:"reasoning" block while leaving type:"text" empty.  When both
+    // blocks are present (the model intended text output), fall back to
+    // reasoning blocks so the summary is not discarded.
+    const deps = makeDeps({
+      resolveModel: vi.fn(() => ({
+        provider: "ollama",
+        model: "qwen3.5:9b",
+      })),
+      complete: vi.fn(async () => ({
+        content: [
+          {
+            type: "reasoning",
+            text: "The input describes a text processing pipeline that...",
+          },
+          {
+            type: "text",
+            text: "",
+          },
+        ],
+      })),
+    });
+
+    const summarize = await createSummarizeFn({
+      deps,
+      legacyParams: {
+        provider: "ollama",
+        model: "qwen3.5:9b",
+      },
+    });
+
+    const summary = await summarize!("H".repeat(8_000), false);
+
+    expect(summary).toContain("text processing pipeline");
+    // Recovery succeeds on the first attempt — no retry or fallback needed.
     expect(vi.mocked(deps.complete)).toHaveBeenCalledTimes(1);
   });
 

@@ -411,11 +411,15 @@ function normalizeCompletionSummary(content: unknown): { summary: string; blockT
   collectTextLikeFields(content, chunks);
   collectBlockTypes(content, blockTypeSet);
 
-  // Fallback: when no text was collected from non-reasoning blocks (e.g.
-  // Ollama extended-thinking models that place the entire summary inside a
-  // type:"reasoning" block), re-collect including reasoning blocks so the
-  // model's output is not discarded.  See #944.
-  if (chunks.length === 0) {
+  // Fallback: when no text was collected from non-reasoning blocks but the
+  // content array contains text-type blocks alongside reasoning blocks, the
+  // model intended to produce text output and placed the entire summary
+  // inside the reasoning block (e.g. Ollama extended-thinking models, #944).
+  // Only re-collect from reasoning blocks when a text-type block is present
+  // so truly private reasoning/thinking payloads are never promoted to
+  // summary text.  Empty text blocks produce empty-string chunks, so check
+  // whether every collected chunk is blank rather than relying on length.
+  if (chunks.every((c) => !c.trim()) && blockTypeSet.has("text")) {
     const reasoningChunks: string[] = [];
     collectTextLikeFields(content, reasoningChunks, false);
     chunks.push(...reasoningChunks);
