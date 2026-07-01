@@ -16,10 +16,11 @@ import {
 import { PendingSummaryPublisher } from "./pending-summary-publisher.js";
 import { PendingSummaryPreparationWorker } from "./pending-summary-worker.js";
 import type { ConversationStore, MessageRecord } from "./store/conversation-store.js";
-import type {
-  PendingCompactionBatchRecord,
-  PendingSummaryNodeRecord,
-  PendingSummaryStore,
+import {
+  MAX_PENDING_NODE_RETRIES,
+  type PendingCompactionBatchRecord,
+  type PendingSummaryNodeRecord,
+  type PendingSummaryStore,
 } from "./store/pending-summary-store.js";
 import type { ContextItemRecord, SummaryRecord, SummaryStore } from "./store/summary-store.js";
 import { LcmProviderAuthError, type LcmSummarizeFn } from "./summarize.js";
@@ -203,10 +204,18 @@ export class PendingCompactionCoordinator {
       return { status: "prepared", batchId: batch.batchId, nodeId: prepared.nodeId };
     }
     if (prepared.status === "failed") {
-      await this.pendingSummaryStore.markBatchStale({
-        batchId: batch.batchId,
-        failureSummary: prepared.failureSummary,
-      });
+      // A transient failure leaves the node claimable again after its backoff
+      // window; ready siblings keep their prepared content. Only auth failures
+      // (the circuit breaker owns the global stop) and retry exhaustion
+      // invalidate the batch.
+      const failedNode = await this.pendingSummaryStore.getNode(prepared.nodeId);
+      const retriesExhausted = (failedNode?.retryCount ?? 0) >= MAX_PENDING_NODE_RETRIES;
+      if (prepared.authFailure || retriesExhausted) {
+        await this.pendingSummaryStore.markBatchStale({
+          batchId: batch.batchId,
+          failureSummary: prepared.failureSummary,
+        });
+      }
       return {
         status: "failed",
         batchId: batch.batchId,

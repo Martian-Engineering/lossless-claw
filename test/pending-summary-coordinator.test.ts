@@ -13,10 +13,18 @@ function createStores() {
   const { fts5Available } = getLcmDbFeatures(db);
   runLcmMigrations(db, { fts5Available });
   return {
+    db,
     conversationStore: new ConversationStore(db, { fts5Available }),
     pendingSummaryStore: new PendingSummaryStore(db),
     summaryStore: new SummaryStore(db, { fts5Available }),
   };
+}
+
+/** Fast-forward every pending node's retry backoff so claims retry now. */
+function clearRetryBackoff(db: DatabaseSync): void {
+  db.prepare(
+    `UPDATE pending_summary_nodes SET next_attempt_after = '2000-01-01T00:00:00.000Z'`,
+  ).run();
 }
 
 describe("PendingCompactionCoordinator", () => {
@@ -323,8 +331,8 @@ describe("PendingCompactionCoordinator", () => {
     ]);
   });
 
-  it("replans the same projection after a failed pending preparation", async () => {
-    const { conversationStore, pendingSummaryStore, summaryStore } = createStores();
+  it("retries a failed pending preparation in place without discarding the batch", async () => {
+    const { db, conversationStore, pendingSummaryStore, summaryStore } = createStores();
     const conversation = await conversationStore.createConversation({
       sessionId: "pending-coordinator-retry-session",
       sessionKey: "agent:main:pending-coordinator-retry",
@@ -385,25 +393,115 @@ describe("PendingCompactionCoordinator", () => {
       sessionKey: "agent:main:pending-coordinator-retry",
     });
     expect(firstPlan).toMatchObject({ status: "planned" });
+    if (firstPlan.status !== "planned") {
+      throw new Error("Expected the pending compaction attempt to plan");
+    }
     await expect(
       coordinator.runOnce({ conversationId: conversation.conversationId }),
     ).resolves.toMatchObject({ status: "failed", failureSummary: "provider timeout" });
 
-    const secondPlan = await coordinator.runOnce({
-      conversationId: conversation.conversationId,
-      sessionKey: "agent:main:pending-coordinator-retry",
+    // The transient failure keeps the batch active with the node parked in
+    // failed status behind its retry backoff.
+    const batchAfterFailure = await pendingSummaryStore.getActiveBatchForConversation(
+      conversation.conversationId,
+    );
+    expect(batchAfterFailure?.batchId).toBe(firstPlan.batchId);
+    const failedNodes = await pendingSummaryStore.getNodesByBatch(firstPlan.batchId);
+    expect(failedNodes).toHaveLength(1);
+    expect(failedNodes[0]).toMatchObject({ status: "failed", retryCount: 1 });
+    expect(failedNodes[0]!.nextAttemptAfter!.getTime()).toBeGreaterThan(Date.now());
+
+    // Backoff still active: nothing is claimable yet.
+    await expect(
+      coordinator.runOnce({ conversationId: conversation.conversationId }),
+    ).resolves.toMatchObject({ status: "idle" });
+
+    clearRetryBackoff(db);
+    await expect(
+      coordinator.runOnce({ conversationId: conversation.conversationId }),
+    ).resolves.toMatchObject({ status: "prepared", batchId: firstPlan.batchId });
+    await expect(
+      coordinator.runOnce({ conversationId: conversation.conversationId }),
+    ).resolves.toMatchObject({ status: "published", batchId: firstPlan.batchId });
+  });
+
+  it("stales the batch only after pending preparation retries are exhausted", async () => {
+    const { db, conversationStore, pendingSummaryStore, summaryStore } = createStores();
+    const conversation = await conversationStore.createConversation({
+      sessionId: "pending-coordinator-exhaust-session",
+      sessionKey: "agent:main:pending-coordinator-exhaust",
     });
-    expect(secondPlan).toMatchObject({ status: "planned" });
-    if (firstPlan.status !== "planned" || secondPlan.status !== "planned") {
-      throw new Error("Expected both pending compaction attempts to plan");
+    const messages = await conversationStore.createMessagesBulk([
+      {
+        conversationId: conversation.conversationId,
+        seq: 1,
+        role: "user",
+        content: "exhaust source message",
+        tokenCount: 4,
+      },
+      {
+        conversationId: conversation.conversationId,
+        seq: 2,
+        role: "assistant",
+        content: "fresh tail message",
+        tokenCount: 4,
+      },
+    ]);
+    await summaryStore.appendContextMessages(
+      conversation.conversationId,
+      messages.map((message) => message.messageId),
+    );
+
+    const coordinator = new PendingCompactionCoordinator({
+      conversationStore,
+      pendingSummaryStore,
+      summaryStore,
+      model: "test-model",
+      leaseOwner: "test-worker",
+      config: {
+        freshTailCount: 1,
+        leafChunkTokens: 100,
+        condensedMinFanout: 2,
+        condensedMinSourceTokens: 1,
+        condensedChunkTokens: 100,
+      },
+      summarize: async () => {
+        throw new Error("persistent provider failure");
+      },
+    });
+
+    const plan = await coordinator.runOnce({ conversationId: conversation.conversationId });
+    expect(plan).toMatchObject({ status: "planned" });
+    if (plan.status !== "planned") {
+      throw new Error("Expected the pending compaction attempt to plan");
     }
-    expect(secondPlan.batchId).not.toBe(firstPlan.batchId);
+
+    // Attempts one and two fail transiently and keep the batch alive.
+    for (let attempt = 1; attempt <= 2; attempt += 1) {
+      await expect(
+        coordinator.runOnce({ conversationId: conversation.conversationId }),
+      ).resolves.toMatchObject({ status: "failed" });
+      await expect(
+        pendingSummaryStore.getActiveBatchForConversation(conversation.conversationId),
+      ).resolves.toMatchObject({ batchId: plan.batchId });
+      clearRetryBackoff(db);
+    }
+
+    // The third failure exhausts retries and stales the whole batch.
     await expect(
       coordinator.runOnce({ conversationId: conversation.conversationId }),
-    ).resolves.toMatchObject({ status: "prepared" });
+    ).resolves.toMatchObject({ status: "failed" });
+    await expect(
+      pendingSummaryStore.getActiveBatchForConversation(conversation.conversationId),
+    ).resolves.toBeNull();
+    await expect(pendingSummaryStore.getBatch(plan.batchId)).resolves.toMatchObject({
+      status: "stale",
+    });
+
+    // The next pass replans a fresh batch for the same projection.
     await expect(
       coordinator.runOnce({ conversationId: conversation.conversationId }),
-    ).resolves.toMatchObject({ status: "published" });
+    ).resolves.toMatchObject({ status: "planned" });
   });
 
   it("publishes a mixed canonical and pending frontier", async () => {
