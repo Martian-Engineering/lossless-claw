@@ -23,7 +23,11 @@ import {
   type PendingSummaryStore,
 } from "./store/pending-summary-store.js";
 import type { ContextItemRecord, SummaryRecord, SummaryStore } from "./store/summary-store.js";
-import { LcmProviderAuthError, type LcmSummarizeFn } from "./summarize.js";
+import {
+  LcmProviderAuthError,
+  LcmSummarySpendLimitError,
+  type LcmSummarizeFn,
+} from "./summarize.js";
 
 const PENDING_PROMPT_VERSION = "pending-summary-dag:v1";
 
@@ -206,10 +210,14 @@ export class PendingCompactionCoordinator {
         }),
       estimateTokens,
       isAuthFailure: (error) => error instanceof LcmProviderAuthError,
+      isSpendLimitFailure: (error) => error instanceof LcmSummarySpendLimitError,
     });
     const prepared = await worker.prepareOne({ conversationId: input.conversationId });
     if (prepared.status === "prepared") {
       return { status: "prepared", batchId: batch.batchId, nodeId: prepared.nodeId };
+    }
+    if (prepared.status === "spend-limited") {
+      return { status: "idle", reason: "summary spend backoff open" };
     }
     if (prepared.status === "failed") {
       // A transient failure leaves the node claimable again after its backoff
