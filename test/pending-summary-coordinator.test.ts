@@ -221,7 +221,7 @@ describe("PendingCompactionCoordinator", () => {
         seq: 3,
         role: "assistant",
         content: "fresh tail message",
-        tokenCount: 4,
+        tokenCount: 120,
       },
     ]);
     await summaryStore.appendContextMessages(
@@ -245,7 +245,7 @@ describe("PendingCompactionCoordinator", () => {
         leafChunkTokens: 100,
         condensedMinFanout: 2,
         condensedMinSourceTokens: 1,
-        condensedChunkTokens: 100,
+        condensedChunkTokens: 400,
       },
       summarize: async (sourceText) => `leaf(${sourceText})`,
     });
@@ -597,7 +597,7 @@ describe("PendingCompactionCoordinator", () => {
         seq: 3,
         role: "user",
         content: "initial fresh tail",
-        tokenCount: 10,
+        tokenCount: 120,
       },
     ]);
     await summaryStore.appendContextMessages(
@@ -692,6 +692,111 @@ describe("PendingCompactionCoordinator", () => {
         }),
       ]),
     );
+  });
+
+  it("does not extend a ready batch for suffix growth below the leaf chunk minimum", async () => {
+    const { conversationStore, pendingSummaryStore, summaryStore } = createStores();
+    const conversation = await conversationStore.createConversation({
+      sessionId: "pending-coordinator-tiny-suffix-session",
+      sessionKey: "agent:main:pending-coordinator-tiny-suffix",
+    });
+    const initialMessages = await conversationStore.createMessagesBulk([
+      {
+        conversationId: conversation.conversationId,
+        seq: 1,
+        role: "user",
+        content: "first compactable message",
+        tokenCount: 10,
+      },
+      {
+        conversationId: conversation.conversationId,
+        seq: 2,
+        role: "assistant",
+        content: "second compactable message",
+        tokenCount: 10,
+      },
+      {
+        conversationId: conversation.conversationId,
+        seq: 3,
+        role: "user",
+        content: "heartbeat-sized fresh tail",
+        tokenCount: 5,
+      },
+    ]);
+    await summaryStore.appendContextMessages(
+      conversation.conversationId,
+      initialMessages.map((message) => message.messageId),
+    );
+
+    let summarizeCalls = 0;
+    const coordinator = new PendingCompactionCoordinator({
+      conversationStore,
+      pendingSummaryStore,
+      summaryStore,
+      model: "test-model",
+      leaseOwner: "test-worker",
+      config: {
+        freshTailCount: 1,
+        leafChunkTokens: 100,
+        condensedMinFanout: 99,
+        condensedMinSourceTokens: 1,
+        condensedChunkTokens: 100,
+      },
+      summarize: async (sourceText) => {
+        summarizeCalls += 1;
+        return `leaf(${sourceText})`;
+      },
+    });
+
+    await expect(
+      coordinator.runOnce({
+        conversationId: conversation.conversationId,
+        publishPolicy: "prepare-only",
+      }),
+    ).resolves.toMatchObject({ status: "planned", nodeCount: 1 });
+    await expect(
+      coordinator.runOnce({
+        conversationId: conversation.conversationId,
+        publishPolicy: "prepare-only",
+      }),
+    ).resolves.toMatchObject({ status: "prepared" });
+    const batch = await pendingSummaryStore.getActiveBatchForConversation(
+      conversation.conversationId,
+    );
+    expect(batch).not.toBeNull();
+    const summarizeCallsWhenReady = summarizeCalls;
+
+    // Two heartbeat-sized exchanges arrive; the previous tail becomes
+    // compactable but the suffix stays far below leafChunkTokens.
+    const [heartbeatTail] = await conversationStore.createMessagesBulk([
+      {
+        conversationId: conversation.conversationId,
+        seq: 4,
+        role: "assistant",
+        content: "heartbeat reply",
+        tokenCount: 5,
+      },
+    ]);
+    await summaryStore.appendContextMessage(conversation.conversationId, heartbeatTail!.messageId);
+
+    // The ready frontier is reported without extending the batch or spending
+    // any further summarizer calls.
+    await expect(
+      coordinator.runOnce({
+        conversationId: conversation.conversationId,
+        publishPolicy: "prepare-only",
+      }),
+    ).resolves.toMatchObject({ status: "ready" });
+    expect(summarizeCalls).toBe(summarizeCallsWhenReady);
+
+    const batchAfter = await pendingSummaryStore.getActiveBatchForConversation(
+      conversation.conversationId,
+    );
+    expect(batchAfter?.batchId).toBe(batch!.batchId);
+    expect(batchAfter?.compactableEndOrdinal).toBe(batch!.compactableEndOrdinal);
+    await expect(
+      pendingSummaryStore.getNodesByBatch(batch!.batchId),
+    ).resolves.toHaveLength(1);
   });
 
   it("stales condensed pending summaries when a canonical child changes during tail growth", async () => {
