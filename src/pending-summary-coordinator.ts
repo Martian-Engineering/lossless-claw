@@ -294,8 +294,26 @@ export class PendingCompactionCoordinator {
       nodeIdPrefix,
     });
     const canonicalNodes = this.buildCanonicalSummaryPlannerNodes(input.snapshot);
+    // Nodes already covered by a ready condensed ancestor must not re-enter
+    // condensation planning: re-grouping them at their own depth rebuilds a
+    // whole-prefix parent (one full re-summarization) for every extension.
+    // With covered children removed, new leaves condense among themselves, and
+    // deeper parents form over [existing condensed, new parent] pairs only when
+    // the fanout/token policy is genuinely met — layered DAG growth.
+    const coveringCondensedNodes = reusablePendingNodes.filter(
+      (node) => node.kind === "condensed",
+    );
+    const condensedCandidates = [...canonicalNodes, ...reusablePendingNodes, ...leafNodes].filter(
+      (node) =>
+        !coveringCondensedNodes.some(
+          (cover) =>
+            cover.depth > node.depth &&
+            cover.ordinalStart <= node.ordinalStart &&
+            cover.ordinalEnd >= node.ordinalEnd,
+        ),
+    );
     const condensedNodes = planPendingCondensedNodes({
-      nodes: [...canonicalNodes, ...reusablePendingNodes, ...leafNodes],
+      nodes: condensedCandidates,
       condensedMinFanout: this.config.condensedMinFanout,
       condensedMinSourceTokens: this.config.condensedMinSourceTokens,
       condensedChunkTokens: this.config.condensedChunkTokens,
