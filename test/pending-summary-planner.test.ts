@@ -89,6 +89,51 @@ describe("pending summary planner", () => {
     });
   });
 
+  it("clamps a misconfigured fanout of one instead of looping forever", () => {
+    const leafNodes = planPendingLeafNodes({
+      items: [message(0, 10, 50)],
+      freshTailCount: 0,
+      leafChunkTokens: 60,
+      nodeIdPrefix: "leaf",
+    });
+
+    // With fanout 1 unclamped, this single node would condense into itself at
+    // depth+1 on every layer pass and the planner would never terminate.
+    const condensedNodes = planPendingCondensedNodes({
+      nodes: leafNodes,
+      condensedMinFanout: 1,
+      condensedMinSourceTokens: 1,
+      condensedChunkTokens: 200,
+      nodeIdPrefix: "condensed",
+    });
+
+    expect(condensedNodes).toEqual([]);
+  });
+
+  it("stops layering at the planning cap under adversarial policy inputs", () => {
+    // Two adjacent nodes per layer would normally terminate quickly; the cap
+    // is a backstop, so just assert planning terminates and stays bounded for
+    // a wide input set with permissive policy values.
+    const manyLeaves = planPendingLeafNodes({
+      items: Array.from({ length: 64 }, (_, index) => message(index, 100 + index, 10)),
+      freshTailCount: 0,
+      leafChunkTokens: 10,
+      nodeIdPrefix: "leaf",
+    });
+
+    const condensedNodes = planPendingCondensedNodes({
+      nodes: manyLeaves,
+      condensedMinFanout: 2,
+      condensedMinSourceTokens: 0,
+      condensedChunkTokens: 10_000,
+      nodeIdPrefix: "condensed",
+    });
+
+    expect(condensedNodes.length).toBeGreaterThan(0);
+    expect(condensedNodes.length).toBeLessThan(200);
+    expect(Math.max(...condensedNodes.map((node) => node.depth))).toBeLessThanOrEqual(32);
+  });
+
   it("tracks canonical child summary ids separately from pending child nodes", () => {
     const condensedNodes = planPendingCondensedNodes({
       nodes: [
