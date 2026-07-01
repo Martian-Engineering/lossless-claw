@@ -25,6 +25,8 @@ function createNode(): PendingSummaryNodeRecord {
     leaseOwner: "worker-a",
     leaseExpiresAt: new Date("2026-06-30T12:05:00.000Z"),
     failureSummary: null,
+    retryCount: 0,
+    nextAttemptAfter: null,
     createdAt: new Date("2026-06-30T12:00:00.000Z"),
     updatedAt: new Date("2026-06-30T12:00:00.000Z"),
     readyAt: null,
