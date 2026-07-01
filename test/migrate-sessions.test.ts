@@ -1,12 +1,11 @@
 import { mkdtempSync, rmSync, writeFileSync, existsSync, mkdirSync, appendFileSync } from "node:fs";
-import { homedir, tmpdir } from "node:os";
+import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import { closeLcmConnection, createLcmDatabaseConnection } from "../src/db/connection.js";
 import { runLcmMigrations } from "../src/db/migration.js";
 import { ConversationStore } from "../src/store/conversation-store.js";
-import { SummaryStore } from "../src/store/summary-store.js";
-import { defaultStateDir, runSessionMigration } from "../src/migrate-sessions.js";
+import { runSessionMigration } from "../src/migrate-sessions.js";
 
 const roots: string[] = [];
 
@@ -67,14 +66,12 @@ function migratedDb(root: string): string {
 function openMigratedDb(dbPath: string): {
   db: ReturnType<typeof createLcmDatabaseConnection>;
   conversationStore: ConversationStore;
-  summaryStore: SummaryStore;
 } {
   const db = createLcmDatabaseConnection(dbPath);
   runLcmMigrations(db);
   return {
     db,
     conversationStore: new ConversationStore(db),
-    summaryStore: new SummaryStore(db),
   };
 }
 
@@ -108,9 +105,9 @@ describe("runSessionMigration", () => {
     expect(existsSync(dbPath)).toBe(false);
   });
 
-  it("imports a fresh session into conversations, messages, parts, context, FTS, and checkpoint state", async () => {
+  it("imports a fresh session into conversations, messages, parts, context, and FTS", async () => {
     const root = tempRoot();
-    const sessionFile = writeAgentSession(root, "session-a.jsonl", [
+    writeAgentSession(root, "session-a.jsonl", [
       sessionHeader("session-a"),
       messageEntry("m1", null, "user", "hello searchable history"),
       messageEntry("m2", "m1", "assistant", "saved reply"),
@@ -131,7 +128,7 @@ describe("runSessionMigration", () => {
       skippedMessages: 0,
     });
 
-    const { db, conversationStore, summaryStore } = openMigratedDb(dbPath);
+    const { db, conversationStore } = openMigratedDb(dbPath);
     try {
       const conversation = await conversationStore.getConversationForSession({ sessionId: "session-a" });
       expect(conversation).not.toBeNull();
@@ -158,14 +155,6 @@ describe("runSessionMigration", () => {
         mode: "full_text",
       });
       expect(search).toHaveLength(1);
-      const checkpoint = await summaryStore.getConversationBootstrapState(conversation!.conversationId);
-      expect(checkpoint).toMatchObject({
-        sessionFilePath: sessionFile,
-        lastSeenSize: expect.any(Number),
-        lastProcessedOffset: expect.any(Number),
-        sessionHeaderId: "session-a",
-        lastProcessedEntryId: "m2",
-      });
     } finally {
       closeLcmConnection(db);
     }
@@ -375,42 +364,5 @@ describe("runSessionMigration", () => {
         expect.objectContaining({ file: expect.stringContaining("good.jsonl"), status: "imported" }),
       ]),
     );
-  });
-});
-
-describe("defaultStateDir", () => {
-  const ORIG = process.env.OPENCLAW_STATE_DIR;
-
-  afterEach(() => {
-    if (ORIG === undefined) {
-      delete process.env.OPENCLAW_STATE_DIR;
-    } else {
-      process.env.OPENCLAW_STATE_DIR = ORIG;
-    }
-  });
-
-  it("falls back to ~/.openclaw when OPENCLAW_STATE_DIR is unset", () => {
-    delete process.env.OPENCLAW_STATE_DIR;
-    expect(defaultStateDir()).toBe(join(homedir(), ".openclaw"));
-  });
-
-  it("returns OPENCLAW_STATE_DIR when set", () => {
-    process.env.OPENCLAW_STATE_DIR = "/custom/state";
-    expect(defaultStateDir()).toBe("/custom/state");
-  });
-
-  it("trims whitespace from OPENCLAW_STATE_DIR", () => {
-    process.env.OPENCLAW_STATE_DIR = "  /custom/state  ";
-    expect(defaultStateDir()).toBe("/custom/state");
-  });
-
-  it("falls back when OPENCLAW_STATE_DIR is an empty string", () => {
-    process.env.OPENCLAW_STATE_DIR = "";
-    expect(defaultStateDir()).toBe(join(homedir(), ".openclaw"));
-  });
-
-  it("falls back when OPENCLAW_STATE_DIR is whitespace only", () => {
-    process.env.OPENCLAW_STATE_DIR = "   ";
-    expect(defaultStateDir()).toBe(join(homedir(), ".openclaw"));
   });
 });

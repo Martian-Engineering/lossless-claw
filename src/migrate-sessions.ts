@@ -6,7 +6,6 @@ import { DatabaseSync } from "node:sqlite";
 import { closeLcmConnection, createLcmDatabaseConnection } from "./db/connection.js";
 import { runLcmMigrations } from "./db/migration.js";
 import { buildMessageParts, filterPersistableMessages, toStoredMessage, type StoredMessage } from "./message-content.js";
-import { createBootstrapEntryHash } from "./message-signatures.js";
 import type { AgentMessage } from "./openclaw-bridge.js";
 import { ConversationStore, type MessageRecord } from "./store/conversation-store.js";
 import { SummaryStore } from "./store/summary-store.js";
@@ -402,20 +401,6 @@ async function importPreparedFile(
       createdMessages.map((message) => message.messageId),
     );
     await conversationStore.markConversationBootstrapped(conversation.conversationId);
-
-    const lastImportable = importable[importable.length - 1] ?? null;
-    await summaryStore.upsertConversationBootstrapState({
-      conversationId: conversation.conversationId,
-      sessionFilePath: prepared.file,
-      lastSeenSize: prepared.stat.size,
-      lastSeenMtimeMs: prepared.stat.mtimeMs,
-      lastProcessedOffset: prepared.stat.size,
-      lastProcessedEntryHash: createBootstrapEntryHash(lastImportable?.stored ?? null),
-      sessionHeaderId: prepared.sessionHeaderId,
-      lastProcessedEntryId: lastImportable?.transcriptEntryId ?? null,
-      forkBounded: false,
-      forkSourceMessageCount: importable.length,
-    });
 
     if (createdMessages.length === 0) {
       return {
