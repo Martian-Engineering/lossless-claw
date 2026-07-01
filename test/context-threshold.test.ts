@@ -185,23 +185,30 @@ describe("persistedContextThresholdOverride", () => {
       persistedContextThresholdOverride({
         contextThreshold: 0.1,
         contextThresholdSource: "override",
+        contextFreshTailCount: 16,
       }),
     ).toMatchObject({
       contextThreshold: 0.1,
       source: "override",
+      freshTailCount: 16,
       reason: "persisted deferred threshold debt",
     });
     expect(
       persistedContextThresholdOverride({
         contextThreshold: 0.5,
         contextThresholdSource: "global",
+        contextFreshTailCount: null,
       }),
     ).toMatchObject({ contextThreshold: 0.5, source: "global" });
   });
 
   it("returns undefined when no threshold was persisted", () => {
     expect(
-      persistedContextThresholdOverride({ contextThreshold: null, contextThresholdSource: null }),
+      persistedContextThresholdOverride({
+        contextThreshold: null,
+        contextThresholdSource: null,
+        contextFreshTailCount: null,
+      }),
     ).toBeUndefined();
   });
 });

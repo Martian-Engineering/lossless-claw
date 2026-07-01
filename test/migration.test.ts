@@ -206,10 +206,11 @@ describe("runLcmMigrations summary depth backfill", () => {
     expect(columns.some((column) => column.name === "next_attempt_after")).toBe(true);
     expect(columns.some((column) => column.name === "context_threshold")).toBe(true);
     expect(columns.some((column) => column.name === "context_threshold_source")).toBe(true);
+    expect(columns.some((column) => column.name === "context_fresh_tail_count")).toBe(true);
 
     const row = db
       .prepare(
-        `SELECT pending, reason, token_budget, current_token_count, retry_attempts, next_attempt_after, context_threshold, context_threshold_source
+        `SELECT pending, reason, token_budget, current_token_count, retry_attempts, next_attempt_after, context_threshold, context_threshold_source, context_fresh_tail_count
          FROM conversation_compaction_maintenance
          WHERE conversation_id = 1`,
       )
@@ -222,6 +223,7 @@ describe("runLcmMigrations summary depth backfill", () => {
       next_attempt_after: string | null;
       context_threshold: number | null;
       context_threshold_source: string | null;
+      context_fresh_tail_count: number | null;
     };
     expect(row).toEqual({
       pending: 1,
@@ -232,6 +234,7 @@ describe("runLcmMigrations summary depth backfill", () => {
       next_attempt_after: null,
       context_threshold: null,
       context_threshold_source: null,
+      context_fresh_tail_count: null,
     });
   });
 

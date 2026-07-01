@@ -137,6 +137,7 @@ function describeRuleMatch(
 export function persistedContextThresholdOverride(maintenance: {
   contextThreshold: number | null;
   contextThresholdSource: "global" | "override" | null;
+  contextFreshTailCount: number | null;
 }): ResolvedContextThreshold | undefined {
   if (
     typeof maintenance.contextThreshold !== "number" ||
@@ -149,6 +150,11 @@ export function persistedContextThresholdOverride(maintenance: {
     source: maintenance.contextThresholdSource === "override" ? "override" : "global",
     specificity: 0,
     reason: "persisted deferred threshold debt",
+    ...(typeof maintenance.contextFreshTailCount === "number" &&
+    Number.isFinite(maintenance.contextFreshTailCount) &&
+    maintenance.contextFreshTailCount > 0
+      ? { freshTailCount: Math.floor(maintenance.contextFreshTailCount) }
+      : {}),
   };
 }
 

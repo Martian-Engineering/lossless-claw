@@ -806,18 +806,28 @@ export class LcmContextEngine implements ContextEngine {
       const resolvedProjectedTokenCount = this.normalizeObservedTokenCount(
         maintenance.projectedTokenCount ?? undefined,
       );
+      const runtimeResolvedContextThreshold = this.contextThresholdResolver.resolve({
+        sessionKey: params.sessionKey,
+        runtime: readRuntimeModelContext(
+          asRecord(params.runtimeContext),
+          asRecord(params.legacyParams),
+        ),
+      });
       // Prefer the threshold persisted with the debt row: a background drain
       // may lack the runtime model metadata that originally selected it, and
-      // re-resolving could silently flip the compaction decision.
-      const resolvedContextThreshold =
-        persistedContextThresholdOverride(maintenance)
-        ?? this.contextThresholdResolver.resolve({
-          sessionKey: params.sessionKey,
-          runtime: readRuntimeModelContext(
-            asRecord(params.runtimeContext),
-            asRecord(params.legacyParams),
-          ),
-        });
+      // re-resolving could silently flip the compaction decision. New debt rows
+      // also persist selected fresh-tail count; the runtime fallback only helps
+      // older rows written before that column existed.
+      const persistedContextThreshold = persistedContextThresholdOverride(maintenance);
+      const resolvedContextThreshold = persistedContextThreshold
+        ? {
+            ...persistedContextThreshold,
+            ...(persistedContextThreshold.freshTailCount === undefined &&
+            runtimeResolvedContextThreshold.freshTailCount !== undefined
+              ? { freshTailCount: runtimeResolvedContextThreshold.freshTailCount }
+              : {}),
+          }
+        : runtimeResolvedContextThreshold;
 
       const isThresholdDebt = maintenance.reason?.trim() === "threshold";
       if (!isThresholdDebt) {
@@ -825,7 +835,12 @@ export class LcmContextEngine implements ContextEngine {
           params.conversationId,
           resolvedTokenBudget,
           resolvedCurrentTokenCount,
-          { contextThreshold: resolvedContextThreshold.contextThreshold },
+          {
+            contextThreshold: resolvedContextThreshold.contextThreshold,
+            ...(resolvedContextThreshold.freshTailCount !== undefined
+              ? { freshTailCount: resolvedContextThreshold.freshTailCount }
+              : {}),
+          },
         );
         this.logContextThresholdSelection({
           conversationId: params.conversationId,
@@ -1086,6 +1101,9 @@ export class LcmContextEngine implements ContextEngine {
       });
     const decision = await this.compaction.evaluate(conversationId, tokenBudget, observedTokens, {
       contextThreshold: resolvedContextThreshold.contextThreshold,
+      ...(resolvedContextThreshold.freshTailCount !== undefined
+        ? { freshTailCount: resolvedContextThreshold.freshTailCount }
+        : {}),
     });
     const targetTokens =
       params.compactionTarget === "threshold" ? decision.threshold : tokenBudget;
@@ -3176,7 +3194,12 @@ export class LcmContextEngine implements ContextEngine {
         conversation.conversationId,
         tokenBudget,
         observedCurrentTokenCount,
-        { contextThreshold: resolvedContextThreshold.contextThreshold },
+        {
+          contextThreshold: resolvedContextThreshold.contextThreshold,
+          ...(resolvedContextThreshold.freshTailCount !== undefined
+            ? { freshTailCount: resolvedContextThreshold.freshTailCount }
+            : {}),
+        },
       );
       this.logContextThresholdSelection({
         conversationId: conversation.conversationId,

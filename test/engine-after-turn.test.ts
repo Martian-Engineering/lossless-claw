@@ -1062,7 +1062,7 @@ describe("LcmContextEngine afterTurn", () => {
           conversationId: number,
           tokenBudget: number,
           observed?: number,
-          options?: { contextThreshold?: number },
+          options?: { contextThreshold?: number; freshTailCount?: number },
         ) => Promise<unknown>;
       };
     };
@@ -1109,7 +1109,7 @@ describe("LcmContextEngine afterTurn", () => {
           conversationId: number,
           tokenBudget: number,
           observed?: number,
-          options?: { contextThreshold?: number },
+          options?: { contextThreshold?: number; freshTailCount?: number },
         ) => Promise<unknown>;
       };
     };
@@ -1149,6 +1149,64 @@ describe("LcmContextEngine afterTurn", () => {
     });
   });
 
+  it("afterTurn forwards matching fresh-tail overrides into threshold evaluation", async () => {
+    const engine = createEngineWithConfig({
+      contextThresholdOverrides: [
+        {
+          match: { model: "vllm/qwen3.6-27b" },
+          contextThreshold: 0.5,
+          freshTailCount: 16,
+        },
+      ],
+    });
+    const sessionId = "after-turn-fresh-tail-threshold-override";
+    const privateEngine = engine as unknown as {
+      compaction: {
+        evaluate: (
+          conversationId: number,
+          tokenBudget: number,
+          observed?: number,
+          options?: { contextThreshold?: number; freshTailCount?: number },
+        ) => Promise<unknown>;
+      };
+    };
+    const evaluateSpy = vi.spyOn(privateEngine.compaction, "evaluate").mockResolvedValue({
+      shouldCompact: true,
+      reason: "threshold",
+      currentTokens: 40_000,
+      threshold: 32_000,
+    });
+
+    await engine.afterTurn({
+      sessionId,
+      sessionFile: createSessionFilePath("after-turn-fresh-tail-threshold-override"),
+      messages: [makeMessage({ role: "assistant", content: "fresh turn content" })],
+      prePromptMessageCount: 0,
+      tokenBudget: 128_000,
+      runtimeContext: {
+        currentTokenCount: 40_000,
+        provider: "vllm",
+        model: "qwen3.6-27b",
+      },
+    });
+
+    expect(evaluateSpy).toHaveBeenCalledWith(expect.any(Number), 128_000, 40_000, {
+      contextThreshold: 0.5,
+      freshTailCount: 16,
+    });
+    const conversation = await engine.getConversationStore().getConversationBySessionId(sessionId);
+    expect(conversation).not.toBeNull();
+    const maintenance = await engine
+      .getCompactionMaintenanceStore()
+      .getConversationCompactionMaintenance(conversation!.conversationId);
+    expect(maintenance).toMatchObject({
+      pending: true,
+      contextThreshold: 0.5,
+      contextThresholdSource: "override",
+      contextFreshTailCount: 16,
+    });
+  });
+
   it("afterTurn forwards legacy-only resolved threshold overrides into inline compaction", async () => {
     const engine = createEngineWithConfig({
       proactiveThresholdCompactionMode: "inline",
@@ -1166,7 +1224,7 @@ describe("LcmContextEngine afterTurn", () => {
           conversationId: number,
           tokenBudget: number,
           observed?: number,
-          options?: { contextThreshold?: number },
+          options?: { contextThreshold?: number; freshTailCount?: number },
         ) => Promise<unknown>;
       };
     };

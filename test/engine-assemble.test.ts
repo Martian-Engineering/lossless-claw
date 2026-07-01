@@ -1597,6 +1597,47 @@ describe("LcmContextEngine.assemble canonical path", () => {
     );
   });
 
+  it("assemble uses matching context-threshold fresh-tail overrides", async () => {
+    const engine = createEngineWithConfig({
+      freshTailCount: 64,
+      contextThresholdOverrides: [
+        {
+          match: { model: "vllm/qwen3.6-27b" },
+          contextThreshold: 0.5,
+          freshTailCount: 16,
+        },
+      ],
+    });
+    const privateEngine = engine as unknown as {
+      assembler: {
+        assemble: (input: unknown) => Promise<unknown>;
+      };
+    };
+    const sessionId = "session-assembly-fresh-tail-override";
+
+    await engine.ingest({
+      sessionId,
+      message: { role: "user", content: "persisted message" } as AgentMessage,
+    });
+    const assembleSpy = vi.spyOn(privateEngine.assembler, "assemble");
+
+    await engine.assemble({
+      sessionId,
+      messages: [makeMessage({ role: "user", content: "live message" })],
+      tokenBudget: 10_000,
+      runtimeContext: {
+        provider: "vllm",
+        model: "qwen3.6-27b",
+      },
+    });
+
+    expect(assembleSpy).toHaveBeenCalledWith(
+      expect.objectContaining({
+        freshTailCount: 16,
+      }),
+    );
+  });
+
   it("bounds previous assembled prefix snapshots with LRU eviction", async () => {
     const engine = createEngine();
     const cache = (

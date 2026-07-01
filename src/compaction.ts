@@ -700,7 +700,7 @@ export class CompactionEngine {
     conversationId: number,
     tokenBudget: number,
     observedTokenCount?: number,
-    options?: { contextThreshold?: number },
+    options?: { contextThreshold?: number; freshTailCount?: number },
   ): Promise<CompactionDecision> {
     const storedTokens = await this.summaryStore.getContextTokenCount(conversationId);
     const liveTokens =
@@ -710,7 +710,9 @@ export class CompactionEngine {
         ? Math.floor(observedTokenCount)
         : 0;
     const rawTokensOutsideTail =
-      liveTokens > 0 ? await this.countRawTokensOutsideFreshTail(conversationId) : undefined;
+      liveTokens > 0
+        ? await this.countRawTokensOutsideFreshTail(conversationId, options?.freshTailCount)
+        : undefined;
     const projectedTokens =
       liveTokens > 0 ? liveTokens + (rawTokensOutsideTail ?? 0) : undefined;
     const currentTokens = Math.max(storedTokens, projectedTokens ?? liveTokens);

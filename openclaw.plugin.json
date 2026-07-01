@@ -37,7 +37,7 @@
     },
     "contextThresholdOverrides": {
       "label": "Context Threshold Overrides",
-      "help": "Optional ordered rules that override contextThreshold by model, model context-window range, or session glob pattern"
+      "help": "Optional ordered rules that override contextThreshold and freshTailCount by model, model context-window range, or session glob pattern"
     },
     "sweepMaxDepth": {
       "label": "Sweep Max Depth",
@@ -376,6 +376,10 @@
               "type": "number",
               "minimum": 0,
               "maximum": 1
+            },
+            "freshTailCount": {
+              "type": "integer",
+              "minimum": 1
             }
           }
         }

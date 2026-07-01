@@ -85,6 +85,7 @@ describe("resolveLcmConfig", () => {
           name: "large-context",
           match: { modelContextWindowMin: 900000 },
           contextThreshold: 0.15,
+          freshTailCount: 16,
         },
         {
           match: { model: "openai/gpt-5.5", sessionPattern: "agent:*:telegram:**" },
@@ -147,6 +148,7 @@ describe("resolveLcmConfig", () => {
         name: "large-context",
         match: { modelContextWindowMin: 900000 },
         contextThreshold: 0.15,
+        freshTailCount: 16,
       },
       {
         match: { model: "openai/gpt-5.5", sessionPattern: "agent:*:telegram:**" },
@@ -747,6 +749,10 @@ describe("resolveLcmConfig", () => {
             minimum: 0,
             maximum: 1,
           },
+          freshTailCount: {
+            type: "integer",
+            minimum: 1,
+          },
         },
       },
     });
@@ -791,6 +797,13 @@ describe("resolveLcmConfig", () => {
         ],
       })
     ).toThrow(/sessionPattern/);
+    expect(() =>
+      resolveLcmConfig({}, {
+        contextThresholdOverrides: [
+          { match: { model: "openai/gpt-5.5" }, contextThreshold: 0.5, freshTailCount: 0 },
+        ],
+      })
+    ).toThrow(/freshTailCount/);
   });
 
   it("ships a manifest with dynamicLeafChunkTokens in schema", () => {

@@ -216,9 +216,10 @@ export class CompactionTelemetryRecorder {
       rawTokensOutsideTail: params.rawTokensOutsideTail ?? null,
       contextThreshold: params.contextThreshold?.contextThreshold ?? null,
       contextThresholdSource: params.contextThreshold?.source ?? null,
+      contextFreshTailCount: params.contextThreshold?.freshTailCount ?? null,
     });
     this.deps.log.debug(
-      `[lcm] deferred compaction debt recorded: conversation=${params.conversationId} reason=${params.reason} tokenBudget=${params.tokenBudget} currentTokenCount=${params.currentTokenCount ?? "null"} projectedTokenCount=${params.projectedTokenCount ?? "null"} rawTokensOutsideTail=${params.rawTokensOutsideTail ?? "null"} contextThreshold=${params.contextThreshold?.contextThreshold ?? "null"} contextThresholdSource=${params.contextThreshold?.source ?? "null"}`,
+      `[lcm] deferred compaction debt recorded: conversation=${params.conversationId} reason=${params.reason} tokenBudget=${params.tokenBudget} currentTokenCount=${params.currentTokenCount ?? "null"} projectedTokenCount=${params.projectedTokenCount ?? "null"} rawTokensOutsideTail=${params.rawTokensOutsideTail ?? "null"} contextThreshold=${params.contextThreshold?.contextThreshold ?? "null"} contextThresholdSource=${params.contextThreshold?.source ?? "null"} contextFreshTailCount=${params.contextThreshold?.freshTailCount ?? "null"}`,
     );
   }
 }

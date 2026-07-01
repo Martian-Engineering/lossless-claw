@@ -128,6 +128,7 @@ describe("LcmContextEngine maintain and assemble budget", () => {
         {
           match: { modelContextWindowMax: 250_000 },
           contextThreshold: 0.1,
+          freshTailCount: 16,
         },
       ],
     });
@@ -142,6 +143,7 @@ describe("LcmContextEngine maintain and assemble budget", () => {
       currentTokenCount: 80_000,
       contextThreshold: 0.1,
       contextThresholdSource: "override",
+      contextFreshTailCount: 16,
     });
     const privateEngine = engine as unknown as {
       executeCompactionCore: (params: unknown) => Promise<unknown>;
@@ -178,6 +180,7 @@ describe("LcmContextEngine maintain and assemble budget", () => {
         contextThresholdOverride: expect.objectContaining({
           contextThreshold: 0.1,
           source: "override",
+          freshTailCount: 16,
         }),
       }),
     );
