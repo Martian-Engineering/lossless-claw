@@ -966,10 +966,8 @@ describe("createLcmSummarizeFromLegacyParams", () => {
 
     const summary = await summarize!("H".repeat(8_000), false);
 
-    // Reasoning-only blocks without an accompanying text-type block are
-    // treated as private diagnostics, not summary content. The fallback
-    // only activates when the response contains both reasoning and text
-    // blocks (model intended text output), per #944.
+    // Reasoning-only blocks are treated as private diagnostics, not summary
+    // content, even when a model returns a provider-specific summary wrapper.
     expect(summary).toContain("[LCM fallback summary; truncated for context management]");
 
     const diagnostics = getDepsLogText(deps);
@@ -978,11 +976,43 @@ describe("createLcmSummarizeFromLegacyParams", () => {
     expect(diagnostics).not.toContain("PRIVATE_TYPED_REASONING_TRACE");
   });
 
-  it("recovers summary from reasoning blocks when a text block is also present (#944)", async () => {
-    // Ollama extended-thinking models place the entire summary inside a
-    // type:"reasoning" block while leaving type:"text" empty.  When both
-    // blocks are present (the model intended text output), fall back to
-    // reasoning blocks so the summary is not discarded.
+  it("omits summary thinking for Ollama so summaries stay in text blocks (#944)", async () => {
+    const deps = makeDeps({
+      resolveModel: vi.fn(() => ({
+        provider: "ollama",
+        model: "qwen3.5:9b",
+      })),
+      complete: vi.fn(async () => ({
+        content: [
+          {
+            type: "text",
+            text: "The input describes a text processing pipeline that...",
+          },
+        ],
+      })),
+    });
+
+    const summarize = await createSummarizeFn({
+      deps,
+      legacyParams: {
+        provider: "ollama",
+        model: "qwen3.5:9b",
+      },
+    });
+
+    const summary = await summarize!("H".repeat(8_000), false);
+
+    expect(summary).toContain("text processing pipeline");
+    expect(vi.mocked(deps.complete)).toHaveBeenCalledTimes(1);
+
+    const requestOptions = vi.mocked(deps.complete).mock.calls[0]?.[0] as
+      | { reasoning?: string; reasoningIfSupported?: string }
+      | undefined;
+    expect(requestOptions?.reasoning).toBeUndefined();
+    expect(requestOptions?.reasoningIfSupported).toBeUndefined();
+  });
+
+  it("does not promote Ollama private reasoning text when a text block is also present", async () => {
     const deps = makeDeps({
       resolveModel: vi.fn(() => ({
         provider: "ollama",
@@ -992,7 +1022,7 @@ describe("createLcmSummarizeFromLegacyParams", () => {
         content: [
           {
             type: "reasoning",
-            text: "The input describes a text processing pipeline that...",
+            text: "PRIVATE_MIXED_REASONING_TRACE",
           },
           {
             type: "text",
@@ -1012,9 +1042,17 @@ describe("createLcmSummarizeFromLegacyParams", () => {
 
     const summary = await summarize!("H".repeat(8_000), false);
 
-    expect(summary).toContain("text processing pipeline");
-    // Recovery succeeds on the first attempt — no retry or fallback needed.
-    expect(vi.mocked(deps.complete)).toHaveBeenCalledTimes(1);
+    expect(summary).toContain("[LCM fallback summary; truncated for context management]");
+    expect(summary).not.toContain("PRIVATE_MIXED_REASONING_TRACE");
+
+    const diagnostics = getDepsLogText(deps);
+    expect(diagnostics).not.toContain("PRIVATE_MIXED_REASONING_TRACE");
+
+    for (const call of vi.mocked(deps.complete).mock.calls) {
+      const requestOptions = call[0] as { reasoning?: string; reasoningIfSupported?: string };
+      expect(requestOptions.reasoning).toBeUndefined();
+      expect(requestOptions.reasoningIfSupported).toBeUndefined();
+    }
   });
 
   it("does not treat thinking-only completions as summary content", async () => {

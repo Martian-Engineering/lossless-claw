@@ -337,14 +337,10 @@ function shouldAppendDirectTextField(key: string): boolean {
 }
 
 /** Collect text payloads from common provider response shapes. */
-function collectTextLikeFields(
-  value: unknown,
-  out: string[],
-  skipReasoning = true,
-): void {
+function collectTextLikeFields(value: unknown, out: string[]): void {
   if (Array.isArray(value)) {
     for (const entry of value) {
-      collectTextLikeFields(entry, out, skipReasoning);
+      collectTextLikeFields(entry, out);
     }
     return;
   }
@@ -352,10 +348,7 @@ function collectTextLikeFields(
     return;
   }
 
-  if (
-    skipReasoning &&
-    (isReasoningLikeType(value.type) || isReasoningLikeType(value.rawType))
-  ) {
+  if (isReasoningLikeType(value.type) || isReasoningLikeType(value.rawType)) {
     return;
   }
 
@@ -374,7 +367,7 @@ function collectTextLikeFields(
         }
         continue;
       }
-      collectTextLikeFields(nested, out, skipReasoning);
+      collectTextLikeFields(nested, out);
     }
   }
 }
@@ -410,20 +403,6 @@ function normalizeCompletionSummary(content: unknown): { summary: string; blockT
 
   collectTextLikeFields(content, chunks);
   collectBlockTypes(content, blockTypeSet);
-
-  // Fallback: when no text was collected from non-reasoning blocks but the
-  // content array contains text-type blocks alongside reasoning blocks, the
-  // model intended to produce text output and placed the entire summary
-  // inside the reasoning block (e.g. Ollama extended-thinking models, #944).
-  // Only re-collect from reasoning blocks when a text-type block is present
-  // so truly private reasoning/thinking payloads are never promoted to
-  // summary text.  Empty text blocks produce empty-string chunks, so check
-  // whether every collected chunk is blank rather than relying on length.
-  if (chunks.every((c) => !c.trim()) && blockTypeSet.has("text")) {
-    const reasoningChunks: string[] = [];
-    collectTextLikeFields(content, reasoningChunks, false);
-    chunks.push(...reasoningChunks);
-  }
 
   const blockTypes = [...blockTypeSet].sort((a, b) => a.localeCompare(b));
   return {
@@ -1610,6 +1589,9 @@ export async function createLcmSummarizeFromLegacyParams(params: {
       const model = candidate.model;
       const runtimeModelOverride = buildRuntimeModelOverride(candidate);
       const nextCandidate = index < resolvedCandidates.length - 1 ? resolvedCandidates[index + 1]! : undefined;
+      const shouldRequestSummaryThinking =
+        params.deps.config.enableSummaryThinking !== false &&
+        provider.trim().toLowerCase() !== "ollama";
       const runSummarizerCall = async (
         label: string,
         reasoning?: string,
@@ -1630,7 +1612,7 @@ export async function createLcmSummarizeFromLegacyParams(params: {
             },
           ],
           maxTokens: maxTokensOverride ?? initialMaxTokens,
-          ...(params.deps.config.enableSummaryThinking !== false
+          ...(shouldRequestSummaryThinking
             ? ({ reasoningIfSupported: "low" } as const)
             : {}),
           ...(reasoning ? { reasoning } : {}),
@@ -1857,8 +1839,7 @@ export async function createLcmSummarizeFromLegacyParams(params: {
           isCondensed ? condensedTargetTokens : leafTargetTokens,
         );
         try {
-          const retryReasoning =
-            params.deps.config.enableSummaryThinking !== false ? "low" : undefined;
+          const retryReasoning = shouldRequestSummaryThinking ? "low" : undefined;
           const retryResult = await attemptSummarizerCall("retry", retryReasoning, retryMaxTokens);
           const retryNormalized = normalizeCompletionSummary(retryResult.content);
           const retryEnvelopeNormalized = retryNormalized.summary
