@@ -138,3 +138,6 @@
 {"type":"close","timestamp":"2026-07-01T23:53:51.314085Z","issue_id":"lc-b2d.2","payload":{}}
 {"type":"status_update","timestamp":"2026-07-01T23:54:00.016991Z","issue_id":"lc-b2d.3","payload":{"status":"in_progress"}}
 {"type":"close","timestamp":"2026-07-01T23:54:53.737433Z","issue_id":"lc-b2d.3","payload":{}}
+{"type":"status_update","timestamp":"2026-07-01T23:54:53.960959Z","issue_id":"lc-b2d.4","payload":{"status":"in_progress"}}
+{"type":"close","timestamp":"2026-07-01T23:56:15.148818Z","issue_id":"lc-b2d.4","payload":{}}
+{"type":"close","timestamp":"2026-07-01T23:56:15.20112Z","issue_id":"lc-b2d","payload":{}}
