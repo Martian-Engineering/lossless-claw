@@ -31,6 +31,7 @@ import { LargeFileInterceptor } from "./large-file-interceptor.js";
 import {
   PendingCompactionCoordinator,
   type PendingCompactionCoordinatorResult,
+  type PendingCompactionPublishPolicy,
 } from "./pending-summary-coordinator.js";
 import { readRuntimeModelContext } from "./runtime-model.js";
 import type { LcmConfig } from "./db/config.js";
@@ -703,6 +704,7 @@ export class LcmContextEngine implements ContextEngine {
         currentTokenCount: params.currentTokenCount,
         legacyParams,
         sessionQueueHeld: false,
+        pendingPublishPolicy: "prepare-only",
       });
       if (result) {
         this.deps.log.debug(
@@ -718,7 +720,14 @@ export class LcmContextEngine implements ContextEngine {
         nextMaintenance?.nextAttemptAfter !== null &&
         nextMaintenance?.nextAttemptAfter !== undefined &&
         nextMaintenance.nextAttemptAfter.getTime() > Date.now();
-      if (nextMaintenance?.pending && !nextMaintenance.running && !retryBackoffActive) {
+      const pendingSummariesReadyForPublish =
+        result?.reason === "pending summaries ready for publish";
+      if (
+        nextMaintenance?.pending &&
+        !nextMaintenance.running &&
+        !retryBackoffActive &&
+        !pendingSummariesReadyForPublish
+      ) {
         this.scheduleDeferredCompactionDebtDrain(params);
       }
     } finally {
@@ -739,6 +748,7 @@ export class LcmContextEngine implements ContextEngine {
     runtimeContext?: ContextEngineMaintenanceRuntimeContext;
     legacyParams?: Record<string, unknown>;
     sessionQueueHeld?: boolean;
+    pendingPublishPolicy?: PendingCompactionPublishPolicy;
   }): Promise<(ContextEngineMaintenanceResult & { exhausted?: boolean }) | null> {
     const maintenance = await this.compactionMaintenanceStore.getConversationCompactionMaintenance(
       params.conversationId,
@@ -853,6 +863,7 @@ export class LcmContextEngine implements ContextEngine {
         runtimeContext: params.runtimeContext,
         legacyParams: params.legacyParams,
         sessionQueueHeld: params.sessionQueueHeld === true,
+        publishPolicy: params.pendingPublishPolicy ?? "publish-if-ready",
       });
       const blockedByAuthCircuitBreaker = result.reason === "circuit breaker open";
       // #639 Mode 2: terminal compaction exhaustion (no eligible candidates while
@@ -925,6 +936,7 @@ export class LcmContextEngine implements ContextEngine {
     force?: boolean;
     sessionQueueHeld?: boolean;
     maxPendingSteps?: number;
+    publishPolicy?: PendingCompactionPublishPolicy;
   }): Promise<CompactResult & { pending?: boolean }> {
     const breakerScope = this.resolveSessionQueueKey(params.sessionId, params.sessionKey);
     const resolvedSummarizer = await this.resolveSummarize({
@@ -987,11 +999,13 @@ export class LcmContextEngine implements ContextEngine {
       lastResult = await coordinator.runOnce({
         conversationId: params.conversationId,
         sessionKey: params.sessionKey,
+        publishPolicy: params.publishPolicy,
       });
       if (lastResult.status === "published") {
         return {
           ok: true,
           compacted: true,
+          ...(lastResult.remainingCompactableWork === true ? { pending: true } : {}),
           reason: "pending summaries published",
           summaryId: lastResult.frontierSummaryIds[0],
           result: lastResult,
@@ -1006,6 +1020,15 @@ export class LcmContextEngine implements ContextEngine {
           compacted: false,
           reason: lastResult.failureSummary,
           error: lastResult.failureSummary,
+          result: lastResult,
+        };
+      }
+      if (lastResult.status === "ready") {
+        return {
+          ok: true,
+          compacted: false,
+          pending: true,
+          reason: lastResult.reason,
           result: lastResult,
         };
       }
@@ -1111,6 +1134,7 @@ export class LcmContextEngine implements ContextEngine {
           currentTokenCount: normalizedCurrentTokenCount,
           legacyParams: deferredLegacyParams,
           sessionQueueHeld: true,
+          pendingPublishPolicy: "publish-if-ready",
         });
         drainResult = { exhausted: result?.exhausted === true };
       },
@@ -2419,6 +2443,7 @@ export class LcmContextEngine implements ContextEngine {
               runtimeContext: params.runtimeContext,
               legacyParams: asRecord(params.runtimeContext),
               sessionQueueHeld: true,
+              pendingPublishPolicy: "prepare-only",
             });
           }
         } else if (maintenance?.pending || maintenance?.running) {
@@ -3720,7 +3745,7 @@ export class LcmContextEngine implements ContextEngine {
           Math.floor(this.config.maxSweepIterations),
           (await this.summaryStore.getContextItems(conversation.conversationId)).length * 2 + 8,
         );
-        return this.executePendingCompactionCore({
+        const result = await this.executePendingCompactionCore({
           conversationId: conversation.conversationId,
           sessionId: params.sessionId,
           sessionKey: params.sessionKey,
@@ -3735,6 +3760,15 @@ export class LcmContextEngine implements ContextEngine {
           sessionQueueHeld: true,
           maxPendingSteps: manualPendingStepCap,
         });
+        if (result.compacted && result.pending !== true) {
+          await this.compactionMaintenanceStore.markProactiveCompactionFinished({
+            conversationId: conversation.conversationId,
+            finishedAt: new Date(),
+            failureSummary: null,
+            keepPending: false,
+          });
+        }
+        return result;
       },
     );
   }
