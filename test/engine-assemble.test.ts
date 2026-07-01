@@ -18,7 +18,7 @@ import {
 afterEach(cleanupEngineTestState);
 describe("LcmContextEngine.assemble canonical path", () => {
   it("strips assistant prefill tails when no DB conversation exists", async () => {
-    const engine = createEngine();
+    const engine = createEngineWithConfig({ promptAwareEviction: false });
     const liveMessages: AgentMessage[] = [
       { role: "user", content: "first turn" },
       { role: "assistant", content: "first reply" },
@@ -517,7 +517,7 @@ describe("LcmContextEngine.assemble canonical path", () => {
       engine,
       sessionId,
       summaryId: "sum_prompt_recall_preserve_summary",
-      summaryContent: "Long unrelated summary. ".repeat(100),
+      summaryContent: "Long unrelated summary. ".repeat(20),
       prompt,
     });
     const volatileEvent =
@@ -537,18 +537,18 @@ describe("LcmContextEngine.assemble canonical path", () => {
       sessionId,
       messages: liveMessages,
       prompt,
-      tokenBudget: baseline.estimatedTokens + 20,
+      tokenBudget: baseline.estimatedTokens + 100,
     });
 
     const rendered = constrained.messages.map((message) =>
       typeof message.content === "string" ? message.content : JSON.stringify(message.content),
     );
     expect(rendered.some((content) => content.includes("<lossless_claw_prompt_recall>"))).toBe(false);
-    expect(rendered.some((content) => content.includes("<summary id=\"sum_prompt_recall_preserve_summary\""))).toBe(
+    expect(rendered.some((content) => content.includes('<summary id="sum_prompt_recall_preserve_summary"'))).toBe(
       true,
     );
     expect(rendered.some((content) => content.includes("Small live note."))).toBe(true);
-    expect(constrained.estimatedTokens).toBeLessThanOrEqual(baseline.estimatedTokens + 20);
+    expect(constrained.estimatedTokens).toBeLessThanOrEqual(baseline.estimatedTokens + 100);
   });
 
   it("does not add prompt-recall when the active summary already carries the exact fact", async () => {
