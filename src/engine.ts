@@ -1018,6 +1018,7 @@ export class LcmContextEngine implements ContextEngine {
         sessionKey: params.sessionKey,
         tokenBudget: resolvedTokenBudget,
         currentTokenCount: resolvedCurrentTokenCount,
+        compactionTarget: "threshold",
         contextThresholdOverride: resolvedContextThreshold,
         runtimeContext: params.runtimeContext,
         legacyParams: params.legacyParams,
@@ -1149,6 +1150,7 @@ export class LcmContextEngine implements ContextEngine {
     });
 
     let lastResult: PendingCompactionCoordinatorResult | null = null;
+    let preparedSteps = 0;
     const configuredMaxSteps =
       typeof params.maxPendingSteps === "number" && Number.isFinite(params.maxPendingSteps)
         ? params.maxPendingSteps
@@ -1174,10 +1176,18 @@ export class LcmContextEngine implements ContextEngine {
         if (lastResult.authFailure && resolvedSummarizer.breakerKey) {
           this.compactionGuards.recordCompactionAuthFailure(resolvedSummarizer.breakerKey);
         }
+        // Auth failures surface the legacy-normalized reason: hosts and the
+        // maintenance retry classifier match on "provider auth failure", not
+        // on raw provider error text. The raw detail stays in `error`.
+        const failureReason = lastResult.authFailure
+          ? preparedSteps > 0
+            ? "provider auth failure after partial compaction"
+            : "provider auth failure"
+          : lastResult.failureSummary;
         return {
           ok: false,
           compacted: false,
-          reason: lastResult.failureSummary,
+          reason: failureReason,
           error: lastResult.failureSummary,
           result: lastResult,
         };
@@ -1214,7 +1224,7 @@ export class LcmContextEngine implements ContextEngine {
             runtimeContext: params.runtimeContext,
             legacyParams: params.legacyParams,
             customInstructions: params.customInstructions,
-            compactionTarget: params.compactionTarget ?? "threshold",
+            compactionTarget: params.compactionTarget,
             force: params.force === true,
           });
           if (params.sessionQueueHeld === true) {
@@ -1236,8 +1246,11 @@ export class LcmContextEngine implements ContextEngine {
           result: lastResult,
         };
       }
-      if (lastResult.status === "prepared" && resolvedSummarizer.breakerKey) {
-        this.compactionGuards.recordCompactionSuccess(resolvedSummarizer.breakerKey);
+      if (lastResult.status === "prepared") {
+        preparedSteps += 1;
+        if (resolvedSummarizer.breakerKey) {
+          this.compactionGuards.recordCompactionSuccess(resolvedSummarizer.breakerKey);
+        }
       }
     }
 
