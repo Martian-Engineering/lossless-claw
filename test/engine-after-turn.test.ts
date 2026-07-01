@@ -133,6 +133,51 @@ describe("LcmContextEngine afterTurn", () => {
     expect(deferredDebtLog).not.toContain("rawTokensOutsideTail=null");
   });
 
+  it("afterTurn schedules prepare-only pending summaries below threshold", async () => {
+    const engine = createEngineWithDeps({
+      freshTailCount: 1,
+      leafChunkTokens: 120,
+    });
+    const sessionId = "after-turn-below-threshold-pending-summary-prep";
+    const privateEngine = engine as unknown as {
+      schedulePendingSummaryPreparationDrain: (params: unknown) => void;
+      scheduleDeferredCompactionDebtDrain: (params: unknown) => void;
+    };
+    await seedBacklogContext(engine, sessionId, [100, 100, 100]);
+    const prepareScheduleSpy = vi
+      .spyOn(privateEngine, "schedulePendingSummaryPreparationDrain")
+      .mockImplementation(() => undefined);
+    const thresholdScheduleSpy = vi
+      .spyOn(privateEngine, "scheduleDeferredCompactionDebtDrain")
+      .mockImplementation(() => undefined);
+
+    await engine.afterTurn({
+      sessionId,
+      sessionFile: createSessionFilePath("after-turn-below-threshold-pending-summary-prep"),
+      messages: [makeMessage({ role: "assistant", content: "fresh below-threshold turn" })],
+      prePromptMessageCount: 0,
+      tokenBudget: 10_000,
+      runtimeContext: { currentTokenCount: 300 },
+    });
+
+    const conversation = await engine.getConversationStore().getConversationBySessionId(sessionId);
+    expect(conversation).not.toBeNull();
+    const maintenance = await engine
+      .getCompactionMaintenanceStore()
+      .getConversationCompactionMaintenance(conversation!.conversationId);
+    expect(maintenance?.pending ?? false).toBe(false);
+    expect(thresholdScheduleSpy).not.toHaveBeenCalled();
+    expect(prepareScheduleSpy).toHaveBeenCalledWith(
+      expect.objectContaining({
+        conversationId: conversation!.conversationId,
+        sessionId,
+        tokenBudget: 10_000,
+        currentTokenCount: 300,
+        reason: "leaf-prep",
+      }),
+    );
+  });
+
   it("background deferred summarization does not block later user-turn ingestion", async () => {
     let resolveComplete:
       | ((value: { content: Array<{ type: "text"; text: string }> }) => void)

@@ -180,6 +180,50 @@ export async function runPendingSummaryCompactionProof(): Promise<PendingSummary
   }
   await record("after-ready-no-publish");
 
+  const [extensionMessage] = await stores.conversationStore.createMessagesBulk([
+    {
+      conversationId: conversation.conversationId,
+      seq: 5,
+      role: "user",
+      content: "echo raw message extends compactable prefix",
+      tokenCount: 4,
+    },
+  ]);
+  await stores.summaryStore.appendContextMessage(
+    conversation.conversationId,
+    extensionMessage!.messageId,
+  );
+
+  const extended = await coordinator.runOnce({
+    conversationId: conversation.conversationId,
+    publishPolicy: "prepare-only",
+  });
+  if (extended.status !== "planned") {
+    failures.push(`expected extension planned step, got ${extended.status}`);
+  }
+  await record("after-tail-growth-extension-plan");
+
+  await coordinator.runOnce({
+    conversationId: conversation.conversationId,
+    publishPolicy: "prepare-only",
+  });
+  await record("after-extension-leaf-preparation");
+
+  await coordinator.runOnce({
+    conversationId: conversation.conversationId,
+    publishPolicy: "prepare-only",
+  });
+  await record("after-extension-condensed-preparation");
+
+  const extendedReady = await coordinator.runOnce({
+    conversationId: conversation.conversationId,
+    publishPolicy: "prepare-only",
+  });
+  if (extendedReady.status !== "ready") {
+    failures.push(`expected extended ready step, got ${extendedReady.status}`);
+  }
+  await record("after-extension-ready-no-publish");
+
   const published = await coordinator.runOnce({ conversationId: conversation.conversationId });
   if (published.status !== "published") {
     failures.push(`expected published step, got ${published.status}`);
@@ -218,6 +262,10 @@ function validateProof(input: {
     "after-leaf-preparation",
     "after-condensed-preparation",
     "after-ready-no-publish",
+    "after-tail-growth-extension-plan",
+    "after-extension-leaf-preparation",
+    "after-extension-condensed-preparation",
+    "after-extension-ready-no-publish",
   ]) {
     const checkpoint = byLabel.get(label);
     if (!checkpoint) {
@@ -276,9 +324,90 @@ function validateProof(input: {
     input.failures.push("prepare-only ready step should not swap canonical context");
   }
 
+  const afterExtensionPlan = byLabel.get("after-tail-growth-extension-plan");
+  if (afterExtensionPlan?.pendingNodes.length !== 5) {
+    input.failures.push("after-tail-growth-extension-plan should add one leaf and one condensed parent");
+  }
+  if (afterExtensionPlan?.pendingNodes.filter((node) => node.status === "ready").length !== 3) {
+    input.failures.push("after-tail-growth-extension-plan should preserve the original ready frontier");
+  }
+  if (
+    afterExtensionPlan?.pendingNodes.filter(
+      (node) => node.status === "planned" && node.ordinalStart === 3 && node.ordinalEnd === 3,
+    ).length !== 1
+  ) {
+    input.failures.push("after-tail-growth-extension-plan should plan the newly compactable suffix leaf");
+  }
+  if (
+    !afterExtensionPlan?.pendingNodes.some(
+      (node) =>
+        node.kind === "condensed" &&
+        node.status === "planned" &&
+        node.ordinalStart === 0 &&
+        node.ordinalEnd === 3,
+    )
+  ) {
+    input.failures.push("after-tail-growth-extension-plan should plan a larger condensed frontier");
+  }
+
+  const afterExtensionLeaves = byLabel.get("after-extension-leaf-preparation");
+  if (
+    !afterExtensionLeaves?.pendingNodes.some(
+      (node) =>
+        node.kind === "leaf" &&
+        node.status === "ready" &&
+        node.ordinalStart === 3 &&
+        node.ordinalEnd === 3,
+    )
+  ) {
+    input.failures.push("after-extension-leaf-preparation should ready the suffix leaf");
+  }
+  if (
+    !afterExtensionLeaves?.pendingNodes.some(
+      (node) => node.kind === "condensed" && node.status === "planned" && node.ordinalEnd === 3,
+    )
+  ) {
+    input.failures.push("after-extension-leaf-preparation should leave the larger condensed parent planned");
+  }
+
+  const afterExtensionCondensed = byLabel.get("after-extension-condensed-preparation");
+  const extensionCondensedCalls =
+    afterExtensionCondensed?.summarizeCalls.filter((call) => call.isCondensed) ?? [];
+  const rawLeafCalls =
+    afterExtensionCondensed?.summarizeCalls.filter((call) => !call.isCondensed) ?? [];
+  if (
+    !afterExtensionCondensed?.pendingNodes.some(
+      (node) =>
+        node.kind === "condensed" &&
+        node.status === "ready" &&
+        node.ordinalStart === 0 &&
+        node.ordinalEnd === 3,
+    )
+  ) {
+    input.failures.push("after-extension-condensed-preparation should ready the larger condensed parent");
+  }
+  if (rawLeafCalls.length !== 3) {
+    input.failures.push("extension should prepare only the newly compactable suffix leaf");
+  }
+  if (
+    !extensionCondensedCalls.some((call) =>
+      call.sourceText.includes("delta raw fresh tail"),
+    )
+  ) {
+    input.failures.push("larger condensed preparation should include the newly compactable suffix");
+  }
+
+  const afterExtensionReady = byLabel.get("after-extension-ready-no-publish");
+  if (afterExtensionReady?.canonicalSummaries !== 0) {
+    input.failures.push("extended prepare-only ready step should not publish canonical summaries");
+  }
+  if (!afterExtensionReady?.contextItems.every((item) => item.itemType === "message")) {
+    input.failures.push("extended prepare-only ready step should not swap canonical context");
+  }
+
   const afterPublish = byLabel.get("after-publish");
-  if (afterPublish?.canonicalSummaries !== 3) {
-    input.failures.push("after-publish should promote two leaves plus one condensed summary");
+  if (afterPublish?.canonicalSummaries !== 4) {
+    input.failures.push("after-publish should promote three leaves plus the larger condensed summary");
   }
   if (
     afterPublish?.contextItems.length !== 2 ||
@@ -287,8 +416,16 @@ function validateProof(input: {
   ) {
     input.failures.push("after-publish should swap covered raw prefix and keep fresh tail raw");
   }
-  if (!afterPublish?.pendingNodes.every((node) => node.status === "promoted")) {
-    input.failures.push("after-publish should mark all pending nodes promoted");
+  const promotedCoverage = afterPublish?.pendingNodes.filter(
+    (node) => node.status === "promoted",
+  );
+  if (
+    promotedCoverage?.length !== 4 ||
+    !promotedCoverage.some(
+      (node) => node.kind === "condensed" && node.ordinalStart === 0 && node.ordinalEnd === 3,
+    )
+  ) {
+    input.failures.push("after-publish should promote the larger frontier and its leaf ancestors");
   }
   if (
     !input.publishedSummary ||
@@ -297,8 +434,8 @@ function validateProof(input: {
   ) {
     input.failures.push("published frontier summary should be the condensed parent");
   }
-  if (input.publishedParents.length !== 2) {
-    input.failures.push("published condensed summary should link to two leaf parents");
+  if (input.publishedParents.length !== 3) {
+    input.failures.push("published condensed summary should link to three leaf parents");
   }
 }
 
