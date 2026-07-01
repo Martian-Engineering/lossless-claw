@@ -982,6 +982,133 @@ describe("PendingCompactionCoordinator", () => {
     ).resolves.toHaveLength(1);
   });
 
+  it("stays a zero-spend no-op across repeated heartbeat-sized turns", async () => {
+    const { conversationStore, pendingSummaryStore, summaryStore } = createStores();
+    const conversation = await conversationStore.createConversation({
+      sessionId: "pending-coordinator-heartbeat-loop-session",
+      sessionKey: "agent:main:pending-coordinator-heartbeat-loop",
+    });
+    const initialMessages = await conversationStore.createMessagesBulk([
+      {
+        conversationId: conversation.conversationId,
+        seq: 1,
+        role: "user",
+        content: "backlog message one",
+        tokenCount: 60,
+      },
+      {
+        conversationId: conversation.conversationId,
+        seq: 2,
+        role: "assistant",
+        content: "backlog message two",
+        tokenCount: 60,
+      },
+      {
+        conversationId: conversation.conversationId,
+        seq: 3,
+        role: "user",
+        content: "fresh tail",
+        tokenCount: 5,
+      },
+    ]);
+    await summaryStore.appendContextMessages(
+      conversation.conversationId,
+      initialMessages.map((message) => message.messageId),
+    );
+
+    let summarizeCalls = 0;
+    const coordinator = new PendingCompactionCoordinator({
+      conversationStore,
+      pendingSummaryStore,
+      summaryStore,
+      model: "test-model",
+      leaseOwner: "test-worker",
+      config: {
+        freshTailCount: 1,
+        leafChunkTokens: 100,
+        condensedMinFanout: 2,
+        condensedMinSourceTokens: 1,
+        condensedChunkTokens: 400,
+      },
+      summarize: async (sourceText) => {
+        summarizeCalls += 1;
+        return `leaf(${sourceText.slice(0, 24)})`;
+      },
+    });
+    const runPrepareOnly = () =>
+      coordinator.runOnce({
+        conversationId: conversation.conversationId,
+        publishPolicy: "prepare-only",
+      });
+
+    // Reach the ready state, then record the steady-state baseline.
+    let result = await runPrepareOnly();
+    expect(result).toMatchObject({ status: "planned" });
+    do {
+      result = await runPrepareOnly();
+    } while (result.status === "prepared");
+    expect(result.status).toBe("ready");
+    const batch = await pendingSummaryStore.getActiveBatchForConversation(
+      conversation.conversationId,
+    );
+    const baselineCalls = summarizeCalls;
+    const baselineNodes = (await pendingSummaryStore.getNodesByBatch(batch!.batchId)).length;
+
+    // The conversation-4854 pathology: many consecutive heartbeat-sized turns.
+    // Every cycle must report the existing frontier with zero planning and
+    // zero summarizer spend — cumulatively, not just for one gated cycle.
+    for (let cycle = 0; cycle < 6; cycle += 1) {
+      const [heartbeat] = await conversationStore.createMessagesBulk([
+        {
+          conversationId: conversation.conversationId,
+          seq: 4 + cycle,
+          role: cycle % 2 === 0 ? ("user" as const) : ("assistant" as const),
+          content: `heartbeat exchange ${cycle}`,
+          tokenCount: 6,
+        },
+      ]);
+      await summaryStore.appendContextMessage(conversation.conversationId, heartbeat!.messageId);
+      await expect(runPrepareOnly()).resolves.toMatchObject({ status: "ready" });
+    }
+    expect(summarizeCalls).toBe(baselineCalls);
+    const batchAfterHeartbeats = await pendingSummaryStore.getActiveBatchForConversation(
+      conversation.conversationId,
+    );
+    expect(batchAfterHeartbeats?.batchId).toBe(batch!.batchId);
+    expect(batchAfterHeartbeats?.compactableEndOrdinal).toBe(batch!.compactableEndOrdinal);
+    await expect(pendingSummaryStore.getNodesByBatch(batch!.batchId)).resolves.toHaveLength(
+      baselineNodes,
+    );
+
+    // One genuinely large turn (followed by a fresh tail behind it) crosses
+    // the gate: exactly one extension pass.
+    const largeTurnMessages = await conversationStore.createMessagesBulk([
+      {
+        conversationId: conversation.conversationId,
+        seq: 10,
+        role: "user",
+        content: "large turn that finally justifies leaf work",
+        tokenCount: 120,
+      },
+      {
+        conversationId: conversation.conversationId,
+        seq: 11,
+        role: "assistant",
+        content: "new fresh tail",
+        tokenCount: 5,
+      },
+    ]);
+    for (const message of largeTurnMessages) {
+      await summaryStore.appendContextMessage(conversation.conversationId, message.messageId);
+    }
+    await expect(runPrepareOnly()).resolves.toMatchObject({ status: "planned" });
+    const extendedBatch = await pendingSummaryStore.getActiveBatchForConversation(
+      conversation.conversationId,
+    );
+    expect(extendedBatch?.batchId).toBe(batch!.batchId);
+    expect(extendedBatch!.compactableEndOrdinal).toBeGreaterThan(batch!.compactableEndOrdinal);
+  });
+
   it("does not rebuild a whole-prefix condensed parent when extending past a ready one", async () => {
     const { conversationStore, pendingSummaryStore, summaryStore } = createStores();
     const conversation = await conversationStore.createConversation({
