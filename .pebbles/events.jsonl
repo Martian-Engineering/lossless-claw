@@ -54,3 +54,5 @@
 {"type":"close","timestamp":"2026-06-30T22:30:02.926411Z","issue_id":"lc-6df","payload":{}}
 {"type":"create","timestamp":"2026-06-30T23:15:12.409387Z","issue_id":"lc-4f0","payload":{"description":"Background pending-summary maintenance should prepare ready summaries without publishing them. Manual compact, threshold inline compact, and emergency over-budget assembly should publish ready pending summaries.","priority":"2","title":"Defer pending summary publish until compaction is needed","type":"task"}}
 {"type":"close","timestamp":"2026-07-01T00:00:33.117635Z","issue_id":"lc-4f0","payload":{}}
+{"type":"create","timestamp":"2026-07-01T00:04:04.909445Z","issue_id":"lc-a4d","payload":{"description":"Adjust the pending summary compaction proof harness to assert prepare-only ready state before explicit publish.","priority":"2","title":"Update pending summary E2E proof for deferred publish","type":"task"}}
+{"type":"close","timestamp":"2026-07-01T00:04:14.626949Z","issue_id":"lc-a4d","payload":{}}
