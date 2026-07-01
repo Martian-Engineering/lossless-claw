@@ -99,6 +99,8 @@ const HANDLED_CONVERSATION_ID_TABLES = new Set([
   "conversation_compaction_telemetry",
   "conversation_compaction_maintenance",
   "focus_briefs",
+  "pending_compaction_batches",
+  "pending_summary_nodes",
 ]);
 
 const EMPTY_COUNTS: RolloverSplitCounts = {
@@ -490,6 +492,27 @@ function reparentSimpleConversationTables(db: DatabaseSync, group: SafeGroup): v
   }
 }
 
+// Pending compaction batches are hidden prepared work keyed to per-conversation
+// context ordinals and source projection fingerprints. A lane merge rewrites
+// conversation ids and resequences context items, which invalidates every batch
+// in the lane (sources and target alike), so the repair drops them. Nodes are
+// deleted before batches so the delete order is valid even without cascades;
+// node link rows cascade off pending_summary_nodes.
+function deleteInvalidatedPendingCompactionState(db: DatabaseSync, group: SafeGroup): void {
+  if (!hasTable(db, "pending_compaction_batches")) {
+    return;
+  }
+  const idPlaceholders = placeholders(group.orderedConversationIds);
+  db.prepare(
+    `DELETE FROM pending_summary_nodes
+     WHERE conversation_id IN (${idPlaceholders})`,
+  ).run(...group.orderedConversationIds);
+  db.prepare(
+    `DELETE FROM pending_compaction_batches
+     WHERE conversation_id IN (${idPlaceholders})`,
+  ).run(...group.orderedConversationIds);
+}
+
 function clearSourceStateAndMarkTarget(db: DatabaseSync, group: SafeGroup): void {
   const sourcePlaceholders = placeholders(group.sourceConversationIds);
   for (const table of [
@@ -661,6 +684,7 @@ function verifyRepairedTargets(db: DatabaseSync, targetConversationIds: number[]
 }
 
 function repairSafeGroup(db: DatabaseSync, group: SafeGroup): void {
+  deleteInvalidatedPendingCompactionState(db, group);
   reparentMessages(db, group);
   reparentContextItems(db, group);
   reparentSimpleConversationTables(db, group);

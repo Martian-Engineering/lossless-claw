@@ -1866,6 +1866,39 @@ describe("lcm command", () => {
     setConversationTimes(fixture, active.conversationId, "2026-06-17 01:11:00");
     insertRolloverStateRows(fixture, firstArchived.conversationId, active.conversationId);
 
+    // Pending compaction rows are ordinal-keyed prepared work; the repair must
+    // treat them as handled (lane stays safe) and drop them for the whole lane.
+    const sourceMessage = fixture.db
+      .prepare(`SELECT message_id FROM messages WHERE conversation_id = ? LIMIT 1`)
+      .get(firstArchived.conversationId) as { message_id: number };
+    for (const [batchId, conversationId] of [
+      ["pcb_rollover_source", firstArchived.conversationId],
+      ["pcb_rollover_target", active.conversationId],
+    ] as const) {
+      fixture.db
+        .prepare(
+          `INSERT INTO pending_compaction_batches (
+             batch_id, conversation_id, status, source_projection_fingerprint,
+             compactable_start_ordinal, compactable_end_ordinal, prompt_version, model
+           ) VALUES (?, ?, 'ready', 'fp', 0, 1, 'test', 'test-model')`,
+        )
+        .run(batchId, conversationId);
+      fixture.db
+        .prepare(
+          `INSERT INTO pending_summary_nodes (
+             node_id, batch_id, conversation_id, kind, depth, status,
+             ordinal_start, ordinal_end, source_fingerprint, prompt_version, model
+           ) VALUES (?, ?, ?, 'leaf', 0, 'ready', 0, 1, 'fp', 'test', 'test-model')`,
+        )
+        .run(`${batchId}-node`, batchId, conversationId);
+    }
+    fixture.db
+      .prepare(
+        `INSERT INTO pending_summary_node_messages (node_id, message_id, ordinal)
+         VALUES ('pcb_rollover_source-node', ?, 0)`,
+      )
+      .run(sourceMessage.message_id);
+
     const blocked = await fixture.command.handler(
       createCommandContext("doctor apply rollover-splits"),
     );
@@ -1964,6 +1997,16 @@ describe("lcm command", () => {
       reason: "doctor-rollover-split-repair",
       running: 0,
     });
+
+    const pendingCounts = fixture.db
+      .prepare(
+        `SELECT
+           (SELECT COUNT(*) FROM pending_compaction_batches) AS batches,
+           (SELECT COUNT(*) FROM pending_summary_nodes) AS nodes,
+           (SELECT COUNT(*) FROM pending_summary_node_messages) AS node_messages`,
+      )
+      .get() as { batches: number; nodes: number; node_messages: number };
+    expect(pendingCounts).toEqual({ batches: 0, nodes: 0, node_messages: 0 });
 
     const ftsRows = fixture.db
       .prepare(`SELECT rowid FROM messages_fts WHERE messages_fts MATCH 'oldone'`)
