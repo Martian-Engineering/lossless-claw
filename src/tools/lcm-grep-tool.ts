@@ -242,6 +242,7 @@ export function createLcmGrepTool(input: {
         before,
         sort: effectiveSort,
         largeFilesDir: lcm.configView?.largeFilesDir,
+        allConversations: conversationScope.allConversations,
       });
 
       const lines: string[] = [];

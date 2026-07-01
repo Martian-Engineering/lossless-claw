@@ -99,6 +99,9 @@ export interface GrepInput {
   sort?: SearchSort;
   /** Required when scope="files". Used to validate file paths before reading. */
   largeFilesDir?: string;
+  /** When true and no explicit fileIds/conversationId/conversationIds are
+   *  provided, search large files across all conversations. */
+  allConversations?: boolean;
 }
 
 export interface GrepResult {
@@ -353,7 +356,7 @@ export class RetrievalEngine {
    * Depending on `scope`, searches messages, summaries, or both (in parallel).
    */
   async grep(input: GrepInput): Promise<GrepResult> {
-    const { query, mode, scope, conversationId, conversationIds, fileIds, since, before, limit, sort, largeFilesDir } = input;
+    const { query, mode, scope, conversationId, conversationIds, fileIds, since, before, limit, sort, largeFilesDir, allConversations } = input;
 
     if (scope === "files") {
       if (!largeFilesDir) {
@@ -369,6 +372,7 @@ export class RetrievalEngine {
         before,
         limit,
         largeFilesDir,
+        allConversations,
       });
       return { messages: [], summaries: [], files, totalMatches: files.length };
     }

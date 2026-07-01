@@ -131,6 +131,9 @@ export type LargeFileSearchInput = {
   limit?: number;
   largeFilesDir: string;
   maxBytesPerFile?: number;
+  /** When true and no explicit fileIds/conversationId/conversationIds are
+   *  provided, search large files across all conversations. */
+  allConversations?: boolean;
 };
 
 export type LargeFileSearchResult = {
@@ -1729,9 +1732,20 @@ export class SummaryStore {
         `SELECT file_id, conversation_id, file_name, mime_type, byte_size, line_count, storage_uri, exploration_summary, created_at
        FROM large_files
        WHERE conversation_id = ?
-       ORDER BY created_at`,
+       ORDER BY created_at DESC`,
       )
       .all(conversationId) as unknown as LargeFileRow[];
+    return rows.map(toLargeFileRecord);
+  }
+
+  async getAllLargeFiles(): Promise<LargeFileRecord[]> {
+    const rows = this.db
+      .prepare(
+        `SELECT file_id, conversation_id, file_name, mime_type, byte_size, line_count, storage_uri, exploration_summary, created_at
+       FROM large_files
+       ORDER BY created_at DESC`,
+      )
+      .all() as unknown as LargeFileRow[];
     return rows.map(toLargeFileRecord);
   }
 
@@ -1760,6 +1774,8 @@ export class SummaryStore {
       }
     } else if (input.conversationId != null) {
       files = await this.getLargeFilesByConversation(input.conversationId);
+    } else if (input.allConversations) {
+      files = await this.getAllLargeFiles();
     }
 
     if (input.since) {

@@ -471,6 +471,57 @@ describe("SummaryStore shallow-tree helpers", () => {
     }
   });
 
+  it("searches large files across all conversations when allConversations is true", async () => {
+    const { conversationStore, summaryStore } = createStores();
+    const safeRoot = mkdtempSync(join(tmpdir(), "lcm-search-all-convs-"));
+    try {
+      const conv1 = await conversationStore.createConversation({
+        sessionId: "summary-store-search-all-1",
+        title: "Summary store search all 1",
+      });
+      const conv2 = await conversationStore.createConversation({
+        sessionId: "summary-store-search-all-2",
+        title: "Summary store search all 2",
+      });
+
+      const content1 = "needle alpha";
+      const content2 = "needle beta";
+      const path1 = join(safeRoot, "a.txt");
+      const path2 = join(safeRoot, "b.txt");
+      writeFileSync(path1, content1, "utf8");
+      writeFileSync(path2, content2, "utf8");
+
+      await summaryStore.insertLargeFile({
+        fileId: "file_all_1",
+        conversationId: conv1.conversationId,
+        fileName: "a.txt",
+        mimeType: "text/plain",
+        byteSize: Buffer.byteLength(content1, "utf8"),
+        storageUri: path1,
+      });
+      await summaryStore.insertLargeFile({
+        fileId: "file_all_2",
+        conversationId: conv2.conversationId,
+        fileName: "b.txt",
+        mimeType: "text/plain",
+        byteSize: Buffer.byteLength(content2, "utf8"),
+        storageUri: path2,
+      });
+
+      const results = await summaryStore.searchLargeFiles({
+        query: "needle",
+        mode: "regex",
+        allConversations: true,
+        largeFilesDir: safeRoot,
+      });
+
+      expect(results).toHaveLength(2);
+      expect(results.map((r) => r.fileId).sort()).toEqual(["file_all_1", "file_all_2"]);
+    } finally {
+      rmSync(safeRoot, { recursive: true, force: true });
+    }
+  });
+
   it("stores and returns large file lineCount", async () => {
     const { conversationStore, summaryStore } = createStores();
     const conversation = await conversationStore.createConversation({
