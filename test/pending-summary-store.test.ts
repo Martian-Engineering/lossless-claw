@@ -281,6 +281,114 @@ describe("PendingSummaryStore", () => {
     });
   });
 
+  it("reclaims failed nodes after their backoff and stops at the retry cap", async () => {
+    const { conversationStore, pendingSummaryStore } = createStores();
+    const conversation = await conversationStore.createConversation({
+      sessionId: "pending-summary-retry-session",
+      sessionKey: "agent:main:pending-summary-retry",
+    });
+    await pendingSummaryStore.createBatch({
+      batchId: "batch_retry_a",
+      conversationId: conversation.conversationId,
+      sourceProjectionFingerprint: "projection:v1",
+      compactableStartOrdinal: 0,
+      compactableEndOrdinal: 0,
+      promptVersion: "leaf:v1",
+      model: "test-model",
+    });
+    await pendingSummaryStore.insertNode({
+      nodeId: "node_retry_a",
+      batchId: "batch_retry_a",
+      conversationId: conversation.conversationId,
+      kind: "leaf",
+      depth: 0,
+      status: "planned",
+      ordinalStart: 0,
+      ordinalEnd: 0,
+      sourceFingerprint: "source:retry",
+      promptVersion: "leaf:v1",
+      model: "test-model",
+    });
+
+    const claimAt = (now: Date, leaseMinutes: number) =>
+      pendingSummaryStore.claimNextPlannedNode({
+        conversationId: conversation.conversationId,
+        leaseOwner: "worker-a",
+        leaseExpiresAt: new Date(now.getTime() + leaseMinutes * 60_000),
+        now,
+      });
+
+    // First failure: retry_count 1 with a 60s backoff stamp.
+    const firstClaim = await claimAt(new Date("2026-06-30T12:00:00.000Z"), 5);
+    await expect(
+      pendingSummaryStore.markNodeFailed({
+        nodeId: "node_retry_a",
+        leaseOwner: "worker-a",
+        leaseExpiresAt: firstClaim!.leaseExpiresAt!,
+        failureSummary: "transient failure",
+        now: new Date("2026-06-30T12:00:30.000Z"),
+      }),
+    ).resolves.toBe(true);
+    await expect(pendingSummaryStore.getNode("node_retry_a")).resolves.toMatchObject({
+      status: "failed",
+      retryCount: 1,
+      nextAttemptAfter: new Date("2026-06-30T12:01:30.000Z"),
+    });
+
+    // Inside the backoff window the node is not claimable; after it, it is.
+    await expect(claimAt(new Date("2026-06-30T12:01:00.000Z"), 5)).resolves.toBeNull();
+    const retryClaim = await claimAt(new Date("2026-06-30T12:02:00.000Z"), 5);
+    expect(retryClaim).toMatchObject({ nodeId: "node_retry_a", status: "running", retryCount: 1 });
+
+    // Success resets the retry bookkeeping.
+    await expect(
+      pendingSummaryStore.markNodeReady({
+        nodeId: "node_retry_a",
+        leaseOwner: "worker-a",
+        leaseExpiresAt: retryClaim!.leaseExpiresAt!,
+        content: "recovered pending summary",
+        tokenCount: 5,
+      }),
+    ).resolves.toBe(true);
+    await expect(pendingSummaryStore.getNode("node_retry_a")).resolves.toMatchObject({
+      status: "ready",
+      retryCount: 0,
+      nextAttemptAfter: null,
+    });
+
+    // A node at the retry cap is never claimable, even after its backoff.
+    await pendingSummaryStore.insertNode({
+      nodeId: "node_retry_capped",
+      batchId: "batch_retry_a",
+      conversationId: conversation.conversationId,
+      kind: "leaf",
+      depth: 0,
+      status: "planned",
+      ordinalStart: 1,
+      ordinalEnd: 1,
+      sourceFingerprint: "source:capped",
+      promptVersion: "leaf:v1",
+      model: "test-model",
+    });
+    for (let attempt = 1; attempt <= 3; attempt += 1) {
+      const attemptNow = new Date(Date.parse("2026-06-30T13:00:00.000Z") + attempt * 3_600_000);
+      const claim = await claimAt(attemptNow, 5);
+      expect(claim).toMatchObject({ nodeId: "node_retry_capped" });
+      await pendingSummaryStore.markNodeFailed({
+        nodeId: "node_retry_capped",
+        leaseOwner: "worker-a",
+        leaseExpiresAt: claim!.leaseExpiresAt!,
+        failureSummary: `attempt ${attempt} failed`,
+        now: attemptNow,
+      });
+    }
+    await expect(pendingSummaryStore.getNode("node_retry_capped")).resolves.toMatchObject({
+      status: "failed",
+      retryCount: 3,
+    });
+    await expect(claimAt(new Date("2026-07-01T12:00:00.000Z"), 5)).resolves.toBeNull();
+  });
+
   it("does not claim nodes from stale batches", async () => {
     const { conversationStore, pendingSummaryStore } = createStores();
     const conversation = await conversationStore.createConversation({
