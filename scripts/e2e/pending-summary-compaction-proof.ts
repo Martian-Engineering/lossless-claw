@@ -171,6 +171,15 @@ export async function runPendingSummaryCompactionProof(): Promise<PendingSummary
   await coordinator.runOnce({ conversationId: conversation.conversationId });
   await record("after-condensed-preparation");
 
+  const ready = await coordinator.runOnce({
+    conversationId: conversation.conversationId,
+    publishPolicy: "prepare-only",
+  });
+  if (ready.status !== "ready") {
+    failures.push(`expected ready step, got ${ready.status}`);
+  }
+  await record("after-ready-no-publish");
+
   const published = await coordinator.runOnce({ conversationId: conversation.conversationId });
   if (published.status !== "published") {
     failures.push(`expected published step, got ${published.status}`);
@@ -203,7 +212,13 @@ function validateProof(input: {
   publishedSummary: { content: string; kind: string; depth: number } | null;
 }): void {
   const byLabel = new Map(input.checkpoints.map((checkpoint) => [checkpoint.label, checkpoint]));
-  for (const label of ["seeded-raw-context", "after-plan", "after-leaf-preparation", "after-condensed-preparation"]) {
+  for (const label of [
+    "seeded-raw-context",
+    "after-plan",
+    "after-leaf-preparation",
+    "after-condensed-preparation",
+    "after-ready-no-publish",
+  ]) {
     const checkpoint = byLabel.get(label);
     if (!checkpoint) {
       input.failures.push(`missing checkpoint ${label}`);
@@ -246,6 +261,19 @@ function validateProof(input: {
       .length !== 1
   ) {
     input.failures.push("after-condensed-preparation should have one ready condensed parent");
+  }
+
+  const afterReady = byLabel.get("after-ready-no-publish");
+  if (
+    afterReady?.pendingNodes.filter((node) => node.status === "ready").length !== 3
+  ) {
+    input.failures.push("after-ready-no-publish should leave all pending nodes ready");
+  }
+  if (afterReady?.canonicalSummaries !== 0) {
+    input.failures.push("prepare-only ready step should not publish canonical summaries");
+  }
+  if (!afterReady?.contextItems.every((item) => item.itemType === "message")) {
+    input.failures.push("prepare-only ready step should not swap canonical context");
   }
 
   const afterPublish = byLabel.get("after-publish");
