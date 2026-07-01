@@ -197,18 +197,26 @@ export function planPendingLeafNodes(
 }
 
 /**
+ * Layer cap for condensation planning. Real DAGs stay in single digits; the
+ * cap only exists so no policy input can spin the layering loop forever.
+ */
+const MAX_CONDENSED_PLANNING_LAYERS = 32;
+
+/**
  * Plan hidden condensed parent nodes over adjacent same-depth pending nodes.
  */
 export function planPendingCondensedNodes(
   input: PlanPendingCondensedNodesInput,
 ): PendingSummaryPlannerNode[] {
-  const minFanout = normalizePositiveInteger(input.condensedMinFanout, 2);
+  // A fanout of 1 would let a single node condense into itself at depth+1 on
+  // every layer pass, so the effective minimum is always at least 2.
+  const minFanout = Math.max(2, normalizePositiveInteger(input.condensedMinFanout, 2));
   const minSourceTokens = normalizeNonNegativeInteger(input.condensedMinSourceTokens);
   const chunkTokenBudget = normalizePositiveInteger(input.condensedChunkTokens, 1);
   const planned: PendingSummaryPlannerNode[] = [];
   let candidates = [...input.nodes].sort(compareNodesForPlanning);
 
-  while (true) {
+  for (let layer = 0; layer < MAX_CONDENSED_PLANNING_LAYERS; layer++) {
     const nextLayer = planOneCondensedLayer({
       nodes: candidates,
       minFanout,
