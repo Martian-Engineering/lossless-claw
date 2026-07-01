@@ -441,9 +441,9 @@ export class SessionRolloverDetector {
    * rollover is a legitimate runtime session-file reset, not a foreign
    * transcript sharing the key. Rebind the existing conversation row so all
    * summaries, messages, frontier rows, and metadata keep the same
-   * conversation id while the new session can bootstrap normally. Returns
-   * true when rebound; false leaves the existing freeze-and-preserve
-   * behavior in place.
+   * conversation id while the new session can bootstrap normally. Returns the
+   * rebind outcome plus whether a non-rebound preserve is an expected pending
+   * state rather than a genuine freeze.
    */
   async rotateAmbiguousRolloverForProvablyFreshTranscript(params: {
     phase: "bootstrap" | "assemble" | "afterTurn";
@@ -465,14 +465,14 @@ export class SessionRolloverDetector {
       return { rebound: false, preserveExpected: false };
     }
     if (!verdict.fresh) {
-      // Not an error: the rollover is a legitimate same-key continuation (or the
-      // evidence is insufficient to prove a reset), so freeze-and-preserve is the
-      // correct, expected outcome. The genuine "could not heal" headline is the
-      // caller's preserve log; this records only the freshness reason.
-      this.deps.log.info(
-        `[lcm] ${params.phase}: ambiguous rollover not provably fresh conversation=${params.rollover.conversationId} sessionKey=${params.rollover.sessionKey} freshness=${verdict.reason} lastPersistedAt=${verdict.lastPersistedAt?.toISOString() ?? "none"} firstCandidateAt=${verdict.firstCandidateAt !== null ? new Date(verdict.firstCandidateAt).toISOString() : "none"}`,
-      );
-      return { rebound: false, preserveExpected: isTransientAmbiguousRolloverFreshness(verdict.reason) };
+      const preserveExpected = isTransientAmbiguousRolloverFreshness(verdict.reason);
+      const message = `[lcm] ${params.phase}: ambiguous rollover not provably fresh conversation=${params.rollover.conversationId} sessionKey=${params.rollover.sessionKey} freshness=${verdict.reason} lastPersistedAt=${verdict.lastPersistedAt?.toISOString() ?? "none"} firstCandidateAt=${verdict.firstCandidateAt !== null ? new Date(verdict.firstCandidateAt).toISOString() : "none"}`;
+      if (preserveExpected) {
+        this.deps.log.info(message);
+      } else {
+        this.deps.log.warn(message);
+      }
+      return { rebound: false, preserveExpected };
     }
 
     const rebound = await this.conversationStore.rebindConversationSession(

@@ -513,7 +513,7 @@ describe("ambiguous rollover tier-2 fresh-transcript rotation", () => {
 
     expect(result.bootstrapped).toBe(false);
     expect(result.reason).toBe("ambiguous session-key runtime rollover");
-    expect(log.info).toHaveBeenCalledWith(
+    expect(log.warn).toHaveBeenCalledWith(
       expect.stringContaining("freshness=identity-overlap-with-persisted-history"),
     );
     // A conflicting overlap is a genuine freeze (it never heals), so the
@@ -582,7 +582,7 @@ describe("ambiguous rollover tier-2 fresh-transcript rotation", () => {
       sessionFile: staleFile,
     });
     expect(staleResult.bootstrapped).toBe(false);
-    expect(log.info).toHaveBeenCalledWith(
+    expect(log.warn).toHaveBeenCalledWith(
       expect.stringContaining("freshness=candidate-entries-predate-last-persisted"),
     );
 

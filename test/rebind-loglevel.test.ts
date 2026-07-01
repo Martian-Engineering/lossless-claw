@@ -93,10 +93,10 @@ describe("ambiguous-rollover rebind happy-path log levels", () => {
     );
   });
 
-  it("logs the not-provably-fresh preserve decision at info, not warn", async () => {
+  it("logs the conflicting not-provably-fresh preserve decision at warn", async () => {
     const { detector, log } = makeDetector({
       // Persisted history is newer than the candidate entries: the rollover is
-      // a legitimate same-key continuation, correctly preserved (not an error).
+      // a genuine conflict, so preserve/freeze is correct and actionable.
       getLastMessage: async () => ({ createdAt: new Date(Date.now() + 10 * 60_000) }),
     });
 
@@ -109,8 +109,8 @@ describe("ambiguous-rollover rebind happy-path log levels", () => {
     });
 
     expect(rebound).toEqual({ rebound: false, preserveExpected: false });
-    expect(log.warn).not.toHaveBeenCalled();
-    expect(log.info).toHaveBeenCalledWith(expect.stringContaining("not provably fresh"));
+    expect(log.info).not.toHaveBeenCalled();
+    expect(log.warn).toHaveBeenCalledWith(expect.stringContaining("not provably fresh"));
   });
 
   it("logs the assemble-phase per-phase preserve restatement at debug, not warn", () => {
