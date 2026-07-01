@@ -1038,6 +1038,24 @@ export class LcmContextEngine implements ContextEngine {
         reason: "circuit breaker open",
       };
     }
+    // Manual and force compaction are informed consent to spend; automatic
+    // preparation and publish passes must not burn summarizer calls while the
+    // poor-reduction spend backoff is open for this scope.
+    const summarySpendScopeKey = this.compactionGuards.resolveSummarySpendScope({
+      kind: "compaction",
+      scope: breakerScope,
+    });
+    const pendingManualCompaction =
+      (asRecord(params.runtimeContext) ?? asRecord(params.legacyParams))?.manualCompaction === true;
+    if (params.force === true || pendingManualCompaction) {
+      this.compactionGuards.clearSummarySpendBackoff(summarySpendScopeKey);
+    } else if (this.compactionGuards.getSummarySpendBackoffUntil(summarySpendScopeKey)) {
+      return {
+        ok: false,
+        compacted: false,
+        reason: "summary spend backoff open",
+      };
+    }
     const withPublishLock =
       params.sessionQueueHeld === true
         ? undefined
@@ -1123,6 +1141,17 @@ export class LcmContextEngine implements ContextEngine {
         };
       }
       if (lastResult.status === "idle") {
+        // A spend backoff opened mid-run (guard cap reached during this pass)
+        // must surface as a failure so deferred debt stays pending with the
+        // backoff as its retry horizon.
+        if (lastResult.reason === "summary spend backoff open") {
+          return {
+            ok: false,
+            compacted: false,
+            reason: lastResult.reason,
+            result: lastResult,
+          };
+        }
         if (
           lastResult.reason === "no compactable context outside fresh tail" ||
           lastResult.reason === "no pending summary nodes planned"

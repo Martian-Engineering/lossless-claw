@@ -6,6 +6,7 @@ import { PendingCompactionCoordinator } from "../src/pending-summary-coordinator
 import { ConversationStore } from "../src/store/conversation-store.js";
 import { PendingSummaryStore } from "../src/store/pending-summary-store.js";
 import { SummaryStore } from "../src/store/summary-store.js";
+import { LcmSummarySpendLimitError } from "../src/summarize.js";
 
 function createStores() {
   const db = new DatabaseSync(":memory:");
@@ -435,6 +436,78 @@ describe("PendingCompactionCoordinator", () => {
     await expect(
       coordinator.runOnce({ conversationId: conversation.conversationId }),
     ).resolves.toMatchObject({ status: "published", batchId: firstPlan.batchId });
+  });
+
+  it("releases the claim without failure bookkeeping when the spend guard refuses", async () => {
+    const { conversationStore, pendingSummaryStore, summaryStore } = createStores();
+    const conversation = await conversationStore.createConversation({
+      sessionId: "pending-coordinator-spend-session",
+      sessionKey: "agent:main:pending-coordinator-spend",
+    });
+    const messages = await conversationStore.createMessagesBulk([
+      {
+        conversationId: conversation.conversationId,
+        seq: 1,
+        role: "user",
+        content: "spend guard source message",
+        tokenCount: 4,
+      },
+      {
+        conversationId: conversation.conversationId,
+        seq: 2,
+        role: "assistant",
+        content: "fresh tail message",
+        tokenCount: 4,
+      },
+    ]);
+    await summaryStore.appendContextMessages(
+      conversation.conversationId,
+      messages.map((message) => message.messageId),
+    );
+
+    const coordinator = new PendingCompactionCoordinator({
+      conversationStore,
+      pendingSummaryStore,
+      summaryStore,
+      model: "test-model",
+      leaseOwner: "test-worker",
+      config: {
+        freshTailCount: 1,
+        leafChunkTokens: 100,
+        condensedMinFanout: 2,
+        condensedMinSourceTokens: 1,
+        condensedChunkTokens: 100,
+      },
+      summarize: async () => {
+        throw new LcmSummarySpendLimitError({
+          scopeKey: "compaction:test",
+          backoffUntil: new Date(Date.now() + 60_000),
+        });
+      },
+    });
+
+    const plan = await coordinator.runOnce({ conversationId: conversation.conversationId });
+    expect(plan).toMatchObject({ status: "planned" });
+    if (plan.status !== "planned") {
+      throw new Error("Expected the pending compaction attempt to plan");
+    }
+    await expect(
+      coordinator.runOnce({ conversationId: conversation.conversationId }),
+    ).resolves.toMatchObject({ status: "idle", reason: "summary spend backoff open" });
+
+    // The node goes back to planned with no retry bookkeeping and the batch
+    // stays active for a later drain once the backoff clears.
+    const nodes = await pendingSummaryStore.getNodesByBatch(plan.batchId);
+    expect(nodes).toHaveLength(1);
+    expect(nodes[0]).toMatchObject({
+      status: "planned",
+      retryCount: 0,
+      leaseOwner: null,
+      failureSummary: null,
+    });
+    await expect(
+      pendingSummaryStore.getActiveBatchForConversation(conversation.conversationId),
+    ).resolves.toMatchObject({ batchId: plan.batchId });
   });
 
   it("stales the batch only after pending preparation retries are exhausted", async () => {
