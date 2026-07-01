@@ -21,6 +21,11 @@ export type PendingSummaryPreparationStore = {
     leaseExpiresAt: Date;
     failureSummary: string;
   }): Promise<boolean>;
+  releaseNodeClaim(input: {
+    nodeId: string;
+    leaseOwner: string;
+    leaseExpiresAt: Date;
+  }): Promise<boolean>;
 };
 
 export type PendingSummaryPreparationWorkerOptions = {
@@ -32,11 +37,13 @@ export type PendingSummaryPreparationWorkerOptions = {
   summarize: (sourceText: string, node: PendingSummaryNodeRecord) => Promise<string>;
   estimateTokens: (content: string) => number;
   isAuthFailure?: (error: unknown) => boolean;
+  isSpendLimitFailure?: (error: unknown) => boolean;
 };
 
 export type PendingSummaryPreparationResult =
   | { status: "idle" }
   | { status: "prepared"; nodeId: string }
+  | { status: "spend-limited"; nodeId: string }
   | { status: "failed"; nodeId: string; failureSummary: string; authFailure?: boolean };
 
 function describeError(error: unknown): string {
@@ -82,6 +89,7 @@ export class PendingSummaryPreparationWorker {
   ) => Promise<string>;
   private readonly estimateTokens: (content: string) => number;
   private readonly isAuthFailure: (error: unknown) => boolean;
+  private readonly isSpendLimitFailure: (error: unknown) => boolean;
 
   constructor(options: PendingSummaryPreparationWorkerOptions) {
     this.store = options.store;
@@ -92,6 +100,7 @@ export class PendingSummaryPreparationWorker {
     this.summarize = options.summarize;
     this.estimateTokens = options.estimateTokens;
     this.isAuthFailure = options.isAuthFailure ?? (() => false);
+    this.isSpendLimitFailure = options.isSpendLimitFailure ?? (() => false);
   }
 
   /** Prepare one pending summary node for a conversation, if work is claimable. */
@@ -132,6 +141,16 @@ export class PendingSummaryPreparationWorker {
       }
       return { status: "prepared", nodeId: node.nodeId };
     } catch (error) {
+      // A spend-guard refusal is not a node failure: no model outcome exists,
+      // so the claim is released untouched and the node stays planned.
+      if (this.isSpendLimitFailure(error)) {
+        await this.store.releaseNodeClaim({
+          nodeId: node.nodeId,
+          leaseOwner: this.leaseOwner,
+          leaseExpiresAt: node.leaseExpiresAt,
+        });
+        return { status: "spend-limited", nodeId: node.nodeId };
+      }
       const failureSummary = describeError(error);
       const authFailure = this.isAuthFailure(error);
       const saved = await this.store.markNodeFailed({

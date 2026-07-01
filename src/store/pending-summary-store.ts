@@ -813,6 +813,34 @@ export class PendingSummaryStore {
   }
 
   /**
+   * Return a claimed node to the planned pool without recording a failure.
+   *
+   * Used when preparation was blocked before any model outcome existed (e.g.
+   * the summary spend guard refused the call) — the node is not at fault, so
+   * its retry bookkeeping is left untouched.
+   */
+  async releaseNodeClaim(input: {
+    nodeId: string;
+    leaseOwner: string;
+    leaseExpiresAt: Date;
+  }): Promise<boolean> {
+    const result = this.db
+      .prepare(
+        `UPDATE pending_summary_nodes
+         SET status = 'planned',
+             lease_owner = NULL,
+             lease_expires_at = NULL,
+             updated_at = datetime('now')
+         WHERE node_id = ?
+           AND status = 'running'
+           AND lease_owner = ?
+           AND lease_expires_at = ?`,
+      )
+      .run(input.nodeId, input.leaseOwner, input.leaseExpiresAt.toISOString());
+    return Number(result.changes ?? 0) > 0;
+  }
+
+  /**
    * Mark a pending node failed and release its lease.
    *
    * Each failure increments the node's retry count and stamps the exponential

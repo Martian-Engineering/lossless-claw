@@ -56,6 +56,10 @@ describe("PendingSummaryPreparationWorker", () => {
         events.push(`failed:${input.nodeId}:${input.leaseOwner}:${input.failureSummary}`);
         return true;
       },
+      async releaseNodeClaim(input) {
+        events.push(`released:${input.nodeId}`);
+        return true;
+      },
     };
     const worker = new PendingSummaryPreparationWorker({
       store,
@@ -101,6 +105,10 @@ describe("PendingSummaryPreparationWorker", () => {
         events.push(`failed:${input.nodeId}:${input.leaseOwner}:${input.failureSummary}`);
         return true;
       },
+      async releaseNodeClaim(input) {
+        events.push(`released:${input.nodeId}`);
+        return true;
+      },
     };
     const worker = new PendingSummaryPreparationWorker({
       store,
@@ -134,6 +142,10 @@ describe("PendingSummaryPreparationWorker", () => {
       },
       async markNodeFailed(input) {
         events.push(`failed:${input.nodeId}:${input.leaseOwner}:${input.failureSummary}`);
+        return true;
+      },
+      async releaseNodeClaim(input) {
+        events.push(`released:${input.nodeId}`);
         return true;
       },
     };
@@ -171,6 +183,10 @@ describe("PendingSummaryPreparationWorker", () => {
         events.push(`failed:${input.nodeId}:${input.leaseOwner}:${input.failureSummary}`);
         return true;
       },
+      async releaseNodeClaim(input) {
+        events.push(`released:${input.nodeId}`);
+        return true;
+      },
     };
     const worker = new PendingSummaryPreparationWorker({
       store,
@@ -190,6 +206,46 @@ describe("PendingSummaryPreparationWorker", () => {
     expect(events).toEqual(["failed:node_worker_a:worker-a:empty pending summary content"]);
   });
 
+  it("releases the claim without failure bookkeeping on spend-guard refusal", async () => {
+    const events: string[] = [];
+    const store: PendingSummaryPreparationStore = {
+      async claimNextPlannedNode() {
+        return createNode();
+      },
+      async markNodeReady(input) {
+        events.push(`ready:${input.nodeId}`);
+        return true;
+      },
+      async markNodeFailed(input) {
+        events.push(`failed:${input.nodeId}:${input.leaseOwner}:${input.failureSummary}`);
+        return true;
+      },
+      async releaseNodeClaim(input) {
+        events.push(`released:${input.nodeId}`);
+        return true;
+      },
+    };
+    class SpendLimitError extends Error {}
+    const worker = new PendingSummaryPreparationWorker({
+      store,
+      leaseOwner: "worker-a",
+      leaseMs: 60_000,
+      now: () => new Date("2026-06-30T12:00:00.000Z"),
+      loadSourceText: async () => "source text",
+      summarize: async () => {
+        throw new SpendLimitError("spend guard refused");
+      },
+      estimateTokens: () => 0,
+      isSpendLimitFailure: (error) => error instanceof SpendLimitError,
+    });
+
+    await expect(worker.prepareOne({ conversationId: 42 })).resolves.toEqual({
+      status: "spend-limited",
+      nodeId: "node_worker_a",
+    });
+    expect(events).toEqual(["released:node_worker_a"]);
+  });
+
   it("treats a lost lease during ready save as obsolete work", async () => {
     const events: string[] = [];
     const store: PendingSummaryPreparationStore = {
@@ -202,6 +258,10 @@ describe("PendingSummaryPreparationWorker", () => {
       },
       async markNodeFailed(input) {
         events.push(`failed:${input.nodeId}:${input.leaseOwner}`);
+        return true;
+      },
+      async releaseNodeClaim(input) {
+        events.push(`released:${input.nodeId}`);
         return true;
       },
     };
