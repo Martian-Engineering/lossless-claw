@@ -73,6 +73,8 @@ export type ContextThresholdOverride = {
   name?: string;
   match: ContextThresholdOverrideMatch;
   contextThreshold: number;
+  /** Optional override for freshTailCount when this rule matches. */
+  freshTailCount?: number;
 };
 
 export type LcmConfigSource = "env" | "plugin-config" | "default";
@@ -478,6 +480,10 @@ function toContextThresholdOverrides(value: unknown): ContextThresholdOverride[]
       throw new Error(`${path}.match.modelContextWindowMin must be <= modelContextWindowMax`);
     }
 
+    const overrideFreshTailCount = record.freshTailCount !== undefined
+      ? parsePositiveIntegerMatcher(record.freshTailCount, `${path}.freshTailCount`)
+      : undefined;
+
     return {
       ...(toStr(record.name) ? { name: toStr(record.name) } : {}),
       match: {
@@ -487,6 +493,7 @@ function toContextThresholdOverrides(value: unknown): ContextThresholdOverride[]
         ...(sessionPattern ? { sessionPattern } : {}),
       },
       contextThreshold: parseContextThresholdOverrideThreshold(record.contextThreshold, path),
+      ...(overrideFreshTailCount !== undefined ? { freshTailCount: overrideFreshTailCount } : {}),
     };
   });
 }

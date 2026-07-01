@@ -200,6 +200,8 @@ export type ContextEngine = {
     messages: AgentMessage[];
     tokenBudget?: number;
     prompt?: string;
+    /** Optional runtime context for override resolution (model, provider, etc.). */
+    runtimeContext?: Record<string, unknown>;
   }): Promise<AssembleResult>;
   compact(params: {
     sessionId: string;

@@ -21,6 +21,8 @@ export type ResolvedContextThreshold = {
   specificity: number;
   modelRef?: string;
   modelContextWindow?: number;
+  /** freshTailCount from a matching override rule, if set. */
+  freshTailCount?: number;
 };
 
 type CompiledOverrideRule = {
@@ -157,6 +159,7 @@ export function describeResolvedContextThreshold(resolved: ResolvedContextThresh
     ` ruleIndex=${resolved.ruleIndex ?? "none"} ruleName=${resolved.ruleName ?? "none"}` +
     ` specificity=${resolved.specificity} model=${resolved.modelRef ?? "none"}` +
     ` modelContextWindow=${resolved.modelContextWindow ?? "none"}` +
+    ` freshTailCount=${resolved.freshTailCount ?? "none"}` +
     ` reason=${resolved.reason.replaceAll(" ", "_")}`
   );
 }
@@ -224,6 +227,9 @@ export class ContextThresholdResolver {
       reason: describeRuleMatch(best.rule, runtime),
       specificity: best.specificity,
       ...runtimeFields,
+      ...(best.rule.freshTailCount !== undefined
+        ? { freshTailCount: best.rule.freshTailCount }
+        : {}),
     };
   }
 }

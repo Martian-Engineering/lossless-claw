@@ -1202,6 +1202,9 @@ export class LcmContextEngine implements ContextEngine {
           conversationId,
           tokenBudget,
           contextThreshold: resolvedContextThreshold.contextThreshold,
+          ...(resolvedContextThreshold.freshTailCount !== undefined
+            ? { freshTailCount: resolvedContextThreshold.freshTailCount }
+            : {}),
           summarize,
           force: forceThresholdSweep,
           hardTrigger: false,
@@ -1413,6 +1416,9 @@ export class LcmContextEngine implements ContextEngine {
         conversationId,
         tokenBudget,
         contextThreshold: resolvedContextThreshold.contextThreshold,
+        ...(resolvedContextThreshold.freshTailCount !== undefined
+          ? { freshTailCount: resolvedContextThreshold.freshTailCount }
+          : {}),
         targetTokens: convergenceTargetTokens,
         ...(effectiveCurrentTokens !== undefined ? { currentTokens: effectiveCurrentTokens } : {}),
         summarize,
@@ -3340,6 +3346,8 @@ export class LcmContextEngine implements ContextEngine {
     tokenBudget?: number;
     /** Optional user query for relevance-based eviction (BM25-lite). When absent or unsearchable, falls back to chronological eviction. */
     prompt?: string;
+    /** Optional runtime context for override resolution (model, provider, etc.). */
+    runtimeContext?: Record<string, unknown>;
   }): Promise<AssembleResult> {
     let liveMessages = params.messages;
     // Return a new fallback array so the runtime hook treats this as assembled
@@ -3602,10 +3610,17 @@ export class LcmContextEngine implements ContextEngine {
         }
       }
 
+      const resolvedContextThreshold = this.contextThresholdResolver.resolve({
+        sessionKey: params.sessionKey,
+        runtime: readRuntimeModelContext(asRecord(params.runtimeContext)),
+      });
+      const assembledFreshTailCount =
+        resolvedContextThreshold.freshTailCount ?? this.config.freshTailCount;
+
       const assembled = await this.assembler.assemble({
         conversationId: conversation.conversationId,
         tokenBudget,
-        freshTailCount: this.config.freshTailCount,
+        freshTailCount: assembledFreshTailCount,
         freshTailMaxTokens: this.config.freshTailMaxTokens,
         promptAwareEviction: this.config.promptAwareEviction,
         prompt: params.prompt,
