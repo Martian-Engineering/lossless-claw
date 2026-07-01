@@ -140,6 +140,18 @@ describe("PendingCompactionCoordinator", () => {
     });
     expect(summary?.content).toContain("condensed(");
     await expect(summaryStore.getSummaryParents(summaryId)).resolves.toHaveLength(2);
+
+    // Publish promotes every ancestor and drops the heavy pending payloads,
+    // keeping only lineage metadata on the promoted rows.
+    if (planned.status !== "planned") {
+      throw new Error("Expected the initial pending compaction attempt to plan");
+    }
+    const promotedNodes = await pendingSummaryStore.getNodesByBatch(planned.batchId);
+    expect(promotedNodes.length).toBeGreaterThan(0);
+    for (const node of promotedNodes) {
+      expect(node).toMatchObject({ status: "promoted", content: null });
+      expect(node.canonicalSummaryId).toBeTruthy();
+    }
   });
 
   it("prepares leaf source from message parts when stored content is empty", async () => {

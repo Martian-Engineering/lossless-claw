@@ -27,6 +27,9 @@ import { LcmProviderAuthError, type LcmSummarizeFn } from "./summarize.js";
 
 const PENDING_PROMPT_VERSION = "pending-summary-dag:v1";
 
+/** Finished (stale/failed/published) batches are kept this long for doctor visibility. */
+const PENDING_BATCH_RETENTION_MS = 7 * 24 * 60 * 60 * 1000;
+
 export type PendingCompactionCoordinatorConfig = {
   freshTailCount: number;
   freshTailMaxTokens?: number;
@@ -164,6 +167,10 @@ export class PendingCompactionCoordinator {
     publishPolicy?: PendingCompactionPublishPolicy;
   }): Promise<PendingCompactionCoordinatorResult> {
     const publishPolicy = input.publishPolicy ?? "publish-if-ready";
+    await this.pendingSummaryStore.deleteFinishedBatches({
+      conversationId: input.conversationId,
+      olderThan: new Date(Date.now() - PENDING_BATCH_RETENTION_MS),
+    });
     const snapshot = await this.buildProjectionSnapshot(input.conversationId);
     if (snapshot.compactableStartOrdinal == null || snapshot.compactableEndOrdinal == null) {
       return { status: "idle", reason: "no compactable context outside fresh tail" };
@@ -185,6 +192,7 @@ export class PendingCompactionCoordinator {
       });
       return { status: "stale", batchId: batch.batchId, reason: staleReason };
     }
+    await this.pendingSummaryStore.pruneSupersededNodes(batch.batchId);
 
     const worker = new PendingSummaryPreparationWorker({
       store: this.pendingSummaryStore,
@@ -496,6 +504,7 @@ export class PendingCompactionCoordinator {
       frontierNodeIds: pendingFrontier.map((node) => node.nodeId),
       expectedSourceProjectionFingerprint: input.batch.sourceProjectionFingerprint,
     });
+    await this.pendingSummaryStore.clearPromotedPayloads(input.batch.batchId);
     const publishedByNodeId = new Map(
       pendingFrontier.map(
         (node, index) => [node.nodeId, published.frontierSummaryIds[index]!] as const,
