@@ -14,7 +14,6 @@ import type {
   SubagentEndReason,
   SubagentSpawnPreparation,
 } from "./openclaw-bridge.js";
-import { delegateCompactionToRuntime } from "openclaw/plugin-sdk";
 import { contentFromParts, ContextAssembler, pickToolCallId, pickToolIsError, pickToolName } from "./assembler.js";
 import { CompactionEngine, type CompactionConfig } from "./compaction.js";
 import { BatchDeduplicator } from "./batch-dedup.js";
@@ -3996,15 +3995,22 @@ export class LcmContextEngine implements ContextEngine {
     force?: boolean;
   }): Promise<CompactResult> {
     if (this.shouldIgnoreSession({ sessionId: params.sessionId, sessionKey: params.sessionKey })) {
-      // Excluded sessions get no LCM tracking (no DAG, no summary DB rows), so this
-      // plugin cannot compact them itself. Rather than a bare refusal — which OpenClaw
-      // core's preflight guard treats as a hard failure, not a safe skip — delegate to
-      // the framework's own stock compaction path (the same bridge its default
-      // no-plugin engine uses).
+      if (this.deps.delegateCompactionToRuntime) {
+        // Excluded sessions get no LCM tracking, so delegate to OpenClaw's
+        // runtime compaction when the host exposes that compatibility bridge.
+        this.deps.log.info(
+          `[lcm] compact: delegating to runtime session=${params.sessionId}${params.sessionKey?.trim() ? ` sessionKey=${params.sessionKey.trim()}` : ""} reason=session_excluded`,
+        );
+        return await this.deps.delegateCompactionToRuntime(params);
+      }
       this.deps.log.info(
-        `[lcm] compact: delegating to runtime session=${params.sessionId}${params.sessionKey?.trim() ? ` sessionKey=${params.sessionKey.trim()}` : ""} reason=session_excluded`,
+        `[lcm] compact: skipped session=${params.sessionId}${params.sessionKey?.trim() ? ` sessionKey=${params.sessionKey.trim()}` : ""} reason=session_excluded runtime_delegate=unavailable`,
       );
-      return await delegateCompactionToRuntime(params);
+      return {
+        ok: true,
+        compacted: false,
+        reason: "session excluded",
+      };
     }
     if (this.isStatelessSession(params.sessionKey)) {
       this.deps.log.info(
