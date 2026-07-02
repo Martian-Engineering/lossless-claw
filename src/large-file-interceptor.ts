@@ -754,7 +754,7 @@ export class LargeFileInterceptor {
   async interceptLargeToolResults(params: {
     conversationId: number;
     message: AgentMessage;
-    toolCallInputMap?: ReadonlyMap<string, Record<string, unknown>>;
+    toolCallInputMap?: ReadonlyMap<string, { name?: string; input?: Record<string, unknown> }>;
     getFileId?: (input: { content: string; toolName: string; callId?: string }) => string;
   }): Promise<{ rewrittenMessage: AgentMessage; fileIds: string[] } | null> {
     if (
@@ -861,18 +861,23 @@ export class LargeFileInterceptor {
       interceptedAny = true;
 
       // If the read tool output was truncated, recover the full content from disk.
-      // The tool call input carries the original file path; without this recovery
-      // the truncated output gets externalized and the agent can never retrieve
-      // the complete file via lcm_describe.
+      // The tool call input carries the original file path. Because tool result
+      // blocks often do not repeat the tool name, fall back to the name recorded
+      // in the paired tool_use input (when a live toolCallInputMap is supplied).
+      // The presence of a toolCallInputMap signals a live current-turn context;
+      // historical ingest/replay paths omit it and therefore preserve the
+      // truncated text as recorded.
       let contentToExternalize = extractedText;
+      const effectiveToolName =
+        (callId && params.toolCallInputMap?.get(callId)?.name) || toolName;
       if (
-        toolName === "read" &&
+        effectiveToolName === "read" &&
         callId &&
         params.toolCallInputMap &&
         isReadToolTruncated(extractedText)
       ) {
         const toolInput = params.toolCallInputMap.get(callId);
-        const readPath = toolInput && safeString(toolInput.path);
+        const readPath = toolInput?.input && safeString(toolInput.input.path);
         if (readPath && isAbsolute(readPath) && existsSync(readPath)) {
           try {
             contentToExternalize = readFileSync(readPath, "utf8");
@@ -885,7 +890,7 @@ export class LargeFileInterceptor {
       const externalized = await this.externalizeLargeTextPayload({
         conversationId: params.conversationId,
         content: contentToExternalize,
-        fileId: params.getFileId?.({ content: extractedText, toolName, callId }),
+        fileId: params.getFileId?.({ content: contentToExternalize, toolName, callId }),
         fileName: `${toolName}.txt`,
         mimeType: "text/plain",
         formatReference: ({ fileId, byteSize, summary }) =>

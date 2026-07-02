@@ -2545,12 +2545,11 @@ export class LcmContextEngine implements ContextEngine {
     sessionId: string;
     sessionKey?: string;
     message: AgentMessage;
-    toolCallInputMap?: ReadonlyMap<string, Record<string, unknown>>;
     isHeartbeat?: boolean;
     createdAt?: Date | string;
     skipReplayTimestampFloodGuard?: boolean;
   }): Promise<IngestResult> {
-    const { sessionId, sessionKey, message, toolCallInputMap, isHeartbeat, createdAt, skipReplayTimestampFloodGuard } = params;
+    const { sessionId, sessionKey, message, isHeartbeat, createdAt, skipReplayTimestampFloodGuard } = params;
     if (isHeartbeat) {
       return { ingested: false };
     }
@@ -2696,7 +2695,6 @@ export class LcmContextEngine implements ContextEngine {
       const intercepted = await this.largeFileInterceptor.interceptLargeToolResults({
         conversationId,
         message: messageForParts,
-        toolCallInputMap,
       });
       if (intercepted) {
         messageForParts = intercepted.rewrittenMessage;
@@ -2808,13 +2806,11 @@ export class LcmContextEngine implements ContextEngine {
             }
           }
           let ingestedCount = 0;
-          const toolCallInputMap = buildToolCallInputMap(messages);
           for (const message of messages) {
             const result = await this.ingestSingle({
               sessionId: params.sessionId,
               sessionKey: params.sessionKey,
               message,
-              toolCallInputMap,
               isHeartbeat: params.isHeartbeat,
               createdAt: resolveTranscriptMessageCreatedAt(message),
             });
