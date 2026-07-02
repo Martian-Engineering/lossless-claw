@@ -4,6 +4,10 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { AgentMessage } from "../src/openclaw-bridge.js";
 import {
+  MAX_LIVE_READ_RECOVERY_BYTES,
+  recoverLiveReadToolContent,
+} from "../src/read-tool-recovery.js";
+import {
   cleanupEngineTestState,
   createEngineWithConfig,
   createSessionFilePath,
@@ -60,6 +64,40 @@ function readToolResultMessages(params: {
 }
 
 describe("read tool truncation recovery", () => {
+  it("rejects non-file read paths during live recovery", () => {
+    const dirPath = mkdtempSync(join(tmpdir(), "lossless-claw-read-dir-"));
+    tempDirs.push(dirPath);
+    const truncatedOutput = makeTruncatedOutput("[Read output capped at 20 bytes]");
+
+    const recovered = recoverLiveReadToolContent({
+      callId: "call_read_dir",
+      extractedText: truncatedOutput,
+      toolCallInputMap: new Map([
+        ["call_read_dir", { name: "read", input: { path: dirPath } }],
+      ]),
+    });
+
+    expect(recovered).toBe(truncatedOutput);
+  });
+
+  it("rejects oversized read paths during live recovery", () => {
+    const fileDir = mkdtempSync(join(tmpdir(), "lossless-claw-read-large-"));
+    tempDirs.push(fileDir);
+    const filePath = join(fileDir, "large-source.txt");
+    writeFileSync(filePath, Buffer.alloc(MAX_LIVE_READ_RECOVERY_BYTES + 1, "x"));
+    const truncatedOutput = makeTruncatedOutput("[Truncated: content exceeded limit]");
+
+    const recovered = recoverLiveReadToolContent({
+      callId: "call_read_large",
+      extractedText: truncatedOutput,
+      toolCallInputMap: new Map([
+        ["call_read_large", { name: "read", input: { path: filePath } }],
+      ]),
+    });
+
+    expect(recovered).toBe(truncatedOutput);
+  });
+
   it("assemble() recovers full file content from a live current-turn read tool result", async () => {
     const engine = createEngineForRecovery();
     const sessionId = "assemble-read-truncation-recovery";

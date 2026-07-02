@@ -1,7 +1,9 @@
-import { existsSync, readFileSync } from "node:fs";
+import { readFileSync, statSync } from "node:fs";
 import { isAbsolute } from "node:path";
 import type { ToolCallInputMap } from "./tool-pairing.js";
 import { safeString } from "./value-utils.js";
+
+export const MAX_LIVE_READ_RECOVERY_BYTES = 8 * 1024 * 1024;
 
 const READ_CAPPED_RE = /\[Read output capped at/i;
 const READ_TRUNCATED_RE = /\[Truncated:/;
@@ -22,10 +24,14 @@ export function recoverLiveReadToolContent(params: {
   }
   const toolInput = params.toolCallInputMap.get(params.callId);
   const readPath = toolInput?.input && safeString(toolInput.input.path);
-  if (!readPath || !isAbsolute(readPath) || !existsSync(readPath)) {
+  if (!readPath || !isAbsolute(readPath)) {
     return params.extractedText;
   }
   try {
+    const stats = statSync(readPath);
+    if (!stats.isFile() || stats.size > MAX_LIVE_READ_RECOVERY_BYTES) {
+      return params.extractedText;
+    }
     return readFileSync(readPath, "utf8");
   } catch {
     return params.extractedText;
