@@ -1589,6 +1589,9 @@ export async function createLcmSummarizeFromLegacyParams(params: {
       const model = candidate.model;
       const runtimeModelOverride = buildRuntimeModelOverride(candidate);
       const nextCandidate = index < resolvedCandidates.length - 1 ? resolvedCandidates[index + 1]! : undefined;
+      const shouldRequestSummaryThinking =
+        params.deps.config.enableSummaryThinking !== false &&
+        provider.trim().toLowerCase() !== "ollama";
       const runSummarizerCall = async (
         label: string,
         reasoning?: string,
@@ -1609,7 +1612,7 @@ export async function createLcmSummarizeFromLegacyParams(params: {
             },
           ],
           maxTokens: maxTokensOverride ?? initialMaxTokens,
-          ...(params.deps.config.enableSummaryThinking !== false
+          ...(shouldRequestSummaryThinking
             ? ({ reasoningIfSupported: "low" } as const)
             : {}),
           ...(reasoning ? { reasoning } : {}),
@@ -1836,8 +1839,7 @@ export async function createLcmSummarizeFromLegacyParams(params: {
           isCondensed ? condensedTargetTokens : leafTargetTokens,
         );
         try {
-          const retryReasoning =
-            params.deps.config.enableSummaryThinking !== false ? "low" : undefined;
+          const retryReasoning = shouldRequestSummaryThinking ? "low" : undefined;
           const retryResult = await attemptSummarizerCall("retry", retryReasoning, retryMaxTokens);
           const retryNormalized = normalizeCompletionSummary(retryResult.content);
           const retryEnvelopeNormalized = retryNormalized.summary
