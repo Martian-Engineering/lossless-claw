@@ -14,6 +14,7 @@ import type {
   SubagentEndReason,
   SubagentSpawnPreparation,
 } from "./openclaw-bridge.js";
+import { delegateCompactionToRuntime } from "openclaw/plugin-sdk";
 import { contentFromParts, ContextAssembler, pickToolCallId, pickToolIsError, pickToolName } from "./assembler.js";
 import { CompactionEngine, type CompactionConfig } from "./compaction.js";
 import { BatchDeduplicator } from "./batch-dedup.js";
@@ -3995,14 +3996,15 @@ export class LcmContextEngine implements ContextEngine {
     force?: boolean;
   }): Promise<CompactResult> {
     if (this.shouldIgnoreSession({ sessionId: params.sessionId, sessionKey: params.sessionKey })) {
+      // Excluded sessions get no LCM tracking (no DAG, no summary DB rows), so this
+      // plugin cannot compact them itself. Rather than a bare refusal — which OpenClaw
+      // core's preflight guard treats as a hard failure, not a safe skip — delegate to
+      // the framework's own stock compaction path (the same bridge its default
+      // no-plugin engine uses).
       this.deps.log.info(
-        `[lcm] compact: skipped session=${params.sessionId}${params.sessionKey?.trim() ? ` sessionKey=${params.sessionKey.trim()}` : ""} reason=session_excluded`,
+        `[lcm] compact: delegating to runtime session=${params.sessionId}${params.sessionKey?.trim() ? ` sessionKey=${params.sessionKey.trim()}` : ""} reason=session_excluded`,
       );
-      return {
-        ok: true,
-        compacted: false,
-        reason: "session excluded",
-      };
+      return await delegateCompactionToRuntime(params);
     }
     if (this.isStatelessSession(params.sessionKey)) {
       this.deps.log.info(
