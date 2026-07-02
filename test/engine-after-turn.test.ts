@@ -133,6 +133,62 @@ describe("LcmContextEngine afterTurn", () => {
     expect(deferredDebtLog).not.toContain("rawTokensOutsideTail=null");
   });
 
+  it("afterTurn does not let a lower runtime token count suppress local prompt pressure", async () => {
+    const engine = createEngineWithDeps({ freshTailCount: 200 });
+    const sessionId = "after-turn-runtime-count-under-reports-local-estimate";
+    const privateEngine = engine as unknown as {
+      scheduleDeferredCompactionDebtDrain: (params: unknown) => void;
+    };
+    await seedBacklogContext(engine, sessionId, [10]);
+    const scheduleSpy = vi
+      .spyOn(privateEngine, "scheduleDeferredCompactionDebtDrain")
+      .mockImplementation(() => undefined);
+    const compactSpy = vi.spyOn(engine, "compact");
+    const messages = [
+      makeMessage({
+        role: "user",
+        content: [{ type: "text", text: `start ${"x".repeat(6000)}` }],
+      }),
+      makeMessage({
+        role: "assistant",
+        content: [{ type: "text", text: `result ${"y".repeat(6000)}` }],
+      }),
+    ];
+    const localEstimate = estimateSerializedMessagesTokens(messages);
+    expect(localEstimate).toBeGreaterThan(750);
+
+    await engine.afterTurn({
+      sessionId,
+      sessionFile: createSessionFilePath("after-turn-runtime-count-under-reports-local-estimate"),
+      messages,
+      prePromptMessageCount: 0,
+      tokenBudget: 1000,
+      runtimeContext: { currentTokenCount: 300 },
+    });
+
+    const conversation = await engine.getConversationStore().getConversationBySessionId(sessionId);
+    expect(conversation).not.toBeNull();
+    const maintenance = await engine
+      .getCompactionMaintenanceStore()
+      .getConversationCompactionMaintenance(conversation!.conversationId);
+    expect(compactSpy).not.toHaveBeenCalled();
+    expect(scheduleSpy).toHaveBeenCalledWith(
+      expect.objectContaining({
+        sessionId,
+        tokenBudget: 1000,
+        currentTokenCount: localEstimate,
+        reason: "threshold",
+      }),
+    );
+    expect(maintenance).toMatchObject({
+      pending: true,
+      running: false,
+      reason: "threshold",
+      tokenBudget: 1000,
+      currentTokenCount: localEstimate,
+    });
+  });
+
   it("afterTurn schedules prepare-only pending summaries below threshold", async () => {
     const engine = createEngineWithDeps({
       freshTailCount: 1,
