@@ -254,16 +254,27 @@ describe("LcmContextEngine ignored sessions", () => {
     expect(included.messages[0]?.content).toBe("persisted context");
   });
 
-  it("skips compact for ignored sessions while compact still evaluates included sessions", async () => {
-    const engine = createEngineWithConfig({
-      ignoreSessionPatterns: ["agent:*:cron:**"],
-    });
+  it("delegates compact for ignored sessions while compact still evaluates included sessions", async () => {
+    const delegateCompactionToRuntime = vi.fn(async () => ({
+      ok: true,
+      compacted: true,
+      reason: "runtime compacted ignored session",
+      result: { summary: "runtime summary" },
+    }));
+    const ignoredSessionFile = createSessionFilePath("ignored-compact");
+    const engine = createEngineWithDeps(
+      { ignoreSessionPatterns: ["agent:*:cron:**"] },
+      { delegateCompactionToRuntime },
+    );
 
     const ignored = await engine.compact({
       sessionId: ignoredSessionId,
       sessionKey: ignoredSessionKey,
-      sessionFile: createSessionFilePath("ignored-compact"),
+      sessionFile: ignoredSessionFile,
       tokenBudget: 1000,
+      currentTokenCount: 2500,
+      compactionTarget: "budget",
+      runtimeContext: { workspaceDir: "/tmp/workspace" },
     });
 
     await engine.ingest({
@@ -278,13 +289,43 @@ describe("LcmContextEngine ignored sessions", () => {
       tokenBudget: 1000,
     });
 
+    expect(delegateCompactionToRuntime).toHaveBeenCalledTimes(1);
+    expect(delegateCompactionToRuntime).toHaveBeenCalledWith({
+      sessionId: ignoredSessionId,
+      sessionKey: ignoredSessionKey,
+      sessionFile: ignoredSessionFile,
+      tokenBudget: 1000,
+      currentTokenCount: 2500,
+      compactionTarget: "budget",
+      runtimeContext: { workspaceDir: "/tmp/workspace" },
+    });
+    expect(ignored).toEqual({
+      ok: true,
+      compacted: true,
+      reason: "runtime compacted ignored session",
+      result: { summary: "runtime summary" },
+    });
+    expect(included.ok).toBe(true);
+    expect(included.reason).not.toBe("runtime compacted ignored session");
+  });
+
+  it("skips compact for ignored sessions when runtime delegation is unavailable", async () => {
+    const engine = createEngineWithConfig({
+      ignoreSessionPatterns: ["agent:*:cron:**"],
+    });
+
+    const ignored = await engine.compact({
+      sessionId: ignoredSessionId,
+      sessionKey: ignoredSessionKey,
+      sessionFile: createSessionFilePath("ignored-compact-no-delegate"),
+      tokenBudget: 1000,
+    });
+
     expect(ignored).toEqual({
       ok: true,
       compacted: false,
       reason: "session excluded",
     });
-    expect(included.ok).toBe(true);
-    expect(included.reason).not.toBe("session excluded");
   });
 
   it("skips prepareSubagentSpawn for ignored sessions while creating grants for included sessions", async () => {
@@ -1350,4 +1391,3 @@ describe("LcmContextEngine connection lifecycle", () => {
 });
 
 // ── Bootstrap ───────────────────────────────────────────────────────────────
-

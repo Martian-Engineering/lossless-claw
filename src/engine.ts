@@ -4020,8 +4020,16 @@ export class LcmContextEngine implements ContextEngine {
     force?: boolean;
   }): Promise<CompactResult> {
     if (this.shouldIgnoreSession({ sessionId: params.sessionId, sessionKey: params.sessionKey })) {
+      if (this.deps.delegateCompactionToRuntime) {
+        // Excluded sessions get no LCM tracking, so delegate to OpenClaw's
+        // runtime compaction when the host exposes that compatibility bridge.
+        this.deps.log.info(
+          `[lcm] compact: delegating to runtime session=${params.sessionId}${params.sessionKey?.trim() ? ` sessionKey=${params.sessionKey.trim()}` : ""} reason=session_excluded`,
+        );
+        return await this.deps.delegateCompactionToRuntime(params);
+      }
       this.deps.log.info(
-        `[lcm] compact: skipped session=${params.sessionId}${params.sessionKey?.trim() ? ` sessionKey=${params.sessionKey.trim()}` : ""} reason=session_excluded`,
+        `[lcm] compact: skipped session=${params.sessionId}${params.sessionKey?.trim() ? ` sessionKey=${params.sessionKey.trim()}` : ""} reason=session_excluded runtime_delegate=unavailable`,
       );
       return {
         ok: true,
