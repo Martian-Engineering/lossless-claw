@@ -234,6 +234,13 @@ export function buildForkBoundedLiveFallback(params: {
   };
 }
 
+export function forkBoundedLiveSuffixAppendLogLevel(append: {
+  evictedMessages: number;
+  overBudget: boolean;
+}): "warn" | "debug" {
+  return append.overBudget || append.evictedMessages > 0 ? "warn" : "debug";
+}
+
 export function appendForkBoundedLiveSuffixWithinBudget(params: {
   assembledMessages: AgentMessage[];
   assembledEstimatedTokens: number;
