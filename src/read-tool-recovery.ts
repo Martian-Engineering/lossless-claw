@@ -1,4 +1,4 @@
-import { readFileSync, statSync } from "node:fs";
+import { closeSync, fstatSync, openSync, readFileSync } from "node:fs";
 import { isAbsolute } from "node:path";
 import type { ToolCallInputMap } from "./tool-pairing.js";
 import { safeString } from "./value-utils.js";
@@ -27,14 +27,20 @@ export function recoverLiveReadToolContent(params: {
   if (!readPath || !isAbsolute(readPath)) {
     return params.extractedText;
   }
+  let fd: number | undefined;
   try {
-    const stats = statSync(readPath);
+    fd = openSync(readPath, "r");
+    const stats = fstatSync(fd);
     if (!stats.isFile() || stats.size > MAX_LIVE_READ_RECOVERY_BYTES) {
       return params.extractedText;
     }
-    return readFileSync(readPath, "utf8");
+    return readFileSync(fd, "utf8");
   } catch {
     return params.extractedText;
+  } finally {
+    if (fd !== undefined) {
+      closeSync(fd);
+    }
   }
 }
 
