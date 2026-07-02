@@ -1949,8 +1949,6 @@ function throwControlUnavailable(
   throw new LcmProgrammaticControlUnavailableError(operation, reasonCode);
 }
 
-const programmaticRotateTimestampByConversationId = new Map<number, string>();
-
 function classifyProgrammaticRotateUnavailableReason(reason: string | undefined): string {
   const normalized = (reason ?? "").toLowerCase();
   if (normalized.includes("transcript")) {
@@ -1990,14 +1988,10 @@ export async function runLcmProgrammaticControl(params: {
   });
 
   if (params.operation === "status") {
-    const conversationId = current.kind === "resolved" ? current.stats.conversationId : undefined;
     return {
       operation: "status",
       active: current.kind === "resolved",
       messageCount: current.kind === "resolved" ? current.stats.messageCount : 0,
-      lastRotatedAt: conversationId !== undefined
-        ? programmaticRotateTimestampByConversationId.get(conversationId) ?? null
-        : null,
     };
   }
 
@@ -2076,7 +2070,6 @@ export async function runLcmProgrammaticControl(params: {
   }
 
   const rotatedAt = new Date().toISOString();
-  programmaticRotateTimestampByConversationId.set(current.stats.conversationId, rotatedAt);
   const refreshed = await resolveCurrentConversation({
     ctx: params.ctx,
     db: params.db,

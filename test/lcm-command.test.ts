@@ -3185,7 +3185,6 @@ describe("lcm command", () => {
       operation: "status",
       active: true,
       messageCount: 1,
-      lastRotatedAt: null,
     });
     expect(doctor).toMatchObject({
       operation: "doctor",
@@ -3279,7 +3278,6 @@ describe("lcm command", () => {
       operation: "status",
       active: true,
       messageCount: 2,
-      lastRotatedAt: result.lastRotatedAt,
     });
     expect(rotateSessionStorageWithBackup).toHaveBeenCalledWith({
       sessionId: "programmatic-rotate-session",
