@@ -300,6 +300,47 @@ describe("read tool truncation recovery", () => {
     expect(storedContent).not.toBe(fullContent);
   });
 
+  it("assemble() does not recover historical live read results before the active user turn", async () => {
+    const engine = createEngineForRecovery();
+    const sessionId = "assemble-read-historical-live-no-recovery";
+
+    const fileDir = mkdtempSync(join(tmpdir(), "lossless-claw-read-source-"));
+    tempDirs.push(fileDir);
+    const filePath = join(fileDir, "source.txt");
+    const currentContent = Array.from(
+      { length: 30 },
+      (_, index) => `line ${index + 1}: current disk content must not replace history`,
+    ).join("\n");
+    writeFileSync(filePath, currentContent, "utf8");
+
+    const truncatedOutput = makeTruncatedOutput("[Read output capped at 20 bytes]");
+    const liveMessages = [
+      makeMessage({ role: "user", content: "old request" }),
+      ...readToolResultMessages({ filePath, truncatedOutput, callId: "call_old_read" }),
+      makeMessage({ role: "user", content: "new active request" }),
+    ];
+
+    await engine.getConversationStore().getOrCreateConversation(sessionId);
+
+    await engine.assemble({
+      sessionId,
+      messages: liveMessages,
+      tokenBudget: 4096,
+    });
+
+    const conversation = await engine.getConversationStore().getConversationBySessionId(sessionId);
+    expect(conversation).not.toBeNull();
+
+    const largeFiles = await engine
+      .getSummaryStore()
+      .getLargeFilesByConversation(conversation!.conversationId);
+    expect(largeFiles).toHaveLength(1);
+
+    const storedContent = readFileSync(largeFiles[0]!.storageUri, "utf8");
+    expect(storedContent).toBe(truncatedOutput);
+    expect(storedContent).not.toBe(currentContent);
+  });
+
   it("bootstrap import does not rehydrate truncated read tool results from current disk", async () => {
     const largeFilesDir = mkdtempSync(join(tmpdir(), "lossless-claw-large-files-"));
     tempDirs.push(largeFilesDir);

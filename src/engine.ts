@@ -3429,13 +3429,24 @@ export class LcmContextEngine implements ContextEngine {
         // Keep the rewritten view local; OpenClaw owns the live message array.
         const rewrittenMessages = liveMessages.slice();
         let interceptedAny = false;
-        const toolCallInputMap = buildToolCallInputMap(liveMessages);
+        const lastLiveUserIndex = (() => {
+          for (let index = liveMessages.length - 1; index >= 0; index--) {
+            if (liveMessages[index]?.role === "user") {
+              return index;
+            }
+          }
+          return -1;
+        })();
+        const currentTurnToolCallInputMap =
+          lastLiveUserIndex >= 0
+            ? buildToolCallInputMap(liveMessages.slice(lastLiveUserIndex + 1))
+            : undefined;
         for (let i = 0; i < liveMessages.length; i++) {
           const message = liveMessages[i]!;
           const intercepted = await this.largeFileInterceptor.interceptLargeToolResults({
             conversationId: conversation.conversationId,
             message,
-            toolCallInputMap,
+            toolCallInputMap: i > lastLiveUserIndex ? currentTurnToolCallInputMap : undefined,
             getFileId: ({ content, toolName, callId }) =>
               buildLiveToolOutputFileId({
                 conversationId: conversation.conversationId,
