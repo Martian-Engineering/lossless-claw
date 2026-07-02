@@ -106,7 +106,7 @@ export async function runPendingSummaryStaleRecoveryProof(): Promise<PendingSumm
     leaseOwner: "proof-worker",
     config: {
       freshTailCount: 1,
-      leafChunkTokens: 100,
+      leafChunkTokens: 20,
       condensedMinFanout: 99,
       condensedMinSourceTokens: 1,
       condensedChunkTokens: 100,
@@ -217,13 +217,13 @@ export async function runPendingSummaryCompactionProof(): Promise<PendingSummary
       content: "bravo raw message to compact",
       tokenCount: 4,
     },
-    {
-      conversationId: conversation.conversationId,
-      seq: 3,
-      role: "user",
-      content: "charlie raw message to compact",
-      tokenCount: 4,
-    },
+      {
+        conversationId: conversation.conversationId,
+        seq: 3,
+        role: "user",
+        content: "charlie raw message to compact",
+        tokenCount: 8,
+      },
     {
       conversationId: conversation.conversationId,
       seq: 4,

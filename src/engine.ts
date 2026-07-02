@@ -626,6 +626,23 @@ export class LcmContextEngine implements ContextEngine {
     return cap != null && cap > 0 ? Math.min(budget, cap) : budget;
   }
 
+  /** Match pending condensed planning to foreground condensation's token floor. */
+  private resolvePendingCondensedMinSourceTokens(): number {
+    const leafChunkTokens =
+      typeof this.config.leafChunkTokens === "number" &&
+      Number.isFinite(this.config.leafChunkTokens) &&
+      this.config.leafChunkTokens > 0
+        ? Math.floor(this.config.leafChunkTokens)
+        : 20_000;
+    const condensedTargetTokens =
+      typeof this.config.condensedTargetTokens === "number" &&
+      Number.isFinite(this.config.condensedTargetTokens) &&
+      this.config.condensedTargetTokens > 0
+        ? Math.floor(this.config.condensedTargetTokens)
+        : 2_000;
+    return Math.max(condensedTargetTokens, Math.floor(leafChunkTokens * 0.1));
+  }
+
   /** Normalize token counters that may legitimately be zero. */
 
 
@@ -1087,7 +1104,7 @@ export class LcmContextEngine implements ContextEngine {
         freshTailMaxTokens: this.config.freshTailMaxTokens,
         leafChunkTokens: this.config.leafChunkTokens,
         condensedMinFanout: this.config.condensedMinFanout,
-        condensedMinSourceTokens: this.config.condensedTargetTokens,
+        condensedMinSourceTokens: this.resolvePendingCondensedMinSourceTokens(),
         condensedChunkTokens: this.config.leafChunkTokens,
         leaseMs: this.config.summaryTimeoutMs,
         stripInjectedContextTags: this.config.stripInjectedContextTags,
@@ -1147,6 +1164,15 @@ export class LcmContextEngine implements ContextEngine {
         };
       }
       if (lastResult.status === "idle") {
+        if (lastResult.reason === "no claimable pending summary nodes") {
+          return {
+            ok: true,
+            compacted: false,
+            pending: true,
+            reason: lastResult.reason,
+            result: lastResult,
+          };
+        }
         // A spend backoff opened mid-run (guard cap reached during this pass)
         // must surface as a failure so deferred debt stays pending with the
         // backoff as its retry horizon.

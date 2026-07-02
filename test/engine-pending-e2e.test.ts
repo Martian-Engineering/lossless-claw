@@ -92,8 +92,8 @@ describe("pending summary compaction engine e2e (mocked LLM)", () => {
       const sessionId = "pending-e2e-background-loop";
       const sessionFile = createSessionFilePath(sessionId);
 
-      // Backlog of three 100-token messages plus a small fresh-tail turn.
-      await seedBacklogContext(engine, sessionId, [100, 100, 100]);
+      // Backlog of three leaf-sized messages plus a small fresh-tail turn.
+      await seedBacklogContext(engine, sessionId, [120, 120, 120]);
       await engine.ingest({
         sessionId,
         message: makeMessage({ role: "assistant", content: "fresh tail turn one" }),
@@ -107,8 +107,8 @@ describe("pending summary compaction engine e2e (mocked LLM)", () => {
       });
       const conversationId = await conversationIdFor(engine, sessionId);
 
-      // The 100-token backlog against leafChunkTokens=120 chunks into three
-      // leaves; wait for the background drain to prepare all of them.
+      // The 120-token backlog meets leafChunkTokens=120 exactly, producing
+      // three leaves; wait for the background drain to prepare all of them.
       const batchId = await waitForReadyNodes(engine, conversationId, 3);
       expect(complete.mock.calls.length).toBe(3);
 
@@ -210,7 +210,7 @@ describe("pending summary compaction engine e2e (mocked LLM)", () => {
       const sessionId = "pending-e2e-manual-promotion";
       const sessionFile = createSessionFilePath(sessionId);
 
-      await seedBacklogContext(engine, sessionId, [100, 100, 100]);
+      await seedBacklogContext(engine, sessionId, [120, 120, 120]);
       await engine.ingest({
         sessionId,
         message: makeMessage({ role: "assistant", content: "fresh tail turn" }),
