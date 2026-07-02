@@ -835,7 +835,7 @@ export class LargeFileInterceptor {
         rewrittenContent.push(item);
         continue;
       }
-      if (typeof extractedText !== "string" || estimateTokens(extractedText) < threshold) {
+      if (typeof extractedText !== "string") {
         rewrittenContent.push(item);
         continue;
       }
@@ -859,14 +859,31 @@ export class LargeFileInterceptor {
         continue;
       }
 
-      interceptedAny = true;
-
       const externalizedPayload = resolveLiveToolResultExternalization({
         toolName,
         callId,
         extractedText,
         toolCallInputMap: params.toolCallInputMap,
       });
+      if (estimateTokens(externalizedPayload.content) < threshold) {
+        if (externalizedPayload.content !== extractedText) {
+          const recoveredBlock = { ...record };
+          if (isPlainTextToolResult) {
+            recoveredBlock.text = externalizedPayload.content;
+          } else if ("output" in recoveredBlock || !("content" in recoveredBlock)) {
+            recoveredBlock.output = externalizedPayload.content;
+          } else {
+            recoveredBlock.content = externalizedPayload.content;
+          }
+          interceptedAny = true;
+          rewrittenContent.push(recoveredBlock);
+        } else {
+          rewrittenContent.push(item);
+        }
+        continue;
+      }
+
+      interceptedAny = true;
 
       const externalized = await this.externalizeLargeTextPayload({
         conversationId: params.conversationId,

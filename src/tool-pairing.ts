@@ -68,10 +68,31 @@ export type ToolCallInputMap = ReadonlyMap<
   { name?: string; input?: Record<string, unknown> }
 >;
 
+function parseToolCallInput(record: Record<string, unknown>): Record<string, unknown> | undefined {
+  const directInput = asRecord(record.input);
+  if (directInput) {
+    return directInput;
+  }
+  const directArguments = asRecord(record.arguments);
+  if (directArguments) {
+    return directArguments;
+  }
+  if (typeof record.arguments !== "string") {
+    return undefined;
+  }
+  try {
+    return asRecord(JSON.parse(record.arguments));
+  } catch {
+    return undefined;
+  }
+}
+
 export function buildToolCallInputMap(
   messages: AgentMessage[],
 ): ToolCallInputMap {
   const map = new Map<string, { name?: string; input?: Record<string, unknown> }>();
+  const seenIds = new Set<string>();
+  const ambiguousIds = new Set<string>();
   for (const message of messages) {
     if (message.role !== "assistant" || !Array.isArray(message.content)) {
       continue;
@@ -83,8 +104,17 @@ export function buildToolCallInputMap(
       }
       const id = extractToolPairingIdFromRecord(record);
       const name = safeString(record.name);
-      const input = asRecord(record.input) ?? asRecord(record.arguments);
-      if (id && input) {
+      const input = parseToolCallInput(record);
+      if (!id) {
+        continue;
+      }
+      if (seenIds.has(id)) {
+        map.delete(id);
+        ambiguousIds.add(id);
+        continue;
+      }
+      seenIds.add(id);
+      if (input && !ambiguousIds.has(id)) {
         map.set(id, { name, input });
       }
     }

@@ -7,6 +7,7 @@ import {
   MAX_LIVE_READ_RECOVERY_BYTES,
   recoverLiveReadToolContent,
 } from "../src/read-tool-recovery.js";
+import { buildToolCallInputMap } from "../src/tool-pairing.js";
 import {
   cleanupEngineTestState,
   createEngineWithConfig,
@@ -18,11 +19,13 @@ import {
 
 afterEach(cleanupEngineTestState);
 
-function createEngineForRecovery(overrides?: Partial<{ largeFilesDir: string }>) {
+function createEngineForRecovery(
+  overrides?: Partial<{ largeFilesDir: string; largeFileTokenThreshold: number }>,
+) {
   const largeFilesDir = overrides?.largeFilesDir ?? mkdtempSync(join(tmpdir(), "lossless-claw-large-files-"));
   tempDirs.push(largeFilesDir);
   return createEngineWithConfig({
-    largeFileTokenThreshold: 20,
+    largeFileTokenThreshold: overrides?.largeFileTokenThreshold ?? 20,
     stubLargeToolPayloads: true,
     largeFilesDir,
   });
@@ -98,6 +101,71 @@ describe("read tool truncation recovery", () => {
     expect(recovered).toBe(truncatedOutput);
   });
 
+  it("does not recover from duplicate tool call ids", () => {
+    const firstDir = mkdtempSync(join(tmpdir(), "lossless-claw-read-first-"));
+    const secondDir = mkdtempSync(join(tmpdir(), "lossless-claw-read-second-"));
+    tempDirs.push(firstDir, secondDir);
+    const firstPath = join(firstDir, "first.txt");
+    const secondPath = join(secondDir, "second.txt");
+    writeFileSync(firstPath, "first file content", "utf8");
+    writeFileSync(secondPath, "second file content", "utf8");
+
+    const toolCallInputMap = buildToolCallInputMap([
+      makeMessage({
+        role: "assistant",
+        content: [
+          { type: "tool_use", id: "duplicate_read", name: "read", input: { path: firstPath } },
+        ],
+      }),
+      makeMessage({
+        role: "assistant",
+        content: [
+          { type: "tool_use", id: "duplicate_read", name: "read", input: { path: secondPath } },
+        ],
+      }),
+    ]);
+    const truncatedOutput = makeTruncatedOutput("[Read output capped at 20 bytes]");
+
+    const recovered = recoverLiveReadToolContent({
+      callId: "duplicate_read",
+      extractedText: truncatedOutput,
+      toolCallInputMap,
+    });
+
+    expect(recovered).toBe(truncatedOutput);
+  });
+
+  it("recovers read paths from JSON-string function_call arguments", () => {
+    const fileDir = mkdtempSync(join(tmpdir(), "lossless-claw-read-function-call-"));
+    tempDirs.push(fileDir);
+    const filePath = join(fileDir, "source.txt");
+    const fullContent = "function_call JSON arguments should recover this content";
+    writeFileSync(filePath, fullContent, "utf8");
+
+    const toolCallInputMap = buildToolCallInputMap([
+      makeMessage({
+        role: "assistant",
+        content: [
+          {
+            type: "function_call",
+            call_id: "call_function_read",
+            name: "read",
+            arguments: JSON.stringify({ path: filePath }),
+          },
+        ],
+      }),
+    ]);
+    const truncatedOutput = makeTruncatedOutput("[Read output capped at 20 bytes]");
+
+    const recovered = recoverLiveReadToolContent({
+      callId: "call_function_read",
+      extractedText: truncatedOutput,
+      toolCallInputMap,
+    });
+
+    expect(recovered).toBe(fullContent);
+  });
+
   it("assemble() recovers full file content from a live current-turn read tool result", async () => {
     const engine = createEngineForRecovery();
     const sessionId = "assemble-read-truncation-recovery";
@@ -105,7 +173,10 @@ describe("read tool truncation recovery", () => {
     const fileDir = mkdtempSync(join(tmpdir(), "lossless-claw-read-source-"));
     tempDirs.push(fileDir);
     const filePath = join(fileDir, "source.txt");
-    const fullContent = ["line 1", "line 2", "line 3", "line 4", "line 5"].join("\n");
+    const fullContent = Array.from(
+      { length: 30 },
+      (_, index) => `line ${index + 1}: recovered read content should be externalized`,
+    ).join("\n");
     writeFileSync(filePath, fullContent, "utf8");
 
     const truncatedOutput = makeTruncatedOutput("[Read output capped at 50 bytes]");
@@ -145,6 +216,50 @@ describe("read tool truncation recovery", () => {
       .join("\n");
     expect(stubText).toContain(`[LCM Tool Output: ${largeFiles[0]!.fileId}`);
     expect(stubText).toContain("tool=read");
+  });
+
+  it("assemble() recovers capped read output before applying the large-tool threshold", async () => {
+    const engine = createEngineForRecovery({ largeFileTokenThreshold: 25_000 });
+    const sessionId = "assemble-read-recovery-before-threshold";
+
+    const fileDir = mkdtempSync(join(tmpdir(), "lossless-claw-read-source-"));
+    tempDirs.push(fileDir);
+    const filePath = join(fileDir, "source.txt");
+    const fullContent = [
+      "Recovered content should be visible to the model.",
+      "The capped fragment alone is below the default large-tool threshold.",
+      "Lossless should still use the paired live read path.",
+    ].join("\n");
+    writeFileSync(filePath, fullContent, "utf8");
+
+    const truncatedOutput = makeTruncatedOutput("[Read output capped at 32768 bytes]");
+    const liveMessages = [
+      makeMessage({ role: "user", content: "read the file" }),
+      ...readToolResultMessages({ filePath, truncatedOutput }),
+    ];
+
+    await engine.getConversationStore().getOrCreateConversation(sessionId);
+
+    const assembleResult = await engine.assemble({
+      sessionId,
+      messages: liveMessages,
+      tokenBudget: 4096,
+    });
+
+    const conversation = await engine.getConversationStore().getConversationBySessionId(sessionId);
+    expect(conversation).not.toBeNull();
+
+    const largeFiles = await engine
+      .getSummaryStore()
+      .getLargeFilesByConversation(conversation!.conversationId);
+    expect(largeFiles).toHaveLength(0);
+
+    const promptText = assembleResult.messages
+      .map((m) => (typeof m.content === "string" ? m.content : JSON.stringify(m.content)))
+      .join("\n");
+    expect(promptText).toContain("Recovered content should be visible to the model.");
+    expect(promptText).toContain("Lossless should still use the paired live read path.");
+    expect(promptText).not.toContain("[Read output capped at 32768 bytes]");
   });
 
   it("afterTurn() ingest preserves truncated read tool result without recovery", async () => {
