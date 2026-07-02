@@ -1059,9 +1059,15 @@ export class TranscriptReconciler {
         importedMessages += 1;
       }
     }
-    this.host.deps.log.warn(
-      `[lcm] reconcileSessionTail: no anchor for ${sessionContext}; imported transcript as new epoch reason=${params.noAnchorImportReason ?? "unspecified"} duration=${formatDurationMs(Date.now() - startedAt)} historicalMessages=${historicalMessages.length} candidateMessages=${noAnchorImportMessages.length} importedMessages=${importedMessages} adoptedMessages=${adoptedMessages} capped=${noAnchorImportCapped} overlap=${adoptedMessages > 0}`,
-    );
+    // A fresh-ambiguous-rollover rebind imports the rolled transcript as a new
+    // epoch by design (the lane just healed), so record it at info. Every other
+    // no-anchor new-epoch import is an unexpected reconciliation worth a warn.
+    const noAnchorEpochImport = `[lcm] reconcileSessionTail: no anchor for ${sessionContext}; imported transcript as new epoch reason=${params.noAnchorImportReason ?? "unspecified"} duration=${formatDurationMs(Date.now() - startedAt)} historicalMessages=${historicalMessages.length} candidateMessages=${noAnchorImportMessages.length} importedMessages=${importedMessages} adoptedMessages=${adoptedMessages} capped=${noAnchorImportCapped} overlap=${adoptedMessages > 0}`;
+    if (params.noAnchorImportReason === "fresh-ambiguous-rollover-rebind") {
+      this.host.deps.log.info(noAnchorEpochImport);
+    } else {
+      this.host.deps.log.warn(noAnchorEpochImport);
+    }
     if (noAnchorImportCapped) {
       // Partial pass: keep the checkpoint un-advanced so the next pass
       // continues the drain (via the entry-id anchor once this chunk's
@@ -2013,7 +2019,7 @@ export class TranscriptReconciler {
           // Tier-2 resolution: rebind the frozen conversation and import the
           // fresh transcript now. The freshness proof is the extra safety signal
           // that lets the no-anchor path ingest the full id-less transcript.
-          const rotatedForFreshTranscript =
+          const rolloverResolution =
             await this.rolloverDetector.rotateAmbiguousRolloverForProvablyFreshTranscript({
               phase: "afterTurn",
               sessionId: params.sessionId,
@@ -2021,7 +2027,7 @@ export class TranscriptReconciler {
               candidateMessages: historicalMessages,
               createReplacement: true,
             });
-          if (rotatedForFreshTranscript) {
+          if (rolloverResolution.rebound) {
             const reconcile = await this.importFreshAmbiguousRolloverTranscript({
               sessionId: params.sessionId,
               sessionKey: params.sessionKey,
@@ -2041,6 +2047,7 @@ export class TranscriptReconciler {
             rollover: ambiguousRollover,
             sessionId: params.sessionId,
             sessionFile: params.sessionFile,
+            expected: rolloverResolution.preserveExpected,
           });
           return {
             importedMessages: 0,

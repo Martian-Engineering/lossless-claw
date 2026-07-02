@@ -41,6 +41,34 @@ export type AmbiguousSessionKeyRuntimeRollover = {
   trackedSessionFile: string;
 };
 
+/**
+ * Outcome of a tier-2 ambiguous-rollover resolution attempt. `rebound` means
+ * the lane healed in place. When it did not, `preserveExpected` is true only for
+ * a transient freshness failure (the new transcript cannot be judged yet and the
+ * next turn re-evaluates); a conflicting or anomalous failure leaves it false.
+ */
+export type AmbiguousRolloverResolution =
+  | { rebound: true }
+  | { rebound: false; preserveExpected: boolean };
+
+/**
+ * Freshness verdicts where the new transcript simply lacks the evidence to prove
+ * a reset YET (no usable timestamps, delivery-only traffic, nothing comparable):
+ * the preserve is a pending state the next turn re-evaluates, not a stuck freeze.
+ * Every other not-fresh reason (identity overlap, candidate entries predating
+ * persistence) is a genuine conflict that does not heal and stays a warn.
+ */
+const TRANSIENT_AMBIGUOUS_ROLLOVER_FRESHNESS_REASONS = new Set<string>([
+  "no-candidate-timestamps",
+  "candidate-missing-timestamp",
+  "delivery-only-synthetic-transcript",
+  "no-comparable-candidate-content",
+]);
+
+function isTransientAmbiguousRolloverFreshness(reason: string): boolean {
+  return TRANSIENT_AMBIGUOUS_ROLLOVER_FRESHNESS_REASONS.has(reason);
+}
+
 /** Engine callback that closes the old conversation and optionally creates its replacement. */
 export type ApplySessionReplacementFn = (params: {
   reason: string;
@@ -233,10 +261,19 @@ export class SessionRolloverDetector {
     rollover: AmbiguousSessionKeyRuntimeRollover;
     sessionId: string;
     sessionFile?: string;
+    // The assemble pass defers freshness judgment to the next bootstrap/afterTurn,
+    // so its preserve is a transient per-phase restatement that resolves on the
+    // healing pass, not a lane that stayed stuck. Only the genuine freeze (a
+    // bootstrap/afterTurn pass that judged the rollover and could not heal it)
+    // warns.
+    expected?: boolean;
   }): void {
-    this.deps.log.warn(
-      `[lcm] ${params.phase}: ${AMBIGUOUS_SESSION_KEY_RUNTIME_ROLLOVER_REASON}; preserving conversation=${params.rollover.conversationId} session=${params.sessionId} sessionKey=${params.rollover.sessionKey} oldSessionId=${params.rollover.activeSessionId} oldFile=${params.rollover.trackedSessionFile}${params.sessionFile ? ` newFile=${params.sessionFile}` : ""}`,
-    );
+    const message = `[lcm] ${params.phase}: ${AMBIGUOUS_SESSION_KEY_RUNTIME_ROLLOVER_REASON}; preserving conversation=${params.rollover.conversationId} session=${params.sessionId} sessionKey=${params.rollover.sessionKey} oldSessionId=${params.rollover.activeSessionId} oldFile=${params.rollover.trackedSessionFile}${params.sessionFile ? ` newFile=${params.sessionFile}` : ""}`;
+    if (params.expected) {
+      this.deps.log.debug(message);
+    } else {
+      this.deps.log.warn(message);
+    }
   }
 
   /**
@@ -407,9 +444,9 @@ export class SessionRolloverDetector {
    * rollover is a legitimate runtime session-file reset, not a foreign
    * transcript sharing the key. Rebind the existing conversation row so all
    * summaries, messages, frontier rows, and metadata keep the same
-   * conversation id while the new session can bootstrap normally. Returns
-   * true when rebound; false leaves the existing freeze-and-preserve
-   * behavior in place.
+   * conversation id while the new session can bootstrap normally. Returns the
+   * rebind outcome plus whether a non-rebound preserve is an expected pending
+   * state rather than a genuine freeze.
    */
   async rotateAmbiguousRolloverForProvablyFreshTranscript(params: {
     phase: "bootstrap" | "assemble" | "afterTurn";
@@ -417,7 +454,7 @@ export class SessionRolloverDetector {
     rollover: AmbiguousSessionKeyRuntimeRollover;
     candidateMessages: AgentMessage[];
     createReplacement: boolean;
-  }): Promise<boolean> {
+  }): Promise<AmbiguousRolloverResolution> {
     let verdict: Awaited<ReturnType<SessionRolloverDetector["evaluateAmbiguousRolloverFreshness"]>>;
     try {
       verdict = await this.evaluateAmbiguousRolloverFreshness({
@@ -428,13 +465,17 @@ export class SessionRolloverDetector {
       this.deps.log.warn(
         `[lcm] ${params.phase}: ambiguous rollover freshness check failed conversation=${params.rollover.conversationId} error=${describeLogError(err)}`,
       );
-      return false;
+      return { rebound: false, preserveExpected: false };
     }
     if (!verdict.fresh) {
-      this.deps.log.warn(
-        `[lcm] ${params.phase}: ambiguous rollover not provably fresh conversation=${params.rollover.conversationId} sessionKey=${params.rollover.sessionKey} freshness=${verdict.reason} lastPersistedAt=${verdict.lastPersistedAt?.toISOString() ?? "none"} firstCandidateAt=${verdict.firstCandidateAt !== null ? new Date(verdict.firstCandidateAt).toISOString() : "none"}`,
-      );
-      return false;
+      const preserveExpected = isTransientAmbiguousRolloverFreshness(verdict.reason);
+      const message = `[lcm] ${params.phase}: ambiguous rollover not provably fresh conversation=${params.rollover.conversationId} sessionKey=${params.rollover.sessionKey} freshness=${verdict.reason} lastPersistedAt=${verdict.lastPersistedAt?.toISOString() ?? "none"} firstCandidateAt=${verdict.firstCandidateAt !== null ? new Date(verdict.firstCandidateAt).toISOString() : "none"}`;
+      if (preserveExpected) {
+        this.deps.log.info(message);
+      } else {
+        this.deps.log.warn(message);
+      }
+      return { rebound: false, preserveExpected };
     }
 
     const rebound = await this.conversationStore.rebindConversationSession(
@@ -446,13 +487,15 @@ export class SessionRolloverDetector {
       this.deps.log.warn(
         `[lcm] ${params.phase}: ambiguous rollover rebind failed conversation=${params.rollover.conversationId} sessionKey=${params.rollover.sessionKey} oldSessionId=${params.rollover.activeSessionId} newSessionId=${params.sessionId}; leaving lane frozen`,
       );
-      return false;
+      return { rebound: false, preserveExpected: false };
     }
 
-    this.deps.log.warn(
+    // Expected success: the lane healed in place. Logged at info so the
+    // recovery is observable without flagging a routine /new as an anomaly.
+    this.deps.log.info(
       `[lcm] ${params.phase}: ambiguous rollover resolved by fresh-transcript rebind conversation=${params.rollover.conversationId} sessionKey=${params.rollover.sessionKey} oldSessionId=${params.rollover.activeSessionId} newSessionId=${params.sessionId} candidateMessages=${params.candidateMessages.length} lastPersistedAt=${verdict.lastPersistedAt?.toISOString() ?? "none"} firstCandidateAt=${verdict.firstCandidateAt !== null ? new Date(verdict.firstCandidateAt).toISOString() : "none"}`,
     );
-    return true;
+    return { rebound: true };
   }
 
   async transcriptContainsCurrentConversationTailAnchor(params: {

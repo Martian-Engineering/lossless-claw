@@ -264,9 +264,14 @@ describe("ambiguous rollover tier-2 fresh-transcript rotation", () => {
       sessionFile: newSessionFile,
     });
 
-    expect(log.warn).toHaveBeenCalledWith(
+    expect(log.warn).not.toHaveBeenCalledWith(
       expect.stringContaining("resolved by fresh-transcript rebind"),
     );
+    expect(log.info).toHaveBeenCalledWith(
+      expect.stringContaining("resolved by fresh-transcript rebind"),
+    );
+    // A successful /new heal must be silent: no warn-level noise on the happy path.
+    expect(log.warn).not.toHaveBeenCalled();
     expect(result.bootstrapped).toBe(true);
     expect(result.importedMessages).toBeGreaterThan(0);
 
@@ -301,7 +306,10 @@ describe("ambiguous rollover tier-2 fresh-transcript rotation", () => {
       sessionFile: newSessionFile,
     });
 
-    expect(log.warn).toHaveBeenCalledWith(
+    expect(log.warn).not.toHaveBeenCalledWith(
+      expect.stringContaining("resolved by fresh-transcript rebind"),
+    );
+    expect(log.info).toHaveBeenCalledWith(
       expect.stringContaining("resolved by fresh-transcript rebind"),
     );
     expect(result.bootstrapped).toBe(true);
@@ -357,7 +365,10 @@ describe("ambiguous rollover tier-2 fresh-transcript rotation", () => {
       sessionFile: newSessionFile,
     });
 
-    expect(log.warn).toHaveBeenCalledWith(
+    expect(log.warn).not.toHaveBeenCalledWith(
+      expect.stringContaining("resolved by fresh-transcript rebind"),
+    );
+    expect(log.info).toHaveBeenCalledWith(
       expect.stringContaining("resolved by fresh-transcript rebind"),
     );
     expect(result.bootstrapped).toBe(true);
@@ -404,7 +415,10 @@ describe("ambiguous rollover tier-2 fresh-transcript rotation", () => {
       sessionFile: newSessionFile,
     });
 
-    expect(log.warn).toHaveBeenCalledWith(
+    expect(log.warn).not.toHaveBeenCalledWith(
+      expect.stringContaining("resolved by fresh-transcript rebind"),
+    );
+    expect(log.info).toHaveBeenCalledWith(
       expect.stringContaining("resolved by fresh-transcript rebind"),
     );
     expect(result.bootstrapped).toBe(true);
@@ -439,7 +453,10 @@ describe("ambiguous rollover tier-2 fresh-transcript rotation", () => {
       tokenBudget: 10_000,
     });
 
-    expect(log.warn).toHaveBeenCalledWith(
+    expect(log.warn).not.toHaveBeenCalledWith(
+      expect.stringContaining("resolved by fresh-transcript rebind"),
+    );
+    expect(log.info).toHaveBeenCalledWith(
       expect.stringContaining("resolved by fresh-transcript rebind"),
     );
     const reboundAfterFirst = await engine
@@ -499,6 +516,49 @@ describe("ambiguous rollover tier-2 fresh-transcript rotation", () => {
     expect(log.warn).toHaveBeenCalledWith(
       expect.stringContaining("freshness=identity-overlap-with-persisted-history"),
     );
+    // A conflicting overlap is a genuine freeze (it never heals), so the
+    // preserve stays at warn.
+    expect(log.warn).toHaveBeenCalledWith(
+      expect.stringContaining("ambiguous session-key runtime rollover; preserving"),
+    );
+    const conversation = await engine
+      .getConversationStore()
+      .getConversationBySessionKey(SESSION_KEY);
+    expect(conversation?.conversationId).toBe(lane.conversationId);
+    expect(conversation?.sessionId).toBe(OLD_SESSION_ID);
+  });
+
+  it("demotes the preserve to debug when freshness is only transiently unjudgeable (live /new shape)", async () => {
+    const { engine, log, db } = createEngine();
+    const lane = await seedFrozenLane(engine, db);
+
+    // The new session's first event has no usable timestamp (delivery/empty), so
+    // freshness cannot be judged yet: the preserve is a pending state the next
+    // turn re-evaluates. This is the live conv-56 /new shape (freshness=
+    // candidate-missing-timestamp); a pending preserve must NOT warn. If the
+    // transcript later conflicts, that turn's preserve warns on its own.
+    const bareFile = createTempFile(
+      "bare-no-timestamps.jsonl",
+      `${JSON.stringify({ role: "user", content: [{ type: "text", text: "first post-new turn, no timestamp" }] })}\n`,
+    );
+
+    const result = await engine.bootstrap({
+      sessionId: NEW_SESSION_ID,
+      sessionKey: SESSION_KEY,
+      sessionFile: bareFile,
+    });
+
+    expect(result.bootstrapped).toBe(false);
+    expect(result.reason).toBe("ambiguous session-key runtime rollover");
+    expect(log.info).toHaveBeenCalledWith(
+      expect.stringContaining("freshness=candidate-missing-timestamp"),
+    );
+    expect(log.debug).toHaveBeenCalledWith(
+      expect.stringContaining("ambiguous session-key runtime rollover; preserving"),
+    );
+    expect(log.warn).not.toHaveBeenCalledWith(
+      expect.stringContaining("ambiguous session-key runtime rollover; preserving"),
+    );
     const conversation = await engine
       .getConversationStore()
       .getConversationBySessionKey(SESSION_KEY);
@@ -537,7 +597,7 @@ describe("ambiguous rollover tier-2 fresh-transcript rotation", () => {
       sessionFile: bareFile,
     });
     expect(bareResult.bootstrapped).toBe(false);
-    expect(log.warn).toHaveBeenCalledWith(
+    expect(log.info).toHaveBeenCalledWith(
       expect.stringContaining("freshness=candidate-missing-timestamp"),
     );
 
@@ -575,10 +635,10 @@ describe("ambiguous rollover tier-2 fresh-transcript rotation", () => {
 
     expect(result.bootstrapped).toBe(false);
     expect(result.reason).toBe("ambiguous session-key runtime rollover");
-    expect(log.warn).toHaveBeenCalledWith(
+    expect(log.info).toHaveBeenCalledWith(
       expect.stringContaining("freshness=delivery-only-synthetic-transcript"),
     );
-    expect(log.warn).not.toHaveBeenCalledWith(
+    expect(log.info).not.toHaveBeenCalledWith(
       expect.stringContaining("resolved by fresh-transcript rebind"),
     );
     const conversation = await engine
@@ -616,10 +676,10 @@ describe("ambiguous rollover tier-2 fresh-transcript rotation", () => {
 
     expect(result.bootstrapped).toBe(false);
     expect(result.reason).toBe("ambiguous session-key runtime rollover");
-    expect(log.warn).toHaveBeenCalledWith(
+    expect(log.info).toHaveBeenCalledWith(
       expect.stringContaining("freshness=no-comparable-candidate-content"),
     );
-    expect(log.warn).not.toHaveBeenCalledWith(
+    expect(log.info).not.toHaveBeenCalledWith(
       expect.stringContaining("resolved by fresh-transcript rebind"),
     );
     const conversation = await engine
@@ -667,10 +727,10 @@ describe("ambiguous rollover tier-2 fresh-transcript rotation", () => {
     });
 
     expect(result.messages.length).toBeGreaterThan(0);
-    expect(log.warn).toHaveBeenCalledWith(
+    expect(log.debug).toHaveBeenCalledWith(
       expect.stringContaining("ambiguous session-key runtime rollover; preserving"),
     );
-    expect(log.warn).not.toHaveBeenCalledWith(
+    expect(log.info).not.toHaveBeenCalledWith(
       expect.stringContaining("resolved by fresh-transcript rebind"),
     );
     const conversation = await engine
@@ -718,7 +778,10 @@ describe("ambiguous rollover tier-2 fresh-transcript rotation", () => {
       tokenBudget: 10_000,
     });
 
-    expect(log.warn).toHaveBeenCalledWith(
+    expect(log.warn).not.toHaveBeenCalledWith(
+      expect.stringContaining("resolved by fresh-transcript rebind"),
+    );
+    expect(log.info).toHaveBeenCalledWith(
       expect.stringContaining("resolved by fresh-transcript rebind"),
     );
     const rebound = await engine
@@ -785,7 +848,10 @@ describe("ambiguous rollover tier-2 fresh-transcript rotation", () => {
       sessionFile: newSessionFile,
     });
 
-    expect(log.warn).toHaveBeenCalledWith(
+    expect(log.warn).not.toHaveBeenCalledWith(
+      expect.stringContaining("resolved by fresh-transcript rebind"),
+    );
+    expect(log.info).toHaveBeenCalledWith(
       expect.stringContaining("resolved by fresh-transcript rebind"),
     );
     expect(result.bootstrapped).toBe(true);
@@ -844,7 +910,10 @@ describe("ambiguous rollover tier-2 fresh-transcript rotation", () => {
       sessionFile: newSessionFile,
     });
 
-    expect(log.warn).toHaveBeenCalledWith(
+    expect(log.warn).not.toHaveBeenCalledWith(
+      expect.stringContaining("resolved by fresh-transcript rebind"),
+    );
+    expect(log.info).toHaveBeenCalledWith(
       expect.stringContaining("resolved by fresh-transcript rebind"),
     );
     expect(result.bootstrapped).toBe(true);
