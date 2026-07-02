@@ -54,19 +54,45 @@ describe("pending summary planner", () => {
     });
 
     expect(nodes.map((node) => [node.nodeId, node.ordinalStart, node.ordinalEnd])).toEqual([
-      ["leaf-leaf-0-0", 0, 0],
-      ["leaf-leaf-1-1", 1, 1],
-      ["leaf-leaf-3-3", 3, 3],
-      ["leaf-leaf-4-4", 4, 4],
+      ["leaf-leaf-0-1", 0, 1],
+      ["leaf-leaf-3-4", 3, 4],
     ]);
-    expect(nodes.map((node) => node.sourceMessageIds)).toEqual([[10], [11], [12], [13]]);
+    expect(nodes.map((node) => node.sourceMessageIds)).toEqual([[10, 11], [12, 13]]);
+  });
+
+  it("does not plan an under-threshold compactable prefix as a leaf", () => {
+    const nodes = planPendingLeafNodes({
+      items: [
+        message(0, 10, 334),
+        ...Array.from({ length: 128 }, (_, index) => message(index + 1, 11 + index, 1)),
+      ],
+      freshTailCount: 128,
+      leafChunkTokens: 20_000,
+      nodeIdPrefix: "leaf",
+    });
+
+    expect(nodes).toEqual([]);
+  });
+
+  it("does not plan an under-threshold trailing leaf after an eligible chunk", () => {
+    const nodes = planPendingLeafNodes({
+      items: [message(0, 10, 6), message(1, 11, 6), message(2, 12, 3)],
+      freshTailCount: 0,
+      leafChunkTokens: 10,
+      nodeIdPrefix: "leaf",
+    });
+
+    expect(nodes.map((node) => [node.nodeId, node.ordinalStart, node.ordinalEnd])).toEqual([
+      ["leaf-leaf-0-1", 0, 1],
+    ]);
+    expect(nodes.map((node) => node.sourceMessageIds)).toEqual([[10, 11]]);
   });
 
   it("plans condensed parents over adjacent same-depth nodes", () => {
     const leafNodes = planPendingLeafNodes({
       items: [message(0, 10, 5), message(1, 11, 5), message(2, 12, 5)],
       freshTailCount: 0,
-      leafChunkTokens: 6,
+      leafChunkTokens: 5,
       nodeIdPrefix: "leaf",
     });
 
@@ -91,7 +117,7 @@ describe("pending summary planner", () => {
 
   it("clamps a misconfigured fanout of one instead of looping forever", () => {
     const leafNodes = planPendingLeafNodes({
-      items: [message(0, 10, 50)],
+      items: [message(0, 10, 60)],
       freshTailCount: 0,
       leafChunkTokens: 60,
       nodeIdPrefix: "leaf",
@@ -224,7 +250,7 @@ describe("pending summary planner", () => {
     const leafNodes = planPendingLeafNodes({
       items: [message(0, 10, 5), message(1, 11, 5), message(2, 12, 5)],
       freshTailCount: 0,
-      leafChunkTokens: 6,
+      leafChunkTokens: 5,
       nodeIdPrefix: "leaf",
     });
     const condensedNodes = planPendingCondensedNodes({
