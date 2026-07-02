@@ -49,14 +49,17 @@ function toModelRef(provider, model) {
   if (!modelId) {
     return undefined;
   }
+  const providerId = readString(provider);
+  if (providerId) {
+    return `${providerId}/${modelId}`;
+  }
   const slash = modelId.indexOf("/");
   if (slash > 0 && slash < modelId.length - 1) {
     const directProvider = modelId.slice(0, slash).trim();
     const directModel = modelId.slice(slash + 1).trim();
     return directProvider && directModel ? `${directProvider}/${directModel}` : undefined;
   }
-  const providerId = readString(provider);
-  return providerId ? `${providerId}/${modelId}` : undefined;
+  return undefined;
 }
 
 function uniqueModelRefs(modelRefs) {

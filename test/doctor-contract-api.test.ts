@@ -177,6 +177,31 @@ describe("doctor contract runtime LLM compatibility", () => {
     expect(mutation.config.plugins.entries["lossless-claw"].subagent.allowedModels).toEqual(["*"]);
   });
 
+  it("prefers explicit fallback provider over slash-parsed provider in model", () => {
+    const result = collectLosslessRuntimeLlmModelRefs({
+      plugins: {
+        entries: {
+          "lossless-claw": {
+            config: {
+              fallbackProviders: [
+                { provider: "openrouter", model: "anthropic/claude-sonnet-4-6" },
+              ],
+            },
+          },
+        },
+      },
+    });
+
+    expect(result.modelRefs).toEqual([
+      {
+        field: "fallbackProviders",
+        modelRef: "openrouter/anthropic/claude-sonnet-4-6",
+        configPath: "plugins.entries.lossless-claw.config.fallbackProviders[0]",
+      },
+    ]);
+    expect(result.skipped).toEqual([]);
+  });
+
   it("reports bare fallback models as skipped instead of inventing refs", () => {
     const result = collectLosslessRuntimeLlmModelRefs({
       plugins: {
