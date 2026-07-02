@@ -63,7 +63,7 @@ export function extractToolResultIdForPairing(message: AgentMessage): string | u
   return undefined;
 }
 
-export type ToolCallInputMap = Map<
+export type ToolCallInputMap = ReadonlyMap<
   string,
   { name?: string; input?: Record<string, unknown> }
 >;
@@ -71,7 +71,7 @@ export type ToolCallInputMap = Map<
 export function buildToolCallInputMap(
   messages: AgentMessage[],
 ): ToolCallInputMap {
-  const map: ToolCallInputMap = new Map();
+  const map = new Map<string, { name?: string; input?: Record<string, unknown> }>();
   for (const message of messages) {
     if (message.role !== "assistant" || !Array.isArray(message.content)) {
       continue;

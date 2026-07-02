@@ -7,9 +7,8 @@
  * Extracted from engine.ts (Phase 2 of the engine decomposition).
  */
 import { mkdir, writeFile } from "node:fs/promises";
-import { existsSync, readFileSync } from "node:fs";
 import { createHash, randomUUID } from "node:crypto";
-import { isAbsolute, join } from "node:path";
+import { join } from "node:path";
 import type { LcmConfig } from "./db/config.js";
 import type { SummaryStore } from "./store/summary-store.js";
 import type { AgentMessage } from "./openclaw-bridge.js";
@@ -29,6 +28,8 @@ import {
   serializeRawPayloadContent,
   type StoredMessage,
 } from "./message-content.js";
+import { resolveLiveToolResultExternalization } from "./read-tool-recovery.js";
+import { buildExternalizedToolResultBlock } from "./tool-result-blocks.js";
 import { asRecord, safeBoolean, safeString } from "./value-utils.js";
 
 /** Resolves the optional model-backed summarizer used for large-file exploration summaries. */
@@ -860,43 +861,27 @@ export class LargeFileInterceptor {
 
       interceptedAny = true;
 
-      // If the read tool output was truncated, recover the full content from disk.
-      // The tool call input carries the original file path. Because tool result
-      // blocks often do not repeat the tool name, fall back to the name recorded
-      // in the paired tool_use input (when a live toolCallInputMap is supplied).
-      // The presence of a toolCallInputMap signals a live current-turn context;
-      // historical ingest/replay paths omit it and therefore preserve the
-      // truncated text as recorded.
-      let contentToExternalize = extractedText;
-      const effectiveToolName =
-        (callId && params.toolCallInputMap?.get(callId)?.name) || toolName;
-      if (
-        effectiveToolName === "read" &&
-        callId &&
-        params.toolCallInputMap &&
-        isReadToolTruncated(extractedText)
-      ) {
-        const toolInput = params.toolCallInputMap.get(callId);
-        const readPath = toolInput?.input && safeString(toolInput.input.path);
-        if (readPath && isAbsolute(readPath) && existsSync(readPath)) {
-          try {
-            contentToExternalize = readFileSync(readPath, "utf8");
-          } catch {
-            // Fall back to the truncated text if the file can't be read.
-          }
-        }
-      }
+      const externalizedPayload = resolveLiveToolResultExternalization({
+        toolName,
+        callId,
+        extractedText,
+        toolCallInputMap: params.toolCallInputMap,
+      });
 
       const externalized = await this.externalizeLargeTextPayload({
         conversationId: params.conversationId,
-        content: contentToExternalize,
-        fileId: params.getFileId?.({ content: contentToExternalize, toolName, callId }),
-        fileName: `${toolName}.txt`,
+        content: externalizedPayload.content,
+        fileId: params.getFileId?.({
+          content: externalizedPayload.content,
+          toolName: externalizedPayload.toolName,
+          callId,
+        }),
+        fileName: `${externalizedPayload.toolName}.txt`,
         mimeType: "text/plain",
         formatReference: ({ fileId, byteSize, summary }) =>
           formatToolOutputReference({
             fileId,
-            toolName,
+            toolName: externalizedPayload.toolName,
             byteSize,
             summary,
           }),
@@ -904,41 +889,18 @@ export class LargeFileInterceptor {
 
       const normalizedRawType =
         rawType === "function_call_output" ? "function_call_output" : "tool_result";
-      const compactBlock: Record<string, unknown> = isPlainTextToolResult
-        ? {
-            type: "text",
-            text: externalized.reference,
-            rawType: normalizedRawType,
-            externalizedFileId: externalized.fileId,
-            originalByteSize: externalized.byteSize,
-            toolOutputExternalized: true,
-            externalizationReason: "large_tool_result",
-          }
-        : {
-            type: normalizedRawType,
-            output: externalized.reference,
-            externalizedFileId: externalized.fileId,
-            originalByteSize: externalized.byteSize,
-            toolOutputExternalized: true,
-            externalizationReason: "large_tool_result",
-          };
-      if (callId) {
-        if (normalizedRawType === "function_call_output") {
-          compactBlock.call_id = callId;
-        } else {
-          compactBlock.tool_use_id = callId;
-        }
-      }
-      if (typeof record.is_error === "boolean") {
-        compactBlock.is_error = record.is_error;
-      } else if (typeof record.isError === "boolean") {
-        compactBlock.isError = record.isError;
-      } else if (typeof topLevelIsError === "boolean") {
-        compactBlock.isError = topLevelIsError;
-      }
-      if (toolName) {
-        compactBlock.name = toolName;
-      }
+      const compactBlock = buildExternalizedToolResultBlock({
+        isPlainTextToolResult,
+        normalizedRawType,
+        reference: externalized.reference,
+        fileId: externalized.fileId,
+        byteSize: externalized.byteSize,
+        callId,
+        recordIsError: record.is_error,
+        recordIsErrorCamel: record.isError,
+        topLevelIsError,
+        toolName: externalizedPayload.toolName,
+      });
 
       rewrittenContent.push(compactBlock);
       fileIds.push(externalized.fileId);
@@ -1026,11 +988,4 @@ export class LargeFileInterceptor {
       },
     };
   }
-}
-
-const READ_CAPPED_RE = /\[Read output capped at/i;
-const READ_TRUNCATED_RE = /\[Truncated:/;
-
-function isReadToolTruncated(text: string): boolean {
-  return READ_CAPPED_RE.test(text) || READ_TRUNCATED_RE.test(text);
 }

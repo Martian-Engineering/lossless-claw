@@ -95,10 +95,18 @@ describe("read tool truncation recovery", () => {
     const storedContent = readFileSync(largeFiles[0]!.storageUri, "utf8");
     expect(storedContent).toBe(fullContent);
 
+    const described = await engine.getRetrieval().describe(largeFiles[0]!.fileId, {
+      expandFile: true,
+      largeFilesDir: engine.configView.largeFilesDir,
+    });
+    expect(described?.file?.content).toBe(fullContent);
+    expect(described?.file?.contentTruncated).toBe(false);
+
     const stubText = assembleResult.messages
       .map((m) => (typeof m.content === "string" ? m.content : JSON.stringify(m.content)))
       .join("\n");
     expect(stubText).toContain(`[LCM Tool Output: ${largeFiles[0]!.fileId}`);
+    expect(stubText).toContain("tool=read");
   });
 
   it("afterTurn() ingest preserves truncated read tool result without recovery", async () => {
