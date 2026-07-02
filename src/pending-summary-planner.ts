@@ -147,8 +147,17 @@ export function planPendingLeafNodes(
   let chunk: PendingSummaryPlannerSnapshotItem[] = [];
   let chunkTokens = 0;
 
+  const resetChunk = () => {
+    chunk = [];
+    chunkTokens = 0;
+  };
+
   const flushChunk = () => {
     if (chunk.length === 0) {
+      return;
+    }
+    if (chunkTokens < chunkTokenBudget) {
+      resetChunk();
       return;
     }
     const ordinalStart = chunk[0]?.ordinal ?? 0;
@@ -168,8 +177,7 @@ export function planPendingLeafNodes(
       childNodeIds: [],
       childSummaryIds: [],
     });
-    chunk = [];
-    chunkTokens = 0;
+    resetChunk();
   };
 
   for (const item of items) {
@@ -182,9 +190,6 @@ export function planPendingLeafNodes(
     }
 
     const tokenCount = normalizeNonNegativeInteger(item.tokenCount);
-    if (chunk.length > 0 && chunkTokens + tokenCount > chunkTokenBudget) {
-      flushChunk();
-    }
     chunk.push(item);
     chunkTokens += tokenCount;
     if (chunkTokens >= chunkTokenBudget) {

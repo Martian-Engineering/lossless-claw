@@ -55,7 +55,7 @@ describe("PendingCompactionCoordinator", () => {
         seq: 3,
         role: "user",
         content: "nine ten eleven twelve",
-        tokenCount: 4,
+        tokenCount: 8,
       },
       {
         conversationId: conversation.conversationId,
@@ -193,7 +193,7 @@ describe("PendingCompactionCoordinator", () => {
       leaseOwner: "test-worker",
       config: {
         freshTailCount: 0,
-        leafChunkTokens: 1_000,
+        leafChunkTokens: 400,
         condensedMinFanout: 2,
         condensedMinSourceTokens: 1,
         condensedChunkTokens: 100,
@@ -263,7 +263,7 @@ describe("PendingCompactionCoordinator", () => {
       },
       config: {
         freshTailCount: 1,
-        leafChunkTokens: 100,
+        leafChunkTokens: 8,
         condensedMinFanout: 2,
         condensedMinSourceTokens: 1,
         condensedChunkTokens: 400,
@@ -387,7 +387,7 @@ describe("PendingCompactionCoordinator", () => {
       leaseOwner: "test-worker",
       config: {
         freshTailCount: 1,
-        leafChunkTokens: 100,
+        leafChunkTokens: 8,
         condensedMinFanout: 2,
         condensedMinSourceTokens: 1,
         condensedChunkTokens: 100,
@@ -473,7 +473,7 @@ describe("PendingCompactionCoordinator", () => {
       leaseOwner: "test-worker",
       config: {
         freshTailCount: 1,
-        leafChunkTokens: 100,
+        leafChunkTokens: 4,
         condensedMinFanout: 2,
         condensedMinSourceTokens: 1,
         condensedChunkTokens: 100,
@@ -545,7 +545,7 @@ describe("PendingCompactionCoordinator", () => {
       leaseOwner: "test-worker",
       config: {
         freshTailCount: 1,
-        leafChunkTokens: 100,
+        leafChunkTokens: 4,
         condensedMinFanout: 2,
         condensedMinSourceTokens: 1,
         condensedChunkTokens: 100,
@@ -633,7 +633,7 @@ describe("PendingCompactionCoordinator", () => {
       leaseOwner: "test-worker",
       config: {
         freshTailCount: 1,
-        leafChunkTokens: 100,
+        leafChunkTokens: 4,
         condensedMinFanout: 99,
         condensedMinSourceTokens: 1,
         condensedChunkTokens: 100,
@@ -713,7 +713,7 @@ describe("PendingCompactionCoordinator", () => {
       leaseOwner: "test-worker",
       config: {
         freshTailCount: 1,
-        leafChunkTokens: 100,
+        leafChunkTokens: 4,
         condensedMinFanout: 2,
         condensedMinSourceTokens: 1,
         condensedChunkTokens: 100,
@@ -796,7 +796,7 @@ describe("PendingCompactionCoordinator", () => {
       leaseOwner: "test-worker",
       config: {
         freshTailCount: 1,
-        leafChunkTokens: 100,
+        leafChunkTokens: 20,
         condensedMinFanout: 99,
         condensedMinSourceTokens: 1,
         condensedChunkTokens: 100,
@@ -920,7 +920,7 @@ describe("PendingCompactionCoordinator", () => {
       leaseOwner: "test-worker",
       config: {
         freshTailCount: 1,
-        leafChunkTokens: 100,
+        leafChunkTokens: 20,
         condensedMinFanout: 99,
         condensedMinSourceTokens: 1,
         condensedChunkTokens: 100,
@@ -1380,7 +1380,7 @@ describe("PendingCompactionCoordinator", () => {
       leaseOwner: "test-worker",
       config: {
         freshTailCount: 1,
-        leafChunkTokens: 100,
+        leafChunkTokens: 4,
         condensedMinFanout: 2,
         condensedMinSourceTokens: 1,
         condensedChunkTokens: 100,
