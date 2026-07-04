@@ -53,6 +53,7 @@ import {
   readLeafPathMessages,
   readTranscriptHeader,
   resolveTranscriptMessageCreatedAt,
+  resolveTranscriptMessageInnerTimestamp,
 } from "./transcript.js";
 import { asRecord, formatDurationMs, isMissingFileError, safeString } from "./value-utils.js";
 
@@ -409,9 +410,11 @@ export class TranscriptReconciler {
     // re-appended under new ids) and is eligible for stale-id re-stamping.
     const leafEntryIds = new Set(entryIds);
 
+    const replayTwinIndex = this.buildReplayTwinIndex(historicalMessages);
     let importedMessages = 0;
     let adoptedMessages = 0;
     let restampedMessages = 0;
+    let replayTwinsSkipped = 0;
     for (const message of importableTail) {
       const entryId = getTranscriptEntryId(message)!;
       const stored = toStoredMessage(message);
@@ -436,6 +439,16 @@ export class TranscriptReconciler {
         restampedMessages += 1;
         continue;
       }
+      if (await this.candidateHasPersistedReplayTwin(conversationId, message, replayTwinIndex)) {
+        // Re-appended replay: an already-persisted entry in this tail shares the
+        // role, canonical content, and frozen inner timestamp under a different
+        // id. Skip it rather than insert a duplicate row.
+        replayTwinsSkipped += 1;
+        this.host.deps.log.debug(
+          `[lcm] reconcileSessionTailByEntryIds: skipped source-identity replay twin entry=${entryId} for ${sessionContext}`,
+        );
+        continue;
+      }
       // Entry-id-verified imports are exact (the id is proven absent), so the
       // same-second replay flood heuristic does not apply.
       const result = await this.host.ingestSingle({
@@ -451,7 +464,7 @@ export class TranscriptReconciler {
     }
 
     this.host.deps.log.debug(
-      `[lcm] reconcileSessionTail: entry-id path for ${sessionContext} duration=${formatDurationMs(Date.now() - startedAt)} historicalMessages=${historicalMessages.length} anchorIndex=${anchorIndex} missingTail=${missingTail.length} importedMessages=${importedMessages} adoptedMessages=${adoptedMessages} restampedMessages=${restampedMessages} capped=${entryIdImportCapped}`,
+      `[lcm] reconcileSessionTail: entry-id path for ${sessionContext} duration=${formatDurationMs(Date.now() - startedAt)} historicalMessages=${historicalMessages.length} anchorIndex=${anchorIndex} missingTail=${missingTail.length} importedMessages=${importedMessages} adoptedMessages=${adoptedMessages} restampedMessages=${restampedMessages} replayTwinsSkipped=${replayTwinsSkipped} capped=${entryIdImportCapped}`,
     );
     if (entryIdImportCapped) {
       return {
@@ -494,6 +507,83 @@ export class TranscriptReconciler {
         params.entryId,
       );
       if (restamped) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  /**
+   * Twin-replay key for a reconcile candidate: the same identity canonicalization
+   * used for identity_hash (role plus canonicalized content) joined to the
+   * full-precision INNER source timestamp. Returns null when the message carries
+   * no inner timestamp, which makes the guard fail open. The per-entry envelope
+   * timestamp is deliberately excluded: OpenClaw re-stamps it fresh on every
+   * re-append, so only the frozen inner timestamp identifies one source event.
+   */
+  private replayTwinKey(message: AgentMessage): string | null {
+    const inner = resolveTranscriptMessageInnerTimestamp(message);
+    if (inner === null) {
+      return null;
+    }
+    const stored = toStoredMessage(message);
+    const innerTag = typeof inner === "number" ? `n:${inner}` : `s:${inner}`;
+    return `${buildMessageIdentityHash(stored.role, stored.content)} ${innerTag}`;
+  }
+
+  private buildReplayTwinIndex(tail: AgentMessage[]): Map<string, string[]> {
+    const index = new Map<string, string[]>();
+    for (const message of tail) {
+      const entryId = getTranscriptEntryId(message);
+      if (!entryId) {
+        continue;
+      }
+      const key = this.replayTwinKey(message);
+      if (key === null) {
+        continue;
+      }
+      const ids = index.get(key);
+      if (ids) {
+        ids.push(entryId);
+      } else {
+        index.set(key, [entryId]);
+      }
+    }
+    return index;
+  }
+
+  /**
+   * True when `candidate` (a proven-absent transcript entry) is a re-appended
+   * replay of a logical source event that is ALREADY persisted under a different
+   * entry id: another entry in the same parsed transcript tail shares its role,
+   * canonical content, and frozen inner millisecond timestamp, and that entry's
+   * id is already in the store. OpenClaw retry/failover storms re-append the same
+   * inbound event under fresh uuids with the same frozen inner timestamp;
+   * genuinely repeated messages are distinct source events with distinct inner
+   * timestamps, so they are never twins. Second-granularity created_at is never
+   * consulted, so same-second legitimate repeats survive.
+   */
+  private async candidateHasPersistedReplayTwin(
+    conversationId: number,
+    candidate: AgentMessage,
+    twinIndex: Map<string, string[]>,
+  ): Promise<boolean> {
+    const key = this.replayTwinKey(candidate);
+    if (key === null) {
+      return false;
+    }
+    const candidateId = getTranscriptEntryId(candidate);
+    const siblingIds = twinIndex.get(key);
+    if (!siblingIds) {
+      return false;
+    }
+    for (const siblingId of siblingIds) {
+      if (siblingId === candidateId) {
+        continue;
+      }
+      if (
+        await this.host.conversationStore.hasMessageByTranscriptEntryId(conversationId, siblingId)
+      ) {
         return true;
       }
     }
@@ -1606,9 +1696,49 @@ export class TranscriptReconciler {
     sessionKey?: string;
     messages: AgentMessage[];
     replayGuardExemptPrefixLength: number;
+    // When both are set, each candidate runs the two-tier replay-twin gate below
+    // (used by the append-only fast path, whose parsed delta cannot see a
+    // persisted twin from a prior pass).
+    replayTwinConversationId?: number;
+    replayTwinSessionFile?: string;
   }): Promise<number> {
     let importedMessages = 0;
+    // Tier 2 full-tail index, built lazily at most once per batch: only a Tier-1
+    // store hit (a persisted same-identity, same-second row) justifies the full
+    // leaf-path re-read.
+    let replayTwinIndex: Map<string, string[]> | null = null;
     for (const [index, message] of params.messages.entries()) {
+      const { replayTwinConversationId, replayTwinSessionFile } = params;
+      if (
+        replayTwinConversationId !== undefined &&
+        replayTwinSessionFile !== undefined &&
+        this.replayTwinKey(message) !== null
+      ) {
+        const stored = toStoredMessage(message);
+        const tier1 = await this.host.conversationStore.hasPersistedIdentityAtCreatedAtSecond(
+          replayTwinConversationId,
+          stored.role,
+          stored.content,
+          resolveTranscriptMessageCreatedAt(message),
+        );
+        if (tier1) {
+          replayTwinIndex ??= this.buildReplayTwinIndex(
+            await readLeafPathMessages(replayTwinSessionFile),
+          );
+          if (
+            await this.candidateHasPersistedReplayTwin(
+              replayTwinConversationId,
+              message,
+              replayTwinIndex,
+            )
+          ) {
+            this.host.deps.log.debug(
+              `[lcm] ingestBatch: skipped source-identity replay twin entry=${getTranscriptEntryId(message) ?? "?"} conversation=${replayTwinConversationId}`,
+            );
+            continue;
+          }
+        }
+      }
       const result = await this.host.ingestSingle({
         sessionId: params.sessionId,
         sessionKey: params.sessionKey,
@@ -1865,6 +1995,8 @@ export class TranscriptReconciler {
             sessionKey: params.sessionKey,
             messages: replayFilteredMessages,
             replayGuardExemptPrefixLength: replayFiltered.replayGuardExemptPrefixLength,
+            replayTwinConversationId: conversation.conversationId,
+            replayTwinSessionFile: params.sessionFile,
           });
           await this.recordImportAndRefreshCheckpoint({
             conversationId: conversation.conversationId,
