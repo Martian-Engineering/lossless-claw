@@ -313,7 +313,7 @@ describe("F1 degraded-path double-write", () => {
     expect(userRows.length).toBe(2);
   });
 
-  it("degraded path KEEPS a metadata-only same-body turn without timestamp evidence", async () => {
+  it("degraded path COLLAPSES a metadata-block same-body turn onto its bare persisted row", async () => {
     const engine: LcmContextEngine = createEngine();
     const sessionId = "f1-degraded-metadata-same-body";
     const sessionKey = "agent:main:f1-degraded-metadata-same-body";
@@ -361,6 +361,13 @@ describe("F1 degraded-path double-write", () => {
 
     const stored = await engine.getConversationStore().getMessages(conversation.conversationId);
     const userRows = stored.filter((m) => m.role === "user");
-    expect(userRows.length).toBe(2);
+    // Reversal of the earlier keep-both behavior (was: strict decoration gate,
+    // metadata block not trusted without a channel timestamp). The runtime copy
+    // strips, via a STRUCTURALLY validated leading block, to the same full body
+    // ("ok") as the bare persisted row, so it is the decorated face of the same
+    // turn and collapses. Full-body equality (not containment) drops no user
+    // content, only the non-anchoring metadata wrapper; a frame concealing a
+    // DIFFERENT body still fails equality and stays fail-closed.
+    expect(userRows.length).toBe(1);
   });
 });

@@ -23,6 +23,7 @@ import {
 } from "./message-content.js";
 import { messageIdentity } from "./message-signatures.js";
 import type { AgentMessage } from "./openclaw-bridge.js";
+import { openClawInboundBodiesMatch } from "./openclaw-inbound-metadata.js";
 import type { ConversationStore, MessageRecord } from "./store/conversation-store.js";
 import { buildMessageIdentityHash } from "./store/message-identity.js";
 import type { LargeFileRecord, SummaryStore } from "./store/summary-store.js";
@@ -89,6 +90,17 @@ export class BatchDeduplicator {
     }
     if (persistedRole !== "user" || batchRole !== "user") {
       return false;
+    }
+    // Bare-vs-wrapped same turn: the transcript persists the BARE body while the
+    // runtime array carries the copy wrapped in the standard untrusted-metadata
+    // block (no channel timestamp), so their identity_hashes differ (the block
+    // survives canonicalization) and the timestamp decoration gate below cannot
+    // see it. Collapse when both reduce to the same FULL model-facing body once a
+    // structurally validated leading block and channel timestamp are stripped.
+    // Full-body equality, not containment, so a forged frame concealing a
+    // different body stays unequal and is never collapsed (fail-closed).
+    if (openClawInboundBodiesMatch(batchContent, persistedContent)) {
+      return true;
     }
     return liveContentIsRecognizedDecoratedBareBody({
       liveContent: batchContent,

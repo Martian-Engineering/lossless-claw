@@ -75,6 +75,34 @@ export function extractBodyAfterOpenClawInboundMetadataBlock(content: string): s
   return stripMetadataSeparator(remaining);
 }
 
+/**
+ * The model-facing user body of an OpenClaw inbound turn: the content with a
+ * recognized leading inbound-metadata block stripped (via
+ * extractBodyAfterOpenClawInboundMetadataBlock) and a single leading channel
+ * timestamp removed, then trimmed. A turn carrying neither decoration returns
+ * its own trimmed content. This is the shared reduction used to decide whether
+ * two faces of one turn (the bare persisted row and the decorated runtime copy)
+ * render to the same body.
+ */
+export function openClawInboundModelFacingBody(content: string): string {
+  const body = extractBodyAfterOpenClawInboundMetadataBlock(content) ?? content;
+  return stripLeadingOpenClawInboundTimestamp(body.trimStart()).trim();
+}
+
+/**
+ * True when `liveContent` and `bareContent` reduce to the same non-empty
+ * model-facing body (see openClawInboundModelFacingBody). This is byte-equality
+ * of the full stripped bodies, not containment, so a distinct turn whose
+ * trailing line merely matches a prior body, or a forged metadata frame
+ * concealing a different body, is never treated as the same turn (fail-closed).
+ * Only a structurally validated leading block is stripped, so quoting
+ * "(untrusted metadata)" as prose does not reduce a turn to a shorter body.
+ */
+export function openClawInboundBodiesMatch(liveContent: string, bareContent: string): boolean {
+  const liveBody = openClawInboundModelFacingBody(liveContent);
+  return liveBody.length > 0 && liveBody === openClawInboundModelFacingBody(bareContent);
+}
+
 const CONVERSATION_INFO_KEYS = new Set([
   "chat_id",
   "message_id",

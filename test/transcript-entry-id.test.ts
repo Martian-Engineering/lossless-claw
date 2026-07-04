@@ -415,7 +415,7 @@ describe("afterTurn covered-frontier alignment", () => {
     expect(messages.map((message) => message.content)).toEqual(["nice! thank you!"]);
   });
 
-  it("keeps a conv-info-only runtime copy without trusted timestamp evidence", async () => {
+  it("collapses a conv-info-only runtime copy onto its bare transcript row", async () => {
     const sessionFile = createSessionFilePath("decorated-convinfo-dup");
     const header = JSON.stringify({
       type: "session",
@@ -453,10 +453,12 @@ describe("afterTurn covered-frontier alignment", () => {
       .getConversationStore()
       .getConversationForSession({ sessionId });
     const messages = await engine.getConversationStore().getMessages(conversation!.conversationId);
-    expect(messages.map((message) => message.content)).toEqual([
-      "Hey there! hows it going?",
-      decorated,
-    ]);
+    // Reversal of the earlier keep-both behavior: the decorated runtime copy
+    // strips, via a structurally validated leading block, to the same full body
+    // as the bare transcript row, so it is the same turn and collapses onto it
+    // (full-body equality; a frame concealing a different body would stay
+    // distinct). Only the non-anchoring metadata wrapper is dropped.
+    expect(messages.map((message) => message.content)).toEqual(["Hey there! hows it going?"]);
   });
 
   it("keeps a genuinely distinct runtime turn even when it shares a trailing word", async () => {
