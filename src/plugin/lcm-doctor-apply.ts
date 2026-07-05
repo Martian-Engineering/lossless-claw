@@ -5,6 +5,7 @@ import type { LcmConfig } from "../db/config.js";
 import type { LcmSummarizeFn } from "../summarize.js";
 import { createLcmSummarizeFromLegacyParams } from "../summarize.js";
 import type { LcmDependencies } from "../types.js";
+import { createLcmDatabaseBackup } from "./lcm-db-backup.js";
 import { detectDoctorMarker, loadDoctorTargets, type DoctorTargetRecord } from "./lcm-doctor-shared.js";
 import { estimateTokens } from "../estimate-tokens.js";
 
@@ -143,6 +144,17 @@ export async function applyScopedDoctorRepair(params: {
   }
 
   if (repairedSummaryIds.length > 0) {
+    const backupPath = createLcmDatabaseBackup(params.db, {
+      databasePath: params.config.databasePath,
+      label: "scoped-doctor-repair",
+    });
+    if (!backupPath) {
+      return {
+        kind: "unavailable",
+        reason: "Lossless Claw could not determine a doctor apply backup path.",
+      };
+    }
+
     await withDatabaseTransaction(params.db, "BEGIN IMMEDIATE", async () => {
         for (const summaryId of repairedSummaryIds) {
           const override = overrides.get(summaryId);
