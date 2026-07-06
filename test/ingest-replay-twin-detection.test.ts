@@ -10,6 +10,7 @@
 import { afterEach, describe, expect, it } from "vitest";
 import { writeFileSync } from "node:fs";
 import type { AgentMessage } from "../src/openclaw-bridge.js";
+import { readLeafPathMessages } from "../src/transcript.js";
 import { cleanupEngineTestState, createEngine, createSessionFilePath } from "./helpers.js";
 
 afterEach(cleanupEngineTestState);
@@ -151,5 +152,52 @@ describe("reconcile ingest replay-twin detection (inner source timestamp)", () =
     await engine.afterTurn({ sessionId, sessionFile, messages: [], prePromptMessageCount: 0 });
 
     expect(await userContents(engine, sessionId)).toEqual([feathers, "they weigh the same", feathers]);
+  });
+
+  it("continues past capped replay-twin prefixes to import real backlog entries", async () => {
+    const sessionFile = createSessionFilePath("replay-twin-capped-prefix");
+    const header = headerLine("replay-twin-capped-prefix-header");
+    const feathers = "a kilogram of feathers";
+    writeTranscript(sessionFile, header, [
+      entryLine({ id: "e1", parentId: null, role: "user", text: feathers, innerMs: FROZEN_MS }),
+    ]);
+
+    const engine = createEngine();
+    const sessionId = "replay-twin-capped-prefix";
+    await engine.bootstrap({ sessionId, sessionFile });
+
+    const replayTwins = Array.from({ length: 55 }, (_, index) =>
+      entryLine({
+        id: `e-twin-${index}`,
+        parentId: index === 0 ? "e1" : `e-twin-${index - 1}`,
+        role: "user",
+        text: feathers,
+        innerMs: FROZEN_MS,
+      }),
+    );
+    writeTranscript(sessionFile, header, [
+      entryLine({ id: "e1", parentId: null, role: "user", text: feathers, innerMs: FROZEN_MS }),
+      ...replayTwins,
+      entryLine({
+        id: "e-real",
+        parentId: "e-twin-54",
+        role: "assistant",
+        text: "the scale agrees",
+        innerMs: FROZEN_MS + 1_000,
+      }),
+    ]);
+
+    const conversation = await engine
+      .getConversationStore()
+      .getConversationForSession({ sessionId });
+    const reconcile = await engine.getTranscriptReconciler().reconcileSessionTail({
+      sessionId,
+      conversationId: conversation!.conversationId,
+      historicalMessages: await readLeafPathMessages(sessionFile),
+      lastProcessedEntryId: "e1",
+    });
+
+    expect(reconcile).toMatchObject({ blockedByImportCap: false, importedMessages: 1 });
+    expect(await userContents(engine, sessionId)).toEqual([feathers, "the scale agrees"]);
   });
 });

@@ -396,12 +396,9 @@ export class TranscriptReconciler {
     const entryIdImportCap = transcriptImportCap(params.existingDbCount);
     const entryIdImportCapped =
       params.existingDbCount > 0 && missingTail.length > entryIdImportCap;
-    const importableTail = entryIdImportCapped
-      ? missingTail.slice(0, entryIdImportCap)
-      : missingTail;
     if (entryIdImportCapped) {
       this.host.deps.log.warn(
-        `[lcm] reconcileSessionTail: entry-id import cap chunking for ${sessionContext} — importing ${importableTail.length}/${missingTail.length} anchored backlog messages this pass (existing: ${params.existingDbCount}, cap: ${entryIdImportCap}); remaining backlog continues next pass`,
+        `[lcm] reconcileSessionTail: entry-id import cap chunking for ${sessionContext} — importing ${entryIdImportCap}/${missingTail.length} anchored backlog messages this pass (existing: ${params.existingDbCount}, cap: ${entryIdImportCap}); remaining backlog continues next pass`,
       );
     }
 
@@ -415,7 +412,9 @@ export class TranscriptReconciler {
     let adoptedMessages = 0;
     let restampedMessages = 0;
     let replayTwinsSkipped = 0;
-    for (const message of importableTail) {
+    let cappedImportProgress = 0;
+    let cappedWithRemaining = false;
+    for (const message of missingTail) {
       const entryId = getTranscriptEntryId(message)!;
       const stored = toStoredMessage(message);
       const adopted = await this.host.conversationStore.adoptTranscriptEntryId(
@@ -426,6 +425,7 @@ export class TranscriptReconciler {
       );
       if (adopted) {
         adoptedMessages += 1;
+        cappedImportProgress += 1;
         continue;
       }
       const restamped = await this.adoptStaleTranscriptEntryId({
@@ -437,6 +437,7 @@ export class TranscriptReconciler {
       });
       if (restamped) {
         restampedMessages += 1;
+        cappedImportProgress += 1;
         continue;
       }
       if (await this.candidateHasPersistedReplayTwin(conversationId, message, replayTwinIndex)) {
@@ -449,6 +450,10 @@ export class TranscriptReconciler {
         );
         continue;
       }
+      if (entryIdImportCapped && cappedImportProgress >= entryIdImportCap) {
+        cappedWithRemaining = true;
+        break;
+      }
       // Entry-id-verified imports are exact (the id is proven absent), so the
       // same-second replay flood heuristic does not apply.
       const result = await this.host.ingestSingle({
@@ -460,13 +465,14 @@ export class TranscriptReconciler {
       });
       if (result.ingested) {
         importedMessages += 1;
+        cappedImportProgress += 1;
       }
     }
 
     this.host.deps.log.debug(
       `[lcm] reconcileSessionTail: entry-id path for ${sessionContext} duration=${formatDurationMs(Date.now() - startedAt)} historicalMessages=${historicalMessages.length} anchorIndex=${anchorIndex} missingTail=${missingTail.length} importedMessages=${importedMessages} adoptedMessages=${adoptedMessages} restampedMessages=${restampedMessages} replayTwinsSkipped=${replayTwinsSkipped} capped=${entryIdImportCapped}`,
     );
-    if (entryIdImportCapped) {
+    if (entryIdImportCapped && cappedWithRemaining) {
       return {
         blockedByImportCap: true,
         blockedReason: "import-cap",
@@ -528,7 +534,7 @@ export class TranscriptReconciler {
     }
     const stored = toStoredMessage(message);
     const innerTag = typeof inner === "number" ? `n:${inner}` : `s:${inner}`;
-    return `${buildMessageIdentityHash(stored.role, stored.content)} ${innerTag}`;
+    return `${buildMessageIdentityHash(stored.role, stored.content)}\u0000${innerTag}`;
   }
 
   private buildReplayTwinIndex(tail: AgentMessage[]): Map<string, string[]> {
