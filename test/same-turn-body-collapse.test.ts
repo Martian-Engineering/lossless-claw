@@ -9,7 +9,12 @@
 // different body, or a distinct turn whose trailing line merely matches, stays
 // fail-closed.
 import { describe, expect, it } from "vitest";
-import { openClawInboundBodiesMatch } from "../src/openclaw-inbound-metadata.js";
+import {
+  canonicalizeOpenClawInboundMetadataIdentityContent,
+  openClawInboundBodiesMatch,
+  openClawInboundModelFacingBody,
+} from "../src/openclaw-inbound-metadata.js";
+import { buildMessageIdentityHash } from "../src/store/message-identity.js";
 
 function metadataWrapped(body: string): string {
   return (
@@ -21,6 +26,41 @@ function metadataWrapped(body: string): string {
 function channelTimestamped(body: string): string {
   return `[Sun 2026-06-21 13:19 GMT+3] ${body}`;
 }
+
+// Ground truth: OpenClaw core (src/auto-reply/reply/inbound-meta.ts,
+// formatUntrustedJsonBlock + the "Chat history since last reply" call site)
+// emits the recap as a JSON-fenced array under the same block grammar as the
+// other untrusted-metadata blocks, not as free-text lines.
+function historyRecapBlock(entries: Array<{ sender: string; timestamp_ms: number; body: string }>): string {
+  return [
+    "Chat history since last reply (untrusted, for context):",
+    "```json",
+    JSON.stringify(entries, null, 2),
+    "```",
+  ].join("\n");
+}
+
+function metadataWrappedWithRecap(recap: string, body: string): string {
+  return (
+    'Conversation info (untrusted metadata):\n```json\n{\n  "chat_id": "telegram:100000001",\n  "sender": "sam.rivera"\n}\n```\n\n' +
+    recap +
+    "\n\n" +
+    body
+  );
+}
+
+const TWO_ENTRY_RECAP = historyRecapBlock([
+  { sender: "lee.chen", timestamp_ms: 1780000000000, body: "did the build finish?" },
+  { sender: "sam.rivera", timestamp_ms: 1780000005000, body: "not sure, checking" },
+]);
+
+const FIVE_ENTRY_RECAP = historyRecapBlock([
+  { sender: "lee.chen", timestamp_ms: 1780000000000, body: "did the build finish?" },
+  { sender: "sam.rivera", timestamp_ms: 1780000005000, body: "not sure, checking" },
+  { sender: "lee.chen", timestamp_ms: 1780000010000, body: "any update?" },
+  { sender: "sam.rivera", timestamp_ms: 1780000015000, body: "almost done" },
+  { sender: "lee.chen", timestamp_ms: 1780000020000, body: "ok take your time" },
+]);
 
 describe("openClawInboundBodiesMatch (same-turn model-facing body)", () => {
   it("matches a metadata-block runtime copy (no timestamp) against its bare persisted row", () => {
@@ -61,5 +101,116 @@ describe("openClawInboundBodiesMatch (same-turn model-facing body)", () => {
     expect(
       openClawInboundBodiesMatch("the assistant replied (untrusted metadata) earlier\nok", "ok"),
     ).toBe(false);
+  });
+});
+
+// Issue #973: OpenClaw also injects a host recap block ("Chat history since
+// last reply (untrusted, for context):") between the metadata block(s) and
+// the current message body when there are unread channel messages. Before
+// this fix, the reduction above stripped only the metadata block(s), so a
+// recap-bearing decorated face never matched its bare row and both got
+// replayed to the model.
+describe("openClawInboundBodiesMatch with a host chat-history recap block (issue #973)", () => {
+  it("matches a decorated face carrying a recap block against its bare persisted row", () => {
+    const bare = "what's the status on the deploy?";
+    expect(openClawInboundBodiesMatch(metadataWrappedWithRecap(TWO_ENTRY_RECAP, bare), bare)).toBe(
+      true,
+    );
+  });
+
+  it("matches regardless of recap size (a growing chat-history window)", () => {
+    const bare = "what's the status on the deploy?";
+    expect(openClawInboundBodiesMatch(metadataWrappedWithRecap(FIVE_ENTRY_RECAP, bare), bare)).toBe(
+      true,
+    );
+  });
+
+  it("does NOT strip when the recap header is merely quoted in the user's own body (fail-closed)", () => {
+    const bare =
+      'Chat history since last reply (untrusted, for context): that\'s an odd phrase to quote, right?';
+    // No ```json fence follows the header here, so it never structurally
+    // validates as a recap block: the metadata-block strip alone already
+    // recovers the match, and the quoted header stays part of the body.
+    expect(openClawInboundBodiesMatch(metadataWrapped(bare), bare)).toBe(true);
+  });
+
+  it("does NOT strip a malformed recap block, so it stays part of the body and blocks the match (fail-closed)", () => {
+    const bare = "what's the status on the deploy?";
+    const malformedRecap = [
+      "Chat history since last reply (untrusted, for context):",
+      "```json",
+      "not valid json{{{",
+      "```",
+    ].join("\n");
+    expect(openClawInboundBodiesMatch(metadataWrappedWithRecap(malformedRecap, bare), bare)).toBe(
+      false,
+    );
+  });
+
+  it("does NOT strip a recap-shaped JSON object, not an array (the real emitter only ever emits an array)", () => {
+    const bare = "what's the status on the deploy?";
+    const objectShapedRecap = [
+      "Chat history since last reply (untrusted, for context):",
+      "```json",
+      JSON.stringify({ sender: "lee.chen", body: "did the build finish?" }, null, 2),
+      "```",
+    ].join("\n");
+    expect(openClawInboundBodiesMatch(metadataWrappedWithRecap(objectShapedRecap, bare), bare)).toBe(
+      false,
+    );
+  });
+
+  it("does NOT strip an empty recap array (the real emitter never emits one)", () => {
+    const bare = "what's the status on the deploy?";
+    const emptyRecap = historyRecapBlock([]);
+    expect(openClawInboundBodiesMatch(metadataWrappedWithRecap(emptyRecap, bare), bare)).toBe(false);
+  });
+
+  it("leaves recap-like text at the start of a BARE row untouched (no metadata block, nothing to strip)", () => {
+    const recapLikeBareBody = [
+      "Chat history since last reply (untrusted, for context):",
+      "```json",
+      JSON.stringify([{ sender: "lee.chen", timestamp_ms: 1780000000000, body: "hello" }], null, 2),
+      "```",
+      "",
+      "actual question here",
+    ].join("\n");
+    expect(openClawInboundModelFacingBody(recapLikeBareBody)).toBe(recapLikeBareBody.trim());
+  });
+});
+
+// The recap is a snapshot of "history since last reply": it grows and
+// changes turn to turn even when it decorates the same logical message, so it
+// must not perturb the identity hash used to recognize repeat ingestion of
+// that same decorated turn (mirrors how volatile keys are already excluded
+// from the canonicalized Conversation info block).
+describe("canonicalizeOpenClawInboundMetadataIdentityContent / buildMessageIdentityHash with a recap block", () => {
+  it("produces the same identity hash for the same turn whether or not a recap is present", () => {
+    const bare = "what's the status on the deploy?";
+    const noRecap = metadataWrapped(bare);
+    const withRecap = metadataWrappedWithRecap(TWO_ENTRY_RECAP, bare);
+    expect(buildMessageIdentityHash("user", withRecap)).toBe(buildMessageIdentityHash("user", noRecap));
+  });
+
+  it("produces the same identity hash regardless of how many entries the recap carries", () => {
+    const bare = "what's the status on the deploy?";
+    const small = metadataWrappedWithRecap(TWO_ENTRY_RECAP, bare);
+    const large = metadataWrappedWithRecap(FIVE_ENTRY_RECAP, bare);
+    expect(buildMessageIdentityHash("user", large)).toBe(buildMessageIdentityHash("user", small));
+  });
+
+  it("does NOT fold a malformed recap block into the canonicalized identity content", () => {
+    const bare = "what's the status on the deploy?";
+    const malformedRecap = [
+      "Chat history since last reply (untrusted, for context):",
+      "```json",
+      "not valid json{{{",
+      "```",
+    ].join("\n");
+    const withMalformedRecap = metadataWrappedWithRecap(malformedRecap, bare);
+    const withoutRecap = metadataWrapped(bare);
+    expect(
+      canonicalizeOpenClawInboundMetadataIdentityContent("user", withMalformedRecap),
+    ).not.toBe(canonicalizeOpenClawInboundMetadataIdentityContent("user", withoutRecap));
   });
 });
