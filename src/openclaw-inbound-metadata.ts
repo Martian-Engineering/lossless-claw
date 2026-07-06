@@ -5,9 +5,43 @@ const OPENCLAW_INBOUND_METADATA_BLOCK_RE =
 // untrusted-metadata block, including this one) always emits heading + a
 // ```json fence + JSON.stringify(payload, null, 2) + closing fence. The recap
 // heading is fixed text; unlike the metadata blocks its payload is a JSON
-// ARRAY (the bounded chat-history window), not an object.
+// ARRAY (the bounded chat-history window), not an object. This is the current
+// (post-2026.6.10) emission shape.
 const OPENCLAW_INBOUND_HISTORY_RECAP_BLOCK_RE =
   /^Chat history since last reply \(untrusted, for context\):\r?\n```json\r?\n([\s\S]*?)\r?\n```/;
+
+// Ground truth (2026.6.10-era fleet, predates the JSON-array rendering above):
+// OpenClaw core's formatChatWindowMessage (openclaw-fork
+// src/auto-reply/reply/inbound-meta.ts:233), invoked from the "Chat history
+// since last reply" call site (same file, ~line 723-747, since commit
+// ba53782363 "render chat history since last reply as per-message prose"),
+// renders each history entry as ONE line: an optional "#<message_id>" token,
+// an optional "<weekday> <YYYY-MM-DD> <HH:MM:SS> <tz>" timestamp token (each
+// independently omitted when its source field is absent -- confirmed by that
+// same commit's own "renders chat history as per-message prose" test, which
+// renders `#1001 sam.rivera: ...` with no timestamp at all), then
+// "<sender>: <content>". A line carrying NEITHER token is indistinguishable
+// from ordinary prose, so it is deliberately excluded from recognition here
+// (fail-closed: at least one anchor token is required).
+const OPENCLAW_INBOUND_HISTORY_RECAP_LINE_ID_TOKEN = String.raw`#\S+`;
+const OPENCLAW_INBOUND_HISTORY_RECAP_LINE_TIMESTAMP_TOKEN =
+  String.raw`[A-Za-z]{3} \d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2} \S+`;
+const OPENCLAW_INBOUND_HISTORY_RECAP_LINE_ENTRY_SRC = String.raw`(?:${OPENCLAW_INBOUND_HISTORY_RECAP_LINE_ID_TOKEN} ${OPENCLAW_INBOUND_HISTORY_RECAP_LINE_TIMESTAMP_TOKEN} |${OPENCLAW_INBOUND_HISTORY_RECAP_LINE_ID_TOKEN} |${OPENCLAW_INBOUND_HISTORY_RECAP_LINE_TIMESTAMP_TOKEN} ).+: .+`;
+
+// Unlike the JSON form (self-delimiting via the closing fence), prose lines
+// have no hard terminator: the real emitter just stops emitting lines, and
+// buildInboundUserContextPrefix joins every block (including this one) with
+// blocks.filter(Boolean).join("\n\n"). So the only structurally valid ways
+// for a run of entry lines to end are a blank-line block separator or end of
+// content; the trailing lookahead enforces that. A run that peters out into
+// anything else (a line that is neither a valid entry nor a blank separator)
+// fails the WHOLE match, so it is never partially stripped up to that point.
+const OPENCLAW_INBOUND_HISTORY_RECAP_LINE_BLOCK_RE = new RegExp(
+  String.raw`^Chat history since last reply \(untrusted, for context\):\r?\n` +
+    `(?:${OPENCLAW_INBOUND_HISTORY_RECAP_LINE_ENTRY_SRC})` +
+    `(?:\r?\n(?:${OPENCLAW_INBOUND_HISTORY_RECAP_LINE_ENTRY_SRC}))*` +
+    String.raw`(?=\r?\n\r?\n|\r?\n?$)`,
+);
 
 // OpenClaw-version-coupled inbound decoration string: the header an OpenClaw
 // runtime prepends to a user turn that carries an ambient room event (channel
@@ -370,16 +404,21 @@ function isValidOpenClawInboundHistoryRecapPayload(json: string): boolean {
 /**
  * Length of a structurally validated leading host chat-history recap block in
  * `candidate` (already trimmed of leading whitespace by the caller), or 0 when
- * none is present. Fail-closed: a user quoting the header in prose without the
- * fenced array immediately following, or a malformed/empty/non-array payload,
- * strips nothing.
+ * none is present. Recognizes either the current JSON-array form or the
+ * 2026.6.10-era per-line prose form (both are live on the fleet at once, since
+ * not every deployment has picked up the JSON-rendering change yet).
+ * Fail-closed in both forms: a user quoting the header in prose without a
+ * fenced array or a valid entry line immediately following, a
+ * malformed/empty/non-array JSON payload, or a run of prose lines not
+ * properly terminated by a blank line or end of content, all strip nothing.
  */
 function matchLeadingOpenClawInboundHistoryRecap(candidate: string): number {
-  const match = OPENCLAW_INBOUND_HISTORY_RECAP_BLOCK_RE.exec(candidate);
-  if (!match) {
-    return 0;
+  const jsonMatch = OPENCLAW_INBOUND_HISTORY_RECAP_BLOCK_RE.exec(candidate);
+  if (jsonMatch) {
+    return isValidOpenClawInboundHistoryRecapPayload(jsonMatch[1] ?? "") ? jsonMatch[0].length : 0;
   }
-  return isValidOpenClawInboundHistoryRecapPayload(match[1] ?? "") ? match[0].length : 0;
+  const lineMatch = OPENCLAW_INBOUND_HISTORY_RECAP_LINE_BLOCK_RE.exec(candidate);
+  return lineMatch ? lineMatch[0].length : 0;
 }
 
 function canonicalizeMetadataJson(

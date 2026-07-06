@@ -214,3 +214,213 @@ describe("canonicalizeOpenClawInboundMetadataIdentityContent / buildMessageIdent
     ).not.toBe(canonicalizeOpenClawInboundMetadataIdentityContent("user", withoutRecap));
   });
 });
+
+// Issue #973, iteration 2: the fleet was still running a 2026.6.10-era
+// OpenClaw core whose recap emitter predates the JSON-array rendering above.
+// Ground truth: openclaw-fork src/auto-reply/reply/inbound-meta.ts,
+// formatChatWindowMessage (line 233) invoked from the "Chat history since last
+// reply" call site (line ~723-747, since commit ba53782363, "render chat
+// history since last reply as per-message prose"). Each entry renders as ONE
+// line: an optional "#<message_id>" token, an optional "<weekday>
+// <YYYY-MM-DD> <HH:MM:SS> <tz>" timestamp token (each independently omitted
+// when its source field is absent -- the emitter's own
+// "renders chat history as per-message prose" test in inbound-meta.test.ts
+// renders `#1001 sam.rivera: ...` with NO timestamp at all), then
+// "<sender>: <content>". Unlike the JSON form there is no hard terminator
+// (no closing fence), so the block only ends at a blank line or end of
+// content; a run of otherwise-valid lines that peters out into anything else
+// must not be partially stripped (fail-closed on the whole block).
+function historyRecapLineBlock(
+  entries: Array<{ id: string; timestamp: string; sender: string; body: string }>,
+): string {
+  return [
+    "Chat history since last reply (untrusted, for context):",
+    ...entries.map((e) => `#${e.id} ${e.timestamp} ${e.sender}: ${e.body}`),
+  ].join("\n");
+}
+
+function metadataWrappedWithLineRecap(recap: string, body: string): string {
+  return (
+    'Conversation info (untrusted metadata):\n```json\n{\n  "chat_id": "telegram:100000001",\n  "sender": "sam.rivera"\n}\n```\n\n' +
+    recap +
+    "\n\n" +
+    body
+  );
+}
+
+const TWO_ENTRY_LINE_RECAP = historyRecapLineBlock([
+  {
+    id: "1780000000.000100",
+    timestamp: "Mon 2026-07-06 15:05:54 GMT+3",
+    sender: "lee.chen",
+    body: "did the build finish?",
+  },
+  {
+    id: "1780000005.000200",
+    timestamp: "Mon 2026-07-06 15:06:34 GMT+3",
+    sender: "sam.rivera",
+    body: "not sure, checking",
+  },
+]);
+
+const FIVE_ENTRY_LINE_RECAP = historyRecapLineBlock([
+  {
+    id: "1780000000.000100",
+    timestamp: "Mon 2026-07-06 15:05:54 GMT+3",
+    sender: "lee.chen",
+    body: "did the build finish?",
+  },
+  {
+    id: "1780000005.000200",
+    timestamp: "Mon 2026-07-06 15:06:34 GMT+3",
+    sender: "sam.rivera",
+    body: "not sure, checking",
+  },
+  {
+    id: "1780000010.000300",
+    timestamp: "Mon 2026-07-06 15:07:10 GMT+3",
+    sender: "lee.chen",
+    body: "any update?",
+  },
+  {
+    id: "1780000015.000400",
+    timestamp: "Mon 2026-07-06 15:07:45 GMT+3",
+    sender: "sam.rivera",
+    body: "almost done",
+  },
+  {
+    id: "1780000020.000500",
+    timestamp: "Mon 2026-07-06 15:08:20 GMT+3",
+    sender: "lee.chen",
+    body: "ok take your time",
+  },
+]);
+
+describe("openClawInboundBodiesMatch with a 6.10-era line-format host chat-history recap (issue #973)", () => {
+  it("matches a decorated face carrying a line-format recap block against its bare persisted row", () => {
+    const bare = "what's the status on the deploy?";
+    expect(
+      openClawInboundBodiesMatch(metadataWrappedWithLineRecap(TWO_ENTRY_LINE_RECAP, bare), bare),
+    ).toBe(true);
+  });
+
+  it("matches regardless of line-format recap size (a growing chat-history window)", () => {
+    const bare = "what's the status on the deploy?";
+    expect(
+      openClawInboundBodiesMatch(metadataWrappedWithLineRecap(FIVE_ENTRY_LINE_RECAP, bare), bare),
+    ).toBe(true);
+  });
+
+  it("recognizes entry lines whose sender contains a space (a real display name)", () => {
+    const bare = "what's the status on the deploy?";
+    const recap = historyRecapLineBlock([
+      {
+        id: "1780000000.000100",
+        timestamp: "Mon 2026-07-06 15:05:54 GMT+3",
+        sender: "Sam Rivera",
+        body: "did the build finish?",
+      },
+    ]);
+    expect(openClawInboundBodiesMatch(metadataWrappedWithLineRecap(recap, bare), bare)).toBe(true);
+  });
+
+  it("recognizes entry lines whose sender contains a colon (unusual but structurally permitted)", () => {
+    const bare = "what's the status on the deploy?";
+    const recap = historyRecapLineBlock([
+      {
+        id: "1780000000.000100",
+        timestamp: "Mon 2026-07-06 15:05:54 GMT+3",
+        sender: "erin:oncall",
+        body: "did the build finish?",
+      },
+    ]);
+    expect(openClawInboundBodiesMatch(metadataWrappedWithLineRecap(recap, bare), bare)).toBe(true);
+  });
+
+  it("recognizes a media-only entry line (bracketed content-type tag, no body text)", () => {
+    const bare = "what's the status on the deploy?";
+    const recap = [
+      "Chat history since last reply (untrusted, for context):",
+      "#1780000000.000100 Mon 2026-07-06 15:05:54 GMT+3 lee.chen: [image/jpeg]",
+    ].join("\n");
+    expect(openClawInboundBodiesMatch(metadataWrappedWithLineRecap(recap, bare), bare)).toBe(true);
+  });
+
+  it("does NOT strip when the recap header is merely quoted in the user's own body (fail-closed)", () => {
+    const bare =
+      'Chat history since last reply (untrusted, for context): that\'s an odd phrase to quote, right?';
+    expect(openClawInboundBodiesMatch(metadataWrapped(bare), bare)).toBe(true);
+  });
+
+  it("does NOT strip a line carrying neither a message-id nor a timestamp anchor (indistinguishable from ordinary prose, fail-closed)", () => {
+    const bare = "what's the status on the deploy?";
+    const unanchoredRecap = [
+      "Chat history since last reply (untrusted, for context):",
+      "lee.chen: did the build finish?",
+    ].join("\n");
+    expect(
+      openClawInboundBodiesMatch(metadataWrappedWithLineRecap(unanchoredRecap, bare), bare),
+    ).toBe(false);
+  });
+
+  it("does NOT strip a malformed entry line (no colon separator), so it blocks the match (fail-closed)", () => {
+    const bare = "what's the status on the deploy?";
+    const malformedRecap = [
+      "Chat history since last reply (untrusted, for context):",
+      "#1780000000.000100 Mon 2026-07-06 15:05:54 GMT+3 lee.chen did the build finish",
+    ].join("\n");
+    expect(
+      openClawInboundBodiesMatch(metadataWrappedWithLineRecap(malformedRecap, bare), bare),
+    ).toBe(false);
+  });
+
+  it("does NOT partially strip a run of valid entry lines that is not properly terminated by a blank line (fail-closed on the whole block)", () => {
+    const bare = "what's the status on the deploy?";
+    const improperlyTerminated = [
+      "Chat history since last reply (untrusted, for context):",
+      "#1780000000.000100 Mon 2026-07-06 15:05:54 GMT+3 lee.chen: did the build finish?",
+      "directly attached line, not blank, not a valid entry either",
+    ].join("\n");
+    const decorated = metadataWrapped(`${improperlyTerminated}\n\n${bare}`);
+    expect(openClawInboundBodiesMatch(decorated, bare)).toBe(false);
+  });
+
+  it("leaves recap-like line-format text at the start of a BARE row untouched (no metadata block, nothing to strip)", () => {
+    const recapLikeBareBody = [
+      "Chat history since last reply (untrusted, for context):",
+      "#1780000000.000100 Mon 2026-07-06 15:05:54 GMT+3 lee.chen: hello",
+      "",
+      "actual question here",
+    ].join("\n");
+    expect(openClawInboundModelFacingBody(recapLikeBareBody)).toBe(recapLikeBareBody.trim());
+  });
+});
+
+describe("canonicalizeOpenClawInboundMetadataIdentityContent / buildMessageIdentityHash with a line-format recap block", () => {
+  it("produces the same identity hash for the same turn whether or not a line-format recap is present", () => {
+    const bare = "what's the status on the deploy?";
+    const noRecap = metadataWrapped(bare);
+    const withRecap = metadataWrappedWithLineRecap(TWO_ENTRY_LINE_RECAP, bare);
+    expect(buildMessageIdentityHash("user", withRecap)).toBe(buildMessageIdentityHash("user", noRecap));
+  });
+
+  it("produces the same identity hash regardless of how many entries the line-format recap carries", () => {
+    const bare = "what's the status on the deploy?";
+    const small = metadataWrappedWithLineRecap(TWO_ENTRY_LINE_RECAP, bare);
+    const large = metadataWrappedWithLineRecap(FIVE_ENTRY_LINE_RECAP, bare);
+    expect(buildMessageIdentityHash("user", large)).toBe(buildMessageIdentityHash("user", small));
+  });
+
+  it("does NOT fold a malformed line-format recap block into the canonicalized identity content", () => {
+    const bare = "what's the status on the deploy?";
+    const malformedRecap = [
+      "Chat history since last reply (untrusted, for context):",
+      "#1780000000.000100 Mon 2026-07-06 15:05:54 GMT+3 lee.chen did the build finish",
+    ].join("\n");
+    const withMalformedRecap = metadataWrappedWithLineRecap(malformedRecap, bare);
+    const withoutRecap = metadataWrapped(bare);
+    expect(
+      canonicalizeOpenClawInboundMetadataIdentityContent("user", withMalformedRecap),
+    ).not.toBe(canonicalizeOpenClawInboundMetadataIdentityContent("user", withoutRecap));
+  });
+});
