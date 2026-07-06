@@ -2942,6 +2942,8 @@ describe("lcm command", () => {
 
     expect(result.text).toContain("repair targets: 3");
     expect(result.text).toContain("emergency-fallback summaries: 1");
+    expect(result.text).toContain("backup path:");
+    expect(result.text).toContain("scoped-doctor-repair");
     expect(result.text).toContain("repaired summaries: 3");
     expect(result.text).toContain("result: repaired 3 summary(s) in place");
     expect(result.text).toContain("sum_emergency_fix, sum_leaf_fix, sum_parent_fix");

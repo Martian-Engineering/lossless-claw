@@ -1683,8 +1683,22 @@ describe("applyScopedDoctorRepair backup safety", () => {
       throw new Error(`expected doctor repair to apply: ${result.reason}`);
     }
     expect(result.repaired).toBe(1);
+    expect(result.backupPath).toContain("scoped-doctor-repair");
 
     const backupFiles = readdirSync(tempDir).filter((name) => name.includes("scoped-doctor-repair"));
-    expect(backupFiles.length).toBeGreaterThan(0);
+    expect(backupFiles).toHaveLength(1);
+    const repairedSummary = await summaryStore.getSummary(summaryId);
+    expect(repairedSummary?.content).toBe("Repaired summary content without any doctor marker.");
+
+    const backupDb = createLcmDatabaseConnection(join(tempDir, backupFiles[0]!));
+    try {
+      const backedUpSummary = backupDb
+        .prepare("SELECT content FROM summaries WHERE summary_id = ?")
+        .get(summaryId) as { content: string } | undefined;
+      expect(backedUpSummary?.content).toBe(FALLBACK_SUMMARY_MARKER);
+    } finally {
+      closeLcmConnection(backupDb);
+      closeLcmConnection(db);
+    }
   });
 });
