@@ -234,6 +234,7 @@ export function buildForkBoundedLiveFallback(params: {
   };
 }
 
+/** Return the log level for fork-bounded live suffix append pressure. */
 export function forkBoundedLiveSuffixAppendLogLevel(append: {
   evictedMessages: number;
   overBudget: boolean;
