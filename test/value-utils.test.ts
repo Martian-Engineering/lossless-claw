@@ -14,9 +14,42 @@ import {
   toJson,
 } from "../src/value-utils.js";
 
-// ---------------------------------------------------------------------------
-// getErrorCode
-// ---------------------------------------------------------------------------
+const nonErrorValues: Array<[string, unknown]> = [
+  ["string", "ENOENT"],
+  ["number", 42],
+  ["null", null],
+  ["undefined", undefined],
+  ["plain object with code", { code: "ENOENT" }],
+  ["plain object with message and code", { message: "boom", code: "EBUSY" }],
+];
+
+const nonStringValues: Array<[string, unknown]> = [
+  ["number", 42],
+  ["boolean", true],
+  ["null", null],
+  ["undefined", undefined],
+  ["object", { key: "val" }],
+  ["array", ["a", "b"]],
+];
+
+const nonBooleanValues: Array<[string, unknown]> = [
+  ["string", "true"],
+  ["number", 1],
+  ["null", null],
+  ["undefined", undefined],
+  ["object", { value: true }],
+];
+
+const nonRecordValues: Array<[string, unknown]> = [
+  ["array", [1, 2, 3]],
+  ["null", null],
+  ["undefined", undefined],
+  ["string", "hello"],
+  ["number", 42],
+  ["boolean", true],
+  ["function", () => undefined],
+];
+
 describe("getErrorCode", () => {
   it("returns the code when error has a string code", () => {
     const error = Object.assign(new Error("boom"), { code: "ENOENT" });
@@ -32,31 +65,14 @@ describe("getErrorCode", () => {
     expect(getErrorCode(error)).toBeUndefined();
   });
 
-  it("returns undefined for non-Error values", () => {
-    expect(getErrorCode("ENOENT")).toBeUndefined();
-    expect(getErrorCode(42)).toBeUndefined();
-    expect(getErrorCode(null)).toBeUndefined();
-    expect(getErrorCode(undefined)).toBeUndefined();
-    expect(getErrorCode({ code: "ENOENT" })).toBeUndefined();
-  });
-
-  it("returns undefined for a plain object with message + code (not an Error instance)", () => {
-    expect(getErrorCode({ message: "boom", code: "EBUSY" })).toBeUndefined();
+  it.each(nonErrorValues)("returns undefined for %s", (_label, value) => {
+    expect(getErrorCode(value)).toBeUndefined();
   });
 });
 
-// ---------------------------------------------------------------------------
-// isMissingFileError
-// ---------------------------------------------------------------------------
 describe("isMissingFileError", () => {
-  it("returns true for ENOENT", () => {
-    expect(isMissingFileError(Object.assign(new Error("gone"), { code: "ENOENT" }))).toBe(true);
-  });
-
-  it("returns true for ENOTDIR", () => {
-    expect(isMissingFileError(Object.assign(new Error("not a dir"), { code: "ENOTDIR" }))).toBe(
-      true,
-    );
+  it.each(["ENOENT", "ENOTDIR"])("returns true for %s", (code) => {
+    expect(isMissingFileError(Object.assign(new Error("gone"), { code }))).toBe(true);
   });
 
   it("returns false for other error codes", () => {
@@ -68,87 +84,54 @@ describe("isMissingFileError", () => {
     expect(isMissingFileError(new Error("no code"))).toBe(false);
   });
 
-  it("returns false for non-Error values", () => {
-    expect(isMissingFileError("ENOENT")).toBe(false);
-    expect(isMissingFileError({ code: "ENOENT" })).toBe(false);
-    expect(isMissingFileError(null)).toBe(false);
-    expect(isMissingFileError(undefined)).toBe(false);
+  it.each(nonErrorValues)("returns false for %s", (_label, value) => {
+    expect(isMissingFileError(value)).toBe(false);
   });
 });
 
-// ---------------------------------------------------------------------------
-// normalizeSessionFilePathForComparison
-// ---------------------------------------------------------------------------
 describe("normalizeSessionFilePathForComparison", () => {
-  it("resolves a valid path to an absolute path", () => {
-    const result = normalizeSessionFilePathForComparison("/foo/bar/session.jsonl");
-    expect(result).toBe(resolvePath("/foo/bar/session.jsonl"));
+  it.each([
+    ["absolute path", "/foo/bar/session.jsonl", resolvePath("/foo/bar/session.jsonl")],
+    ["trimmed absolute path", "  /foo/bar  ", resolvePath("/foo/bar")],
+    ["relative path", "relative/path.jsonl", resolvePath("relative/path.jsonl")],
+  ])("normalizes %s", (_label, input, expected) => {
+    expect(normalizeSessionFilePathForComparison(input)).toBe(expected);
   });
 
-  it("trims whitespace before resolving", () => {
-    const result = normalizeSessionFilePathForComparison("  /foo/bar  ");
-    expect(result).toBe(resolvePath("/foo/bar"));
-  });
-
-  it("returns empty string for empty input", () => {
-    expect(normalizeSessionFilePathForComparison("")).toBe("");
-  });
-
-  it("returns empty string for whitespace-only input", () => {
-    expect(normalizeSessionFilePathForComparison("   ")).toBe("");
-  });
-
-  it("resolves a relative path against cwd", () => {
-    const result = normalizeSessionFilePathForComparison("relative/path.jsonl");
-    expect(result).toBe(resolvePath("relative/path.jsonl"));
+  it.each(["", "   "])("returns empty string for empty input %j", (input) => {
+    expect(normalizeSessionFilePathForComparison(input)).toBe("");
   });
 });
 
-// ---------------------------------------------------------------------------
-// toJson
-// ---------------------------------------------------------------------------
 describe("toJson", () => {
-  it("serializes a plain object to JSON", () => {
-    expect(toJson({ a: 1, b: "two" })).toBe('{"a":1,"b":"two"}');
+  it.each([
+    ["plain object", { a: 1, b: "two" }, '{"a":1,"b":"two"}'],
+    ["array", [1, 2, 3], "[1,2,3]"],
+    ["string", "hello", '"hello"'],
+    ["number", 42, "42"],
+    ["boolean", true, "true"],
+    ["null", null, "null"],
+  ])("serializes %s to JSON", (_label, value, expected) => {
+    expect(toJson(value)).toBe(expected);
   });
 
-  it("serializes an array to JSON", () => {
-    expect(toJson([1, 2, 3])).toBe("[1,2,3]");
-  });
-
-  it("serializes a string (produces a quoted JSON string)", () => {
-    expect(toJson("hello")).toBe('"hello"');
-  });
-
-  it("serializes a number", () => {
-    expect(toJson(42)).toBe("42");
-  });
-
-  it("serializes a boolean", () => {
-    expect(toJson(true)).toBe("true");
-  });
-
-  it("serializes null", () => {
-    expect(toJson(null)).toBe("null");
-  });
-
-  it("returns empty string for undefined (JSON.stringify returns undefined, not a string)", () => {
-    expect(toJson(undefined)).toBe("");
-  });
-
-  it("returns empty string for a function (JSON.stringify returns undefined)", () => {
-    expect(toJson(() => {})).toBe("");
+  it.each([
+    ["undefined", undefined],
+    ["function", () => undefined],
+  ])("returns empty string when JSON.stringify omits %s", (_label, value) => {
+    expect(toJson(value)).toBe("");
   });
 });
 
-// ---------------------------------------------------------------------------
-// hashSerializedMessages
-// ---------------------------------------------------------------------------
 describe("hashSerializedMessages", () => {
   it("returns a 16-character hex string", () => {
     const hash = hashSerializedMessages(["hello"]);
     expect(hash).toHaveLength(16);
     expect(/^[0-9a-f]{16}$/.test(hash)).toBe(true);
+  });
+
+  it("uses the expected truncated sha256 digest", () => {
+    expect(hashSerializedMessages(["hello"])).toBe("c7a0f7154e64cd96");
   });
 
   it("produces deterministic output for the same input", () => {
@@ -168,16 +151,13 @@ describe("hashSerializedMessages", () => {
     expect(hash).toHaveLength(16);
   });
 
-  it("preserves order sensitivity (different order → different hash)", () => {
+  it("preserves order sensitivity", () => {
     const forward = hashSerializedMessages(["first", "second"]);
     const reversed = hashSerializedMessages(["second", "first"]);
     expect(forward).not.toBe(reversed);
   });
 });
 
-// ---------------------------------------------------------------------------
-// safeString
-// ---------------------------------------------------------------------------
 describe("safeString", () => {
   it("returns the value when it is a string", () => {
     expect(safeString("hello")).toBe("hello");
@@ -187,55 +167,22 @@ describe("safeString", () => {
     expect(safeString("")).toBe("");
   });
 
-  it("returns undefined for a number", () => {
-    expect(safeString(42)).toBeUndefined();
-  });
-
-  it("returns undefined for a boolean", () => {
-    expect(safeString(true)).toBeUndefined();
-  });
-
-  it("returns undefined for null", () => {
-    expect(safeString(null)).toBeUndefined();
-  });
-
-  it("returns undefined for undefined", () => {
-    expect(safeString(undefined)).toBeUndefined();
-  });
-
-  it("returns undefined for an object", () => {
-    expect(safeString({ key: "val" })).toBeUndefined();
-  });
-
-  it("returns undefined for an array", () => {
-    expect(safeString(["a", "b"])).toBeUndefined();
+  it.each(nonStringValues)("returns undefined for %s", (_label, value) => {
+    expect(safeString(value)).toBeUndefined();
   });
 });
 
-// ---------------------------------------------------------------------------
-// formatDurationMs
-// ---------------------------------------------------------------------------
 describe("formatDurationMs", () => {
-  it("formats a duration with the ms suffix", () => {
-    expect(formatDurationMs(150)).toBe("150ms");
-  });
-
-  it("formats zero", () => {
-    expect(formatDurationMs(0)).toBe("0ms");
-  });
-
-  it("formats a large duration", () => {
-    expect(formatDurationMs(60000)).toBe("60000ms");
-  });
-
-  it("formats a negative number (passes through as-is)", () => {
-    expect(formatDurationMs(-1)).toBe("-1ms");
+  it.each([
+    [150, "150ms"],
+    [0, "0ms"],
+    [60000, "60000ms"],
+    [-1, "-1ms"],
+  ])("formats %s with the ms suffix", (durationMs, expected) => {
+    expect(formatDurationMs(durationMs)).toBe(expected);
   });
 });
 
-// ---------------------------------------------------------------------------
-// asRecord
-// ---------------------------------------------------------------------------
 describe("asRecord", () => {
   it("returns the object for a plain object", () => {
     const obj = { a: 1, b: 2 };
@@ -247,38 +194,11 @@ describe("asRecord", () => {
     expect(asRecord(obj)).toBe(obj);
   });
 
-  it("returns undefined for an array", () => {
-    expect(asRecord([1, 2, 3])).toBeUndefined();
-  });
-
-  it("returns undefined for null", () => {
-    expect(asRecord(null)).toBeUndefined();
-  });
-
-  it("returns undefined for undefined", () => {
-    expect(asRecord(undefined)).toBeUndefined();
-  });
-
-  it("returns undefined for a string", () => {
-    expect(asRecord("hello")).toBeUndefined();
-  });
-
-  it("returns undefined for a number", () => {
-    expect(asRecord(42)).toBeUndefined();
-  });
-
-  it("returns undefined for a boolean", () => {
-    expect(asRecord(true)).toBeUndefined();
-  });
-
-  it("returns undefined for a function", () => {
-    expect(asRecord(() => {})).toBeUndefined();
+  it.each(nonRecordValues)("returns undefined for %s", (_label, value) => {
+    expect(asRecord(value)).toBeUndefined();
   });
 });
 
-// ---------------------------------------------------------------------------
-// safeBoolean
-// ---------------------------------------------------------------------------
 describe("safeBoolean", () => {
   it("returns true for true", () => {
     expect(safeBoolean(true)).toBe(true);
@@ -288,123 +208,55 @@ describe("safeBoolean", () => {
     expect(safeBoolean(false)).toBe(false);
   });
 
-  it("returns undefined for a string", () => {
-    expect(safeBoolean("true")).toBeUndefined();
-  });
-
-  it("returns undefined for a number", () => {
-    expect(safeBoolean(1)).toBeUndefined();
-  });
-
-  it("returns undefined for null", () => {
-    expect(safeBoolean(null)).toBeUndefined();
-  });
-
-  it("returns undefined for undefined", () => {
-    expect(safeBoolean(undefined)).toBeUndefined();
-  });
-
-  it("returns undefined for an object", () => {
-    expect(safeBoolean({ value: true })).toBeUndefined();
+  it.each(nonBooleanValues)("returns undefined for %s", (_label, value) => {
+    expect(safeBoolean(value)).toBeUndefined();
   });
 });
 
-// ---------------------------------------------------------------------------
-// resolvePositiveInteger
-// ---------------------------------------------------------------------------
 describe("resolvePositiveInteger", () => {
   const fallback = 100;
 
-  it("returns the floored integer for a positive finite number", () => {
-    expect(resolvePositiveInteger(5, fallback)).toBe(5);
+  it.each([
+    [5, 5],
+    [3.9, 3],
+  ])("normalizes positive finite value %s", (value, expected) => {
+    expect(resolvePositiveInteger(value, fallback)).toBe(expected);
   });
 
-  it("floors floating point values", () => {
-    expect(resolvePositiveInteger(3.9, fallback)).toBe(3);
-  });
-
-  it("returns the fallback for zero", () => {
-    expect(resolvePositiveInteger(0, fallback)).toBe(fallback);
-  });
-
-  it("returns the fallback for a negative number", () => {
-    expect(resolvePositiveInteger(-5, fallback)).toBe(fallback);
-  });
-
-  it("returns the fallback for Infinity", () => {
-    expect(resolvePositiveInteger(Infinity, fallback)).toBe(fallback);
-  });
-
-  it("returns the fallback for -Infinity", () => {
-    expect(resolvePositiveInteger(-Infinity, fallback)).toBe(fallback);
-  });
-
-  it("returns the fallback for NaN", () => {
-    expect(resolvePositiveInteger(NaN, fallback)).toBe(fallback);
-  });
-
-  it("returns the fallback for a string", () => {
-    expect(resolvePositiveInteger("5", fallback)).toBe(fallback);
-  });
-
-  it("returns the fallback for null", () => {
-    expect(resolvePositiveInteger(null, fallback)).toBe(fallback);
-  });
-
-  it("returns the fallback for undefined", () => {
-    expect(resolvePositiveInteger(undefined, fallback)).toBe(fallback);
-  });
-
-  it("returns the fallback for a boolean", () => {
-    expect(resolvePositiveInteger(true, fallback)).toBe(fallback);
+  it.each([
+    ["zero", 0],
+    ["negative number", -5],
+    ["Infinity", Infinity],
+    ["-Infinity", -Infinity],
+    ["NaN", NaN],
+    ["string", "5"],
+    ["null", null],
+    ["undefined", undefined],
+    ["boolean", true],
+  ])("returns the fallback for %s", (_label, value) => {
+    expect(resolvePositiveInteger(value, fallback)).toBe(fallback);
   });
 });
 
-// ---------------------------------------------------------------------------
-// normalizeOptionalCount
-// ---------------------------------------------------------------------------
 describe("normalizeOptionalCount", () => {
-  it("returns the floored integer for a non-negative finite number", () => {
-    expect(normalizeOptionalCount(5)).toBe(5);
+  it.each([
+    [5, 5],
+    [3.9, 3],
+    [0, 0],
+  ])("normalizes non-negative finite value %s", (value, expected) => {
+    expect(normalizeOptionalCount(value)).toBe(expected);
   });
 
-  it("floors floating point values", () => {
-    expect(normalizeOptionalCount(3.9)).toBe(3);
-  });
-
-  it("returns 0 for zero", () => {
-    expect(normalizeOptionalCount(0)).toBe(0);
-  });
-
-  it("returns undefined for a negative number", () => {
-    expect(normalizeOptionalCount(-1)).toBeUndefined();
-  });
-
-  it("returns undefined for Infinity", () => {
-    expect(normalizeOptionalCount(Infinity)).toBeUndefined();
-  });
-
-  it("returns undefined for -Infinity", () => {
-    expect(normalizeOptionalCount(-Infinity)).toBeUndefined();
-  });
-
-  it("returns undefined for NaN", () => {
-    expect(normalizeOptionalCount(NaN)).toBeUndefined();
-  });
-
-  it("returns undefined for a string", () => {
-    expect(normalizeOptionalCount("5")).toBeUndefined();
-  });
-
-  it("returns undefined for null", () => {
-    expect(normalizeOptionalCount(null)).toBeUndefined();
-  });
-
-  it("returns undefined for undefined", () => {
-    expect(normalizeOptionalCount(undefined)).toBeUndefined();
-  });
-
-  it("returns undefined for a boolean", () => {
-    expect(normalizeOptionalCount(false)).toBeUndefined();
+  it.each([
+    ["negative number", -1],
+    ["Infinity", Infinity],
+    ["-Infinity", -Infinity],
+    ["NaN", NaN],
+    ["string", "5"],
+    ["null", null],
+    ["undefined", undefined],
+    ["boolean", false],
+  ])("returns undefined for %s", (_label, value) => {
+    expect(normalizeOptionalCount(value)).toBeUndefined();
   });
 });
