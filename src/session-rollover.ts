@@ -12,6 +12,7 @@ import { describeLogError } from "./lcm-log.js";
 import { isLikelyInjectedDeliveryOnlyTranscript, toStoredMessage } from "./message-content.js";
 import { createBootstrapEntryHash, messageIdentity } from "./message-signatures.js";
 import type { AgentMessage } from "./openclaw-bridge.js";
+import { isIsolatedCronSessionKey } from "./session-patterns.js";
 import type { ArchiveCause, ConversationStore } from "./store/conversation-store.js";
 import { getTranscriptEntryMeta } from "./transcript.js";
 import { isMissingFileError } from "./value-utils.js";
@@ -155,16 +156,6 @@ export class SessionRolloverDetector {
     return true;
   }
 
-  /** Cron session keys represent isolated scheduled runs, not conversation continuity. */
-  private isIsolatedCronSessionKey(sessionKey?: string): boolean {
-    const trimmed = sessionKey?.trim();
-    if (!trimmed) {
-      return false;
-    }
-    const parts = trimmed.split(":");
-    return parts.length >= 4 && parts[0] === "agent" && parts[2] === "cron";
-  }
-
   /**
    * Archive the prior active cron run when OpenClaw reuses a scheduler
    * sessionKey for a new isolated runtime session.
@@ -180,7 +171,7 @@ export class SessionRolloverDetector {
     if (
       !normalizedSessionId ||
       !normalizedSessionKey ||
-      !this.isIsolatedCronSessionKey(normalizedSessionKey)
+      !isIsolatedCronSessionKey(normalizedSessionKey)
     ) {
       return false;
     }
@@ -496,6 +487,49 @@ export class SessionRolloverDetector {
       `[lcm] ${params.phase}: ambiguous rollover resolved by fresh-transcript rebind conversation=${params.rollover.conversationId} sessionKey=${params.rollover.sessionKey} oldSessionId=${params.rollover.activeSessionId} newSessionId=${params.sessionId} candidateMessages=${params.candidateMessages.length} lastPersistedAt=${verdict.lastPersistedAt?.toISOString() ?? "none"} firstCandidateAt=${verdict.firstCandidateAt !== null ? new Date(verdict.firstCandidateAt).toISOString() : "none"}`,
     );
     return { rebound: true };
+  }
+
+  /**
+   * Check whether a candidate runtime transcript is fresh enough to rotate an
+   * isolated cron lane without risking an older callback taking over the active
+   * cron conversation.
+   */
+  async transcriptIsProvablyFreshForRuntimeRollover(params: {
+    phase: "bootstrap" | "assemble" | "afterTurn";
+    conversationId: number;
+    sessionKey: string;
+    activeSessionId: string;
+    nextSessionId: string;
+    candidateMessages: AgentMessage[];
+    source: "isolated-cron";
+  }): Promise<boolean> {
+    let verdict: Awaited<ReturnType<SessionRolloverDetector["evaluateAmbiguousRolloverFreshness"]>>;
+    try {
+      verdict = await this.evaluateAmbiguousRolloverFreshness({
+        conversationId: params.conversationId,
+        candidateMessages: params.candidateMessages,
+      });
+    } catch (err) {
+      this.deps.log.warn(
+        `[lcm] ${params.phase}: ${params.source} freshness check failed conversation=${params.conversationId} error=${describeLogError(err)}`,
+      );
+      return false;
+    }
+
+    if (!verdict.fresh) {
+      const message = `[lcm] ${params.phase}: ${params.source} rollover not provably fresh conversation=${params.conversationId} sessionKey=${params.sessionKey} oldSessionId=${params.activeSessionId} newSessionId=${params.nextSessionId} freshness=${verdict.reason} lastPersistedAt=${verdict.lastPersistedAt?.toISOString() ?? "none"} firstCandidateAt=${verdict.firstCandidateAt !== null ? new Date(verdict.firstCandidateAt).toISOString() : "none"}`;
+      if (isTransientAmbiguousRolloverFreshness(verdict.reason)) {
+        this.deps.log.info(message);
+      } else {
+        this.deps.log.warn(message);
+      }
+      return false;
+    }
+
+    this.deps.log.info(
+      `[lcm] ${params.phase}: ${params.source} rollover transcript proved fresh conversation=${params.conversationId} sessionKey=${params.sessionKey} oldSessionId=${params.activeSessionId} newSessionId=${params.nextSessionId} candidateMessages=${params.candidateMessages.length} lastPersistedAt=${verdict.lastPersistedAt?.toISOString() ?? "none"} firstCandidateAt=${verdict.firstCandidateAt !== null ? new Date(verdict.firstCandidateAt).toISOString() : "none"}`,
+    );
+    return true;
   }
 
   async transcriptContainsCurrentConversationTailAnchor(params: {

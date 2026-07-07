@@ -3,6 +3,7 @@ import {
   getRuntimeExpansionAuthManager,
   resolveDelegatedExpansionGrantId,
 } from "../expansion-auth.js";
+import { isIsolatedCronSessionKey } from "../session-patterns.js";
 import type { LcmDependencies } from "../types.js";
 
 export type LcmConversationScope = {
@@ -54,15 +55,6 @@ async function lookupConversationForSession(input: {
   }
 
   return store.getConversationBySessionId(normalizedSessionId);
-}
-
-function isIsolatedCronSessionKey(sessionKey?: string): boolean {
-  const trimmed = sessionKey?.trim();
-  if (!trimmed) {
-    return false;
-  }
-  const parts = trimmed.split(":");
-  return parts.length >= 4 && parts[0] === "agent" && parts[2] === "cron";
 }
 
 /**
