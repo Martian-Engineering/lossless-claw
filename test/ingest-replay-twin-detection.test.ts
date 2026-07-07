@@ -95,6 +95,35 @@ describe("reconcile ingest replay-twin detection (inner source timestamp)", () =
     expect(await userContents(engine, sessionId)).toEqual([feathers, "they weigh the same"]);
   });
 
+  it("advances the append-only checkpoint when every appended entry is a replay twin", async () => {
+    const sessionFile = createSessionFilePath("replay-twin-checkpoint");
+    const header = headerLine("replay-twin-checkpoint-header");
+    const feathers = "a kilogram of feathers";
+    writeTranscript(sessionFile, header, [
+      entryLine({ id: "e1", parentId: null, role: "user", text: feathers, innerMs: FROZEN_MS }),
+    ]);
+
+    const engine = createEngine();
+    const sessionId = "replay-twin-checkpoint";
+    await engine.bootstrap({ sessionId, sessionFile });
+
+    writeTranscript(sessionFile, header, [
+      entryLine({ id: "e1", parentId: null, role: "user", text: feathers, innerMs: FROZEN_MS }),
+      entryLine({ id: "e2", parentId: "e1", role: "user", text: feathers, innerMs: FROZEN_MS }),
+    ]);
+    await engine.afterTurn({ sessionId, sessionFile, messages: [], prePromptMessageCount: 0 });
+
+    const conversation = await engine
+      .getConversationStore()
+      .getConversationForSession({ sessionId });
+    const checkpoint = await engine
+      .getSummaryStore()
+      .getConversationBootstrapState(conversation!.conversationId);
+
+    expect(checkpoint?.lastProcessedEntryId).toBe("e2");
+    expect(await userContents(engine, sessionId)).toEqual([feathers]);
+  });
+
   it("keeps a genuine repeat carrying a DISTINCT inner timestamp", async () => {
     const sessionFile = createSessionFilePath("replay-twin-distinct-ts");
     const header = headerLine("replay-twin-distinct-ts-header");

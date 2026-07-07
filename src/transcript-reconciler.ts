@@ -1707,6 +1707,7 @@ export class TranscriptReconciler {
     // persisted twin from a prior pass).
     replayTwinConversationId?: number;
     replayTwinSessionFile?: string;
+    onReplayTwinSkipped?: () => void;
   }): Promise<number> {
     let importedMessages = 0;
     // Tier 2 full-tail index, built lazily at most once per batch: only a Tier-1
@@ -1741,6 +1742,7 @@ export class TranscriptReconciler {
             this.host.deps.log.debug(
               `[lcm] ingestBatch: skipped source-identity replay twin entry=${getTranscriptEntryId(message) ?? "?"} conversation=${replayTwinConversationId}`,
             );
+            params.onReplayTwinSkipped?.();
             continue;
           }
         }
@@ -1996,6 +1998,7 @@ export class TranscriptReconciler {
           source: "afterTurn transcript reconcile append-only",
         });
         if (!appendOnlyOverlapsPersisted) {
+          let replayTwinsSkipped = 0;
           const importedMessages = await this.ingestBatch({
             sessionId: params.sessionId,
             sessionKey: params.sessionKey,
@@ -2003,12 +2006,22 @@ export class TranscriptReconciler {
             replayGuardExemptPrefixLength: replayFiltered.replayGuardExemptPrefixLength,
             replayTwinConversationId: conversation.conversationId,
             replayTwinSessionFile: params.sessionFile,
+            onReplayTwinSkipped: () => {
+              replayTwinsSkipped += 1;
+            },
           });
-          await this.recordImportAndRefreshCheckpoint({
-            conversationId: conversation.conversationId,
-            sessionFile: params.sessionFile,
-            importedMessages,
-          });
+          if (importedMessages > 0) {
+            await this.recordImportAndRefreshCheckpoint({
+              conversationId: conversation.conversationId,
+              sessionFile: params.sessionFile,
+              importedMessages,
+            });
+          } else if (replayTwinsSkipped > 0) {
+            await this.refreshBootstrapState({
+              conversationId: conversation.conversationId,
+              sessionFile: params.sessionFile,
+            });
+          }
           return {
             importedMessages,
             blockedByImportCap: false,
