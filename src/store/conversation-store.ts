@@ -873,6 +873,38 @@ export class ConversationStore {
   }
 
   /**
+   * Tier-1 replay-twin gate for the append-only reconcile path: does this
+   * conversation already hold a row with the same role, identity hash, and
+   * created_at SECOND as the candidate? An indexed point lookup
+   * (messages_conv_identity_hash_idx), no file read. A miss proves the candidate
+   * is genuinely new content, so the append-only fast path proceeds untouched; a
+   * hit is ambiguous (a re-append twin OR a legitimate same-second repeat) and
+   * the caller resolves it at full inner-timestamp precision.
+   */
+  async hasPersistedIdentityAtCreatedAtSecond(
+    conversationId: ConversationId,
+    role: MessageRole,
+    content: string,
+    createdAt: Date | string | undefined,
+  ): Promise<boolean> {
+    const createdAtSecond = formatMessageCreatedAt(createdAt);
+    if (!createdAtSecond) {
+      return false;
+    }
+    const identityHash = buildMessageIdentityHash(role, content);
+    const row = this.db
+      .prepare(
+        `SELECT 1 AS count
+       FROM messages
+       WHERE conversation_id = ? AND identity_hash = ? AND role = ? AND created_at = ?
+       LIMIT 1`,
+      )
+      .get(conversationId, identityHash, role, createdAtSecond) as unknown as CountRow | undefined;
+
+    return row?.count === 1;
+  }
+
+  /**
    * Stamp a transcript entry id onto the earliest identity-matching row that
    * has none. Heals rows persisted from the runtime array (flush lag) or
    * before the entry-id migration when the transcript later delivers the

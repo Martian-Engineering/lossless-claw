@@ -60,6 +60,31 @@ export function resolveTranscriptMessageCreatedAt(message: AgentMessage): Date |
   return getTranscriptEntryMeta(message)?.timestamp ?? undefined;
 }
 
+/**
+ * The full-precision INNER source timestamp of a transcript message
+ * (message.timestamp / createdAt / created_at) as resolveTranscriptMessageCreatedAt
+ * reads it, BEFORE the store truncates it to a whole second. Returned as a
+ * number of epoch milliseconds when parseable, else the trimmed string, else
+ * null. The per-entry envelope timestamp is intentionally NOT used as a
+ * fallback: OpenClaw re-stamps it fresh on every re-append, so it cannot
+ * identify a frozen source event. Used only for replay-twin detection, which
+ * must fail open when no inner timestamp is present.
+ */
+export function resolveTranscriptMessageInnerTimestamp(message: AgentMessage): number | string | null {
+  const raw = message as unknown as Record<string, unknown>;
+  const value = raw.timestamp ?? raw.createdAt ?? raw.created_at;
+  if (typeof value === "number") {
+    return Number.isFinite(value) ? value : null;
+  }
+  if (value instanceof Date) {
+    return Number.isFinite(value.getTime()) ? value.getTime() : null;
+  }
+  if (typeof value === "string" && value.trim()) {
+    return value.trim();
+  }
+  return null;
+}
+
 function normalizeEnvelopeString(value: unknown): string | null {
   if (typeof value !== "string") {
     return null;
