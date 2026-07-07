@@ -4,6 +4,9 @@ import { join } from "node:path";
 import type { DatabaseSync } from "node:sqlite";
 import type {
   ContextEngine,
+  ContextEngineControlCapabilities,
+  ContextEngineControlRequest,
+  ContextEngineControlResult,
   ContextEngineInfo,
   ContextEngineHostCapability,
   AssembleResult,
@@ -38,6 +41,10 @@ import {
   revokeDelegatedExpansionGrantForSession,
 } from "./expansion-auth.js";
 import { describeLogError, formatSessionLabel } from "./lcm-log.js";
+import {
+  getLcmProgrammaticControlCapabilities,
+  runLcmProgrammaticControl,
+} from "./plugin/lcm-command.js";
 import { describeLcmConfigSource } from "./db/config.js";
 import { RetrievalEngine } from "./retrieval.js";
 import { compileSessionPatterns, matchesSessionPattern } from "./session-patterns.js";
@@ -4403,6 +4410,29 @@ export class LcmContextEngine implements ContextEngine {
     params: Parameters<SessionRotationService["rotateSessionStorageWithBackup"]>[0],
   ): Promise<RotateSessionStorageWithBackupResult> {
     return this.sessionRotation.rotateSessionStorageWithBackup(params);
+  }
+
+  getControlCapabilities(): ContextEngineControlCapabilities {
+    return getLcmProgrammaticControlCapabilities({
+      deps: this.deps,
+      getLcm: async () => this,
+    });
+  }
+
+  async control(params: ContextEngineControlRequest): Promise<ContextEngineControlResult> {
+    return runLcmProgrammaticControl({
+      operation: params.operation,
+      ctx: {
+        agentId: params.agentId,
+        sessionId: params.sessionId,
+        sessionKey: params.sessionKey,
+        runtimeContext: params.runtimeContext,
+      },
+      db: this.db,
+      config: this.config,
+      deps: this.deps,
+      getLcm: async () => this,
+    });
   }
 
   /** @internal Test seam: typed access to the compaction engine. */

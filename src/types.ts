@@ -179,6 +179,7 @@ export interface LcmDependencies {
 
   /** Resolve the current transcript file path for a session identity */
   resolveSessionTranscriptFile: (params: {
+    agentId?: string;
     sessionId: string;
     sessionKey?: string;
   }) => Promise<string | undefined>;

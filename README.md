@@ -61,6 +61,18 @@ Not currently supported as root CLI commands:
 
 The bundled skill focuses on configuration, diagnostics, architecture, and recall-tool usage. Its reference set lives under `skills/lossless-claw/references/`.
 
+### Programmatic control
+
+Lossless-claw also exposes an optional host-facing context-engine control contract for OpenClaw gateways that support context-engine capabilities and control dispatch. The contract is intentionally smaller than the native slash command surface:
+
+- `status` returns whether an LCM conversation is active and the current stored message count.
+- `doctor` returns a bounded, sanitized warning list for summary-health issues.
+- `rotate` runs the same safe transcript rotation path as `/lossless rotate` and returns the post-rotate message count plus the timestamp for that successful rotate operation.
+
+Programmatic control never returns transcript text, local database paths, backup paths, credentials, provider debug, or shell output. `status` does not report `lastRotatedAt`; hosts that need durable rotation timestamps should persist that product state themselves after a successful `rotate` result.
+
+This surface is capability-gated by the OpenClaw host. At the time of this change there is not yet a stable OpenClaw release with the required context-engine control endpoints; downstream users should treat it as unavailable unless their host advertises the matching capability, for example through the pending `openclaw/openclaw#98060` contract or an equivalent downstream gateway.
+
 ## Session Migration CLI
 
 `lossless-claw-migrate-sessions` is a one-time shell CLI for backfilling OpenClaw JSONL session files into `lcm.db` after lossless-claw was disabled, missing, or installed after sessions already existed. It is not a background replay loop and it does not run summarization.

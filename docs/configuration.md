@@ -11,6 +11,15 @@ generic CLI harnesses such as `claude-cli` and `codex-cli` do not. If you must
 use a generic CLI harness, set `plugins.slots.contextEngine` to `legacy` for
 that run instead of `lossless-claw`.
 
+The optional programmatic `status` / `doctor` / `rotate` control surface requires
+a host that separately advertises context-engine capabilities/control dispatch.
+That host contract is not covered by the baseline plugin API version above. As
+of this documentation update, no stable OpenClaw release includes those gateway
+endpoints; downstream control planes should probe host capabilities and treat
+control as unavailable until `openclaw/openclaw#98060` or an equivalent stable
+host contract lands. The plugin's normal context-engine behavior and slash
+commands continue to work on the baseline supported OpenClaw versions.
+
 Configuration precedence is:
 
 1. Environment variables
@@ -166,6 +175,21 @@ openclaw plugins install --link /path/to/lossless-claw
 ```
 
 ## Reference
+
+### Programmatic context-engine control
+
+When the OpenClaw host supports context-engine control dispatch, lossless-claw
+advertises three sanitized operations:
+
+| Operation | Result | Notes |
+| --- | --- | --- |
+| `status` | `active`, `messageCount` | Reports current LCM conversation state only. It does not include `lastRotatedAt` because that timestamp is product/runtime state, not durable LCM state. |
+| `doctor` | `ok`, `warnings[]` | Returns a bounded summary-health warning list without transcript text, paths, or raw provider/debug output. |
+| `rotate` | `messageCount`, `lastRotatedAt` | Reuses the `/lossless rotate` implementation and returns the timestamp for the successful rotate operation. Hosts that need durable rotation history should persist this result outside lossless-claw. |
+
+The control surface never accepts arbitrary slash commands and never exposes
+local database paths, transcript paths, backup paths, credentials, or raw shell
+output.
 
 ### Core storage and session behavior
 

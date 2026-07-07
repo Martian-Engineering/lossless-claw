@@ -11,7 +11,12 @@ import { resolveLcmConfig } from "../src/db/config.js";
 import { ConversationStore } from "../src/store/conversation-store.js";
 import { FocusBriefStore } from "../src/store/focus-brief-store.js";
 import { SummaryStore } from "../src/store/summary-store.js";
-import { createLcmCommand, __testing } from "../src/plugin/lcm-command.js";
+import {
+  LcmProgrammaticControlUnavailableError,
+  createLcmCommand,
+  runLcmProgrammaticControl,
+  __testing,
+} from "../src/plugin/lcm-command.js";
 import { FALLBACK_DIRECTIVE_SUMMARY_MARKER } from "../src/summary-fallback.js";
 import type { LcmSummarizeFn } from "../src/summarize.js";
 import type { LcmDependencies } from "../src/types.js";
@@ -3129,6 +3134,316 @@ describe("lcm command", () => {
     expect(result.text).toContain("💾 Lossless Claw Backup");
     expect(result.text).toContain("status: failed");
     expect(result.text).toContain("reason: disk full");
+  });
+
+  it("returns sanitized programmatic status and doctor results", async () => {
+    const fixture = createCommandFixture();
+    tempDirs.add(fixture.tempDir);
+    dbPaths.add(fixture.dbPath);
+
+    const conversation = await fixture.conversationStore.createConversation({
+      sessionId: "programmatic-control-session",
+      sessionKey: "user:u1:chat",
+    });
+    const [message] = await fixture.conversationStore.createMessagesBulk([
+      {
+        conversationId: conversation.conversationId,
+        seq: 0,
+        role: "user",
+        content: "remember the safe control state",
+        tokenCount: 6,
+      },
+    ]);
+    await fixture.summaryStore.insertSummary({
+      summaryId: "sum_programmatic_control",
+      conversationId: conversation.conversationId,
+      kind: "leaf",
+      depth: 0,
+      content: "broken summary\n[Truncated from 222 tokens]",
+      tokenCount: 8,
+    });
+    await fixture.summaryStore.linkSummaryToMessages("sum_programmatic_control", [message.messageId]);
+
+    const ctx = createCommandContext(undefined, {
+      sessionId: "programmatic-control-session",
+      sessionKey: "user:u1:chat",
+    });
+    const status = await runLcmProgrammaticControl({
+      operation: "status",
+      ctx,
+      db: fixture.db,
+      config: fixture.config,
+    });
+    const doctor = await runLcmProgrammaticControl({
+      operation: "doctor",
+      ctx,
+      db: fixture.db,
+      config: fixture.config,
+    });
+
+    expect(status).toEqual({
+      operation: "status",
+      active: true,
+      messageCount: 1,
+    });
+    expect(doctor).toMatchObject({
+      operation: "doctor",
+      ok: false,
+    });
+    expect((doctor as { warnings: string[] }).warnings.join("\n")).toContain("summary issue");
+    expect((doctor as { warnings: string[] }).warnings.join("\n")).not.toContain(fixture.dbPath);
+    expect((doctor as { warnings: string[] }).warnings.join("\n")).not.toContain("programmatic-control-session");
+  });
+
+  it("rotates through the programmatic handler without returning paths", async () => {
+    const transcriptPath = join(tmpdir(), `lossless-claw-programmatic-rotate-${Date.now()}.jsonl`);
+    writeFileSync(transcriptPath, "{\"message\":{\"role\":\"user\",\"content\":\"existing\"}}\n");
+    tempDirs.add(transcriptPath);
+
+    let currentConversationId = 0;
+    const rotateSessionStorageWithBackup = vi.fn(async () => ({
+      kind: "rotated" as const,
+      currentConversationId,
+      currentMessageCount: 2,
+      backupPath: join(tmpdir(), "not-returned.bak"),
+      preservedTailMessageCount: 1,
+      checkpointSize: 11,
+      bytesRemoved: 22,
+    }));
+    const deps = {
+      resolveSessionIdFromSessionKey: vi.fn(async () => undefined),
+      resolveSessionTranscriptFile: vi.fn(async () => transcriptPath),
+    } as unknown as LcmDependencies;
+    const getLcm = async () => ({
+      rotateSessionStorageWithBackup,
+    });
+    const fixture = createCommandFixture({ deps, getLcm });
+    tempDirs.add(fixture.tempDir);
+    dbPaths.add(fixture.dbPath);
+
+    const conversation = await fixture.conversationStore.createConversation({
+      sessionId: "programmatic-rotate-session",
+      sessionKey: "user:u1:chat",
+    });
+    currentConversationId = conversation.conversationId;
+    await fixture.conversationStore.createMessagesBulk([
+      {
+        conversationId: conversation.conversationId,
+        seq: 0,
+        role: "user",
+        content: "first message",
+        tokenCount: 2,
+      },
+      {
+        conversationId: conversation.conversationId,
+        seq: 1,
+        role: "assistant",
+        content: "second message",
+        tokenCount: 2,
+      },
+    ]);
+
+    const result = await runLcmProgrammaticControl({
+      operation: "rotate",
+      ctx: createCommandContext(undefined, {
+        agentId: "openmanager-main",
+        sessionId: "programmatic-rotate-session",
+        sessionKey: "user:u1:chat",
+      }),
+      db: fixture.db,
+      config: fixture.config,
+      deps,
+      getLcm,
+    });
+
+    expect(result.operation).toBe("rotate");
+    if (result.operation !== "rotate") {
+      throw new Error("expected rotate result");
+    }
+    expect(result.messageCount).toBe(2);
+    expect(Date.parse(result.lastRotatedAt)).toBeGreaterThan(0);
+    expect(JSON.stringify(result)).not.toContain("not-returned.bak");
+    expect(JSON.stringify(result)).not.toContain(transcriptPath);
+
+    const status = await runLcmProgrammaticControl({
+      operation: "status",
+      ctx: createCommandContext(undefined, {
+        sessionId: "programmatic-rotate-session",
+        sessionKey: "user:u1:chat",
+      }),
+      db: fixture.db,
+      config: fixture.config,
+    });
+    expect(status).toEqual({
+      operation: "status",
+      active: true,
+      messageCount: 2,
+    });
+    expect(rotateSessionStorageWithBackup).toHaveBeenCalledWith({
+      sessionId: "programmatic-rotate-session",
+      sessionKey: "user:u1:chat",
+      sessionFile: transcriptPath,
+      lockTimeoutMs: 30_000,
+    });
+    expect(deps.resolveSessionTranscriptFile).toHaveBeenCalledWith({
+      agentId: "openmanager-main",
+      sessionId: "programmatic-rotate-session",
+      sessionKey: "user:u1:chat",
+    });
+  });
+
+  it("reports programmatic rotate unavailable with a stable reason code", async () => {
+    const fixture = createCommandFixture();
+    tempDirs.add(fixture.tempDir);
+    dbPaths.add(fixture.dbPath);
+
+    const conversation = await fixture.conversationStore.createConversation({
+      sessionId: "programmatic-unavailable-session",
+      sessionKey: "user:u1:chat",
+    });
+    await fixture.conversationStore.createMessagesBulk([
+      {
+        conversationId: conversation.conversationId,
+        seq: 0,
+        role: "user",
+        content: "first message",
+        tokenCount: 2,
+      },
+    ]);
+
+    await expect(
+      runLcmProgrammaticControl({
+        operation: "rotate",
+        ctx: createCommandContext(undefined, {
+          sessionId: "programmatic-unavailable-session",
+          sessionKey: "user:u1:chat",
+        }),
+        db: fixture.db,
+        config: fixture.config,
+      }),
+    ).rejects.toMatchObject({
+      name: "LcmProgrammaticControlUnavailableError",
+      reasonCode: "runtime_unavailable",
+    } satisfies Partial<LcmProgrammaticControlUnavailableError>);
+  });
+
+  it("rejects programmatic rotate when the explicit session id conflicts with the resolved conversation", async () => {
+    const transcriptPath = join(tmpdir(), `lossless-claw-programmatic-mismatch-${Date.now()}.jsonl`);
+    writeFileSync(transcriptPath, "{\"message\":{\"role\":\"user\",\"content\":\"existing\"}}\n");
+    tempDirs.add(transcriptPath);
+
+    const rotateSessionStorageWithBackup = vi.fn(async () => ({
+      kind: "rotated" as const,
+      currentConversationId: 1,
+      currentMessageCount: 1,
+      backupPath: join(tmpdir(), "not-returned.bak"),
+      preservedTailMessageCount: 1,
+      checkpointSize: 11,
+      bytesRemoved: 22,
+    }));
+    const deps = {
+      resolveSessionIdFromSessionKey: vi.fn(async () => "unrelated-runtime-session"),
+      resolveSessionTranscriptFile: vi.fn(async () => transcriptPath),
+    } as unknown as LcmDependencies;
+    const getLcm = async () => ({
+      rotateSessionStorageWithBackup,
+    });
+    const fixture = createCommandFixture({ deps, getLcm });
+    tempDirs.add(fixture.tempDir);
+    dbPaths.add(fixture.dbPath);
+
+    const conversation = await fixture.conversationStore.createConversation({
+      sessionId: "programmatic-mismatch-session",
+      sessionKey: "user:u1:chat",
+    });
+    await fixture.conversationStore.createMessagesBulk([
+      {
+        conversationId: conversation.conversationId,
+        seq: 0,
+        role: "user",
+        content: "first message",
+        tokenCount: 2,
+      },
+    ]);
+
+    await expect(
+      runLcmProgrammaticControl({
+        operation: "rotate",
+        ctx: createCommandContext(undefined, {
+          sessionId: "unrelated-runtime-session",
+          sessionKey: "user:u1:chat",
+        }),
+        db: fixture.db,
+        config: fixture.config,
+        deps,
+        getLcm,
+      }),
+    ).rejects.toMatchObject({
+      name: "LcmProgrammaticControlUnavailableError",
+      reasonCode: "session_id_unavailable",
+    } satisfies Partial<LcmProgrammaticControlUnavailableError>);
+    expect(rotateSessionStorageWithBackup).not.toHaveBeenCalled();
+    expect(deps.resolveSessionTranscriptFile).not.toHaveBeenCalled();
+  });
+
+  it("rejects unsupported programmatic operations before rotate can run", async () => {
+    const transcriptPath = join(tmpdir(), `lossless-claw-programmatic-unsupported-${Date.now()}.jsonl`);
+    writeFileSync(transcriptPath, "{\"message\":{\"role\":\"user\",\"content\":\"existing\"}}\n");
+    tempDirs.add(transcriptPath);
+
+    const rotateSessionStorageWithBackup = vi.fn(async () => ({
+      kind: "rotated" as const,
+      currentConversationId: 1,
+      currentMessageCount: 1,
+      backupPath: join(tmpdir(), "not-returned.bak"),
+      preservedTailMessageCount: 1,
+      checkpointSize: 11,
+      bytesRemoved: 22,
+    }));
+    const deps = {
+      resolveSessionIdFromSessionKey: vi.fn(async () => "programmatic-unsupported-session"),
+      resolveSessionTranscriptFile: vi.fn(async () => transcriptPath),
+    } as unknown as LcmDependencies;
+    const getLcm = async () => ({
+      rotateSessionStorageWithBackup,
+    });
+    const fixture = createCommandFixture({ deps, getLcm });
+    tempDirs.add(fixture.tempDir);
+    dbPaths.add(fixture.dbPath);
+
+    const conversation = await fixture.conversationStore.createConversation({
+      sessionId: "programmatic-unsupported-session",
+      sessionKey: "user:u1:chat",
+    });
+    await fixture.conversationStore.createMessagesBulk([
+      {
+        conversationId: conversation.conversationId,
+        seq: 0,
+        role: "user",
+        content: "first message",
+        tokenCount: 2,
+      },
+    ]);
+
+    await expect(
+      runLcmProgrammaticControl({
+        operation: "backup" as Parameters<typeof runLcmProgrammaticControl>[0]["operation"],
+        ctx: createCommandContext(undefined, {
+          sessionId: "programmatic-unsupported-session",
+          sessionKey: "user:u1:chat",
+        }),
+        db: fixture.db,
+        config: fixture.config,
+        deps,
+        getLcm,
+      }),
+    ).rejects.toMatchObject({
+      name: "LcmProgrammaticControlUnavailableError",
+      operation: "backup",
+      reasonCode: "unsupported_operation",
+    } satisfies Partial<LcmProgrammaticControlUnavailableError>);
+    expect(rotateSessionStorageWithBackup).not.toHaveBeenCalled();
+    expect(deps.resolveSessionTranscriptFile).not.toHaveBeenCalled();
   });
 
   it("rotates the current session and replaces the latest rotate backup", async () => {
