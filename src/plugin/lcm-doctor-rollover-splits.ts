@@ -1,7 +1,11 @@
 import type { DatabaseSync, SQLInputValue } from "node:sqlite";
 import { getFileBackedDatabasePath } from "../db/connection.js";
 import { isIsolatedCronSessionKey } from "../session-patterns.js";
-import { normalizeMessageContentForFullTextIndex } from "../store/conversation-store.js";
+import {
+  DELIBERATE_ARCHIVE_CAUSES,
+  normalizeMessageContentForFullTextIndex,
+} from "../store/conversation-store.js";
+import type { ArchiveCause } from "../store/conversation-store.js";
 import { withDatabaseTransaction } from "../transaction-mutex.js";
 import { createLcmDatabaseBackup } from "./lcm-db-backup.js";
 
@@ -58,6 +62,7 @@ type ConversationRow = {
   session_key: string;
   active: number;
   archived_at: string | null;
+  archive_cause: string | null;
   created_at: string;
   messages: number;
   summaries: number;
@@ -146,6 +151,15 @@ function hasStrandedData(row: ConversationRow): boolean {
   );
 }
 
+// Deliberate archives (e.g. an operator /reset) are excluded from merge sources:
+// the user wiped that conversation on purpose. A legacy NULL cause stays
+// merge-eligible so a genuine pre-deploy broken split is never withheld.
+function isDeliberateArchive(row: ConversationRow): boolean {
+  return (
+    row.archive_cause !== null && DELIBERATE_ARCHIVE_CAUSES.has(row.archive_cause as ArchiveCause)
+  );
+}
+
 function compareConversationChronology(left: ConversationRow, right: ConversationRow): number {
   const created = left.created_at.localeCompare(right.created_at);
   if (created !== 0) return created;
@@ -176,6 +190,7 @@ function loadConversationRows(db: DatabaseSync, sessionKey: string): Conversatio
          c.session_key,
          c.active,
          c.archived_at,
+         c.archive_cause,
          c.created_at,
          COALESCE((SELECT COUNT(*) FROM messages m WHERE m.conversation_id = c.conversation_id), 0) AS messages,
          COALESCE((SELECT COUNT(*) FROM summaries s WHERE s.conversation_id = c.conversation_id), 0) AS summaries,
@@ -275,7 +290,9 @@ function classifySessionKeyGroup(params: {
   }
 
   const rows = loadConversationRows(params.db, params.sessionKey);
-  const sources = rows.filter((row) => row.active === 0 && hasStrandedData(row));
+  const sources = rows.filter(
+    (row) => row.active === 0 && hasStrandedData(row) && !isDeliberateArchive(row),
+  );
   if (sources.length === 0) {
     return null;
   }

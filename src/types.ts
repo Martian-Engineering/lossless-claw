@@ -7,6 +7,7 @@
 
 import type { LcmConfig } from "./db/config.js";
 import type { LcmConfigDiagnostics } from "./db/config.js";
+import type { CompactResult } from "./openclaw-bridge.js";
 
 /**
  * Minimal LLM completion interface needed by LCM for summarization.
@@ -75,6 +76,20 @@ export type CompleteFn = (params: {
   reasoningIfSupported?: string;
 }) => Promise<CompletionResult>;
 
+/** Optional bridge to OpenClaw's built-in runtime compaction path. */
+export type RuntimeCompactionDelegateFn = (params: {
+  sessionId: string;
+  sessionKey?: string;
+  sessionFile: string;
+  tokenBudget?: number;
+  currentTokenCount?: number;
+  compactionTarget?: "budget" | "threshold";
+  customInstructions?: string;
+  runtimeContext?: Record<string, unknown>;
+  legacyParams?: Record<string, unknown>;
+  force?: boolean;
+}) => Promise<CompactResult>;
+
 /**
  * Gateway RPC call interface.
  */
@@ -124,6 +139,9 @@ export interface LcmDependencies {
 
   /** LLM completion function for summarization */
   complete: CompleteFn;
+
+  /** Optional OpenClaw runtime compaction delegate for sessions LCM intentionally ignores */
+  delegateCompactionToRuntime?: RuntimeCompactionDelegateFn;
 
   /** Gateway RPC call function (for subagent spawning, session ops) */
   callGateway: CallGatewayFn;

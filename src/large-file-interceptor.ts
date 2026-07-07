@@ -28,6 +28,8 @@ import {
   serializeRawPayloadContent,
   type StoredMessage,
 } from "./message-content.js";
+import { resolveLiveToolResultExternalization } from "./read-tool-recovery.js";
+import { buildExternalizedToolResultBlock } from "./tool-result-blocks.js";
 import { asRecord, safeBoolean, safeString } from "./value-utils.js";
 
 /** Resolves the optional model-backed summarizer used for large-file exploration summaries. */
@@ -753,6 +755,7 @@ export class LargeFileInterceptor {
   async interceptLargeToolResults(params: {
     conversationId: number;
     message: AgentMessage;
+    toolCallInputMap?: ReadonlyMap<string, { name?: string; input?: Record<string, unknown> }>;
     getFileId?: (input: { content: string; toolName: string; callId?: string }) => string;
   }): Promise<{ rewrittenMessage: AgentMessage; fileIds: string[] } | null> {
     if (
@@ -832,12 +835,11 @@ export class LargeFileInterceptor {
         rewrittenContent.push(item);
         continue;
       }
-      if (typeof extractedText !== "string" || estimateTokens(extractedText) < threshold) {
+      if (typeof extractedText !== "string") {
         rewrittenContent.push(item);
         continue;
       }
 
-      interceptedAny = true;
       const toolName =
         safeString(record.name) ??
         topLevelToolName ??
@@ -850,16 +852,53 @@ export class LargeFileInterceptor {
         safeString(record.call_id) ??
         safeString(record.id) ??
         topLevelToolCallId;
+
+      // lcm_describe is already a drilldown response; re-stubbing adds another hop.
+      if (toolName === "lcm_describe") {
+        rewrittenContent.push(item);
+        continue;
+      }
+
+      const externalizedPayload = resolveLiveToolResultExternalization({
+        toolName,
+        callId,
+        extractedText,
+        toolCallInputMap: params.toolCallInputMap,
+      });
+      if (estimateTokens(externalizedPayload.content) < threshold) {
+        if (externalizedPayload.content !== extractedText) {
+          const recoveredBlock = { ...record };
+          if (isPlainTextToolResult) {
+            recoveredBlock.text = externalizedPayload.content;
+          } else if ("output" in recoveredBlock || !("content" in recoveredBlock)) {
+            recoveredBlock.output = externalizedPayload.content;
+          } else {
+            recoveredBlock.content = externalizedPayload.content;
+          }
+          interceptedAny = true;
+          rewrittenContent.push(recoveredBlock);
+        } else {
+          rewrittenContent.push(item);
+        }
+        continue;
+      }
+
+      interceptedAny = true;
+
       const externalized = await this.externalizeLargeTextPayload({
         conversationId: params.conversationId,
-        content: extractedText,
-        fileId: params.getFileId?.({ content: extractedText, toolName, callId }),
-        fileName: `${toolName}.txt`,
+        content: externalizedPayload.content,
+        fileId: params.getFileId?.({
+          content: externalizedPayload.content,
+          toolName: externalizedPayload.toolName,
+          callId,
+        }),
+        fileName: `${externalizedPayload.toolName}.txt`,
         mimeType: "text/plain",
         formatReference: ({ fileId, byteSize, summary }) =>
           formatToolOutputReference({
             fileId,
-            toolName,
+            toolName: externalizedPayload.toolName,
             byteSize,
             summary,
           }),
@@ -867,41 +906,18 @@ export class LargeFileInterceptor {
 
       const normalizedRawType =
         rawType === "function_call_output" ? "function_call_output" : "tool_result";
-      const compactBlock: Record<string, unknown> = isPlainTextToolResult
-        ? {
-            type: "text",
-            text: externalized.reference,
-            rawType: normalizedRawType,
-            externalizedFileId: externalized.fileId,
-            originalByteSize: externalized.byteSize,
-            toolOutputExternalized: true,
-            externalizationReason: "large_tool_result",
-          }
-        : {
-            type: normalizedRawType,
-            output: externalized.reference,
-            externalizedFileId: externalized.fileId,
-            originalByteSize: externalized.byteSize,
-            toolOutputExternalized: true,
-            externalizationReason: "large_tool_result",
-          };
-      if (callId) {
-        if (normalizedRawType === "function_call_output") {
-          compactBlock.call_id = callId;
-        } else {
-          compactBlock.tool_use_id = callId;
-        }
-      }
-      if (typeof record.is_error === "boolean") {
-        compactBlock.is_error = record.is_error;
-      } else if (typeof record.isError === "boolean") {
-        compactBlock.isError = record.isError;
-      } else if (typeof topLevelIsError === "boolean") {
-        compactBlock.isError = topLevelIsError;
-      }
-      if (toolName) {
-        compactBlock.name = toolName;
-      }
+      const compactBlock = buildExternalizedToolResultBlock({
+        isPlainTextToolResult,
+        normalizedRawType,
+        reference: externalized.reference,
+        fileId: externalized.fileId,
+        byteSize: externalized.byteSize,
+        callId,
+        recordIsError: record.is_error,
+        recordIsErrorCamel: record.isError,
+        topLevelIsError,
+        toolName: externalizedPayload.toolName,
+      });
 
       rewrittenContent.push(compactBlock);
       fileIds.push(externalized.fileId);

@@ -372,6 +372,179 @@ describe("afterTurn covered-frontier alignment", () => {
     expect(messages.map((message) => message.content)).toEqual(["question one", "answer one"]);
   });
 
+  it("collapses the decorated [timestamp] runtime copy onto the bare transcript row (store double-write)", async () => {
+    const sessionFile = createSessionFilePath("decorated-timestamp-dup");
+    const header = JSON.stringify({
+      type: "session",
+      version: 3,
+      id: "decorated-timestamp-dup-header",
+      timestamp: new Date().toISOString(),
+      cwd: process.cwd(),
+    });
+    const entryLine = (id: string, parentId: string | null, role: AgentMessage["role"], text: string) =>
+      JSON.stringify({
+        type: "message",
+        id,
+        parentId,
+        timestamp: new Date().toISOString(),
+        message: { role, content: [{ type: "text", text }] },
+      });
+    // Transcript holds the BARE body with an entry id (the real transcript copy).
+    writeFileSync(
+      sessionFile,
+      `${header}\n${entryLine("dup-1", null, "user", "nice! thank you!")}\n`,
+      "utf8",
+    );
+
+    const engine = createEngine();
+    const sessionId = "decorated-timestamp-dup";
+    // The afterTurn runtime batch carries the DECORATED ([timestamp]) copy of the
+    // SAME turn — the live shape that double-writes today.
+    await engine.afterTurn({
+      sessionId,
+      sessionFile,
+      messages: [makeMessage("user", "[Sun 2026-06-21 17:16 GMT+3] nice! thank you!")],
+      prePromptMessageCount: 0,
+    });
+
+    const conversation = await engine
+      .getConversationStore()
+      .getConversationForSession({ sessionId });
+    const messages = await engine.getConversationStore().getMessages(conversation!.conversationId);
+    // Exactly ONE row — the decorated runtime copy must not double-write.
+    expect(messages.map((message) => message.content)).toEqual(["nice! thank you!"]);
+  });
+
+  it("keeps a conv-info-only runtime copy without trusted timestamp evidence", async () => {
+    const sessionFile = createSessionFilePath("decorated-convinfo-dup");
+    const header = JSON.stringify({
+      type: "session",
+      version: 3,
+      id: "decorated-convinfo-dup-header",
+      timestamp: new Date().toISOString(),
+      cwd: process.cwd(),
+    });
+    const entryLine = (id: string, parentId: string | null, role: AgentMessage["role"], text: string) =>
+      JSON.stringify({
+        type: "message",
+        id,
+        parentId,
+        timestamp: new Date().toISOString(),
+        message: { role, content: [{ type: "text", text }] },
+      });
+    writeFileSync(
+      sessionFile,
+      `${header}\n${entryLine("ci-1", null, "user", "Hey there! hows it going?")}\n`,
+      "utf8",
+    );
+
+    const engine = createEngine();
+    const sessionId = "decorated-convinfo-dup";
+    const decorated =
+      'Conversation info (untrusted metadata):\n```json\n{\n  "chat_id": "telegram:100000002"\n}\n```\n\nHey there! hows it going?';
+    await engine.afterTurn({
+      sessionId,
+      sessionFile,
+      messages: [makeMessage("user", decorated)],
+      prePromptMessageCount: 0,
+    });
+
+    const conversation = await engine
+      .getConversationStore()
+      .getConversationForSession({ sessionId });
+    const messages = await engine.getConversationStore().getMessages(conversation!.conversationId);
+    expect(messages.map((message) => message.content)).toEqual([
+      "Hey there! hows it going?",
+      decorated,
+    ]);
+  });
+
+  it("keeps a genuinely distinct runtime turn even when it shares a trailing word", async () => {
+    const sessionFile = createSessionFilePath("distinct-not-collapsed");
+    const header = JSON.stringify({
+      type: "session",
+      version: 3,
+      id: "distinct-not-collapsed-header",
+      timestamp: new Date().toISOString(),
+      cwd: process.cwd(),
+    });
+    const entryLine = (id: string, parentId: string | null, role: AgentMessage["role"], text: string) =>
+      JSON.stringify({
+        type: "message",
+        id,
+        parentId,
+        timestamp: new Date().toISOString(),
+        message: { role, content: [{ type: "text", text }] },
+      });
+    // Transcript bare row is one turn; the runtime batch is a DIFFERENT new turn
+    // that merely shares a trailing word (mid-line, not line-aligned) — must NOT
+    // collapse (fail-closed containment).
+    writeFileSync(
+      sessionFile,
+      `${header}\n${entryLine("d-1", null, "user", "ok")}\n`,
+      "utf8",
+    );
+
+    const engine = createEngine();
+    const sessionId = "distinct-not-collapsed";
+    await engine.afterTurn({
+      sessionId,
+      sessionFile,
+      messages: [makeMessage("user", "please say ok to bob")],
+      prePromptMessageCount: 0,
+    });
+
+    const conversation = await engine
+      .getConversationStore()
+      .getConversationForSession({ sessionId });
+    const messages = await engine.getConversationStore().getMessages(conversation!.conversationId);
+    // Both turns survive: the bare "ok" and the genuinely distinct new turn.
+    expect(messages.map((message) => message.content)).toEqual(["ok", "please say ok to bob"]);
+  });
+
+  it("keeps a distinct multi-line turn whose trailing LINE equals a short prior body (no false-collapse)", async () => {
+    const sessionFile = createSessionFilePath("trailing-line-not-collapsed");
+    const header = JSON.stringify({
+      type: "session",
+      version: 3,
+      id: "trailing-line-not-collapsed-header",
+      timestamp: new Date().toISOString(),
+      cwd: process.cwd(),
+    });
+    const entryLine = (id: string, parentId: string | null, role: AgentMessage["role"], text: string) =>
+      JSON.stringify({
+        type: "message",
+        id,
+        parentId,
+        timestamp: new Date().toISOString(),
+        message: { role, content: [{ type: "text", text }] },
+      });
+    // Prior bare turn is a short "ok"; the new runtime turn is genuinely distinct
+    // but its trailing line happens to equal "ok". The decoration gate must keep
+    // it (arbitrary leading text is NOT recognized decoration) — collapsing would
+    // be silent data loss.
+    writeFileSync(
+      sessionFile,
+      `${header}\n${entryLine("tl-1", null, "user", "ok")}\n`,
+      "utf8",
+    );
+
+    const engine = createEngine();
+    const sessionId = "trailing-line-not-collapsed";
+    await engine.afterTurn({
+      sessionId,
+      sessionFile,
+      messages: [makeMessage("user", "here is more context\nok")],
+      prePromptMessageCount: 0,
+    });
+
+    const conversation = await engine
+      .getConversationStore()
+      .getConversationForSession({ sessionId });
+    const messages = await engine.getConversationStore().getMessages(conversation!.conversationId);
+    expect(messages.map((message) => message.content)).toEqual(["ok", "here is more context\nok"]);
+  });
+
   it("persists only the flush-lagged remainder, then dedupes the transcript catch-up", async () => {
     const sessionFile = createSessionFilePath("covered-flush-lag");
     const manager = SessionManager.open(sessionFile);

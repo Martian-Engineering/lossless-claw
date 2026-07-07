@@ -73,6 +73,40 @@ When answering users:
 - explain that cron scheduler session keys are isolated per runtime run while preserving archived prior runs
 - if they need a truly separate LCM history, use a different session key context (for example a different chat/thread/binding) or explicit non-MVP migration/surgery tools
 
+## Importing past conversation data
+
+If a user explicitly asks how to import old or past OpenClaw conversation data into Lossless, recommend the packaged session migration CLI:
+
+```bash
+npx --package @martian-engineering/lossless-claw@latest lossless-claw-migrate-sessions --state-dir ~/.openclaw
+```
+
+That command name, `lossless-claw-migrate-sessions`, is the npm package executable declared by lossless-claw. It backfills OpenClaw JSONL session files into `lcm.db`.
+
+Use it when:
+
+- lossless-claw was installed after useful OpenClaw sessions already existed
+- lossless-claw was disabled or missing for a period
+- the user wants historical JSONL sessions imported into Lossless storage
+
+Do not present it as:
+
+- a background replay loop
+- a summarization or embedding migration
+- a replacement for normal startup bootstrap/crash recovery
+- a general rewrite/transplant/surgery tool
+
+Safe recommendation pattern:
+
+1. Run the dry-run command first and inspect the output.
+2. Apply only after the user confirms the target state directory and import set:
+
+```bash
+npx --package @martian-engineering/lossless-claw@latest lossless-claw-migrate-sessions --state-dir ~/.openclaw --apply
+```
+
+The CLI defaults to `${OPENCLAW_STATE_DIR:-~/.openclaw}` and `${OPENCLAW_STATE_DIR:-~/.openclaw}/lcm.db`. On `--apply`, it creates a timestamped SQLite backup before writing when the database already exists. For narrow imports, suggest `--file <path>`, repeatable `--sessions-dir <path>`, `--since <iso-date>`, or `--limit <n>`.
+
 ## Relation to `/status`
 
 This session behavior is separate from `/status` metrics.

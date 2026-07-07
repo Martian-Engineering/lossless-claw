@@ -2,10 +2,10 @@
  * Scoped context-threshold override resolution.
  *
  * Operators can configure `contextThresholdOverrides` rules that pick a
- * different compaction threshold per runtime context: exact model id,
- * model context-window range, and session-key glob. This module owns rule
- * matching, specificity ranking, and the resolved-threshold descriptor the
- * engine threads through compaction calls and deferred maintenance debt.
+ * different compaction policy per runtime context: exact model id, model
+ * context-window range, and session-key glob. This module owns rule matching,
+ * specificity ranking, and the resolved-threshold descriptor the engine
+ * threads through compaction calls and deferred maintenance debt.
  */
 import type { ContextThresholdOverride } from "./db/config.js";
 import type { RuntimeModelContext } from "./runtime-model.js";
@@ -21,6 +21,10 @@ export type ResolvedContextThreshold = {
   specificity: number;
   modelRef?: string;
   modelContextWindow?: number;
+  /** freshTailCount from a matching override rule, if set. */
+  freshTailCount?: number;
+  /** leafChunkTokens from a matching override rule, if set. */
+  leafChunkTokens?: number;
 };
 
 type CompiledOverrideRule = {
@@ -135,6 +139,8 @@ function describeRuleMatch(
 export function persistedContextThresholdOverride(maintenance: {
   contextThreshold: number | null;
   contextThresholdSource: "global" | "override" | null;
+  contextFreshTailCount: number | null;
+  contextLeafChunkTokens: number | null;
 }): ResolvedContextThreshold | undefined {
   if (
     typeof maintenance.contextThreshold !== "number" ||
@@ -147,6 +153,16 @@ export function persistedContextThresholdOverride(maintenance: {
     source: maintenance.contextThresholdSource === "override" ? "override" : "global",
     specificity: 0,
     reason: "persisted deferred threshold debt",
+    ...(typeof maintenance.contextFreshTailCount === "number" &&
+    Number.isFinite(maintenance.contextFreshTailCount) &&
+    maintenance.contextFreshTailCount > 0
+      ? { freshTailCount: Math.floor(maintenance.contextFreshTailCount) }
+      : {}),
+    ...(typeof maintenance.contextLeafChunkTokens === "number" &&
+    Number.isFinite(maintenance.contextLeafChunkTokens) &&
+    maintenance.contextLeafChunkTokens > 0
+      ? { leafChunkTokens: Math.floor(maintenance.contextLeafChunkTokens) }
+      : {}),
   };
 }
 
@@ -157,6 +173,8 @@ export function describeResolvedContextThreshold(resolved: ResolvedContextThresh
     ` ruleIndex=${resolved.ruleIndex ?? "none"} ruleName=${resolved.ruleName ?? "none"}` +
     ` specificity=${resolved.specificity} model=${resolved.modelRef ?? "none"}` +
     ` modelContextWindow=${resolved.modelContextWindow ?? "none"}` +
+    ` freshTailCount=${resolved.freshTailCount ?? "none"}` +
+    ` leafChunkTokens=${resolved.leafChunkTokens ?? "none"}` +
     ` reason=${resolved.reason.replaceAll(" ", "_")}`
   );
 }
@@ -224,6 +242,12 @@ export class ContextThresholdResolver {
       reason: describeRuleMatch(best.rule, runtime),
       specificity: best.specificity,
       ...runtimeFields,
+      ...(best.rule.freshTailCount !== undefined
+        ? { freshTailCount: best.rule.freshTailCount }
+        : {}),
+      ...(best.rule.leafChunkTokens !== undefined
+        ? { leafChunkTokens: best.rule.leafChunkTokens }
+        : {}),
     };
   }
 }

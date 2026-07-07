@@ -200,6 +200,10 @@ export type ContextEngine = {
     messages: AgentMessage[];
     tokenBudget?: number;
     prompt?: string;
+    /** Current model identifier from OpenClaw hosts that predate assemble runtimeContext. */
+    model?: string;
+    /** Optional runtime context for override resolution (model, provider, etc.). */
+    runtimeContext?: Record<string, unknown>;
   }): Promise<AssembleResult>;
   compact(params: {
     sessionId: string;

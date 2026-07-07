@@ -32,7 +32,7 @@ Good default:
 
 ### `contextThresholdOverrides`
 
-Optional ordered rules that choose a different compaction threshold for matching runtime contexts.
+Optional ordered rules that choose a different compaction threshold, and optionally a different fresh-tail count or leaf chunk size, for matching runtime contexts.
 
 Supported match fields:
 
@@ -41,7 +41,9 @@ Supported match fields:
 - `modelContextWindowMax`: match models/windows at or below this token count
 - `sessionPattern`: session-key glob, using the same `*` and `**` semantics as ignored/stateless sessions
 
-Rules are AND-matched: if a rule includes both `model` and `sessionPattern`, both must match. If multiple rules match, Lossless picks the highest-specificity rule, then the earliest rule in the array for ties. If no rule matches, it falls back to global `contextThreshold`.
+Rules are AND-matched: if a rule includes both `model` and `sessionPattern`, both must match. If multiple rules match, Lossless picks the highest-specificity rule, then the earliest rule in the array for ties. If no rule matches, it falls back to global `contextThreshold`, `freshTailCount`, and `leafChunkTokens`. If a matching rule includes `freshTailCount`, Lossless uses that value for assembly and threshold compaction. If it includes `leafChunkTokens`, Lossless uses that value for matching threshold sweeps.
+
+Context-window matchers require explicit model context-window metadata from the OpenClaw host. Lossless does not infer those matches from the active token budget. Use exact `model` or `sessionPattern` rules when an override must affect assemble-time `freshTailCount` on all currently supported OpenClaw hosts.
 
 Example:
 
@@ -52,7 +54,9 @@ Example:
     {
       "name": "large-context-models",
       "match": { "modelContextWindowMin": 900000 },
-      "contextThreshold": 0.15
+      "contextThreshold": 0.15,
+      "freshTailCount": 16,
+      "leafChunkTokens": 12000
     },
     {
       "name": "telegram-sessions",
@@ -65,7 +69,7 @@ Example:
 
 Debugging:
 
-- threshold-selection logs include the selected threshold, source, rule index/name, token budget, threshold tokens, model, context-window value, and match reason
+- threshold-selection logs include the selected threshold, source, rule index/name, token budget, threshold tokens, fresh-tail count, model, context-window value, and match reason
 - there is no env-var override for `contextThresholdOverrides`; use plugin config for structured rules
 
 ### `freshTailCount`
@@ -544,6 +548,7 @@ Why it matters:
 - keeps low-value automation or noisy sessions out of the DB
 - useful for excluding certain agent lanes or ephemeral traffic entirely
 - cron scheduler keys are already isolated per runtime run, so ignore them only when they should bypass LCM compaction
+- ignored-session `/compact` calls use OpenClaw's built-in runtime compaction delegate when the host exposes it; older hosts keep the previous safe skip behavior
 
 ### `statelessSessionPatterns`
 

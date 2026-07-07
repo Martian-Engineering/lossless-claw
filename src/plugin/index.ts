@@ -30,10 +30,17 @@ import type {
   LcmDependencies,
   RuntimeLlmCompleteFn,
   RuntimeLlmModelOverride,
+  RuntimeCompactionDelegateFn,
   StartupSessionFileCandidate,
 } from "../types.js";
 
 const MIN_CONTEXT_ENGINE_OPENCLAW_VERSION = "2026.5.28";
+
+type PluginSdkCoreModule = {
+  delegateCompactionToRuntime?: RuntimeCompactionDelegateFn;
+};
+
+let pluginSdkCoreImport: Promise<PluginSdkCoreModule | null> | undefined;
 
 type ContextEngineCapableOpenClawPluginApi = OpenClawPluginApi & {
   registerContextEngine: (id: string, factory: ContextEngineFactory) => void;
@@ -56,6 +63,36 @@ function parseAgentSessionKey(sessionKey: string): { agentId: string; suffix: st
     return null;
   }
   return { agentId, suffix };
+}
+
+/** Lazily load optional OpenClaw SDK helpers without raising the peer floor. */
+function loadPluginSdkCore(log: LcmDependencies["log"]): Promise<PluginSdkCoreModule | null> {
+  pluginSdkCoreImport ??= (Function("specifier", "return import(specifier)") as (
+    specifier: string,
+  ) => Promise<PluginSdkCoreModule>)("openclaw/plugin-sdk/core").catch((error: unknown) => {
+    log.debug(`[lcm] runtime compaction delegate unavailable: ${describeLogError(error)}`);
+    return null;
+  });
+  return pluginSdkCoreImport;
+}
+
+/** Create a late-bound delegate to OpenClaw's stock runtime compaction path. */
+function createRuntimeCompactionDelegate(log: LcmDependencies["log"]): RuntimeCompactionDelegateFn {
+  return async (params) => {
+    const core = await loadPluginSdkCore(log);
+    const delegate = core?.delegateCompactionToRuntime;
+    if (!delegate) {
+      log.debug(
+        `[lcm] runtime compaction delegate unavailable for ignored session=${params.sessionId}${params.sessionKey?.trim() ? ` sessionKey=${params.sessionKey.trim()}` : ""}`,
+      );
+      return {
+        ok: true,
+        compacted: false,
+        reason: "session excluded",
+      };
+    }
+    return await delegate(params);
+  };
 }
 
 /** Return a stable normalized agent id. */
@@ -1311,6 +1348,7 @@ function createLcmDependencies(
   return {
     config,
     configDiagnostics: diagnostics,
+    delegateCompactionToRuntime: createRuntimeCompactionDelegate(log),
     complete: async ({
       provider,
       model,

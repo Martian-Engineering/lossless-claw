@@ -2708,6 +2708,69 @@ describe("LcmContextEngine.compact token budget plumbing", () => {
     );
   });
 
+  it("forwards matching leaf chunk overrides into threshold sweeps", async () => {
+    const engine = createEngineWithConfig({
+      contextThresholdOverrides: [
+        {
+          match: { model: "vllm/qwen3.6-27b" },
+          contextThreshold: 0.5,
+          leafChunkTokens: 12000,
+        },
+      ],
+    });
+    const privateEngine = engine as unknown as {
+      compaction: {
+        evaluate: (
+          conversationId: number,
+          tokenBudget: number,
+          observed?: number,
+          options?: { contextThreshold?: number; freshTailCount?: number },
+        ) => Promise<unknown>;
+        compactFullSweep: (input: unknown) => Promise<unknown>;
+      };
+    };
+
+    vi.spyOn(privateEngine.compaction, "evaluate").mockResolvedValue({
+      shouldCompact: true,
+      reason: "threshold",
+      currentTokens: 90_000,
+      threshold: 64_000,
+    });
+    const compactFullSweepSpy = vi
+      .spyOn(privateEngine.compaction, "compactFullSweep")
+      .mockResolvedValue({
+        actionTaken: true,
+        tokensBefore: 90_000,
+        tokensAfter: 60_000,
+        condensed: false,
+      });
+
+    await engine.ingest({
+      sessionId: "leaf-chunk-override-threshold-sweep",
+      message: { role: "user", content: "trigger qwen sweep" } as AgentMessage,
+    });
+
+    const result = await engine.compact({
+      sessionId: "leaf-chunk-override-threshold-sweep",
+      sessionFile: "/tmp/session.jsonl",
+      tokenBudget: 128_000,
+      currentTokenCount: 90_000,
+      compactionTarget: "threshold",
+      runtimeContext: {
+        provider: "vllm",
+        model: "qwen3.6-27b",
+      },
+    });
+
+    expect(result.ok).toBe(true);
+    expect(compactFullSweepSpy).toHaveBeenCalledWith(
+      expect.objectContaining({
+        contextThreshold: 0.5,
+        leafChunkTokens: 12000,
+      }),
+    );
+  });
+
   it("forces one compaction round for manual compaction requests in runtimeContext", async () => {
     const engine = createEngine();
     const privateEngine = engine as unknown as {

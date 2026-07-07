@@ -538,11 +538,71 @@ export function liveContentContainsBareBody(params: {
 }
 
 /**
+ * Recognize whether `liveContent` is the bare body wrapped in RECOGNIZED
+ * decoration (the decorated, model-facing face of the same turn as
+ * `bareContent`), as opposed to an unrelated turn that merely ends with the
+ * same trailing line. It must structurally contain the bare body (line-aligned
+ * trailing segment) AND carry recognized decoration evidence:
+ *   - the bare body appears as a CHANNEL-TIMESTAMP-prefixed trailing line (the
+ *     channel always stamps the model-facing body), OR
+ *   - the whole content reduces to the bare body once a single leading channel
+ *     timestamp is stripped.
+ * Metadata blocks are intentionally not trusted as decoration evidence here:
+ * until OpenClaw provides a non-user-forgeable marker, a structured
+ * "(untrusted metadata)" frame remains ordinary user-controlled text.
+ * Arbitrary user text has none of the timestamp evidence, so it is never
+ * collapsed, preventing silent data loss.
+ */
+export function liveContentIsRecognizedDecoratedBareBody(params: {
+  liveContent: string;
+  bareContent: string;
+}): boolean {
+  if (!liveContentContainsBareBody(params)) {
+    return false;
+  }
+  const bareNoTimestamp = stripLeadingOpenClawInboundTimestamp(params.bareContent.trim()).trim();
+  if (bareNoTimestamp.length === 0) {
+    return false;
+  }
+  const liveTrimmed = params.liveContent.trimEnd();
+  const liveLeadingTrimmed = liveTrimmed.trimStart();
+  const liveWithoutTimestamp = stripLeadingOpenClawInboundTimestamp(liveLeadingTrimmed);
+  if (
+    liveWithoutTimestamp !== liveLeadingTrimmed &&
+    liveWithoutTimestamp.trim() === bareNoTimestamp
+  ) {
+    return true;
+  }
+  const timestampedSuffixIndex = liveTrimmed.length - bareNoTimestamp.length;
+  if (timestampedSuffixIndex > 0 && liveTrimmed.endsWith(bareNoTimestamp)) {
+    const before = liveTrimmed.slice(0, timestampedSuffixIndex);
+    const lineStart = before.lastIndexOf("\n") + 1;
+    const prefixOnFinalLine = before.slice(lineStart);
+    if (
+      prefixOnFinalLine.length > 0 &&
+      stripLeadingOpenClawInboundTimestamp(prefixOnFinalLine).trim().length === 0
+    ) {
+      return true;
+    }
+  }
+  const lastNewline = liveTrimmed.lastIndexOf("\n");
+  const trailingLine = lastNewline < 0 ? liveTrimmed : liveTrimmed.slice(lastNewline + 1);
+  const trailingWithoutTimestamp = stripLeadingOpenClawInboundTimestamp(trailingLine);
+  return (
+    trailingWithoutTimestamp !== trailingLine &&
+    trailingWithoutTimestamp.trim() === bareNoTimestamp
+  );
+}
+
+/**
  * Recognize whether an assembled user row is a BARE copy of the live current
- * turn (its persisted face), purely structurally: it must be a line-aligned
- * trailing segment of the live content AND strictly shorter than it. The
+ * turn (its persisted face): it must be a line-aligned trailing segment of the
+ * live content, strictly shorter than it, AND the live content must carry
+ * recognized decoration (see liveContentIsRecognizedDecoratedBareBody). The
  * strictly-shorter guard distinguishes a bare/timestamped body row from the
- * decorated live copy itself without any decoration-tag knowledge.
+ * decorated live copy itself (equal length, never collapsed); the decoration
+ * gate prevents collapsing an unrelated turn that merely ends with the same
+ * trailing line.
  */
 function assembledRowIsStructuralBareCurrentTurn(params: {
   liveContent: string;
@@ -554,7 +614,7 @@ function assembledRowIsStructuralBareCurrentTurn(params: {
   if (params.assembledContent.length >= params.liveContent.length) {
     return false;
   }
-  return liveContentContainsBareBody({
+  return liveContentIsRecognizedDecoratedBareBody({
     liveContent: params.liveContent,
     bareContent: params.assembledContent,
   });

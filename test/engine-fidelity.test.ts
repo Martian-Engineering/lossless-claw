@@ -1906,10 +1906,11 @@ describe("LcmContextEngine fidelity and token budget", () => {
 
   it("bootstrap fails closed on ambiguous runtime rollover while the old transcript still exists", async () => {
     const warnLog = vi.fn();
+    const debugLog = vi.fn();
     const engine = createEngineWithDeps(
       {},
       {
-        log: { info: vi.fn(), warn: warnLog, error: vi.fn(), debug: vi.fn() },
+        log: { info: vi.fn(), warn: warnLog, error: vi.fn(), debug: debugLog },
       },
     );
     const firstSessionId = "bootstrap-ambiguous-rollover-old-runtime";
@@ -1954,11 +1955,19 @@ describe("LcmContextEngine fidelity and token budget", () => {
       importedMessages: 0,
       reason: "ambiguous session-key runtime rollover",
     });
+    // Transiently unjudgeable (no usable timestamps): the preserve is a pending
+    // state logged at debug; the freeze/no-merge guard below is unchanged, and a
+    // real conflict would warn on its own turn.
+    expect(
+      debugLog.mock.calls
+        .map((call) => String(call[0]))
+        .some((message) => message.includes("ambiguous session-key runtime rollover; preserving")),
+    ).toBe(true);
     expect(
       warnLog.mock.calls
         .map((call) => String(call[0]))
-        .some((message) => message.includes("ambiguous session-key runtime rollover")),
-    ).toBe(true);
+        .some((message) => message.includes("ambiguous session-key runtime rollover; preserving")),
+    ).toBe(false);
 
     const stored = await engine.getConversationStore().getMessages(conversation!.conversationId);
     expect(stored.map((message) => message.content)).toEqual([

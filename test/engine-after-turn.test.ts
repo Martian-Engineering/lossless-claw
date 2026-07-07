@@ -1062,7 +1062,7 @@ describe("LcmContextEngine afterTurn", () => {
           conversationId: number,
           tokenBudget: number,
           observed?: number,
-          options?: { contextThreshold?: number },
+          options?: { contextThreshold?: number; freshTailCount?: number },
         ) => Promise<unknown>;
       };
     };
@@ -1109,7 +1109,7 @@ describe("LcmContextEngine afterTurn", () => {
           conversationId: number,
           tokenBudget: number,
           observed?: number,
-          options?: { contextThreshold?: number },
+          options?: { contextThreshold?: number; freshTailCount?: number },
         ) => Promise<unknown>;
       };
     };
@@ -1149,6 +1149,66 @@ describe("LcmContextEngine afterTurn", () => {
     });
   });
 
+  it("afterTurn forwards matching fresh-tail overrides into threshold evaluation", async () => {
+    const engine = createEngineWithConfig({
+      contextThresholdOverrides: [
+        {
+          match: { model: "vllm/qwen3.6-27b" },
+          contextThreshold: 0.5,
+          freshTailCount: 16,
+          leafChunkTokens: 12000,
+        },
+      ],
+    });
+    const sessionId = "after-turn-fresh-tail-threshold-override";
+    const privateEngine = engine as unknown as {
+      compaction: {
+        evaluate: (
+          conversationId: number,
+          tokenBudget: number,
+          observed?: number,
+          options?: { contextThreshold?: number; freshTailCount?: number },
+        ) => Promise<unknown>;
+      };
+    };
+    const evaluateSpy = vi.spyOn(privateEngine.compaction, "evaluate").mockResolvedValue({
+      shouldCompact: true,
+      reason: "threshold",
+      currentTokens: 40_000,
+      threshold: 32_000,
+    });
+
+    await engine.afterTurn({
+      sessionId,
+      sessionFile: createSessionFilePath("after-turn-fresh-tail-threshold-override"),
+      messages: [makeMessage({ role: "assistant", content: "fresh turn content" })],
+      prePromptMessageCount: 0,
+      tokenBudget: 128_000,
+      runtimeContext: {
+        currentTokenCount: 40_000,
+        provider: "vllm",
+        model: "qwen3.6-27b",
+      },
+    });
+
+    expect(evaluateSpy).toHaveBeenCalledWith(expect.any(Number), 128_000, 40_000, {
+      contextThreshold: 0.5,
+      freshTailCount: 16,
+    });
+    const conversation = await engine.getConversationStore().getConversationBySessionId(sessionId);
+    expect(conversation).not.toBeNull();
+    const maintenance = await engine
+      .getCompactionMaintenanceStore()
+      .getConversationCompactionMaintenance(conversation!.conversationId);
+    expect(maintenance).toMatchObject({
+      pending: true,
+      contextThreshold: 0.5,
+      contextThresholdSource: "override",
+      contextFreshTailCount: 16,
+      contextLeafChunkTokens: 12000,
+    });
+  });
+
   it("afterTurn forwards legacy-only resolved threshold overrides into inline compaction", async () => {
     const engine = createEngineWithConfig({
       proactiveThresholdCompactionMode: "inline",
@@ -1156,6 +1216,7 @@ describe("LcmContextEngine afterTurn", () => {
         {
           match: { modelContextWindowMax: 250_000 },
           contextThreshold: 0.1,
+          leafChunkTokens: 12000,
         },
       ],
     });
@@ -1166,7 +1227,7 @@ describe("LcmContextEngine afterTurn", () => {
           conversationId: number,
           tokenBudget: number,
           observed?: number,
-          options?: { contextThreshold?: number },
+          options?: { contextThreshold?: number; freshTailCount?: number },
         ) => Promise<unknown>;
       };
     };
@@ -1202,6 +1263,7 @@ describe("LcmContextEngine afterTurn", () => {
         contextThresholdOverride: expect.objectContaining({
           contextThreshold: 0.1,
           source: "override",
+          leafChunkTokens: 12000,
         }),
       }),
     );
@@ -3094,10 +3156,11 @@ describe("LcmContextEngine afterTurn", () => {
 
   it("afterTurn fails closed on ambiguous runtime rollover while the old transcript still exists", async () => {
     const warnLog = vi.fn();
+    const debugLog = vi.fn();
     const engine = createEngineWithDeps(
       {},
       {
-        log: { info: vi.fn(), warn: warnLog, error: vi.fn(), debug: vi.fn() },
+        log: { info: vi.fn(), warn: warnLog, error: vi.fn(), debug: debugLog },
       },
     );
     const privateEngine = engine as unknown as {
@@ -3163,11 +3226,19 @@ describe("LcmContextEngine afterTurn", () => {
       tokenBudget: 4_096,
     });
 
+    // The new transcript is only transiently unjudgeable (no usable timestamps),
+    // so the preserve is a pending state logged at debug; the freeze/no-merge
+    // guard below is unchanged, and a real conflict would warn on its own turn.
+    expect(
+      debugLog.mock.calls
+        .map((call) => String(call[0]))
+        .some((message) => message.includes("ambiguous session-key runtime rollover; preserving")),
+    ).toBe(true);
     expect(
       warnLog.mock.calls
         .map((call) => String(call[0]))
-        .some((message) => message.includes("ambiguous session-key runtime rollover")),
-    ).toBe(true);
+        .some((message) => message.includes("ambiguous session-key runtime rollover; preserving")),
+    ).toBe(false);
     const stored = await engine.getConversationStore().getMessages(conversation!.conversationId);
     expect(stored.map((message) => message.content)).toEqual([
       "old afterTurn long-lived question",

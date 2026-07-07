@@ -35,10 +35,11 @@ afterEach(cleanupEngineTestState);
 describe("LcmContextEngine maintain and assemble budget", () => {
   it("assemble falls back to live messages on ambiguous runtime rollover while the old transcript still exists", async () => {
     const warnLog = vi.fn();
+    const debugLog = vi.fn();
     const engine = createEngineWithDeps(
       {},
       {
-        log: { info: vi.fn(), warn: warnLog, error: vi.fn(), debug: vi.fn() },
+        log: { info: vi.fn(), warn: warnLog, error: vi.fn(), debug: debugLog },
       },
     );
     const firstSessionId = "assemble-ambiguous-rollover-old-runtime";
@@ -74,11 +75,18 @@ describe("LcmContextEngine maintain and assemble budget", () => {
     expect(
       assembled.messages.some((message) => message.content === "openai-codex/gpt-5.5"),
     ).toBe(false);
+    // The assemble pass defers rollover resolution to the next bootstrap/afterTurn,
+    // so its preserve restatement is debug, not an anomaly warn.
+    expect(
+      debugLog.mock.calls
+        .map((call) => String(call[0]))
+        .some((message) => message.includes("ambiguous session-key runtime rollover")),
+    ).toBe(true);
     expect(
       warnLog.mock.calls
         .map((call) => String(call[0]))
         .some((message) => message.includes("ambiguous session-key runtime rollover")),
-    ).toBe(true);
+    ).toBe(false);
     const activeByKey = await engine.getConversationStore().getConversationForSession({
       sessionId: secondSessionId,
       sessionKey,
@@ -128,6 +136,8 @@ describe("LcmContextEngine maintain and assemble budget", () => {
         {
           match: { modelContextWindowMax: 250_000 },
           contextThreshold: 0.1,
+          freshTailCount: 16,
+          leafChunkTokens: 12000,
         },
       ],
     });
@@ -142,6 +152,8 @@ describe("LcmContextEngine maintain and assemble budget", () => {
       currentTokenCount: 80_000,
       contextThreshold: 0.1,
       contextThresholdSource: "override",
+      contextFreshTailCount: 16,
+      contextLeafChunkTokens: 12000,
     });
     const privateEngine = engine as unknown as {
       executeCompactionCore: (params: unknown) => Promise<unknown>;
@@ -178,6 +190,8 @@ describe("LcmContextEngine maintain and assemble budget", () => {
         contextThresholdOverride: expect.objectContaining({
           contextThreshold: 0.1,
           source: "override",
+          freshTailCount: 16,
+          leafChunkTokens: 12000,
         }),
       }),
     );

@@ -206,10 +206,12 @@ describe("runLcmMigrations summary depth backfill", () => {
     expect(columns.some((column) => column.name === "next_attempt_after")).toBe(true);
     expect(columns.some((column) => column.name === "context_threshold")).toBe(true);
     expect(columns.some((column) => column.name === "context_threshold_source")).toBe(true);
+    expect(columns.some((column) => column.name === "context_fresh_tail_count")).toBe(true);
+    expect(columns.some((column) => column.name === "context_leaf_chunk_tokens")).toBe(true);
 
     const row = db
       .prepare(
-        `SELECT pending, reason, token_budget, current_token_count, retry_attempts, next_attempt_after, context_threshold, context_threshold_source
+        `SELECT pending, reason, token_budget, current_token_count, retry_attempts, next_attempt_after, context_threshold, context_threshold_source, context_fresh_tail_count, context_leaf_chunk_tokens
          FROM conversation_compaction_maintenance
          WHERE conversation_id = 1`,
       )
@@ -222,6 +224,8 @@ describe("runLcmMigrations summary depth backfill", () => {
       next_attempt_after: string | null;
       context_threshold: number | null;
       context_threshold_source: string | null;
+      context_fresh_tail_count: number | null;
+      context_leaf_chunk_tokens: number | null;
     };
     expect(row).toEqual({
       pending: 1,
@@ -232,6 +236,8 @@ describe("runLcmMigrations summary depth backfill", () => {
       next_attempt_after: null,
       context_threshold: null,
       context_threshold_source: null,
+      context_fresh_tail_count: null,
+      context_leaf_chunk_tokens: null,
     });
   });
 
@@ -532,6 +538,45 @@ describe("runLcmMigrations summary depth backfill", () => {
         .prepare(`INSERT INTO conversations (session_id, session_key, active) VALUES (?, ?, 1)`)
         .run("duplicate-active-session", "agent:main:main"),
     ).toThrow();
+  });
+
+  it("adds a nullable archive_cause column to legacy conversations idempotently", () => {
+    const db = createTestDb("archive-cause.db");
+
+    db.exec(`
+      CREATE TABLE conversations (
+        conversation_id INTEGER PRIMARY KEY AUTOINCREMENT,
+        session_id TEXT NOT NULL,
+        session_key TEXT,
+        active INTEGER NOT NULL DEFAULT 1,
+        archived_at TEXT,
+        title TEXT,
+        created_at TEXT NOT NULL DEFAULT (datetime('now')),
+        updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+      );
+    `);
+    db.prepare(`INSERT INTO conversations (session_id, session_key) VALUES (?, ?)`).run(
+      "legacy-session",
+      "agent:test:main:legacy",
+    );
+
+    runLcmMigrations(db, { fts5Available: false });
+
+    const columns = db.prepare(`PRAGMA table_info(conversations)`).all() as Array<{ name: string }>;
+    expect(columns.some((column) => column.name === "archive_cause")).toBe(true);
+
+    const legacyRow = db
+      .prepare(`SELECT archive_cause FROM conversations WHERE session_key = ?`)
+      .get("agent:test:main:legacy") as { archive_cause: string | null };
+    expect(legacyRow.archive_cause).toBeNull();
+
+    // Second run is a no-op: re-adding the column would throw "duplicate column name".
+    expect(() => runLcmMigrations(db, { fts5Available: false })).not.toThrow();
+
+    const archiveCauseColumns = (
+      db.prepare(`PRAGMA table_info(conversations)`).all() as Array<{ name: string }>
+    ).filter((column) => column.name === "archive_cause");
+    expect(archiveCauseColumns).toHaveLength(1);
   });
 
   it("creates focus brief tables and indexes outside the summary DAG", () => {

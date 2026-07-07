@@ -63,6 +63,65 @@ export function extractToolResultIdForPairing(message: AgentMessage): string | u
   return undefined;
 }
 
+export type ToolCallInputMap = ReadonlyMap<
+  string,
+  { name?: string; input?: Record<string, unknown> }
+>;
+
+function parseToolCallInput(record: Record<string, unknown>): Record<string, unknown> | undefined {
+  const directInput = asRecord(record.input);
+  if (directInput) {
+    return directInput;
+  }
+  const directArguments = asRecord(record.arguments);
+  if (directArguments) {
+    return directArguments;
+  }
+  if (typeof record.arguments !== "string") {
+    return undefined;
+  }
+  try {
+    return asRecord(JSON.parse(record.arguments));
+  } catch {
+    return undefined;
+  }
+}
+
+export function buildToolCallInputMap(
+  messages: AgentMessage[],
+): ToolCallInputMap {
+  const map = new Map<string, { name?: string; input?: Record<string, unknown> }>();
+  const seenIds = new Set<string>();
+  const ambiguousIds = new Set<string>();
+  for (const message of messages) {
+    if (message.role !== "assistant" || !Array.isArray(message.content)) {
+      continue;
+    }
+    for (const block of message.content) {
+      const record = asRecord(block);
+      if (!record || typeof record.type !== "string" || !TOOL_CALL_RAW_TYPES.has(record.type)) {
+        continue;
+      }
+      const id = extractToolPairingIdFromRecord(record);
+      const name = safeString(record.name);
+      const input = parseToolCallInput(record);
+      if (!id) {
+        continue;
+      }
+      if (seenIds.has(id)) {
+        map.delete(id);
+        ambiguousIds.add(id);
+        continue;
+      }
+      seenIds.add(id);
+      if (input && !ambiguousIds.has(id)) {
+        map.set(id, { name, input });
+      }
+    }
+  }
+  return map;
+}
+
 export function expandProtectedToolPairIndexes(params: {
   assembledMessages: AgentMessage[];
   protectedAssembledIndexes: Set<number>;

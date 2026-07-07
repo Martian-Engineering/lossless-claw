@@ -201,6 +201,12 @@ function ensureCompactionMaintenanceColumns(db: DatabaseSync): void {
   const hasContextThresholdSource = maintenanceColumns.some(
     (col) => col.name === "context_threshold_source",
   );
+  const hasContextFreshTailCount = maintenanceColumns.some(
+    (col) => col.name === "context_fresh_tail_count",
+  );
+  const hasContextLeafChunkTokens = maintenanceColumns.some(
+    (col) => col.name === "context_leaf_chunk_tokens",
+  );
 
   if (!hasProjectedTokenCount) {
     db.exec(`ALTER TABLE conversation_compaction_maintenance ADD COLUMN projected_token_count INTEGER`);
@@ -221,6 +227,12 @@ function ensureCompactionMaintenanceColumns(db: DatabaseSync): void {
   }
   if (!hasContextThresholdSource) {
     db.exec(`ALTER TABLE conversation_compaction_maintenance ADD COLUMN context_threshold_source TEXT`);
+  }
+  if (!hasContextFreshTailCount) {
+    db.exec(`ALTER TABLE conversation_compaction_maintenance ADD COLUMN context_fresh_tail_count INTEGER`);
+  }
+  if (!hasContextLeafChunkTokens) {
+    db.exec(`ALTER TABLE conversation_compaction_maintenance ADD COLUMN context_leaf_chunk_tokens INTEGER`);
   }
 }
 
@@ -1067,6 +1079,7 @@ export function runLcmMigrations(
       session_key TEXT,
       active INTEGER NOT NULL DEFAULT 1,
       archived_at TEXT,
+      archive_cause TEXT,
       title TEXT,
       bootstrapped_at TEXT,
       created_at TEXT NOT NULL DEFAULT (datetime('now')),
@@ -1231,6 +1244,8 @@ export function runLcmMigrations(
       raw_tokens_outside_tail INTEGER,
       context_threshold REAL,
       context_threshold_source TEXT,
+      context_fresh_tail_count INTEGER,
+      context_leaf_chunk_tokens INTEGER,
       retry_attempts INTEGER NOT NULL DEFAULT 0,
       next_attempt_after TEXT,
       updated_at TEXT NOT NULL DEFAULT (datetime('now'))
@@ -1317,6 +1332,11 @@ export function runLcmMigrations(
     const hasArchivedAt = conversationColumns.some((col) => col.name === "archived_at");
     if (!hasArchivedAt) {
       db.exec(`ALTER TABLE conversations ADD COLUMN archived_at TEXT`);
+    }
+
+    const hasArchiveCause = conversationColumns.some((col) => col.name === "archive_cause");
+    if (!hasArchiveCause) {
+      db.exec(`ALTER TABLE conversations ADD COLUMN archive_cause TEXT`);
     }
 
     db.exec(`UPDATE conversations SET active = 1 WHERE active IS NULL`);

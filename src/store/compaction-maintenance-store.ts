@@ -17,6 +17,8 @@ export type ConversationCompactionMaintenanceRecord = {
   rawTokensOutsideTail: number | null;
   contextThreshold: number | null;
   contextThresholdSource: "global" | "override" | null;
+  contextFreshTailCount: number | null;
+  contextLeafChunkTokens: number | null;
   retryAttempts: number;
   nextAttemptAfter: Date | null;
   updatedAt: Date;
@@ -37,6 +39,8 @@ type ConversationCompactionMaintenanceRow = {
   raw_tokens_outside_tail: number | null;
   context_threshold: number | null;
   context_threshold_source: string | null;
+  context_fresh_tail_count: number | null;
+  context_leaf_chunk_tokens: number | null;
   retry_attempts: number;
   next_attempt_after: string | null;
   updated_at: string;
@@ -83,6 +87,18 @@ function toMaintenanceRecord(
     contextThresholdSource:
       row.context_threshold_source === "override" || row.context_threshold_source === "global"
         ? row.context_threshold_source
+        : null,
+    contextFreshTailCount:
+      typeof row.context_fresh_tail_count === "number" &&
+      Number.isFinite(row.context_fresh_tail_count) &&
+      row.context_fresh_tail_count > 0
+        ? Math.floor(row.context_fresh_tail_count)
+        : null,
+    contextLeafChunkTokens:
+      typeof row.context_leaf_chunk_tokens === "number" &&
+      Number.isFinite(row.context_leaf_chunk_tokens) &&
+      row.context_leaf_chunk_tokens > 0
+        ? Math.floor(row.context_leaf_chunk_tokens)
         : null,
     retryAttempts:
       typeof row.retry_attempts === "number" && Number.isFinite(row.retry_attempts)
@@ -131,6 +147,14 @@ function mergeMaintenanceRecord(
       patch.contextThresholdSource !== undefined
         ? patch.contextThresholdSource
         : existing?.contextThresholdSource ?? null,
+    contextFreshTailCount:
+      patch.contextFreshTailCount !== undefined
+        ? patch.contextFreshTailCount
+        : existing?.contextFreshTailCount ?? null,
+    contextLeafChunkTokens:
+      patch.contextLeafChunkTokens !== undefined
+        ? patch.contextLeafChunkTokens
+        : existing?.contextLeafChunkTokens ?? null,
     retryAttempts:
       patch.retryAttempts !== undefined
         ? Math.max(0, Math.floor(patch.retryAttempts))
@@ -179,6 +203,8 @@ export class CompactionMaintenanceStore {
            raw_tokens_outside_tail,
            context_threshold,
            context_threshold_source,
+           context_fresh_tail_count,
+           context_leaf_chunk_tokens,
            retry_attempts,
            next_attempt_after,
            updated_at
@@ -209,10 +235,12 @@ export class CompactionMaintenanceStore {
            raw_tokens_outside_tail,
            context_threshold,
            context_threshold_source,
+           context_fresh_tail_count,
+           context_leaf_chunk_tokens,
            retry_attempts,
            next_attempt_after,
            updated_at
-         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'))
+         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'))
          ON CONFLICT(conversation_id) DO UPDATE SET
            pending = excluded.pending,
            requested_at = excluded.requested_at,
@@ -227,6 +255,8 @@ export class CompactionMaintenanceStore {
            raw_tokens_outside_tail = excluded.raw_tokens_outside_tail,
            context_threshold = excluded.context_threshold,
            context_threshold_source = excluded.context_threshold_source,
+           context_fresh_tail_count = excluded.context_fresh_tail_count,
+           context_leaf_chunk_tokens = excluded.context_leaf_chunk_tokens,
            retry_attempts = excluded.retry_attempts,
            next_attempt_after = excluded.next_attempt_after,
            updated_at = datetime('now')`,
@@ -246,6 +276,8 @@ export class CompactionMaintenanceStore {
         record.rawTokensOutsideTail ?? null,
         record.contextThreshold ?? null,
         record.contextThresholdSource ?? null,
+        record.contextFreshTailCount ?? null,
+        record.contextLeafChunkTokens ?? null,
         record.retryAttempts,
         record.nextAttemptAfter?.toISOString() ?? null,
       );
@@ -262,6 +294,8 @@ export class CompactionMaintenanceStore {
     rawTokensOutsideTail?: number | null;
     contextThreshold?: number | null;
     contextThresholdSource?: "global" | "override" | null;
+    contextFreshTailCount?: number | null;
+    contextLeafChunkTokens?: number | null;
   }): Promise<void> {
     const existing = await this.getConversationCompactionMaintenance(input.conversationId);
     await this.saveConversationCompactionMaintenance(
@@ -280,6 +314,8 @@ export class CompactionMaintenanceStore {
         // resets both columns to null.
         contextThreshold: input.contextThreshold ?? null,
         contextThresholdSource: input.contextThresholdSource ?? null,
+        contextFreshTailCount: input.contextFreshTailCount ?? null,
+        contextLeafChunkTokens: input.contextLeafChunkTokens ?? null,
       }),
     );
   }

@@ -44,8 +44,13 @@ import { compileSessionPatterns, matchesSessionPattern } from "./session-pattern
 import { logStartupBannerOnce } from "./startup-banner-log.js";
 import { CompactionTelemetryStore } from "./store/compaction-telemetry-store.js";
 import { CompactionMaintenanceStore } from "./store/compaction-maintenance-store.js";
-import { ConversationStore, type ConversationRecord } from "./store/conversation-store.js";
+import {
+  ConversationStore,
+  type ArchiveCause,
+  type ConversationRecord,
+} from "./store/conversation-store.js";
 import { FocusBriefStore, type FocusBriefRecord } from "./store/focus-brief-store.js";
+import { buildToolCallInputMap } from "./tool-pairing.js";
 import { SummaryStore, type ContextItemRecord } from "./store/summary-store.js";
 import { createLcmSummarizeFromLegacyParams, FALLBACK_SUMMARY_MARKER, LcmProviderAuthError, LcmSummarySpendLimitError, type LcmSummarizeFn } from "./summarize.js";
 import type { LcmDependencies } from "./types.js";
@@ -94,6 +99,18 @@ const LOSSLESS_SUBAGENT_SPAWN_REQUIRED_HOST_CAPABILITIES: ContextEngineHostCapab
 ];
 const MAX_PREVIOUS_ASSEMBLED_SNAPSHOTS = 100;
 const FORK_BOUNDED_BOOTSTRAP_REASON = "fork-bounded bootstrap import";
+
+// Host-contract dependency: the deliberate-vs-incidental archive distinction
+// relies on OpenClaw emitting these exact reason strings only for genuine
+// operator actions. A real /reset surfaces BOTH a before_reset(reason=reset) and
+// a session_end(reason=reset), so both lifecycle handlers must map reset to
+// manual-reset; the COALESCE write makes the order between them irrelevant. If
+// the host renames a reason, the mapping changes silently; the producer mapping
+// test guards it.
+const HOST_BEFORE_RESET_REASON_NEW = "new";
+const HOST_BEFORE_RESET_REASON_RESET = "reset";
+const HOST_SESSION_END_REASON_DELETED = "deleted";
+const HOST_SESSION_END_REASON_RESET = "reset";
 const CONTEXT_ENGINE_PROJECTION_EPOCH_VERSION = "summary-prefix-v1";
 const DEFERRED_ASSEMBLY_DEGRADED_PRESSURE_RATIO = 0.75;
 type CompactionExecutionParams = {
@@ -806,18 +823,32 @@ export class LcmContextEngine implements ContextEngine {
       const resolvedProjectedTokenCount = this.normalizeObservedTokenCount(
         maintenance.projectedTokenCount ?? undefined,
       );
+      const runtimeResolvedContextThreshold = this.contextThresholdResolver.resolve({
+        sessionKey: params.sessionKey,
+        runtime: readRuntimeModelContext(
+          asRecord(params.runtimeContext),
+          asRecord(params.legacyParams),
+        ),
+      });
       // Prefer the threshold persisted with the debt row: a background drain
       // may lack the runtime model metadata that originally selected it, and
-      // re-resolving could silently flip the compaction decision.
-      const resolvedContextThreshold =
-        persistedContextThresholdOverride(maintenance)
-        ?? this.contextThresholdResolver.resolve({
-          sessionKey: params.sessionKey,
-          runtime: readRuntimeModelContext(
-            asRecord(params.runtimeContext),
-            asRecord(params.legacyParams),
-          ),
-        });
+      // re-resolving could silently flip the compaction decision. New debt rows
+      // also persist selected fresh-tail and leaf chunk sizing; the runtime
+      // fallback only helps older rows written before those columns existed.
+      const persistedContextThreshold = persistedContextThresholdOverride(maintenance);
+      const resolvedContextThreshold = persistedContextThreshold
+        ? {
+            ...persistedContextThreshold,
+            ...(persistedContextThreshold.freshTailCount === undefined &&
+            runtimeResolvedContextThreshold.freshTailCount !== undefined
+              ? { freshTailCount: runtimeResolvedContextThreshold.freshTailCount }
+              : {}),
+            ...(persistedContextThreshold.leafChunkTokens === undefined &&
+            runtimeResolvedContextThreshold.leafChunkTokens !== undefined
+              ? { leafChunkTokens: runtimeResolvedContextThreshold.leafChunkTokens }
+              : {}),
+          }
+        : runtimeResolvedContextThreshold;
 
       const isThresholdDebt = maintenance.reason?.trim() === "threshold";
       if (!isThresholdDebt) {
@@ -825,7 +856,12 @@ export class LcmContextEngine implements ContextEngine {
           params.conversationId,
           resolvedTokenBudget,
           resolvedCurrentTokenCount,
-          { contextThreshold: resolvedContextThreshold.contextThreshold },
+          {
+            contextThreshold: resolvedContextThreshold.contextThreshold,
+            ...(resolvedContextThreshold.freshTailCount !== undefined
+              ? { freshTailCount: resolvedContextThreshold.freshTailCount }
+              : {}),
+          },
         );
         this.logContextThresholdSelection({
           conversationId: params.conversationId,
@@ -1086,6 +1122,9 @@ export class LcmContextEngine implements ContextEngine {
       });
     const decision = await this.compaction.evaluate(conversationId, tokenBudget, observedTokens, {
       contextThreshold: resolvedContextThreshold.contextThreshold,
+      ...(resolvedContextThreshold.freshTailCount !== undefined
+        ? { freshTailCount: resolvedContextThreshold.freshTailCount }
+        : {}),
     });
     const targetTokens =
       params.compactionTarget === "threshold" ? decision.threshold : tokenBudget;
@@ -1202,6 +1241,12 @@ export class LcmContextEngine implements ContextEngine {
           conversationId,
           tokenBudget,
           contextThreshold: resolvedContextThreshold.contextThreshold,
+          ...(resolvedContextThreshold.freshTailCount !== undefined
+            ? { freshTailCount: resolvedContextThreshold.freshTailCount }
+            : {}),
+          ...(resolvedContextThreshold.leafChunkTokens !== undefined
+            ? { leafChunkTokens: resolvedContextThreshold.leafChunkTokens }
+            : {}),
           summarize,
           force: forceThresholdSweep,
           hardTrigger: false,
@@ -1413,6 +1458,12 @@ export class LcmContextEngine implements ContextEngine {
         conversationId,
         tokenBudget,
         contextThreshold: resolvedContextThreshold.contextThreshold,
+        ...(resolvedContextThreshold.freshTailCount !== undefined
+          ? { freshTailCount: resolvedContextThreshold.freshTailCount }
+          : {}),
+        ...(resolvedContextThreshold.leafChunkTokens !== undefined
+          ? { leafChunkTokens: resolvedContextThreshold.leafChunkTokens }
+          : {}),
         targetTokens: convergenceTargetTokens,
         ...(effectiveCurrentTokens !== undefined ? { currentTokens: effectiveCurrentTokens } : {}),
         summarize,
@@ -1817,7 +1868,7 @@ export class LcmContextEngine implements ContextEngine {
               // this is a legitimate reset. Rebind the existing conversation
               // and import the new transcript immediately while the freshness
               // proof is still in hand.
-              const rotatedForFreshTranscript =
+              const rolloverResolution =
                 await this.sessionRolloverDetector.rotateAmbiguousRolloverForProvablyFreshTranscript({
                   phase: "bootstrap",
                   sessionId: params.sessionId,
@@ -1825,12 +1876,13 @@ export class LcmContextEngine implements ContextEngine {
                   candidateMessages: preloadedHistoricalMessages,
                   createReplacement: false,
                 });
-              if (!rotatedForFreshTranscript) {
+              if (!rolloverResolution.rebound) {
                 this.sessionRolloverDetector.logAmbiguousSessionKeyRuntimeRollover({
                   phase: "bootstrap",
                   rollover: ambiguousRollover,
                   sessionId: params.sessionId,
                   sessionFile: params.sessionFile,
+                  expected: rolloverResolution.preserveExpected,
                 });
                 return {
                   bootstrapped: false,
@@ -2919,9 +2971,16 @@ export class LcmContextEngine implements ContextEngine {
     let dedupedNewMessages: AgentMessage[] = [];
     if (transcriptReconcileUnsafeToAdvance) {
       if (newMessages.length > 0 || params.autoCompactionSummary) {
-        this.deps.log.warn(
-          `[lcm] afterTurn: transcript reconcile did not cover the transcript frontier; skipping afterTurn persistence to avoid creating a future anchor past unreconciled transcript history ${sessionLabel}`,
-        );
+        // The ambiguous-rollover defer is the benign self-heal path; the rotate
+        // below re-runs the rebind that imports the frontier. Any other
+        // unsafe-to-advance result is a genuine "skipping past unreconciled
+        // history" event worth a warn.
+        const frontierNotCovered = `[lcm] afterTurn: transcript reconcile did not cover the transcript frontier; skipping afterTurn persistence to avoid creating a future anchor past unreconciled transcript history ${sessionLabel}`;
+        if (transcriptReconcileBlockedByAmbiguousRollover) {
+          this.deps.log.debug(frontierNotCovered);
+        } else {
+          this.deps.log.warn(frontierNotCovered);
+        }
       }
       if (transcriptReconcileBlockedByAmbiguousRollover) {
         await runRuntimeAutoRotate();
@@ -3176,7 +3235,12 @@ export class LcmContextEngine implements ContextEngine {
         conversation.conversationId,
         tokenBudget,
         observedCurrentTokenCount,
-        { contextThreshold: resolvedContextThreshold.contextThreshold },
+        {
+          contextThreshold: resolvedContextThreshold.contextThreshold,
+          ...(resolvedContextThreshold.freshTailCount !== undefined
+            ? { freshTailCount: resolvedContextThreshold.freshTailCount }
+            : {}),
+        },
       );
       this.logContextThresholdSelection({
         conversationId: conversation.conversationId,
@@ -3344,8 +3408,12 @@ export class LcmContextEngine implements ContextEngine {
     sessionKey?: string;
     messages: AgentMessage[];
     tokenBudget?: number;
+    /** Current model identifier from OpenClaw hosts that predate assemble runtimeContext. */
+    model?: string;
     /** Optional user query for relevance-based eviction (BM25-lite). When absent or unsearchable, falls back to chronological eviction. */
     prompt?: string;
+    /** Optional runtime context for override resolution (model, provider, etc.). */
+    runtimeContext?: Record<string, unknown>;
   }): Promise<AssembleResult> {
     let liveMessages = params.messages;
     // Return a new fallback array so the runtime hook treats this as assembled
@@ -3418,6 +3486,7 @@ export class LcmContextEngine implements ContextEngine {
           phase: "assemble",
           rollover: ambiguousRollover,
           sessionId: params.sessionId,
+          expected: true,
         });
         return safeFallback();
       }
@@ -3434,11 +3503,24 @@ export class LcmContextEngine implements ContextEngine {
         // Keep the rewritten view local; OpenClaw owns the live message array.
         const rewrittenMessages = liveMessages.slice();
         let interceptedAny = false;
+        const lastLiveUserIndex = (() => {
+          for (let index = liveMessages.length - 1; index >= 0; index--) {
+            if (liveMessages[index]?.role === "user") {
+              return index;
+            }
+          }
+          return -1;
+        })();
+        const currentTurnToolCallInputMap =
+          lastLiveUserIndex >= 0
+            ? buildToolCallInputMap(liveMessages.slice(lastLiveUserIndex + 1))
+            : undefined;
         for (let i = 0; i < liveMessages.length; i++) {
           const message = liveMessages[i]!;
           const intercepted = await this.largeFileInterceptor.interceptLargeToolResults({
             conversationId: conversation.conversationId,
             message,
+            toolCallInputMap: i > lastLiveUserIndex ? currentTurnToolCallInputMap : undefined,
             getFileId: ({ content, toolName, callId }) =>
               buildLiveToolOutputFileId({
                 conversationId: conversation.conversationId,
@@ -3608,10 +3690,17 @@ export class LcmContextEngine implements ContextEngine {
         }
       }
 
+      const resolvedContextThreshold = this.contextThresholdResolver.resolve({
+        sessionKey: params.sessionKey,
+        runtime: readRuntimeModelContext(asRecord(params.runtimeContext), { model: params.model }),
+      });
+      const assembledFreshTailCount =
+        resolvedContextThreshold.freshTailCount ?? this.config.freshTailCount;
+
       const assembled = await this.assembler.assemble({
         conversationId: conversation.conversationId,
         tokenBudget,
-        freshTailCount: this.config.freshTailCount,
+        freshTailCount: assembledFreshTailCount,
         freshTailMaxTokens: this.config.freshTailMaxTokens,
         promptAwareEviction: this.config.promptAwareEviction,
         prompt: params.prompt,
@@ -3768,9 +3857,12 @@ export class LcmContextEngine implements ContextEngine {
         });
       }
       if (volatileLiveInputAppend.appendedMessages > 0) {
-        this.deps.log.warn(
-          `[lcm] assemble: appended unpersisted volatile live input conversation=${conversation.conversationId} ${sessionLabel} appendedMessages=${volatileLiveInputAppend.appendedMessages} appendedTokens=${volatileLiveInputAppend.appendedTokens} evictedMessages=${volatileLiveInputAppend.evictedMessages} evictedTokens=${volatileLiveInputAppend.evictedTokens} overBudget=${volatileLiveInputAppend.overBudget}`,
-        );
+        const volatileLiveInputAppendLog = `[lcm] assemble: appended unpersisted volatile live input conversation=${conversation.conversationId} ${sessionLabel} appendedMessages=${volatileLiveInputAppend.appendedMessages} appendedTokens=${volatileLiveInputAppend.appendedTokens} evictedMessages=${volatileLiveInputAppend.evictedMessages} evictedTokens=${volatileLiveInputAppend.evictedTokens} overBudget=${volatileLiveInputAppend.overBudget}`;
+        if (volatileLiveInputAppend.overBudget || volatileLiveInputAppend.evictedMessages > 0) {
+          this.deps.log.warn(volatileLiveInputAppendLog);
+        } else {
+          this.deps.log.debug(volatileLiveInputAppendLog);
+        }
       }
 
       // Final budget clamp by serialized (model-boundary) estimate. Internal
@@ -3948,8 +4040,16 @@ export class LcmContextEngine implements ContextEngine {
     force?: boolean;
   }): Promise<CompactResult> {
     if (this.shouldIgnoreSession({ sessionId: params.sessionId, sessionKey: params.sessionKey })) {
+      if (this.deps.delegateCompactionToRuntime) {
+        // Excluded sessions get no LCM tracking, so delegate to OpenClaw's
+        // runtime compaction when the host exposes that compatibility bridge.
+        this.deps.log.info(
+          `[lcm] compact: delegating to runtime session=${params.sessionId}${params.sessionKey?.trim() ? ` sessionKey=${params.sessionKey.trim()}` : ""} reason=session_excluded`,
+        );
+        return await this.deps.delegateCompactionToRuntime(params);
+      }
       this.deps.log.info(
-        `[lcm] compact: skipped session=${params.sessionId}${params.sessionKey?.trim() ? ` sessionKey=${params.sessionKey.trim()}` : ""} reason=session_excluded`,
+        `[lcm] compact: skipped session=${params.sessionId}${params.sessionKey?.trim() ? ` sessionKey=${params.sessionKey.trim()}` : ""} reason=session_excluded runtime_delegate=unavailable`,
       );
       return {
         ok: true,
@@ -4129,6 +4229,7 @@ export class LcmContextEngine implements ContextEngine {
    */
   private async applySessionReplacement(params: {
     reason: string;
+    archiveCause: ArchiveCause;
     sessionId?: string;
     sessionKey?: string;
     nextSessionId?: string;
@@ -4151,7 +4252,7 @@ export class LcmContextEngine implements ContextEngine {
         );
         return;
       }
-      await this.conversationStore.archiveConversation(current.conversationId);
+      await this.conversationStore.archiveConversation(current.conversationId, params.archiveCause);
     }
 
     if (!params.createReplacement) {
@@ -4183,7 +4284,7 @@ export class LcmContextEngine implements ContextEngine {
     sessionKey?: string;
   }): Promise<void> {
     const reason = params.reason?.trim();
-    if (reason !== "new" && reason !== "reset") {
+    if (reason !== HOST_BEFORE_RESET_REASON_NEW && reason !== HOST_BEFORE_RESET_REASON_RESET) {
       return;
     }
     if (this.shouldIgnoreSession({ sessionId: params.sessionId, sessionKey: params.sessionKey })) {
@@ -4198,7 +4299,7 @@ export class LcmContextEngine implements ContextEngine {
       this.resolveSessionQueueKey(params.sessionId, params.sessionKey),
       async () =>
         this.conversationStore.withTransaction(async () => {
-          if (reason === "new") {
+          if (reason === HOST_BEFORE_RESET_REASON_NEW) {
             const conversation = await this.conversationStore.getConversationForSession({
               sessionId: params.sessionId,
               sessionKey: params.sessionKey,
@@ -4220,6 +4321,7 @@ export class LcmContextEngine implements ContextEngine {
           }
           await this.applySessionReplacement({
             reason: "/reset",
+            archiveCause: "manual-reset",
             sessionId: params.sessionId,
             sessionKey: params.sessionKey,
             createReplacement: true,
@@ -4254,7 +4356,7 @@ export class LcmContextEngine implements ContextEngine {
       return;
     }
 
-    const createReplacement = reason !== "deleted";
+    const createReplacement = reason !== HOST_SESSION_END_REASON_DELETED;
     this.ensureMigrated();
     await this.withSessionQueue(
       this.resolveSessionQueueKey(params.nextSessionId ?? params.sessionId, params.sessionKey ?? params.nextSessionKey),
@@ -4262,6 +4364,12 @@ export class LcmContextEngine implements ContextEngine {
         this.conversationStore.withTransaction(async () => {
           await this.applySessionReplacement({
             reason: `session_end:${reason}`,
+            archiveCause:
+              reason === HOST_SESSION_END_REASON_DELETED
+                ? "session-deleted"
+                : reason === HOST_SESSION_END_REASON_RESET
+                  ? "manual-reset"
+                  : "session-end",
             sessionId: params.sessionId,
             sessionKey: params.sessionKey ?? params.nextSessionKey,
             nextSessionId: params.nextSessionId,
