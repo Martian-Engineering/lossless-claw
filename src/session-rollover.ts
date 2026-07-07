@@ -489,6 +489,49 @@ export class SessionRolloverDetector {
     return { rebound: true };
   }
 
+  /**
+   * Check whether a candidate runtime transcript is fresh enough to rotate an
+   * isolated cron lane without risking an older callback taking over the active
+   * cron conversation.
+   */
+  async transcriptIsProvablyFreshForRuntimeRollover(params: {
+    phase: "bootstrap" | "assemble" | "afterTurn";
+    conversationId: number;
+    sessionKey: string;
+    activeSessionId: string;
+    nextSessionId: string;
+    candidateMessages: AgentMessage[];
+    source: "isolated-cron";
+  }): Promise<boolean> {
+    let verdict: Awaited<ReturnType<SessionRolloverDetector["evaluateAmbiguousRolloverFreshness"]>>;
+    try {
+      verdict = await this.evaluateAmbiguousRolloverFreshness({
+        conversationId: params.conversationId,
+        candidateMessages: params.candidateMessages,
+      });
+    } catch (err) {
+      this.deps.log.warn(
+        `[lcm] ${params.phase}: ${params.source} freshness check failed conversation=${params.conversationId} error=${describeLogError(err)}`,
+      );
+      return false;
+    }
+
+    if (!verdict.fresh) {
+      const message = `[lcm] ${params.phase}: ${params.source} rollover not provably fresh conversation=${params.conversationId} sessionKey=${params.sessionKey} oldSessionId=${params.activeSessionId} newSessionId=${params.nextSessionId} freshness=${verdict.reason} lastPersistedAt=${verdict.lastPersistedAt?.toISOString() ?? "none"} firstCandidateAt=${verdict.firstCandidateAt !== null ? new Date(verdict.firstCandidateAt).toISOString() : "none"}`;
+      if (isTransientAmbiguousRolloverFreshness(verdict.reason)) {
+        this.deps.log.info(message);
+      } else {
+        this.deps.log.warn(message);
+      }
+      return false;
+    }
+
+    this.deps.log.info(
+      `[lcm] ${params.phase}: ${params.source} rollover transcript proved fresh conversation=${params.conversationId} sessionKey=${params.sessionKey} oldSessionId=${params.activeSessionId} newSessionId=${params.nextSessionId} candidateMessages=${params.candidateMessages.length} lastPersistedAt=${verdict.lastPersistedAt?.toISOString() ?? "none"} firstCandidateAt=${verdict.firstCandidateAt !== null ? new Date(verdict.firstCandidateAt).toISOString() : "none"}`,
+    );
+    return true;
+  }
+
   async transcriptContainsCurrentConversationTailAnchor(params: {
     conversationId: number;
     historicalMessages: AgentMessage[];

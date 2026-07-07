@@ -2363,10 +2363,37 @@ export class TranscriptReconciler {
         cronSessionKey,
       );
       if (activeByCronKey && activeByCronKey.sessionId !== params.sessionId) {
-        this.host.deps.log.warn(
-          `[lcm] afterTurn: isolated cron key is owned by another active runtime; preserving active cron conversation session=${params.sessionId} sessionKey=${cronSessionKey} activeSession=${activeByCronKey.sessionId}`,
+        const historicalMessages = await readLeafPathMessages(params.sessionFile);
+        const freshRuntime =
+          await this.rolloverDetector.transcriptIsProvablyFreshForRuntimeRollover({
+            phase: "afterTurn",
+            conversationId: activeByCronKey.conversationId,
+            sessionKey: cronSessionKey,
+            activeSessionId: activeByCronKey.sessionId,
+            nextSessionId: params.sessionId,
+            candidateMessages: historicalMessages,
+            source: "isolated-cron",
+          });
+        if (!freshRuntime) {
+          this.host.deps.log.warn(
+            `[lcm] afterTurn: isolated cron key is owned by another active runtime; preserving active cron conversation session=${params.sessionId} sessionKey=${cronSessionKey} activeSession=${activeByCronKey.sessionId}`,
+          );
+          return { conversation: null, staleIsolatedCron: true };
+        }
+
+        const rotated = await this.rolloverDetector.rotateIsolatedCronConversationIfRuntimeChanged({
+          phase: "afterTurn",
+          sessionId: params.sessionId,
+          sessionKey: cronSessionKey,
+          createReplacement: false,
+        });
+        if (!rotated) {
+          return { conversation: null, staleIsolatedCron: true };
+        }
+        const conversation = await this.host.conversationStore.getConversationBySessionId(
+          params.sessionId,
         );
-        return { conversation: null, staleIsolatedCron: true };
+        return { conversation, staleIsolatedCron: false };
       }
 
       return {

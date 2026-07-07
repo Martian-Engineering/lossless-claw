@@ -43,6 +43,7 @@ import {
   createSessionFilePath,
   makeMessage,
   writeLeafTranscript,
+  writeLeafTranscriptMessages,
 } from "./helpers.js";
 
 afterEach(cleanupEngineTestState);
@@ -443,5 +444,68 @@ describe("cron isolation / fail-closed rollover preservation", () => {
     ).map((m) => m.content);
     expect(secondContentsAfterStale).toEqual(["second cron message", "second cron reply"]);
     expect(secondContentsAfterStale).not.toContain("stale first cron answer");
+  });
+
+  it("isolated cron afterTurn can rotate a provably fresh new runtime", async () => {
+    const engine = createEngine();
+
+    const firstSessionId = "cron-run-afterturn-old";
+    const firstSessionFile = createSessionFilePath("cron-run-afterturn-old");
+    writeLeafTranscript(firstSessionFile, [
+      { role: "user", content: "old cron message" },
+      { role: "assistant", content: "old cron reply" },
+    ]);
+
+    await engine.bootstrap({
+      sessionId: firstSessionId,
+      sessionKey: cronSessionKey,
+      sessionFile: firstSessionFile,
+    });
+
+    const firstConversation = await engine
+      .getConversationStore()
+      .getConversationBySessionId(firstSessionId);
+    expect(firstConversation).not.toBeNull();
+
+    const secondSessionId = "cron-run-afterturn-new";
+    const freshBase = Date.now() + 60_000;
+    const secondMessages = [
+      makeMessage({ role: "user", content: "fresh cron afterTurn prompt" }),
+      makeMessage({ role: "assistant", content: "fresh cron afterTurn answer" }),
+    ].map((message, index) => ({
+      ...message,
+      timestamp: freshBase + index,
+    }));
+    const secondSessionFile = createSessionFilePath("cron-run-afterturn-new");
+    writeLeafTranscriptMessages(secondSessionFile, secondMessages);
+
+    await engine.afterTurn({
+      sessionId: secondSessionId,
+      sessionKey: cronSessionKey,
+      sessionFile: secondSessionFile,
+      messages: secondMessages,
+      prePromptMessageCount: 0,
+      tokenBudget: 4096,
+    });
+
+    const archivedFirstConversation = await engine
+      .getConversationStore()
+      .getConversation(firstConversation!.conversationId);
+    expect(archivedFirstConversation?.active).toBe(false);
+
+    const activeByCronKey = await engine
+      .getConversationStore()
+      .getConversationBySessionKey(cronSessionKey);
+    expect(activeByCronKey).not.toBeNull();
+    expect(activeByCronKey?.sessionId).toBe(secondSessionId);
+    expect(activeByCronKey?.conversationId).not.toBe(firstConversation!.conversationId);
+
+    const secondContents = (
+      await engine.getConversationStore().getMessages(activeByCronKey!.conversationId)
+    ).map((m) => m.content);
+    expect(secondContents).toEqual([
+      "fresh cron afterTurn prompt",
+      "fresh cron afterTurn answer",
+    ]);
   });
 });
