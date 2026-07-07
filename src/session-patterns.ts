@@ -22,6 +22,18 @@ export function matchesSessionPattern(sessionKey: string, patterns: RegExp[]): b
   return patterns.some((pattern) => pattern.test(sessionKey));
 }
 
+/** Whether a session key names an isolated scheduled cron run. */
+export function isIsolatedCronSessionKey(
+  sessionKey: string | null | undefined,
+): boolean {
+  const trimmed = sessionKey?.trim();
+  if (!trimmed) {
+    return false;
+  }
+  const parts = trimmed.split(":");
+  return parts.length >= 4 && parts[0] === "agent" && parts[2] === "cron";
+}
+
 const SESSION_KEY_CHANNEL_SCOPE = /^(.*:channel:[^:]+)(?::thread:[^:]+|:active-memory:[^:]+)*$/;
 
 /**

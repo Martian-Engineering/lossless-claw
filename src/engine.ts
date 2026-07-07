@@ -2902,6 +2902,12 @@ export class LcmContextEngine implements ContextEngine {
         hasOverlap: false,
       };
     }
+    if (transcriptReconcileResult.blockedReason === "stale-isolated-cron-afterturn") {
+      this.deps.log.warn(
+        `[lcm] afterTurn: stale isolated cron callback skipped before persistence and compaction maintenance ${sessionLabel}`,
+      );
+      return;
+    }
     const transcriptReconcileUnsafeToAdvance =
       transcriptReconcileResult.blockedByImportCap ||
       (!transcriptReconcileResult.hasOverlap && transcriptReconcileResult.importedMessages === 0);

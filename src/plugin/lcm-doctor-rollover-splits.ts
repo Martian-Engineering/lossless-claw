@@ -1,5 +1,6 @@
 import type { DatabaseSync, SQLInputValue } from "node:sqlite";
 import { getFileBackedDatabasePath } from "../db/connection.js";
+import { isIsolatedCronSessionKey } from "../session-patterns.js";
 import { normalizeMessageContentForFullTextIndex } from "../store/conversation-store.js";
 import { withDatabaseTransaction } from "../transaction-mutex.js";
 import { createLcmDatabaseBackup } from "./lcm-db-backup.js";
@@ -143,11 +144,6 @@ function hasStrandedData(row: ConversationRow): boolean {
     row.large_files > 0 ||
     row.focus_briefs > 0
   );
-}
-
-function isIsolatedCronSessionKey(sessionKey: string): boolean {
-  const parts = sessionKey.split(":");
-  return parts.length >= 4 && parts[0] === "agent" && parts[2] === "cron";
 }
 
 function compareConversationChronology(left: ConversationRow, right: ConversationRow): number {

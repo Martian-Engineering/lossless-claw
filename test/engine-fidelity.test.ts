@@ -2092,6 +2092,11 @@ describe("LcmContextEngine fidelity and token budget", () => {
       { role: "user", content: "current afterTurn cron input" },
       { role: "assistant", content: "current afterTurn cron output" },
     ]);
+    await engine.bootstrap({
+      sessionId: secondSessionId,
+      sessionKey,
+      sessionFile: newSessionFile,
+    });
 
     await engine.afterTurn({
       sessionId: secondSessionId,

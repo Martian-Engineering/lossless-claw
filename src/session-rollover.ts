@@ -12,6 +12,7 @@ import { describeLogError } from "./lcm-log.js";
 import { isLikelyInjectedDeliveryOnlyTranscript, toStoredMessage } from "./message-content.js";
 import { createBootstrapEntryHash, messageIdentity } from "./message-signatures.js";
 import type { AgentMessage } from "./openclaw-bridge.js";
+import { isIsolatedCronSessionKey } from "./session-patterns.js";
 import type { ConversationStore } from "./store/conversation-store.js";
 import { getTranscriptEntryMeta } from "./transcript.js";
 import { isMissingFileError } from "./value-utils.js";
@@ -125,16 +126,6 @@ export class SessionRolloverDetector {
     return true;
   }
 
-  /** Cron session keys represent isolated scheduled runs, not conversation continuity. */
-  private isIsolatedCronSessionKey(sessionKey?: string): boolean {
-    const trimmed = sessionKey?.trim();
-    if (!trimmed) {
-      return false;
-    }
-    const parts = trimmed.split(":");
-    return parts.length >= 4 && parts[0] === "agent" && parts[2] === "cron";
-  }
-
   /**
    * Archive the prior active cron run when OpenClaw reuses a scheduler
    * sessionKey for a new isolated runtime session.
@@ -150,7 +141,7 @@ export class SessionRolloverDetector {
     if (
       !normalizedSessionId ||
       !normalizedSessionKey ||
-      !this.isIsolatedCronSessionKey(normalizedSessionKey)
+      !isIsolatedCronSessionKey(normalizedSessionKey)
     ) {
       return false;
     }

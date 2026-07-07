@@ -101,6 +101,7 @@ export type TranscriptReconcileResult = {
     | "import-cap"
     | "cross-conversation-raw-id"
     | "duplicate-transcript-replay"
+    | "stale-isolated-cron-afterturn"
     | "ambiguous-session-key-runtime-rollover"
     | "ambiguous-rollover-rotated-fresh-transcript";
   importedMessages: number;

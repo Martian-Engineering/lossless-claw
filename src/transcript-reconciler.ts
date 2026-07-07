@@ -36,7 +36,7 @@ import {
   messageIdentity,
 } from "./message-signatures.js";
 import { resolveEpochRoute, selectEntryIdTail, transcriptImportCap } from "./reconcile-plan.js";
-import { isBaseChannelSessionKey, sessionKeyChannelScope } from "./session-patterns.js";
+import { isBaseChannelSessionKey, isIsolatedCronSessionKey, sessionKeyChannelScope } from "./session-patterns.js";
 import {
   externalizedReplayMetadataMatches,
   extractPlainToolReplayTextsById,
@@ -54,7 +54,6 @@ import {
   readTranscriptHeader,
   resolveTranscriptMessageCreatedAt,
 } from "./transcript.js";
-import { isIsolatedCronSessionKey } from "./tools/lcm-conversation-scope.js";
 import { asRecord, formatDurationMs, isMissingFileError, safeString } from "./value-utils.js";
 
 /**
@@ -2144,8 +2143,7 @@ export class TranscriptReconciler {
     let checkpointMissingMetadataFrontier = false;
     if (
       neverIngestedCheckpoint &&
-      (conversation.sessionId === params.sessionId ||
-        isIsolatedCronSessionKey(conversation.sessionKey ?? undefined)) &&
+      conversation.sessionId === params.sessionId &&
       conversation.bootstrappedAt !== null
     ) {
       checkpointMissingMetadataFrontier =
@@ -2252,25 +2250,16 @@ export class TranscriptReconciler {
     allowNoAnchorImportOnCheckpointMissing?: boolean;
   }): Promise<TranscriptReconcileResult> {
     const queueKey = this.host.resolveSessionQueueKey(params.sessionId, params.sessionKey);
-    await this.host.conversationStore.withTransaction(async () => {
-      await this.rolloverDetector.rotateIsolatedCronConversationIfRuntimeChanged({
-        phase: "afterTurn",
-        sessionId: params.sessionId,
-        sessionKey: params.sessionKey,
-        createReplacement: false,
-      });
-      await this.rolloverDetector.rotateStaleSessionKeyConversationIfTrackedTranscriptMissing({
-        phase: "afterTurn",
-        sessionId: params.sessionId,
-        sessionKey: params.sessionKey,
-        sessionFile: params.sessionFile,
-        createReplacement: false,
-      });
-    });
-    const conversation = await this.host.conversationStore.getConversationForSession({
-      sessionId: params.sessionId,
-      sessionKey: params.sessionKey,
-    });
+    const resolved = await this.resolveAfterTurnConversation(params);
+    if (resolved.staleIsolatedCron) {
+      return {
+        importedMessages: 0,
+        blockedByImportCap: false,
+        blockedReason: "stale-isolated-cron-afterturn",
+        hasOverlap: false,
+      };
+    }
+    const conversation = resolved.conversation;
     if (!conversation) {
       return this.importInitialAfterTurnTranscript({
         sessionId: params.sessionId,
@@ -2328,6 +2317,77 @@ export class TranscriptReconciler {
       sessionFileStatError,
       transcriptEpochShrank,
     });
+  }
+
+  // Isolated cron keys identify a scheduled job family; the runtime sessionId
+  // identifies one run. Resolve by runtime session first so a late afterTurn
+  // from an archived run cannot archive or import into a newer active run.
+  private async resolveAfterTurnConversation(params: {
+    sessionId: string;
+    sessionKey?: string;
+    sessionFile: string;
+  }): Promise<{ conversation: ConversationRecord | null; staleIsolatedCron: boolean }> {
+    const normalizedSessionKey = params.sessionKey?.trim();
+    if (isIsolatedCronSessionKey(normalizedSessionKey)) {
+      const cronSessionKey = normalizedSessionKey ?? "";
+      const byRuntimeSession = await this.host.conversationStore.getConversationBySessionId(
+        params.sessionId,
+      );
+      if (
+        byRuntimeSession &&
+        byRuntimeSession.sessionKey?.trim() === cronSessionKey
+      ) {
+        if (byRuntimeSession.active) {
+          return { conversation: byRuntimeSession, staleIsolatedCron: false };
+        }
+        this.host.deps.log.warn(
+          `[lcm] afterTurn: stale isolated cron runtime session; preserving active cron conversation session=${params.sessionId} sessionKey=${cronSessionKey}`,
+        );
+        return { conversation: null, staleIsolatedCron: true };
+      }
+      if (byRuntimeSession) {
+        this.host.deps.log.warn(
+          `[lcm] afterTurn: isolated cron runtime session is bound to another session key; skipping ambiguous import session=${params.sessionId} sessionKey=${cronSessionKey} boundSessionKey=${byRuntimeSession.sessionKey ?? ""}`,
+        );
+        return { conversation: null, staleIsolatedCron: true };
+      }
+
+      const activeByCronKey = await this.host.conversationStore.getConversationBySessionKey(
+        cronSessionKey,
+      );
+      if (activeByCronKey && activeByCronKey.sessionId !== params.sessionId) {
+        this.host.deps.log.warn(
+          `[lcm] afterTurn: isolated cron key is owned by another active runtime; preserving active cron conversation session=${params.sessionId} sessionKey=${cronSessionKey} activeSession=${activeByCronKey.sessionId}`,
+        );
+        return { conversation: null, staleIsolatedCron: true };
+      }
+
+      return {
+        conversation: activeByCronKey?.sessionId === params.sessionId ? activeByCronKey : null,
+        staleIsolatedCron: false,
+      };
+    }
+
+    await this.host.conversationStore.withTransaction(async () => {
+      await this.rolloverDetector.rotateIsolatedCronConversationIfRuntimeChanged({
+        phase: "afterTurn",
+        sessionId: params.sessionId,
+        sessionKey: params.sessionKey,
+        createReplacement: false,
+      });
+      await this.rolloverDetector.rotateStaleSessionKeyConversationIfTrackedTranscriptMissing({
+        phase: "afterTurn",
+        sessionId: params.sessionId,
+        sessionKey: params.sessionKey,
+        sessionFile: params.sessionFile,
+        createReplacement: false,
+      });
+    });
+    const conversation = await this.host.conversationStore.getConversationForSession({
+      sessionId: params.sessionId,
+      sessionKey: params.sessionKey,
+    });
+    return { conversation, staleIsolatedCron: false };
   }
 
   filterSyntheticHeartbeatTranscriptMessages(params: {
