@@ -1,18 +1,22 @@
 // Engine maintain() sweeps and assemble() budget/degradation behavior. Split from engine-fidelity.test.ts.
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { randomUUID } from "node:crypto";
-import { appendFileSync, mkdtempSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { appendFileSync, mkdtempSync, readdirSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { SessionManager } from "@earendil-works/pi-coding-agent";
 import { ContextAssembler } from "../src/assembler.js";
 import type { LcmConfig } from "../src/db/config.js";
 import { closeLcmConnection, createLcmDatabaseConnection } from "../src/db/connection.js";
+import { getLcmDbFeatures } from "../src/db/features.js";
+import { runLcmMigrations } from "../src/db/migration.js";
 import { LcmContextEngine } from "../src/engine.js";
 import { estimateSerializedMessageTokens, estimateSerializedMessagesTokens, estimateTokens } from "../src/estimate-tokens.js";
 import type { AgentMessage } from "../src/openclaw-bridge.js";
 import { applyScopedDoctorRepair } from "../src/plugin/lcm-doctor-apply.js";
-import { detectDoctorMarker } from "../src/plugin/lcm-doctor-shared.js";
+import { detectDoctorMarker, FALLBACK_SUMMARY_MARKER } from "../src/plugin/lcm-doctor-shared.js";
+import { ConversationStore } from "../src/store/conversation-store.js";
+import { SummaryStore } from "../src/store/summary-store.js";
 import type { LcmDependencies } from "../src/types.js";
 import {
   cleanupEngineTestState,
@@ -25,6 +29,7 @@ import {
   writeLeafTranscriptMessages,
   createEngineWithConfig,
   createEngineWithDeps,
+  createTestConfig,
   makeMessage,
   seedBacklogContext,
   estimateAssembledPayloadTokens,
@@ -1628,5 +1633,72 @@ describe("LcmContextEngine maintain and assemble budget", () => {
         tokenBudget: 2_048,
       }),
     );
+  });
+});
+
+describe("applyScopedDoctorRepair backup safety", () => {
+  it("creates a database backup before mutating summaries", async () => {
+    const tempDir = mkdtempSync(join(tmpdir(), "lossless-claw-doctor-apply-backup-"));
+    tempDirs.push(tempDir);
+    const dbPath = join(tempDir, "lcm.db");
+    const db = createLcmDatabaseConnection(dbPath);
+    const { fts5Available } = getLcmDbFeatures(db);
+    runLcmMigrations(db, { fts5Available });
+    const conversationStore = new ConversationStore(db, { fts5Available });
+    const summaryStore = new SummaryStore(db, { fts5Available });
+
+    const conversation = await conversationStore.createConversation({
+      sessionId: "doctor-apply-backup-session",
+      sessionKey: "agent:test:main:doctor-apply-backup",
+    });
+    const message = await conversationStore.createMessage({
+      conversationId: conversation.conversationId,
+      seq: 0,
+      role: "user",
+      content: "hello from the backup fixture",
+      tokenCount: 5,
+    });
+
+    const summaryId = "sum_doctor_apply_backup_1";
+    await summaryStore.insertSummary({
+      summaryId,
+      conversationId: conversation.conversationId,
+      kind: "leaf",
+      depth: 0,
+      content: FALLBACK_SUMMARY_MARKER,
+      tokenCount: 10,
+    });
+    await summaryStore.linkSummaryToMessages(summaryId, [message.messageId]);
+
+    const config = createTestConfig(dbPath);
+    const result = await applyScopedDoctorRepair({
+      db,
+      config,
+      conversationId: conversation.conversationId,
+      summarize: async () => "Repaired summary content without any doctor marker.",
+    });
+
+    expect(result.kind).toBe("applied");
+    if (result.kind !== "applied") {
+      throw new Error(`expected doctor repair to apply: ${result.reason}`);
+    }
+    expect(result.repaired).toBe(1);
+    expect(result.backupPath).toContain("scoped-doctor-repair");
+
+    const backupFiles = readdirSync(tempDir).filter((name) => name.includes("scoped-doctor-repair"));
+    expect(backupFiles).toHaveLength(1);
+    const repairedSummary = await summaryStore.getSummary(summaryId);
+    expect(repairedSummary?.content).toBe("Repaired summary content without any doctor marker.");
+
+    const backupDb = createLcmDatabaseConnection(join(tempDir, backupFiles[0]!));
+    try {
+      const backedUpSummary = backupDb
+        .prepare("SELECT content FROM summaries WHERE summary_id = ?")
+        .get(summaryId) as { content: string } | undefined;
+      expect(backedUpSummary?.content).toBe(FALLBACK_SUMMARY_MARKER);
+    } finally {
+      closeLcmConnection(backupDb);
+      closeLcmConnection(db);
+    }
   });
 });

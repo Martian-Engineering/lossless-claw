@@ -3135,6 +3135,7 @@ async function buildDoctorApplyText(params: {
       buildStatLine("truncated-marker summaries", formatNumber(stats.truncated)),
       buildStatLine("fallback-marker summaries", formatNumber(stats.fallback)),
       buildStatLine("emergency-fallback summaries", formatNumber(stats.emergency)),
+      buildStatLine("backup path", result.backupPath ?? "skipped (no writes)"),
       buildStatLine("repaired summaries", formatNumber(result.repaired)),
       buildStatLine("unchanged summaries", formatNumber(result.unchanged)),
       buildStatLine("skipped summaries", formatNumber(result.skipped.length)),
