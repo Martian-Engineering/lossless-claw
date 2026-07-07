@@ -3327,6 +3327,125 @@ describe("lcm command", () => {
     } satisfies Partial<LcmProgrammaticControlUnavailableError>);
   });
 
+  it("rejects programmatic rotate when the explicit session id conflicts with the resolved conversation", async () => {
+    const transcriptPath = join(tmpdir(), `lossless-claw-programmatic-mismatch-${Date.now()}.jsonl`);
+    writeFileSync(transcriptPath, "{\"message\":{\"role\":\"user\",\"content\":\"existing\"}}\n");
+    tempDirs.add(transcriptPath);
+
+    const rotateSessionStorageWithBackup = vi.fn(async () => ({
+      kind: "rotated" as const,
+      currentConversationId: 1,
+      currentMessageCount: 1,
+      backupPath: join(tmpdir(), "not-returned.bak"),
+      preservedTailMessageCount: 1,
+      checkpointSize: 11,
+      bytesRemoved: 22,
+    }));
+    const deps = {
+      resolveSessionIdFromSessionKey: vi.fn(async () => "unrelated-runtime-session"),
+      resolveSessionTranscriptFile: vi.fn(async () => transcriptPath),
+    } as unknown as LcmDependencies;
+    const getLcm = async () => ({
+      rotateSessionStorageWithBackup,
+    });
+    const fixture = createCommandFixture({ deps, getLcm });
+    tempDirs.add(fixture.tempDir);
+    dbPaths.add(fixture.dbPath);
+
+    const conversation = await fixture.conversationStore.createConversation({
+      sessionId: "programmatic-mismatch-session",
+      sessionKey: "user:u1:chat",
+    });
+    await fixture.conversationStore.createMessagesBulk([
+      {
+        conversationId: conversation.conversationId,
+        seq: 0,
+        role: "user",
+        content: "first message",
+        tokenCount: 2,
+      },
+    ]);
+
+    await expect(
+      runLcmProgrammaticControl({
+        operation: "rotate",
+        ctx: createCommandContext(undefined, {
+          sessionId: "unrelated-runtime-session",
+          sessionKey: "user:u1:chat",
+        }),
+        db: fixture.db,
+        config: fixture.config,
+        deps,
+        getLcm,
+      }),
+    ).rejects.toMatchObject({
+      name: "LcmProgrammaticControlUnavailableError",
+      reasonCode: "session_id_unavailable",
+    } satisfies Partial<LcmProgrammaticControlUnavailableError>);
+    expect(rotateSessionStorageWithBackup).not.toHaveBeenCalled();
+    expect(deps.resolveSessionTranscriptFile).not.toHaveBeenCalled();
+  });
+
+  it("rejects unsupported programmatic operations before rotate can run", async () => {
+    const transcriptPath = join(tmpdir(), `lossless-claw-programmatic-unsupported-${Date.now()}.jsonl`);
+    writeFileSync(transcriptPath, "{\"message\":{\"role\":\"user\",\"content\":\"existing\"}}\n");
+    tempDirs.add(transcriptPath);
+
+    const rotateSessionStorageWithBackup = vi.fn(async () => ({
+      kind: "rotated" as const,
+      currentConversationId: 1,
+      currentMessageCount: 1,
+      backupPath: join(tmpdir(), "not-returned.bak"),
+      preservedTailMessageCount: 1,
+      checkpointSize: 11,
+      bytesRemoved: 22,
+    }));
+    const deps = {
+      resolveSessionIdFromSessionKey: vi.fn(async () => "programmatic-unsupported-session"),
+      resolveSessionTranscriptFile: vi.fn(async () => transcriptPath),
+    } as unknown as LcmDependencies;
+    const getLcm = async () => ({
+      rotateSessionStorageWithBackup,
+    });
+    const fixture = createCommandFixture({ deps, getLcm });
+    tempDirs.add(fixture.tempDir);
+    dbPaths.add(fixture.dbPath);
+
+    const conversation = await fixture.conversationStore.createConversation({
+      sessionId: "programmatic-unsupported-session",
+      sessionKey: "user:u1:chat",
+    });
+    await fixture.conversationStore.createMessagesBulk([
+      {
+        conversationId: conversation.conversationId,
+        seq: 0,
+        role: "user",
+        content: "first message",
+        tokenCount: 2,
+      },
+    ]);
+
+    await expect(
+      runLcmProgrammaticControl({
+        operation: "backup" as Parameters<typeof runLcmProgrammaticControl>[0]["operation"],
+        ctx: createCommandContext(undefined, {
+          sessionId: "programmatic-unsupported-session",
+          sessionKey: "user:u1:chat",
+        }),
+        db: fixture.db,
+        config: fixture.config,
+        deps,
+        getLcm,
+      }),
+    ).rejects.toMatchObject({
+      name: "LcmProgrammaticControlUnavailableError",
+      operation: "backup",
+      reasonCode: "unsupported_operation",
+    } satisfies Partial<LcmProgrammaticControlUnavailableError>);
+    expect(rotateSessionStorageWithBackup).not.toHaveBeenCalled();
+    expect(deps.resolveSessionTranscriptFile).not.toHaveBeenCalled();
+  });
+
   it("rotates the current session and replaces the latest rotate backup", async () => {
     const transcriptPath = join(tmpdir(), `lossless-claw-rotate-${Date.now()}.jsonl`);
     writeFileSync(transcriptPath, "{\"message\":{\"role\":\"user\",\"content\":[{\"type\":\"text\",\"text\":\"existing\"}]}}\n");

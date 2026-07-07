@@ -1090,6 +1090,93 @@ describe("lcm plugin registration", () => {
     rmSync(sessionStorePath, { force: true });
   });
 
+  it("uses the agent encoded in sessionKey when resolving a transcript file", async () => {
+    const dbPath = join(tmpdir(), `lossless-claw-${Date.now()}-${Math.random().toString(16)}.db`);
+    dbPaths.add(dbPath);
+    const alphaStorePath = join(
+      tmpdir(),
+      `lossless-claw-alpha-store-${Date.now()}-${Math.random().toString(16)}.json`,
+    );
+    const betaStorePath = join(
+      tmpdir(),
+      `lossless-claw-beta-store-${Date.now()}-${Math.random().toString(16)}.json`,
+    );
+    const sessionId = `shared-session-${Date.now()}-${Math.random().toString(16).slice(2)}`;
+    const sessionKey = `agent:alpha:chat:${Math.random().toString(16).slice(2)}`;
+    const alphaSessionFile = join(tmpdir(), `${sessionId}-alpha.jsonl`);
+    const betaSessionFile = join(tmpdir(), `${sessionId}-beta.jsonl`);
+
+    writeFileSync(
+      alphaStorePath,
+      `${JSON.stringify({
+        [sessionKey]: {
+          sessionId,
+          sessionFile: alphaSessionFile,
+        },
+      }, null, 2)}\n`,
+      "utf8",
+    );
+    writeFileSync(
+      betaStorePath,
+      `${JSON.stringify({
+        [`agent:beta:chat:${Math.random().toString(16).slice(2)}`]: {
+          sessionId,
+          sessionFile: betaSessionFile,
+        },
+      }, null, 2)}\n`,
+      "utf8",
+    );
+
+    const { api, getFactory } = buildApi({ enabled: true, dbPath });
+    const resolveStorePath = vi.fn((_store: string | undefined, options?: { agentId?: string }) =>
+      options?.agentId === "alpha" ? alphaStorePath : betaStorePath,
+    );
+    (api.runtime as unknown as {
+      channel: {
+        session: {
+          resolveStorePath: typeof resolveStorePath;
+          loadSessionStore: (storePath: string) => Record<string, unknown>;
+          resolveSessionFilePath: (
+            runtimeSessionId: string,
+            entry?: { sessionFile?: unknown },
+          ) => string;
+        };
+      };
+    }).channel.session = {
+      resolveStorePath,
+      loadSessionStore: (storePath: string) => JSON.parse(readFileSync(storePath, "utf8")) as Record<string, unknown>,
+      resolveSessionFilePath: (runtimeSessionId: string, entry?: { sessionFile?: unknown }) =>
+        typeof entry?.sessionFile === "string" && entry.sessionFile.trim()
+          ? entry.sessionFile
+          : join(tmpdir(), `${runtimeSessionId}.jsonl`),
+    };
+
+    lcmPlugin.register(api);
+
+    const factory = getFactory();
+    expect(factory).toBeTypeOf("function");
+    const engine = factory!() as {
+      deps?: {
+        resolveSessionTranscriptFile: (params: {
+          agentId?: string;
+          sessionId: string;
+          sessionKey?: string;
+        }) => Promise<string | undefined>;
+      };
+    };
+
+    await expect(
+      engine.deps?.resolveSessionTranscriptFile({
+        agentId: "beta",
+        sessionId,
+        sessionKey,
+      }),
+    ).resolves.toBe(alphaSessionFile);
+    expect(resolveStorePath).toHaveBeenCalledWith(undefined, { agentId: "alpha" });
+    rmSync(alphaStorePath, { force: true });
+    rmSync(betaStorePath, { force: true });
+  });
+
   it("uses runtime OpenClaw defaults when api.pluginConfig is ready before api.config", () => {
     const { api, getFactory, infoLog } = buildApi(
       {

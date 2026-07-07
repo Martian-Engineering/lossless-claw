@@ -139,9 +139,10 @@ type FocusCompactionCommandEngine = {
 
 type RuntimeCommandEngine = RotateCommandEngine & Partial<FocusCompactionCommandEngine>;
 
+/** Error thrown when a host requests a control operation that cannot run safely. */
 export class LcmProgrammaticControlUnavailableError extends Error {
   constructor(
-    readonly operation: ContextEngineControlOperation,
+    readonly operation: string,
     readonly reasonCode: string,
     message = "Lossless Claw control operation is unavailable.",
   ) {
@@ -150,9 +151,10 @@ export class LcmProgrammaticControlUnavailableError extends Error {
   }
 }
 
+/** Error thrown when a supported control operation fails after starting. */
 export class LcmProgrammaticControlFailedError extends Error {
   constructor(
-    readonly operation: ContextEngineControlOperation,
+    readonly operation: string,
     readonly reasonCode: string,
     message = "Lossless Claw control operation failed.",
   ) {
@@ -843,9 +845,12 @@ async function resolveRuntimeSessionId(params: {
   deps: LcmDependencies;
   current: Extract<CurrentConversationResolution, { kind: "resolved" }>;
 }): Promise<string | undefined> {
+  const currentSessionId = normalizeIdentity(params.current.stats.sessionId);
   const directSessionId = normalizeIdentity(params.ctx.sessionId);
   if (directSessionId) {
-    return directSessionId;
+    return !currentSessionId || directSessionId === currentSessionId
+      ? directSessionId
+      : undefined;
   }
 
   const sessionKey = normalizeIdentity(params.ctx.sessionKey);
@@ -858,7 +863,7 @@ async function resolveRuntimeSessionId(params: {
     }
   }
 
-  return normalizeIdentity(params.current.stats.sessionId);
+  return currentSessionId;
 }
 
 function normalizePositiveInteger(value: number | null | undefined): number | null {
@@ -1922,6 +1927,16 @@ export function getLcmProgrammaticControlCapabilities(params?: {
   };
 }
 
+function normalizeControlOperation(operation: unknown): ContextEngineControlOperation {
+  if (operation === "status" || operation === "doctor" || operation === "rotate") {
+    return operation;
+  }
+  throw new LcmProgrammaticControlUnavailableError(
+    typeof operation === "string" ? operation : "unknown",
+    "unsupported_operation",
+  );
+}
+
 function buildProgrammaticDoctorWarnings(stats: DoctorSummaryStats): string[] {
   const warnings: string[] = [];
   if (stats.total > 0) {
@@ -1982,12 +1997,13 @@ export async function runLcmProgrammaticControl(params: {
   deps?: LcmDependencies;
   getLcm?: () => Promise<RuntimeCommandEngine>;
 }): Promise<ContextEngineControlResult> {
+  const operation = normalizeControlOperation(params.operation);
   const current = await resolveCurrentConversation({
     ctx: params.ctx,
     db: params.db,
   });
 
-  if (params.operation === "status") {
+  if (operation === "status") {
     return {
       operation: "status",
       active: current.kind === "resolved",
@@ -1995,7 +2011,7 @@ export async function runLcmProgrammaticControl(params: {
     };
   }
 
-  if (params.operation === "doctor") {
+  if (operation === "doctor") {
     if (current.kind === "unavailable") {
       return {
         operation: "doctor",

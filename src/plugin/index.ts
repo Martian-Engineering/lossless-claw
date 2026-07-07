@@ -1517,7 +1517,7 @@ function createLcmDependencies(
         const sessionConfig = isRecord(cfg) && isRecord(cfg.session) ? cfg.session : undefined;
         const normalizedSessionKey = sessionKey?.trim();
         const parsed = normalizedSessionKey ? parseAgentSessionKey(normalizedSessionKey) : null;
-        const agentId = normalizeAgentId(requestedAgentId ?? parsed?.agentId);
+        const agentId = normalizeAgentId(parsed?.agentId ?? requestedAgentId);
         const storePath = sessionApi.resolveStorePath(getStringField(sessionConfig, "store"), {
           agentId,
         });
