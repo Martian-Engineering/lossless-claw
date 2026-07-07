@@ -73,7 +73,7 @@ import {
   type TranscriptRewriteRequest,
 } from "./session-rotation.js";
 import { describeAssembledPrefixChange, formatOverflowDiagnosticsForLog, shouldLogOverflowDiagnostics, type AssemblePrefixSnapshot, type BootstrapImportObservation } from "./assemble-debug.js";
-import { appendForkBoundedLiveSuffixWithinBudget, buildDegradedLiveAssembleResult, buildForkBoundedLiveFallback, clampMessagesToSerializedBudget, resolveDeferredAssemblyPressure } from "./assemble-fallback.js";
+import { appendForkBoundedLiveSuffixWithinBudget, buildDegradedLiveAssembleResult, buildForkBoundedLiveFallback, clampMessagesToSerializedBudget, forkBoundedLiveSuffixAppendLogLevel, resolveDeferredAssemblyPressure } from "./assemble-fallback.js";
 import { resolveBootstrapMaxTokens, trimBootstrapMessagesToBudget } from "./bootstrap-budget.js";
 import { batchLooksLikeHeartbeatAckTurn, pruneHeartbeatOkTurns } from "./heartbeat-filter.js";
 import { appendUncoveredVolatileLiveInputsWithinBudget, isVolatileLiveInputMessage, messageContentCoveredBySummary, resolveProtectedFreshTailAssembledIndexes } from "./live-coverage.js";
@@ -3717,7 +3717,10 @@ export class LcmContextEngine implements ContextEngine {
       const preRecallEstimatedTokens =
         forkLiveSuffixAppend?.estimatedTokens ?? assembled.estimatedTokens;
       if (forkLiveSuffixAppend && forkLiveSuffixAppend.appendedMessages > 0) {
-        this.deps.log.warn(
+        // Appending the fork-bounded live suffix is routine for thread-fork
+        // sessions; only budget pressure needs operator attention.
+        const forkSuffixLogLevel = forkBoundedLiveSuffixAppendLogLevel(forkLiveSuffixAppend);
+        this.deps.log[forkSuffixLogLevel](
           `[lcm] assemble: appended fork-bounded live suffix conversation=${conversation.conversationId} ${sessionLabel} appendedMessages=${forkLiveSuffixAppend.appendedMessages} appendedTokens=${forkLiveSuffixAppend.appendedTokens} evictedMessages=${forkLiveSuffixAppend.evictedMessages} evictedTokens=${forkLiveSuffixAppend.evictedTokens} overBudget=${forkLiveSuffixAppend.overBudget}`,
         );
       }
