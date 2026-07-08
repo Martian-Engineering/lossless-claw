@@ -1,14 +1,32 @@
 const OPENCLAW_INBOUND_METADATA_BLOCK_RE =
   /^(Conversation info \(untrusted metadata\)|Sender \(untrusted metadata\)):\r?\n```json\r?\n([\s\S]*?)\r?\n```/;
 
+// Recap header text varies by fleet deployment/core version (multiple
+// grammars are simultaneously live -- not every deployment has picked up the
+// same core). One list keeps future header variants a one-line addition; each
+// is tried against every recognized body shape below.
+const OPENCLAW_INBOUND_HISTORY_RECAP_HEADERS = [
+  "Chat history since last reply (untrusted, for context):",
+];
+
+function escapeOpenClawRecapHeaderRegExpLiteral(value: string): string {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+const OPENCLAW_INBOUND_HISTORY_RECAP_HEADER_SRC = `(?:${OPENCLAW_INBOUND_HISTORY_RECAP_HEADERS.map(
+  escapeOpenClawRecapHeaderRegExpLiteral,
+).join("|")})`;
+
 // Ground truth: OpenClaw core's formatUntrustedJsonBlock (used for every
 // untrusted-metadata block, including this one) always emits heading + a
 // ```json fence + JSON.stringify(payload, null, 2) + closing fence. The recap
 // heading is fixed text; unlike the metadata blocks its payload is a JSON
 // ARRAY (the bounded chat-history window), not an object. This is the current
 // (post-2026.6.10) emission shape.
-const OPENCLAW_INBOUND_HISTORY_RECAP_BLOCK_RE =
-  /^Chat history since last reply \(untrusted, for context\):\r?\n```json\r?\n([\s\S]*?)\r?\n```/;
+const OPENCLAW_INBOUND_HISTORY_RECAP_BLOCK_RE = new RegExp(
+  `^${OPENCLAW_INBOUND_HISTORY_RECAP_HEADER_SRC}` +
+    String.raw`\r?\n\`\`\`json\r?\n([\s\S]*?)\r?\n\`\`\``,
+);
 
 // Ground truth (2026.6.10-era fleet, predates the JSON-array rendering above):
 // OpenClaw core's formatChatWindowMessage (openclaw-fork
@@ -37,7 +55,8 @@ const OPENCLAW_INBOUND_HISTORY_RECAP_LINE_ENTRY_SRC = String.raw`(?:${OPENCLAW_I
 // anything else (a line that is neither a valid entry nor a blank separator)
 // fails the WHOLE match, so it is never partially stripped up to that point.
 const OPENCLAW_INBOUND_HISTORY_RECAP_LINE_BLOCK_RE = new RegExp(
-  String.raw`^Chat history since last reply \(untrusted, for context\):\r?\n` +
+  `^${OPENCLAW_INBOUND_HISTORY_RECAP_HEADER_SRC}` +
+    String.raw`\r?\n` +
     `(?:${OPENCLAW_INBOUND_HISTORY_RECAP_LINE_ENTRY_SRC})` +
     `(?:\r?\n(?:${OPENCLAW_INBOUND_HISTORY_RECAP_LINE_ENTRY_SRC}))*` +
     String.raw`(?=\r?\n\r?\n|\r?\n?$)`,
