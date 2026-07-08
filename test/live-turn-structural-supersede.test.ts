@@ -740,6 +740,102 @@ describe("appendUncoveredVolatileLiveInputsWithinBudget recognizes memory-first 
     );
     expect(okSurvives).toBe(true);
   });
+
+  it("does NOT recognize a marker-bearing distinct turn that ends with an EARLIER assembled row's body (forgeable-marker guard)", () => {
+    // Security boundary (PR 978 review): injected-context markers are
+    // user-forgeable text (stripInjectedContextBlocks / DEFAULT_STRIP_INJECTED_
+    // CONTEXT_TAGS strip them from stored content precisely because a user can
+    // type them). A distinct current turn that TYPES a marker and merely ends
+    // with the verbatim body of an EARLIER assembled user row must not be
+    // recognized via that coincidence. Marker recognition is now constrained to
+    // the LAST assembled user row (the genuine current turn's bare face); here
+    // the newest assembled user row is a DIFFERENT body, so the forged marker
+    // has no eligible row to match. Was recognized (appendedMessages === 1)
+    // before the last-row constraint; fail-closed after.
+    const EARLIER_BODY = "please say ok to bob";
+    const assembledMessages: AgentMessage[] = [
+      { role: "user", content: EARLIER_BODY },
+      { role: "assistant", content: "earlier reply" },
+      // Newest (last) assembled user row is a DISTINCT body, not EARLIER_BODY.
+      { role: "user", content: "the genuinely newest persisted turn body" },
+    ] as AgentMessage[];
+    const liveMessages: AgentMessage[] = [
+      { role: "user", content: decoratedMemoryFirstRaw(EARLIER_BODY) },
+    ] as AgentMessage[];
+
+    const result = appendUncoveredVolatileLiveInputsWithinBudget({
+      assembledMessages,
+      assembledEstimatedTokens: 10,
+      liveMessages,
+      tokenBudget: 1_000_000,
+    });
+
+    // Nothing appended via the forged marker: the distinct turn is not treated
+    // as the structural current turn.
+    expect(result.appendedMessages).toBe(0);
+    // Both bare rows survive in their original order (no deletion, no reorder).
+    const userContents = result.messages
+      .filter((message) => (message as { role: string }).role === "user")
+      .map((message) => (message as { content: string }).content);
+    expect(userContents).toEqual([EARLIER_BODY, "the genuinely newest persisted turn body"]);
+  });
+
+  it("does NOT recognize a marker-bearing live turn that contains NO bare assembled body (marker alone is insufficient)", () => {
+    // Recognition requires BOTH a marker AND a line-aligned bare-body match
+    // against the last assembled user row. A marker with no structural
+    // containment of any assembled row is never recognized.
+    const assembledMessages: AgentMessage[] = [
+      { role: "user", content: "earlier persisted turn" },
+      { role: "assistant", content: "earlier reply" },
+      { role: "user", content: "a bare row body that the live turn does not contain" },
+    ] as AgentMessage[];
+    const liveMessages: AgentMessage[] = [
+      { role: "user", content: decoratedMemoryFirstRaw("a completely unrelated live body") },
+    ] as AgentMessage[];
+
+    const result = appendUncoveredVolatileLiveInputsWithinBudget({
+      assembledMessages,
+      assembledEstimatedTokens: 10,
+      liveMessages,
+      tokenBudget: 1_000_000,
+    });
+
+    expect(result.appendedMessages).toBe(0);
+  });
+
+  it("last-row marker coincidence is appended at the END with both bare rows preserved (benign residual, no reorder/loss)", () => {
+    // The last assembled user row is structurally indistinguishable between a
+    // genuine memory-first current turn and a distinct turn that merely ends
+    // with that row's body -- both are the last live user message carrying a
+    // marker and ending with the newest bare row. Recognizing it is therefore
+    // by design (the last-row constraint cannot separate them), but the residual
+    // is bounded: the decorated copy is appended at the END and every bare
+    // assembled row is preserved in order -- no deletion, no reordering.
+    const assembledMessages: AgentMessage[] = [
+      { role: "user", content: "earlier persisted turn" },
+      { role: "assistant", content: "earlier reply" },
+      { role: "user", content: "ok" },
+    ] as AgentMessage[];
+    const liveMessages: AgentMessage[] = [
+      { role: "user", content: decoratedMemoryFirstRaw("here is more context\nok") },
+    ] as AgentMessage[];
+
+    const result = appendUncoveredVolatileLiveInputsWithinBudget({
+      assembledMessages,
+      assembledEstimatedTokens: 10,
+      liveMessages,
+      tokenBudget: 1_000_000,
+    });
+
+    const userContents = result.messages
+      .filter((message) => (message as { role: string }).role === "user")
+      .map((message) => (message as { content: string }).content);
+    // Both bare rows present in original order; the decorated copy is LAST.
+    expect(userContents[0]).toBe("earlier persisted turn");
+    expect(userContents[1]).toBe("ok");
+    expect(userContents[userContents.length - 1]).toContain("<active_memory_plugin>");
+    expect(userContents[userContents.length - 1]).toContain("here is more context\nok");
+  });
 });
 
 describe("engine.assemble preserves webchat decoration + memory (no-preamble, memory-first path)", () => {

@@ -625,10 +625,22 @@ function liveContentCarriesRecognizedInjectedContextMarker(liveContent: string):
  * decorated live copy itself (equal length, never collapsed); the decoration
  * gate prevents collapsing an unrelated turn that merely ends with the same
  * trailing line.
+ *
+ * Injected-context markers are USER-FORGEABLE text: stripInjectedContextBlocks
+ * (compaction.ts) and DEFAULT_STRIP_INJECTED_CONTEXT_TAGS (db/config.ts) strip
+ * them from stored content precisely because a user (or a retrieved prompt-
+ * injection payload) can type them verbatim. So marker-based recognition is
+ * trusted ONLY when the candidate assembled row is the LAST assembled user row
+ * -- the genuine current turn's bare persisted face is necessarily the newest
+ * user row. This denies the forgeable-marker path any earlier row: a distinct
+ * live turn that merely ends with an EARLIER row's body can no longer be
+ * recognized via a typed marker. The channel-timestamp path is server-injected
+ * evidence and keeps its existing any-row matching.
  */
 function assembledRowIsStructuralBareCurrentTurn(params: {
   liveContent: string;
   assembledContent: string;
+  assembledIsLastUserRow: boolean;
 }): boolean {
   if (params.assembledContent === params.liveContent) {
     return false;
@@ -637,6 +649,7 @@ function assembledRowIsStructuralBareCurrentTurn(params: {
     return false;
   }
   if (
+    params.assembledIsLastUserRow &&
     liveContentCarriesRecognizedInjectedContextMarker(params.liveContent) &&
     liveContentContainsBareBody({
       liveContent: params.liveContent,
@@ -667,6 +680,20 @@ function resolveStructuralCurrentTurnLiveIndex(params: {
   assembledMessages: AgentMessage[];
   liveMessages: AgentMessage[];
 }): number | null {
+  // The genuine current turn's bare persisted face is necessarily the NEWEST
+  // assembled user row, so the forgeable marker path is constrained to it (see
+  // assembledRowIsStructuralBareCurrentTurn). Precompute that row's index once.
+  let lastAssembledUserIndex = -1;
+  for (
+    let assembledIndex = params.assembledMessages.length - 1;
+    assembledIndex >= 0;
+    assembledIndex--
+  ) {
+    if (toStoredMessage(params.assembledMessages[assembledIndex] as AgentMessage).role === "user") {
+      lastAssembledUserIndex = assembledIndex;
+      break;
+    }
+  }
   for (let liveIndex = params.liveMessages.length - 1; liveIndex >= 0; liveIndex--) {
     const stored = toStoredMessage(params.liveMessages[liveIndex] as AgentMessage);
     if (stored.role !== "user") {
@@ -675,8 +702,12 @@ function resolveStructuralCurrentTurnLiveIndex(params: {
     if (!stored.content.trim()) {
       return null;
     }
-    for (const assembledMessage of params.assembledMessages) {
-      const assembledStored = toStoredMessage(assembledMessage);
+    for (
+      let assembledIndex = 0;
+      assembledIndex < params.assembledMessages.length;
+      assembledIndex++
+    ) {
+      const assembledStored = toStoredMessage(params.assembledMessages[assembledIndex] as AgentMessage);
       if (assembledStored.role !== "user") {
         continue;
       }
@@ -684,6 +715,7 @@ function resolveStructuralCurrentTurnLiveIndex(params: {
         assembledRowIsStructuralBareCurrentTurn({
           liveContent: stored.content,
           assembledContent: assembledStored.content,
+          assembledIsLastUserRow: assembledIndex === lastAssembledUserIndex,
         })
       ) {
         return liveIndex;
