@@ -35,11 +35,7 @@ Most installations only need to override a handful of keys. If you want a comple
   "enabled": true,
   "databasePath": "/Users/alice/.openclaw/lcm.db",
   "largeFilesDir": "/Users/alice/.openclaw/lcm-files",
-  "ignoreSessionPatterns": [
-    "agent:*:cron:**",
-    "agent:*:**:active-memory:**",
-    "agent:*:dreaming-narrative-**"
-  ],
+  "ignoreSessionPatterns": [],
   "statelessSessionPatterns": [],
   "skipStatelessSessions": true,
   "contextThreshold": 0.75,
@@ -385,6 +381,8 @@ LCM_EXPANSION_MODEL=openai/gpt-5.4-mini
 - `**` matches anything, including `:`
 
 Cron scheduler keys (`agent:<agent>:cron:<job>...`) are isolated automatically when a new runtime `sessionId` reuses the same `sessionKey`. Configure `ignoreSessionPatterns` for cron only when the run should bypass LCM entirely; leave cron sessions included when they need in-run compaction. When OpenClaw exposes its runtime compaction delegate, `/compact` and overflow recovery for ignored sessions fall back to OpenClaw's built-in compaction path instead of LCM's summary DAG. Older hosts that do not expose that delegate keep the previous safe skip behavior.
+
+These examples are storage exclusions, not compaction preferences. Matching sessions do not create LCM conversation rows or store messages in LCM. The `agent:*:**:active-memory:**` pattern is intentionally broad because `**` spans colon-separated session-key segments, including channel or thread prefixes before `active-memory`.
 
 Example:
 

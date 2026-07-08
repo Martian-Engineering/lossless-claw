@@ -548,7 +548,19 @@ Why it matters:
 - keeps low-value automation or noisy sessions out of the DB
 - useful for excluding certain agent lanes or ephemeral traffic entirely
 - cron scheduler keys are already isolated per runtime run, so ignore them only when they should bypass LCM compaction
+- matching sessions do not create LCM conversation rows or store messages in LCM
+- `agent:*:**:active-memory:**` is intentionally broad for active-memory keys because `**` spans colon-separated session-key segments
 - ignored-session `/compact` calls use OpenClaw's built-in runtime compaction delegate when the host exposes it; older hosts keep the previous safe skip behavior
+
+Example:
+
+```json
+[
+  "agent:*:cron:**",
+  "agent:*:**:active-memory:**",
+  "agent:*:dreaming-narrative-**"
+]
+```
 
 ### `statelessSessionPatterns`
 

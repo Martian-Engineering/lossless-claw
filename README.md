@@ -217,6 +217,8 @@ Add a `lossless-claw` entry under `plugins.entries` in your OpenClaw config:
 }
 ```
 
+The `ignoreSessionPatterns` entries in this example are storage exclusions. Matching cron, active-memory, and dreaming narrative sessions do not create LCM conversation rows or store messages in LCM.
+
 `leafChunkTokens` controls how many source tokens can accumulate in a leaf compaction chunk before summarization is triggered. The default is `20000`, but quota-limited summary providers may benefit from a larger value to reduce compaction frequency. `summaryModel` and `summaryProvider` let you request a cheaper or faster compaction model through OpenClaw's `api.runtime.llm.complete` capability; OpenClaw still owns provider dispatch and auth. Explicit summary model requests require `llm.allowModelOverride` and matching `llm.allowedModels` policy entries for `lossless-claw`. `expansionModel` does the same for `lcm_expand_query` sub-agent calls (drilling into summaries to recover detail). `delegationTimeoutMs` controls how long `lcm_expand_query` waits for that delegated sub-agent to finish before returning a timeout error; it defaults to `120000` (120s). `summaryTimeoutMs` controls the per-call timeout for model-backed LCM summarization; it defaults to `60000` (60s). `summaryMaxCallsPerWindow`, `summaryCallWindowMs`, and `summarySpendBackoffMs` bound repeated non-auth summarization spend per session. When unset, the model settings still fall back to OpenClaw's configured default model/provider. See [Expansion model override requirements](#expansion-model-override-requirements) for the required `subagent` trust policy when using `expansionModel`.
 
 ### Environment variables
@@ -379,8 +381,12 @@ Pattern rules:
 Examples:
 
 - `agent:*:cron:**` excludes cron sessions for any agent when you want to bypass LCM entirely
+- `agent:*:**:active-memory:**` excludes active-memory sessions under nested channel or thread keys; the `**` segment is intentionally broad because it spans colon-separated session-key segments
+- `agent:*:dreaming-narrative-**` excludes dreaming narrative sessions for any agent
 - `agent:main:subagent:**` excludes all main-agent subagent sessions
 - `agent:ops:**` excludes every session under the `ops` agent id
+
+Treat these examples as storage exclusions. Matching sessions do not create LCM conversation rows or store messages in LCM, so use them only for lanes whose history can stay outside LCM.
 
 Environment variable example:
 
