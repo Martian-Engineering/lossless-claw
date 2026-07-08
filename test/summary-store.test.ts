@@ -359,6 +359,63 @@ describe("SummaryStore shallow-tree helpers", () => {
     }
   });
 
+  it("keeps fileIds constrained to the requested conversation scope", async () => {
+    const { conversationStore, summaryStore } = createStores();
+    const safeRoot = mkdtempSync(join(tmpdir(), "lcm-search-fileids-scope-"));
+    try {
+      const allowedConversation = await conversationStore.createConversation({
+        sessionId: "summary-store-fileids-scope-allowed",
+        title: "Summary store fileIds scope allowed",
+      });
+      const otherConversation = await conversationStore.createConversation({
+        sessionId: "summary-store-fileids-scope-other",
+        title: "Summary store fileIds scope other",
+      });
+      const allowedPath = join(safeRoot, "allowed.txt");
+      const otherPath = join(safeRoot, "other.txt");
+      writeFileSync(allowedPath, "allowed needle", "utf8");
+      writeFileSync(otherPath, "other needle", "utf8");
+
+      await summaryStore.insertLargeFile({
+        fileId: "file_allowed_scope",
+        conversationId: allowedConversation.conversationId,
+        fileName: "allowed.txt",
+        mimeType: "text/plain",
+        byteSize: Buffer.byteLength("allowed needle", "utf8"),
+        storageUri: allowedPath,
+      });
+      await summaryStore.insertLargeFile({
+        fileId: "file_other_scope",
+        conversationId: otherConversation.conversationId,
+        fileName: "other.txt",
+        mimeType: "text/plain",
+        byteSize: Buffer.byteLength("other needle", "utf8"),
+        storageUri: otherPath,
+      });
+
+      const scopedResults = await summaryStore.searchLargeFiles({
+        query: "needle",
+        mode: "regex",
+        conversationId: allowedConversation.conversationId,
+        fileIds: ["file_other_scope"],
+        largeFilesDir: safeRoot,
+      });
+      expect(scopedResults).toHaveLength(0);
+
+      const allConversationResults = await summaryStore.searchLargeFiles({
+        query: "needle",
+        mode: "regex",
+        allConversations: true,
+        fileIds: ["file_other_scope"],
+        largeFilesDir: safeRoot,
+      });
+      expect(allConversationResults).toHaveLength(1);
+      expect(allConversationResults[0].fileId).toBe("file_other_scope");
+    } finally {
+      rmSync(safeRoot, { recursive: true, force: true });
+    }
+  });
+
   it("respects maxBytesPerFile when searching large files", async () => {
     const { conversationStore, summaryStore } = createStores();
     const safeRoot = mkdtempSync(join(tmpdir(), "lcm-search-maxbytes-"));
@@ -396,6 +453,69 @@ describe("SummaryStore shallow-tree helpers", () => {
     }
   });
 
+  it("rejects unsafe regex patterns when searching large files", async () => {
+    const { conversationStore, summaryStore } = createStores();
+    const safeRoot = mkdtempSync(join(tmpdir(), "lcm-search-regex-guard-"));
+    try {
+      const conversation = await conversationStore.createConversation({
+        sessionId: "summary-store-search-regex-guard",
+        title: "Summary store search regex guard",
+      });
+      const content = "aaaaaaaaaaaaaaaaaaaaaaaa";
+      const payloadPath = join(safeRoot, "guard.txt");
+      writeFileSync(payloadPath, content, "utf8");
+
+      await summaryStore.insertLargeFile({
+        fileId: "file_regex_guard_12345",
+        conversationId: conversation.conversationId,
+        fileName: "guard.txt",
+        mimeType: "text/plain",
+        byteSize: Buffer.byteLength(content, "utf8"),
+        storageUri: payloadPath,
+      });
+
+      const nestedQuantifierResults = await summaryStore.searchLargeFiles({
+        query: "(a+)+",
+        mode: "regex",
+        conversationId: conversation.conversationId,
+        largeFilesDir: safeRoot,
+      });
+      expect(nestedQuantifierResults).toHaveLength(0);
+
+      const quantifiedAlternationResults = await summaryStore.searchLargeFiles({
+        query: "(a|aa)+$",
+        mode: "regex",
+        conversationId: conversation.conversationId,
+        largeFilesDir: safeRoot,
+      });
+      expect(quantifiedAlternationResults).toHaveLength(0);
+
+      const boundedNestedQuantifierResults = await summaryStore.searchLargeFiles({
+        query: "(a{1,2})+$",
+        mode: "regex",
+        conversationId: conversation.conversationId,
+        largeFilesDir: safeRoot,
+      });
+      expect(boundedNestedQuantifierResults).toHaveLength(0);
+
+      const safeResults = await summaryStore.searchLargeFiles({
+        query: "a+",
+        mode: "regex",
+        conversationId: conversation.conversationId,
+        largeFilesDir: safeRoot,
+      });
+      expect(safeResults).toHaveLength(1);
+      expect(safeResults[0]).toMatchObject({
+        fileId: "file_regex_guard_12345",
+        scannedBytes: Buffer.byteLength(content, "utf8"),
+        scanByteLimit: 512_000,
+        scanTruncated: false,
+      });
+    } finally {
+      rmSync(safeRoot, { recursive: true, force: true });
+    }
+  });
+
   it("skips non-text large files when searching contents", async () => {
     const { conversationStore, summaryStore } = createStores();
     const safeRoot = mkdtempSync(join(tmpdir(), "lcm-search-binary-"));
@@ -425,6 +545,41 @@ describe("SummaryStore shallow-tree helpers", () => {
       });
 
       expect(results).toHaveLength(0);
+    } finally {
+      rmSync(safeRoot, { recursive: true, force: true });
+    }
+  });
+
+  it("reports large file byteOffset as a UTF-8 byte offset", async () => {
+    const { conversationStore, summaryStore } = createStores();
+    const safeRoot = mkdtempSync(join(tmpdir(), "lcm-search-byte-offset-"));
+    try {
+      const conversation = await conversationStore.createConversation({
+        sessionId: "summary-store-byte-offset",
+        title: "Summary store byte offset",
+      });
+      const content = "πreamble\nneedle";
+      const payloadPath = join(safeRoot, "unicode.txt");
+      writeFileSync(payloadPath, content, "utf8");
+
+      await summaryStore.insertLargeFile({
+        fileId: "file_byte_offset_12345",
+        conversationId: conversation.conversationId,
+        fileName: "unicode.txt",
+        mimeType: "text/plain",
+        byteSize: Buffer.byteLength(content, "utf8"),
+        storageUri: payloadPath,
+      });
+
+      const results = await summaryStore.searchLargeFiles({
+        query: "needle",
+        mode: "regex",
+        conversationId: conversation.conversationId,
+        largeFilesDir: safeRoot,
+      });
+
+      expect(results).toHaveLength(1);
+      expect(results[0].byteOffset).toBe(Buffer.byteLength("πreamble\n", "utf8"));
     } finally {
       rmSync(safeRoot, { recursive: true, force: true });
     }
@@ -717,6 +872,43 @@ describe("SummaryStore shallow-tree helpers", () => {
 
       expect(result?.file?.content).toBe(content);
       expect(result?.file?.content).not.toContain("\uFFFD");
+    } finally {
+      rmSync(safeRoot, { recursive: true, force: true });
+    }
+  });
+
+  it("preserves a trailing multi-byte UTF-8 character in line-range reads", async () => {
+    const { conversationStore, summaryStore } = createStores();
+    const safeRoot = mkdtempSync(join(tmpdir(), "lcm-describe-range-trailing-utf8-"));
+    try {
+      const conversation = await conversationStore.createConversation({
+        sessionId: "summary-store-describe-range-trailing-utf8",
+        title: "Summary store describe range trailing utf8",
+      });
+      const content = "alpha\n中";
+      const payloadPath = join(safeRoot, "trailing-utf8.txt");
+      writeFileSync(payloadPath, content, "utf8");
+
+      await summaryStore.insertLargeFile({
+        fileId: "file_range_trailing_utf8",
+        conversationId: conversation.conversationId,
+        fileName: "trailing-utf8.txt",
+        mimeType: "text/plain",
+        byteSize: Buffer.byteLength(content, "utf8"),
+        lineCount: 2,
+        storageUri: payloadPath,
+        explorationSummary: "trailing utf8 boundary test",
+      });
+
+      const retrieval = new RetrievalEngine(conversationStore, summaryStore);
+      const result = await retrieval.describe("file_range_trailing_utf8", {
+        expandFile: true,
+        startLine: 1,
+        largeFilesDir: safeRoot,
+      });
+
+      expect(result?.file?.content).toBe(content);
+      expect(result?.file?.contentTruncated).toBe(false);
     } finally {
       rmSync(safeRoot, { recursive: true, force: true });
     }

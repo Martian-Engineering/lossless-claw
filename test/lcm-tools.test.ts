@@ -158,6 +158,12 @@ describe("LCM tools session scoping", () => {
     expect(patternDescription).toContain("FTS5 defaults to AND matching");
     expect(patternDescription).toContain("prefer 1-3 distinctive terms or one quoted multi-word phrase");
     expect(patternDescription).toContain("Regex syntax such as alternation (`A|B`) requires regex mode");
+    const scopeDescription = (
+      tool.parameters as {
+        properties: Record<string, { description?: string }>;
+      }
+    ).properties.scope?.description;
+    expect(scopeDescription).toContain("bounded prefix of externalized large file contents");
   });
 
   it("lcm_grep rejects regex alternation in full-text mode before searching", async () => {
@@ -350,6 +356,84 @@ describe("LCM tools session scoping", () => {
     );
     const text = (result.content[0] as { text: string }).text;
     expect(text).toContain("**Mode:** full_text | **Scope:** both | **Sort:** relevance");
+  });
+
+  it("lcm_grep reports the bounded file scan contract for scope=files", async () => {
+    const retrieval = {
+      grep: vi.fn(async () => ({
+        messages: [],
+        summaries: [],
+        files: [
+          {
+            fileId: "file_abc123",
+            conversationId: 42,
+            fileName: "large.log",
+            matchedText: "NEEDLE",
+            lineNumber: 12,
+            byteOffset: 345,
+            snippet: "before NEEDLE after",
+            scannedBytes: 512_000,
+            scanByteLimit: 512_000,
+            scanTruncated: true,
+            createdAt: new Date("2026-01-02T00:00:00.000Z"),
+          },
+        ],
+        totalMatches: 1,
+      })),
+      expand: vi.fn(),
+      describe: vi.fn(),
+    };
+
+    const tool = createLcmGrepTool({
+      deps: makeDeps(),
+      lcm: buildLcmEngine({ retrieval, conversationId: 42 }) as never,
+      sessionId: "session-1",
+    });
+    const result = await tool.execute("call-files", {
+      pattern: "NEEDLE",
+      scope: "files",
+      fileIds: ["file_abc123"],
+    });
+
+    expect(retrieval.grep).toHaveBeenCalledWith(
+      expect.objectContaining({
+        scope: "files",
+        fileIds: ["file_abc123"],
+      }),
+    );
+    const text = (result.content[0] as { text: string }).text;
+    expect(text).toContain("**File scan:** first 512,000 bytes per file");
+    expect(text).toContain("matches beyond that prefix are not searched");
+    expect(text).toContain("file scan truncated");
+    expect(result.details).toMatchObject({
+      fileCount: 1,
+      fileScanByteLimit: 512_000,
+    });
+  });
+
+  it("lcm_describe rejects inverted file line ranges before retrieval", async () => {
+    const retrieval = {
+      grep: vi.fn(),
+      expand: vi.fn(),
+      describe: vi.fn(),
+    };
+
+    const tool = createLcmDescribeTool({
+      deps: makeDeps(),
+      lcm: buildLcmEngine({ retrieval, conversationId: 42 }) as never,
+      sessionId: "session-1",
+    });
+    const result = await tool.execute("call-describe-range", {
+      id: "file_abc123",
+      expandFile: true,
+      startLine: 20,
+      endLine: 10,
+    });
+
+    expect(retrieval.describe).not.toHaveBeenCalled();
+    expect((result.details as { error?: string }).error).toContain(
+      "`endLine` must be greater than or equal to `startLine`",
+    );
   });
 
   it("lcm_grep resolves conversation scope via sessionKey continuity before sessionId lookup", async () => {

@@ -8,7 +8,7 @@ LCM provides four tools for agents to search, inspect, and recall information fr
 
 Most recall tasks follow this escalation:
 
-1. **`lcm_grep`** — Find relevant summaries or messages by keyword/regex
+1. **`lcm_grep`** — Find relevant summaries, messages, or externalized file prefixes by keyword/regex
 2. **`lcm_describe`** — Inspect a specific summary's full content (cheap, no sub-agent)
 3. **`lcm_expand_query`** — Deep recall: spawn a sub-agent to expand the DAG and answer a focused question
 
@@ -30,7 +30,7 @@ Summaries are lossy by design. The "Expand for details about:" footer at the end
 
 ### lcm_grep
 
-Search across messages and/or summaries using regex or full-text search.
+Search across messages, summaries, and/or the bounded prefix of externalized large files using regex or full-text search.
 
 Use `mode: "full_text"` for keyword or topical recall. Full-text queries are not regexes: alternation (`A|B`), regex wildcards (`.*`), character classes (`[abc]`), and anchors (`^foo`, `foo$`) require `mode: "regex"`. Wrap exact multi-word phrases in quotes to preserve phrase matching. Keep the default `sort: "recency"` for recent events, switch to `sort: "relevance"` when looking for the best older match on a topic, and use `sort: "hybrid"` when you want relevance without giving up recency entirely.
 
@@ -40,7 +40,8 @@ Use `mode: "full_text"` for keyword or topical recall. Full-text queries are not
 |-------|------|----------|---------|-------------|
 | `pattern` | string | ✅ | — | Search pattern |
 | `mode` | string | | `"regex"` | `"regex"` or `"full_text"` |
-| `scope` | string | | `"both"` | `"messages"`, `"summaries"`, or `"both"` |
+| `scope` | string | | `"both"` | `"messages"`, `"summaries"`, `"both"`, or `"files"` |
+| `fileIds` | string[] | | — | Optional `file_xxx` IDs to restrict `scope: "files"` searches |
 | `conversationId` | number | | current session family | Specific physical conversation to search |
 | `allConversations` | boolean | | `false` | Search all conversations |
 | `since` | string | | — | ISO timestamp lower bound |
@@ -49,12 +50,13 @@ Use `mode: "full_text"` for keyword or topical recall. Full-text queries are not
 | `sort` | string | | `"recency"` | `"recency"`, `"relevance"`, or `"hybrid"` for full-text ranking |
 
 **Returns:** Array of matches with:
-- `id` — Message or summary ID
-- `type` — `"message"` or `"summary"`
+- `id` — Message, summary, or file ID
+- `type` — `"message"`, `"summary"`, or `"file"`
 - `snippet` — Truncated content around the match
 - `conversationId` — Which conversation
 - `createdAt` — Timestamp
 - For summaries: `depth`, `kind`, `summaryId`
+- For files: line number, byte offset, matched text, and a snippet from the first 512,000 bytes scanned per file
 
 **Examples:**
 
@@ -70,6 +72,9 @@ lcm_grep(pattern: "config\\.threshold.*0\\.[0-9]+", scope: "summaries")
 
 # Recent messages containing a specific term
 lcm_grep(pattern: "deployment", since: "2026-02-19T00:00:00Z", scope: "messages")
+
+# Search the bounded scanned prefix of an externalized file
+lcm_grep(pattern: "CRITICAL_MARKER", scope: "files", fileIds: ["file_789abc012345"])
 ```
 
 ### lcm_describe
@@ -95,7 +100,7 @@ Look up metadata and content for a specific summary or stored file.
 - File IDs referenced in the summary
 
 **Returns for files:**
-- File content (full text)
+- File content, capped by `expandFileMaxBytes`
 - Metadata: fileName, mimeType, byteSize
 - Exploration summary
 - Storage path

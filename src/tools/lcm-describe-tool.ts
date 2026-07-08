@@ -55,8 +55,8 @@ const LcmDescribeSchema = Type.Object({
         "the original output of an elided tool result that was replaced with a " +
         "[LCM Tool Output: file_xxx | tool=… | N bytes] reference. Capped at " +
         "expandFileMaxBytes (default 32768 = ~8K tokens). Returns content + " +
-        "contentTruncated boolean. Use lcm_grep(scope='files', fileIds=[file_xxx]) to " +
-        "search the full file content when it exceeds the cap.",
+        "contentTruncated boolean. Use lcm_grep(scope='files', fileIds=[file_xxx]) " +
+        "to search the bounded file prefix when it exceeds the cap.",
     }),
   ),
   expandFileMaxBytes: Type.Optional(
@@ -139,7 +139,7 @@ export function createLcmDescribeTool(input: {
       "for context efficiency. Call lcm_describe(id=file_xxx, expandFile=true) to " +
       "fetch the original output content before answering questions that depend on " +
       "its specifics. If the inlined content is truncated, use lcm_grep(scope='files', " +
-      "fileIds=[file_xxx]) to search the full file content.",
+      "fileIds=[file_xxx]) to search the bounded file prefix.",
     parameters: LcmDescribeSchema,
     async execute(_toolCallId, params) {
       const lcm = input.lcm ?? (await input.getLcm?.());
@@ -183,6 +183,9 @@ export function createLcmDescribeTool(input: {
         typeof p.startLine === "number" && Number.isFinite(p.startLine) ? p.startLine : undefined;
       const endLine =
         typeof p.endLine === "number" && Number.isFinite(p.endLine) ? p.endLine : undefined;
+      if (startLine != null && endLine != null && endLine < startLine) {
+        return jsonResult({ error: "`endLine` must be greater than or equal to `startLine`." });
+      }
       const result = await retrieval.describe(id, {
         expandFile,
         expandFileMaxBytes,
@@ -356,7 +359,7 @@ export function createLcmDescribeTool(input: {
             lines.push("");
             lines.push(
               `*Output truncated to ${f.content.length.toLocaleString()} of ${f.byteSize?.toLocaleString() ?? "?"} bytes. ` +
-                `Use lcm_grep(scope='files', fileIds=['${result.id}']) to search the full content.*`,
+                `Use lcm_grep(scope='files', fileIds=['${result.id}']) to search the bounded file prefix.*`,
             );
           }
         } else if (expandFile) {

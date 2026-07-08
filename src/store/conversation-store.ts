@@ -7,6 +7,7 @@ import { buildLikeSearchPlan, containsCjk, createFallbackSnippet } from "./full-
 import { buildMessageIdentityHash } from "./message-identity.js";
 import { parseUtcTimestamp, parseUtcTimestampOrNull } from "./parse-utc-timestamp.js";
 import { buildFtsOrderBy, type SearchSort } from "./full-text-sort.js";
+import { compileSafeSearchRegex } from "./search-regex.js";
 
 export type ConversationId = number;
 export type MessageId = number;
@@ -1670,14 +1671,8 @@ export class ConversationStore {
     before?: Date,
   ): MessageSearchResult[] {
     // SQLite has no native POSIX regex; fetch candidates and filter in JS
-    // Guard against ReDoS: reject patterns with nested quantifiers or excessive length
-    if (pattern.length > 500 || /(\+|\*|\?)\)(\+|\*|\?|\{\d)/.test(pattern)) {
-      return [];
-    }
-    let re: RegExp;
-    try {
-      re = new RegExp(pattern);
-    } catch {
+    const re = compileSafeSearchRegex(pattern);
+    if (!re) {
       return [];
     }
 

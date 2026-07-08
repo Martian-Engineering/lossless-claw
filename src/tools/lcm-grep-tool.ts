@@ -5,6 +5,7 @@ import type { AnyAgentTool } from "./common.js";
 import { jsonResult } from "./common.js";
 import { parseIsoTimestampParam, resolveLcmConversationScope } from "./lcm-conversation-scope.js";
 import { formatTimestamp } from "../compaction.js";
+import { DEFAULT_LARGE_FILE_SEARCH_MAX_BYTES } from "../store/summary-store.js";
 
 const MAX_RESULT_CHARS = 40_000; // ~10k tokens
 
@@ -37,14 +38,14 @@ const LcmGrepSchema = Type.Object({
   scope: Type.Optional(
     Type.String({
       description:
-        'What to search: "messages" for raw messages, "summaries" for compacted summaries, "both" for all, or "files" for externalized large file contents. Default: "both".',
+        'What to search: "messages" for raw messages, "summaries" for compacted summaries, "both" for all, or "files" for the bounded prefix of externalized large file contents. Default: "both".',
       enum: ["messages", "summaries", "both", "files"],
     }),
   ),
   fileIds: Type.Optional(
     Type.Array(Type.String(), {
       description:
-        'Optional list of file_xxx IDs to restrict the search to when scope="files". If omitted, all large files in the conversation scope are searched.',
+        'Optional list of file_xxx IDs to restrict the search to when scope="files". If omitted, large files in the conversation scope are searched, scanning up to 512000 bytes per file.',
     }),
   ),
   conversationId: Type.Optional(
@@ -164,9 +165,9 @@ export function createLcmGrepTool(input: {
     label: "LCM Grep",
     description:
       "Search compacted conversation history or externalized file contents using regex or full-text search. " +
-      "Searches across messages, summaries, and/or large files stored by LCM. " +
+      "Searches across messages, summaries, and/or a bounded prefix of large files stored by LCM. " +
       "Use this to find specific content that may have been compacted away from " +
-      "active context, or to search within the full content of externalized files " +
+      "active context, or to search within the first 512000 bytes of externalized files " +
       "(scope='files') when a previous lcm_describe result was truncated. " +
       "In full_text mode, queries use FTS5 AND semantics by default, so keep them short and focused; quoted phrases stay intact and optional sort modes can prioritize relevance for older topics. Returns matching snippets with their summary/message/file IDs " +
       "for follow-up with lcm_expand or lcm_describe.",
@@ -266,6 +267,11 @@ export function createLcmGrepTool(input: {
           }`,
         );
       }
+      if (scope === "files") {
+        lines.push(
+          `**File scan:** first ${DEFAULT_LARGE_FILE_SEARCH_MAX_BYTES.toLocaleString()} bytes per file; matches beyond that prefix are not searched.`,
+        );
+      }
       lines.push(`**Total matches:** ${result.totalMatches}`);
       lines.push("");
 
@@ -311,7 +317,8 @@ export function createLcmGrepTool(input: {
         for (const file of files) {
           const snippet = truncateSnippet(file.snippet);
           const nameSuffix = file.fileName ? ` (${file.fileName})` : "";
-          const line = `- [conv=${file.conversationId} ${file.fileId}${nameSuffix}] line ${file.lineNumber}, offset ${file.byteOffset}: \`${file.matchedText}\` ${snippet}`;
+          const truncationSuffix = file.scanTruncated ? " (file scan truncated)" : "";
+          const line = `- [conv=${file.conversationId} ${file.fileId}${nameSuffix}] line ${file.lineNumber}, offset ${file.byteOffset}: \`${file.matchedText}\` ${snippet}${truncationSuffix}`;
           if (currentChars + line.length > MAX_RESULT_CHARS) {
             lines.push("*(truncated — more results available)*");
             break;
@@ -332,6 +339,9 @@ export function createLcmGrepTool(input: {
           messageCount: result.messages.length,
           summaryCount: result.summaries.length,
           fileCount: files.length,
+          ...(scope === "files"
+            ? { fileScanByteLimit: DEFAULT_LARGE_FILE_SEARCH_MAX_BYTES }
+            : {}),
           totalMatches: result.totalMatches,
         },
       };

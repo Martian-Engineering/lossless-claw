@@ -7,6 +7,7 @@ import { sanitizeFts5Query } from "./fts5-sanitize.js";
 import { buildLikeSearchPlan, containsCjk, createFallbackSnippet } from "./full-text-fallback.js";
 import { parseUtcTimestamp, parseUtcTimestampOrNull } from "./parse-utc-timestamp.js";
 import { buildFtsOrderBy, type SearchSort } from "./full-text-sort.js";
+import { compileSafeSearchRegex } from "./search-regex.js";
 
 export type SummaryKind = "leaf" | "condensed";
 export type ContextItemType = "message" | "summary";
@@ -136,6 +137,8 @@ export type LargeFileSearchInput = {
   allConversations?: boolean;
 };
 
+export const DEFAULT_LARGE_FILE_SEARCH_MAX_BYTES = 512_000;
+
 export type LargeFileSearchResult = {
   fileId: string;
   conversationId: number;
@@ -148,6 +151,12 @@ export type LargeFileSearchResult = {
   byteOffset: number;
   /** Snippet with surrounding context. */
   snippet: string;
+  /** Number of bytes scanned from the file for this match. */
+  scannedBytes: number;
+  /** Maximum bytes searched per file for this scan. */
+  scanByteLimit: number;
+  /** True when the file had content beyond the scanned prefix. */
+  scanTruncated: boolean;
   createdAt: Date;
 };
 
@@ -405,20 +414,19 @@ interface FileContentMatch {
 }
 
 function findRegexMatches(content: string, pattern: string, maxMatches: number): FileContentMatch[] {
-  try {
-    const regex = new RegExp(pattern, "g");
-    const matches: FileContentMatch[] = [];
-    let match;
-    while ((match = regex.exec(content)) !== null && matches.length < maxMatches) {
-      matches.push({ index: match.index, length: match[0].length, text: match[0] });
-      if (match.index === regex.lastIndex) {
-        regex.lastIndex++;
-      }
-    }
-    return matches;
-  } catch {
+  const regex = compileSafeSearchRegex(pattern, "g");
+  if (!regex) {
     return [];
   }
+  const matches: FileContentMatch[] = [];
+  let match;
+  while ((match = regex.exec(content)) !== null && matches.length < maxMatches) {
+    matches.push({ index: match.index, length: match[0].length, text: match[0] });
+    if (match.index === regex.lastIndex) {
+      regex.lastIndex++;
+    }
+  }
+  return matches;
 }
 
 function findFullTextMatches(content: string, query: string, maxMatches: number): FileContentMatch[] {
@@ -508,6 +516,10 @@ function createSearchSnippet(content: string, index: number, length: number): st
     snippet = snippet + "...";
   }
   return snippet;
+}
+
+function byteOffsetAt(content: string, index: number): number {
+  return Buffer.byteLength(content.slice(0, index), "utf8");
 }
 
 function toConversationBootstrapStateRecord(
@@ -1623,14 +1635,8 @@ export class SummaryStore {
     since?: Date,
     before?: Date,
   ): SummarySearchResult[] {
-    // Guard against ReDoS: reject patterns with nested quantifiers or excessive length
-    if (pattern.length > 500 || /(\+|\*|\?)\)(\+|\*|\?|\{\d)/.test(pattern)) {
-      return [];
-    }
-    let re: RegExp;
-    try {
-      re = new RegExp(pattern);
-    } catch {
+    const re = compileSafeSearchRegex(pattern);
+    if (!re) {
       return [];
     }
 
@@ -1756,7 +1762,10 @@ export class SummaryStore {
    */
   async searchLargeFiles(input: LargeFileSearchInput): Promise<LargeFileSearchResult[]> {
     const limit = input.limit ?? 50;
-    const maxBytesPerFile = input.maxBytesPerFile ?? 512_000;
+    const requestedMaxBytes = input.maxBytesPerFile ?? DEFAULT_LARGE_FILE_SEARCH_MAX_BYTES;
+    const maxBytesPerFile = Number.isFinite(requestedMaxBytes)
+      ? Math.max(0, Math.trunc(requestedMaxBytes))
+      : DEFAULT_LARGE_FILE_SEARCH_MAX_BYTES;
     const maxMatchesPerFile = 10;
 
     let files: LargeFileRecord[] = [];
@@ -1784,6 +1793,12 @@ export class SummaryStore {
     if (input.before) {
       files = files.filter((f) => f.createdAt.getTime() < input.before!.getTime());
     }
+    if (input.conversationIds && input.conversationIds.length > 0) {
+      const conversationIds = new Set(input.conversationIds);
+      files = files.filter((f) => conversationIds.has(f.conversationId));
+    } else if (input.conversationId != null) {
+      files = files.filter((f) => f.conversationId === input.conversationId);
+    }
 
     const results: LargeFileSearchResult[] = [];
     for (const file of files) {
@@ -1794,13 +1809,14 @@ export class SummaryStore {
         continue;
       }
 
-      const content = await this.readValidatedLargeFileContentUpTo(file.storageUri, {
+      const readResult = await this.readValidatedLargeFileContentUpTo(file.storageUri, {
         largeFilesDir: input.largeFilesDir,
         maxBytes: maxBytesPerFile,
       });
-      if (content == null) {
+      if (readResult == null) {
         continue;
       }
+      const { content, scannedBytes, scanTruncated } = readResult;
 
       const matches =
         input.mode === "regex"
@@ -1817,8 +1833,11 @@ export class SummaryStore {
           fileName: file.fileName,
           matchedText: match.text,
           lineNumber: lineNumberAt(content, match.index),
-          byteOffset: match.index,
+          byteOffset: byteOffsetAt(content, match.index),
           snippet: createSearchSnippet(content, match.index, match.length),
+          scannedBytes,
+          scanByteLimit: maxBytesPerFile,
+          scanTruncated,
           createdAt: file.createdAt,
         });
       }
@@ -1958,7 +1977,7 @@ export class SummaryStore {
   private async readValidatedLargeFileContentUpTo(
     storageUri: string,
     options: LargeFileReadOptions,
-  ): Promise<string | null> {
+  ): Promise<{ content: string; scannedBytes: number; scanTruncated: boolean } | null> {
     try {
       const file = await this.openValidatedLargeFile(storageUri, options);
       if (!file) {
@@ -1970,9 +1989,21 @@ export class SummaryStore {
           return null;
         }
         const maxBytes = options.maxBytes ?? stats.size;
-        const buffer = Buffer.alloc(Math.min(maxBytes, stats.size));
-        const { bytesRead } = await file.read(buffer, 0, buffer.length, 0);
-        return buffer.subarray(0, bytesRead).toString("utf8");
+        const readLimit = Math.min(maxBytes, stats.size);
+        const buffer = Buffer.alloc(readLimit);
+        let bytesRead = 0;
+        while (bytesRead < buffer.length) {
+          const result = await file.read(buffer, bytesRead, buffer.length - bytesRead, bytesRead);
+          if (result.bytesRead === 0) {
+            break;
+          }
+          bytesRead += result.bytesRead;
+        }
+        return {
+          content: buffer.subarray(0, bytesRead).toString("utf8"),
+          scannedBytes: bytesRead,
+          scanTruncated: bytesRead < stats.size,
+        };
       } finally {
         await file.close().catch(() => undefined);
       }

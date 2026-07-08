@@ -195,7 +195,7 @@ Files embedded in user messages (typically via `<file>` blocks from tool output)
    - Generate a ~200 token exploration summary (structural analysis, key sections, etc.)
    - Insert a `large_files` record with metadata
    - Replace the file block in the message with a compact reference
-3. The `lcm_describe` tool can retrieve full file content by ID.
+3. The `lcm_describe` tool can retrieve bounded file content by ID, and `lcm_grep(scope="files")` can search the first 512,000 bytes of externalized text files.
 
 This prevents a single large file paste from consuming the entire context window while keeping the content accessible.
 

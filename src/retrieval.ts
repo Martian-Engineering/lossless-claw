@@ -529,6 +529,7 @@ function truncateToValidUtf8End(buf: Buffer, byteLength: number): number {
         -1; // invalid leading pattern
       if (continuationBytes === expectedContinuations) {
         // The multi-byte character is fully inside the buffer.
+        safeEnd = byteLength;
         break;
       }
       // Incomplete sequence: drop the start byte and everything after it.
