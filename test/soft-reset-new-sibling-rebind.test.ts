@@ -9,13 +9,13 @@
  * a stale session key whose tracked transcript had vanished and destructively
  * archived the pruned conversation, stranding the retained summaries.
  *
- * Fix under test: when the tracked transcript is missing but an on-disk archive
- * sibling (`.reset.`/`.deleted.`) proves it was deliberately archived, the
- * destructive guard stands down and the existing ambiguous-rollover path
- * rebinds the same conversation under its freshness gate — preserving the
- * retained summaries and re-anchoring to the NEW session file. A genuine loss
- * with no sibling still archives; a foreign reused-key transcript still fails
- * the freshness gate and is never merged.
+ * Fix under test: when Lossless recorded a /new prune and the tracked transcript
+ * is missing with a `.reset.` archive sibling, the destructive guard stands down
+ * and the existing ambiguous-rollover path rebinds the same conversation under
+ * its freshness gate — preserving the retained summaries and re-anchoring to
+ * the NEW session file. A genuine loss with no sibling still archives; a bare
+ * suffix without Lossless's /new marker still archives; a foreign reused-key
+ * transcript still fails the freshness gate and is never merged.
  */
 import { mkdtempSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -261,7 +261,7 @@ describe("/new soft-reset carry-forward via archive-sibling probe", () => {
 
     // Destructive guard stood down; the ambiguous path rebound the lane.
     expect(log.info).toHaveBeenCalledWith(
-      expect.stringContaining("tracked transcript archived (reset/deleted sibling present)"),
+      expect.stringContaining("tracked transcript archived after /new (reset sibling present)"),
     );
     expect(log.info).toHaveBeenCalledWith(
       expect.stringContaining("resolved by fresh-transcript rebind"),
@@ -288,6 +288,7 @@ describe("/new soft-reset carry-forward via archive-sibling probe", () => {
       .getSummaryStore()
       .getConversationBootstrapState(lane.conversationId);
     expect(bootstrapState?.sessionFilePath).toBe(newSessionFile);
+    expect(bootstrapState?.softResetPrunedAt).toBeNull();
   });
 
   it("still archives and creates a replacement when the transcript is genuinely lost (no sibling)", async () => {
@@ -308,7 +309,7 @@ describe("/new soft-reset carry-forward via archive-sibling probe", () => {
       expect.stringContaining("detected reset/rollover without prior lifecycle split"),
     );
     expect(log.info).not.toHaveBeenCalledWith(
-      expect.stringContaining("tracked transcript archived (reset/deleted sibling present)"),
+      expect.stringContaining("tracked transcript archived after /new (reset sibling present)"),
     );
 
     const original = await engine.getConversationStore().getConversation(lane.conversationId);
@@ -321,6 +322,11 @@ describe("/new soft-reset carry-forward via archive-sibling probe", () => {
   it("does NOT merge a foreign reused-key transcript even with a sibling (freshness gate holds)", async () => {
     const { engine, log, db } = createEngine({ newSessionRetainDepth: 2 });
     const lane = await seedSummaryBearingLane(engine, db);
+    await engine.handleBeforeReset({
+      reason: "new",
+      sessionId: OLD_SESSION_ID,
+      sessionKey: SESSION_KEY,
+    });
     archiveTrackedFile(lane.trackedFile, "reset");
 
     // The "new" transcript overlaps the lane's own persisted history, so it is
@@ -342,7 +348,7 @@ describe("/new soft-reset carry-forward via archive-sibling probe", () => {
 
     // Guard stood down (sibling), but the freshness gate refused the merge.
     expect(log.info).toHaveBeenCalledWith(
-      expect.stringContaining("tracked transcript archived (reset/deleted sibling present)"),
+      expect.stringContaining("tracked transcript archived after /new (reset sibling present)"),
     );
     expect(result.bootstrapped).toBe(false);
     expect(result.reason).toBe("ambiguous session-key runtime rollover");
@@ -364,7 +370,7 @@ describe("/new soft-reset carry-forward via archive-sibling probe", () => {
     expect(conversation?.sessionId).toBe(OLD_SESSION_ID);
   });
 
-  it("treats a .deleted. archive sibling the same as a .reset. sibling (stands down + rebinds)", async () => {
+  it("does not treat a .deleted. archive sibling as /new continuity proof", async () => {
     const { engine, log, db } = createEngine({ newSessionRetainDepth: 2 });
     const lane = await seedSummaryBearingLane(engine, db);
 
@@ -382,20 +388,46 @@ describe("/new soft-reset carry-forward via archive-sibling probe", () => {
       sessionFile: newSessionFile,
     });
 
-    expect(log.info).toHaveBeenCalledWith(
-      expect.stringContaining("tracked transcript archived (reset/deleted sibling present)"),
+    expect(log.info).not.toHaveBeenCalledWith(
+      expect.stringContaining("tracked transcript archived after /new (reset sibling present)"),
     );
-    expect(log.info).toHaveBeenCalledWith(
-      expect.stringContaining("resolved by fresh-transcript rebind"),
-    );
-    expect(log.warn).not.toHaveBeenCalledWith(
+    expect(log.warn).toHaveBeenCalledWith(
       expect.stringContaining("detected reset/rollover without prior lifecycle split"),
     );
-    const rebound = await engine.getConversationStore().getConversationBySessionKey(SESSION_KEY);
-    expect(rebound?.conversationId).toBe(lane.conversationId);
-    expect(rebound?.sessionId).toBe(NEW_SESSION_ID);
-    const carried = await engine.getSummaryStore().getContextItems(lane.conversationId);
-    expect(carried.map((item) => item.summaryId)).toContain("sum_d2");
+    expect(log.info).not.toHaveBeenCalledWith(
+      expect.stringContaining("resolved by fresh-transcript rebind"),
+    );
+    const original = await engine.getConversationStore().getConversation(lane.conversationId);
+    expect(original?.active).toBe(false);
+    const active = await engine.getConversationStore().getConversationBySessionKey(SESSION_KEY);
+    expect(active?.conversationId).not.toBe(lane.conversationId);
+    expect(active?.sessionId).toBe(NEW_SESSION_ID);
+  });
+
+  it("does not treat a bare .reset. sibling as continuity proof without the /new marker", async () => {
+    const { engine, log, db } = createEngine({ newSessionRetainDepth: 2 });
+    const lane = await seedSummaryBearingLane(engine, db);
+
+    archiveTrackedFile(lane.trackedFile, "reset");
+    const newSessionFile = writeRolledTranscript({ name: NEW_SESSION_ID, entries: freshEntries() });
+
+    await engine.bootstrap({
+      sessionId: NEW_SESSION_ID,
+      sessionKey: SESSION_KEY,
+      sessionFile: newSessionFile,
+    });
+
+    expect(log.info).not.toHaveBeenCalledWith(
+      expect.stringContaining("tracked transcript archived after /new (reset sibling present)"),
+    );
+    expect(log.warn).toHaveBeenCalledWith(
+      expect.stringContaining("detected reset/rollover without prior lifecycle split"),
+    );
+    const original = await engine.getConversationStore().getConversation(lane.conversationId);
+    expect(original?.active).toBe(false);
+    const active = await engine.getConversationStore().getConversationBySessionKey(SESSION_KEY);
+    expect(active?.conversationId).not.toBe(lane.conversationId);
+    expect(active?.sessionId).toBe(NEW_SESSION_ID);
   });
 
   it("a legit single /new is silent: bootstrap preserves at debug while unjudgeable, afterTurn rebinds once the turn lands", async () => {
