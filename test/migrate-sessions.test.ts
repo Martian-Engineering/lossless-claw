@@ -262,15 +262,88 @@ describe("runSessionMigration", () => {
       expect(await reopened.conversationStore.getMessageCount(conversation!.conversationId)).toBe(2);
       const rows = reopened.db
         .prepare(
-          `SELECT content, transcript_entry_id
-           FROM messages
-           WHERE conversation_id = ?
-           ORDER BY seq`,
+          `SELECT m.content, m.transcript_entry_id, trust.trust_state, trust.reason
+           FROM messages AS m
+           LEFT JOIN message_transcript_anchor_trust AS trust
+             ON trust.message_id = m.message_id
+           WHERE m.conversation_id = ?
+           ORDER BY m.seq`,
         )
-        .all(conversation!.conversationId) as Array<{ content: string; transcript_entry_id: string | null }>;
+        .all(conversation!.conversationId) as Array<{
+        content: string;
+        transcript_entry_id: string | null;
+        trust_state: string | null;
+        reason: string | null;
+      }>;
       expect(rows).toEqual([
-        { content: "already persisted", transcript_entry_id: "m1" },
-        { content: "existing reply", transcript_entry_id: "m2" },
+        {
+          content: "already persisted",
+          transcript_entry_id: "m1",
+          trust_state: "repaired",
+          reason: "identity-matched non-empty transcript migration",
+        },
+        {
+          content: "existing reply",
+          transcript_entry_id: "m2",
+          trust_state: "repaired",
+          reason: "identity-matched non-empty transcript migration",
+        },
+      ]);
+    } finally {
+      closeLcmConnection(reopened.db);
+    }
+  });
+
+  it("does not weakly adopt blank assistant transcript ids onto existing rows", async () => {
+    const root = tempRoot();
+    writeAgentSession(root, "session-a.jsonl", [
+      sessionHeader("session-a"),
+      messageEntry("m1", null, "assistant", ""),
+    ]);
+    const dbPath = migratedDb(root);
+    const { db, conversationStore } = openMigratedDb(dbPath);
+    try {
+      const conversation = await conversationStore.getOrCreateConversation("session-a");
+      await conversationStore.createMessage({
+        conversationId: conversation.conversationId,
+        seq: 1,
+        role: "assistant",
+        content: "",
+        tokenCount: 0,
+      });
+    } finally {
+      closeLcmConnection(db);
+    }
+
+    const result = await runSessionMigration({ dbPath, stateDir: root, apply: true });
+
+    expect(result.importedMessages).toBe(1);
+    expect(result.files[0]).toMatchObject({
+      status: "imported",
+      importedMessages: 1,
+      skippedMessages: 0,
+    });
+
+    const reopened = openMigratedDb(dbPath);
+    try {
+      const conversation = await reopened.conversationStore.getConversationForSession({ sessionId: "session-a" });
+      const rows = reopened.db
+        .prepare(
+          `SELECT m.content, m.transcript_entry_id, trust.trust_state
+           FROM messages AS m
+           LEFT JOIN message_transcript_anchor_trust AS trust
+             ON trust.message_id = m.message_id
+           WHERE m.conversation_id = ?
+           ORDER BY m.seq`,
+        )
+        .all(conversation!.conversationId) as Array<{
+        content: string;
+        transcript_entry_id: string | null;
+        trust_state: string | null;
+      }>;
+      expect(rows).toEqual([
+        { content: "", transcript_entry_id: null, trust_state: null },
+        { content: "", transcript_entry_id: "m1", trust_state: "verified" },
       ]);
     } finally {
       closeLcmConnection(reopened.db);

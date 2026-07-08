@@ -392,6 +392,50 @@ function ensureMessageTranscriptEntryIdColumn(db: DatabaseSync): void {
   }
 }
 
+// Creates the durable trust boundary used by SQLite transcript migration.
+// Existing message transcript ids remain data, not trusted anchors, until a
+// later audit writes an explicit trust row or conversation epoch.
+function ensureTranscriptAnchorTrustTables(db: DatabaseSync): void {
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS message_transcript_anchor_trust (
+      message_id INTEGER PRIMARY KEY REFERENCES messages(message_id) ON DELETE CASCADE,
+      conversation_id INTEGER NOT NULL REFERENCES conversations(conversation_id) ON DELETE CASCADE,
+      transcript_entry_id TEXT,
+      trust_state TEXT NOT NULL CHECK (trust_state IN (
+        'verified', 'repaired', 'suspect', 'legacy_prefix', 'unproven'
+      )),
+      source TEXT NOT NULL,
+      reason TEXT,
+      verified_at TEXT,
+      created_at TEXT NOT NULL DEFAULT (datetime('now')),
+      updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+    );
+
+    CREATE TABLE IF NOT EXISTS conversation_transcript_epochs (
+      conversation_id INTEGER PRIMARY KEY REFERENCES conversations(conversation_id) ON DELETE CASCADE,
+      session_id TEXT NOT NULL,
+      session_key TEXT,
+      frontier_entry_id TEXT,
+      frontier_seq INTEGER,
+      frontier_created_at TEXT,
+      migration_mode TEXT NOT NULL CHECK (migration_mode IN (
+        'verified', 'repairable', 'legacy_prefix', 'corrupt'
+      )),
+      metadata_json TEXT,
+      created_at TEXT NOT NULL DEFAULT (datetime('now')),
+      updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+    );
+
+    CREATE INDEX IF NOT EXISTS message_anchor_trust_conv_state_idx
+      ON message_transcript_anchor_trust (conversation_id, trust_state);
+    CREATE INDEX IF NOT EXISTS message_anchor_trust_conv_entry_idx
+      ON message_transcript_anchor_trust (conversation_id, transcript_entry_id)
+      WHERE transcript_entry_id IS NOT NULL;
+    CREATE INDEX IF NOT EXISTS conversation_transcript_epochs_mode_idx
+      ON conversation_transcript_epochs (migration_mode, created_at);
+  `);
+}
+
 function backfillMessageIdentityHashes(
   db: DatabaseSync,
   options?: { managesOwnTransaction?: boolean },
@@ -1039,6 +1083,35 @@ export function runLcmMigrations(
       UNIQUE (conversation_id, seq)
     );
 
+    CREATE TABLE IF NOT EXISTS message_transcript_anchor_trust (
+      message_id INTEGER PRIMARY KEY REFERENCES messages(message_id) ON DELETE CASCADE,
+      conversation_id INTEGER NOT NULL REFERENCES conversations(conversation_id) ON DELETE CASCADE,
+      transcript_entry_id TEXT,
+      trust_state TEXT NOT NULL CHECK (trust_state IN (
+        'verified', 'repaired', 'suspect', 'legacy_prefix', 'unproven'
+      )),
+      source TEXT NOT NULL,
+      reason TEXT,
+      verified_at TEXT,
+      created_at TEXT NOT NULL DEFAULT (datetime('now')),
+      updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+    );
+
+    CREATE TABLE IF NOT EXISTS conversation_transcript_epochs (
+      conversation_id INTEGER PRIMARY KEY REFERENCES conversations(conversation_id) ON DELETE CASCADE,
+      session_id TEXT NOT NULL,
+      session_key TEXT,
+      frontier_entry_id TEXT,
+      frontier_seq INTEGER,
+      frontier_created_at TEXT,
+      migration_mode TEXT NOT NULL CHECK (migration_mode IN (
+        'verified', 'repairable', 'legacy_prefix', 'corrupt'
+      )),
+      metadata_json TEXT,
+      created_at TEXT NOT NULL DEFAULT (datetime('now')),
+      updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+    );
+
     CREATE TABLE IF NOT EXISTS summaries (
       summary_id TEXT PRIMARY KEY,
       conversation_id INTEGER NOT NULL REFERENCES conversations(conversation_id) ON DELETE CASCADE,
@@ -1285,6 +1358,13 @@ export function runLcmMigrations(
 
     -- Indexes
     CREATE INDEX IF NOT EXISTS messages_conv_seq_idx ON messages (conversation_id, seq);
+    CREATE INDEX IF NOT EXISTS message_anchor_trust_conv_state_idx
+      ON message_transcript_anchor_trust (conversation_id, trust_state);
+    CREATE INDEX IF NOT EXISTS message_anchor_trust_conv_entry_idx
+      ON message_transcript_anchor_trust (conversation_id, transcript_entry_id)
+      WHERE transcript_entry_id IS NOT NULL;
+    CREATE INDEX IF NOT EXISTS conversation_transcript_epochs_mode_idx
+      ON conversation_transcript_epochs (migration_mode, created_at);
     CREATE INDEX IF NOT EXISTS summaries_conv_created_idx ON summaries (conversation_id, created_at);
     CREATE INDEX IF NOT EXISTS summary_messages_message_idx ON summary_messages (message_id);
     CREATE INDEX IF NOT EXISTS summary_parents_parent_summary_idx ON summary_parents (parent_summary_id);
@@ -1383,6 +1463,9 @@ export function runLcmMigrations(
     );
     runMigrationStep("ensureMessageTranscriptEntryIdColumn", log, () =>
       ensureMessageTranscriptEntryIdColumn(db),
+    );
+    runMigrationStep("ensureTranscriptAnchorTrustTables", log, () =>
+      ensureTranscriptAnchorTrustTables(db),
     );
     // Partial unique index: NULL entry ids (legacy rows, runtime ingests) are
     // exempt, so this only enforces idempotency for transcript-imported rows.

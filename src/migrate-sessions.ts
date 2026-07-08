@@ -354,7 +354,7 @@ async function importPreparedFile(
           continue;
         }
         seenEntryIds.add(entry.transcriptEntryId);
-        if (existingCount > 0) {
+        if (existingCount > 0 && entry.stored.content.trim().length > 0) {
           const adopted = await conversationStore.adoptTranscriptEntryId(
             conversation.conversationId,
             entry.stored.role,
@@ -362,6 +362,21 @@ async function importPreparedFile(
             entry.transcriptEntryId,
           );
           if (adopted) {
+            const anchor = await conversationStore.getTranscriptEntryAnchorCandidate(
+              conversation.conversationId,
+              entry.transcriptEntryId,
+            );
+            if (anchor) {
+              await conversationStore.upsertMessageTranscriptAnchorTrust({
+                messageId: anchor.messageId,
+                conversationId: conversation.conversationId,
+                transcriptEntryId: entry.transcriptEntryId,
+                trustState: "repaired",
+                source: "migrate-sessions",
+                reason: "identity-matched non-empty transcript migration",
+                verifiedAt: new Date(),
+              });
+            }
             existingEntryIds.add(entry.transcriptEntryId);
             skippedMessages += 1;
             continue;
@@ -384,6 +399,17 @@ async function importPreparedFile(
         createdAt: resolveTranscriptMessageCreatedAt(entry.message),
         skipReplayTimestampFloodGuard: true,
       });
+      if (entry.transcriptEntryId) {
+        await conversationStore.upsertMessageTranscriptAnchorTrust({
+          messageId: message.messageId,
+          conversationId: conversation.conversationId,
+          transcriptEntryId: entry.transcriptEntryId,
+          trustState: "verified",
+          source: "migrate-sessions",
+          reason: "message imported from transcript entry",
+          verifiedAt: new Date(),
+        });
+      }
       nextSeq += 1;
       await conversationStore.createMessageParts(
         message.messageId,

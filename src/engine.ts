@@ -61,6 +61,10 @@ import type {
   SessionTranscriptReadTarget,
   VisibleSessionTranscriptMessageEntry,
 } from "./types.js";
+import {
+  classifyTranscriptAnchors,
+  type TranscriptAnchorAuditEntry,
+} from "./transcript-anchor-audit.js";
 import { estimateTokens } from "./estimate-tokens.js";
 import {
   buildDeterministicFallbackSummary,
@@ -238,6 +242,23 @@ function messageFromVisibleTranscriptEntry(
     parentId: entry.parentId,
     timestamp: entry.createdAt ?? null,
   });
+}
+
+function auditEntryFromVisibleTranscriptEntry(
+  entry: VisibleSessionTranscriptMessageEntry,
+): TranscriptAnchorAuditEntry | null {
+  if (!hasPersistableMessageRole(entry.message)) {
+    return null;
+  }
+  const stored = toStoredMessage(entry.message);
+  return {
+    entryId: entry.entryId,
+    parentId: entry.parentId,
+    seq: entry.seq,
+    role: stored.role,
+    content: stored.content,
+    createdAt: entry.createdAt,
+  };
 }
 
 
@@ -2036,9 +2057,12 @@ export class LcmContextEngine implements ContextEngine {
     conversationId: number;
     historicalMessages: AgentMessage[];
     requireOverlap?: boolean;
+    legacyPrefixAnchorEntryId?: string | null;
   }): Promise<TranscriptReconcileResult> {
     let importedMessages = 0;
     let hasOverlap = false;
+    let establishedEpochBoundary = false;
+    let suspectEpochEntryId: string | null = null;
     let overlapAnchorIndex = -1;
     const importableMessages: Array<{ index: number; message: AgentMessage }> = [];
     const entryIds = params.historicalMessages
@@ -2057,12 +2081,64 @@ export class LcmContextEngine implements ContextEngine {
       const message = params.historicalMessages[index]!;
       const entryId = getTranscriptEntryId(message);
       if (entryId && existingEntryIds.has(entryId)) {
-        hasOverlap = true;
-        overlapAnchorIndex = index;
-        continue;
+        const stored = toStoredMessage(message);
+        const candidate = await this.conversationStore.getTranscriptEntryAnchorCandidate(
+          params.conversationId,
+          entryId,
+        );
+        const trustedAnchor = await this.conversationStore.isTrustedTranscriptAnchor(
+          params.conversationId,
+          entryId,
+        );
+        if (
+          candidate &&
+          trustedAnchor &&
+          candidate.role === stored.role &&
+          candidate.content === stored.content
+        ) {
+          await this.conversationStore.upsertMessageTranscriptAnchorTrust({
+            messageId: candidate.messageId,
+            conversationId: params.conversationId,
+            transcriptEntryId: entryId,
+            trustState: "verified",
+            source: "projection-reconcile",
+            reason: "entry id matches role and content",
+            verifiedAt: new Date(),
+          });
+          hasOverlap = true;
+          overlapAnchorIndex = index;
+          continue;
+        }
+        if (candidate) {
+          const reason =
+            candidate.role !== stored.role
+              ? "entry id role mismatch"
+              : candidate.content !== stored.content
+                ? "entry id content mismatch"
+                : "entry id lacks explicit trust";
+          await this.conversationStore.upsertMessageTranscriptAnchorTrust({
+            messageId: candidate.messageId,
+            conversationId: params.conversationId,
+            transcriptEntryId: entryId,
+            trustState: "suspect",
+            source: "projection-reconcile",
+            reason,
+          });
+          if (reason === "entry id role mismatch" || reason === "entry id content mismatch") {
+            await this.conversationStore.clearTranscriptEntryIdForMessage(
+              params.conversationId,
+              candidate.messageId,
+            );
+            existingEntryIds.delete(entryId);
+          }
+          establishedEpochBoundary = true;
+          suspectEpochEntryId ??= entryId;
+        }
       }
 
-      if (entryId) {
+      const canUseWeakIdentityAdoption =
+        (!params.legacyPrefixAnchorEntryId || hasOverlap) && !establishedEpochBoundary;
+      if (entryId && canUseWeakIdentityAdoption) {
         const stored = toStoredMessage(message);
         const adopted = await this.conversationStore.adoptRecentTranscriptEntryId(
           params.conversationId,
@@ -2135,7 +2211,40 @@ export class LcmContextEngine implements ContextEngine {
       importableMessages.push({ index, message });
     }
 
-    if (params.requireOverlap && !hasOverlap) {
+    if (establishedEpochBoundary) {
+      const frontierMessage = params.historicalMessages.at(-1);
+      await this.conversationStore.upsertConversationTranscriptEpoch({
+        conversationId: params.conversationId,
+        sessionId: params.sessionId,
+        sessionKey: params.sessionKey ?? null,
+        frontierEntryId: frontierMessage ? getTranscriptEntryId(frontierMessage) : null,
+        frontierSeq: params.historicalMessages.length,
+        frontierCreatedAt: frontierMessage
+          ? resolveTranscriptMessageCreatedAt(frontierMessage) ?? null
+          : null,
+        migrationMode: "legacy_prefix",
+        metadata: {
+          reason: "suspect transcript anchor",
+          suspectEntryId: suspectEpochEntryId,
+        },
+      });
+    }
+
+    if (!hasOverlap && params.legacyPrefixAnchorEntryId) {
+      const legacyPrefixAnchorIndex = params.historicalMessages.findIndex(
+        (message) => getTranscriptEntryId(message) === params.legacyPrefixAnchorEntryId,
+      );
+      if (legacyPrefixAnchorIndex >= 0) {
+        hasOverlap = true;
+        overlapAnchorIndex = legacyPrefixAnchorIndex;
+      }
+    }
+
+    if (
+      params.requireOverlap &&
+      !hasOverlap &&
+      !establishedEpochBoundary
+    ) {
       return {
         importedMessages: 0,
         blockedByImportCap: true,
@@ -2173,7 +2282,94 @@ export class LcmContextEngine implements ContextEngine {
       importedMessages,
       blockedByImportCap: cappedByImportLimit,
       ...(cappedByImportLimit ? { blockedReason: "import-cap" as const } : {}),
-      hasOverlap,
+      hasOverlap: hasOverlap || establishedEpochBoundary,
+    };
+  }
+
+  private async auditTranscriptAnchorsForProjection(params: {
+    conversationId: number;
+    sessionId: string;
+    sessionKey?: string;
+    entries: readonly VisibleSessionTranscriptMessageEntry[];
+  }): Promise<{
+    legacyPrefixAnchorEntryId: string | null;
+  }> {
+    const messages = await this.conversationStore.listTranscriptAnchorAuditMessages(
+      params.conversationId,
+    );
+    const entries = params.entries
+      .map(auditEntryFromVisibleTranscriptEntry)
+      .filter((entry): entry is TranscriptAnchorAuditEntry => entry !== null);
+    const audit = classifyTranscriptAnchors({ messages, entries });
+    const existingEpoch = await this.conversationStore.getConversationTranscriptEpoch(
+      params.conversationId,
+    );
+    const existingLegacyPrefixAnchorEntryId =
+      existingEpoch?.migrationMode === "legacy_prefix" ? existingEpoch.frontierEntryId : null;
+
+    for (const decision of audit.anchorDecisions) {
+      await this.conversationStore.upsertMessageTranscriptAnchorTrust({
+        messageId: decision.messageId,
+        conversationId: params.conversationId,
+        transcriptEntryId: decision.transcriptEntryId,
+        trustState: decision.trustState,
+        source: "projection-audit",
+        reason: decision.reason,
+        verifiedAt: decision.trustState === "verified" ? new Date() : null,
+      });
+          const confirmedFalseAnchor =
+            decision.trustState === "suspect" &&
+            decision.reason !== "entry id missing from projection" &&
+            decision.reason !== "entry id lacks explicit trust" &&
+            decision.reason !== "blank content cannot prove entry id";
+      if (confirmedFalseAnchor) {
+        await this.conversationStore.clearTranscriptEntryIdForMessage(
+          params.conversationId,
+          decision.messageId,
+        );
+      }
+    }
+
+    for (const repair of audit.repairProposals) {
+      const adopted = await this.conversationStore.adoptTranscriptEntryIdForMessage(
+        params.conversationId,
+        repair.messageId,
+        repair.transcriptEntryId,
+      );
+      if (adopted) {
+        await this.conversationStore.upsertMessageTranscriptAnchorTrust({
+          messageId: repair.messageId,
+          conversationId: params.conversationId,
+          transcriptEntryId: repair.transcriptEntryId,
+          trustState: "repaired",
+          source: "projection-audit",
+          reason: repair.reason,
+          verifiedAt: new Date(),
+        });
+      }
+    }
+
+    const frontier = entries.at(-1);
+    if (audit.requiresEpochBoundary && !existingLegacyPrefixAnchorEntryId) {
+      await this.conversationStore.upsertConversationTranscriptEpoch({
+        conversationId: params.conversationId,
+        sessionId: params.sessionId,
+        sessionKey: params.sessionKey ?? null,
+        frontierEntryId: frontier?.entryId ?? null,
+        frontierSeq: frontier?.seq ?? entries.length,
+        frontierCreatedAt: frontier?.createdAt ?? null,
+        migrationMode: "legacy_prefix",
+        metadata: {
+          reason: "unproven transcript anchors",
+          classification: audit.classification,
+        },
+      });
+    }
+
+    return {
+      legacyPrefixAnchorEntryId:
+        existingLegacyPrefixAnchorEntryId ??
+        (audit.requiresEpochBoundary ? frontier?.entryId ?? null : null),
     };
   }
 
@@ -2253,12 +2449,19 @@ export class LcmContextEngine implements ContextEngine {
             };
           }
 
+          const anchorAudit = await this.auditTranscriptAnchorsForProjection({
+            conversationId,
+            sessionId: params.sessionId,
+            sessionKey: params.sessionKey,
+            entries,
+          });
           const reconcile = await this.reconcileProjectedTranscriptMessages({
             sessionId: params.sessionId,
             sessionKey: params.sessionKey,
             conversationId,
             historicalMessages,
             requireOverlap: true,
+            legacyPrefixAnchorEntryId: anchorAudit.legacyPrefixAnchorEntryId,
           });
           this.deps.log.debug(
             `[lcm] bootstrap: sqlite projection reconcile finished conversation=${conversationId} ${params.sessionLabel} importedMessages=${reconcile.importedMessages} overlap=${reconcile.hasOverlap} blockedByImportCap=${reconcile.blockedByImportCap} duration=${formatDurationMs(Date.now() - params.startedAt)}`,
@@ -2463,12 +2666,19 @@ export class LcmContextEngine implements ContextEngine {
             };
           }
 
+          const anchorAudit = await this.auditTranscriptAnchorsForProjection({
+            conversationId,
+            sessionId: params.sessionId,
+            sessionKey: params.sessionKey,
+            entries,
+          });
           const reconcile = await this.reconcileProjectedTranscriptMessages({
             sessionId: params.sessionId,
             sessionKey: params.sessionKey,
             conversationId,
             historicalMessages,
             requireOverlap: true,
+            legacyPrefixAnchorEntryId: anchorAudit.legacyPrefixAnchorEntryId,
           });
           this.deps.log.debug(
             `[lcm] afterTurn: visible projection reconcile finished conversation=${conversationId} ${params.sessionLabel} importedMessages=${reconcile.importedMessages} overlap=${reconcile.hasOverlap} blockedByImportCap=${reconcile.blockedByImportCap} duration=${formatDurationMs(Date.now() - params.startedAt)}`,
@@ -2815,6 +3025,17 @@ export class LcmContextEngine implements ContextEngine {
       createdAt,
       skipReplayTimestampFloodGuard,
     });
+    if (transcriptEntryId) {
+      await this.conversationStore.upsertMessageTranscriptAnchorTrust({
+        messageId: msgRecord.messageId,
+        conversationId,
+        transcriptEntryId,
+        trustState: "verified",
+        source: "transcript-import",
+        reason: "message imported from transcript entry",
+        verifiedAt: new Date(),
+      });
+    }
     await this.conversationStore.createMessageParts(
       msgRecord.messageId,
       buildMessageParts({
