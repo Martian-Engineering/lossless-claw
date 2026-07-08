@@ -224,7 +224,13 @@ async function seedSummaryBearingLane(
   return { conversationId, trackedFile };
 }
 
-/** Simulate the host's archive rename: trackedFile -> `${trackedFile}.<kind>.<ts>`. */
+/**
+ * Simulate the host's archive rename: `trackedFile` -> `${trackedFile}.<kind>.<ts>`.
+ * This mirrors the exact shape OpenClaw core produces in `archiveFileOnDisk`
+ * (`src/gateway/session-transcript-files.fs.ts`: `${filePath}.${reason}.<ts>`,
+ * `reason` a `SessionArchiveReason` of "bak" | "reset" | "deleted"). The `<ts>`
+ * is a representative host timestamp, not a value copied from a live session.
+ */
 function archiveTrackedFile(trackedFile: string, kind: "reset" | "deleted"): void {
   renameSync(trackedFile, `${trackedFile}.${kind}.2026-06-29T120000-000Z`);
 }
