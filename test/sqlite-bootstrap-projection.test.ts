@@ -446,7 +446,7 @@ describe("LcmContextEngine.bootstrap sqlite transcript projection", () => {
     ).resolves.toMatchObject({
       bootstrapped: false,
       importedMessages: 0,
-      reason: "reconcile projection has no overlap",
+      reason: "conversation already up to date",
     });
 
     const conversation = await engine.getConversationStore().getConversationForSession({
@@ -690,7 +690,7 @@ describe("LcmContextEngine.bootstrap sqlite transcript projection", () => {
     ).resolves.toMatchObject({
       bootstrapped: false,
       importedMessages: 0,
-      reason: "reconcile projection has no overlap",
+      reason: "conversation already up to date",
     });
 
     const conversation = await engine.getConversationStore().getConversationForSession({
@@ -704,6 +704,212 @@ describe("LcmContextEngine.bootstrap sqlite transcript projection", () => {
       )
       .all(conversation!.conversationId) as Array<{ transcript_entry_id: string | null }>;
     expect(rows.map((row) => row.transcript_entry_id)).toEqual(["entry-stale-reset"]);
+  });
+
+  it("does not weakly adopt a blank legacy row as an overlap anchor", async () => {
+    const sessionId = "sqlite-bootstrap-blank-weak-adoption-session";
+    const sessionKey = "agent:main:sqlite-bootstrap-blank-weak-adoption-session";
+    const readVisibleSessionTranscriptMessageEntries = vi.fn(async () => [
+      {
+        entryId: "entry-current-blank",
+        parentId: null,
+        seq: 1,
+        role: "assistant",
+        message: { role: "assistant", content: "" } satisfies AgentMessage,
+        createdAt: "2026-06-29T12:29:05.000Z",
+      },
+    ]);
+    const { engine, db } = createEngineWithDepsOverridesAndDb({
+      readVisibleSessionTranscriptMessageEntries,
+    } satisfies Partial<LcmDependencies>);
+
+    await expect(
+      engine.ingestBatch({
+        sessionId,
+        sessionKey,
+        messages: [{ role: "assistant", content: "" } satisfies AgentMessage],
+      }),
+    ).resolves.toMatchObject({ ingestedCount: 1 });
+
+    await expect(
+      engine.bootstrap({
+        sessionId,
+        sessionKey,
+        runtimeContext: {
+          transcriptStorage: { kind: "sqlite" },
+          sessionTarget: {
+            agentId: "main",
+            sessionId,
+            sessionKey,
+            storePath: "/tmp/openclaw-agent.sqlite",
+          },
+        },
+      }),
+    ).resolves.toMatchObject({
+      bootstrapped: false,
+      importedMessages: 0,
+      reason: "conversation already up to date",
+    });
+
+    const conversation = await engine.getConversationStore().getConversationForSession({
+      sessionId,
+      sessionKey,
+    });
+    expect(conversation).not.toBeNull();
+    const rows = db
+      .prepare(
+        `SELECT content, transcript_entry_id
+         FROM messages
+         WHERE conversation_id = ?
+         ORDER BY seq`,
+      )
+      .all(conversation!.conversationId) as Array<{
+      content: string;
+      transcript_entry_id: string | null;
+    }>;
+    expect(rows).toEqual([
+      { content: "", transcript_entry_id: null },
+    ]);
+
+    const epoch = await engine
+      .getConversationStore()
+      .getConversationTranscriptEpoch(conversation!.conversationId);
+    expect(epoch).toMatchObject({
+      migrationMode: "legacy_prefix",
+      metadata: { reason: "unproven transcript anchors", classification: "legacy_prefix" },
+    });
+  });
+
+  it("does not use a stale blank assistant id as a projection overlap anchor", async () => {
+    const sessionId = "sqlite-bootstrap-stale-blank-anchor-session";
+    const sessionKey = "agent:main:sqlite-bootstrap-stale-blank-anchor-session";
+    const readVisibleSessionTranscriptMessageEntries = vi.fn(async () => [
+      {
+        entryId: "entry-current-user-before-blank",
+        parentId: null,
+        seq: 1,
+        role: "user",
+        message: { role: "user", content: "this is the user message that was skipped" } satisfies AgentMessage,
+        createdAt: "2026-06-29T12:29:10.000Z",
+      },
+      {
+        entryId: "entry-current-assistant-blank-id",
+        parentId: "entry-current-user-before-blank",
+        seq: 2,
+        role: "assistant",
+        message: { role: "assistant", content: "current assistant content" } satisfies AgentMessage,
+        createdAt: "2026-06-29T12:29:11.000Z",
+      },
+    ]);
+    const { engine, db } = createEngineWithDepsOverridesAndDb({
+      readVisibleSessionTranscriptMessageEntries,
+    } satisfies Partial<LcmDependencies>);
+
+    await expect(
+      engine.ingestBatch({
+        sessionId,
+        sessionKey,
+        messages: [
+          attachTranscriptEntryMeta(
+            { role: "assistant", content: "" } satisfies AgentMessage,
+            {
+              entryId: "entry-current-assistant-blank-id",
+              parentId: null,
+              timestamp: "2026-05-20T12:00:00.000Z",
+            },
+          ),
+        ],
+      }),
+    ).resolves.toMatchObject({ ingestedCount: 1 });
+
+    await expect(
+      engine.bootstrap({
+        sessionId,
+        sessionKey,
+        runtimeContext: {
+          transcriptStorage: { kind: "sqlite" },
+          sessionTarget: {
+            agentId: "main",
+            sessionId,
+            sessionKey,
+            storePath: "/tmp/openclaw-agent.sqlite",
+          },
+        },
+      }),
+    ).resolves.toMatchObject({
+      bootstrapped: false,
+      importedMessages: 0,
+      reason: "conversation already up to date",
+    });
+
+    const conversation = await engine.getConversationStore().getConversationForSession({
+      sessionId,
+      sessionKey,
+    });
+    expect(conversation).not.toBeNull();
+    const rows = db
+      .prepare(
+        `SELECT message_id, content, transcript_entry_id
+         FROM messages
+         WHERE conversation_id = ?
+         ORDER BY seq`,
+      )
+      .all(conversation!.conversationId) as Array<{
+      message_id: number;
+      content: string;
+      transcript_entry_id: string | null;
+    }>;
+    expect(rows).toEqual([
+      { message_id: 1, content: "", transcript_entry_id: null },
+    ]);
+
+    const trustRows = db
+      .prepare(
+        `SELECT message_id, transcript_entry_id, trust_state, reason
+         FROM message_transcript_anchor_trust
+         WHERE conversation_id = ?
+         ORDER BY message_id`,
+      )
+      .all(conversation!.conversationId) as Array<{
+      message_id: number;
+      transcript_entry_id: string | null;
+      trust_state: string;
+      reason: string;
+    }>;
+    expect(trustRows).toEqual([
+      {
+        message_id: 1,
+        transcript_entry_id: "entry-current-assistant-blank-id",
+        trust_state: "suspect",
+        reason: "entry id content mismatch",
+      },
+    ]);
+
+    const epochRow = db
+      .prepare(
+        `SELECT session_id, session_key, frontier_entry_id, frontier_seq, migration_mode, metadata_json
+         FROM conversation_transcript_epochs
+         WHERE conversation_id = ?`,
+      )
+      .get(conversation!.conversationId) as {
+      session_id: string;
+      session_key: string;
+      frontier_entry_id: string;
+      frontier_seq: number;
+      migration_mode: string;
+      metadata_json: string;
+    };
+    expect(epochRow).toEqual({
+      session_id: sessionId,
+      session_key: sessionKey,
+      frontier_entry_id: "entry-current-assistant-blank-id",
+      frontier_seq: 2,
+      migration_mode: "legacy_prefix",
+      metadata_json: JSON.stringify({
+        reason: "unproven transcript anchors",
+        classification: "legacy_prefix",
+      }),
+    });
   });
 
   it("does not restamp a repeated same-content turn with a different timestamp", async () => {
@@ -1187,7 +1393,7 @@ describe("LcmContextEngine.bootstrap sqlite transcript projection", () => {
     expect(messages.at(-1)?.content).toBe("tail 49");
   });
 
-  it("starts a fresh conversation for a no-overlap bootstrap projection after reset", async () => {
+  it("keeps an existing conversation at a legacy frontier for a no-overlap bootstrap projection", async () => {
     const sessionId = "sqlite-bootstrap-no-overlap-session";
     const sessionKey = "agent:main:sqlite-bootstrap-no-overlap-session";
     let visibleEntries: VisibleSessionTranscriptMessageEntry[] = [
@@ -1247,9 +1453,9 @@ describe("LcmContextEngine.bootstrap sqlite transcript projection", () => {
         },
       }),
     ).resolves.toMatchObject({
-      bootstrapped: true,
-      importedMessages: 1,
-      reason: "fresh sqlite transcript projection",
+      bootstrapped: false,
+      importedMessages: 0,
+      reason: "already bootstrapped",
     });
 
     const conversation = await engine.getConversationStore().getConversationForSession({
@@ -1258,17 +1464,65 @@ describe("LcmContextEngine.bootstrap sqlite transcript projection", () => {
     });
     expect(conversation).not.toBeNull();
     const messages = await engine.getConversationStore().getMessages(conversation!.conversationId);
-    expect(messages.map((message) => message.content)).toEqual(["unrelated user"]);
+    expect(messages.map((message) => message.content)).toEqual(["original user"]);
     const rows = db
       .prepare(
         `SELECT conversation_id, active FROM conversations WHERE session_key = ? ORDER BY conversation_id`,
       )
       .all(sessionKey) as Array<{ conversation_id: number; active: number }>;
-    expect(rows).toHaveLength(2);
-    expect(rows.map((row) => row.active)).toEqual([0, 1]);
+    expect(rows).toHaveLength(1);
+    expect(rows.map((row) => row.active)).toEqual([1]);
+
+    const epoch = await engine
+      .getConversationStore()
+      .getConversationTranscriptEpoch(conversation!.conversationId);
+    expect(epoch).toMatchObject({
+      frontierEntryId: "entry-unrelated-user",
+      migrationMode: "legacy_prefix",
+    });
+
+    visibleEntries = [
+      ...visibleEntries,
+      {
+        entryId: "entry-after-legacy-frontier",
+        parentId: "entry-unrelated-user",
+        seq: 2,
+        role: "assistant",
+        message: { role: "assistant", content: "after legacy frontier" } satisfies AgentMessage,
+        createdAt: "2026-06-29T12:11:01.000Z",
+      },
+    ];
+
+    await expect(
+      engine.bootstrap({
+        sessionId,
+        sessionKey,
+        runtimeContext: {
+          transcriptStorage: { kind: "sqlite" },
+          sessionTarget: {
+            agentId: "main",
+            sessionId,
+            sessionKey,
+            storePath: "/tmp/openclaw-agent.sqlite",
+          },
+        },
+      }),
+    ).resolves.toMatchObject({
+      bootstrapped: true,
+      importedMessages: 1,
+      reason: "reconciled missing session messages",
+    });
+
+    const updatedMessages = await engine
+      .getConversationStore()
+      .getMessages(conversation!.conversationId);
+    expect(updatedMessages.map((message) => message.content)).toEqual([
+      "original user",
+      "after legacy frontier",
+    ]);
   });
 
-  it("fails closed instead of persisting afterTurn when an existing projection has no overlap", async () => {
+  it("persists only post-frontier afterTurn output when an existing projection has no row overlap", async () => {
     const sessionId = "sqlite-afterturn-no-overlap-session";
     const sessionKey = "agent:main:sqlite-afterturn-no-overlap-session";
     let visibleEntries: VisibleSessionTranscriptMessageEntry[] = [
@@ -1341,7 +1595,10 @@ describe("LcmContextEngine.bootstrap sqlite transcript projection", () => {
     });
     expect(conversation).not.toBeNull();
     const messages = await engine.getConversationStore().getMessages(conversation!.conversationId);
-    expect(messages.map((message) => message.content)).toEqual(["original user"]);
+    expect(messages.map((message) => message.content)).toEqual([
+      "original user",
+      "unrelated assistant",
+    ]);
   });
 
   it("does not persist afterTurn runtime messages when the visible projection is unavailable", async () => {

@@ -1272,6 +1272,78 @@ describe("runLcmMigrations summary depth backfill", () => {
     expect(partRow?.text_content).toBe("hello");
   });
 
+  it("creates transcript anchor trust and epoch tables without trusting legacy ids", () => {
+    const db = createTestDb("transcript-anchor-trust.db");
+
+    runLcmMigrations(db, { fts5Available: false });
+
+    db.prepare(
+      `INSERT INTO conversations (conversation_id, session_id, session_key)
+       VALUES (?, ?, ?)`,
+    ).run(1, "session-a", "agent:main:session-a");
+    db.prepare(
+      `INSERT INTO messages (
+         message_id, conversation_id, seq, role, content, token_count, transcript_entry_id
+       ) VALUES (?, ?, ?, ?, ?, ?, ?)`,
+    ).run(1, 1, 1, "assistant", "", 0, "entry-looks-authoritative");
+
+    runLcmMigrations(db, { fts5Available: false });
+
+    const tableRows = db
+      .prepare(
+        `SELECT name
+         FROM sqlite_master
+         WHERE type = 'table'
+           AND name IN ('message_transcript_anchor_trust', 'conversation_transcript_epochs')
+         ORDER BY name`,
+      )
+      .all() as Array<{ name: string }>;
+    expect(tableRows.map((row) => row.name)).toEqual([
+      "conversation_transcript_epochs",
+      "message_transcript_anchor_trust",
+    ]);
+
+    const trustColumns = db
+      .prepare(`PRAGMA table_info(message_transcript_anchor_trust)`)
+      .all() as Array<{ name?: string }>;
+    expect(trustColumns.map((column) => column.name)).toEqual([
+      "message_id",
+      "conversation_id",
+      "transcript_entry_id",
+      "trust_state",
+      "source",
+      "reason",
+      "verified_at",
+      "created_at",
+      "updated_at",
+    ]);
+
+    const epochColumns = db
+      .prepare(`PRAGMA table_info(conversation_transcript_epochs)`)
+      .all() as Array<{ name?: string }>;
+    expect(epochColumns.map((column) => column.name)).toEqual([
+      "conversation_id",
+      "session_id",
+      "session_key",
+      "frontier_entry_id",
+      "frontier_seq",
+      "frontier_created_at",
+      "migration_mode",
+      "metadata_json",
+      "created_at",
+      "updated_at",
+    ]);
+
+    const trustedRows = db
+      .prepare(`SELECT COUNT(*) AS count FROM message_transcript_anchor_trust`)
+      .get() as { count: number };
+    const epochRows = db
+      .prepare(`SELECT COUNT(*) AS count FROM conversation_transcript_epochs`)
+      .get() as { count: number };
+    expect(trustedRows.count).toBe(0);
+    expect(epochRows.count).toBe(0);
+  });
+
   it("backfills legacy tool_call_id values from metadata.raw.call_id", () => {
     const tempDir = mkdtempSync(join(tmpdir(), "lossless-claw-migration-"));
     tempDirs.push(tempDir);

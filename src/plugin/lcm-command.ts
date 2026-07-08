@@ -101,6 +101,17 @@ type LcmInstallTrackWarning = {
   spec: string;
   version: string;
 };
+type AnchorTrustAuditStats = {
+  verified: number;
+  repaired: number;
+  suspect: number;
+  legacyPrefix: number;
+  unproven: number;
+  epochVerified: number;
+  epochRepairable: number;
+  epochLegacyPrefix: number;
+  epochCorrupt: number;
+};
 
 type ParsedLcmCommand =
   | { kind: "status" }
@@ -110,6 +121,7 @@ type ParsedLcmCommand =
   | { kind: "refocus" }
   | { kind: "unfocus" }
   | { kind: "doctor"; apply: boolean; applyOptions?: DoctorApplyOptions }
+  | { kind: "doctor_anchors" }
   | { kind: "doctor_rollover_splits"; apply: boolean; applyOptions?: RolloverSplitApplyOptions }
   | { kind: "doctor_cleaners"; apply: boolean; filterId?: DoctorCleanerId; vacuum: boolean }
   | { kind: "help"; error?: string };
@@ -428,6 +440,83 @@ function buildVersionDoctorSection(scan: LcmVersionDoctorScan): string {
   return buildSection(scan.split ? "⚠️ Version split" : "🧩 Installed copies", lines);
 }
 
+function getAnchorTrustAuditStats(db: DatabaseSync): AnchorTrustAuditStats {
+  const stats: AnchorTrustAuditStats = {
+    verified: 0,
+    repaired: 0,
+    suspect: 0,
+    legacyPrefix: 0,
+    unproven: 0,
+    epochVerified: 0,
+    epochRepairable: 0,
+    epochLegacyPrefix: 0,
+    epochCorrupt: 0,
+  };
+  const trustRows = db
+    .prepare(
+      `SELECT trust_state, COUNT(*) AS count
+       FROM message_transcript_anchor_trust
+       GROUP BY trust_state`,
+    )
+    .all() as Array<{ trust_state: string; count: number }>;
+  for (const row of trustRows) {
+    if (row.trust_state === "verified") stats.verified = row.count;
+    if (row.trust_state === "repaired") stats.repaired = row.count;
+    if (row.trust_state === "suspect") stats.suspect = row.count;
+    if (row.trust_state === "legacy_prefix") stats.legacyPrefix = row.count;
+    if (row.trust_state === "unproven") stats.unproven = row.count;
+  }
+
+  const epochRows = db
+    .prepare(
+      `SELECT migration_mode, COUNT(*) AS count
+       FROM conversation_transcript_epochs
+       GROUP BY migration_mode`,
+    )
+    .all() as Array<{ migration_mode: string; count: number }>;
+  for (const row of epochRows) {
+    if (row.migration_mode === "verified") stats.epochVerified = row.count;
+    if (row.migration_mode === "repairable") stats.epochRepairable = row.count;
+    if (row.migration_mode === "legacy_prefix") stats.epochLegacyPrefix = row.count;
+    if (row.migration_mode === "corrupt") stats.epochCorrupt = row.count;
+  }
+  return stats;
+}
+
+function buildAnchorTrustAuditText(db: DatabaseSync): string {
+  const stats = getAnchorTrustAuditStats(db);
+  const lines = [
+    ...buildHeaderLines(),
+    "",
+    "🩺 Lossless Claw Anchor Audit",
+    "",
+    buildSection("🔗 Message anchors", [
+      buildStatLine("verified", formatNumber(stats.verified)),
+      buildStatLine("repaired", formatNumber(stats.repaired)),
+      buildStatLine("suspect", formatNumber(stats.suspect)),
+      buildStatLine("legacy-prefix", formatNumber(stats.legacyPrefix)),
+      buildStatLine("unproven", formatNumber(stats.unproven)),
+    ]),
+    "",
+    buildSection("🧱 Transcript epochs", [
+      buildStatLine("verified", formatNumber(stats.epochVerified)),
+      buildStatLine("repairable", formatNumber(stats.epochRepairable)),
+      buildStatLine("legacy-prefix", formatNumber(stats.epochLegacyPrefix)),
+      buildStatLine("corrupt", formatNumber(stats.epochCorrupt)),
+    ]),
+  ];
+  if (stats.suspect > 0 || stats.epochLegacyPrefix > 0) {
+    lines.push(
+      "",
+      buildSection("⚠️ Continuity", [
+        buildStatLine("status", "preserved with ignored legacy anchors"),
+        buildStatLine("action", "none required"),
+      ]),
+    );
+  }
+  return lines.join("\n");
+}
+
 function formatCompressionRatio(contextTokens: number, compressedTokens: number): string {
   if (
     !Number.isFinite(contextTokens) ||
@@ -619,6 +708,9 @@ function parseLcmCommand(rawArgs: string | undefined): ParsedLcmCommand {
       if (rest.length === 1 && rest[0]?.toLowerCase() === "rollover-splits") {
         return { kind: "doctor_rollover_splits", apply: false };
       }
+      if (rest.length === 1 && rest[0]?.toLowerCase() === "anchors") {
+        return { kind: "doctor_anchors" };
+      }
       if (rest[0]?.toLowerCase() === "clean" && rest[1]?.toLowerCase() === "apply") {
         const parsedApply = parseDoctorCleanerApplyArgs(rest.slice(2));
         return parsedApply.ok
@@ -649,7 +741,7 @@ function parseLcmCommand(rawArgs: string | undefined): ParsedLcmCommand {
       return {
         kind: "help",
         error:
-          `\`${VISIBLE_COMMAND} doctor\` accepts no arguments, \`rollover-splits\` for global rollover diagnostics, \`apply rollover-splits [confirm]\` for backup-first split repair, \`clean\` for global high-confidence junk diagnostics, \`clean apply [filter-id] [vacuum]\` for cleanup, \`apply [confirm-offline]\` for current-conversation repair, or \`apply <conversation-id> confirm-offline\` for targeted repair.`,
+          `\`${VISIBLE_COMMAND} doctor\` accepts no arguments, \`anchors\` for transcript anchor diagnostics, \`rollover-splits\` for global rollover diagnostics, \`apply rollover-splits [confirm]\` for backup-first split repair, \`clean\` for global high-confidence junk diagnostics, \`clean apply [filter-id] [vacuum]\` for cleanup, \`apply [confirm-offline]\` for current-conversation repair, or \`apply <conversation-id> confirm-offline\` for targeted repair.`,
       };
     case "help":
       return { kind: "help" };
@@ -1280,6 +1372,10 @@ function buildHelpText(error?: string): string {
         "Deactivate the active focus overlay without deleting focus history.",
       ),
       buildStatLine(formatCommand(`${VISIBLE_COMMAND} doctor`), "Scan for broken or truncated summaries."),
+      buildStatLine(
+        formatCommand(`${VISIBLE_COMMAND} doctor anchors`),
+        "Report transcript anchor trust and legacy-prefix epoch counts.",
+      ),
       buildStatLine(
         formatCommand(`${VISIBLE_COMMAND} doctor rollover-splits`),
         "Report whole-DB fresh-transcript rollover split memory.",
@@ -3042,6 +3138,8 @@ export function createLcmCommand(params: {
                   buildRolloverSplitScanSection(scanRolloverSplits(await getDb())),
                 ].join("\n"),
               };
+        case "doctor_anchors":
+          return { text: buildAnchorTrustAuditText(await getDb()) };
         case "doctor_cleaners":
           return parsed.apply
             ? {
