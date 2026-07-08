@@ -95,9 +95,17 @@ export class SessionRolloverDetector {
    * transcript path — its `${basename}.reset.<ts>` (reset/new) or
    * `${basename}.deleted.<ts>` (deletion) rename. A surviving sibling is
    * durable, restart-proof evidence that a vanished tracked file was
-   * deliberately archived rather than silently lost. Mirrors the host's own
-   * archive-prefix convention (its reset hooks find archives by the same
-   * `${basename}.reset.` lookup prefix). Fails closed (false) on any I/O error.
+   * deliberately archived rather than silently lost.
+   *
+   * Host contract (OpenClaw core, confirmed on the 2026.6.10 line and current
+   * main): the archive name is minted by `archiveFileOnDisk(filePath, reason)`
+   * in `src/gateway/session-transcript-files.fs.ts` as `${filePath}.${reason}.<ts>`,
+   * where `reason` is a `SessionArchiveReason` (`src/config/sessions/artifacts.ts`,
+   * one of "bak" | "reset" | "deleted"). The host rediscovers its own archives by
+   * the same `${basename}.reset.` prefix (`findLatestArchivedTranscript`,
+   * `src/auto-reply/reply/commands-reset-hooks.ts`). The reset/new rename on a
+   * fresh sessionId is the exact rollover documented in issue #754. Fails closed
+   * (false) on any I/O error.
    */
   private async hasArchivedTranscriptSibling(trackedFile: string): Promise<boolean> {
     const prefix = basename(trackedFile);
@@ -294,10 +302,17 @@ export class SessionRolloverDetector {
       // The tracked transcript is gone. Treat it as an ambiguous rollover
       // (eligible for the fresh-transcript rebind that preserves retained
       // summaries) only when an on-disk archive sibling proves the host
-      // deliberately archived it — a /new soft reset or a host-missed /reset.
-      // A genuine silent loss leaves no sibling and falls to the destructive
-      // guard instead.
+      // deliberately archived it (a /new soft reset or a host-missed /reset).
+      // A genuine silent loss leaves no sibling. This is a SECONDARY decline:
+      // every caller runs rotateStaleSessionKeyConversationIfTrackedTranscript
+      // Missing first (see engine.ts), which archives-or-rotates the lane and
+      // warns on genuine loss, so that case is already handled there. Log at
+      // debug (not warn) for host-contract-drift diagnosis without double-
+      // warning or firing on a transient mid-rotation ENOENT.
       if (!(await this.hasArchivedTranscriptSibling(trackedSessionFile))) {
+        this.deps.log.debug(
+          `[lcm] ${params.phase}: tracked transcript missing with no archive sibling; declining ambiguous-rollover rebind (destructive guard handles genuine loss) conversation=${activeByKey.conversationId} sessionKey=${normalizedSessionKey} file=${trackedSessionFile}`,
+        );
         return null;
       }
     }
