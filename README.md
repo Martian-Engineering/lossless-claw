@@ -197,7 +197,9 @@ Add a `lossless-claw` entry under `plugins.entries` in your OpenClaw config:
             "cacheTTLSeconds": 300
           },
           "ignoreSessionPatterns": [
-            "agent:*:cron:**"
+            "agent:*:cron:**",
+            "agent:*:**:active-memory:**",
+            "agent:*:dreaming-narrative-**"
           ],
           "transcriptGcEnabled": false,
           "proactiveThresholdCompactionMode": "deferred",

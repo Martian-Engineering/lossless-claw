@@ -35,7 +35,11 @@ Most installations only need to override a handful of keys. If you want a comple
   "enabled": true,
   "databasePath": "/Users/alice/.openclaw/lcm.db",
   "largeFilesDir": "/Users/alice/.openclaw/lcm-files",
-  "ignoreSessionPatterns": [],
+  "ignoreSessionPatterns": [
+    "agent:*:cron:**",
+    "agent:*:**:active-memory:**",
+    "agent:*:dreaming-narrative-**"
+  ],
   "statelessSessionPatterns": [],
   "skipStatelessSessions": true,
   "contextThreshold": 0.75,
@@ -387,7 +391,9 @@ Example:
 ```json
 {
   "ignoreSessionPatterns": [
-    "agent:*:cron:**"
+    "agent:*:cron:**",
+    "agent:*:**:active-memory:**",
+    "agent:*:dreaming-narrative-**"
   ],
   "statelessSessionPatterns": [
     "agent:*:subagent:**",
