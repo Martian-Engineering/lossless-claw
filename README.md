@@ -513,7 +513,6 @@ src/
   expansion-auth.ts         # Delegation grants for sub-agent expansion
   expansion-policy.ts       # Depth/token policy for expansion
   large-files.ts            # File interception, storage, and exploration summaries
-  integrity.ts              # DAG integrity checks and repair utilities
   transcript-repair.ts      # Tool-use/result pairing sanitization
   types.ts                  # Core type definitions (dependency injection contracts)
   openclaw-bridge.ts        # Bridge utilities
