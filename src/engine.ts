@@ -295,6 +295,58 @@ function auditEntryFromVisibleTranscriptEntry(
   };
 }
 
+function transcriptAuditTimestampMs(value: Date | string | undefined): number | null {
+  if (value instanceof Date) {
+    const ms = value.getTime();
+    return Number.isFinite(ms) ? ms : null;
+  }
+  if (typeof value !== "string" || value.trim().length === 0) {
+    return null;
+  }
+  const ms = Date.parse(value);
+  return Number.isFinite(ms) ? ms : null;
+}
+
+function selectLegacyPrefixFrontier(params: {
+  messages: readonly TranscriptAnchorAuditMessage[];
+  entries: readonly TranscriptAnchorAuditEntry[];
+}): {
+  frontier: TranscriptAnchorAuditEntry | null;
+  allowsUnanchoredImport: boolean;
+} {
+  const persistedTimes = params.messages
+    .map((message) => transcriptAuditTimestampMs(message.createdAt))
+    .filter((ms): ms is number => ms !== null);
+  const maxPersistedTime = persistedTimes.length > 0 ? Math.max(...persistedTimes) : null;
+  if (maxPersistedTime === null) {
+    return {
+      frontier: params.entries.at(-1) ?? null,
+      allowsUnanchoredImport: false,
+    };
+  }
+
+  const freshSuffixIndex = params.entries.findIndex((entry) => {
+    const entryTime = transcriptAuditTimestampMs(entry.createdAt);
+    return entryTime !== null && entryTime > maxPersistedTime;
+  });
+  if (freshSuffixIndex < 0) {
+    return {
+      frontier: params.entries.at(-1) ?? null,
+      allowsUnanchoredImport: false,
+    };
+  }
+  if (freshSuffixIndex === 0) {
+    return {
+      frontier: null,
+      allowsUnanchoredImport: true,
+    };
+  }
+  return {
+    frontier: params.entries[freshSuffixIndex - 1] ?? null,
+    allowsUnanchoredImport: false,
+  };
+}
+
 
 
 
@@ -2387,6 +2439,7 @@ export class LcmContextEngine implements ContextEngine {
     entries: readonly VisibleSessionTranscriptMessageEntry[];
   }): Promise<{
     legacyPrefixAnchorEntryId: string | null;
+    allowsUnanchoredLegacyPrefixImport: boolean;
   }> {
     const messages = await this.conversationStore.listTranscriptAnchorAuditMessages(
       params.conversationId,
@@ -2443,14 +2496,15 @@ export class LcmContextEngine implements ContextEngine {
       }
     }
 
-    const frontier = entries.at(-1);
+    const selectedFrontier = selectLegacyPrefixFrontier({ messages, entries });
+    const frontier = selectedFrontier.frontier;
     if (audit.requiresEpochBoundary && !existingLegacyPrefixAnchorEntryId) {
       await this.conversationStore.upsertConversationTranscriptEpoch({
         conversationId: params.conversationId,
         sessionId: params.sessionId,
         sessionKey: params.sessionKey ?? null,
         frontierEntryId: frontier?.entryId ?? null,
-        frontierSeq: frontier?.seq ?? entries.length,
+        frontierSeq: frontier?.seq ?? 0,
         frontierCreatedAt: frontier?.createdAt ?? null,
         migrationMode: "legacy_prefix",
         metadata: {
@@ -2464,6 +2518,10 @@ export class LcmContextEngine implements ContextEngine {
       legacyPrefixAnchorEntryId:
         existingLegacyPrefixAnchorEntryId ??
         (audit.requiresEpochBoundary ? frontier?.entryId ?? null : null),
+      allowsUnanchoredLegacyPrefixImport:
+        audit.requiresEpochBoundary &&
+        !existingLegacyPrefixAnchorEntryId &&
+        selectedFrontier.allowsUnanchoredImport,
     };
   }
 
@@ -2554,7 +2612,7 @@ export class LcmContextEngine implements ContextEngine {
             sessionKey: params.sessionKey,
             conversationId,
             historicalMessages,
-            requireOverlap: true,
+            requireOverlap: !anchorAudit.allowsUnanchoredLegacyPrefixImport,
             legacyPrefixAnchorEntryId: anchorAudit.legacyPrefixAnchorEntryId,
           });
           this.deps.log.debug(
@@ -2771,7 +2829,7 @@ export class LcmContextEngine implements ContextEngine {
             sessionKey: params.sessionKey,
             conversationId,
             historicalMessages,
-            requireOverlap: true,
+            requireOverlap: !anchorAudit.allowsUnanchoredLegacyPrefixImport,
             legacyPrefixAnchorEntryId: anchorAudit.legacyPrefixAnchorEntryId,
           });
           this.deps.log.debug(
