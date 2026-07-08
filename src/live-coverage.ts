@@ -595,16 +595,24 @@ export function liveContentIsRecognizedDecoratedBareBody(params: {
 }
 
 /**
- * Recognized memory/context-plugin injected-context markers, as emitted by
- * before_prompt_build prependContext hooks. These are ordinary text a user can
- * type verbatim (they are stripped from stored content for exactly that
- * reason), so a marker alone is NOT trusted turn-identity evidence: the
- * marker-based recognition path is additionally constrained to the last
- * assembled user row (see assembledRowIsStructuralBareCurrentTurn). Single
- * named const.
+ * Recognized memory/context injected-content markers. They come from several
+ * paths with different provenance:
+ *   - active_memory_plugin, relevant-memories, relevant_memories, and
+ *     hindsight_memories are stripped by DEFAULT_STRIP_INJECTED_CONTEXT_TAGS.
+ *   - inherited-rules, derived-focus, and error-detected are context-prelude
+ *     markers with separate semantics and are not in that default strip list.
+ *   - INTERNAL_CONTEXT_BEGIN_MARKER participates in the internal-context path,
+ *     where complete blocks are validated by hasCompleteInternalContextBlock.
+ *
+ * This helper only checks substring presence, so marker presence alone is NOT
+ * turn-identity evidence. Safety comes from constraining marker-based
+ * recognition to the last assembled user row (see
+ * assembledRowIsStructuralBareCurrentTurn).
  */
 const INJECTED_CONTEXT_MARKERS = [
   "<relevant-memories>",
+  "<relevant_memories>",
+  "<hindsight_memories>",
   "<inherited-rules>",
   "<derived-focus>",
   "<error-detected>",
@@ -628,16 +636,17 @@ function liveContentCarriesRecognizedInjectedContextMarker(liveContent: string):
  * gate prevents collapsing an unrelated turn that merely ends with the same
  * trailing line.
  *
- * Injected-context markers are USER-FORGEABLE text: stripInjectedContextBlocks
- * (compaction.ts) and DEFAULT_STRIP_INJECTED_CONTEXT_TAGS (db/config.ts) strip
- * them from stored content precisely because a user (or a retrieved prompt-
- * injection payload) can type them verbatim. So marker-based recognition is
- * trusted ONLY when the candidate assembled row is the LAST assembled user row
- * -- the genuine current turn's bare persisted face is necessarily the newest
- * user row. This denies the forgeable-marker path any earlier row: a distinct
- * live turn that merely ends with an EARLIER row's body can no longer be
- * recognized via a typed marker. The channel-timestamp path is server-injected
- * evidence and keeps its existing any-row matching.
+ * Marker presence is not treated as proof of provenance. Some recognized
+ * plugin tags are ordinary user-typeable text and are stripped from stored
+ * content by DEFAULT_STRIP_INJECTED_CONTEXT_TAGS; other entries in the marker
+ * list have distinct handling outside that default strip policy. For all of
+ * them, marker-based recognition is trusted ONLY when the candidate assembled
+ * row is the LAST assembled user row -- the genuine current turn's bare
+ * persisted face is necessarily the newest user row. This denies the marker
+ * path any earlier row: a distinct live turn that merely ends with an EARLIER
+ * row's body can no longer be recognized via a typed marker. The
+ * channel-timestamp path is server-injected evidence and keeps its existing
+ * any-row matching.
  */
 function assembledRowIsStructuralBareCurrentTurn(params: {
   liveContent: string;

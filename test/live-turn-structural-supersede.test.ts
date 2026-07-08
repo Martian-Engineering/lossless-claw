@@ -641,6 +641,40 @@ describe("appendUncoveredVolatileLiveInputsWithinBudget recognizes memory-first 
     expect(result.appendedMessages).toBe(1);
   });
 
+  it("recognizes default-stripped legacy and hindsight memory marker tags", () => {
+    // DEFAULT_STRIP_INJECTED_CONTEXT_TAGS also strips these tags. If they are
+    // the only live-current-turn decoration and the channel adds no timestamp,
+    // they need the same marker-based structural path as active_memory_plugin
+    // and relevant-memories.
+    for (const tag of ["relevant_memories", "hindsight_memories"]) {
+      const assembledMessages: AgentMessage[] = [
+        { role: "user", content: "earlier persisted turn" },
+        { role: "assistant", content: "earlier reply" },
+        { role: "user", content: WEBCHAT_BODY },
+      ] as AgentMessage[];
+      const liveMessages: AgentMessage[] = [
+        { role: "user", content: `<${tag}>memory note</${tag}>\n\n${WEBCHAT_BODY}` },
+      ] as AgentMessage[];
+
+      const result = appendUncoveredVolatileLiveInputsWithinBudget({
+        assembledMessages,
+        assembledEstimatedTokens: 10,
+        liveMessages,
+        tokenBudget: 1_000_000,
+      });
+
+      const userContents = result.messages
+        .filter((message) => (message as { role: string }).role === "user")
+        .map((message) => (message as { content: string }).content);
+      const decoratedCopies = userContents.filter((content) =>
+        content.includes(`<${tag}>`),
+      );
+      expect(decoratedCopies).toHaveLength(1);
+      expect(decoratedCopies[0]).toContain(WEBCHAT_BODY);
+      expect(result.appendedMessages).toBe(1);
+    }
+  });
+
   it("recognizes and appends a memory-first live turn wrapping a Conversation-info metadata face", () => {
     // Same defect, other decorated face: memory blocks prepended before a
     // "Conversation info (untrusted metadata):" preamble with no timestamp.
@@ -742,10 +776,10 @@ describe("appendUncoveredVolatileLiveInputsWithinBudget recognizes memory-first 
   });
 
   it("does NOT recognize a marker-bearing distinct turn that ends with an EARLIER assembled row's body (forgeable-marker guard)", () => {
-    // Security boundary (PR 978 review): injected-context markers are
-    // user-forgeable text (stripInjectedContextBlocks / DEFAULT_STRIP_INJECTED_
-    // CONTEXT_TAGS strip them from stored content precisely because a user can
-    // type them). A distinct current turn that TYPES a marker and merely ends
+    // Security boundary (PR 978 review): marker presence is not trusted as
+    // proof of provenance. Some plugin tags are user-typeable text that is
+    // stripped from stored content; other recognized markers have separate
+    // semantics. A distinct current turn that TYPES a marker and merely ends
     // with the verbatim body of an EARLIER assembled user row must not be
     // recognized via that coincidence. Marker recognition is now constrained to
     // the LAST assembled user row (the genuine current turn's bare face); here
