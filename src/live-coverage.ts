@@ -595,11 +595,13 @@ export function liveContentIsRecognizedDecoratedBareBody(params: {
 }
 
 /**
- * Recognized memory/context-plugin injected-context markers: a live turn
- * carrying one of these was decorated by a before_prompt_build prependContext
- * hook, which is trustworthy turn-identity evidence a forged-metadata block is
- * not (plugins inject these server-side; users cannot make their own message
- * trigger a plugin tag). Single named const.
+ * Recognized memory/context-plugin injected-context markers, as emitted by
+ * before_prompt_build prependContext hooks. These are ordinary text a user can
+ * type verbatim (they are stripped from stored content for exactly that
+ * reason), so a marker alone is NOT trusted turn-identity evidence: the
+ * marker-based recognition path is additionally constrained to the last
+ * assembled user row (see assembledRowIsStructuralBareCurrentTurn). Single
+ * named const.
  */
 const INJECTED_CONTEXT_MARKERS = [
   "<relevant-memories>",
