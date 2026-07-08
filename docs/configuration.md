@@ -382,7 +382,7 @@ LCM_EXPANSION_MODEL=openai/gpt-5.4-mini
 
 Cron scheduler keys (`agent:<agent>:cron:<job>...`) are isolated automatically when a new runtime `sessionId` reuses the same `sessionKey`. Configure `ignoreSessionPatterns` for cron only when the run should bypass LCM entirely; leave cron sessions included when they need in-run compaction. When OpenClaw exposes its runtime compaction delegate, `/compact` and overflow recovery for ignored sessions fall back to OpenClaw's built-in compaction path instead of LCM's summary DAG. Older hosts that do not expose that delegate keep the previous safe skip behavior.
 
-These examples are storage exclusions, not compaction preferences. Matching sessions do not create LCM conversation rows or store messages in LCM. The `agent:*:**:active-memory:**` pattern is intentionally broad because `**` spans colon-separated session-key segments, including channel or thread prefixes before `active-memory`.
+These examples are storage exclusions, not compaction preferences. Matching sessions do not create LCM conversation rows or store messages in LCM. The `agent:*:**:active-memory:**` pattern is intentionally broad because `**` spans colon-separated session-key segments, including nested prefixes before `active-memory`. The `agent:*:dreaming-narrative-**` example matches OpenClaw memory-core keys built with the `dreaming-narrative-` prefix ([source](https://github.com/openclaw/openclaw/blob/b81666ca6af25c86cc099983a4358cdc5ea9ced8/extensions/memory-core/src/dreaming-narrative.ts)).
 
 Example:
 

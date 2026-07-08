@@ -550,6 +550,7 @@ Why it matters:
 - cron scheduler keys are already isolated per runtime run, so ignore them only when they should bypass LCM compaction
 - matching sessions do not create LCM conversation rows or store messages in LCM
 - `agent:*:**:active-memory:**` is intentionally broad for active-memory keys because `**` spans colon-separated session-key segments
+- `agent:*:dreaming-narrative-**` matches OpenClaw memory-core keys built with the `dreaming-narrative-` prefix ([source](https://github.com/openclaw/openclaw/blob/b81666ca6af25c86cc099983a4358cdc5ea9ced8/extensions/memory-core/src/dreaming-narrative.ts))
 - ignored-session `/compact` calls use OpenClaw's built-in runtime compaction delegate when the host exposes it; older hosts keep the previous safe skip behavior
 
 Example:
