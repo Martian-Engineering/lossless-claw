@@ -202,6 +202,30 @@ describe("doctor contract runtime LLM compatibility", () => {
     expect(result.skipped).toEqual([]);
   });
 
+  it("does not combine summaryProvider with provider-prefixed summaryModel", () => {
+    const result = collectLosslessRuntimeLlmModelRefs({
+      plugins: {
+        entries: {
+          "lossless-claw": {
+            config: {
+              summaryProvider: "openrouter",
+              summaryModel: "anthropic/claude-sonnet-4-6",
+            },
+          },
+        },
+      },
+    });
+
+    expect(result.modelRefs).toEqual([
+      {
+        field: "summaryModel",
+        modelRef: "anthropic/claude-sonnet-4-6",
+        configPath: "plugins.entries.lossless-claw.config.summaryModel",
+      },
+    ]);
+    expect(result.skipped).toEqual([]);
+  });
+
   it("reports bare fallback models as skipped instead of inventing refs", () => {
     const result = collectLosslessRuntimeLlmModelRefs({
       plugins: {

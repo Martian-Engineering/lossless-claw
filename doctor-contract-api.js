@@ -44,14 +44,10 @@ function readSubagentPolicy(cfg) {
   return readModelOverridePolicy(cfg, "subagent");
 }
 
-function toModelRef(provider, model) {
+function toProviderPrefixedModelRef(provider, model) {
   const modelId = readString(model);
   if (!modelId) {
     return undefined;
-  }
-  const providerId = readString(provider);
-  if (providerId) {
-    return `${providerId}/${modelId}`;
   }
   const slash = modelId.indexOf("/");
   if (slash > 0 && slash < modelId.length - 1) {
@@ -59,7 +55,14 @@ function toModelRef(provider, model) {
     const directModel = modelId.slice(slash + 1).trim();
     return directProvider && directModel ? `${directProvider}/${directModel}` : undefined;
   }
-  return undefined;
+  const providerId = readString(provider);
+  return providerId ? `${providerId}/${modelId}` : undefined;
+}
+
+function toFallbackModelRef(provider, model) {
+  const providerId = readString(provider);
+  const modelId = readString(model);
+  return providerId && modelId ? `${providerId}/${modelId}` : undefined;
 }
 
 function uniqueModelRefs(modelRefs) {
@@ -88,7 +91,7 @@ function collectLosslessRuntimeLlmModelRefs(cfg) {
     if (!modelId) {
       return;
     }
-    const modelRef = toModelRef(provider, modelId);
+    const modelRef = toProviderPrefixedModelRef(provider, modelId);
     if (modelRef) {
       modelRefs.push({ field, modelRef, configPath });
       return;
@@ -124,7 +127,7 @@ function collectLosslessRuntimeLlmModelRefs(cfg) {
         });
         continue;
       }
-      const modelRef = toModelRef(fallback.provider, fallback.model);
+      const modelRef = toFallbackModelRef(fallback.provider, fallback.model);
       if (modelRef) {
         modelRefs.push({
           field: "fallbackProviders",
@@ -159,7 +162,7 @@ function collectLosslessSubagentModelRefs(cfg) {
   const skipped = [];
   const modelId = readString(config.expansionModel);
   if (modelId) {
-    const modelRef = toModelRef(config.expansionProvider, modelId);
+    const modelRef = toProviderPrefixedModelRef(config.expansionProvider, modelId);
     if (modelRef) {
       modelRefs.push({
         field: "expansionModel",

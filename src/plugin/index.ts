@@ -980,7 +980,7 @@ function stringifyRuntimeLlmContent(content: unknown): string {
 }
 
 /** Build the optional provider/model override ref accepted by runtime.llm.complete. */
-function buildRuntimeModelRef(provider: string | undefined, model: string): string | undefined {
+function buildProviderPrefixedRuntimeModelRef(provider: string | undefined, model: string): string | undefined {
   const modelId = model.trim();
   if (!modelId) {
     return undefined;
@@ -1065,7 +1065,7 @@ function buildConfiguredModelRequirement(params: {
   if (!modelId) {
     return undefined;
   }
-  const modelRef = buildRuntimeModelRef(
+  const modelRef = buildProviderPrefixedRuntimeModelRef(
     typeof params.provider === "string" ? params.provider.trim() : undefined,
     modelId,
   );
@@ -1082,6 +1082,36 @@ function buildConfiguredModelRequirement(params: {
   }
   return {
     configField: params.configField,
+    configPath: params.configPath,
+    modelRef,
+  };
+}
+
+/** Convert a fallback provider entry to the runtime ref used for policy validation. */
+function buildFallbackModelRequirement(params: {
+  configPath: string;
+  provider?: unknown;
+  model?: unknown;
+}): RuntimeLlmPolicyRequirement | { unresolved: RuntimeLlmPolicyCheck["unresolved"][number] } | undefined {
+  const providerId = typeof params.provider === "string" ? params.provider.trim() : "";
+  const modelId = typeof params.model === "string" ? params.model.trim() : "";
+  if (!providerId && !modelId) {
+    return undefined;
+  }
+  if (!providerId || !modelId) {
+    return {
+      unresolved: {
+        configField: "fallbackProviders",
+        configPath: params.configPath,
+        reason:
+          `${params.configPath} needs both provider and model. ` +
+          `Use provider/model fallback entries so openclaw doctor --fix can update plugins.entries.lossless-claw.llm.allowedModels.`,
+      },
+    };
+  }
+  const modelRef = `${providerId}/${modelId}`;
+  return {
+    configField: "fallbackProviders",
     configPath: params.configPath,
     modelRef,
   };
@@ -1123,8 +1153,7 @@ function collectRuntimeLlmPolicyRequirements(config: LcmDependencies["config"]):
     model: config.largeFileSummaryModel,
   }));
   for (const [index, fallback] of config.fallbackProviders.entries()) {
-    add(buildConfiguredModelRequirement({
-      configField: "fallbackProviders",
+    add(buildFallbackModelRequirement({
       configPath: `plugins.entries.lossless-claw.config.fallbackProviders[${index}]`,
       provider: fallback.provider,
       model: fallback.model,

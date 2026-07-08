@@ -967,6 +967,41 @@ describe("lcm plugin registration", () => {
     );
   });
 
+  it("uses fallbackProviders provider when checking runtime LLM policy", () => {
+    const { api, warnLog } = buildApi({
+      enabled: true,
+      fallbackProviders: [
+        { provider: "openrouter", model: "anthropic/claude-sonnet-4-6" },
+      ],
+    });
+    api.config = {
+      plugins: {
+        entries: {
+          "lossless-claw": {
+            config: {
+              fallbackProviders: [
+                { provider: "openrouter", model: "anthropic/claude-sonnet-4-6" },
+              ],
+            },
+            llm: {
+              allowModelOverride: true,
+              allowedModels: ["openrouter/anthropic/claude-sonnet-4-6"],
+            },
+          },
+        },
+      },
+    } as OpenClawPluginApi["config"];
+
+    lcmPlugin.register(api);
+
+    expect(warnLog).not.toHaveBeenCalledWith(
+      expect.stringContaining("fallbackProviders=anthropic/claude-sonnet-4-6"),
+    );
+    expect(warnLog).not.toHaveBeenCalledWith(
+      expect.stringContaining("Runtime LLM model override policy"),
+    );
+  });
+
   it("falls back to runtime plugin config for the startup banner when register runs before api.pluginConfig is populated", () => {
     const { api, infoLog } = buildApi(
       {},
