@@ -595,10 +595,32 @@ export function liveContentIsRecognizedDecoratedBareBody(params: {
 }
 
 /**
+ * Recognized memory/context-plugin injected-context markers: a live turn
+ * carrying one of these was decorated by a before_prompt_build prependContext
+ * hook, which is trustworthy turn-identity evidence a forged-metadata block is
+ * not (plugins inject these server-side; users cannot make their own message
+ * trigger a plugin tag). Single named const.
+ */
+const INJECTED_CONTEXT_MARKERS = [
+  "<relevant-memories>",
+  "<inherited-rules>",
+  "<derived-focus>",
+  "<error-detected>",
+  "<active_memory_plugin>",
+  INTERNAL_CONTEXT_BEGIN_MARKER,
+] as const;
+
+function liveContentCarriesRecognizedInjectedContextMarker(liveContent: string): boolean {
+  return INJECTED_CONTEXT_MARKERS.some((marker) => liveContent.includes(marker));
+}
+
+/**
  * Recognize whether an assembled user row is a BARE copy of the live current
  * turn (its persisted face): it must be a line-aligned trailing segment of the
  * live content, strictly shorter than it, AND the live content must carry
- * recognized decoration (see liveContentIsRecognizedDecoratedBareBody). The
+ * recognized decoration evidence -- EITHER a channel timestamp (see
+ * liveContentIsRecognizedDecoratedBareBody) OR a recognized injected-context
+ * marker (memory-first turns are not always channel-timestamped). The
  * strictly-shorter guard distinguishes a bare/timestamped body row from the
  * decorated live copy itself (equal length, never collapsed); the decoration
  * gate prevents collapsing an unrelated turn that merely ends with the same
@@ -613,6 +635,15 @@ function assembledRowIsStructuralBareCurrentTurn(params: {
   }
   if (params.assembledContent.length >= params.liveContent.length) {
     return false;
+  }
+  if (
+    liveContentCarriesRecognizedInjectedContextMarker(params.liveContent) &&
+    liveContentContainsBareBody({
+      liveContent: params.liveContent,
+      bareContent: params.assembledContent,
+    })
+  ) {
+    return true;
   }
   return liveContentIsRecognizedDecoratedBareBody({
     liveContent: params.liveContent,
