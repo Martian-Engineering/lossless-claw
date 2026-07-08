@@ -1,12 +1,13 @@
 // Same-turn model-facing body match (Fix A). A runtime copy wrapped in the
 // standard OpenClaw untrusted-metadata block (no channel timestamp) is the
-// decorated face of the same turn as its bare persisted row: both reduce to the
-// same full model-facing body once a structurally validated leading block and a
-// leading channel timestamp are stripped. openClawInboundBodiesMatch is the
-// shared reduction the after-turn batch matcher uses to collapse that pair; it
-// is byte-equality of the FULL stripped bodies (not containment), so a forged
-// frame concealing a different body, or a distinct turn whose trailing line
-// merely matches, stays fail-closed.
+// decorated face of the same turn as its bare persisted row: the runtime side
+// reduces to the same full model-facing body as the bare side once a
+// structurally validated leading block and a leading channel timestamp are
+// stripped. openClawInboundBodiesMatch is the shared directional reduction the
+// after-turn batch matcher uses to collapse that pair; it is byte-equality of
+// the FULL stripped bodies (not containment), so a forged frame concealing a
+// different body, or a distinct turn whose trailing line merely matches, stays
+// fail-closed.
 import { describe, expect, it } from "vitest";
 import { openClawInboundBodiesMatch } from "../src/openclaw-inbound-metadata.js";
 
@@ -25,6 +26,11 @@ describe("openClawInboundBodiesMatch (same-turn model-facing body)", () => {
   it("matches a metadata-block runtime copy (no timestamp) against its bare persisted row", () => {
     const bare = "Hello there Aria";
     expect(openClawInboundBodiesMatch(metadataWrapped(bare), bare)).toBe(true);
+  });
+
+  it("does NOT strip metadata-shaped text from the persisted-side row", () => {
+    const bare = "Hello there Aria";
+    expect(openClawInboundBodiesMatch(bare, metadataWrapped(bare))).toBe(false);
   });
 
   it("does NOT match a metadata-wrapped frame concealing a DIFFERENT body (forgery stays fail-closed)", () => {

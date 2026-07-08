@@ -81,6 +81,7 @@ export class BatchDeduplicator {
     persistedContent: string,
     batchRole: string,
     batchContent: string,
+    options?: { allowUntimestampedInboundBodyMatch?: boolean },
   ): boolean {
     if (
       messageIdentity(persistedRole, persistedContent) ===
@@ -91,15 +92,14 @@ export class BatchDeduplicator {
     if (persistedRole !== "user" || batchRole !== "user") {
       return false;
     }
-    // Bare-vs-wrapped same turn: the transcript persists the BARE body while the
-    // runtime array carries the copy wrapped in the standard untrusted-metadata
-    // block (no channel timestamp), so their identity_hashes differ (the block
-    // survives canonicalization) and the timestamp decoration gate below cannot
-    // see it. Collapse when both reduce to the same FULL model-facing body once a
-    // structurally validated leading block and channel timestamp are stripped.
-    // Full-body equality, not containment, so a forged frame concealing a
-    // different body stays unequal and is never collapsed (fail-closed).
-    if (openClawInboundBodiesMatch(batchContent, persistedContent)) {
+    // A metadata block alone is user-forgeable, so body equality after stripping
+    // it is not proof of same-turn decoration. Covered-frontier callers may use
+    // this no-timestamp match only as alignment support; another exact or
+    // timestamp-backed row must still anchor the slice.
+    if (
+      options?.allowUntimestampedInboundBodyMatch === true &&
+      openClawInboundBodiesMatch(batchContent, persistedContent)
+    ) {
       return true;
     }
     return liveContentIsRecognizedDecoratedBareBody({
@@ -164,6 +164,17 @@ export class BatchDeduplicator {
             )
           ) {
             exactAnchor = true;
+            continue;
+          }
+          if (
+            this.runtimeRowCoversPersistedFrontierRow(
+              tailMessages[i]!.role,
+              tailMessages[i]!.content,
+              storedBatch[i]!.role,
+              storedBatch[i]!.content,
+              { allowUntimestampedInboundBodyMatch: true },
+            )
+          ) {
             continue;
           }
           aligned = false;

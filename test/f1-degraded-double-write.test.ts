@@ -1,17 +1,17 @@
 // F1 follow-up repro: does the DEGRADED (non-covered transcript) afterTurn path
 // suffer the same store double-write the COVERED path was fixed for?
 //
-// The covered path (alignRuntimeBatchAgainstCoveredFrontier) learned to collapse
-// a DECORATED runtime copy onto the BARE persisted row of the same turn via
-// runtimeRowCoversPersistedFrontierRow. The degraded path (deduplicateAfterTurnBatch
-// + deduplicateSuffixFallback) still compares with raw messageIdentity only, so a
-// decorated copy whose bare body is already persisted should NOT match and should
-// be ingested as a SECOND row.
+// The covered path (alignRuntimeBatchAgainstCoveredFrontier) can collapse a
+// DECORATED runtime copy onto the BARE persisted row of the same turn via
+// runtimeRowCoversPersistedFrontierRow. The degraded path
+// (deduplicateAfterTurnBatch + deduplicateSuffixFallback) has weaker evidence,
+// so it must stay timestamp-gated: metadata-only body equality is not enough to
+// collapse a potentially genuine repeat.
 //
-// This test drives the degraded path by pointing the bootstrap checkpoint at a
-// MISSING session file (transcriptCovered=false). It asserts the DESIRED behavior
-// (single collapsed user row). On the current code it is expected to FAIL, showing
-// 2 rows — that failure IS the double-write demonstration.
+// These tests drive the degraded path by pointing the bootstrap checkpoint at a
+// MISSING session file (transcriptCovered=false), then pin both sides of the
+// safety boundary: timestamp-backed collapse is allowed, metadata-only body
+// equality keeps both rows.
 import { afterEach, describe, expect, it } from "vitest";
 import { LcmContextEngine } from "../src/engine.js";
 import {
@@ -65,7 +65,7 @@ describe("F1 degraded-path double-write", () => {
       lastProcessedEntryHash: "checkpoint-hash",
     });
 
-    // 3) afterTurn batch carries the DECORATED copy of the SAME turn.
+    // 3) afterTurn batch carries the timestamp-decorated copy of the SAME turn.
     const decorated =
       'Conversation info (untrusted metadata):\n```json\n{\n  "chat_id": "telegram:100000001",\n  "sender": "sam.rivera"\n}\n```\n\n' +
       channelTimestamped(bare);
@@ -313,7 +313,7 @@ describe("F1 degraded-path double-write", () => {
     expect(userRows.length).toBe(2);
   });
 
-  it("degraded path COLLAPSES a metadata-block same-body turn onto its bare persisted row", async () => {
+  it("degraded path KEEPS a metadata-block same-body turn without timestamp evidence", async () => {
     const engine: LcmContextEngine = createEngine();
     const sessionId = "f1-degraded-metadata-same-body";
     const sessionKey = "agent:main:f1-degraded-metadata-same-body";
@@ -361,13 +361,69 @@ describe("F1 degraded-path double-write", () => {
 
     const stored = await engine.getConversationStore().getMessages(conversation.conversationId);
     const userRows = stored.filter((m) => m.role === "user");
-    // Reversal of the earlier keep-both behavior (was: strict decoration gate,
-    // metadata block not trusted without a channel timestamp). The runtime copy
-    // strips, via a STRUCTURALLY validated leading block, to the same full body
-    // ("ok") as the bare persisted row, so it is the decorated face of the same
-    // turn and collapses. Full-body equality (not containment) drops no user
-    // content, only the non-anchoring metadata wrapper; a frame concealing a
-    // DIFFERENT body still fails equality and stays fail-closed.
-    expect(userRows.length).toBe(1);
+    // In the degraded path, a metadata block alone is not proof of same-turn
+    // decoration: a user can author that frame around a legitimate repeated
+    // short body. Without timestamp or covered-frontier evidence, keep both.
+    expect(userRows.length).toBe(2);
+  });
+
+  it("oversized degraded path KEEPS a metadata-block same-body turn without timestamp evidence", async () => {
+    const engine: LcmContextEngine = createEngine();
+    const sessionId = "f1-oversized-degraded-metadata-same-body";
+    const sessionKey = "agent:main:f1-oversized-degraded-metadata-same-body";
+
+    const conversation = await engine
+      .getConversationStore()
+      .getOrCreateConversation(sessionId, { sessionKey });
+
+    const priorBody = "ok";
+    const bulk = await engine.getConversationStore().createMessagesBulk([
+      {
+        conversationId: conversation.conversationId,
+        seq: 0,
+        role: "assistant",
+        content: "previous reply",
+        tokenCount: 2,
+        skipReplayTimestampFloodGuard: true,
+      },
+      {
+        conversationId: conversation.conversationId,
+        seq: 1,
+        role: "user",
+        content: priorBody,
+        tokenCount: 2,
+        skipReplayTimestampFloodGuard: true,
+      },
+    ]);
+    await engine
+      .getSummaryStore()
+      .appendContextMessages(conversation.conversationId, bulk.map((m) => m.messageId));
+
+    const missingSessionFile = createSessionFilePath("f1-oversized-degraded-metadata-same-body");
+    await engine.getSummaryStore().upsertConversationBootstrapState({
+      conversationId: conversation.conversationId,
+      sessionFilePath: missingSessionFile,
+      lastSeenSize: 24_000,
+      lastSeenMtimeMs: 1_700_000_000_000,
+      lastProcessedOffset: 24_000,
+      lastProcessedEntryHash: "checkpoint-hash",
+    });
+
+    const metadataOnly =
+      'Conversation info (untrusted metadata):\n```json\n{\n  "chat_id": "telegram:100000001",\n  "sender": "sam.rivera"\n}\n```\n\n' +
+      priorBody;
+    await engine.afterTurn({
+      sessionId,
+      sessionKey,
+      sessionFile: missingSessionFile,
+      messages: [makeMessage({ role: "user", content: metadataOnly })],
+      prePromptMessageCount: 0,
+      tokenBudget: 4_096,
+    });
+
+    const stored = await engine.getConversationStore().getMessages(conversation.conversationId);
+    expect(stored).toHaveLength(3);
+    const userRows = stored.filter((m) => m.role === "user");
+    expect(userRows.length).toBe(2);
   });
 });

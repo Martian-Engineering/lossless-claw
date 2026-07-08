@@ -90,17 +90,19 @@ export function openClawInboundModelFacingBody(content: string): string {
 }
 
 /**
- * True when `liveContent` and `bareContent` reduce to the same non-empty
- * model-facing body (see openClawInboundModelFacingBody). This is byte-equality
- * of the full stripped bodies, not containment, so a distinct turn whose
- * trailing line merely matches a prior body, or a forged metadata frame
- * concealing a different body, is never treated as the same turn (fail-closed).
- * Only a structurally validated leading block is stripped, so quoting
- * "(untrusted metadata)" as prose does not reduce a turn to a shorter body.
+ * True when the runtime/decorated candidate reduces to the same non-empty body
+ * as the persisted bare candidate. Metadata and recap blocks are stripped only
+ * from the runtime side; the persisted side gets timestamp-normalized but keeps
+ * metadata-shaped text verbatim, because persisted content is user-authored
+ * unless another layer proves otherwise. This is byte-equality of the full
+ * reduced bodies, not containment, so a distinct turn whose trailing line
+ * merely matches a prior body, or a forged metadata frame concealing a
+ * different body, is never treated as the same turn (fail-closed).
  */
 export function openClawInboundBodiesMatch(liveContent: string, bareContent: string): boolean {
   const liveBody = openClawInboundModelFacingBody(liveContent);
-  return liveBody.length > 0 && liveBody === openClawInboundModelFacingBody(bareContent);
+  const bareBody = stripLeadingOpenClawInboundTimestamp(bareContent.trimStart()).trim();
+  return liveBody.length > 0 && liveBody === bareBody;
 }
 
 const CONVERSATION_INFO_KEYS = new Set([
