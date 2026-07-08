@@ -49,6 +49,36 @@ function metadataWrappedWithRecap(recap: string, body: string): string {
   );
 }
 
+function hostJsonBlock(heading: string, payload: unknown): string {
+  return [heading, "```json", JSON.stringify(payload, null, 2), "```"].join("\n");
+}
+
+function metadataWrappedWithContextAndRecap(recap: string, body: string): string {
+  return (
+    'Conversation info (untrusted metadata):\n```json\n{\n  "chat_id": "telegram:100000001",\n  "sender": "sam.rivera"\n}\n```\n\n' +
+    hostJsonBlock("Reply target of current user message (untrusted, for context):", {
+      sender_label: "lee.chen",
+      body: "did the build finish?",
+    }) +
+    "\n\n" +
+    recap +
+    "\n\n" +
+    body
+  );
+}
+
+function metadataWrappedWithReplyContext(replyBody: string, body: string): string {
+  return (
+    'Conversation info (untrusted metadata):\n```json\n{\n  "chat_id": "telegram:100000001",\n  "sender": "sam.rivera"\n}\n```\n\n' +
+    hostJsonBlock("Reply target of current user message (untrusted, for context):", {
+      sender_label: "lee.chen",
+      body: replyBody,
+    }) +
+    "\n\n" +
+    body
+  );
+}
+
 const TWO_ENTRY_RECAP = historyRecapBlock([
   { sender: "lee.chen", timestamp_ms: 1780000000000, body: "did the build finish?" },
   { sender: "sam.rivera", timestamp_ms: 1780000005000, body: "not sure, checking" },
@@ -123,6 +153,13 @@ describe("openClawInboundBodiesMatch with a host chat-history recap block (issue
     expect(openClawInboundBodiesMatch(metadataWrappedWithRecap(FIVE_ENTRY_RECAP, bare), bare)).toBe(
       true,
     );
+  });
+
+  it("matches when another host context block appears before the recap", () => {
+    const bare = "what's the status on the deploy?";
+    expect(
+      openClawInboundBodiesMatch(metadataWrappedWithContextAndRecap(TWO_ENTRY_RECAP, bare), bare),
+    ).toBe(true);
   });
 
   it("does NOT match when a VALID recap block conceals a DIFFERENT body (recap widening stays fail-closed)", () => {
@@ -210,6 +247,24 @@ describe("canonicalizeOpenClawInboundMetadataIdentityContent / buildMessageIdent
     const small = metadataWrappedWithRecap(TWO_ENTRY_RECAP, bare);
     const large = metadataWrappedWithRecap(FIVE_ENTRY_RECAP, bare);
     expect(buildMessageIdentityHash("user", large)).toBe(buildMessageIdentityHash("user", small));
+  });
+
+  it("preserves host context in the identity hash while ignoring a following recap", () => {
+    const bare = "what's the status on the deploy?";
+    const noRecap = metadataWrappedWithReplyContext("did the build finish?", bare);
+    const withContextAndRecap = metadataWrappedWithContextAndRecap(TWO_ENTRY_RECAP, bare);
+    expect(buildMessageIdentityHash("user", withContextAndRecap)).toBe(
+      buildMessageIdentityHash("user", noRecap),
+    );
+  });
+
+  it("keeps different host context distinct in the identity hash", () => {
+    const bare = "yes";
+    const firstReply = metadataWrappedWithReplyContext("ship the build?", bare);
+    const secondReply = metadataWrappedWithReplyContext("cancel the build?", bare);
+    expect(buildMessageIdentityHash("user", firstReply)).not.toBe(
+      buildMessageIdentityHash("user", secondReply),
+    );
   });
 
   it("does NOT fold a malformed recap block into the canonicalized identity content", () => {

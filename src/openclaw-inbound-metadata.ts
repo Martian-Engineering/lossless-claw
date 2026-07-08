@@ -10,9 +10,23 @@ const OPENCLAW_INBOUND_HISTORY_RECAP_HEADERS = [
   "Conversation context (untrusted, chronological, selected for current message):",
 ];
 
+const OPENCLAW_INBOUND_CONTEXT_BLOCK_HEADINGS = [
+  "Thread starter (untrusted, for context)",
+  "Reply chain of current user message (untrusted, nearest first)",
+  "Reply target of current user message (untrusted, for context)",
+  "Forwarded message context (untrusted metadata)",
+  "Location (untrusted metadata)",
+];
+
 function escapeOpenClawRecapHeaderRegExpLiteral(value: string): string {
   return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 }
+
+const OPENCLAW_INBOUND_CONTEXT_BLOCK_RE = new RegExp(
+  `^(?:${OPENCLAW_INBOUND_CONTEXT_BLOCK_HEADINGS.map(
+    escapeOpenClawRecapHeaderRegExpLiteral,
+  ).join("|")}):` + String.raw`\r?\n\`\`\`json\r?\n([\s\S]*?)\r?\n\`\`\``,
+);
 
 const OPENCLAW_INBOUND_HISTORY_RECAP_HEADER_SRC = `(?:${OPENCLAW_INBOUND_HISTORY_RECAP_HEADERS.map(
   escapeOpenClawRecapHeaderRegExpLiteral,
@@ -134,6 +148,7 @@ export function extractBodyAfterOpenClawInboundMetadataBlock(content: string): s
     remaining = secondCandidate.slice(secondMatch[0].length);
   }
 
+  remaining = splitLeadingOpenClawInboundContextBlocks(remaining).remaining;
   const recapCandidate = remaining.trimStart();
   const recapLength = matchLeadingOpenClawInboundHistoryRecap(recapCandidate);
   if (recapLength > 0) {
@@ -268,11 +283,20 @@ export function canonicalizeOpenClawInboundMetadataIdentityContent(
   // shifts turn to turn even when it decorates the same logical message, so
   // it is dropped entirely from the identity input rather than canonicalized
   // (unlike the metadata blocks above, which keep their stable fields).
-  const recapCandidate = afterMetadataBlocks.trimStart();
+  const contextSplit = splitLeadingOpenClawInboundContextBlocks(afterMetadataBlocks);
+  const recapCandidate = contextSplit.remaining.trimStart();
   const recapLength = matchLeadingOpenClawInboundHistoryRecap(recapCandidate);
-  remaining = stripMetadataSeparator(
-    recapLength > 0 ? recapCandidate.slice(recapLength) : afterMetadataBlocks,
-  );
+  if (recapLength > 0) {
+    const contextPrefix = stripMetadataSeparator(contextSplit.blocksText).trimEnd();
+    const afterRecap = stripMetadataSeparator(recapCandidate.slice(recapLength));
+    remaining = contextPrefix
+      ? afterRecap.trim().length > 0
+        ? `${contextPrefix}\n\n${afterRecap}`
+        : contextPrefix
+      : afterRecap;
+  } else {
+    remaining = stripMetadataSeparator(afterMetadataBlocks);
+  }
 
   return remaining.trim().length > 0
     ? `${prelude}${canonicalBlocks.join("\n\n")}\n\n${remaining}`
@@ -391,6 +415,34 @@ function parseOpenClawInboundMetadataRecord(
   return Object.keys(parsed).some((key) => knownKeys.has(key))
     ? (parsed as Record<string, unknown>)
     : null;
+}
+
+function splitLeadingOpenClawInboundContextBlocks(content: string): {
+  blocksText: string;
+  remaining: string;
+} {
+  let remaining = content;
+  let blocksText = "";
+  while (true) {
+    const candidate = remaining.trimStart();
+    const leadingWhitespace = remaining.slice(0, remaining.length - candidate.length);
+    const match = OPENCLAW_INBOUND_CONTEXT_BLOCK_RE.exec(candidate);
+    if (!match || !isValidOpenClawInboundContextPayload(match[1] ?? "")) {
+      return { blocksText, remaining };
+    }
+    blocksText += leadingWhitespace + match[0];
+    remaining = candidate.slice(match[0].length);
+  }
+}
+
+function isValidOpenClawInboundContextPayload(json: string): boolean {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(json);
+  } catch {
+    return false;
+  }
+  return parsed !== null && (typeof parsed === "object" || Array.isArray(parsed));
 }
 
 /**
