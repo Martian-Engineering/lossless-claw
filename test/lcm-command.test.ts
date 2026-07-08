@@ -1708,6 +1708,7 @@ describe("lcm command", () => {
     await createRolloverConversationData(fixture, {
       conversationId: firstArchived.conversationId,
       label: "oldone",
+      transcriptEntryId: "entry_oldone",
       includeSummary: true,
       includeLargeFile: true,
       includeFocusBrief: true,
@@ -1758,6 +1759,21 @@ describe("lcm command", () => {
     const sourceMessage = fixture.db
       .prepare(`SELECT message_id FROM messages WHERE conversation_id = ? LIMIT 1`)
       .get(firstArchived.conversationId) as { message_id: number };
+    await fixture.conversationStore.upsertMessageTranscriptAnchorTrust({
+      messageId: sourceMessage.message_id,
+      conversationId: firstArchived.conversationId,
+      transcriptEntryId: "entry_oldone",
+      trustState: "verified",
+      source: "test",
+      reason: "source rollover anchor",
+    });
+    await fixture.conversationStore.upsertConversationTranscriptEpoch({
+      conversationId: firstArchived.conversationId,
+      sessionId: firstArchived.sessionId,
+      sessionKey: firstArchived.sessionKey,
+      migrationMode: "legacy_prefix",
+      metadata: { reason: "source rollover epoch" },
+    });
     for (const [batchId, conversationId] of [
       ["pcb_rollover_source", firstArchived.conversationId],
       ["pcb_rollover_target", active.conversationId],
@@ -1817,6 +1833,26 @@ describe("lcm command", () => {
       { seq: 2, content: "oldtwo message" },
       { seq: 3, content: "active message" },
     ]);
+    await expect(
+      fixture.conversationStore.getMessageTranscriptAnchorTrust(sourceMessage.message_id),
+    ).resolves.toMatchObject({
+      conversationId: active.conversationId,
+      transcriptEntryId: "entry_oldone",
+      trustState: "verified",
+    });
+    await expect(
+      fixture.conversationStore.getConversationTranscriptEpoch(active.conversationId),
+    ).resolves.toMatchObject({
+      conversationId: active.conversationId,
+      migrationMode: "legacy_prefix",
+      metadata: {
+        reason: "rollover split repair merged transcript epoch state",
+        sourceConversationIds: [firstArchived.conversationId, secondArchived.conversationId],
+      },
+    });
+    await expect(
+      fixture.conversationStore.getConversationTranscriptEpoch(firstArchived.conversationId),
+    ).resolves.toBeNull();
 
     const targetContext = fixture.db
       .prepare(
@@ -3118,6 +3154,67 @@ describe("lcm command", () => {
     expect(repaired?.content).not.toContain("[Truncated from 111 tokens]");
   });
 
+  it("reports transcript anchor audit counts without message content", async () => {
+    const fixture = createCommandFixture();
+    tempDirs.add(fixture.tempDir);
+    dbPaths.add(fixture.dbPath);
+
+    const conversation = await fixture.conversationStore.createConversation({
+      sessionId: "doctor-anchor-audit",
+      sessionKey: "agent:main:telegram:direct:doctor-anchor-audit",
+    });
+    const [verified, suspect] = await fixture.conversationStore.createMessagesBulk([
+      {
+        conversationId: conversation.conversationId,
+        seq: 0,
+        role: "user",
+        content: "sensitive content that must not appear",
+        tokenCount: 7,
+        transcriptEntryId: "entry_verified",
+      },
+      {
+        conversationId: conversation.conversationId,
+        seq: 1,
+        role: "assistant",
+        content: "",
+        tokenCount: 0,
+        transcriptEntryId: "entry_suspect",
+      },
+    ]);
+    await fixture.conversationStore.upsertMessageTranscriptAnchorTrust({
+      messageId: verified.messageId,
+      conversationId: conversation.conversationId,
+      transcriptEntryId: "entry_verified",
+      trustState: "verified",
+      source: "test",
+      reason: "verified test anchor",
+    });
+    await fixture.conversationStore.upsertMessageTranscriptAnchorTrust({
+      messageId: suspect.messageId,
+      conversationId: conversation.conversationId,
+      transcriptEntryId: "entry_suspect",
+      trustState: "suspect",
+      source: "test",
+      reason: "suspect test anchor",
+    });
+    await fixture.conversationStore.upsertConversationTranscriptEpoch({
+      conversationId: conversation.conversationId,
+      sessionId: conversation.sessionId,
+      sessionKey: conversation.sessionKey,
+      migrationMode: "legacy_prefix",
+      metadata: { reason: "test legacy prefix" },
+    });
+
+    const result = await fixture.command.handler(createCommandContext("doctor anchors"));
+
+    expect(result.text).toContain("🩺 Lossless Claw Anchor Audit");
+    expect(result.text).toContain("verified: 1");
+    expect(result.text).toContain("suspect: 1");
+    expect(result.text).toContain("legacy-prefix: 1");
+    expect(result.text).toContain("status: preserved with ignored legacy anchors");
+    expect(result.text).not.toContain("sensitive content");
+  });
+
   it("creates a standalone database backup", async () => {
     const fixture = createCommandFixture();
     tempDirs.add(fixture.tempDir);
@@ -3314,6 +3411,7 @@ describe("lcm command helpers", () => {
       kind: "doctor_rollover_splits",
       apply: false,
     });
+    expect(__testing.parseLcmCommand("doctor anchors")).toEqual({ kind: "doctor_anchors" });
     expect(__testing.parseLcmCommand("doctor apply rollover-splits confirm")).toEqual({
       kind: "doctor_rollover_splits",
       apply: true,
