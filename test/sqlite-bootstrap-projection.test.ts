@@ -837,9 +837,9 @@ describe("LcmContextEngine.bootstrap sqlite transcript projection", () => {
         },
       }),
     ).resolves.toMatchObject({
-      bootstrapped: false,
-      importedMessages: 0,
-      reason: "conversation already up to date",
+      bootstrapped: true,
+      importedMessages: 2,
+      reason: "reconciled missing session messages",
     });
 
     const conversation = await engine.getConversationStore().getConversationForSession({
@@ -861,6 +861,16 @@ describe("LcmContextEngine.bootstrap sqlite transcript projection", () => {
     }>;
     expect(rows).toEqual([
       { message_id: 1, content: "", transcript_entry_id: null },
+      {
+        message_id: 2,
+        content: "this is the user message that was skipped",
+        transcript_entry_id: "entry-current-user-before-blank",
+      },
+      {
+        message_id: 3,
+        content: "current assistant content",
+        transcript_entry_id: "entry-current-assistant-blank-id",
+      },
     ]);
 
     const trustRows = db
@@ -883,6 +893,18 @@ describe("LcmContextEngine.bootstrap sqlite transcript projection", () => {
         trust_state: "suspect",
         reason: "entry id content mismatch",
       },
+      {
+        message_id: 2,
+        transcript_entry_id: "entry-current-user-before-blank",
+        trust_state: "verified",
+        reason: "message imported from transcript entry",
+      },
+      {
+        message_id: 3,
+        transcript_entry_id: "entry-current-assistant-blank-id",
+        trust_state: "verified",
+        reason: "message imported from transcript entry",
+      },
     ]);
 
     const epochRow = db
@@ -894,7 +916,7 @@ describe("LcmContextEngine.bootstrap sqlite transcript projection", () => {
       .get(conversation!.conversationId) as {
       session_id: string;
       session_key: string;
-      frontier_entry_id: string;
+      frontier_entry_id: string | null;
       frontier_seq: number;
       migration_mode: string;
       metadata_json: string;
@@ -902,13 +924,133 @@ describe("LcmContextEngine.bootstrap sqlite transcript projection", () => {
     expect(epochRow).toEqual({
       session_id: sessionId,
       session_key: sessionKey,
-      frontier_entry_id: "entry-current-assistant-blank-id",
-      frontier_seq: 2,
+      frontier_entry_id: null,
+      frontier_seq: 0,
       migration_mode: "legacy_prefix",
       metadata_json: JSON.stringify({
         reason: "unproven transcript anchors",
         classification: "legacy_prefix",
       }),
+    });
+  });
+
+  it("imports fresh post-tail messages when establishing a legacy-prefix epoch", async () => {
+    const sessionId = "sqlite-afterturn-legacy-prefix-fresh-suffix-session";
+    const sessionKey = "agent:main:sqlite-afterturn-legacy-prefix-fresh-suffix-session";
+    const visibleEntries: VisibleSessionTranscriptMessageEntry[] = [
+      {
+        entryId: "entry-fresh-user",
+        parentId: "entry-model-snapshot",
+        seq: 4,
+        role: "user",
+        message: { role: "user", content: "you there?" } satisfies AgentMessage,
+        createdAt: "2026-07-08T16:45:51.306Z",
+      },
+      {
+        entryId: "entry-fresh-assistant",
+        parentId: "entry-fresh-user",
+        seq: 5,
+        role: "assistant",
+        message: { role: "assistant", content: "I am here." } satisfies AgentMessage,
+        createdAt: "2026-07-08T16:45:57.463Z",
+      },
+    ];
+    const readVisibleSessionTranscriptMessageEntries = vi.fn(async () => visibleEntries);
+    const { engine, db } = createEngineWithDepsOverridesAndDb({
+      readVisibleSessionTranscriptMessageEntries,
+    } satisfies Partial<LcmDependencies>);
+
+    await expect(
+      engine.ingestBatch({
+        sessionId,
+        sessionKey,
+        messages: [
+          attachTranscriptEntryMeta(
+            { role: "assistant", content: "" } satisfies AgentMessage,
+            {
+              entryId: "entry-stale-blank",
+              parentId: null,
+              timestamp: "2026-05-20T12:00:00.000Z",
+            },
+          ),
+        ],
+      }),
+    ).resolves.toMatchObject({ ingestedCount: 1 });
+
+    await expect(
+      engine.afterTurn({
+        sessionId,
+        sessionKey,
+        sessionFile: "/tmp/ignored-lossless-sqlite-fresh-suffix.jsonl",
+        messages: [] satisfies AgentMessage[],
+        prePromptMessageCount: 0,
+        runtimeContext: {
+          transcriptStorage: { kind: "sqlite" },
+          sessionTarget: {
+            agentId: "main",
+            sessionId,
+            sessionKey,
+            storePath: "/tmp/openclaw-agent.sqlite",
+          },
+        },
+      }),
+    ).resolves.toBeUndefined();
+
+    const conversation = await engine.getConversationStore().getConversationForSession({
+      sessionId,
+      sessionKey,
+    });
+    expect(conversation).not.toBeNull();
+
+    const messages = await engine.getConversationStore().getMessages(conversation!.conversationId);
+    expect(messages.map((message) => message.content)).toEqual([
+      "",
+      "you there?",
+      "I am here.",
+    ]);
+
+    const trustRows = db
+      .prepare(
+        `SELECT m.content, m.transcript_entry_id, t.trust_state, t.source
+         FROM messages m
+         LEFT JOIN message_transcript_anchor_trust t ON t.message_id = m.message_id
+         WHERE m.conversation_id = ?
+         ORDER BY m.seq`,
+      )
+      .all(conversation!.conversationId) as Array<{
+      content: string;
+      transcript_entry_id: string | null;
+      trust_state: string | null;
+      source: string | null;
+    }>;
+    expect(trustRows).toEqual([
+      {
+        content: "",
+        transcript_entry_id: "entry-stale-blank",
+        trust_state: "suspect",
+        source: "projection-audit",
+      },
+      {
+        content: "you there?",
+        transcript_entry_id: "entry-fresh-user",
+        trust_state: "verified",
+        source: "transcript-import",
+      },
+      {
+        content: "I am here.",
+        transcript_entry_id: "entry-fresh-assistant",
+        trust_state: "verified",
+        source: "transcript-import",
+      },
+    ]);
+
+    const epoch = await engine
+      .getConversationStore()
+      .getConversationTranscriptEpoch(conversation!.conversationId);
+    expect(epoch).toMatchObject({
+      frontierEntryId: null,
+      frontierSeq: 0,
+      migrationMode: "legacy_prefix",
     });
   });
 
