@@ -76,6 +76,7 @@ import type {
 import {
   classifyTranscriptAnchors,
   type TranscriptAnchorAuditEntry,
+  type TranscriptAnchorAuditMessage,
 } from "./transcript-anchor-audit.js";
 import { estimateTokens } from "./estimate-tokens.js";
 import {
