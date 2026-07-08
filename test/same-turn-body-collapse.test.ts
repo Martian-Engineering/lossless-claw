@@ -396,6 +396,52 @@ describe("openClawInboundBodiesMatch with a 6.10-era line-format host chat-histo
   });
 });
 
+// A third recap header grammar, observed verbatim in live telegram and slack
+// traffic (2026-07-08): some deployments relabel the same chronological recap
+// under "Conversation context (untrusted, chronological, selected for current
+// message):" instead of "Chat history since last reply (untrusted, for
+// context):", ahead of the same recap-line body shape.
+const CONVERSATION_CONTEXT_RECAP_HEADER =
+  "Conversation context (untrusted, chronological, selected for current message):";
+
+function metadataWrappedWithHeaderLineRecap(
+  header: string,
+  entryLines: string[],
+  body: string,
+): string {
+  return (
+    'Conversation info (untrusted metadata):\n```json\n{\n  "chat_id": "telegram:100000001",\n  "sender": "sam.rivera"\n}\n```\n\n' +
+    [header, ...entryLines].join("\n") +
+    "\n\n" +
+    body
+  );
+}
+
+describe("openClawInboundBodiesMatch with the conversation-context recap header variant (issue #973)", () => {
+  it("matches a decorated face carrying a conversation-context-header line recap against its bare persisted row", () => {
+    const bare = "what's the status on the deploy?";
+    const decorated = metadataWrappedWithHeaderLineRecap(
+      CONVERSATION_CONTEXT_RECAP_HEADER,
+      [
+        "#1780000000.000100 Mon 2026-07-06 15:05:54 GMT+3 lee.chen: did the build finish?",
+        "#1780000005.000200 Mon 2026-07-06 15:06:34 GMT+3 sam.rivera: not sure, checking",
+      ],
+      bare,
+    );
+    expect(openClawInboundBodiesMatch(decorated, bare)).toBe(true);
+  });
+
+  it("does NOT strip a malformed entry line under the conversation-context header, so it blocks the match (fail-closed)", () => {
+    const bare = "what's the status on the deploy?";
+    const decorated = metadataWrappedWithHeaderLineRecap(
+      CONVERSATION_CONTEXT_RECAP_HEADER,
+      ["#1780000000.000100 Mon 2026-07-06 15:05:54 GMT+3 lee.chen did the build finish"],
+      bare,
+    );
+    expect(openClawInboundBodiesMatch(decorated, bare)).toBe(false);
+  });
+});
+
 describe("canonicalizeOpenClawInboundMetadataIdentityContent / buildMessageIdentityHash with a line-format recap block", () => {
   it("produces the same identity hash for the same turn whether or not a line-format recap is present", () => {
     const bare = "what's the status on the deploy?";

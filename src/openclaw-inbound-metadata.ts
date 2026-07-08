@@ -7,6 +7,7 @@ const OPENCLAW_INBOUND_METADATA_BLOCK_RE =
 // is tried against every recognized body shape below.
 const OPENCLAW_INBOUND_HISTORY_RECAP_HEADERS = [
   "Chat history since last reply (untrusted, for context):",
+  "Conversation context (untrusted, chronological, selected for current message):",
 ];
 
 function escapeOpenClawRecapHeaderRegExpLiteral(value: string): string {
