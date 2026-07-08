@@ -125,6 +125,19 @@ describe("openClawInboundBodiesMatch with a host chat-history recap block (issue
     );
   });
 
+  it("does NOT match when a VALID recap block conceals a DIFFERENT body (recap widening stays fail-closed)", () => {
+    // The reduction now strips a structurally valid recap block, so a decorated
+    // face reduces further than before. Verify the widened surface still fails
+    // closed: when the real body differs from the bare row, a well-formed
+    // (stripped) recap must not manufacture a collapse. Full-body equality, not
+    // containment, so a genuinely distinct turn is preserved.
+    const bare = "what's the status on the deploy?";
+    const differentBody = "actually, cancel the deploy";
+    expect(
+      openClawInboundBodiesMatch(metadataWrappedWithRecap(TWO_ENTRY_RECAP, differentBody), bare),
+    ).toBe(false);
+  });
+
   it("does NOT strip when the recap header is merely quoted in the user's own body (fail-closed)", () => {
     const bare =
       'Chat history since last reply (untrusted, for context): that\'s an odd phrase to quote, right?';
@@ -309,6 +322,17 @@ describe("openClawInboundBodiesMatch with a 6.10-era line-format host chat-histo
     expect(
       openClawInboundBodiesMatch(metadataWrappedWithLineRecap(FIVE_ENTRY_LINE_RECAP, bare), bare),
     ).toBe(true);
+  });
+
+  it("does NOT match when a VALID line-format recap conceals a DIFFERENT body (recap widening stays fail-closed)", () => {
+    // Same fail-closed guarantee for the 6.10-era line-format recap: stripping a
+    // well-formed line recap must not collapse a decorated face whose real body
+    // differs from the bare row.
+    const bare = "what's the status on the deploy?";
+    const differentBody = "actually, cancel the deploy";
+    expect(
+      openClawInboundBodiesMatch(metadataWrappedWithLineRecap(TWO_ENTRY_LINE_RECAP, differentBody), bare),
+    ).toBe(false);
   });
 
   it("recognizes entry lines whose sender contains a space (a real display name)", () => {
