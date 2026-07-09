@@ -1,5 +1,5 @@
 import { DatabaseSync } from "node:sqlite";
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { getLcmDbFeatures } from "../src/db/features.js";
 import { runLcmMigrations } from "../src/db/migration.js";
 import { PendingCompactionCoordinator } from "../src/pending-summary-coordinator.js";
@@ -29,6 +29,54 @@ function clearRetryBackoff(db: DatabaseSync): void {
 }
 
 describe("PendingCompactionCoordinator", () => {
+  it("loads projection messages in bulk while planning", async () => {
+    const { conversationStore, pendingSummaryStore, summaryStore } = createStores();
+    const conversation = await conversationStore.createConversation({
+      sessionId: "pending-coordinator-bulk-session",
+      sessionKey: "agent:main:pending-coordinator-bulk",
+    });
+    const messages = await conversationStore.createMessagesBulk(
+      Array.from({ length: 24 }, (_, index) => ({
+        conversationId: conversation.conversationId,
+        seq: index + 1,
+        role: index % 2 === 0 ? ("user" as const) : ("assistant" as const),
+        content: `bulk projection message ${index + 1}`,
+        tokenCount: 4,
+      })),
+    );
+    await summaryStore.appendContextMessages(
+      conversation.conversationId,
+      messages.map((message) => message.messageId),
+    );
+    const getOneSpy = vi.spyOn(conversationStore, "getMessageById");
+    const getManySpy = vi.spyOn(conversationStore, "getMessagesByIds");
+
+    const coordinator = new PendingCompactionCoordinator({
+      conversationStore,
+      pendingSummaryStore,
+      summaryStore,
+      model: "test-model",
+      leaseOwner: "test-worker",
+      config: {
+        freshTailCount: 1,
+        leafChunkTokens: 8,
+        condensedMinFanout: 2,
+        condensedMinSourceTokens: 1,
+        condensedChunkTokens: 100,
+      },
+      summarize: async () => "summary",
+    });
+
+    await expect(
+      coordinator.runOnce({
+        conversationId: conversation.conversationId,
+        sessionKey: "agent:main:pending-coordinator-bulk",
+      }),
+    ).resolves.toMatchObject({ status: "planned" });
+    expect(getManySpy).toHaveBeenCalledTimes(1);
+    expect(getOneSpy).not.toHaveBeenCalled();
+  });
+
   it("prepares hidden leaves and condensation before publishing one canonical swap", async () => {
     const { conversationStore, pendingSummaryStore, summaryStore } = createStores();
     const conversation = await conversationStore.createConversation({

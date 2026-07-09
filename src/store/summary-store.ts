@@ -409,6 +409,24 @@ export class SummaryStore {
     return row ? toSummaryRecord(row) : null;
   }
 
+  async getSummariesByIds(summaryIds: string[]): Promise<SummaryRecord[]> {
+    const uniqueIds = [...new Set(summaryIds.map((id) => id.trim()).filter(Boolean))];
+    if (uniqueIds.length === 0) {
+      return [];
+    }
+    const placeholders = uniqueIds.map(() => "?").join(", ");
+    const rows = this.db
+      .prepare(
+        `SELECT summary_id, conversation_id, kind, depth, content, token_count, file_ids,
+                earliest_at, latest_at, descendant_count, created_at
+                , descendant_token_count, source_message_token_count, model
+       FROM summaries
+       WHERE summary_id IN (${placeholders})`,
+      )
+      .all(...uniqueIds) as unknown as SummaryRow[];
+    return rows.map(toSummaryRecord);
+  }
+
   /** Return the min/max source message sequence linked to a summary or its parent summaries. */
   async getSummaryMessageSeqRange(summaryId: string): Promise<SummaryMessageSeqRangeRecord> {
     const row = this.db

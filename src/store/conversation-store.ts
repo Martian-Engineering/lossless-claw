@@ -1655,6 +1655,22 @@ export class ConversationStore {
     return row ? toMessageRecord(row) : null;
   }
 
+  async getMessagesByIds(messageIds: MessageId[]): Promise<MessageRecord[]> {
+    const uniqueIds = [...new Set(messageIds.filter((id) => Number.isFinite(id)))];
+    if (uniqueIds.length === 0) {
+      return [];
+    }
+    const placeholders = uniqueIds.map(() => "?").join(", ");
+    const rows = this.db
+      .prepare(
+        `SELECT message_id, conversation_id, seq, role, content, token_count, created_at, large_content
+       FROM messages
+       WHERE message_id IN (${placeholders})`,
+      )
+      .all(...uniqueIds) as unknown as MessageRow[];
+    return rows.map(toMessageRecord);
+  }
+
   /** Return the most recent message whose `large_content` sidecar references the given file id. */
   async getMessageByLargeContent(fileId: string): Promise<MessageRecord | null> {
     const row = this.db

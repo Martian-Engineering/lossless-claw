@@ -704,12 +704,29 @@ export class PendingCompactionCoordinator {
 
   private async buildProjectionSnapshot(conversationId: number): Promise<ProjectionSnapshot> {
     const contextItems = await this.summaryStore.getContextItems(conversationId);
-    const summaryById = new Map<string, SummaryRecord>();
+    const messageIds = contextItems
+      .filter((item) => item.itemType === "message" && item.messageId != null)
+      .map((item) => item.messageId!);
+    const summaryIds = contextItems
+      .filter((item) => item.itemType === "summary" && item.summaryId)
+      .map((item) => item.summaryId!);
+    const messagesById = new Map(
+      (await this.conversationStore.getMessagesByIds(messageIds)).map((message) => [
+        message.messageId,
+        message,
+      ]),
+    );
+    const summaryById = new Map<string, SummaryRecord>(
+      (await this.summaryStore.getSummariesByIds(summaryIds)).map((summary) => [
+        summary.summaryId,
+        summary,
+      ]),
+    );
     const items: PendingSummaryPlannerSnapshotItem[] = [];
 
     for (const item of contextItems) {
       if (item.itemType === "message" && item.messageId != null) {
-        const message = await this.conversationStore.getMessageById(item.messageId);
+        const message = messagesById.get(item.messageId);
         if (!message) {
           continue;
         }
@@ -731,11 +748,10 @@ export class PendingCompactionCoordinator {
       }
 
       if (item.itemType === "summary" && item.summaryId) {
-        const summary = await this.summaryStore.getSummary(item.summaryId);
+        const summary = summaryById.get(item.summaryId);
         if (!summary) {
           continue;
         }
-        summaryById.set(summary.summaryId, summary);
         items.push({
           ordinal: item.ordinal,
           itemType: "summary",
