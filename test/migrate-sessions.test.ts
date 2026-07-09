@@ -219,7 +219,7 @@ describe("runSessionMigration", () => {
     }
   });
 
-  it("adopts transcript entry ids onto existing identity-matching rows without trusting them", async () => {
+  it("imports transcript rows instead of weakly adopting existing identity matches", async () => {
     const root = tempRoot();
     writeAgentSession(root, "session-a.jsonl", [
       sessionHeader("session-a"),
@@ -250,16 +250,17 @@ describe("runSessionMigration", () => {
 
     const result = await runSessionMigration({ dbPath, stateDir: root, apply: true });
 
-    expect(result.importedMessages).toBe(0);
+    expect(result.importedMessages).toBe(2);
     expect(result.files[0]).toMatchObject({
-      status: "up-to-date",
-      skippedMessages: 2,
+      status: "imported",
+      importedMessages: 2,
+      skippedMessages: 0,
     });
 
     const reopened = openMigratedDb(dbPath);
     try {
       const conversation = await reopened.conversationStore.getConversationForSession({ sessionId: "session-a" });
-      expect(await reopened.conversationStore.getMessageCount(conversation!.conversationId)).toBe(2);
+      expect(await reopened.conversationStore.getMessageCount(conversation!.conversationId)).toBe(4);
       const rows = reopened.db
         .prepare(
           `SELECT m.content, m.transcript_entry_id, trust.trust_state, trust.reason
@@ -278,15 +279,27 @@ describe("runSessionMigration", () => {
       expect(rows).toEqual([
         {
           content: "already persisted",
-          transcript_entry_id: "m1",
+          transcript_entry_id: null,
           trust_state: null,
           reason: null,
         },
         {
           content: "existing reply",
-          transcript_entry_id: "m2",
+          transcript_entry_id: null,
           trust_state: null,
           reason: null,
+        },
+        {
+          content: "already persisted",
+          transcript_entry_id: "m1",
+          trust_state: "verified",
+          reason: "message imported from transcript entry",
+        },
+        {
+          content: "existing reply",
+          transcript_entry_id: "m2",
+          trust_state: "verified",
+          reason: "message imported from transcript entry",
         },
       ]);
     } finally {
