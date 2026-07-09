@@ -1,5 +1,5 @@
 import { DatabaseSync } from "node:sqlite";
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { getLcmDbFeatures } from "../src/db/features.js";
 import { runLcmMigrations } from "../src/db/migration.js";
 import { PendingCompactionCoordinator } from "../src/pending-summary-coordinator.js";
@@ -29,6 +29,70 @@ function clearRetryBackoff(db: DatabaseSync): void {
 }
 
 describe("PendingCompactionCoordinator", () => {
+  it("prepares a planned node without rebuilding the full projection snapshot", async () => {
+    const { conversationStore, pendingSummaryStore, summaryStore } = createStores();
+    const conversation = await conversationStore.createConversation({
+      sessionId: "pending-coordinator-incremental-session",
+      sessionKey: "agent:main:pending-coordinator-incremental",
+    });
+    const messages = await conversationStore.createMessagesBulk([
+      {
+        conversationId: conversation.conversationId,
+        seq: 1,
+        role: "user",
+        content: "alpha bravo charlie delta",
+        tokenCount: 4,
+      },
+      {
+        conversationId: conversation.conversationId,
+        seq: 2,
+        role: "assistant",
+        content: "echo foxtrot golf hotel",
+        tokenCount: 4,
+      },
+      {
+        conversationId: conversation.conversationId,
+        seq: 3,
+        role: "user",
+        content: "fresh tail remains raw",
+        tokenCount: 4,
+      },
+    ]);
+    await summaryStore.appendContextMessages(
+      conversation.conversationId,
+      messages.map((message) => message.messageId),
+    );
+
+    const coordinator = new PendingCompactionCoordinator({
+      conversationStore,
+      pendingSummaryStore,
+      summaryStore,
+      model: "test-model",
+      leaseOwner: "test-worker",
+      config: {
+        freshTailCount: 1,
+        leafChunkTokens: 8,
+        condensedMinFanout: 2,
+        condensedMinSourceTokens: 1,
+        condensedChunkTokens: 100,
+      },
+      summarize: async (sourceText) => `leaf(${sourceText})`,
+    });
+
+    await expect(
+      coordinator.runOnce({
+        conversationId: conversation.conversationId,
+        sessionKey: "agent:main:pending-coordinator-incremental",
+      }),
+    ).resolves.toMatchObject({ status: "planned", nodeCount: 1 });
+
+    const getContextItems = vi.spyOn(summaryStore, "getContextItems");
+    await expect(
+      coordinator.runOnce({ conversationId: conversation.conversationId }),
+    ).resolves.toMatchObject({ status: "prepared" });
+    expect(getContextItems).not.toHaveBeenCalled();
+  });
+
   it("prepares hidden leaves and condensation before publishing one canonical swap", async () => {
     const { conversationStore, pendingSummaryStore, summaryStore } = createStores();
     const conversation = await conversationStore.createConversation({
