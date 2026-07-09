@@ -2627,7 +2627,7 @@ export class LcmContextEngine implements ContextEngine {
           );
 
           if (reconcile.blockedReason === "no-overlap-projection" && conversation.bootstrappedAt) {
-            await this.conversationStore.archiveConversation(conversationId);
+            await this.conversationStore.archiveConversation(conversationId, "rollover-fallback");
             const freshConversation = await this.conversationStore.createConversation({
               sessionId: params.sessionId,
               ...(params.sessionKey ? { sessionKey: params.sessionKey } : {}),

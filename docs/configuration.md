@@ -180,13 +180,12 @@ openclaw plugins install --link /path/to/lossless-claw
 ### Programmatic context-engine control
 
 When the OpenClaw host supports context-engine control dispatch, lossless-claw
-advertises three sanitized operations:
+advertises two sanitized operations:
 
 | Operation | Result | Notes |
 | --- | --- | --- |
-| `status` | `active`, `messageCount` | Reports current LCM conversation state only. It does not include `lastRotatedAt` because that timestamp is product/runtime state, not durable LCM state. |
+| `status` | `active`, `messageCount` | Reports current LCM conversation state only. |
 | `doctor` | `ok`, `warnings[]` | Returns a bounded summary-health warning list without transcript text, paths, or raw provider/debug output. |
-| `rotate` | `messageCount`, `lastRotatedAt` | Reuses the `/lossless rotate` implementation and returns the timestamp for the successful rotate operation. Hosts that need durable rotation history should persist this result outside lossless-claw. |
 
 The control surface never accepts arbitrary slash commands and never exposes
 local database paths, transcript paths, backup paths, credentials, or raw shell

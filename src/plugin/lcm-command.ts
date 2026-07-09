@@ -1855,7 +1855,10 @@ async function buildBackupText(params: {
   return lines.join("\n");
 }
 
-export function getLcmProgrammaticControlCapabilities(): ContextEngineControlCapabilities {
+export function getLcmProgrammaticControlCapabilities(_params?: {
+  deps?: LcmDependencies;
+  getLcm?: () => Promise<RuntimeCommandEngine>;
+}): ContextEngineControlCapabilities {
   return {
     status: true,
     doctor: true,
