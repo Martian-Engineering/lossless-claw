@@ -1117,6 +1117,7 @@ describe("runLcmMigrations summary depth backfill", () => {
       "last_processed_entry_id",
       "fork_bounded",
       "fork_source_message_count",
+      "soft_reset_pruned_at",
       "updated_at",
     ]);
   });

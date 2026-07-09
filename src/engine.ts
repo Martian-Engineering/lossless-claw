@@ -4324,6 +4324,7 @@ export class LcmContextEngine implements ContextEngine {
                 ? this.config.newSessionRetainDepth
                 : 2;
             await this.summaryStore.pruneForNewSession(conversation.conversationId, retainDepth);
+            await this.summaryStore.markSoftResetPruned(conversation.conversationId);
             this.deps.log.info(
               `[lcm] /new pruned conversation ${conversation.conversationId} to retain depth ${retainDepth}`,
             );

@@ -144,6 +144,7 @@ export type ConversationBootstrapStateRecord = {
   lastProcessedEntryId: string | null;
   forkBounded: boolean;
   forkSourceMessageCount: number;
+  softResetPrunedAt: Date | null;
   updatedAt: Date;
 };
 
@@ -251,6 +252,7 @@ interface ConversationBootstrapStateRow {
   last_processed_entry_id: string | null;
   fork_bounded: number;
   fork_source_message_count: number;
+  soft_reset_pruned_at: string | null;
   updated_at: string;
 }
 
@@ -361,6 +363,7 @@ function toConversationBootstrapStateRecord(
       row.fork_source_message_count >= 0
         ? Math.floor(row.fork_source_message_count)
         : 0,
+    softResetPrunedAt: parseUtcTimestampOrNull(row.soft_reset_pruned_at),
     updatedAt: parseUtcTimestamp(row.updated_at),
   };
 }
@@ -932,6 +935,18 @@ export class SummaryStore {
          )`,
       )
       .run(conversationId, conversationId, Math.floor(retainDepth));
+  }
+
+  /** Mark that Lossless pruned this conversation for a host /new soft reset. */
+  async markSoftResetPruned(conversationId: number): Promise<void> {
+    this.db
+      .prepare(
+        `UPDATE conversation_bootstrap_state
+         SET soft_reset_pruned_at = datetime('now'),
+             updated_at = datetime('now')
+         WHERE conversation_id = ?`,
+      )
+      .run(conversationId);
   }
 
   async appendContextMessage(conversationId: number, messageId: number): Promise<void> {
@@ -1719,7 +1734,7 @@ export class SummaryStore {
         `SELECT conversation_id, session_file_path, last_seen_size, last_seen_mtime_ms,
                 last_processed_offset, last_processed_entry_hash, session_header_id,
                 last_processed_entry_id, fork_bounded,
-                fork_source_message_count, updated_at
+                fork_source_message_count, soft_reset_pruned_at, updated_at
          FROM conversation_bootstrap_state
          WHERE conversation_id = ?`,
       )
@@ -1766,6 +1781,10 @@ export class SummaryStore {
              WHEN conversation_bootstrap_state.session_file_path != excluded.session_file_path THEN 0
              ELSE conversation_bootstrap_state.fork_source_message_count
            END,
+           soft_reset_pruned_at = CASE
+             WHEN conversation_bootstrap_state.session_file_path != excluded.session_file_path THEN NULL
+             ELSE conversation_bootstrap_state.soft_reset_pruned_at
+           END,
            updated_at = datetime('now')`,
       )
       .run(
@@ -1786,7 +1805,7 @@ export class SummaryStore {
         `SELECT conversation_id, session_file_path, last_seen_size, last_seen_mtime_ms,
                 last_processed_offset, last_processed_entry_hash, session_header_id,
                 last_processed_entry_id, fork_bounded,
-                fork_source_message_count, updated_at
+                fork_source_message_count, soft_reset_pruned_at, updated_at
          FROM conversation_bootstrap_state
          WHERE conversation_id = ?`,
       )

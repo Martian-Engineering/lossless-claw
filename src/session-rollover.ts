@@ -6,7 +6,8 @@
  *
  * Extracted from engine.ts (Phase 3 of the engine decomposition).
  */
-import { stat } from "node:fs/promises";
+import { readdir, stat } from "node:fs/promises";
+import { basename, dirname } from "node:path";
 import { isHeartbeatNoiseContent } from "./heartbeat-filter.js";
 import { describeLogError } from "./lcm-log.js";
 import { isLikelyInjectedDeliveryOnlyTranscript, toStoredMessage } from "./message-content.js";
@@ -91,6 +92,51 @@ export class SessionRolloverDetector {
   ) {}
 
   /**
+   * True when the host left an on-disk reset archive sibling beside a tracked
+   * transcript path (`${basename}.reset.<ts>`). The sibling proves only that
+   * the host performed a reset-style archive; callers must pair it with
+   * Lossless-owned /new state before treating it as continuity evidence.
+   *
+   * Host contract (OpenClaw core, confirmed on the 2026.6.10 line and current
+   * main): the archive name is minted by `archiveFileOnDisk(filePath, reason)`
+   * in `src/gateway/session-transcript-files.fs.ts` as `${filePath}.${reason}.<ts>`,
+   * where `reason` is a `SessionArchiveReason` (`src/config/sessions/artifacts.ts`,
+   * one of "bak" | "reset" | "deleted"). The host rediscovers its own reset
+   * archives by the same `${basename}.reset.` prefix (`findLatestArchivedTranscript`,
+   * `src/auto-reply/reply/commands-reset-hooks.ts`). Fails closed (false) on any
+   * I/O error.
+   */
+  private async hasResetArchivedTranscriptSibling(trackedFile: string): Promise<boolean> {
+    const prefix = basename(trackedFile);
+    if (!prefix) {
+      return false;
+    }
+    const resetPrefix = `${prefix}.reset.`;
+    try {
+      const entries = await readdir(dirname(trackedFile));
+      return entries.some((entry) => entry.startsWith(resetPrefix));
+    } catch (err) {
+      if (!isMissingFileError(err)) {
+        this.deps.log.warn(
+          `[lcm] could not scan for archived transcript sibling dir=${dirname(trackedFile)} file=${prefix} error=${describeLogError(err)}`,
+        );
+      }
+      return false;
+    }
+  }
+
+  private async hasSoftResetArchiveEvidence(params: {
+    softResetPrunedAt?: Date | null;
+    trackedSessionFile: string;
+  }): Promise<boolean> {
+    return (
+      params.softResetPrunedAt !== null &&
+      params.softResetPrunedAt !== undefined &&
+      (await this.hasResetArchivedTranscriptSibling(params.trackedSessionFile))
+    );
+  }
+
+  /**
    * Recover lifecycle splits that the host missed when it pruned a transcript
    * file before Lossless saw a reset/session_end hook. Without this, stable
    * session keys can reattach a new runtime UUID to a stale active conversation
@@ -139,6 +185,22 @@ export class SessionRolloverDetector {
         );
         return false;
       }
+    }
+
+    // The tracked transcript is gone. Stand the destructive rotate down only
+    // when Lossless saw /new pruning for this lane and the host left the
+    // corresponding reset archive sibling. A reset suffix alone is ambiguous
+    // with /reset, and a deleted suffix is never /new continuity proof.
+    if (
+      await this.hasSoftResetArchiveEvidence({
+        softResetPrunedAt: activeBootstrapState?.softResetPrunedAt,
+        trackedSessionFile,
+      })
+    ) {
+      this.deps.log.info(
+        `[lcm] ${params.phase}: tracked transcript archived after /new (reset sibling present); deferring to ambiguous-rollover rebind conversation=${activeByKey.conversationId} sessionKey=${normalizedSessionKey} oldSessionId=${activeByKey.sessionId} newSessionId=${params.sessionId} oldFile=${trackedSessionFile}`,
+      );
+      return false;
     }
 
     this.deps.log.warn(
@@ -235,8 +297,27 @@ export class SessionRolloverDetector {
         this.deps.log.warn(
           `[lcm] ${params.phase}: could not verify tracked transcript path for ambiguous runtime rollover guard conversation=${activeByKey.conversationId} file=${trackedSessionFile} error=${describeLogError(err)}`,
         );
+        return null;
       }
-      return null;
+      // The tracked transcript is gone. Treat it as an ambiguous rollover only
+      // when Lossless saw /new pruning and the host left a reset archive sibling.
+      // A genuine silent loss leaves no sibling. This is a SECONDARY decline:
+      // every caller runs rotateStaleSessionKeyConversationIfTrackedTranscript
+      // Missing first (see engine.ts), which archives-or-rotates the lane and
+      // warns on genuine loss, so that case is already handled there. Log at
+      // debug (not warn) for host-contract-drift diagnosis without double-
+      // warning or firing on a transient mid-rotation ENOENT.
+      if (
+        !(await this.hasSoftResetArchiveEvidence({
+          softResetPrunedAt: activeBootstrapState?.softResetPrunedAt,
+          trackedSessionFile,
+        }))
+      ) {
+        this.deps.log.debug(
+          `[lcm] ${params.phase}: tracked transcript missing without /new reset-archive evidence; declining ambiguous-rollover rebind (destructive guard handles genuine loss) conversation=${activeByKey.conversationId} sessionKey=${normalizedSessionKey} file=${trackedSessionFile}`,
+        );
+        return null;
+      }
     }
 
     return {
