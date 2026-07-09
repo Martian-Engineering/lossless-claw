@@ -2204,6 +2204,29 @@ export class LcmContextEngine implements ContextEngine {
     }
   }
 
+  private async markProjectionReconciledAnchorTrusted(params: {
+    conversationId: number;
+    transcriptEntryId: string;
+    reason: string;
+  }): Promise<void> {
+    const candidate = await this.conversationStore.getTranscriptEntryAnchorCandidate(
+      params.conversationId,
+      params.transcriptEntryId,
+    );
+    if (!candidate) {
+      return;
+    }
+    await this.conversationStore.upsertMessageTranscriptAnchorTrust({
+      messageId: candidate.messageId,
+      conversationId: params.conversationId,
+      transcriptEntryId: params.transcriptEntryId,
+      trustState: "verified",
+      source: "projection-reconcile",
+      reason: params.reason,
+      verifiedAt: new Date(),
+    });
+  }
+
   private async reconcileProjectedTranscriptMessages(params: {
     sessionId: string;
     sessionKey?: string;
@@ -2301,6 +2324,11 @@ export class LcmContextEngine implements ContextEngine {
           this.config.freshTailCount,
         );
         if (adopted) {
+          await this.markProjectionReconciledAnchorTrusted({
+            conversationId: params.conversationId,
+            transcriptEntryId: entryId,
+            reason: "recent tail message adopted as projection anchor",
+          });
           hasOverlap = true;
           overlapAnchorIndex = index;
           continue;
@@ -2312,6 +2340,11 @@ export class LcmContextEngine implements ContextEngine {
           tailWindow: this.config.freshTailCount,
         });
         if (adoptedExternalized) {
+          await this.markProjectionReconciledAnchorTrusted({
+            conversationId: params.conversationId,
+            transcriptEntryId: entryId,
+            reason: "recent externalized tail message adopted as projection anchor",
+          });
           hasOverlap = true;
           overlapAnchorIndex = index;
           continue;
@@ -2351,6 +2384,15 @@ export class LcmContextEngine implements ContextEngine {
               entryId,
             );
             if (restamped) {
+              await this.conversationStore.upsertMessageTranscriptAnchorTrust({
+                messageId: staleEntryMatch.messageId,
+                conversationId: params.conversationId,
+                transcriptEntryId: entryId,
+                trustState: "verified",
+                source: "projection-reconcile",
+                reason: "stale transcript entry id restamped from projection",
+                verifiedAt: new Date(),
+              });
               // Keep the prior overlap anchor. Promoting this restamped row would
               // drop any still-missing projection entries between the old anchor
               // and the reissued-id row when the import list is anchored below.
