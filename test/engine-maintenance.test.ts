@@ -839,7 +839,7 @@ describe("LcmContextEngine maintain and assemble budget", () => {
     }
   });
 
-  it("maintain() bounds provider-fallback recursive sweeps with unlimited depth and repairable lineage", async () => {
+  it("maintain() bounds provider-fallback sweeps and publishes repairable pending lineage", async () => {
     vi.useFakeTimers({ toFake: ["Date"] });
     vi.setSystemTime(new Date("2026-05-31T12:30:00.000Z"));
     try {
@@ -940,8 +940,8 @@ describe("LcmContextEngine maintain and assemble budget", () => {
         },
       });
 
-      expect(first.changed).toBe(false);
-      expect(first.reason).toBe("no claimable pending summary nodes");
+      expect(first.changed).toBe(true);
+      expect(first.reason).toBe("pending summaries published");
       expect(complete.mock.calls.length).toBeGreaterThan(0);
       expect(complete.mock.calls.length).toBeLessThanOrEqual(maxSweepIterations * 2);
       const calledProviders = new Set(
@@ -958,7 +958,7 @@ describe("LcmContextEngine maintain and assemble budget", () => {
 
       const tokensAfter = await summaryStore.getContextTokenCount(conversation.conversationId);
       expect(Number.isFinite(tokensAfter)).toBe(true);
-      expect(tokensAfter).toBe(tokensBefore);
+      expect(tokensAfter).toBeLessThan(tokensBefore);
     } finally {
       vi.useRealTimers();
     }

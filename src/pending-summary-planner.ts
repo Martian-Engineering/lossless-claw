@@ -49,6 +49,17 @@ export type SelectPendingPublishFrontierInput = {
   endOrdinal: number;
 };
 
+export type SelectPendingPublishCoverageTargetInput = {
+  nodes: PendingSummaryPlannerNode[];
+  startOrdinal: number;
+  endOrdinal: number;
+};
+
+export type PendingPublishCoverageTarget = {
+  endOrdinal: number;
+  frontier: PendingSummaryPlannerNode[];
+};
+
 function normalizePositiveInteger(value: number, fallback: number): number {
   if (Number.isFinite(value) && value > 0) {
     return Math.floor(value);
@@ -335,16 +346,14 @@ function createCondensedParent(
   };
 }
 
-/**
- * Select the highest-depth nodes that exactly cover a contiguous publish prefix.
- */
-export function selectPendingPublishFrontier(
-  input: SelectPendingPublishFrontierInput,
-): PendingSummaryPlannerNode[] | null {
+/** Select the highest-depth nodes covering the longest contiguous publish prefix. */
+export function selectPendingPublishCoverageTarget(
+  input: SelectPendingPublishCoverageTargetInput,
+): PendingPublishCoverageTarget | null {
   const startOrdinal = normalizeNonNegativeInteger(input.startOrdinal);
   const endOrdinal = normalizeNonNegativeInteger(input.endOrdinal);
   if (endOrdinal < startOrdinal) {
-    return [];
+    return null;
   }
 
   const frontier: PendingSummaryPlannerNode[] = [];
@@ -365,12 +374,30 @@ export function selectPendingPublishFrontier(
       )[0];
 
     if (!candidate) {
-      return null;
+      break;
     }
 
     frontier.push(candidate);
     cursor = candidate.ordinalEnd + 1;
   }
 
-  return frontier;
+  if (frontier.length === 0) {
+    return null;
+  }
+  return { endOrdinal: cursor - 1, frontier };
+}
+
+/**
+ * Select the highest-depth nodes that exactly cover a contiguous publish prefix.
+ */
+export function selectPendingPublishFrontier(
+  input: SelectPendingPublishFrontierInput,
+): PendingSummaryPlannerNode[] | null {
+  const target = selectPendingPublishCoverageTarget(input);
+  if (!target) {
+    return null;
+  }
+  return target.endOrdinal === normalizeNonNegativeInteger(input.endOrdinal)
+    ? target.frontier
+    : null;
 }

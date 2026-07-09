@@ -3538,19 +3538,15 @@ export class LcmContextEngine implements ContextEngine {
         }
       ).currentTokenCount,
     );
-    const observedTokenCandidates = [
-      runtimePromptTokens,
-      suppliedCurrentTokenCount,
-      estimatedContextTokens,
-    ].filter((count): count is number => typeof count === "number" && Number.isFinite(count));
-    const observedCurrentTokenCount = Math.max(...observedTokenCandidates);
+    const observedCurrentTokenCount =
+      runtimePromptTokens ?? suppliedCurrentTokenCount ?? estimatedContextTokens;
     if (runtimePromptTokens !== undefined) {
       this.deps.log.debug(
         `[lcm] afterTurn: using runtime prompt token count currentTokenCount=${runtimePromptTokens} estimatedTokenCount=${estimatedContextTokens}`,
       );
       if (estimatedContextTokens > runtimePromptTokens) {
         this.deps.log.debug(
-          `[lcm] afterTurn: local prompt estimate exceeds runtime prompt token count; using currentTokenCount=${observedCurrentTokenCount}`,
+          `[lcm] afterTurn: local prompt estimate exceeds runtime prompt token count; keeping runtime currentTokenCount=${observedCurrentTokenCount}`,
         );
       }
     }

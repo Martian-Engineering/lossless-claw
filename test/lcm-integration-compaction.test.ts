@@ -2074,7 +2074,7 @@ describe("LCM integration: compaction", () => {
     });
   });
 
-  it("evaluate compacts when observed tokens plus raw backlog exceed the threshold", async () => {
+  it("evaluate does not add raw backlog to an observed projection count", async () => {
     const backlogEngine = new CompactionEngine(convStore as any, sumStore as any, {
       ...defaultCompactionConfig,
       freshTailCount: 1,
@@ -2086,13 +2086,13 @@ describe("LCM integration: compaction", () => {
 
     const decision = await backlogEngine.evaluate(CONV_ID, 600, 300);
     expect(decision).toMatchObject({
-      shouldCompact: true,
-      reason: "threshold",
+      shouldCompact: false,
+      reason: "none",
       storedTokens: 300,
       observedTokens: 300,
       rawTokensOutsideTail: 200,
-      projectedTokens: 500,
-      currentTokens: 500,
+      projectedTokens: 300,
+      currentTokens: 300,
       threshold: 450,
     });
   });
@@ -2114,8 +2114,8 @@ describe("LCM integration: compaction", () => {
       storedTokens: 200,
       observedTokens: 250,
       rawTokensOutsideTail: 100,
-      projectedTokens: 350,
-      currentTokens: 350,
+      projectedTokens: 250,
+      currentTokens: 250,
       threshold: 450,
     });
   });
