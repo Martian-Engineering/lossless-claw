@@ -778,9 +778,8 @@ export class CompactionEngine {
       liveTokens > 0
         ? await this.countRawTokensOutsideFreshTail(conversationId, options?.freshTailCount)
         : undefined;
-    const projectedTokens =
-      liveTokens > 0 ? liveTokens + (rawTokensOutsideTail ?? 0) : undefined;
-    const currentTokens = Math.max(storedTokens, projectedTokens ?? liveTokens);
+    const projectedTokens = liveTokens > 0 ? Math.max(storedTokens, liveTokens) : undefined;
+    const currentTokens = Math.max(storedTokens, liveTokens);
     const threshold = Math.floor(
       resolveContextThreshold(this.config, options?.contextThreshold) * tokenBudget,
     );

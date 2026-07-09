@@ -9,6 +9,7 @@ import {
   planPendingCondensedNodes,
   planPendingLeafNodes,
   resolvePendingFreshTailOrdinal,
+  selectPendingPublishCoverageTarget,
   selectPendingPublishFrontier,
   type PendingSummaryPlannerNode,
   type PendingSummaryPlannerSnapshotItem,
@@ -368,13 +369,26 @@ export class PendingCompactionCoordinator {
     if (pendingNodes.length === 0) {
       return null;
     }
+    const coverageTarget = selectPendingPublishCoverageTarget({
+      nodes: [...canonicalNodes, ...reusablePendingNodes, ...pendingNodes],
+      startOrdinal: input.batch.compactableStartOrdinal,
+      endOrdinal: input.snapshot.compactableEndOrdinal ?? input.batch.compactableEndOrdinal,
+    });
+    if (!coverageTarget || coverageTarget.endOrdinal <= input.batch.compactableEndOrdinal) {
+      return null;
+    }
 
     await this.pendingSummaryStore.withTransaction(async () => {
       const updated = await this.pendingSummaryStore.updateBatchPlanningTarget({
         batchId: input.batch.batchId,
-        sourceProjectionFingerprint: input.snapshot.sourceProjectionFingerprint,
+        sourceProjectionFingerprint: this.buildBatchSourceFingerprint({
+          conversationId: input.batch.conversationId,
+          snapshot: input.snapshot,
+          startOrdinal: input.batch.compactableStartOrdinal,
+          endOrdinal: coverageTarget.endOrdinal,
+        }),
         compactableStartOrdinal: input.snapshot.compactableStartOrdinal!,
-        compactableEndOrdinal: input.snapshot.compactableEndOrdinal!,
+        compactableEndOrdinal: coverageTarget.endOrdinal,
         plannedFreshTailStartOrdinal: input.snapshot.freshTailStartOrdinal,
       });
       if (!updated) {
@@ -430,15 +444,31 @@ export class PendingCompactionCoordinator {
     if (pendingNodes.length === 0) {
       return { status: "idle", reason: "no pending summary nodes planned" };
     }
+    const coverageTarget = selectPendingPublishCoverageTarget({
+      nodes: [...canonicalNodes, ...pendingNodes],
+      startOrdinal: input.snapshot.compactableStartOrdinal ?? 0,
+      endOrdinal: input.snapshot.compactableEndOrdinal ?? 0,
+    });
+    if (
+      !coverageTarget ||
+      coverageTarget.frontier.every((node) => typeof node.canonicalSummaryId === "string")
+    ) {
+      return { status: "idle", reason: "no publishable pending summary coverage planned" };
+    }
 
     await this.pendingSummaryStore.withTransaction(async () => {
       await this.pendingSummaryStore.createBatch({
         batchId,
         conversationId: input.conversationId,
         sessionKey: input.sessionKey ?? null,
-        sourceProjectionFingerprint: input.snapshot.sourceProjectionFingerprint,
+        sourceProjectionFingerprint: this.buildBatchSourceFingerprint({
+          conversationId: input.conversationId,
+          snapshot: input.snapshot,
+          startOrdinal: input.snapshot.compactableStartOrdinal ?? 0,
+          endOrdinal: coverageTarget.endOrdinal,
+        }),
         compactableStartOrdinal: input.snapshot.compactableStartOrdinal ?? 0,
-        compactableEndOrdinal: input.snapshot.compactableEndOrdinal ?? 0,
+        compactableEndOrdinal: coverageTarget.endOrdinal,
         plannedFreshTailStartOrdinal: input.snapshot.freshTailStartOrdinal,
         promptVersion: PENDING_PROMPT_VERSION,
         model: this.model,
@@ -572,9 +602,13 @@ export class PendingCompactionCoordinator {
     if (!frontier) {
       return null;
     }
+    const pendingFrontier = frontier.filter((node) => typeof node.canonicalSummaryId !== "string");
+    if (pendingFrontier.length === 0 && nodes.some((node) => node.status !== "promoted")) {
+      return null;
+    }
     return {
       frontier,
-      pendingFrontier: frontier.filter((node) => typeof node.canonicalSummaryId !== "string"),
+      pendingFrontier,
     };
   }
 
@@ -615,11 +649,13 @@ export class PendingCompactionCoordinator {
       return "pending batch range is no longer compactable";
     }
 
-    if (
-      input.batch.compactableStartOrdinal === currentStart &&
-      input.batch.compactableEndOrdinal === currentEnd &&
-      input.batch.sourceProjectionFingerprint !== input.snapshot.sourceProjectionFingerprint
-    ) {
+    const expectedBatchFingerprint = this.buildBatchSourceFingerprint({
+      conversationId: input.batch.conversationId,
+      snapshot: input.snapshot,
+      startOrdinal: input.batch.compactableStartOrdinal,
+      endOrdinal: input.batch.compactableEndOrdinal,
+    });
+    if (input.batch.sourceProjectionFingerprint !== expectedBatchFingerprint) {
       return "source projection fingerprint changed before publish";
     }
 
@@ -791,6 +827,27 @@ export class PendingCompactionCoordinator {
       compactableStartOrdinal,
       compactableEndOrdinal,
     };
+  }
+
+  private buildBatchSourceFingerprint(input: {
+    conversationId: number;
+    snapshot: ProjectionSnapshot;
+    startOrdinal: number;
+    endOrdinal: number;
+  }): string {
+    const compactableItems = input.snapshot.items
+      .filter(
+        (item) =>
+          item.ordinal >= input.startOrdinal &&
+          item.ordinal <= input.endOrdinal,
+      )
+      .sort((a, b) => a.ordinal - b.ordinal);
+    return digestText("pending-projection-range", [
+      String(input.conversationId),
+      String(input.startOrdinal),
+      String(input.endOrdinal),
+      ...compactableItems.map((item) => `${item.ordinal}:${item.sourceFingerprint}`),
+    ]);
   }
 
   private buildCanonicalSummaryPlannerNodes(

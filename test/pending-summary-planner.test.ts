@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import {
   planPendingCondensedNodes,
   planPendingLeafNodes,
+  selectPendingPublishCoverageTarget,
   selectPendingPublishFrontier,
   type PendingSummaryPlannerNode,
   type PendingSummaryPlannerSnapshotItem,
@@ -276,5 +277,32 @@ describe("pending summary planner", () => {
         endOrdinal: 1,
       })?.map((node) => node.nodeId),
     ).toEqual(["condensed-condensed-d1-0-1"]);
+  });
+
+  it("selects the longest publishable prefix when later ordinals are uncovered", () => {
+    const leafNodes = planPendingLeafNodes({
+      items: [message(0, 10, 5), message(1, 11, 5), message(2, 12, 3)],
+      freshTailCount: 0,
+      leafChunkTokens: 5,
+      nodeIdPrefix: "leaf",
+    });
+
+    const target = selectPendingPublishCoverageTarget({
+      nodes: leafNodes,
+      startOrdinal: 0,
+      endOrdinal: 2,
+    });
+    expect(target?.endOrdinal).toBe(1);
+    expect(target?.frontier.map((node) => node.nodeId)).toEqual([
+      "leaf-leaf-0-0",
+      "leaf-leaf-1-1",
+    ]);
+    expect(
+      selectPendingPublishFrontier({
+        nodes: leafNodes,
+        startOrdinal: 0,
+        endOrdinal: 2,
+      }),
+    ).toBeNull();
   });
 });
