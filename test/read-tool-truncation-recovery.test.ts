@@ -262,10 +262,9 @@ describe("read tool truncation recovery", () => {
     expect(promptText).not.toContain("[Read output capped at 32768 bytes]");
   });
 
-  it("afterTurn() ingest preserves truncated read tool result without recovery", async () => {
+  it("ingestBatch() preserves truncated read tool result without recovery", async () => {
     const engine = createEngineForRecovery();
-    const sessionId = "afterturn-read-truncation-no-recovery";
-    const sessionFile = createSessionFilePath("afterturn-read-truncation-no-recovery");
+    const sessionId = "ingest-read-truncation-no-recovery";
 
     const fileDir = mkdtempSync(join(tmpdir(), "lossless-claw-read-source-"));
     tempDirs.push(fileDir);
@@ -279,12 +278,9 @@ describe("read tool truncation recovery", () => {
       ...readToolResultMessages({ filePath, truncatedOutput }),
     ];
 
-    await engine.afterTurn({
+    await engine.ingestBatch({
       sessionId,
-      sessionFile,
       messages,
-      prePromptMessageCount: 0,
-      tokenBudget: 4096,
     });
 
     const conversation = await engine.getConversationStore().getConversationBySessionId(sessionId);
@@ -341,7 +337,7 @@ describe("read tool truncation recovery", () => {
     expect(storedContent).not.toBe(currentContent);
   });
 
-  it("bootstrap import does not rehydrate truncated read tool results from current disk", async () => {
+  it("bootstrap without sqlite projection does not import raw session files", async () => {
     const largeFilesDir = mkdtempSync(join(tmpdir(), "lossless-claw-large-files-"));
     tempDirs.push(largeFilesDir);
     const engine = createEngineForRecovery({ largeFilesDir });
@@ -365,19 +361,11 @@ describe("read tool truncation recovery", () => {
       sessionId,
       sessionFile,
     });
-    expect(result.bootstrapped).toBe(true);
+    expect(result.bootstrapped).toBe(false);
+    expect(result.reason).toBe("visible transcript projection unavailable");
 
     const conversation = await engine.getConversationStore().getConversationBySessionId(sessionId);
-    expect(conversation).not.toBeNull();
-
-    const largeFiles = await engine
-      .getSummaryStore()
-      .getLargeFilesByConversation(conversation!.conversationId);
-    expect(largeFiles).toHaveLength(1);
-
-    const storedContent = readFileSync(largeFiles[0]!.storageUri, "utf8");
-    expect(storedContent).toBe(truncatedOutput);
-    expect(storedContent).not.toBe(currentContent);
+    expect(conversation).toBeNull();
   });
 
   it("falls back to truncated content when the read tool path is relative or missing", async () => {
