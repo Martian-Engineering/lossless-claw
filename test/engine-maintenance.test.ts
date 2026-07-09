@@ -28,6 +28,7 @@ import {
   writeLeafTranscriptMessages,
   createEngineWithConfig,
   createEngineWithDeps,
+  createEngineWithDepsOverridesAndDb,
   createTestConfig,
   makeMessage,
   seedBacklogContext,
@@ -37,6 +38,27 @@ import {
 
 afterEach(cleanupEngineTestState);
 describe("LcmContextEngine maintain and assemble budget", () => {
+
+
+  it("maintain() lazily migrates before reading stores", async () => {
+    const { engine, db } = createEngineWithDepsOverridesAndDb({});
+    (engine as unknown as { migrated: boolean }).migrated = false;
+    db.exec("PRAGMA foreign_keys = OFF; DROP TABLE IF EXISTS conversations; PRAGMA foreign_keys = ON;");
+
+    const result = await engine.maintain({
+      sessionId: "maintain-lazy-migration",
+      sessionFile: createSessionFilePath("maintain-lazy-migration"),
+    });
+
+    expect(result).toMatchObject({
+      changed: false,
+      reason: "conversation not found",
+    });
+    const table = db
+      .prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'conversations'")
+      .get() as { name?: string } | undefined;
+    expect(table?.name).toBe("conversations");
+  });
 
 
   it("maintain() leaves deferred threshold debt pending until the host opts in", async () => {
