@@ -354,19 +354,6 @@ async function importPreparedFile(
           continue;
         }
         seenEntryIds.add(entry.transcriptEntryId);
-        if (existingCount > 0 && entry.stored.content.trim().length > 0) {
-          const adopted = await conversationStore.adoptTranscriptEntryId(
-            conversation.conversationId,
-            entry.stored.role,
-            entry.stored.content,
-            entry.transcriptEntryId,
-          );
-          if (adopted) {
-            existingEntryIds.add(entry.transcriptEntryId);
-            skippedMessages += 1;
-            continue;
-          }
-        }
       }
       toImport.push(entry);
     }
