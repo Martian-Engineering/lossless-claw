@@ -175,26 +175,17 @@ export class PendingCompactionCoordinator {
       conversationId: input.conversationId,
       olderThan: new Date(Date.now() - PENDING_BATCH_RETENTION_MS),
     });
-    const snapshot = await this.buildProjectionSnapshot(input.conversationId);
-    if (snapshot.compactableStartOrdinal == null || snapshot.compactableEndOrdinal == null) {
-      return { status: "idle", reason: "no compactable context outside fresh tail" };
-    }
-
     let batch = await this.pendingSummaryStore.getActiveBatchForConversation(input.conversationId);
     if (!batch) {
+      const snapshot = await this.buildProjectionSnapshot(input.conversationId);
+      if (snapshot.compactableStartOrdinal == null || snapshot.compactableEndOrdinal == null) {
+        return { status: "idle", reason: "no compactable context outside fresh tail" };
+      }
       return this.planBatch({
         conversationId: input.conversationId,
         sessionKey: input.sessionKey,
         snapshot,
       });
-    }
-    const staleReason = await this.getActiveBatchStaleReason({ batch, snapshot });
-    if (staleReason) {
-      await this.pendingSummaryStore.markBatchStale({
-        batchId: batch.batchId,
-        failureSummary: staleReason,
-      });
-      return { status: "stale", batchId: batch.batchId, reason: staleReason };
     }
     await this.pendingSummaryStore.pruneSupersededNodes(batch.batchId);
 
@@ -239,6 +230,23 @@ export class PendingCompactionCoordinator {
         failureSummary: prepared.failureSummary,
         authFailure: prepared.authFailure,
       };
+    }
+
+    const snapshot = await this.buildProjectionSnapshot(input.conversationId);
+    if (snapshot.compactableStartOrdinal == null || snapshot.compactableEndOrdinal == null) {
+      return { status: "idle", reason: "no compactable context outside fresh tail" };
+    }
+    batch = await this.pendingSummaryStore.getActiveBatchForConversation(input.conversationId);
+    if (!batch) {
+      return { status: "idle", reason: "pending batch disappeared before validation" };
+    }
+    const staleReason = await this.getActiveBatchStaleReason({ batch, snapshot });
+    if (staleReason) {
+      await this.pendingSummaryStore.markBatchStale({
+        batchId: batch.batchId,
+        failureSummary: staleReason,
+      });
+      return { status: "stale", batchId: batch.batchId, reason: staleReason };
     }
 
     if (publishPolicy === "prepare-only") {
