@@ -219,7 +219,7 @@ describe("runSessionMigration", () => {
     }
   });
 
-  it("adopts transcript entry ids onto existing identity-matching rows instead of duplicating them", async () => {
+  it("adopts transcript entry ids onto existing identity-matching rows without trusting them", async () => {
     const root = tempRoot();
     writeAgentSession(root, "session-a.jsonl", [
       sessionHeader("session-a"),
@@ -279,14 +279,14 @@ describe("runSessionMigration", () => {
         {
           content: "already persisted",
           transcript_entry_id: "m1",
-          trust_state: "repaired",
-          reason: "identity-matched non-empty transcript migration",
+          trust_state: null,
+          reason: null,
         },
         {
           content: "existing reply",
           transcript_entry_id: "m2",
-          trust_state: "repaired",
-          reason: "identity-matched non-empty transcript migration",
+          trust_state: null,
+          reason: null,
         },
       ]);
     } finally {
