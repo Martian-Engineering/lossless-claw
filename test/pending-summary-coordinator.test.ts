@@ -728,6 +728,102 @@ describe("PendingCompactionCoordinator", () => {
     ]);
   });
 
+  it("publishes existing summaries and planned raw work without requiring an undersized raw suffix", async () => {
+    const { conversationStore, pendingSummaryStore, summaryStore } = createStores();
+    const conversation = await conversationStore.createConversation({
+      sessionId: "pending-coordinator-existing-summary-suffix-session",
+      sessionKey: "agent:main:pending-coordinator-existing-summary-suffix",
+    });
+    for (const summaryId of ["sum_existing_prefix_a", "sum_existing_prefix_b"]) {
+      await summaryStore.insertSummary({
+        summaryId,
+        conversationId: conversation.conversationId,
+        kind: "leaf",
+        depth: 0,
+        content: `existing canonical summary ${summaryId}`,
+        tokenCount: 5,
+        sourceMessageTokenCount: 500,
+      });
+      await summaryStore.appendContextSummary(conversation.conversationId, summaryId);
+    }
+    const messages = await conversationStore.createMessagesBulk([
+      {
+        conversationId: conversation.conversationId,
+        seq: 1,
+        role: "user",
+        content: "raw chunk first half",
+        tokenCount: 4,
+      },
+      {
+        conversationId: conversation.conversationId,
+        seq: 2,
+        role: "assistant",
+        content: "raw chunk second half",
+        tokenCount: 4,
+      },
+      {
+        conversationId: conversation.conversationId,
+        seq: 3,
+        role: "user",
+        content: "undersized raw suffix stays raw",
+        tokenCount: 4,
+      },
+    ]);
+    await summaryStore.appendContextMessages(
+      conversation.conversationId,
+      messages.map((message) => message.messageId),
+    );
+
+    const coordinator = new PendingCompactionCoordinator({
+      conversationStore,
+      pendingSummaryStore,
+      summaryStore,
+      model: "test-model",
+      leaseOwner: "test-worker",
+      config: {
+        freshTailCount: 0,
+        leafChunkTokens: 8,
+        condensedMinFanout: 99,
+        condensedMinSourceTokens: 1,
+        condensedChunkTokens: 100,
+      },
+      summarize: async (sourceText) => `leaf(${sourceText})`,
+    });
+
+    const planned = await coordinator.runOnce({
+      conversationId: conversation.conversationId,
+      sessionKey: "agent:main:pending-coordinator-existing-summary-suffix",
+    });
+    expect(planned).toMatchObject({ status: "planned", nodeCount: 1 });
+    if (planned.status !== "planned") {
+      throw new Error("Expected pending summary planning");
+    }
+    await expect(pendingSummaryStore.getBatch(planned.batchId)).resolves.toMatchObject({
+      compactableStartOrdinal: 0,
+      compactableEndOrdinal: 3,
+    });
+    await expect(
+      coordinator.runOnce({ conversationId: conversation.conversationId }),
+    ).resolves.toMatchObject({ status: "prepared" });
+
+    const published = await coordinator.runOnce({ conversationId: conversation.conversationId });
+    expect(published).toMatchObject({
+      status: "published",
+      frontierSummaryIds: [
+        "sum_existing_prefix_a",
+        "sum_existing_prefix_b",
+        expect.stringMatching(/^sum_/),
+      ],
+      remainingCompactableWork: true,
+    });
+    await expect(summaryStore.getContextItems(conversation.conversationId)).resolves.toMatchObject([
+      { ordinal: 0, itemType: "summary", summaryId: "sum_existing_prefix_a" },
+      { ordinal: 1, itemType: "summary", summaryId: "sum_existing_prefix_b" },
+      { ordinal: 2, itemType: "summary" },
+      { ordinal: 3, itemType: "message", messageId: messages[2]!.messageId },
+    ]);
+  });
+
   it("preserves mixed canonical and pending child order when condensing", async () => {
     const { conversationStore, pendingSummaryStore, summaryStore } = createStores();
     const conversation = await conversationStore.createConversation({
@@ -1487,7 +1583,7 @@ describe("PendingCompactionCoordinator", () => {
       coordinator.runOnce({ conversationId: conversation.conversationId }),
     ).resolves.toMatchObject({
       status: "stale",
-      reason: "pending batch source changed before publish",
+      reason: "source projection fingerprint changed before publish",
     });
     await expect(
       pendingSummaryStore.getActiveBatchForConversation(conversation.conversationId),
