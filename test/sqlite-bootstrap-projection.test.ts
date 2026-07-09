@@ -536,6 +536,34 @@ describe("LcmContextEngine.bootstrap sqlite transcript projection", () => {
       "entry-recent-ok",
       "entry-recent-tail",
     ]);
+    const trustRows = db
+      .prepare(
+        `SELECT m.content, t.transcript_entry_id, t.trust_state, t.source
+         FROM messages m
+         LEFT JOIN message_transcript_anchor_trust t ON t.message_id = m.message_id
+         WHERE m.conversation_id = ?
+         ORDER BY m.seq`,
+      )
+      .all(conversation!.conversationId) as Array<{
+      content: string;
+      transcript_entry_id: string | null;
+      trust_state: string | null;
+      source: string | null;
+    }>;
+    expect(trustRows).toEqual([
+      {
+        content: "ok",
+        transcript_entry_id: "entry-recent-ok",
+        trust_state: "verified",
+        source: "projection-reconcile",
+      },
+      {
+        content: "tail after adoption",
+        transcript_entry_id: "entry-recent-tail",
+        trust_state: "verified",
+        source: "transcript-import",
+      },
+    ]);
   });
 
   it("restamps a recent stale transcript id instead of duplicating the message", async () => {
@@ -636,6 +664,40 @@ describe("LcmContextEngine.bootstrap sqlite transcript projection", () => {
       "entry-anchor",
       "entry-current",
       "entry-after-restamp",
+    ]);
+    const trustRows = db
+      .prepare(
+        `SELECT m.content, t.transcript_entry_id, t.trust_state, t.source
+         FROM messages m
+         LEFT JOIN message_transcript_anchor_trust t ON t.message_id = m.message_id
+         WHERE m.conversation_id = ?
+         ORDER BY m.seq`,
+      )
+      .all(conversation!.conversationId) as Array<{
+      content: string;
+      transcript_entry_id: string | null;
+      trust_state: string | null;
+      source: string | null;
+    }>;
+    expect(trustRows).toEqual([
+      {
+        content: "already anchored",
+        transcript_entry_id: "entry-anchor",
+        trust_state: "verified",
+        source: "projection-reconcile",
+      },
+      {
+        content: "same logical turn",
+        transcript_entry_id: "entry-current",
+        trust_state: "verified",
+        source: "projection-reconcile",
+      },
+      {
+        content: "tail after restamp",
+        transcript_entry_id: "entry-after-restamp",
+        trust_state: "verified",
+        source: "transcript-import",
+      },
     ]);
   });
 
@@ -1456,6 +1518,43 @@ describe("LcmContextEngine.bootstrap sqlite transcript projection", () => {
       "entry-externalized-anchor",
       "entry-externalized-file",
       "entry-externalized-tail",
+    ]);
+    const trustRows = db
+      .prepare(
+        `SELECT m.transcript_entry_id AS message_entry_id,
+                t.transcript_entry_id AS trust_entry_id,
+                t.trust_state,
+                t.source
+         FROM messages m
+         LEFT JOIN message_transcript_anchor_trust t ON t.message_id = m.message_id
+         WHERE m.conversation_id = ?
+         ORDER BY m.seq`,
+      )
+      .all(conversation!.conversationId) as Array<{
+      message_entry_id: string | null;
+      trust_entry_id: string | null;
+      trust_state: string | null;
+      source: string | null;
+    }>;
+    expect(trustRows).toEqual([
+      {
+        message_entry_id: "entry-externalized-anchor",
+        trust_entry_id: "entry-externalized-anchor",
+        trust_state: "verified",
+        source: "projection-reconcile",
+      },
+      {
+        message_entry_id: "entry-externalized-file",
+        trust_entry_id: "entry-externalized-file",
+        trust_state: "verified",
+        source: "projection-reconcile",
+      },
+      {
+        message_entry_id: "entry-externalized-tail",
+        trust_entry_id: "entry-externalized-tail",
+        trust_state: "verified",
+        source: "transcript-import",
+      },
     ]);
   });
 
