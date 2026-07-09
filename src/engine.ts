@@ -2969,6 +2969,7 @@ export class LcmContextEngine implements ContextEngine {
         reason: "stateless session",
       };
     }
+    this.ensureMigrated();
     const startedAt = Date.now();
     const sessionLabel = formatSessionLabel(params.sessionId, params.sessionKey);
     const result = await this.withSessionQueue(
