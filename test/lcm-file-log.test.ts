@@ -151,6 +151,7 @@ describe("createIndependentLcmFileLogger", () => {
   });
 
   it("redacts obvious secret-shaped text before writing", () => {
+    __testing.setOpenClawRedactor(undefined);
     const file = path.join(tempDir, "lossless-claw-test.log");
     const logger = createIndependentLcmFileLogger({
       enabled: true,
@@ -165,6 +166,7 @@ describe("createIndependentLcmFileLogger", () => {
   });
 
   it("redacts common host logger secret shapes before writing", () => {
+    __testing.setOpenClawRedactor(undefined);
     const file = path.join(tempDir, "lossless-claw-test.log");
     const githubToken = "ghp_12345678901234567890";
     const githubPat = "github_pat_12345678901234567890";
