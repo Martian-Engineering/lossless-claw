@@ -11,8 +11,8 @@
 import { describe, expect, it } from "vitest";
 import {
   canonicalizeOpenClawInboundMetadataIdentityContent,
+  extractBodyAfterOpenClawInboundMetadataBlock,
   openClawInboundBodiesMatch,
-  openClawInboundModelFacingBody,
 } from "../src/openclaw-inbound-metadata.js";
 import { buildMessageIdentityHash } from "../src/store/message-identity.js";
 
@@ -235,7 +235,7 @@ describe("openClawInboundBodiesMatch with a host chat-history recap block (issue
       "",
       "actual question here",
     ].join("\n");
-    expect(openClawInboundModelFacingBody(recapLikeBareBody)).toBe(recapLikeBareBody.trim());
+    expect(extractBodyAfterOpenClawInboundMetadataBlock(recapLikeBareBody)).toBeNull();
   });
 });
 
@@ -481,7 +481,7 @@ describe("openClawInboundBodiesMatch with a 6.10-era line-format host chat-histo
       "",
       "actual question here",
     ].join("\n");
-    expect(openClawInboundModelFacingBody(recapLikeBareBody)).toBe(recapLikeBareBody.trim());
+    expect(extractBodyAfterOpenClawInboundMetadataBlock(recapLikeBareBody)).toBeNull();
   });
 });
 
