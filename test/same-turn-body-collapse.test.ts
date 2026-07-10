@@ -33,6 +33,14 @@ describe("openClawInboundBodiesMatch (same-turn model-facing body)", () => {
     expect(openClawInboundBodiesMatch(bare, metadataWrapped(bare))).toBe(false);
   });
 
+  it("does NOT match an undecorated runtime row after whitespace normalization", () => {
+    expect(openClawInboundBodiesMatch(" ok ", "ok")).toBe(false);
+  });
+
+  it("does NOT normalize user-authored whitespace after the metadata block", () => {
+    expect(openClawInboundBodiesMatch(metadataWrapped(" ok "), "ok")).toBe(false);
+  });
+
   it("does NOT match a metadata-wrapped frame concealing a DIFFERENT body (forgery stays fail-closed)", () => {
     const bare = "Hello there Aria";
     expect(openClawInboundBodiesMatch(metadataWrapped("Completely different question"), bare)).toBe(
