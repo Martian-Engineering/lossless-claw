@@ -148,6 +148,21 @@ describe("setConfigValue", () => {
     expect(backupFiles()).toEqual([]);
   });
 
+  it("rejects config values that violate runtime cross-field constraints", () => {
+    const original = writeConfig({
+      plugins: { entries: { "lossless-claw": { config: {} } } },
+    });
+    const invalidOverrides = JSON.stringify([{
+      match: { modelContextWindowMin: 100, modelContextWindowMax: 10 },
+      contextThreshold: 0.5,
+    }]);
+
+    expect(() => setConfigValue(configPath, "contextThresholdOverrides", invalidOverrides))
+      .toThrowError(expect.objectContaining({ code: "CONFIG_VALIDATION_FAILED", exitCode: 4 }));
+    expect(readFileSync(configPath, "utf8")).toBe(original);
+    expect(backupFiles()).toEqual([]);
+  });
+
   it("refuses JSON5 and include forms before creating a backup", () => {
     writeFileSync(configPath, "{ // comment\n plugins: {}\n}\n", { mode: 0o600 });
     expect(() => setConfigValue(configPath, "freshTailCount", "20")).toThrowError(

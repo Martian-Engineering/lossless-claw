@@ -393,6 +393,22 @@ function validatePluginConfig(config: JsonRecord, path: string): void {
   );
 }
 
+// Apply runtime cross-field validation that the manifest schema cannot express.
+function validateRuntimeConfig(config: JsonRecord, path: string): void {
+  try {
+    resolveLcmConfigWithDiagnostics({}, config);
+  } catch (error) {
+    throw new CliError(
+      "CONFIG_VALIDATION_FAILED",
+      `Lossless config would fail runtime validation after setting ${path}: ${
+        error instanceof Error ? error.message : String(error)
+      }`,
+      4,
+      { path },
+    );
+  }
+}
+
 // Convert an ISO timestamp to a filename-safe, sortable backup suffix.
 function backupTimestamp(now: Date): string {
   return now.toISOString().replace(/[-:.]/g, "");
@@ -475,6 +491,7 @@ export function setConfigValue(
   const config = getOrCreateRecord(entry, "config", configPath);
   const oldValue = setValueAtPath(config, segments, newValue, configPath);
   validatePluginConfig(config, path);
+  validateRuntimeConfig(config, path);
 
   const backupPath = `${configPath}.lcm-backup-${backupTimestamp((options.now ?? (() => new Date()))())}`;
   try {
