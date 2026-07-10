@@ -104,7 +104,8 @@ function resolveInvocationContext(parsed: ParsedCliArgs, env: NodeJS.ProcessEnv)
     databasePath: parsed.databasePath,
   };
   const basePaths = resolveCliPaths({ env, overrides });
-  const config = loadConfigView(basePaths.configPath, env);
+  const configEnv = { ...env, OPENCLAW_STATE_DIR: basePaths.openclawDir };
+  const config = loadConfigView(basePaths.configPath, configEnv);
   const paths = resolveCliPaths({ env, overrides, pluginConfig: config.raw });
   return { paths, config };
 }

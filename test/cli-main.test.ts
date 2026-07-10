@@ -153,6 +153,26 @@ describe("runCli", () => {
     });
   });
 
+  it("uses the invocation state directory for effective config defaults", () => {
+    writeFileSync(configPath, `${JSON.stringify({
+      plugins: { entries: { "lossless-claw": { config: {} } } },
+    })}\n`, { mode: 0o600 });
+    const stateDirectory = join(directory, "profile");
+
+    const result = invoke([
+      "config",
+      "get",
+      "databasePath",
+      "--openclaw-dir",
+      stateDirectory,
+    ]);
+
+    expect(result.exitCode).toBe(0);
+    expect(JSON.parse(result.stdout)).toMatchObject({
+      data: { isSet: false, effectiveValue: join(stateDirectory, "lcm.db") },
+    });
+  });
+
   it("includes resource-specific options in agent-readable help", () => {
     const result = invoke(["--help"]);
     expect(JSON.parse(result.stdout)).toMatchObject({
