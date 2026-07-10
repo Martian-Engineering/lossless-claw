@@ -87,6 +87,7 @@ type CurrentConversationResolution =
     };
 type DoctorApplyOptions = {
   confirmOffline: boolean;
+  conversationId?: number;
 };
 type DoctorApplyRepairMetrics = {
   repairInputTokenCount: number;
@@ -482,6 +483,7 @@ function parseDoctorApplyArgs(tokens: string[]):
   }
 
   let confirmOffline = false;
+  let conversationId: number | undefined;
   for (const token of tokens) {
     const normalized = token.toLowerCase();
     if (
@@ -495,14 +497,38 @@ function parseDoctorApplyArgs(tokens: string[]):
       continue;
     }
 
+    const parsedId = Number(token);
+    if (
+      !Number.isNaN(parsedId) &&
+      Number.isInteger(parsedId) &&
+      parsedId > 0 &&
+      String(parsedId) === token
+    ) {
+      if (conversationId !== undefined) {
+        return {
+          ok: false,
+          error:
+            `\`${VISIBLE_COMMAND} doctor apply\` accepts at most one conversation id.`,
+        };
+      }
+      conversationId = parsedId;
+      continue;
+    }
+
     return {
       ok: false,
       error:
-        `\`${VISIBLE_COMMAND} doctor apply\` accepts optional \`confirm-offline\` for large/hot repair overrides.`,
+        `\`${VISIBLE_COMMAND} doctor apply\` accepts an optional conversation id and optional \`confirm-offline\` for large/hot repair overrides.`,
     };
   }
 
-  return { ok: true, options: { confirmOffline } };
+  return {
+    ok: true,
+    options: {
+      confirmOffline,
+      ...(conversationId !== undefined ? { conversationId } : {}),
+    },
+  };
 }
 
 function parseRolloverSplitApplyArgs(tokens: string[]):
@@ -605,7 +631,7 @@ function parseLcmCommand(rawArgs: string | undefined): ParsedLcmCommand {
       return {
         kind: "help",
         error:
-          `\`${VISIBLE_COMMAND} doctor\` accepts no arguments, \`rollover-splits\` for global rollover diagnostics, \`apply rollover-splits [confirm]\` for backup-first split repair, \`clean\` for global high-confidence junk diagnostics, \`clean apply [filter-id] [vacuum]\` for cleanup, or \`apply [confirm-offline]\` for the scoped summary repair path.`,
+          `\`${VISIBLE_COMMAND} doctor\` accepts no arguments, \`rollover-splits\` for global rollover diagnostics, \`apply rollover-splits [confirm]\` for backup-first split repair, \`clean\` for global high-confidence junk diagnostics, \`clean apply [filter-id] [vacuum]\` for cleanup, or \`apply [<conversation-id>] [confirm-offline]\` for the scoped summary repair path.`,
       };
     case "help":
       return { kind: "help" };
@@ -838,6 +864,21 @@ async function resolveCurrentConversation(params: {
     kind: "unavailable",
     reason: "OpenClaw did not expose an active session key or session id here, so only GLOBAL stats are available.",
   };
+}
+
+async function resolveDoctorApplyConversationById(
+  db: DatabaseSync,
+  conversationId: number,
+): Promise<CurrentConversationResolution> {
+  const stats = getConversationStatusStats(db, conversationId);
+  if (!stats) {
+    return {
+      kind: "unavailable",
+      reason: `No LCM conversation found with id ${formatNumber(conversationId)}.`,
+    };
+  }
+
+  return { kind: "resolved", source: "session_id", stats };
 }
 
 async function resolveRuntimeSessionId(params: {
@@ -1269,6 +1310,10 @@ function buildHelpText(error?: string): string {
       ),
       buildStatLine(formatCommand(`${VISIBLE_COMMAND} doctor apply`), "Repair broken summaries in the current conversation."),
       buildStatLine(
+        formatCommand(`${VISIBLE_COMMAND} doctor apply <conversation-id>`),
+        "Repair broken summaries in a specific conversation by id.",
+      ),
+      buildStatLine(
         formatCommand(`${VISIBLE_COMMAND} doctor apply confirm-offline`),
         "Override large/hot-session repair preflight after isolating the active channel path.",
       ),
@@ -1504,7 +1549,8 @@ async function buildDoctorText(params: {
       buildSection("🧷 Affected summaries", [summaryList]),
       "",
       buildSection("🛠️ Next step", [
-        `${formatCommand(`${VISIBLE_COMMAND} doctor apply`)} repairs these in place for the current conversation.`,
+        `${formatCommand(`${VISIBLE_COMMAND} doctor apply`)} repairs these in place for the current conversation. ` +
+          `Use ${formatCommand(`${VISIBLE_COMMAND} doctor apply <conversation-id>`)} to target a different conversation.`,
       ]),
     );
   }
@@ -2989,7 +3035,13 @@ async function buildDoctorApplyText(params: {
   summarize?: LcmSummarizeFn;
   options?: DoctorApplyOptions;
 }): Promise<string> {
-  const current = await resolveCurrentConversation(params);
+  const requestedConversationId = params.options?.conversationId;
+  const targetSectionLabel = requestedConversationId !== undefined
+    ? "📍 Target conversation"
+    : "📍 Current conversation";
+  const current = requestedConversationId !== undefined
+    ? await resolveDoctorApplyConversationById(params.db, requestedConversationId)
+    : await resolveCurrentConversation(params);
 
   if (current.kind === "unavailable") {
     return [
@@ -2997,7 +3049,7 @@ async function buildDoctorApplyText(params: {
       "",
       "🩺 Lossless Claw Doctor Apply",
       "",
-      buildSection("📍 Current conversation", [
+      buildSection("📍 Target conversation", [
         buildStatLine("status", "unavailable"),
         buildStatLine("reason", current.reason),
         buildStatLine("fallback", "Doctor apply is conversation-scoped, so no global repair ran."),
@@ -3030,7 +3082,7 @@ async function buildDoctorApplyText(params: {
       "",
       "🩺 Lossless Claw Doctor Apply",
       "",
-      buildSection("📍 Current conversation", [
+      buildSection(targetSectionLabel, [
         buildStatLine("conversation id", formatNumber(current.stats.conversationId)),
         buildStatLine(
           "session key",
@@ -3080,7 +3132,7 @@ async function buildDoctorApplyText(params: {
       "",
       "🩺 Lossless Claw Doctor Apply",
       "",
-      buildSection("📍 Current conversation", [
+      buildSection(targetSectionLabel, [
         buildStatLine("conversation id", formatNumber(current.stats.conversationId)),
         buildStatLine(
           "session key",
@@ -3102,7 +3154,7 @@ async function buildDoctorApplyText(params: {
     "",
     "🩺 Lossless Claw Doctor Apply",
     "",
-    buildSection("📍 Current conversation", [
+    buildSection(targetSectionLabel, [
       buildStatLine("conversation id", formatNumber(current.stats.conversationId)),
       buildStatLine(
         "session key",

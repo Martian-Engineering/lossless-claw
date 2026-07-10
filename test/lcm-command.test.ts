@@ -1626,7 +1626,10 @@ describe("lcm command", () => {
       "sum_current_directive (fallback), sum_current_emergency (emergency), sum_current_new (new), sum_current_old (old)",
     );
     expect(result.text).toContain("**🛠️ Next step**");
-    expect(result.text).toContain("`/lossless doctor apply` repairs these in place for the current conversation.");
+    expect(result.text).toContain(
+      "`/lossless doctor apply` repairs these in place for the current conversation.",
+    );
+    expect(result.text).toContain("`/lossless doctor apply <conversation-id>`");
     expect(result.text).not.toContain("sum_other_new");
     expect(result.text).not.toContain(`conversation id: ${otherConversation.conversationId}`);
   });
@@ -3003,6 +3006,67 @@ describe("lcm command", () => {
     expect(untouched?.content).toContain("[Truncated from 204 tokens]");
   });
 
+  it("repairs a specific conversation by id regardless of the current session context", async () => {
+    const summarize = vi.fn(async () => "REPAIRED BY ID");
+    const fixture = createCommandFixture({ summarize: summarize as LcmSummarizeFn });
+    tempDirs.add(fixture.tempDir);
+    dbPaths.add(fixture.dbPath);
+
+    const currentConversation = await fixture.conversationStore.createConversation({
+      sessionId: "doctor-apply-current-id",
+      sessionKey: "agent:main:telegram:direct:doctor-apply-current-id",
+    });
+    const otherConversation = await fixture.conversationStore.createConversation({
+      sessionId: "doctor-apply-other-id",
+      sessionKey: "agent:main:telegram:direct:doctor-apply-other-id",
+    });
+
+    await fixture.summaryStore.insertSummary({
+      summaryId: "sum_current_id",
+      conversationId: currentConversation.conversationId,
+      kind: "leaf",
+      depth: 0,
+      content: "healthy current summary",
+      tokenCount: 9,
+    });
+    const [message] = await fixture.conversationStore.createMessagesBulk([
+      {
+        conversationId: otherConversation.conversationId,
+        seq: 0,
+        role: "user",
+        content: "other repair source",
+        tokenCount: 7,
+      },
+    ]);
+    await fixture.summaryStore.insertSummary({
+      summaryId: "sum_other_id",
+      conversationId: otherConversation.conversationId,
+      kind: "leaf",
+      depth: 0,
+      content: `broken other summary\n${"[Truncated from 123 tokens]"}`,
+      tokenCount: 11,
+      sourceMessageTokenCount: 7,
+    });
+    await fixture.summaryStore.linkSummaryToMessages("sum_other_id", [message.messageId]);
+
+    const result = await fixture.command.handler(
+      createCommandContext(`doctor apply ${otherConversation.conversationId}`, {
+        sessionKey: "agent:main:telegram:direct:doctor-apply-current-id",
+      }),
+    );
+
+    const repairedOther = await fixture.summaryStore.getSummary("sum_other_id");
+    const untouchedCurrent = await fixture.summaryStore.getSummary("sum_current_id");
+
+    expect(result.text).toContain("🩺 Lossless Claw Doctor Apply");
+    expect(result.text).toContain(`conversation id: ${otherConversation.conversationId}`);
+    expect(result.text).toContain("repaired summaries: 1");
+    expect(summarize).toHaveBeenCalledTimes(1);
+    expect(repairedOther?.content).toContain("REPAIRED BY ID");
+    expect(repairedOther?.content).not.toContain("[Truncated from 123 tokens]");
+    expect(untouchedCurrent?.content).toBe("healthy current summary");
+  });
+
   it("uses the normal runtime model chain for doctor apply when no explicit summary model is set", async () => {
     const hostBoundComplete = vi.fn(async () => ({
       text: "HOST BOUND REPAIR",
@@ -4126,6 +4190,21 @@ describe("lcm command helpers", () => {
       kind: "doctor",
       apply: true,
       applyOptions: { confirmOffline: true },
+    });
+    expect(__testing.parseLcmCommand("doctor apply 42")).toEqual({
+      kind: "doctor",
+      apply: true,
+      applyOptions: { confirmOffline: false, conversationId: 42 },
+    });
+    expect(__testing.parseLcmCommand("doctor apply 42 confirm-offline")).toEqual({
+      kind: "doctor",
+      apply: true,
+      applyOptions: { confirmOffline: true, conversationId: 42 },
+    });
+    expect(__testing.parseLcmCommand("doctor apply not-a-number")).toEqual({
+      kind: "help",
+      error:
+        "`/lossless doctor apply` accepts an optional conversation id and optional `confirm-offline` for large/hot repair overrides.",
     });
     expect(__testing.parseLcmCommand("doctor rollover-splits")).toEqual({
       kind: "doctor_rollover_splits",
