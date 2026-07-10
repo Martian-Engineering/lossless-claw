@@ -77,6 +77,27 @@ describe("readConfigView", () => {
       effectiveValue: 12,
     });
   });
+
+  it("reports runtime-invalid existing config as a config validation failure", () => {
+    writeConfig({
+      plugins: {
+        entries: {
+          "lossless-claw": {
+            config: {
+              contextThresholdOverrides: [{
+                match: { modelContextWindowMin: 100, modelContextWindowMax: 10 },
+                contextThreshold: 0.5,
+              }],
+            },
+          },
+        },
+      },
+    });
+
+    expect(() => readConfigView(configPath, {})).toThrowError(
+      expect.objectContaining({ code: "CONFIG_VALIDATION_FAILED", exitCode: 4 }),
+    );
+  });
 });
 
 describe("setConfigValue", () => {

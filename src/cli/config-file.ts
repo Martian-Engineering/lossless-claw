@@ -152,7 +152,19 @@ export function readConfigView(
   env: NodeJS.ProcessEnv = process.env,
 ): ConfigView {
   const raw = extractLosslessConfig(readRootConfig(configPath), configPath);
-  const resolved = resolveLcmConfigWithDiagnostics(env, raw);
+  let resolved: ReturnType<typeof resolveLcmConfigWithDiagnostics>;
+  try {
+    resolved = resolveLcmConfigWithDiagnostics(env, raw);
+  } catch (error) {
+    throw new CliError(
+      "CONFIG_VALIDATION_FAILED",
+      `Lossless config at ${configPath} failed runtime validation: ${
+        error instanceof Error ? error.message : String(error)
+      }`,
+      4,
+      { configPath },
+    );
+  }
   return {
     configPath,
     raw,
