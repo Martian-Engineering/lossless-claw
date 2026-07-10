@@ -50,6 +50,7 @@ lcm doctor
 - `--recency` conflicts with `--after`.
 - Summary lists accept `--depth <integer>` and `--kind <leaf|condensed>`.
 - Message lists accept repeatable `--role <system|user|assistant|tool>` and `--include-content`.
+- Commands reject selection and filtering options that they do not apply.
 
 ### Pagination
 
@@ -202,7 +203,8 @@ It never returns other OpenClaw config sections.
 5. Creates a timestamped sibling backup.
 6. Writes and fsyncs a sibling temporary file.
 7. Atomically renames the temporary file over the config file while preserving its mode.
-8. Returns the old value, new value, config path, and backup path.
+8. Fsyncs the parent directory on POSIX systems so the rename is durable.
+9. Returns the old value, new value, config path, and backup path.
 
 The writer refuses symlinks, non-JSON syntax, malformed files, and `$include` at the root, `plugins`, `plugins.entries`, the Lossless entry, or its `config` object. Refusal leaves the source and backup set unchanged.
 

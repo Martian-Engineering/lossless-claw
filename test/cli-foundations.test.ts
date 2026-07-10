@@ -148,6 +148,22 @@ describe("parseCliArgs", () => {
       expect.objectContaining({ code: "INVALID_COMMAND", exitCode: 2 }),
     );
   });
+
+  it.each([
+    ["status", "--after", "2026-07-01T00:00:00Z"],
+    ["conversations", "list", "--role", "user"],
+    ["conversations", "show", "--conversation-id", "1", "--limit", "1"],
+    ["messages", "list", "--conversation-id", "1", "--depth", "0"],
+    ["messages", "tail", "--conversation-id", "1", "--cursor", "opaque"],
+    ["summaries", "list", "--role", "assistant"],
+    ["summaries", "show", "summary-1", "--include-content"],
+    ["config", "show", "--session-key", "agent:main:example"],
+    ["doctor", "--count", "1"],
+  ])("rejects command-specific options that %s does not use", (...args) => {
+    expect(() => parseCliArgs(args)).toThrowError(
+      expect.objectContaining({ code: "INVALID_ARGUMENT", exitCode: 2 }),
+    );
+  });
 });
 
 describe("parseTimeFilter", () => {

@@ -82,7 +82,7 @@ const CLI_OPTIONS = {
   before: { type: "string" },
   between: { type: "string" },
   recency: { type: "string" },
-  limit: { type: "string", default: "50" },
+  limit: { type: "string" },
   cursor: { type: "string" },
   role: { type: "string", multiple: true },
   "include-content": { type: "boolean", default: false },
@@ -90,6 +90,37 @@ const CLI_OPTIONS = {
   kind: { type: "string" },
   count: { type: "string" },
 } as const;
+
+type CommandSpecificOption =
+  | "conversation-id"
+  | "session-key"
+  | "after"
+  | "before"
+  | "between"
+  | "recency"
+  | "limit"
+  | "cursor"
+  | "role"
+  | "include-content"
+  | "depth"
+  | "kind"
+  | "count";
+
+const COMMAND_OPTION_SUPPORT: Record<CommandSpecificOption, ReadonlySet<CliCommand["kind"]>> = {
+  "conversation-id": new Set(["conversations.show", "messages.list", "messages.tail", "summaries.list"]),
+  "session-key": new Set(["conversations.show", "messages.list", "messages.tail", "summaries.list"]),
+  after: new Set(["messages.list", "summaries.list"]),
+  before: new Set(["messages.list", "summaries.list"]),
+  between: new Set(["messages.list", "summaries.list"]),
+  recency: new Set(["messages.list", "summaries.list"]),
+  limit: new Set(["conversations.list", "messages.list", "summaries.list"]),
+  cursor: new Set(["conversations.list", "messages.list", "summaries.list"]),
+  role: new Set(["messages.list"]),
+  "include-content": new Set(["messages.list", "summaries.list"]),
+  depth: new Set(["summaries.list"]),
+  kind: new Set(["summaries.list"]),
+  count: new Set(["messages.tail"]),
+};
 
 // Parse a bounded positive integer option without accepting coercible strings.
 function parsePositiveInteger(value: string | undefined, label: string, maximum?: number): number | undefined {
@@ -260,6 +291,28 @@ function parseRawCliArgs(args: string[]) {
   });
 }
 
+// Reject command-specific options instead of silently returning unfiltered data.
+function assertSupportedCommandOptions(
+  command: CliCommand,
+  values: ReturnType<typeof parseRawCliArgs>["values"],
+): void {
+  const supplied = (Object.keys(COMMAND_OPTION_SUPPORT) as CommandSpecificOption[])
+    .filter((option) => {
+      const value = values[option];
+      return Array.isArray(value) ? value.length > 0 : value !== undefined && value !== false;
+    });
+  for (const option of supplied) {
+    if (!COMMAND_OPTION_SUPPORT[option].has(command.kind)) {
+      throw new CliError(
+        "INVALID_ARGUMENT",
+        `--${option} is not supported by ${command.kind}.`,
+        2,
+        { option, command: command.kind },
+      );
+    }
+  }
+}
+
 /** Parse one complete `lcm` invocation into a validated command contract. */
 export function parseCliArgs(args: string[], now: Date = new Date()): ParsedCliArgs {
   let parsed: ReturnType<typeof parseRawCliArgs>;
@@ -275,6 +328,7 @@ export function parseCliArgs(args: string[], now: Date = new Date()): ParsedCliA
 
   // Normalize and validate each external option once at the process boundary.
   const command = parseCommand(parsed.positionals, parsed.values.help === true, parsed.values.version === true);
+  assertSupportedCommandOptions(command, parsed.values);
   const selector = parseSelector(parsed.values["conversation-id"], parsed.values["session-key"]);
   requireSelector(command, selector);
   const format = parsed.values.format;
@@ -307,7 +361,7 @@ export function parseCliArgs(args: string[], now: Date = new Date()): ParsedCliA
       between: parsed.values.between,
       recency: parsed.values.recency,
     }, now),
-    limit: parsePositiveInteger(parsed.values.limit, "limit", 500)!,
+    limit: parsePositiveInteger(parsed.values.limit ?? "50", "limit", 500)!,
     cursor: parsed.values.cursor,
     roles,
     includeContent: parsed.values["include-content"] === true,

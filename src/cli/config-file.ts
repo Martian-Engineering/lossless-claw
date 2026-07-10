@@ -47,7 +47,13 @@ function loadConfigSchema(): JsonRecord {
   return schema;
 }
 
-const CONFIG_SCHEMA = loadConfigSchema();
+let configSchema: JsonRecord | undefined;
+
+// Defer manifest access so help and read-only commands can report their own results.
+function getConfigSchema(): JsonRecord {
+  configSchema ??= loadConfigSchema();
+  return configSchema;
+}
 
 export type ConfigView = {
   configPath: string;
@@ -114,10 +120,10 @@ function readRootConfig(configPath: string): JsonRecord {
 
 // Read an optional object property and reject incompatible config shapes.
 function optionalRecord(parent: JsonRecord, key: string, configPath: string): JsonRecord | undefined {
-  const value = parent[key];
-  if (value === undefined) {
+  if (!Object.hasOwn(parent, key)) {
     return undefined;
   }
+  const value = parent[key];
   const record = asRecord(value);
   if (!record) {
     throw new CliError(
@@ -234,10 +240,13 @@ export function getConfigValue(view: ConfigView, path: string): ConfigValueView 
 
 // Find the manifest schema node for an approved dot path.
 function schemaAtPath(segments: string[]): JsonRecord | undefined {
-  let schema = CONFIG_SCHEMA;
+  let schema = getConfigSchema();
   for (const segment of segments) {
     const properties = asRecord(schema.properties);
-    const next = properties?.[segment];
+    if (!properties || !Object.hasOwn(properties, segment)) {
+      return undefined;
+    }
+    const next = properties[segment];
     const nextSchema = asRecord(next);
     if (!nextSchema) {
       return undefined;
@@ -276,7 +285,7 @@ function validateSchema(
       errors.push({ path, message: `Expected at least ${schema.minProperties} properties` });
     }
     for (const [key, childValue] of Object.entries(record)) {
-      const childSchema = asRecord(properties[key]);
+      const childSchema = Object.hasOwn(properties, key) ? asRecord(properties[key]) : undefined;
       if (!childSchema) {
         if (schema.additionalProperties === false) {
           errors.push({ path: `${path}/${key}`, message: "Unexpected property" });
@@ -350,7 +359,7 @@ function assertNoRelevantIncludes(root: JsonRecord, configPath: string): void {
 
 // Create one object property while rejecting existing scalar or array shapes.
 function getOrCreateRecord(parent: JsonRecord, key: string, configPath: string): JsonRecord {
-  if (parent[key] === undefined) {
+  if (!Object.hasOwn(parent, key)) {
     parent[key] = {};
   }
   const record = asRecord(parent[key]);
@@ -393,7 +402,7 @@ function parseJsonValue(value: string, path: string): unknown {
 
 // Validate the complete plugin config to catch both target and surrounding invalid values.
 function validatePluginConfig(config: JsonRecord, path: string): void {
-  const errors = validateSchema(CONFIG_SCHEMA, config).slice(0, 20);
+  const errors = validateSchema(getConfigSchema(), config).slice(0, 20);
   if (errors.length === 0) {
     return;
   }
@@ -426,6 +435,19 @@ function backupTimestamp(now: Date): string {
   return now.toISOString().replace(/[-:.]/g, "");
 }
 
+// Make a completed rename durable on filesystems that support directory fsync.
+function fsyncParentDirectory(configPath: string): void {
+  if (process.platform === "win32") {
+    return;
+  }
+  const descriptor = openSync(dirname(configPath), "r");
+  try {
+    fsyncSync(descriptor);
+  } finally {
+    closeSync(descriptor);
+  }
+}
+
 // Persist validated JSON through a sibling temp file and atomic rename.
 function writeConfigAtomically(configPath: string, root: JsonRecord, mode: number): void {
   const tempPath = join(dirname(configPath), `.${basename(configPath)}.lcm-${process.pid}-${randomUUID()}.tmp`);
@@ -438,6 +460,7 @@ function writeConfigAtomically(configPath: string, root: JsonRecord, mode: numbe
     closeSync(descriptor);
     descriptor = undefined;
     renameSync(tempPath, configPath);
+    fsyncParentDirectory(configPath);
   } catch (error) {
     if (descriptor !== undefined) {
       closeSync(descriptor);

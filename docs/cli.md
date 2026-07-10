@@ -22,6 +22,8 @@ lcm doctor
 
 Run `lcm --help` for the command and option inventory. Add `--pretty` for indented JSON or `--format table` for compact terminal output.
 
+Command-specific options are rejected when their command does not use them. The CLI never reports success after silently ignoring a selector, filter, pagination option, or content flag.
+
 ## Paths
 
 The OpenClaw state directory uses this precedence:
@@ -124,6 +126,7 @@ Summary detail includes full content, higher-depth `parents` that consume the se
 - `--recency <duration>` accepts a positive integer followed by `s`, `m`, `h`, `d`, or `w`.
 
 `--between` cannot be combined with another time option. `--recency` cannot be combined with `--after`.
+Time filters apply only to `messages list` and `summaries list`.
 
 ## Pagination
 
@@ -162,7 +165,7 @@ lcm config set ignoreSessionPatterns '["agent:*:cron:**"]'
 lcm config set autoRotateSessionFiles.enabled false
 ```
 
-The command checks the path and value against `openclaw.plugin.json`, validates the complete Lossless config, creates an exclusive timestamped sibling backup, preserves the source mode, fsyncs a sibling temporary file, and atomically replaces `openclaw.json`.
+The command checks the path and value against `openclaw.plugin.json`, validates the complete Lossless config, creates an exclusive timestamped sibling backup, preserves the source mode, fsyncs a sibling temporary file, atomically replaces `openclaw.json`, and fsyncs the parent directory on POSIX systems.
 
 Config writes refuse:
 

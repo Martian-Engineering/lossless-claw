@@ -154,6 +154,7 @@ describe("setConfigValue", () => {
 
   it.each([
     ["unknown config path", "notARealSetting", "true"],
+    ["inherited config path", "__proto__", "{}"],
     ["schema-invalid value", "contextThreshold", "2"],
   ])("leaves the file and backup set unchanged for an %s", (_label, path, value) => {
     const original = writeConfig({
