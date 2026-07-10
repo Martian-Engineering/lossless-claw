@@ -59,6 +59,15 @@ type TimeFilterInput = {
 
 const MESSAGE_ROLES = new Set<MessageRole>(["system", "user", "assistant", "tool"]);
 const SUMMARY_KINDS = new Set<SummaryKind>(["leaf", "condensed"]);
+const FIXED_COMMANDS = new Set([
+  "conversations.list",
+  "conversations.show",
+  "messages.list",
+  "messages.tail",
+  "summaries.list",
+  "config.show",
+]);
+const ISO_TIMESTAMP_PATTERN = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}(?::\d{2}(?:\.\d{1,9})?)?(?:Z|[+-]\d{2}:\d{2})$/;
 const CLI_OPTIONS = {
   db: { type: "string" },
   config: { type: "string" },
@@ -115,8 +124,7 @@ function parseNonNegativeInteger(value: string | undefined, label: string): numb
 
 // Parse one externally supplied timestamp and normalize its validation error.
 function parseTimestamp(value: string, label: string): Date {
-  const isoTimestamp = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}(?::\d{2}(?:\.\d{1,9})?)?(?:Z|[+-]\d{2}:\d{2})$/;
-  if (!isoTimestamp.test(value)) {
+  if (!ISO_TIMESTAMP_PATTERN.test(value)) {
     throw new CliError("INVALID_TIME_FILTER", `${label} must be an ISO-8601 timestamp.`, 2, { value });
   }
   const parsed = new Date(value);
@@ -196,6 +204,9 @@ function parseCommand(positionals: string[], help: boolean, version: boolean): C
   }
   const [resource, action, ...rest] = positionals;
   const key = action ? `${resource}.${action}` : resource;
+  if (FIXED_COMMANDS.has(key) && rest.length > 0) {
+    throw new CliError("INVALID_COMMAND", `${key} does not accept positional arguments.`, 2);
+  }
   switch (key) {
     case "status": return { kind: "status" };
     case "conversations.list": return { kind: "conversations.list" };

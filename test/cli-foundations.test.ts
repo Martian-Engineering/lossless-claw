@@ -128,6 +128,19 @@ describe("parseCliArgs", () => {
       expect.objectContaining({ code: "MISSING_SELECTOR", exitCode: 2 }),
     );
   });
+
+  it.each([
+    ["conversations", "list", "unexpected"],
+    ["conversations", "show", "unexpected", "--conversation-id", "1"],
+    ["messages", "list", "unexpected", "--conversation-id", "1"],
+    ["messages", "tail", "unexpected", "--conversation-id", "1"],
+    ["summaries", "list", "unexpected"],
+    ["config", "show", "unexpected"],
+  ])("rejects extra positionals for fixed commands: %s %s", (...args) => {
+    expect(() => parseCliArgs(args)).toThrowError(
+      expect.objectContaining({ code: "INVALID_COMMAND", exitCode: 2 }),
+    );
+  });
 });
 
 describe("parseTimeFilter", () => {
