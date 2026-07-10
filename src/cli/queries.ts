@@ -3,7 +3,9 @@ import {
   decodeCursor,
   encodeCursor,
   type ConversationSelector,
+  type MessageRole,
   type SummaryKind,
+  type TimeFilter,
 } from "./args.js";
 import { CliError, type PaginationMetadata } from "./output.js";
 
@@ -66,6 +68,7 @@ export type ConversationPage = {
 type ConversationQueryInput = {
   limit: number;
   freshTailCount: number;
+  freshTailMaxTokens?: number;
   cursor?: string;
   conversationId?: number;
 };
@@ -288,7 +291,17 @@ export function resolveConversation(
 // Query aggregate conversation rows for either one ID or a keyset-paged list.
 function queryConversationRows(db: DatabaseSync, input: ConversationQueryInput): ConversationListRow[] {
   const where: string[] = [];
-  const args: Array<number | string> = [Math.max(0, Math.floor(input.freshTailCount))];
+  const normalizedTailCount = Math.max(0, Math.floor(input.freshTailCount));
+  const normalizedTailTokenCap = typeof input.freshTailMaxTokens === "number"
+    && Number.isFinite(input.freshTailMaxTokens)
+    && input.freshTailMaxTokens >= 0
+      ? Math.floor(input.freshTailMaxTokens)
+      : null;
+  const args: Array<number | string | null> = [
+    normalizedTailCount,
+    normalizedTailTokenCap,
+    normalizedTailTokenCap,
+  ];
   if (input.conversationId !== undefined) {
     where.push("c.conversation_id = ?");
     args.push(input.conversationId);
@@ -336,14 +349,25 @@ function queryConversationRows(db: DatabaseSync, input: ConversationQueryInput):
         ) GROUP BY conversation_id
     ),
     ranked_messages AS (
-      SELECT conversation_id, token_count,
-             ROW_NUMBER() OVER (PARTITION BY conversation_id ORDER BY seq DESC) AS tailRank
-        FROM messages
+      SELECT ci.conversation_id, m.token_count,
+             ROW_NUMBER() OVER (
+               PARTITION BY ci.conversation_id ORDER BY ci.ordinal DESC
+             ) AS tailRank,
+             SUM(m.token_count) OVER (
+               PARTITION BY ci.conversation_id ORDER BY ci.ordinal DESC
+               ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
+             ) AS cumulativeTokens
+        FROM context_items ci
+        JOIN messages m ON m.message_id = ci.message_id
+       WHERE ci.item_type = 'message'
     ),
     fresh_tail_stats AS (
       SELECT conversation_id, COUNT(*) AS freshTailMessages,
              COALESCE(SUM(token_count), 0) AS freshTailTokens
-        FROM ranked_messages WHERE tailRank <= ? GROUP BY conversation_id
+        FROM ranked_messages
+       WHERE tailRank <= ?
+         AND (tailRank = 1 OR ? IS NULL OR cumulativeTokens <= ?)
+       GROUP BY conversation_id
     )
     SELECT
       c.conversation_id AS conversationId,
@@ -383,7 +407,7 @@ function queryConversationRows(db: DatabaseSync, input: ConversationQueryInput):
 /** Return one keyset-paginated page of aggregate conversation diagnostics. */
 export function listConversations(
   db: DatabaseSync,
-  input: { limit: number; freshTailCount: number; cursor?: string },
+  input: { limit: number; freshTailCount: number; freshTailMaxTokens?: number; cursor?: string },
 ): ConversationPage {
   const rows = queryConversationRows(db, { ...input, limit: input.limit + 1 });
   const hasMore = rows.length > input.limit;
@@ -504,12 +528,13 @@ function getLargeFileStats(db: DatabaseSync, conversationId: number): LargeFileS
 export function getConversationDiagnostics(
   db: DatabaseSync,
   selector: ConversationSelector,
-  input: { freshTailCount: number },
+  input: { freshTailCount: number; freshTailMaxTokens?: number },
 ): ConversationDiagnostics {
   const identity = resolveConversation(db, selector);
   const row = queryConversationRows(db, {
     limit: 1,
     freshTailCount: input.freshTailCount,
+    freshTailMaxTokens: input.freshTailMaxTokens,
     conversationId: identity.conversationId,
   })[0];
   if (!row) {
@@ -525,5 +550,200 @@ export function getConversationDiagnostics(
     bootstrap: getBootstrap(db, identity.conversationId),
     focusBriefs: getFocusBriefStats(db, identity.conversationId),
     largeFiles: getLargeFileStats(db, identity.conversationId),
+  };
+}
+
+export type MessageListItem = {
+  messageId: number;
+  conversationId: number;
+  seq: number;
+  role: MessageRole;
+  tokenCount: number;
+  createdAt: string;
+  largeContent: string | null;
+  preview: string;
+  content?: string;
+};
+
+export type MessagePage = {
+  conversation: ConversationIdentity;
+  items: MessageListItem[];
+  pagination: PaginationMetadata;
+};
+
+type MessageRow = {
+  messageId: number;
+  conversationId: number;
+  seq: number;
+  role: MessageRole;
+  content: string;
+  tokenCount: number;
+  createdAt: string;
+  largeContent: string | null;
+};
+
+export type FreshTailResult = {
+  conversationIdentity: ConversationIdentity;
+  limits: { count: number; maxTokens: number | null };
+  selected: { messages: number; tokens: number; firstSeq: number | null; lastSeq: number | null };
+  conversation: { messages: number; tokens: number };
+  messages: Array<MessageListItem & { content: string }>;
+};
+
+// Produce a bounded single-line preview without changing stored content.
+function previewMessageContent(content: string, maximumCharacters = 240): string {
+  const normalized = content.replace(/\s+/g, " ").trim();
+  return normalized.length <= maximumCharacters
+    ? normalized
+    : `${normalized.slice(0, maximumCharacters - 1)}…`;
+}
+
+// Map a stored message row to the public list representation.
+function mapMessageRow(row: MessageRow, includeContent: boolean): MessageListItem {
+  return {
+    messageId: row.messageId,
+    conversationId: row.conversationId,
+    seq: row.seq,
+    role: row.role,
+    tokenCount: row.tokenCount,
+    createdAt: row.createdAt,
+    largeContent: row.largeContent,
+    preview: previewMessageContent(row.content),
+    ...(includeContent ? { content: row.content } : {}),
+  };
+}
+
+/** Return one filtered, keyset-paginated page of stored conversation messages. */
+export function listMessages(
+  db: DatabaseSync,
+  input: {
+    selector: ConversationSelector;
+    roles: MessageRole[];
+    time: TimeFilter;
+    limit: number;
+    cursor?: string;
+    includeContent: boolean;
+  },
+): MessagePage {
+  const conversation = resolveConversation(db, input.selector);
+  const where = ["m.conversation_id = ?"];
+  const args: Array<number | string> = [conversation.conversationId];
+
+  // Add only enumerated role placeholders and bound timestamp/cursor values.
+  if (input.roles.length > 0) {
+    where.push(`m.role IN (${input.roles.map(() => "?").join(", ")})`);
+    args.push(...input.roles);
+  }
+  if (input.time.after) {
+    where.push("julianday(m.created_at) >= julianday(?)");
+    args.push(input.time.after.toISOString());
+  }
+  if (input.time.before) {
+    where.push("julianday(m.created_at) < julianday(?)");
+    args.push(input.time.before.toISOString());
+  }
+  if (input.cursor) {
+    const cursor = decodeCursor(input.cursor, "messages");
+    if (typeof cursor.id !== "number" || !Number.isInteger(cursor.id)) {
+      throw new CliError("INVALID_CURSOR", "Invalid messages cursor.", 2);
+    }
+    where.push(`(
+      julianday(m.created_at) < julianday(?)
+      OR (julianday(m.created_at) = julianday(?) AND m.message_id < ?)
+    )`);
+    args.push(cursor.timestamp, cursor.timestamp, cursor.id);
+  }
+  args.push(input.limit + 1);
+
+  const rows = db.prepare(`SELECT
+      m.message_id AS messageId, m.conversation_id AS conversationId,
+      m.seq, m.role, m.content, m.token_count AS tokenCount,
+      m.created_at AS createdAt, m.large_content AS largeContent
+    FROM messages m
+    WHERE ${where.join(" AND ")}
+    ORDER BY julianday(m.created_at) DESC, m.message_id DESC
+    LIMIT ?`
+  ).all(...args) as MessageRow[];
+  const hasMore = rows.length > input.limit;
+  const items = (hasMore ? rows.slice(0, input.limit) : rows)
+    .map((row) => mapMessageRow(row, input.includeContent));
+  const last = items.at(-1);
+
+  return {
+    conversation,
+    items,
+    pagination: {
+      limit: input.limit,
+      returned: items.length,
+      hasMore,
+      nextCursor: hasMore && last
+        ? encodeCursor("messages", last.createdAt, last.messageId)
+        : null,
+    },
+  };
+}
+
+/** Return the protected raw-message tail from the current context frontier. */
+export function getFreshTail(
+  db: DatabaseSync,
+  input: {
+    selector: ConversationSelector;
+    freshTailCount: number;
+    freshTailMaxTokens?: number;
+    count?: number;
+  },
+): FreshTailResult {
+  const conversationIdentity = resolveConversation(db, input.selector);
+  const count = Math.max(0, Math.floor(input.count ?? input.freshTailCount));
+  const maxTokens = typeof input.freshTailMaxTokens === "number"
+    && Number.isFinite(input.freshTailMaxTokens)
+    && input.freshTailMaxTokens >= 0
+      ? Math.floor(input.freshTailMaxTokens)
+      : null;
+
+  const rows = db.prepare(`SELECT
+      m.message_id AS messageId, m.conversation_id AS conversationId,
+      m.seq, m.role, m.content, m.token_count AS tokenCount,
+      m.created_at AS createdAt, m.large_content AS largeContent
+    FROM context_items ci
+    JOIN messages m ON m.message_id = ci.message_id
+    WHERE ci.conversation_id = ? AND ci.item_type = 'message'
+    ORDER BY ci.ordinal DESC
+    LIMIT ?`
+  ).all(conversationIdentity.conversationId, count) as MessageRow[];
+
+  // Walk newest to oldest, always preserving the newest row even above the cap.
+  const selectedNewestFirst: MessageRow[] = [];
+  let selectedTokens = 0;
+  for (const row of rows) {
+    if (
+      selectedNewestFirst.length > 0
+      && maxTokens !== null
+      && selectedTokens + row.tokenCount > maxTokens
+    ) {
+      break;
+    }
+    selectedNewestFirst.push(row);
+    selectedTokens += row.tokenCount;
+  }
+  const messages = selectedNewestFirst.reverse().map(
+    (row) => mapMessageRow(row, true) as MessageListItem & { content: string },
+  );
+  const totals = db.prepare(`SELECT COUNT(*) AS messages,
+      COALESCE(SUM(token_count), 0) AS tokens
+    FROM messages WHERE conversation_id = ?`
+  ).get(conversationIdentity.conversationId) as { messages: number; tokens: number };
+
+  return {
+    conversationIdentity,
+    limits: { count, maxTokens },
+    selected: {
+      messages: messages.length,
+      tokens: selectedTokens,
+      firstSeq: messages[0]?.seq ?? null,
+      lastSeq: messages.at(-1)?.seq ?? null,
+    },
+    conversation: totals,
+    messages,
   };
 }
