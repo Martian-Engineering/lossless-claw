@@ -14,7 +14,6 @@ import {
   writeFileSync,
 } from "node:fs";
 import { basename, dirname, join } from "node:path";
-import manifest from "../../openclaw.plugin.json" with { type: "json" };
 import {
   resolveLcmConfigWithDiagnostics,
   type LcmConfig,
@@ -23,9 +22,32 @@ import {
 import { CliError } from "./output.js";
 
 const LOSSLESS_PLUGIN_ID = "lossless-claw";
-const CONFIG_SCHEMA = manifest.configSchema as unknown as JsonRecord;
 
 type JsonRecord = Record<string, unknown>;
+
+// Load the packaged manifest in both source-test and dist/cli.js layouts.
+function loadConfigSchema(): JsonRecord {
+  const candidates = [
+    new URL("../openclaw.plugin.json", import.meta.url),
+    new URL("../../openclaw.plugin.json", import.meta.url),
+  ];
+  const manifestUrl = candidates.find((candidate) => existsSync(candidate));
+  if (!manifestUrl) {
+    throw new CliError(
+      "CONFIG_SCHEMA_NOT_FOUND",
+      "Could not locate the packaged Lossless plugin manifest.",
+      4,
+    );
+  }
+  const parsed = JSON.parse(readFileSync(manifestUrl, "utf8")) as unknown;
+  const schema = asRecord(asRecord(parsed)?.configSchema);
+  if (!schema) {
+    throw new CliError("CONFIG_SCHEMA_INVALID", "Lossless plugin manifest has no configSchema.", 4);
+  }
+  return schema;
+}
+
+const CONFIG_SCHEMA = loadConfigSchema();
 
 export type ConfigView = {
   configPath: string;

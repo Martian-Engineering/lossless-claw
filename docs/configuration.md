@@ -437,6 +437,7 @@ These settings are not part of `plugins.entries.lossless-claw.config`, but they 
 | Env var | Default | Purpose |
 | --- | --- | --- |
 | `OPENCLAW_STATE_DIR` | `~/.openclaw` | Active state directory for the OpenClaw gateway. When set, all path defaults (database, large files, auth profiles, secrets) resolve relative to this directory instead of `~/.openclaw`. Set automatically by OpenClaw for non-default profiles. |
+| `LCM_OPENCLAW_DIR` | unset | Lossless shell CLI override for the OpenClaw state directory. Takes precedence over `OPENCLAW_STATE_DIR` for `lcm` commands only. |
 | `LCM_TUI_CONVERSATION_WINDOW_SIZE` | `200` | Number of messages `lcm-tui` loads per keyset-paged conversation window. |
 
 ## Database operations

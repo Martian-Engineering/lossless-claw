@@ -4,6 +4,21 @@ For the MVP, use the native command surface first. For debugging lossless-claw b
 
 ## Fast path
 
+### `lcm` shell CLI
+
+Use the packaged shell CLI for bounded, structured database inspection outside an OpenClaw conversation:
+
+```bash
+lcm status --pretty
+lcm conversations show --session-key 'agent:main:example'
+lcm messages tail --conversation-id 42
+lcm summaries list --conversation-id 42 --depth 0 --recency 7d
+```
+
+JSON is the default output. List commands return opaque keyset cursors. Database commands open `lcm.db` read-only and do not run migrations, repair, cleanup, compaction, or other write operations. `lcm config set` is the only state-changing shell command and edits one manifest-validated Lossless config path with a timestamped backup.
+
+Path overrides use `--db`, `LCM_DATABASE_PATH`, `--openclaw-dir`, `LCM_OPENCLAW_DIR`, `OPENCLAW_STATE_DIR`, `OPENCLAW_HOME`, `--config`, and `OPENCLAW_CONFIG_PATH`. See `docs/cli.md` in the package for precedence and the complete command contract.
+
 ### Independent Lossless log
 
 Check this first when lossless-claw needs to debug itself, because routine `[lcm]` info and debug lines are written here instead of the shared OpenClaw gateway log.

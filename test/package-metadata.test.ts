@@ -9,4 +9,9 @@ describe("package OpenClaw compatibility metadata", () => {
     expect(packageJson.openclaw.compat.tested).toEqual(["2026.5.28"]);
     expect(packageJson.openclaw.build.openclawVersion).toBe("2026.5.28");
   });
+
+  it("publishes the TypeScript lcm executable", () => {
+    expect(packageJson.bin).toEqual({ lcm: "dist/cli.js" });
+    expect(packageJson.scripts.build).toContain("build:cli");
+  });
 });

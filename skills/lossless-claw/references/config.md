@@ -292,6 +292,7 @@ Why it matters:
 - useful for custom deployments, testing, or isolating environments
 - wrong path selection is a common reason operators think LCM is empty or not growing
 - the default resolves to `${OPENCLAW_STATE_DIR}/lcm.db` (falls back to `~/.openclaw/lcm.db`)
+- the `lcm` shell CLI also accepts `LCM_OPENCLAW_DIR` as a CLI-only state-directory override before `OPENCLAW_STATE_DIR`
 
 ### `databasePath`
 
