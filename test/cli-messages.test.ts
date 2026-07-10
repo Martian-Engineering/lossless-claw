@@ -103,6 +103,34 @@ describe("listMessages", () => {
     expect(second.items).toMatchObject([{ messageId: 102, content: "assistant at shared time" }]);
     expect(second.pagination).toMatchObject({ hasMore: false, nextCursor: null });
   });
+
+  it("bounds preview output unless full content is requested", () => {
+    const writable = new DatabaseSync(databasePath);
+    writable.prepare("UPDATE messages SET content = ? WHERE message_id = 104")
+      .run("x".repeat(5000));
+    writable.close();
+
+    const db = openReadOnlyDatabase(databasePath);
+    const previewPage = listMessages(db, {
+      selector: { kind: "conversationId", value: 1 },
+      roles: [],
+      time: {},
+      limit: 1,
+      includeContent: false,
+    });
+    const contentPage = listMessages(db, {
+      selector: { kind: "conversationId", value: 1 },
+      roles: [],
+      time: {},
+      limit: 1,
+      includeContent: true,
+    });
+    db.close();
+
+    expect(previewPage.items[0]).not.toHaveProperty("content");
+    expect(previewPage.items[0]?.preview).toHaveLength(240);
+    expect(contentPage.items[0]?.content).toHaveLength(5000);
+  });
 });
 
 describe("getFreshTail", () => {

@@ -129,6 +129,30 @@ describe("listSummaries", () => {
     expect(second.items.map((summary) => summary.summaryId)).toEqual(["sum-foreign"]);
     expect(second.pagination).toMatchObject({ hasMore: false, nextCursor: null });
   });
+
+  it("bounds preview output unless full content is requested", () => {
+    const writable = new DatabaseSync(databasePath);
+    writable.prepare("UPDATE summaries SET content = ? WHERE summary_id = 'sum-root'")
+      .run("y".repeat(5000));
+    writable.close();
+
+    const db = openReadOnlyDatabase(databasePath);
+    const previewPage = listSummaries(db, {
+      time: {},
+      limit: 1,
+      includeContent: false,
+    });
+    const contentPage = listSummaries(db, {
+      time: {},
+      limit: 1,
+      includeContent: true,
+    });
+    db.close();
+
+    expect(previewPage.items[0]).not.toHaveProperty("content");
+    expect(previewPage.items[0]?.preview).toHaveLength(240);
+    expect(contentPage.items[0]?.content).toHaveLength(5000);
+  });
 });
 
 describe("getSummaryDetails", () => {

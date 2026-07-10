@@ -9,6 +9,8 @@ import {
 } from "./args.js";
 import { CliError, type PaginationMetadata } from "./output.js";
 
+const LIST_PREVIEW_SOURCE_CHARACTERS = 1024;
+
 export {
   getSummaryDetails,
   listSummaries,
@@ -674,10 +676,13 @@ export function listMessages(
     args.push(cursor.timestamp, cursor.timestamp, cursor.id);
   }
   args.push(input.limit + 1);
+  const contentProjection = input.includeContent
+    ? "m.content"
+    : `substr(m.content, 1, ${LIST_PREVIEW_SOURCE_CHARACTERS})`;
 
   const rows = db.prepare(`SELECT
       m.message_id AS messageId, m.conversation_id AS conversationId,
-      m.seq, m.role, m.content, m.token_count AS tokenCount,
+      m.seq, m.role, ${contentProjection} AS content, m.token_count AS tokenCount,
       m.created_at AS createdAt, m.large_content AS largeContent
     FROM messages m
     WHERE ${where.join(" AND ")}

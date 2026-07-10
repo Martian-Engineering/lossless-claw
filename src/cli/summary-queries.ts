@@ -9,14 +9,21 @@ import {
 } from "./args.js";
 import { CliError, type PaginationMetadata } from "./output.js";
 
+const LIST_PREVIEW_SOURCE_CHARACTERS = 1024;
 const SUMMARY_COVERAGE_TIME = "COALESCE(s.latest_at, s.created_at)";
-const SUMMARY_SELECT = `
+
+// Build the shared summary projection with either full or bounded content.
+function buildSummarySelect(includeContent: boolean): string {
+  const contentProjection = includeContent
+    ? "s.content"
+    : `substr(s.content, 1, ${LIST_PREVIEW_SOURCE_CHARACTERS})`;
+  return `
   SELECT
     s.summary_id AS summaryId,
     s.conversation_id AS conversationId,
     s.kind,
     s.depth,
-    s.content,
+    ${contentProjection} AS content,
     s.token_count AS tokenCount,
     s.earliest_at AS earliestAt,
     s.latest_at AS latestAt,
@@ -40,6 +47,9 @@ const SUMMARY_SELECT = `
      WHERE sm.summary_id = s.summary_id
        AND m.conversation_id = s.conversation_id) AS sourceMessageCount
   FROM summaries s`;
+}
+
+const SUMMARY_SELECT = buildSummarySelect(true);
 
 export type SummaryListItem = {
   summaryId: string;
@@ -209,7 +219,7 @@ export function listSummaries(
   args.push(input.limit + 1);
 
   const whereClause = where.length ? `WHERE ${where.join(" AND ")}` : "";
-  const rows = db.prepare(`${SUMMARY_SELECT}
+  const rows = db.prepare(`${buildSummarySelect(input.includeContent)}
     ${whereClause}
     ORDER BY julianday(${SUMMARY_COVERAGE_TIME}) DESC, s.summary_id DESC
     LIMIT ?`
