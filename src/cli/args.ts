@@ -121,6 +121,7 @@ const COMMAND_OPTION_SUPPORT: Record<CommandSpecificOption, ReadonlySet<CliComma
   kind: new Set(["summaries.list"]),
   count: new Set(["messages.tail"]),
 };
+const CONFIG_JSON_VALUE_SENTINEL = "\0lcm-config-json-value";
 
 // Parse a bounded positive integer option without accepting coercible strings.
 function parsePositiveInteger(value: string | undefined, label: string, maximum?: number): number | undefined {
@@ -301,14 +302,61 @@ function requireSelector(command: CliCommand, selector: ConversationSelector | u
   }
 }
 
+// Protect one negative JSON number from option parsing when it is the config-set value.
+function normalizeDashPrefixedConfigValue(args: string[]): {
+  args: string[];
+  originalValue?: string;
+} {
+  for (const [index, originalValue] of args.entries()) {
+    try {
+      if (!originalValue.startsWith("-") || typeof JSON.parse(originalValue) !== "number") {
+        continue;
+      }
+    } catch {
+      continue;
+    }
+
+    // Let the strict parser prove that this candidate is the config-set value positional.
+    const normalized = [...args];
+    normalized[index] = CONFIG_JSON_VALUE_SENTINEL;
+    try {
+      const inspected = parseArgs({
+        args: normalized,
+        allowPositionals: true,
+        strict: true,
+        options: CLI_OPTIONS,
+      });
+      if (
+        inspected.positionals.length === 4
+        && inspected.positionals[0] === "config"
+        && inspected.positionals[1] === "set"
+        && inspected.positionals[3] === CONFIG_JSON_VALUE_SENTINEL
+      ) {
+        return { args: normalized, originalValue };
+      }
+    } catch {
+      // The normal strict parse below owns the final error for invalid invocations.
+    }
+  }
+  return { args };
+}
+
 // Keep Node's option-schema inference intact for the normalized parser below.
 function parseRawCliArgs(args: string[]) {
-  return parseArgs({
-    args,
+  const normalized = normalizeDashPrefixedConfigValue(args);
+  const parsed = parseArgs({
+    args: normalized.args,
     allowPositionals: true,
     strict: true,
     options: CLI_OPTIONS,
   });
+  if (normalized.originalValue !== undefined) {
+    const valueIndex = parsed.positionals.indexOf(CONFIG_JSON_VALUE_SENTINEL);
+    if (valueIndex >= 0) {
+      parsed.positionals[valueIndex] = normalized.originalValue;
+    }
+  }
+  return parsed;
 }
 
 // Reject command-specific options instead of silently returning unfiltered data.

@@ -164,6 +164,33 @@ describe("parseCliArgs", () => {
       expect.objectContaining({ code: "INVALID_ARGUMENT", exitCode: 2 }),
     );
   });
+
+  it.each([
+    ["config", "set", "sweepMaxDepth", "-1"],
+    ["--pretty", "config", "set", "sweepMaxDepth", "-1"],
+    ["config", "set", "sweepMaxDepth", "--pretty", "-1"],
+    ["config", "set", "sweepMaxDepth", "-1", "--pretty"],
+  ])("preserves a dash-prefixed JSON value for config set", (...args) => {
+    const parsed = parseCliArgs(args);
+
+    expect(parsed.command).toEqual({ kind: "config.set", path: "sweepMaxDepth", value: "-1" });
+    expect(parsed.pretty).toBe(args.includes("--pretty"));
+  });
+
+  it.each(["-12", "-1.5", "-1e2", "-10e-1", "-1e-0"])(
+    "preserves the complete dash-prefixed JSON token %s",
+    (value) => {
+      const parsed = parseCliArgs(["config", "set", "sweepMaxDepth", value]);
+
+      expect(parsed.command).toEqual({ kind: "config.set", path: "sweepMaxDepth", value });
+    },
+  );
+
+  it("does not reinterpret a negative config path as the value", () => {
+    expect(() => parseCliArgs(["config", "set", "-1", "2"])).toThrowError(
+      expect.objectContaining({ code: "INVALID_ARGUMENT", exitCode: 2 }),
+    );
+  });
 });
 
 describe("parseTimeFilter", () => {

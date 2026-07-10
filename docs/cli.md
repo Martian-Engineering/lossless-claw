@@ -159,6 +159,7 @@ lcm config get autoRotateSessionFiles.enabled
 
 ```bash
 lcm config set freshTailCount 96
+lcm config set sweepMaxDepth -1
 lcm config set promptAwareEviction true
 lcm config set summaryModel '"openai/gpt-5.4-mini"'
 lcm config set ignoreSessionPatterns '["agent:*:cron:**"]'
