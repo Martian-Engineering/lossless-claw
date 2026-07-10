@@ -158,6 +158,12 @@ describe("parseTimeFilter", () => {
       }),
     ).toThrowError(expect.objectContaining({ code: "INVALID_TIME_FILTER", exitCode: 2 }));
   });
+
+  it("rejects non-ISO timestamp text", () => {
+    expect(() => parseTimeFilter({ after: "July 1, 2026" })).toThrowError(
+      expect.objectContaining({ code: "INVALID_TIME_FILTER", exitCode: 2 }),
+    );
+  });
 });
 
 describe("opaque cursors", () => {

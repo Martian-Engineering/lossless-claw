@@ -115,6 +115,10 @@ function parseNonNegativeInteger(value: string | undefined, label: string): numb
 
 // Parse one externally supplied timestamp and normalize its validation error.
 function parseTimestamp(value: string, label: string): Date {
+  const isoTimestamp = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}(?::\d{2}(?:\.\d{1,9})?)?(?:Z|[+-]\d{2}:\d{2})$/;
+  if (!isoTimestamp.test(value)) {
+    throw new CliError("INVALID_TIME_FILTER", `${label} must be an ISO-8601 timestamp.`, 2, { value });
+  }
   const parsed = new Date(value);
   if (!Number.isFinite(parsed.getTime())) {
     throw new CliError("INVALID_TIME_FILTER", `${label} must be an ISO-8601 timestamp.`, 2, { value });

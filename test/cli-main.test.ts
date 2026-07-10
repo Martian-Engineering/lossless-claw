@@ -153,6 +153,18 @@ describe("runCli", () => {
     });
   });
 
+  it("includes resource-specific options in agent-readable help", () => {
+    const result = invoke(["--help"]);
+    expect(JSON.parse(result.stdout)).toMatchObject({
+      data: {
+        selectorOptions: expect.arrayContaining(["--conversation-id <id>", "--session-key <key>"]),
+        messageOptions: expect.arrayContaining(["--role <role>", "--include-content"]),
+        summaryOptions: expect.arrayContaining(["--depth <integer>", "--kind <leaf|condensed>"]),
+        tailOptions: ["--count <1..500>"],
+      },
+    });
+  });
+
   it("renders compact table output from the same response data", () => {
     const result = invoke(["conversations", "list", "--format", "table"]);
     expect(result.exitCode).toBe(0);
@@ -169,6 +181,19 @@ describe("runCli", () => {
         code: "MISSING_SELECTOR",
         message: "messages.list requires conversation-id or session-key.",
       },
+    });
+  });
+
+  it("reports SQLite query failures with database exit code 5", () => {
+    const emptyDatabasePath = join(directory, "empty.db");
+    new DatabaseSync(emptyDatabasePath).close();
+
+    const result = invoke(["status", "--db", emptyDatabasePath]);
+
+    expect(result).toMatchObject({ exitCode: 5, stdout: "" });
+    expect(JSON.parse(result.stderr)).toMatchObject({
+      ok: false,
+      error: { code: "DATABASE_QUERY_FAILED" },
     });
   });
 });

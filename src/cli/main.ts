@@ -64,6 +64,10 @@ const HELP_DATA = {
     "--version",
   ],
   listOptions: ["--limit <1..500>", "--cursor <opaque-cursor>"],
+  selectorOptions: ["--conversation-id <id>", "--session-key <key>"],
+  messageOptions: ["--role <role>", "--include-content"],
+  summaryOptions: ["--depth <integer>", "--kind <leaf|condensed>", "--include-content"],
+  tailOptions: ["--count <1..500>"],
   timeOptions: [
     "--after <iso-timestamp>",
     "--before <iso-timestamp>",
@@ -201,6 +205,16 @@ function runDatabaseCommand(
       default:
         throw new CliError("INVALID_COMMAND", `Command ${parsed.command.kind} does not read the database.`, 2);
     }
+  } catch (error) {
+    if (error instanceof CliError) {
+      throw error;
+    }
+    throw new CliError(
+      "DATABASE_QUERY_FAILED",
+      `LCM database query failed: ${error instanceof Error ? error.message : String(error)}`,
+      5,
+      { databasePath: paths.databasePath },
+    );
   } finally {
     db.close();
   }

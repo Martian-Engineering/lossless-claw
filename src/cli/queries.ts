@@ -306,11 +306,7 @@ function queryConversationRows(db: DatabaseSync, input: ConversationQueryInput):
     && input.freshTailMaxTokens >= 0
       ? Math.floor(input.freshTailMaxTokens)
       : null;
-  const args: Array<number | string | null> = [
-    normalizedTailCount,
-    normalizedTailTokenCap,
-    normalizedTailTokenCap,
-  ];
+  const args: Array<number | string | null> = [];
   if (input.conversationId !== undefined) {
     where.push("c.conversation_id = ?");
     args.push(input.conversationId);
@@ -326,34 +322,50 @@ function queryConversationRows(db: DatabaseSync, input: ConversationQueryInput):
     args.push(cursor.timestamp, cursor.timestamp, cursor.id);
   }
   args.push(input.limit);
+  args.push(normalizedTailCount, normalizedTailTokenCap, normalizedTailTokenCap);
 
   const whereClause = where.length ? `WHERE ${where.join(" AND ")}` : "";
   return db.prepare(`
     WITH
+    selected_conversations AS MATERIALIZED (
+      SELECT c.*
+        FROM conversations c
+        ${whereClause}
+       ORDER BY julianday(c.updated_at) DESC, c.conversation_id DESC
+       LIMIT ?
+    ),
     message_stats AS (
-      SELECT conversation_id, COUNT(*) AS messageCount,
+      SELECT m.conversation_id, COUNT(*) AS messageCount,
              COALESCE(SUM(token_count), 0) AS messageTokens,
-             MIN(created_at) AS earliestMessageAt, MAX(created_at) AS latestMessageAt
-        FROM messages GROUP BY conversation_id
+             MIN(m.created_at) AS earliestMessageAt, MAX(m.created_at) AS latestMessageAt
+        FROM messages m
+        JOIN selected_conversations c ON c.conversation_id = m.conversation_id
+       GROUP BY m.conversation_id
     ),
     summary_stats AS (
-      SELECT conversation_id, COUNT(*) AS summaryCount,
-             COALESCE(SUM(token_count), 0) AS summaryTokens,
-             COALESCE(SUM(source_message_token_count), 0) AS summarizedSourceTokens,
-             MIN(COALESCE(earliest_at, created_at)) AS earliestSummaryAt,
-             MAX(COALESCE(latest_at, created_at)) AS latestSummaryAt,
-             MAX(depth) AS maxSummaryDepth
-        FROM summaries GROUP BY conversation_id
+      SELECT s.conversation_id, COUNT(*) AS summaryCount,
+             COALESCE(SUM(s.token_count), 0) AS summaryTokens,
+             COALESCE(SUM(s.source_message_token_count), 0) AS summarizedSourceTokens,
+             MIN(COALESCE(s.earliest_at, s.created_at)) AS earliestSummaryAt,
+             MAX(COALESCE(s.latest_at, s.created_at)) AS latestSummaryAt,
+             MAX(s.depth) AS maxSummaryDepth
+        FROM summaries s
+        JOIN selected_conversations c ON c.conversation_id = s.conversation_id
+       GROUP BY s.conversation_id
     ),
     context_stats AS (
       SELECT conversation_id, COUNT(*) AS contextItems, COALESCE(SUM(tokens), 0) AS contextTokens
         FROM (
           SELECT ci.conversation_id, m.token_count AS tokens
-            FROM context_items ci JOIN messages m ON m.message_id = ci.message_id
+            FROM context_items ci
+            JOIN selected_conversations c ON c.conversation_id = ci.conversation_id
+            JOIN messages m ON m.message_id = ci.message_id
            WHERE ci.item_type = 'message'
           UNION ALL
           SELECT ci.conversation_id, s.token_count AS tokens
-            FROM context_items ci JOIN summaries s ON s.summary_id = ci.summary_id
+            FROM context_items ci
+            JOIN selected_conversations c ON c.conversation_id = ci.conversation_id
+            JOIN summaries s ON s.summary_id = ci.summary_id
            WHERE ci.item_type = 'summary'
         ) GROUP BY conversation_id
     ),
@@ -367,6 +379,7 @@ function queryConversationRows(db: DatabaseSync, input: ConversationQueryInput):
                ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
              ) AS cumulativeTokens
         FROM context_items ci
+        JOIN selected_conversations c ON c.conversation_id = ci.conversation_id
         JOIN messages m ON m.message_id = ci.message_id
        WHERE ci.item_type = 'message'
     ),
@@ -402,14 +415,12 @@ function queryConversationRows(db: DatabaseSync, input: ConversationQueryInput):
       COALESCE(cs.contextTokens, 0) AS contextTokens,
       COALESCE(fts.freshTailMessages, 0) AS freshTailMessages,
       COALESCE(fts.freshTailTokens, 0) AS freshTailTokens
-    FROM conversations c
+    FROM selected_conversations c
     LEFT JOIN message_stats ms ON ms.conversation_id = c.conversation_id
     LEFT JOIN summary_stats ss ON ss.conversation_id = c.conversation_id
     LEFT JOIN context_stats cs ON cs.conversation_id = c.conversation_id
     LEFT JOIN fresh_tail_stats fts ON fts.conversation_id = c.conversation_id
-    ${whereClause}
     ORDER BY julianday(c.updated_at) DESC, c.conversation_id DESC
-    LIMIT ?
   `).all(...args) as ConversationListRow[];
 }
 
