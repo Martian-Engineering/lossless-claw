@@ -232,6 +232,25 @@ export function canonicalizeOpenClawInboundMetadataIdentityContent(
   role: string,
   content: string,
 ): string {
+  return canonicalizeOpenClawInboundMetadataIdentityContentWithRecapPolicy(role, content, true);
+}
+
+/**
+ * Reproduces the identity canonicalization used before host recaps became volatile.
+ * This is retained only so startup migration can recognize and repair version-1 hashes.
+ */
+export function canonicalizeOpenClawInboundMetadataIdentityContentBeforeHistoryRecap(
+  role: string,
+  content: string,
+): string {
+  return canonicalizeOpenClawInboundMetadataIdentityContentWithRecapPolicy(role, content, false);
+}
+
+function canonicalizeOpenClawInboundMetadataIdentityContentWithRecapPolicy(
+  role: string,
+  content: string,
+  stripHistoryRecap: boolean,
+): string {
   if (role !== "user") {
     return content;
   }
@@ -283,17 +302,21 @@ export function canonicalizeOpenClawInboundMetadataIdentityContent(
   // shifts turn to turn even when it decorates the same logical message, so
   // it is dropped entirely from the identity input rather than canonicalized
   // (unlike the metadata blocks above, which keep their stable fields).
-  const contextSplit = splitLeadingOpenClawInboundContextBlocks(afterMetadataBlocks);
-  const recapCandidate = contextSplit.remaining.trimStart();
-  const recapLength = matchLeadingOpenClawInboundHistoryRecap(recapCandidate);
-  if (recapLength > 0) {
-    const contextPrefix = stripMetadataSeparator(contextSplit.blocksText).trimEnd();
-    const afterRecap = stripMetadataSeparator(recapCandidate.slice(recapLength));
-    remaining = contextPrefix
-      ? afterRecap.trim().length > 0
-        ? `${contextPrefix}\n\n${afterRecap}`
-        : contextPrefix
-      : afterRecap;
+  if (stripHistoryRecap) {
+    const contextSplit = splitLeadingOpenClawInboundContextBlocks(afterMetadataBlocks);
+    const recapCandidate = contextSplit.remaining.trimStart();
+    const recapLength = matchLeadingOpenClawInboundHistoryRecap(recapCandidate);
+    if (recapLength > 0) {
+      const contextPrefix = stripMetadataSeparator(contextSplit.blocksText).trimEnd();
+      const afterRecap = stripMetadataSeparator(recapCandidate.slice(recapLength));
+      remaining = contextPrefix
+        ? afterRecap.trim().length > 0
+          ? `${contextPrefix}\n\n${afterRecap}`
+          : contextPrefix
+        : afterRecap;
+    } else {
+      remaining = stripMetadataSeparator(afterMetadataBlocks);
+    }
   } else {
     remaining = stripMetadataSeparator(afterMetadataBlocks);
   }
