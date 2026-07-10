@@ -200,6 +200,12 @@ describe("parseTimeFilter", () => {
       expect.objectContaining({ code: "INVALID_TIME_FILTER", exitCode: 2 }),
     );
   });
+
+  it("rejects ISO-shaped timestamps with impossible calendar dates", () => {
+    expect(() => parseTimeFilter({ after: "2026-02-31T00:00:00Z" })).toThrowError(
+      expect.objectContaining({ code: "INVALID_TIME_FILTER", exitCode: 2 }),
+    );
+  });
 });
 
 describe("opaque cursors", () => {

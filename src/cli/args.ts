@@ -67,7 +67,7 @@ const FIXED_COMMANDS = new Set([
   "summaries.list",
   "config.show",
 ]);
-const ISO_TIMESTAMP_PATTERN = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}(?::\d{2}(?:\.\d{1,9})?)?(?:Z|[+-]\d{2}:\d{2})$/;
+const ISO_TIMESTAMP_PATTERN = /^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2})(?::(\d{2})(?:\.(\d{1,9}))?)?(Z|([+-])(\d{2}):(\d{2}))$/;
 const CLI_OPTIONS = {
   db: { type: "string" },
   config: { type: "string" },
@@ -155,12 +155,32 @@ function parseNonNegativeInteger(value: string | undefined, label: string): numb
 
 // Parse one externally supplied timestamp and normalize its validation error.
 function parseTimestamp(value: string, label: string): Date {
-  if (!ISO_TIMESTAMP_PATTERN.test(value)) {
+  const match = value.match(ISO_TIMESTAMP_PATTERN);
+  if (!match) {
     throw new CliError("INVALID_TIME_FILTER", `${label} must be an ISO-8601 timestamp.`, 2, { value });
   }
   const parsed = new Date(value);
   if (!Number.isFinite(parsed.getTime())) {
     throw new CliError("INVALID_TIME_FILTER", `${label} must be an ISO-8601 timestamp.`, 2, { value });
+  }
+
+  // Undo the parsed offset, then ensure JavaScript did not normalize an impossible date.
+  const offsetSign = match[9] === "-" ? -1 : 1;
+  const offsetMinutes = match[8] === "Z"
+    ? 0
+    : offsetSign * (Number(match[10]) * 60 + Number(match[11]));
+  const local = new Date(parsed.getTime() + offsetMinutes * 60_000);
+  const expected = match.slice(1, 7).map((part) => Number(part ?? 0));
+  const actual = [
+    local.getUTCFullYear(),
+    local.getUTCMonth() + 1,
+    local.getUTCDate(),
+    local.getUTCHours(),
+    local.getUTCMinutes(),
+    local.getUTCSeconds(),
+  ];
+  if (actual.some((part, index) => part !== expected[index])) {
+    throw new CliError("INVALID_TIME_FILTER", `${label} must be a valid calendar timestamp.`, 2, { value });
   }
   return parsed;
 }

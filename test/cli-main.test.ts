@@ -1,5 +1,5 @@
 import { DatabaseSync } from "node:sqlite";
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
@@ -171,6 +171,44 @@ describe("runCli", () => {
     expect(JSON.parse(result.stdout)).toMatchObject({
       data: { isSet: false, effectiveValue: join(stateDirectory, "lcm.db") },
     });
+  });
+
+  it("lets config set repair the targeted value in an invalid current config", () => {
+    writeFileSync(configPath, `${JSON.stringify({
+      plugins: {
+        entries: {
+          "lossless-claw": {
+            config: {
+              databasePath,
+              contextThresholdOverrides: [{
+                match: { modelContextWindowMin: 100, modelContextWindowMax: 10 },
+                contextThreshold: 0.5,
+              }],
+            },
+          },
+        },
+      },
+    })}\n`, { mode: 0o600 });
+
+    const result = invoke(["config", "set", "contextThresholdOverrides", "[]"]);
+
+    expect(result).toMatchObject({ exitCode: 0, stderr: "" });
+    expect(JSON.parse(result.stdout)).toMatchObject({
+      ok: true,
+      command: "config.set",
+      data: { path: "contextThresholdOverrides", newValue: [] },
+      meta: { databasePath, configPath },
+    });
+    expect(JSON.parse(readFileSync(configPath, "utf8")))
+      .toMatchObject({
+        plugins: {
+          entries: {
+            "lossless-claw": {
+              config: { databasePath, contextThresholdOverrides: [] },
+            },
+          },
+        },
+      });
   });
 
   it("includes resource-specific options in agent-readable help", () => {

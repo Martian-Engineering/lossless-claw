@@ -3,6 +3,7 @@ import packageJson from "../../package.json" with { type: "json" };
 import { parseCliArgs, type ParsedCliArgs } from "./args.js";
 import {
   getConfigValue,
+  readRawLosslessConfig,
   readConfigView,
   setConfigValue,
   type ConfigView,
@@ -38,6 +39,13 @@ type CommandResult = {
   data: unknown;
   pagination?: PaginationMetadata;
 };
+
+type InvocationContext = {
+  paths: ResolvedCliPaths;
+  config: ConfigView;
+};
+
+type ConfigSetCommand = Extract<ParsedCliArgs["command"], { kind: "config.set" }>;
 
 const HELP_DATA = {
   usage: "lcm <command> [options]",
@@ -93,16 +101,18 @@ function loadConfigView(configPath: string, env: NodeJS.ProcessEnv): ConfigView 
   };
 }
 
-// Resolve config first, then allow its databasePath/dbPath to participate in DB discovery.
-function resolveInvocationContext(parsed: ParsedCliArgs, env: NodeJS.ProcessEnv): {
-  paths: ResolvedCliPaths;
-  config: ConfigView;
-} {
-  const overrides = {
+// Collect explicit path flags once for config and database discovery.
+function pathOverrides(parsed: ParsedCliArgs) {
+  return {
     openclawDir: parsed.openclawDir,
     configPath: parsed.configPath,
     databasePath: parsed.databasePath,
   };
+}
+
+// Resolve config first, then allow its databasePath/dbPath to participate in DB discovery.
+function resolveInvocationContext(parsed: ParsedCliArgs, env: NodeJS.ProcessEnv): InvocationContext {
+  const overrides = pathOverrides(parsed);
   const basePaths = resolveCliPaths({ env, overrides });
   const configEnv = { ...env, OPENCLAW_STATE_DIR: basePaths.openclawDir };
   const config = loadConfigView(basePaths.configPath, configEnv);
@@ -110,17 +120,27 @@ function resolveInvocationContext(parsed: ParsedCliArgs, env: NodeJS.ProcessEnv)
   return { paths, config };
 }
 
-// Dispatch commands whose only mutable surface is one targeted config value.
+// Apply a targeted repair before loading the effective config, then resolve updated paths.
+function runConfigSetCommand(
+  parsed: ParsedCliArgs,
+  command: ConfigSetCommand,
+  env: NodeJS.ProcessEnv,
+): { paths: ResolvedCliPaths; result: CommandResult } {
+  const overrides = pathOverrides(parsed);
+  const basePaths = resolveCliPaths({ env, overrides });
+  const data = setConfigValue(basePaths.configPath, command.path, command.value);
+  const raw = readRawLosslessConfig(basePaths.configPath);
+  const paths = resolveCliPaths({ env, overrides, pluginConfig: raw });
+  return { paths, result: { data } };
+}
+
+// Dispatch commands that inspect config without opening the database.
 function runConfigCommand(parsed: ParsedCliArgs, config: ConfigView): CommandResult | null {
   switch (parsed.command.kind) {
     case "config.show":
       return { data: config };
     case "config.get":
       return { data: getConfigValue(config, parsed.command.path) };
-    case "config.set":
-      return {
-        data: setConfigValue(config.configPath, parsed.command.path, parsed.command.value),
-      };
     default:
       return null;
   }
@@ -252,14 +272,21 @@ export function runCli(args: string[], io: CliIo = {}): number {
       return 0;
     }
 
-    // Config discovery precedes database discovery so configured DB aliases take effect.
-    const context = resolveInvocationContext(parsed, env);
-    const result = runConfigCommand(parsed, context.config)
-      ?? runDatabaseCommand(parsed, context.paths, context.config);
+    let paths: ResolvedCliPaths;
+    let result: CommandResult;
+    if (parsed.command.kind === "config.set") {
+      ({ paths, result } = runConfigSetCommand(parsed, parsed.command, env));
+    } else {
+      // Config discovery precedes database discovery so configured DB aliases take effect.
+      const context = resolveInvocationContext(parsed, env);
+      paths = context.paths;
+      result = runConfigCommand(parsed, context.config)
+        ?? runDatabaseCommand(parsed, context.paths, context.config);
+    }
     const envelope = createSuccessEnvelope(
       parsed.command.kind,
       result.data,
-      { databasePath: context.paths.databasePath, configPath: context.paths.configPath },
+      { databasePath: paths.databasePath, configPath: paths.configPath },
       result.pagination,
     );
     writeStdout(renderSuccessEnvelope(envelope, parsed.format, parsed.pretty));

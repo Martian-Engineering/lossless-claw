@@ -144,6 +144,11 @@ function extractLosslessConfig(root: JsonRecord, configPath: string): JsonRecord
   return entry ? optionalRecord(entry, "config", configPath) ?? {} : {};
 }
 
+/** Read the raw Lossless plugin config without requiring its current values to validate. */
+export function readRawLosslessConfig(configPath: string): JsonRecord {
+  return extractLosslessConfig(readRootConfig(configPath), configPath);
+}
+
 // Return environment variable names that can affect effective Lossless values, never values.
 function listEnvironmentOverrides(env: NodeJS.ProcessEnv): string[] {
   return Object.keys(env)
@@ -157,7 +162,7 @@ export function readConfigView(
   configPath: string,
   env: NodeJS.ProcessEnv = process.env,
 ): ConfigView {
-  const raw = extractLosslessConfig(readRootConfig(configPath), configPath);
+  const raw = readRawLosslessConfig(configPath);
   let resolved: ReturnType<typeof resolveLcmConfigWithDiagnostics>;
   try {
     resolved = resolveLcmConfigWithDiagnostics(env, raw);
