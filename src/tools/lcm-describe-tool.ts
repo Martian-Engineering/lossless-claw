@@ -93,6 +93,21 @@ function normalizeRequestedTokenCap(value: unknown): number | undefined {
   return Math.max(1, Math.trunc(value));
 }
 
+/**
+ * Accept either a bare LCM ID (`sum_xxx`, `file_xxx`) or a reference string
+ * such as `[LCM Tool Output: file_xxx | tool=… | N bytes]` and return the
+ * first recognizable ID. Returns undefined when no ID can be extracted.
+ */
+function extractLcmDescribeId(raw: string): string | undefined {
+  const trimmed = raw.trim();
+  const bare = trimmed.match(/^(?:sum|file)_[A-Za-z0-9_-]+$/);
+  if (bare) {
+    return trimmed;
+  }
+  const embedded = trimmed.match(/(?:sum|file)_[A-Za-z0-9_-]+/);
+  return embedded?.[0];
+}
+
 function compactDescribeDetails(result: DescribeResult | null) {
   if (!result) {
     return result;
@@ -136,9 +151,11 @@ export function createLcmDescribeTool(input: {
       "token counts, and file exploration results. " +
       "ALSO USE THIS when you see a `[LCM Tool Output: file_xxx | tool=… | N bytes]` " +
       "reference in the conversation — that means an older tool result was elided " +
-      "for context efficiency. Call lcm_describe(id=file_xxx, expandFile=true) to " +
-      "fetch the original output content before answering questions that depend on " +
-      "its specifics. If the inlined content is truncated, use lcm_grep(scope='files', " +
+      "for context efficiency. You may pass the full reference string as `id`; " +
+      "Lossless extracts the file_xxx ID automatically. Call " +
+      "lcm_describe(id=file_xxx, expandFile=true) to fetch the original output " +
+      "content before answering questions that depend on its specifics. " +
+      "If the inlined content is truncated, use lcm_grep(scope='files', " +
       "fileIds=[file_xxx]) to search the bounded file prefix.",
     parameters: LcmDescribeSchema,
     async execute(_toolCallId, params) {
@@ -149,7 +166,14 @@ export function createLcmDescribeTool(input: {
       const retrieval = lcm.getRetrieval();
       const timezone = lcm.timezone;
       const p = params as Record<string, unknown>;
-      const id = (p.id as string).trim();
+      const rawId = typeof p.id === "string" ? p.id : "";
+      const id = extractLcmDescribeId(rawId);
+      if (!id) {
+        return jsonResult({
+          error: `Not a recognized LCM ID: ${rawId}`,
+          hint: "Use a bare ID such as sum_xxx or file_xxx, or a reference string such as [LCM Tool Output: file_xxx | ...].",
+        });
+      }
       const conversationScope = await resolveLcmConversationScope({
         lcm,
         deps: input.deps,

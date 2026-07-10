@@ -436,6 +436,97 @@ describe("LCM tools session scoping", () => {
     );
   });
 
+  it("lcm_describe extracts file_xxx from a full [LCM Tool Output: ...] reference string", async () => {
+    const retrieval = {
+      grep: vi.fn(),
+      expand: vi.fn(),
+      describe: vi.fn(async () => ({
+        id: "file_abc123",
+        type: "file" as const,
+        file: {
+          conversationId: 42,
+          fileName: "large.log",
+          mimeType: "text/plain",
+          byteSize: 1234,
+          lineCount: 56,
+          createdAt: new Date("2026-01-01T00:00:00.000Z"),
+        },
+      })),
+    };
+
+    const tool = createLcmDescribeTool({
+      deps: makeDeps(),
+      lcm: buildLcmEngine({ retrieval, conversationId: 42 }) as never,
+      sessionId: "session-1",
+    });
+    const result = await tool.execute("call-describe-reference", {
+      id: "  [LCM Tool Output: file_abc123 | tool=read_file | 1234 bytes]  ",
+    });
+
+    expect(retrieval.describe).toHaveBeenCalledWith(
+      "file_abc123",
+      expect.any(Object),
+    );
+    expect((result.content[0] as { text: string }).text).toContain("LCM File: file_abc123");
+  });
+
+  it("lcm_describe still accepts a bare sum_xxx ID", async () => {
+    const retrieval = {
+      grep: vi.fn(),
+      expand: vi.fn(),
+      describe: vi.fn(async () => ({
+        id: "sum_abc123",
+        type: "summary" as const,
+        summary: {
+          conversationId: 42,
+          kind: "leaf",
+          content: "summary content",
+          depth: 0,
+          tokenCount: 12,
+          descendantCount: 0,
+          descendantTokenCount: 0,
+          sourceMessageTokenCount: 12,
+          fileIds: [],
+          parentIds: [],
+          childIds: [],
+          messageIds: [],
+          earliestAt: new Date("2026-01-01T00:00:00.000Z"),
+          latestAt: new Date("2026-01-01T00:00:00.000Z"),
+          subtree: [],
+          createdAt: new Date("2026-01-01T00:00:00.000Z"),
+        },
+      })),
+    };
+
+    const tool = createLcmDescribeTool({
+      deps: makeDeps(),
+      lcm: buildLcmEngine({ retrieval, conversationId: 42 }) as never,
+      sessionId: "session-1",
+    });
+    const result = await tool.execute("call-describe-bare", { id: "sum_abc123" });
+
+    expect(retrieval.describe).toHaveBeenCalledWith("sum_abc123", expect.any(Object));
+    expect((result.content[0] as { text: string }).text).toContain("LCM_SUMMARY sum_abc123");
+  });
+
+  it("lcm_describe returns a helpful error for an unrecognized id", async () => {
+    const retrieval = {
+      grep: vi.fn(),
+      expand: vi.fn(),
+      describe: vi.fn(),
+    };
+
+    const tool = createLcmDescribeTool({
+      deps: makeDeps(),
+      lcm: buildLcmEngine({ retrieval, conversationId: 42 }) as never,
+      sessionId: "session-1",
+    });
+    const result = await tool.execute("call-describe-bad-id", { id: "not-an-id" });
+
+    expect(retrieval.describe).not.toHaveBeenCalled();
+    expect((result.details as { error?: string }).error).toContain("Not a recognized LCM ID");
+  });
+
   it("lcm_grep resolves conversation scope via sessionKey continuity before sessionId lookup", async () => {
     const retrieval = {
       grep: vi.fn(async () => ({
