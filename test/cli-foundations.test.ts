@@ -64,7 +64,7 @@ describe("resolveCliPaths", () => {
         OPENCLAW_STATE_DIR: "/state/openclaw",
         LCM_OPENCLAW_DIR: "/state/lossless",
       },
-      pluginConfig: { databasePath: "~/databases/lcm.db", dbPath: "/ignored.db" },
+      pluginConfig: { databasePath: "/ignored.db", dbPath: "~/databases/lcm.db" },
       homedir: () => "/users/fallback",
     });
     expect(pluginPaths).toEqual({
@@ -72,6 +72,13 @@ describe("resolveCliPaths", () => {
       configPath: "/state/lossless/openclaw.json",
       databasePath: "/users/openclaw/databases/lcm.db",
     });
+
+    const preferredKey = resolveCliPaths({
+      env: { HOME: "/users/process", OPENCLAW_HOME: "/users/openclaw" },
+      pluginConfig: { databasePath: "~/databases/preferred.db" },
+      homedir: () => "/users/fallback",
+    });
+    expect(preferredKey.databasePath).toBe("/users/openclaw/databases/preferred.db");
 
     const defaults = resolveCliPaths({
       env: { HOME: "/users/process", OPENCLAW_HOME: "/users/openclaw" },

@@ -42,9 +42,11 @@ The LCM database uses this precedence:
 
 1. `--db`
 2. `LCM_DATABASE_PATH`
-3. `plugins.entries.lossless-claw.config.databasePath`
-4. `plugins.entries.lossless-claw.config.dbPath`
+3. `plugins.entries.lossless-claw.config.dbPath`
+4. `plugins.entries.lossless-claw.config.databasePath`
 5. `<state-directory>/lcm.db`
+
+`databasePath` remains the preferred key for new configuration. The legacy `dbPath` key wins only when both are present, matching the current Lossless Claw runtime resolver.
 
 All response metadata uses absolute paths.
 

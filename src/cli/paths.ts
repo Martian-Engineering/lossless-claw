@@ -73,8 +73,8 @@ export function resolveCliPaths(input: ResolveCliPathsInput = {}): ResolvedCliPa
   // Explicit and environment database paths override both supported plugin keys.
   const databasePathValue = nonEmptyString(overrides.databasePath)
     ?? nonEmptyString(env.LCM_DATABASE_PATH)
-    ?? nonEmptyString(input.pluginConfig?.databasePath)
     ?? nonEmptyString(input.pluginConfig?.dbPath)
+    ?? nonEmptyString(input.pluginConfig?.databasePath)
     ?? join(openclawDir, "lcm.db");
 
   return {

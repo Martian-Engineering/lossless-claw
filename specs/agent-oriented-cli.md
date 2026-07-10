@@ -131,9 +131,11 @@ The database uses this precedence:
 
 1. `--db`
 2. `LCM_DATABASE_PATH`
-3. `plugins.entries.lossless-claw.config.databasePath`
-4. `plugins.entries.lossless-claw.config.dbPath`
+3. `plugins.entries.lossless-claw.config.dbPath`
+4. `plugins.entries.lossless-claw.config.databasePath`
 5. `<state-directory>/lcm.db`
+
+`databasePath` is preferred for new configuration. If both plugin keys exist, the legacy `dbPath` value wins to match the current runtime resolver.
 
 All returned paths are absolute. `~` expands against `OPENCLAW_HOME` when set and the process home otherwise.
 
