@@ -9,6 +9,15 @@ import {
 } from "./args.js";
 import { CliError, type PaginationMetadata } from "./output.js";
 
+export {
+  getSummaryDetails,
+  listSummaries,
+  type SummaryDetails,
+  type SummaryListItem,
+  type SummaryPage,
+  type SummarySourceMessage,
+} from "./summary-queries.js";
+
 export type SummaryDepthStats = {
   kind: SummaryKind;
   depth: number;
