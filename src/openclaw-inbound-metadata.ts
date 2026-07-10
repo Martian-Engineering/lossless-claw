@@ -148,8 +148,8 @@ export function extractBodyAfterOpenClawInboundMetadataBlock(content: string): s
     remaining = secondCandidate.slice(secondMatch[0].length);
   }
 
-  remaining = splitLeadingOpenClawInboundContextBlocks(remaining).remaining;
-  const recapCandidate = remaining.trimStart();
+  const contextSplit = splitLeadingOpenClawInboundContextBlocks(remaining);
+  const recapCandidate = contextSplit.remaining.trimStart();
   const recapLength = matchLeadingOpenClawInboundHistoryRecap(recapCandidate);
   if (recapLength > 0) {
     remaining = recapCandidate.slice(recapLength);

@@ -162,6 +162,16 @@ describe("openClawInboundBodiesMatch with a host chat-history recap block (issue
     ).toBe(true);
   });
 
+  it("does NOT strip a leading host-context-shaped body when no valid recap follows", () => {
+    const bare = "what's the status on the deploy?";
+    expect(
+      openClawInboundBodiesMatch(
+        metadataWrappedWithReplyContext("did the build finish?", bare),
+        bare,
+      ),
+    ).toBe(false);
+  });
+
   it("does NOT match when a VALID recap block conceals a DIFFERENT body (recap widening stays fail-closed)", () => {
     // The reduction now strips a structurally valid recap block, so a decorated
     // face reduces further than before. Verify the widened surface still fails
