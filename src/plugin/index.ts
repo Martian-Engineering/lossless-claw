@@ -1744,6 +1744,7 @@ function wirePluginHandlers(
       db: shared.waitForDatabase,
       config: deps.config,
       openClawConfig,
+      activeSourcePath: typeof api.source === "string" ? api.source : undefined,
       deps,
       getLcm: shared.waitForEngine,
     }),

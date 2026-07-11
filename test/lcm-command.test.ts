@@ -20,6 +20,7 @@ import {
 import { FALLBACK_DIRECTIVE_SUMMARY_MARKER } from "../src/summary-fallback.js";
 import type { LcmSummarizeFn } from "../src/summarize.js";
 import type { LcmDependencies } from "../src/types.js";
+import packageJson from "../package.json" with { type: "json" };
 
 function createCommandFixture(options?: {
   summarize?: LcmSummarizeFn;
@@ -460,6 +461,76 @@ describe("lcm command", () => {
     expect(result.text).toContain("🩺 Lossless Claw Doctor");
     expect(result.text).toContain("**⚠️ Update track**");
     expect(result.text).toContain("installed spec: `@martian-engineering/lossless-claw@0.12.0`");
+  });
+
+  it("warns when doctor finds a generated project copy newer than the active copy", async () => {
+    const fixture = createCommandFixture();
+    tempDirs.add(fixture.tempDir);
+    dbPaths.add(fixture.dbPath);
+    const stateDir = join(fixture.tempDir, "openclaw-state");
+    const activePath = join(stateDir, "active-loaded-copy");
+    const liveShadowPath = join(
+      stateDir,
+      "node_modules",
+      "@martian-engineering",
+      "lossless-claw",
+    );
+    const generatedPath = join(
+      stateDir,
+      "npm",
+      "projects",
+      "generated-project",
+      "node_modules",
+      "@martian-engineering",
+      "lossless-claw",
+    );
+    const extensionShadowPath = join(
+      stateDir,
+      "extensions",
+      "node_modules",
+      "@martian-engineering",
+      "lossless-claw",
+    );
+    mkdirSync(activePath, { recursive: true });
+    mkdirSync(liveShadowPath, { recursive: true });
+    mkdirSync(extensionShadowPath, { recursive: true });
+    mkdirSync(generatedPath, { recursive: true });
+    writeFileSync(
+      join(activePath, "package.json"),
+      JSON.stringify({ name: "@martian-engineering/lossless-claw", version: packageJson.version }),
+    );
+    writeFileSync(
+      join(liveShadowPath, "package.json"),
+      JSON.stringify({ name: "@martian-engineering/lossless-claw", version: packageJson.version }),
+    );
+    writeFileSync(
+      join(extensionShadowPath, "package.json"),
+      JSON.stringify({ name: "@martian-engineering/lossless-claw", version: packageJson.version }),
+    );
+    writeFileSync(
+      join(generatedPath, "package.json"),
+      JSON.stringify({ name: "@martian-engineering/lossless-claw", version: "999.0.0" }),
+    );
+    vi.stubEnv("OPENCLAW_STATE_DIR", stateDir);
+    const command = createLcmCommand({
+      db: fixture.db,
+      config: fixture.config,
+      activeSourcePath: activePath,
+    });
+
+    const result = await command.handler(createCommandContext("doctor"));
+
+    expect(result.text).toContain("**⚠️ Version split**");
+    expect(result.text).toContain(`active version: ${packageJson.version}`);
+    expect(result.text).toContain(`active path: \`${activePath}\``);
+    expect(result.text).toContain(
+      `shadow copy (live): \`${liveShadowPath}\` (v${packageJson.version})`,
+    );
+    expect(result.text).toContain(
+      `shadow copy (live): \`${extensionShadowPath}\` (v${packageJson.version})`,
+    );
+    expect(result.text).toContain(`shadow copy (generated): \`${generatedPath}\` (v999.0.0)`);
+    expect(result.text).toContain("generated or live copy differs from the active Lossless Claw copy");
   });
 
   it("surfaces rollover split memory from the default status command", async () => {

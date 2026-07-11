@@ -37,6 +37,7 @@ import {
   type RolloverSplitCounts,
   type RolloverSplitExample,
 } from "./lcm-doctor-rollover-splits.js";
+import { scanLcmVersionCopies, type LcmVersionDoctorScan } from "./lcm-version-doctor.js";
 import {
   CompactionMaintenanceStore,
   type ConversationCompactionMaintenanceRecord,
@@ -413,6 +414,29 @@ function buildInstallTrackWarningSection(warning: LcmInstallTrackWarning): strin
       formatCommand(`openclaw plugins update ${LOSSLESS_NPM_PACKAGE}@latest`),
     ),
   ]);
+}
+
+/** Format the active package identity and every distinct copy discovered by doctor. */
+function buildVersionDoctorSection(scan: LcmVersionDoctorScan): string {
+  const lines = [
+    buildStatLine("active version", scan.active.version),
+    buildStatLine("active path", formatCommand(scan.active.path)),
+    ...scan.shadows.map((copy) =>
+      buildStatLine(`shadow copy (${copy.kind})`, `${formatCommand(copy.path)} (v${copy.version})`),
+    ),
+  ];
+  if (scan.shadows.length === 0) {
+    lines.push(buildStatLine("shadow copies", "none found"));
+  }
+  if (scan.split) {
+    lines.push(
+      buildStatLine(
+        "impact",
+        "A generated or live copy differs from the active Lossless Claw copy; update the active path above before restarting OpenClaw.",
+      ),
+    );
+  }
+  return buildSection(scan.split ? "⚠️ Version split" : "🧩 Installed copies", lines);
 }
 
 function formatCompressionRatio(contextTokens: number, compressedTokens: number): string {
@@ -1431,6 +1455,7 @@ async function buildDoctorText(params: {
   ctx: PluginCommandContext;
   db: DatabaseSync;
   openClawConfig?: unknown;
+  activeSourcePath?: string;
 }): Promise<string> {
   const rolloverSplits = scanRolloverSplits(params.db);
   const installTrackWarning = detectLcmInstallTrackWarning({
@@ -1438,6 +1463,13 @@ async function buildDoctorText(params: {
     fallbackConfig: params.openClawConfig,
   });
   const current = await resolveCurrentConversation(params);
+  const versionScan = params.activeSourcePath
+    ? scanLcmVersionCopies({
+        activeSourcePath: params.activeSourcePath,
+        activeVersion: packageJson.version,
+        stateDir: resolveOpenclawStateDir(),
+      })
+    : null;
 
   if (current.kind === "unavailable") {
     const lines = [
@@ -1448,6 +1480,9 @@ async function buildDoctorText(params: {
     ];
     if (installTrackWarning) {
       lines.push(buildInstallTrackWarningSection(installTrackWarning), "");
+    }
+    if (versionScan) {
+      lines.push(buildVersionDoctorSection(versionScan), "");
     }
     lines.push(
       buildSection("📍 Current conversation", [
@@ -1470,6 +1505,9 @@ async function buildDoctorText(params: {
   ];
   if (installTrackWarning) {
     lines.push(buildInstallTrackWarningSection(installTrackWarning), "");
+  }
+  if (versionScan) {
+    lines.push(buildVersionDoctorSection(versionScan), "");
   }
   lines.push(
     buildSection("📍 Current conversation", [
@@ -3174,6 +3212,7 @@ export function createLcmCommand(params: {
   db: DatabaseSync | (() => DatabaseSync | Promise<DatabaseSync>);
   config: LcmConfig;
   openClawConfig?: unknown;
+  activeSourcePath?: string;
   deps?: LcmDependencies;
   summarize?: LcmSummarizeFn;
   getLcm?: () => Promise<RuntimeCommandEngine>;
@@ -3271,6 +3310,7 @@ export function createLcmCommand(params: {
                   ctx,
                   db: await getDb(),
                   openClawConfig: params.openClawConfig,
+                  activeSourcePath: params.activeSourcePath,
                 }),
               };
         case "doctor_rollover_splits":
