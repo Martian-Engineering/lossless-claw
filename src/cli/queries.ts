@@ -506,6 +506,12 @@ function getMaintenance(
 
 // Load the optional transcript bootstrap frontier without reading the session file.
 function getBootstrap(db: DatabaseSync, conversationId: number): ConversationDiagnostics["bootstrap"] {
+  const bootstrapTable = db.prepare(
+    "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'conversation_bootstrap_state'",
+  ).get();
+  if (!bootstrapTable) {
+    return null;
+  }
   const row = db.prepare(`SELECT
       session_file_path AS sessionFilePath, last_seen_size AS lastSeenSize,
       last_seen_mtime_ms AS lastSeenMtimeMs, last_processed_offset AS lastProcessedOffset,
