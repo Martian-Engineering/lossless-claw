@@ -154,13 +154,14 @@ const NEW_SESSION_ID = "dddddddd-0000-0000-0000-000000000004";
 /**
  * Seed an active conversation under SESSION_KEY pinned to OLD_SESSION_ID with
  * a week-old, lineage-discriminating history whose final message is a
- * trivial "ping" — the exact shape rapid same-day /new health-check traffic
- * produces. The tracked transcript file lives in its own directory so a test
- * can rename it to an archive sibling.
+ * trivial "ping" (or the given `tailContent`) — the exact shape rapid
+ * same-day /new health-check traffic produces. The tracked transcript file
+ * lives in its own directory so a test can rename it to an archive sibling.
  */
 async function seedPingTailLane(
   engine: LcmContextEngine,
   db: ReturnType<typeof createLcmDatabaseConnection>,
+  tailContent = "ping",
 ): Promise<{ conversationId: number; trackedFile: string }> {
   const base = Date.now() - 7 * 24 * 60 * 60 * 1000;
   for (let index = 0; index < 9; index += 1) {
@@ -177,7 +178,7 @@ async function seedPingTailLane(
   await seedHistoricalMessage(engine, {
     sessionId: OLD_SESSION_ID,
     sessionKey: SESSION_KEY,
-    message: makeMessage("user", "ping", base + 9),
+    message: makeMessage("user", tailContent, base + 9),
   });
   const conversation = await engine.getConversationStore().getConversationBySessionKey(SESSION_KEY);
   expect(conversation).not.toBeNull();
@@ -261,6 +262,69 @@ describe("ambiguous-rollover identity scope (deliberate-rollover awareness)", ()
     );
     const conversation = await engine.getConversationStore().getConversationBySessionKey(SESSION_KEY);
     expect(conversation?.conversationId).toBe(lane.conversationId);
+    expect(conversation?.sessionId).toBe(OLD_SESSION_ID);
+  });
+
+  // Pins TRIVIAL_ROLLOVER_OVERLAP_CONTENT_MAX_LENGTH (session-rollover.ts) at
+  // exactly 8: a future bump of that constant must fail one of these two
+  // tests, making the change a deliberate review point instead of incidental.
+  it("bypasses at the trivial-content boundary: an 8-char overlap rebinds with a deliberate /new", async () => {
+    const tailContent = "12345678";
+    expect(tailContent).toHaveLength(8);
+    const { engine, log, db } = createEngine({ newSessionRetainDepth: 2 });
+    const lane = await seedPingTailLane(engine, db, tailContent);
+    await engine.handleBeforeReset({
+      reason: "new",
+      sessionId: OLD_SESSION_ID,
+      sessionKey: SESSION_KEY,
+    });
+    archiveTrackedFile(lane.trackedFile, "reset");
+
+    const newSessionFile = writeRolledTranscript({
+      name: NEW_SESSION_ID,
+      entries: [{ role: "user", text: tailContent, timestamp: Date.now() + 60_000 }],
+    });
+
+    const result = await engine.bootstrap({
+      sessionId: NEW_SESSION_ID,
+      sessionKey: SESSION_KEY,
+      sessionFile: newSessionFile,
+    });
+
+    expect(log.warn).not.toHaveBeenCalled();
+    expect(result.bootstrapped).toBe(true);
+    const rebound = await engine.getConversationStore().getConversationBySessionKey(SESSION_KEY);
+    expect(rebound?.sessionId).toBe(NEW_SESSION_ID);
+  });
+
+  it("fails closed one character over the trivial-content boundary: a 9-char overlap still preserves and warns", async () => {
+    const tailContent = "123456789";
+    expect(tailContent).toHaveLength(9);
+    const { engine, log, db } = createEngine({ newSessionRetainDepth: 2 });
+    const lane = await seedPingTailLane(engine, db, tailContent);
+    await engine.handleBeforeReset({
+      reason: "new",
+      sessionId: OLD_SESSION_ID,
+      sessionKey: SESSION_KEY,
+    });
+    archiveTrackedFile(lane.trackedFile, "reset");
+
+    const newSessionFile = writeRolledTranscript({
+      name: NEW_SESSION_ID,
+      entries: [{ role: "user", text: tailContent, timestamp: Date.now() + 60_000 }],
+    });
+
+    const result = await engine.bootstrap({
+      sessionId: NEW_SESSION_ID,
+      sessionKey: SESSION_KEY,
+      sessionFile: newSessionFile,
+    });
+
+    expect(result.bootstrapped).toBe(false);
+    expect(log.warn).toHaveBeenCalledWith(
+      expect.stringContaining("freshness=identity-overlap-with-persisted-history"),
+    );
+    const conversation = await engine.getConversationStore().getConversationBySessionKey(SESSION_KEY);
     expect(conversation?.sessionId).toBe(OLD_SESSION_ID);
   });
 });

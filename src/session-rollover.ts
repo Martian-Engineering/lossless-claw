@@ -47,6 +47,16 @@ const AMBIGUOUS_ROLLOVER_OVERLAP_WIDE_WINDOW = 500;
  * still fails closed even when a /new marker and archive sibling are both
  * present, because that is exactly the shape a foreign session reusing a
  * stale sessionKey would produce.
+ *
+ * Two known edges, both accepted deliberately: the check is length-only, so
+ * a short deployment-specific token that happens to be lineage-discriminating
+ * would still bypass; and the bypass can fire even when the trivial message
+ * is the only candidate in the new transcript. Both require the
+ * deliberate-rollover evidence pair (marker + archive sibling) to be reached
+ * at all, which is the actual defense. The threshold value is pinned by a
+ * boundary test in rollover-identity-scope.test.ts ("bypasses/fails closed
+ * at the trivial-content boundary") so a future bump is a deliberate review
+ * point, not an incidental one.
  */
 const TRIVIAL_ROLLOVER_OVERLAP_CONTENT_MAX_LENGTH = 8;
 
