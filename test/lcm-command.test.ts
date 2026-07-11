@@ -533,6 +533,33 @@ describe("lcm command", () => {
     expect(result.text).toContain("generated or live copy differs from the active Lossless Claw copy");
   });
 
+  it("reports clean version diagnostics when doctor finds no shadow copies", async () => {
+    const fixture = createCommandFixture();
+    tempDirs.add(fixture.tempDir);
+    dbPaths.add(fixture.dbPath);
+    const stateDir = join(fixture.tempDir, "openclaw-state");
+    const activePath = join(stateDir, "active-loaded-copy");
+    mkdirSync(activePath, { recursive: true });
+    writeFileSync(
+      join(activePath, "package.json"),
+      JSON.stringify({ name: "@martian-engineering/lossless-claw", version: packageJson.version }),
+    );
+    vi.stubEnv("OPENCLAW_STATE_DIR", stateDir);
+    const command = createLcmCommand({
+      db: fixture.db,
+      config: fixture.config,
+      activeSourcePath: activePath,
+    });
+
+    const result = await command.handler(createCommandContext("doctor"));
+
+    expect(result.text).toContain("**🧩 Installed copies**");
+    expect(result.text).toContain(`active version: ${packageJson.version}`);
+    expect(result.text).toContain(`active path: \`${activePath}\``);
+    expect(result.text).toContain("shadow copies: none found");
+    expect(result.text).not.toContain("**⚠️ Version split**");
+  });
+
   it("surfaces rollover split memory from the default status command", async () => {
     const fixture = createCommandFixture();
     tempDirs.add(fixture.tempDir);
