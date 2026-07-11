@@ -33,7 +33,22 @@ Nothing is lost. Raw messages stay in the database. Summaries link back to their
 
 ## Commands And Skill
 
-The plugin now ships a bundled `lossless-claw` skill plus a small plugin command surface for supported OpenClaw chat/native command providers:
+The package installs an agent-oriented `lcm` shell CLI and includes a bundled `lossless-claw` skill plus plugin commands for supported OpenClaw chat/native command providers.
+
+The shell CLI reads `lcm.db` without modifying conversation data. Its only write command sets one validated Lossless config value in `openclaw.json`:
+
+```bash
+lcm status
+lcm conversations show --session-key 'agent:main:example'
+lcm messages tail --conversation-id 42
+lcm summaries list --conversation-id 42 --depth 0 --recency 7d
+lcm config get freshTailCount
+lcm config set freshTailCount 96
+```
+
+JSON is the default output. List commands use bounded keyset pagination. See [Lossless Claw CLI](docs/cli.md) for commands, filters, path precedence, output fields, config-write safety, and exit codes.
+
+The native OpenClaw command surface provides in-session operations:
 
 - `/lossless` shows version, enablement/selection state, DB path and size, summary counts, and summary-health status
 - `/lossless backup` creates a timestamped backup of the current LCM SQLite database
@@ -43,7 +58,7 @@ The plugin now ships a bundled `lossless-claw` skill plus a small plugin command
 - `/lossless status` shows plugin, conversation, and maintenance state including deferred compaction debt
 - `/lcm` is the shorter alias for `/lossless`
 
-These are plugin slash/native commands, not root shell CLI subcommands. Supported examples:
+Supported native command examples:
 
 - `/lossless`
 - `/lossless backup`
@@ -52,7 +67,7 @@ These are plugin slash/native commands, not root shell CLI subcommands. Supporte
 - `/lossless doctor clean`
 - `/lcm`
 
-Not currently supported as root CLI commands:
+The package does not register these OpenClaw root subcommands:
 
 - `openclaw lossless`
 - `openclaw lcm`
