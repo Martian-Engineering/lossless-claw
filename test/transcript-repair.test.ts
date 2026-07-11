@@ -132,6 +132,129 @@ describe("sanitizeToolUseResultPairing", () => {
     ]);
   });
 
+  it("prefers a later real result over an earlier synthetic repair result", () => {
+    const assistant = {
+      role: "assistant",
+      content: [{ type: "toolCall", id: "call_real", name: "read", input: {} }],
+    };
+    const synthetic = {
+      role: "toolResult",
+      toolCallId: "call_real",
+      toolName: "read",
+      content: [
+        {
+          type: "text",
+          text: "[lossless-claw] missing tool result in session history; inserted synthetic error result for transcript repair.",
+        },
+      ],
+      isError: true,
+    };
+    const real = {
+      role: "toolResult",
+      toolCallId: "call_real",
+      toolName: "read",
+      content: [{ type: "text", text: "real output" }],
+      isError: false,
+    };
+
+    expect(sanitizeToolUseResultPairing([assistant, synthetic, real])).toEqual([
+      assistant,
+      real,
+    ]);
+  });
+
+  it("finds real results displaced past a later assistant tool-call turn", () => {
+    const callA = {
+      role: "assistant",
+      content: [{ type: "toolCall", id: "call_a", name: "read", input: {} }],
+    };
+    const callB = {
+      role: "assistant",
+      content: [{ type: "toolCall", id: "call_b", name: "read", input: {} }],
+    };
+    const resultA = {
+      role: "toolResult",
+      toolCallId: "call_a",
+      toolName: "read",
+      content: [{ type: "text", text: "result A" }],
+    };
+    const resultB = {
+      role: "toolResult",
+      toolCallId: "call_b",
+      toolName: "read",
+      content: [{ type: "text", text: "result B" }],
+    };
+
+    expect(sanitizeToolUseResultPairing([callA, callB, resultA, resultB])).toEqual([
+      callA,
+      resultA,
+      callB,
+      resultB,
+    ]);
+  });
+
+  it("does not classify a real error containing the repair marker as synthetic", () => {
+    const assistant = {
+      role: "assistant",
+      content: [{ type: "toolCall", id: "call_error", name: "read", input: {} }],
+    };
+    const realError = {
+      role: "toolResult",
+      toolCallId: "call_error",
+      toolName: "read",
+      content: [
+        {
+          type: "text",
+          text: "Provider returned [lossless-claw] missing tool result with additional real context.",
+        },
+      ],
+      isError: true,
+    };
+    const laterReal = {
+      role: "toolResult",
+      toolCallId: "call_error",
+      toolName: "read",
+      content: [{ type: "text", text: "later output" }],
+      isError: false,
+    };
+
+    expect(sanitizeToolUseResultPairing([assistant, realError, laterReal])).toEqual([
+      assistant,
+      realError,
+    ]);
+  });
+
+  it("keeps a real result when a synthetic duplicate appears later", () => {
+    const assistant = {
+      role: "assistant",
+      content: [{ type: "toolCall", id: "call_first_real", name: "read", input: {} }],
+    };
+    const real = {
+      role: "toolResult",
+      toolCallId: "call_first_real",
+      toolName: "read",
+      content: [{ type: "text", text: "real output" }],
+      isError: false,
+    };
+    const synthetic = {
+      role: "toolResult",
+      toolCallId: "call_first_real",
+      toolName: "read",
+      content: [
+        {
+          type: "text",
+          text: "[lossless-claw] missing tool result in session history; inserted synthetic error result for transcript repair.",
+        },
+      ],
+      isError: true,
+    };
+
+    expect(sanitizeToolUseResultPairing([assistant, real, synthetic])).toEqual([
+      assistant,
+      real,
+    ]);
+  });
+
   // -- Duplicate assistant tool_use dedup (INC-2026-03-24 class) --
 
   type Block = { type?: string; id?: string; call_id?: string; name?: string; text?: string };

@@ -255,6 +255,22 @@ function filterAssistantToolUseBlocks<T extends AgentMessageLike>(
 
 // -- Repair logic (from session-transcript-repair.ts) --
 
+const MISSING_TOOL_RESULT_TEXT =
+  "[lossless-claw] missing tool result in session history; inserted synthetic error result for transcript repair.";
+
+function isSyntheticMissingToolResult(message: AgentMessageLike): boolean {
+  if (message.isError !== true || !Array.isArray(message.content)) {
+    return false;
+  }
+  return message.content.some(
+    (block) =>
+      !!block &&
+      typeof block === "object" &&
+      (block as { type?: unknown }).type === "text" &&
+      (block as { text?: unknown }).text === MISSING_TOOL_RESULT_TEXT,
+  );
+}
+
 function makeMissingToolResult(params: {
   toolCallId: string;
   toolName?: string;
@@ -266,7 +282,7 @@ function makeMissingToolResult(params: {
     content: [
       {
         type: "text",
-        text: "[lossless-claw] missing tool result in session history; inserted synthetic error result for transcript repair.",
+        text: MISSING_TOOL_RESULT_TEXT,
       },
     ],
     isError: true,
@@ -289,6 +305,7 @@ export function sanitizeToolUseResultPairing<T extends AgentMessageLike>(
 ): T[] {
   const out: T[] = [];
   const seenToolResultIds = new Set<string>();
+  const toolResultPositions = new Map<string, number>();
   const seenToolUseIds = new Set<string>();
   const movedToolResultIndexes = new Set<number>();
   let droppedDuplicateCount = 0;
@@ -311,12 +328,24 @@ export function sanitizeToolUseResultPairing<T extends AgentMessageLike>(
   const pushToolResult = (msg: T) => {
     const id = extractToolResultId(msg);
     if (id && seenToolResultIds.has(id)) {
+      const existingIndex = toolResultPositions.get(id);
+      if (existingIndex !== undefined) {
+        const existing = out[existingIndex];
+        if (
+          existing &&
+          isSyntheticMissingToolResult(existing) &&
+          !isSyntheticMissingToolResult(msg)
+        ) {
+          out[existingIndex] = msg;
+        }
+      }
       droppedDuplicateCount += 1;
       changed = true;
       return;
     }
     if (id) {
       seenToolResultIds.add(id);
+      toolResultPositions.set(id, out.length);
     }
     out.push(msg);
   };
@@ -451,12 +480,23 @@ export function sanitizeToolUseResultPairing<T extends AgentMessageLike>(
                 continue;
               }
               movedToolResultIndexes.add(k);
-              if (seenToolResultIds.has(id) || spanResultsById.has(id)) {
+              if (seenToolResultIds.has(id)) {
                 droppedDuplicateCount += 1;
                 changed = true;
                 continue;
               }
-              spanResultsById.set(id, candidate);
+              const existing = spanResultsById.get(id);
+              if (!existing) {
+                spanResultsById.set(id, candidate);
+              } else if (
+                isSyntheticMissingToolResult(existing) &&
+                !isSyntheticMissingToolResult(candidate)
+              ) {
+                spanResultsById.set(id, candidate);
+                droppedDuplicateCount += 1;
+              } else {
+                droppedDuplicateCount += 1;
+              }
               moved = true;
               changed = true;
             }
@@ -477,12 +517,25 @@ export function sanitizeToolUseResultPairing<T extends AgentMessageLike>(
       if (nextRole === "toolResult") {
         const id = extractToolResultId(next);
         if (id && toolCallIds.has(id)) {
-          if (seenToolResultIds.has(id) || spanResultsById.has(id)) {
+          if (seenToolResultIds.has(id)) {
             droppedDuplicateCount += 1;
             changed = true;
             continue;
           }
-          spanResultsById.set(id, next);
+          const existing = spanResultsById.get(id);
+          if (!existing) {
+            spanResultsById.set(id, next);
+          } else if (
+            isSyntheticMissingToolResult(existing) &&
+            !isSyntheticMissingToolResult(next)
+          ) {
+            spanResultsById.set(id, next);
+            droppedDuplicateCount += 1;
+            changed = true;
+          } else {
+            droppedDuplicateCount += 1;
+            changed = true;
+          }
           continue;
         }
       }
@@ -495,6 +548,29 @@ export function sanitizeToolUseResultPairing<T extends AgentMessageLike>(
       }
     }
 
+    const laterResultsById = new Map<string, { message: T; index: number }>();
+    for (let k = j + 1; k < messages.length; k += 1) {
+      if (movedToolResultIndexes.has(k)) {
+        continue;
+      }
+      const candidate = messages[k];
+      if (!candidate || typeof candidate !== "object" || candidate.role !== "toolResult") {
+        continue;
+      }
+      const id = extractToolResultId(candidate);
+      if (!id || !toolCallIds.has(id) || seenToolResultIds.has(id)) {
+        continue;
+      }
+      const existing = laterResultsById.get(id);
+      if (
+        !existing ||
+        (isSyntheticMissingToolResult(existing.message) &&
+          !isSyntheticMissingToolResult(candidate))
+      ) {
+        laterResultsById.set(id, { message: candidate, index: k });
+      }
+    }
+
     out.push(assistantMsg);
 
     if (spanResultsById.size > 0 && remainder.length > 0) {
@@ -503,7 +579,19 @@ export function sanitizeToolUseResultPairing<T extends AgentMessageLike>(
     }
 
     for (const call of toolCalls) {
-      const existing = spanResultsById.get(call.id);
+      let existing = spanResultsById.get(call.id);
+      const later = laterResultsById.get(call.id);
+      if (
+        later &&
+        (!existing ||
+          (isSyntheticMissingToolResult(existing) &&
+            !isSyntheticMissingToolResult(later.message)))
+      ) {
+        existing = later.message;
+        movedToolResultIndexes.add(later.index);
+        moved = true;
+        changed = true;
+      }
       if (existing) {
         pushToolResult(existing);
       } else {
