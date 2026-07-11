@@ -93,19 +93,91 @@ function normalizeRequestedTokenCap(value: unknown): number | undefined {
   return Math.max(1, Math.trunc(value));
 }
 
+const LCM_BARE_ID_RE = /^(sum|file)_[a-z0-9_-]+$/;
+const LCM_ID_TOKEN_RE = /\b(sum|file)_[a-z0-9_-]+\b/g;
+const LCM_REFERENCE_PREFIX_RE =
+  /^\[LCM (Tool Output|File|Raw Payload):\s*((sum|file)_[a-z0-9_-]+)(?=\s*[|\]])/i;
+
+function isZeroLcmId(id: string): boolean {
+  const suffix = id.slice(id.indexOf("_") + 1);
+  return suffix.length === 0 || /^0+$/.test(suffix);
+}
+
 /**
- * Accept either a bare LCM ID (`sum_xxx`, `file_xxx`) or a reference string
- * such as `[LCM Tool Output: file_xxx | tool=… | N bytes]` and return the
- * first recognizable ID. Returns undefined when no ID can be extracted.
+ * Accept either a bare LCM ID (`sum_xxx`, `file_xxx`) or a single copied
+ * reference string such as `[LCM Tool Output: file_xxx | tool=… | N bytes]`
+ * and return the embedded ID. Rejects ambiguous input (multiple IDs), zero
+ * IDs, malformed IDs, and free-form text that happens to contain an ID.
  */
-function extractLcmDescribeId(raw: string): string | undefined {
+type ExtractLcmDescribeIdResult =
+  | { ok: true; id: string }
+  | { ok: false; error: string; hint?: string };
+
+function extractLcmDescribeId(raw: string): ExtractLcmDescribeIdResult {
   const trimmed = raw.trim();
-  const bare = trimmed.match(/^(?:sum|file)_[A-Za-z0-9_-]+$/);
-  if (bare) {
-    return trimmed;
+
+  // Bare ID: the entire argument must be the ID.
+  if (LCM_BARE_ID_RE.test(trimmed)) {
+    if (isZeroLcmId(trimmed)) {
+      return { ok: false, error: `LCM ID cannot be a zero/empty ID: ${trimmed}` };
+    }
+    return { ok: true, id: trimmed };
   }
-  const embedded = trimmed.match(/(?:sum|file)_[A-Za-z0-9_-]+/);
-  return embedded?.[0];
+
+  // Recognized copied reference forms: [LCM Tool Output: id | ...],
+  // [LCM File: id | ...], [LCM Raw Payload: id | ...].
+  const refMatch = trimmed.match(LCM_REFERENCE_PREFIX_RE);
+  if (refMatch && trimmed.endsWith("]")) {
+    const id = refMatch[2] as string;
+    const afterId = trimmed.slice((refMatch.index ?? 0) + refMatch[0].length);
+    const extraIds = [...afterId.matchAll(LCM_ID_TOKEN_RE)].map((m) => m[0] as string);
+    if (extraIds.length > 0) {
+      return {
+        ok: false,
+        error: `Reference string contains multiple LCM IDs (${id}, ${extraIds.join(", ")}). Provide a single reference string.`,
+      };
+    }
+    if (isZeroLcmId(id)) {
+      return { ok: false, error: `LCM ID cannot be a zero/empty ID: ${id}` };
+    }
+    return { ok: true, id };
+  }
+
+  // Not a valid bare ID or reference. Check for ambiguity / malformed input.
+  const tokens = [...trimmed.matchAll(LCM_ID_TOKEN_RE)].map((m) => m[0] as string);
+  if (tokens.length > 1) {
+    return {
+      ok: false,
+      error: `Input contains multiple LCM IDs (${tokens.join(", ")}). Provide a bare ID or a single reference string.`,
+    };
+  }
+
+  const looseTokens = [...trimmed.matchAll(/\b(sum|file)_[A-Za-z0-9_-]*\b/gi)].map(
+    (m) => m[0] as string,
+  );
+  if (looseTokens.length === 1) {
+    const id = looseTokens[0];
+    const suffix = id.slice(id.indexOf("_") + 1);
+    if (suffix.length === 0) {
+      return { ok: false, error: `LCM ID cannot be a zero/empty ID: ${id}` };
+    }
+    if (!/^[a-z0-9_-]+$/.test(suffix)) {
+      return {
+        ok: false,
+        error: `Malformed LCM ID: ${id}. IDs must be lowercase and contain only letters, digits, underscores, and hyphens after the prefix.`,
+      };
+    }
+    if (isZeroLcmId(id)) {
+      return { ok: false, error: `LCM ID cannot be a zero/empty ID: ${id}` };
+    }
+    return {
+      ok: false,
+      error: `Not a recognized LCM ID format: ${raw}`,
+      hint: "Provide a bare ID or a single copied reference string such as [LCM Tool Output: file_xxx | ...].",
+    };
+  }
+
+  return { ok: false, error: `Not a recognized LCM ID: ${raw}` };
 }
 
 function compactDescribeDetails(result: DescribeResult | null) {
@@ -150,10 +222,10 @@ export function createLcmDescribeTool(input: {
       "from compacted conversation history. Returns summary content, lineage, " +
       "token counts, and file exploration results. " +
       "ALSO USE THIS when you see a `[LCM Tool Output: file_xxx | tool=… | N bytes]` " +
-      "reference in the conversation — that means an older tool result was elided " +
-      "for context efficiency. You may pass the full reference string as `id`; " +
-      "Lossless extracts the file_xxx ID automatically. Call " +
-      "lcm_describe(id=file_xxx, expandFile=true) to fetch the original output " +
+      "or `[LCM File: file_xxx | …]` reference in the conversation — that means an " +
+      "older tool result or large file was elided for context efficiency. You may " +
+      "pass the full reference string as `id`; Lossless extracts the file_xxx ID " +
+      "automatically. Call lcm_describe(id=file_xxx, expandFile=true) to fetch the " +
       "content before answering questions that depend on its specifics. " +
       "If the inlined content is truncated, use lcm_grep(scope='files', " +
       "fileIds=[file_xxx]) to search the bounded file prefix.",
@@ -167,13 +239,16 @@ export function createLcmDescribeTool(input: {
       const timezone = lcm.timezone;
       const p = params as Record<string, unknown>;
       const rawId = typeof p.id === "string" ? p.id : "";
-      const id = extractLcmDescribeId(rawId);
-      if (!id) {
+      const extracted = extractLcmDescribeId(rawId);
+      if (!extracted.ok) {
         return jsonResult({
-          error: `Not a recognized LCM ID: ${rawId}`,
-          hint: "Use a bare ID such as sum_xxx or file_xxx, or a reference string such as [LCM Tool Output: file_xxx | ...].",
+          error: extracted.error,
+          hint:
+            extracted.hint ??
+            "Use a bare ID such as sum_xxx or file_xxx, or a single reference string such as [LCM Tool Output: file_xxx | ...].",
         });
       }
+      const id = extracted.id;
       const conversationScope = await resolveLcmConversationScope({
         lcm,
         deps: input.deps,

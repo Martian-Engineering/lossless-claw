@@ -527,6 +527,124 @@ describe("LCM tools session scoping", () => {
     expect((result.details as { error?: string }).error).toContain("Not a recognized LCM ID");
   });
 
+  it("lcm_describe extracts file_xxx from a full [LCM File: ...] reference string", async () => {
+    const retrieval = {
+      grep: vi.fn(),
+      expand: vi.fn(),
+      describe: vi.fn(async () => ({
+        id: "file_abc123",
+        type: "file" as const,
+        file: {
+          conversationId: 42,
+          fileName: "spec.md",
+          mimeType: "text/markdown",
+          byteSize: 1024,
+          lineCount: 30,
+          createdAt: new Date("2026-01-01T00:00:00.000Z"),
+        },
+      })),
+    };
+
+    const tool = createLcmDescribeTool({
+      deps: makeDeps(),
+      lcm: buildLcmEngine({ retrieval, conversationId: 42 }) as never,
+      sessionId: "session-1",
+    });
+    const result = await tool.execute("call-describe-file-reference", {
+      id: "[LCM File: file_abc123 | spec.md | text/markdown | 1024 bytes]",
+    });
+
+    expect(retrieval.describe).toHaveBeenCalledWith("file_abc123", expect.any(Object));
+    expect((result.content[0] as { text: string }).text).toContain("LCM File: file_abc123");
+  });
+
+  it("lcm_describe rejects multiple bare IDs as ambiguous", async () => {
+    const retrieval = {
+      grep: vi.fn(),
+      expand: vi.fn(),
+      describe: vi.fn(),
+    };
+
+    const tool = createLcmDescribeTool({
+      deps: makeDeps(),
+      lcm: buildLcmEngine({ retrieval, conversationId: 42 }) as never,
+      sessionId: "session-1",
+    });
+    const result = await tool.execute("call-describe-multiple-bare", {
+      id: "file_abc123 sum_def456",
+    });
+
+    expect(retrieval.describe).not.toHaveBeenCalled();
+    expect((result.details as { error?: string }).error).toContain("multiple LCM IDs");
+  });
+
+  it("lcm_describe rejects a reference string containing multiple IDs", async () => {
+    const retrieval = {
+      grep: vi.fn(),
+      expand: vi.fn(),
+      describe: vi.fn(),
+    };
+
+    const tool = createLcmDescribeTool({
+      deps: makeDeps(),
+      lcm: buildLcmEngine({ retrieval, conversationId: 42 }) as never,
+      sessionId: "session-1",
+    });
+    const result = await tool.execute("call-describe-multiple-in-reference", {
+      id: "[LCM Tool Output: file_abc123 | tool=read_file | see file_def456]",
+    });
+
+    expect(retrieval.describe).not.toHaveBeenCalled();
+    expect((result.details as { error?: string }).error).toContain("multiple LCM IDs");
+  });
+
+  it("lcm_describe rejects malformed bare IDs with disallowed characters", async () => {
+    const retrieval = {
+      grep: vi.fn(),
+      expand: vi.fn(),
+      describe: vi.fn(),
+    };
+
+    const tool = createLcmDescribeTool({
+      deps: makeDeps(),
+      lcm: buildLcmEngine({ retrieval, conversationId: 42 }) as never,
+      sessionId: "session-1",
+    });
+
+    const upper = await tool.execute("call-describe-uppercase", { id: "FILE_ABC123" });
+    expect(retrieval.describe).not.toHaveBeenCalled();
+    expect((upper.details as { error?: string }).error).toContain("Malformed LCM ID");
+
+    const spaced = await tool.execute("call-describe-spaced", { id: "file_abc 123" });
+    expect((spaced.details as { error?: string }).error).toMatch(/multiple LCM IDs|Not a recognized LCM ID/);
+  });
+
+  it("lcm_describe rejects zero/empty IDs", async () => {
+    const retrieval = {
+      grep: vi.fn(),
+      expand: vi.fn(),
+      describe: vi.fn(),
+    };
+
+    const tool = createLcmDescribeTool({
+      deps: makeDeps(),
+      lcm: buildLcmEngine({ retrieval, conversationId: 42 }) as never,
+      sessionId: "session-1",
+    });
+
+    const zeroSuffix = await tool.execute("call-describe-zero-suffix", { id: "file_0" });
+    expect(retrieval.describe).not.toHaveBeenCalled();
+    expect((zeroSuffix.details as { error?: string }).error).toContain("zero/empty ID");
+
+    const allZeros = await tool.execute("call-describe-all-zeros", {
+      id: "file_0000000000000000",
+    });
+    expect((allZeros.details as { error?: string }).error).toContain("zero/empty ID");
+
+    const emptySuffix = await tool.execute("call-describe-empty-suffix", { id: "file_" });
+    expect((emptySuffix.details as { error?: string }).error).toContain("zero/empty ID");
+  });
+
   it("lcm_grep resolves conversation scope via sessionKey continuity before sessionId lookup", async () => {
     const retrieval = {
       grep: vi.fn(async () => ({
