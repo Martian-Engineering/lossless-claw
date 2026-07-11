@@ -159,6 +159,16 @@ describe("PendingCompactionCoordinator", () => {
       sessionKey: "agent:main:pending-coordinator",
     });
     expect(planned).toMatchObject({ status: "planned", nodeCount: 3 });
+    await expect(
+      coordinator.runOnce({
+        conversationId: conversation.conversationId,
+        publishPolicy: "publish-ready-only",
+      }),
+    ).resolves.toMatchObject({
+      status: "idle",
+      reason: "no ready pending summary frontier",
+    });
+    expect(summarizeInputs).toHaveLength(0);
     await expect(summaryStore.getContextItems(conversation.conversationId)).resolves.toMatchObject([
       { ordinal: 0, itemType: "message", messageId: messages[0]!.messageId },
       { ordinal: 1, itemType: "message", messageId: messages[1]!.messageId },
@@ -189,8 +199,13 @@ describe("PendingCompactionCoordinator", () => {
       4,
     );
 
-    const published = await coordinator.runOnce({ conversationId: conversation.conversationId });
+    const summarizeCallCountBeforePublish = summarizeInputs.length;
+    const published = await coordinator.runOnce({
+      conversationId: conversation.conversationId,
+      publishPolicy: "publish-ready-only",
+    });
     expect(published).toMatchObject({ status: "published" });
+    expect(summarizeInputs).toHaveLength(summarizeCallCountBeforePublish);
     const contextItems = await summaryStore.getContextItems(conversation.conversationId);
     expect(contextItems).toMatchObject([
       { ordinal: 0, itemType: "summary" },

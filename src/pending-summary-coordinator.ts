@@ -57,7 +57,10 @@ export type PendingCompactionCoordinatorOptions = {
   withPublishLock?: <T>(operation: () => Promise<T>) => Promise<T>;
 };
 
-export type PendingCompactionPublishPolicy = "prepare-only" | "publish-if-ready";
+export type PendingCompactionPublishPolicy =
+  | "prepare-only"
+  | "publish-if-ready"
+  | "publish-ready-only";
 
 export type PendingCompactionCoordinatorResult =
   | { status: "idle"; reason: string }
@@ -178,6 +181,9 @@ export class PendingCompactionCoordinator {
     });
     let batch = await this.pendingSummaryStore.getActiveBatchForConversation(input.conversationId);
     if (!batch) {
+      if (publishPolicy === "publish-ready-only") {
+        return { status: "idle", reason: "no active pending summary batch" };
+      }
       const snapshot = await this.buildProjectionSnapshot(input.conversationId);
       if (snapshot.compactableStartOrdinal == null || snapshot.compactableEndOrdinal == null) {
         return { status: "idle", reason: "no compactable context outside fresh tail" };
@@ -189,6 +195,16 @@ export class PendingCompactionCoordinator {
       });
     }
     await this.pendingSummaryStore.pruneSupersededNodes(batch.batchId);
+
+    // Threshold publication runs at a foreground queue boundary. It may only
+    // revalidate and promote work that background preparation already
+    // completed; in particular, it must never claim a node or call summarize.
+    if (publishPolicy === "publish-ready-only") {
+      const publishResult = await this.withPublishLock(() =>
+        this.publishActiveBatchIfReady(input.conversationId),
+      );
+      return publishResult ?? { status: "idle", reason: "no ready pending summary frontier" };
+    }
 
     const worker = new PendingSummaryPreparationWorker({
       store: this.pendingSummaryStore,
