@@ -802,6 +802,38 @@ export class LcmContextEngine implements ContextEngine {
     });
   }
 
+  /** Give an already-ready frontier a fixed queue position at threshold crossing. */
+  private scheduleThresholdPublicationOpportunity(
+    params: DeferredCompactionDebtDrainParams,
+  ): void {
+    const queueKey = this.resolveSessionQueueKey(params.sessionId, params.sessionKey);
+    const sessionLabel = formatSessionLabel(params.sessionId, params.sessionKey);
+    void this.withSessionQueue(
+      queueKey,
+      async () => {
+        const result = await this.consumeDeferredCompactionDebt({
+          conversationId: params.conversationId,
+          sessionId: params.sessionId,
+          sessionKey: params.sessionKey,
+          tokenBudget: this.applyAssemblyBudgetCap(params.tokenBudget),
+          currentTokenCount: params.currentTokenCount,
+          sessionQueueHeld: true,
+          pendingPublishPolicy: "publish-ready-only",
+        });
+        this.deps.log.debug(
+          `[lcm] threshold publication opportunity done conversation=${params.conversationId} ${sessionLabel} changed=${result?.changed ?? false} reason=${result?.reason ?? "no-debt"}`,
+        );
+      },
+      { operationName: "thresholdPublication", context: sessionLabel },
+    ).catch((err) => {
+      // consumeDeferredCompactionDebt normally converts failures into retained
+      // debt, but keep this boundary failure non-fatal to foreground work.
+      this.deps.log.warn(
+        `[lcm] threshold publication opportunity failed conversation=${params.conversationId} ${sessionLabel}: ${describeLogError(err)}`,
+      );
+    });
+  }
+
   /** Prepare hidden pending summaries later without recording threshold debt. */
   private schedulePendingSummaryPreparationDrain(
     params: PendingSummaryPreparationDrainParams,
@@ -1122,6 +1154,21 @@ export class LcmContextEngine implements ContextEngine {
         sessionQueueHeld: params.sessionQueueHeld === true,
         publishPolicy: params.pendingPublishPolicy ?? "publish-if-ready",
       });
+      let publicationPressureRemains = false;
+      if (params.pendingPublishPolicy === "publish-ready-only" && result.compacted) {
+        const postPublicationDecision = await this.compaction.evaluate(
+          params.conversationId,
+          resolvedTokenBudget,
+          undefined,
+          {
+            contextThreshold: resolvedContextThreshold.contextThreshold,
+            ...(resolvedContextThreshold.freshTailCount !== undefined
+              ? { freshTailCount: resolvedContextThreshold.freshTailCount }
+              : {}),
+          },
+        );
+        publicationPressureRemains = postPublicationDecision.shouldCompact;
+      }
       const blockedByAuthCircuitBreaker = result.reason === "circuit breaker open";
       // #639 Mode 2: terminal compaction exhaustion (no eligible candidates while
       // over target) is non-retryable — clear the debt instead of pinning it and
@@ -1133,6 +1180,7 @@ export class LcmContextEngine implements ContextEngine {
         (result as { exhausted?: boolean }).exhausted === true;
       const keepPending =
         result.pending === true ||
+        publicationPressureRemains ||
         ((!result.ok || blockedByAuthCircuitBreaker) && !compactionExhausted);
       const failureSummary = blockedByAuthCircuitBreaker
         ? "summary provider circuit breaker is open"
@@ -1196,7 +1244,14 @@ export class LcmContextEngine implements ContextEngine {
     publishPolicy?: PendingCompactionPublishPolicy;
   }): Promise<CompactResult & { pending?: boolean }> {
     const breakerScope = this.resolveSessionQueueKey(params.sessionId, params.sessionKey);
-    const resolvedSummarizer = await this.resolveSummarize({
+    const publicationOnly = params.publishPolicy === "publish-ready-only";
+    const resolvedSummarizer = publicationOnly ? {
+      summarize: async () => {
+        throw new Error("publication-only pending summary pass attempted model-backed preparation");
+      },
+      summaryModel: "publication-only",
+      breakerKey: undefined,
+    } : await this.resolveSummarize({
       legacyParams: this.buildSummarizerLegacyParams({
         legacyParams: params.legacyParams,
         sessionKey: params.sessionKey,
@@ -1204,7 +1259,7 @@ export class LcmContextEngine implements ContextEngine {
       customInstructions: params.customInstructions,
       breakerScope,
     });
-    if (
+    if (!publicationOnly &&
       resolvedSummarizer.breakerKey &&
       this.compactionGuards.isCircuitBreakerOpen(resolvedSummarizer.breakerKey)
     ) {
@@ -1231,7 +1286,7 @@ export class LcmContextEngine implements ContextEngine {
           `[lcm] compact: ${pendingManualCompaction ? "manual request" : "force compaction"} cleared summary spend backoff conversation=${params.conversationId} ${formatSessionLabel(params.sessionId, params.sessionKey)} scope=${summarySpendScopeKey} previousBackoffUntil=${clearedBackoffUntil.toISOString()}`,
         );
       }
-    } else if (this.compactionGuards.getSummarySpendBackoffUntil(summarySpendScopeKey)) {
+    } else if (!publicationOnly && this.compactionGuards.getSummarySpendBackoffUntil(summarySpendScopeKey)) {
       return {
         ok: false,
         compacted: false,
@@ -1323,6 +1378,15 @@ export class LcmContextEngine implements ContextEngine {
         };
       }
       if (lastResult.status === "idle") {
+        if (params.publishPolicy === "publish-ready-only") {
+          return {
+            ok: true,
+            compacted: false,
+            pending: true,
+            reason: lastResult.reason,
+            result: lastResult,
+          };
+        }
         if (lastResult.reason === "no claimable pending summary nodes") {
           return {
             ok: true,
@@ -3718,6 +3782,16 @@ export class LcmContextEngine implements ContextEngine {
           currentTokenCount: observedCurrentTokenCount,
           reason: "threshold",
         };
+        // Register this queue entry synchronously. A later foreground operation
+        // can enqueue behind it, but cannot extend the busy promise ahead of it.
+        this.scheduleThresholdPublicationOpportunity({
+          conversationId: conversation.conversationId,
+          sessionId,
+          sessionKey,
+          tokenBudget,
+          currentTokenCount: observedCurrentTokenCount,
+          reason: "threshold",
+        });
       }
       if (!thresholdDecision.shouldCompact) {
         const leafDecision = await this.compaction.evaluateLeafTrigger(

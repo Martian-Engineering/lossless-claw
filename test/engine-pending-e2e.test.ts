@@ -85,6 +85,71 @@ async function waitForReadyNodes(
 
 describe("pending summary compaction engine e2e (mocked LLM)", () => {
   it(
+    "preserves threshold debt when publication finds no active batch",
+    async () => {
+      const { complete } = createFakeComplete();
+      const engine = createPendingE2eEngine(complete);
+      const sessionId = "pending-e2e-threshold-without-batch";
+      const sessionFile = createSessionFilePath(sessionId);
+
+      await seedBacklogContext(engine, sessionId, [120, 120, 120]);
+      await engine.ingest({
+        sessionId,
+        message: makeMessage({ role: "assistant", content: "fresh tail" }),
+      });
+      const conversationId = await conversationIdFor(engine, sessionId);
+      await expect(
+        engine.getPendingSummaryStore().getActiveBatchForConversation(conversationId),
+      ).resolves.toBeNull();
+
+      // Threshold handling synchronously queues publication-ready-only, while
+      // the general deferred drain is scheduled for a later idle callback.
+      await runAfterTurn(engine, sessionId, sessionFile, {
+        tokenBudget: 600,
+        currentTokenCount: 500,
+      });
+      await engine.ingest({
+        sessionId,
+        message: makeMessage({ role: "user", content: "queued after threshold publication" }),
+      });
+
+      // The bounded publication pass cannot create a batch or call the model.
+      // It retains threshold debt so the already-scheduled general drain still
+      // has authority to perform model-backed planning and preparation later.
+      expect(complete).not.toHaveBeenCalled();
+      const maintenanceAfterPublication = await engine
+        .getCompactionMaintenanceStore()
+        .getConversationCompactionMaintenance(conversationId);
+      expect(maintenanceAfterPublication?.pending).toBe(true);
+
+      const privateEngine = engine as unknown as {
+        drainDeferredCompactionDebtIfIdle: (params: {
+          conversationId: number;
+          sessionId: string;
+          queueKey: string;
+          tokenBudget: number;
+          currentTokenCount: number;
+          reason: string;
+        }) => Promise<void>;
+      };
+      await privateEngine.drainDeferredCompactionDebtIfIdle({
+        conversationId,
+        sessionId,
+        queueKey: sessionId,
+        tokenBudget: 600,
+        currentTokenCount: 500,
+        reason: "threshold",
+      });
+
+      // The general drain may leave an active batch, publish it, or retain debt
+      // when pressure remains. A model call proves that the retained debt gave
+      // this normal preparation path authority to advance work.
+      expect(complete.mock.calls.length).toBeGreaterThan(0);
+    },
+    30_000,
+  );
+
+  it(
     "prepares hidden work through real drains, publishes on threshold debt, and assembles the summaries",
     async () => {
       const { complete, inputs } = createFakeComplete();
@@ -160,16 +225,20 @@ describe("pending summary compaction engine e2e (mocked LLM)", () => {
       ).resolves.toHaveLength(0);
 
       // Crossing the proactive threshold records deferred debt, and the debt
-      // drain promotes the already-ready frontier (AN 0002 test 10) instead of
-      // preparing more hidden work.
+      // publication opportunity takes a fixed queue position. The immediately
+      // following foreground ingest therefore cannot starve promotion.
+      const completionCountBeforePublish = complete.mock.calls.length;
       await runAfterTurn(engine, sessionId, sessionFile, {
         tokenBudget: 600,
         currentTokenCount: 300,
       });
-      await vi.waitFor(async () => {
-        const batch = await engine.getPendingSummaryStore().getBatch(batchId);
-        expect(batch?.status).toBe("published");
-      }, WAIT);
+      await engine.ingest({
+        sessionId,
+        message: makeMessage({ role: "user", content: "next foreground operation" }),
+      });
+      const thresholdBatch = await engine.getPendingSummaryStore().getBatch(batchId);
+      expect(thresholdBatch?.status).toBe("published");
+      expect(complete.mock.calls).toHaveLength(completionCountBeforePublish);
 
       // Promotion recorded canonical ids and dropped hidden payloads.
       // (Remaining compactable work may replan a follow-up batch afterwards,
