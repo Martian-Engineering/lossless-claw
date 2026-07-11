@@ -1378,6 +1378,66 @@ describe("LcmContextEngine.assemble canonical path", () => {
     expect((result.messages[1] as { toolCallId?: string }).toolCallId).toBe("call_2");
   });
 
+  it("preserves real results displaced past later fresh-tail tool calls", async () => {
+    const engine = createEngine();
+    const sessionId = "session-displaced-real-tool-results";
+
+    await engine.ingest({
+      sessionId,
+      message: { role: "user", content: "Check both files." } as AgentMessage,
+    });
+    await engine.ingest({
+      sessionId,
+      message: {
+        role: "assistant",
+        content: [{ type: "toolCall", id: "call_a", name: "read", input: { path: "a.txt" } }],
+      } as AgentMessage,
+    });
+    await engine.ingest({
+      sessionId,
+      message: {
+        role: "assistant",
+        content: [{ type: "toolCall", id: "call_b", name: "read", input: { path: "b.txt" } }],
+      } as AgentMessage,
+    });
+    await engine.ingest({
+      sessionId,
+      message: {
+        role: "toolResult",
+        toolCallId: "call_a",
+        toolName: "read",
+        content: [{ type: "text", text: "real result A" }],
+      } as AgentMessage,
+    });
+    await engine.ingest({
+      sessionId,
+      message: {
+        role: "toolResult",
+        toolCallId: "call_b",
+        toolName: "read",
+        content: [{ type: "text", text: "real result B" }],
+      } as AgentMessage,
+    });
+
+    const result = await engine.assemble({
+      sessionId,
+      messages: [],
+      tokenBudget: 10_000,
+    });
+
+    const resultByCallId = new Map(
+      result.messages
+        .filter((message) => message.role === "toolResult")
+        .map((message) => [(message as { toolCallId?: string }).toolCallId, message]),
+    );
+    expect(resultByCallId.size).toBe(2);
+    expect(JSON.stringify(resultByCallId.get("call_a")?.content)).toContain("real result A");
+    expect(JSON.stringify(resultByCallId.get("call_b")?.content)).toContain("real result B");
+    expect(JSON.stringify(result.messages)).not.toContain(
+      "[lossless-claw] missing tool result in session history",
+    );
+  });
+
   it("protects repaired fresh-tail assistant messages after cross-message tool-use dedupe", async () => {
     const engine = createEngineWithConfig({ freshTailCount: 3 });
     const sessionId = "session-fresh-tail-dedupe-protection";
