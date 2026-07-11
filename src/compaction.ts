@@ -292,6 +292,7 @@ const MEDIA_ATTACHMENT_RAW_TYPES = new Set(["file", "image", "snapshot"]);
 const PROVIDER_REASONING_RAW_TYPES = new Set(["reasoning", "thinking", "redacted_thinking"]);
 const STRUCTURED_MEDIA_TEXT_KEYS = ["text", "caption", "alt", "title", "summary"] as const;
 const STRUCTURED_MEDIA_NESTED_KEYS = [
+  "value",
   "content",
   "parts",
   "items",
@@ -306,6 +307,7 @@ const STRUCTURED_MEDIA_NESTED_KEYS = [
   "query",
   "command",
 ] as const;
+const MAX_STRUCTURED_TEXT_DEPTH = 8;
 const LEADING_CLOSED_REASONING_TEXT_BLOCK_RE =
   /^<\s*(think|thinking|reasoning)(?:\s[^>]*)?>[\s\S]*?<\s*\/\s*\1\s*>/i;
 const STANDALONE_CLOSED_REASONING_TEXT_BLOCK_RE =
@@ -465,7 +467,7 @@ function extractSanitizedStructuredText(
   options: MeaningfulTextOptions = {},
   depth = 0,
 ): string[] {
-  if (depth >= 4 || value == null) {
+  if (depth >= MAX_STRUCTURED_TEXT_DEPTH || value == null) {
     return [];
   }
   if (typeof value === "string") {
