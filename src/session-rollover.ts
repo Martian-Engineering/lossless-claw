@@ -133,8 +133,16 @@ export class SessionRolloverDetector {
    * on every subsequent bootstrap/afterTurn call. A reason change for the
    * same generation still warns once more, since that is a materially
    * different situation worth surfacing again.
+   *
+   * Bounded with FIFO eviction at `WARNED_AMBIGUOUS_ROLLOVER_GENERATIONS_CAP`
+   * entries (mirrors `TranscriptReconciler`'s `AFTER_TURN_RECONCILE_KEY_CAP`)
+   * so a long-lived host process that accumulates many distinct frozen
+   * generations doesn't grow this map indefinitely. A generation whose entry
+   * gets evicted just re-warns once more on its next call, which is harmless
+   * noise, so plain size-capped FIFO is enough; no LRU needed.
    */
   private readonly warnedAmbiguousRolloverGenerations = new Map<string, string>();
+  private static readonly WARNED_AMBIGUOUS_ROLLOVER_GENERATIONS_CAP = 500;
 
   constructor(
     private readonly conversationStore: ConversationStore,
@@ -653,6 +661,16 @@ export class SessionRolloverDetector {
         this.deps.log.debug(message);
       } else {
         this.deps.log.warn(message);
+        if (
+          !this.warnedAmbiguousRolloverGenerations.has(generationKey)
+          && this.warnedAmbiguousRolloverGenerations.size
+            >= SessionRolloverDetector.WARNED_AMBIGUOUS_ROLLOVER_GENERATIONS_CAP
+        ) {
+          const oldest = this.warnedAmbiguousRolloverGenerations.keys().next().value;
+          if (typeof oldest === "string") {
+            this.warnedAmbiguousRolloverGenerations.delete(oldest);
+          }
+        }
         this.warnedAmbiguousRolloverGenerations.set(generationKey, verdict.reason);
       }
       return { rebound: false, preserveExpected, alreadyWarned };
