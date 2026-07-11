@@ -25,14 +25,17 @@ function makeConversationStore(initial: FakeConversationStore): ConversationStor
       expect(conversationId).toBe(initial.conversationId);
       return initial.messages.slice(-limit);
     }),
-    getMessages: vi.fn(async (conversationId: number, options?: { limit?: number; offset?: number }) => {
-      expect(conversationId).toBe(initial.conversationId);
-      const limit = options?.limit ?? initial.messages.length;
-      if (options?.offset !== undefined) {
-        return initial.messages.slice(options.offset, options.offset + limit);
-      }
-      return initial.messages.slice(-limit);
-    }),
+    getMessages: vi.fn(
+      async (conversationId: number, options?: { afterSeq?: number; limit?: number }) => {
+        expect(conversationId).toBe(initial.conversationId);
+        const afterSeq = options?.afterSeq ?? -1;
+        const filtered = initial.messages.filter((m) => m.seq > afterSeq).sort((a, b) => a.seq - b.seq);
+        if (options?.limit !== undefined) {
+          return filtered.slice(0, options.limit);
+        }
+        return filtered;
+      },
+    ),
     getLastMessageIdentityHash: vi.fn(async () => {
       const last = initial.messages[initial.messages.length - 1];
       return last ? buildMessageIdentityHash(last.role, last.content) : null;
