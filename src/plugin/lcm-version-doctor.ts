@@ -18,14 +18,25 @@ export type LcmVersionDoctorScan = {
   split: boolean;
 };
 
-/** Normalize the loader-provided source to the directory that contains active code. */
+/** Resolve the loader-provided source to its enclosing Lossless Claw package root. */
 function normalizePackageRoot(sourcePath: string): string {
   const absolutePath = resolve(sourcePath);
   if (!existsSync(absolutePath)) {
     return absolutePath;
   }
   try {
-    return statSync(absolutePath).isDirectory() ? absolutePath : dirname(absolutePath);
+    const sourceDir = statSync(absolutePath).isDirectory() ? absolutePath : dirname(absolutePath);
+    let currentDir = sourceDir;
+    while (true) {
+      if (readPackageCopy(currentDir, "active")) {
+        return currentDir;
+      }
+      const parentDir = dirname(currentDir);
+      if (parentDir === currentDir) {
+        return sourceDir;
+      }
+      currentDir = parentDir;
+    }
   } catch {
     return absolutePath;
   }

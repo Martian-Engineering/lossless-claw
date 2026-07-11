@@ -538,17 +538,25 @@ describe("lcm command", () => {
     tempDirs.add(fixture.tempDir);
     dbPaths.add(fixture.dbPath);
     const stateDir = join(fixture.tempDir, "openclaw-state");
-    const activePath = join(stateDir, "active-loaded-copy");
-    mkdirSync(activePath, { recursive: true });
+    const activePath = join(
+      stateDir,
+      "extensions",
+      "node_modules",
+      "@martian-engineering",
+      "lossless-claw",
+    );
+    const activeSourcePath = join(activePath, "dist", "index.js");
+    mkdirSync(join(activePath, "dist"), { recursive: true });
     writeFileSync(
       join(activePath, "package.json"),
       JSON.stringify({ name: "@martian-engineering/lossless-claw", version: packageJson.version }),
     );
+    writeFileSync(activeSourcePath, "export default {};\n");
     vi.stubEnv("OPENCLAW_STATE_DIR", stateDir);
     const command = createLcmCommand({
       db: fixture.db,
       config: fixture.config,
-      activeSourcePath: activePath,
+      activeSourcePath,
     });
 
     const result = await command.handler(createCommandContext("doctor"));
