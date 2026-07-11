@@ -94,7 +94,10 @@ export async function resolveLcmConversationScope(input: {
   params: Record<string, unknown>;
   sessionId?: string;
   sessionKey?: string;
-  deps?: Pick<LcmDependencies, "isSubagentSessionKey" | "resolveSessionIdFromSessionKey">;
+  deps?: Pick<
+    LcmDependencies,
+    "isSubagentSessionKey" | "resolveSessionIdFromSessionKey" | "log"
+  >;
 }): Promise<LcmConversationScope> {
   const { lcm, params } = input;
   const explicitSessionKey = input.sessionKey?.trim();
@@ -205,9 +208,23 @@ export async function resolveLcmConversationScope(input: {
   }
 
   if (normalizedSessionKey) {
-    const bySessionKey =
-      await lcm.getConversationStore().getConversationBySessionKey(normalizedSessionKey);
+    const store = lcm.getConversationStore();
+    const bySessionKey = await store.getConversationBySessionKey(normalizedSessionKey);
     if (bySessionKey) {
+      const byRuntimeSession =
+        !isDelegatedSession && normalizedInputSessionId && !sessionIdAsSessionKey
+          ? await store.getConversationBySessionId(normalizedInputSessionId)
+          : null;
+      const runtimeSessionOverridesStaleKey =
+        byRuntimeSession?.active === true
+        && byRuntimeSession.conversationId !== bySessionKey.conversationId;
+      const conversation = runtimeSessionOverridesStaleKey ? byRuntimeSession : bySessionKey;
+      const conversationSessionKey = conversation.sessionKey?.trim() || normalizedSessionKey;
+      if (runtimeSessionOverridesStaleKey) {
+        input.deps?.log.warn(
+          `[lcm] recall scope: active runtime session overrides stale tool session key requestedSessionKey=${normalizedSessionKey} resolvedConversation=${bySessionKey.conversationId} resolvedSessionKey=${bySessionKey.sessionKey ?? ""} resolvedActive=${bySessionKey.active} runtimeSessionId=${normalizedInputSessionId} alternativeConversation=${byRuntimeSession.conversationId} alternativeSessionKey=${byRuntimeSession.sessionKey ?? ""} alternativeActive=${byRuntimeSession.active}`,
+        );
+      }
       if (isDelegatedSession && !allowedConversationIds.includes(bySessionKey.conversationId)) {
         return {
           allConversations: false,
@@ -215,21 +232,23 @@ export async function resolveLcmConversationScope(input: {
           error: `Conversation ${bySessionKey.conversationId} is outside delegated conversation scope.`,
         };
       }
-      const familyIds = isolateCurrentSessionFamily
-        ? [bySessionKey.conversationId]
+      const isolateResolvedSessionFamily = isIsolatedCronSessionKey(conversationSessionKey);
+      const familyIds = isolateResolvedSessionFamily
+        ? [conversation.conversationId]
         : typeof (lcm.getConversationStore() as ConversationScopeStore).getConversationFamilyIds === "function"
           ? await (lcm.getConversationStore() as ConversationScopeStore).getConversationFamilyIds({
-              conversationId: bySessionKey.conversationId,
-              sessionKey: normalizedSessionKey,
+              conversationId: conversation.conversationId,
+              sessionId: runtimeSessionOverridesStaleKey ? normalizedInputSessionId : undefined,
+              sessionKey: conversationSessionKey,
             })
-          : [bySessionKey.conversationId];
-      const scopedFamilyIds = familyIds.length > 0 ? familyIds : [bySessionKey.conversationId];
+          : [conversation.conversationId];
+      const scopedFamilyIds = familyIds.length > 0 ? familyIds : [conversation.conversationId];
       const conversationIds = isDelegatedSession
         ? scopedFamilyIds.filter((conversationId) => allowedConversationIds.includes(conversationId))
         : scopedFamilyIds;
       return {
-        conversationId: bySessionKey.conversationId,
-        conversationIds: conversationIds.length > 0 ? conversationIds : [bySessionKey.conversationId],
+        conversationId: conversation.conversationId,
+        conversationIds: conversationIds.length > 0 ? conversationIds : [conversation.conversationId],
         allConversations: false,
         delegated: isDelegatedSession,
       };

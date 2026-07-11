@@ -91,6 +91,7 @@ function buildLcmEngine(params: {
   conversationId?: number;
   conversationIdBySessionKey?: number;
   conversationFamilyIds?: number[];
+  conversationFamilyIdsByRoot?: Record<number, number[]>;
   timezone?: string;
 }) {
   return {
@@ -104,26 +105,35 @@ function buildLcmEngine(params: {
           : {
               conversationId: params.conversationId,
               sessionId: "session-1",
+              sessionKey: "agent:main:main",
+              active: true,
               title: null,
               bootstrappedAt: null,
               createdAt: new Date("2026-01-01T00:00:00.000Z"),
               updatedAt: new Date("2026-01-01T00:00:00.000Z"),
             },
       ),
-      getConversationBySessionKey: vi.fn(async () =>
+      getConversationBySessionKey: vi.fn(async (sessionKey: string) =>
         params.conversationIdBySessionKey == null
           ? null
           : {
               conversationId: params.conversationIdBySessionKey,
               sessionId: "legacy-session",
-              sessionKey: "agent:main:main",
+              sessionKey,
+              active: true,
               title: null,
               bootstrappedAt: null,
               createdAt: new Date("2026-01-01T00:00:00.000Z"),
               updatedAt: new Date("2026-01-01T00:00:00.000Z"),
             },
       ),
-      getConversationFamilyIds: vi.fn(async () => {
+      getConversationFamilyIds: vi.fn(async (input: { conversationId?: number }) => {
+        const idsForRoot = input.conversationId == null
+          ? undefined
+          : params.conversationFamilyIdsByRoot?.[input.conversationId];
+        if (idsForRoot) {
+          return idsForRoot;
+        }
         if (params.conversationFamilyIds && params.conversationFamilyIds.length > 0) {
           return params.conversationFamilyIds;
         }
@@ -461,6 +471,65 @@ describe("LCM tools session scoping", () => {
         conversationId: 42,
         conversationIds: [42],
       }),
+    );
+  });
+
+  it("lcm_grep prefers the active runtime session when the tool sessionKey is stale", async () => {
+    const retrieval = {
+      grep: vi.fn(async (input: { conversationIds?: number[] }) => {
+        const found = input.conversationIds?.includes(1987) === true;
+        return {
+          messages: found
+            ? [{
+                messageId: 987,
+                conversationId: 1987,
+                role: "assistant",
+                snippet: "SMOKE_OK",
+                createdAt: new Date("2026-07-11T13:19:00.000Z"),
+                rank: 0,
+              }]
+            : [],
+          summaries: [],
+          totalMatches: found ? 1 : 0,
+        };
+      }),
+      expand: vi.fn(),
+      describe: vi.fn(),
+    };
+
+    const deps = makeDeps();
+    const tool = createLcmGrepTool({
+      deps,
+      lcm: buildLcmEngine({
+        retrieval,
+        conversationId: 1987,
+        conversationIdBySessionKey: 1884,
+        conversationFamilyIdsByRoot: {
+          1884: [1884],
+          1987: [1987, 1986],
+        },
+      }) as never,
+      sessionId: "02b94cf7-f5bd-49d2-8883-90d7a92cfc8f",
+      sessionKey: "agent:main:telegram:default:direct:stale-chat",
+    });
+    const result = await tool.execute("call-stale-key", { pattern: "SMOKE_OK" });
+
+    expect(retrieval.grep).toHaveBeenCalledWith(
+      expect.objectContaining({
+        conversationId: 1987,
+        conversationIds: [1987, 1986],
+      }),
+    );
+    expect((result.content[0] as { text: string }).text).toContain("SMOKE_OK");
+    expect(deps.log.warn).toHaveBeenCalledWith(
+      expect.stringContaining(
+        "requestedSessionKey=agent:main:telegram:default:direct:stale-chat resolvedConversation=1884",
+      ),
+    );
+    expect(deps.log.warn).toHaveBeenCalledWith(
+      expect.stringContaining(
+        "alternativeConversation=1987 alternativeSessionKey=agent:main:main alternativeActive=true",
+      ),
     );
   });
 
