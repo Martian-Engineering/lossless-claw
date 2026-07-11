@@ -385,9 +385,13 @@ describe("ambiguous-rollover once-only WARN resolution", () => {
       tokenBudget: 10_000,
     });
 
+    const notProvablyFreshWarns = log.warn.mock.calls.filter(([message]) =>
+      String(message).includes("ambiguous rollover not provably fresh"),
+    );
     const preservingWarns = log.warn.mock.calls.filter(([message]) =>
       String(message).includes("ambiguous session-key runtime rollover; preserving"),
     );
+    expect(notProvablyFreshWarns).toHaveLength(1);
     expect(preservingWarns).toHaveLength(1);
   });
 });
