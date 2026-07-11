@@ -78,7 +78,7 @@ type LcmConversationStatusStats = {
 type CurrentConversationResolution =
   | {
       kind: "resolved";
-      source: "session_key" | "session_key_via_session_id" | "session_id";
+      source: "session_key" | "session_key_via_session_id" | "session_id" | "conversation_id";
       stats: LcmConversationStatusStats;
     }
   | {
@@ -878,7 +878,7 @@ async function resolveDoctorApplyConversationById(
     };
   }
 
-  return { kind: "resolved", source: "session_id", stats };
+  return { kind: "resolved", source: "conversation_id", stats };
 }
 
 async function resolveRuntimeSessionId(params: {
@@ -3110,7 +3110,12 @@ async function buildDoctorApplyText(params: {
       ]),
       "",
       buildSection("🛠️ Next step", [
-        `Run ${formatCommand(`${VISIBLE_COMMAND} doctor apply confirm-offline`)} only from an isolated/offline maintenance lane after active channel delivery is paused or moved away from this conversation.`,
+        (() => {
+          const command = requestedConversationId !== undefined
+            ? `${VISIBLE_COMMAND} doctor apply ${formatNumber(requestedConversationId)} confirm-offline`
+            : `${VISIBLE_COMMAND} doctor apply confirm-offline`;
+          return `Run ${formatCommand(command)} only from an isolated/offline maintenance lane after active channel delivery is paused or moved away from this conversation.`;
+        })(),
       ]),
     ].join("\n");
   }

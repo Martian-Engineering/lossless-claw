@@ -3067,6 +3067,22 @@ describe("lcm command", () => {
     expect(untouchedCurrent?.content).toBe("healthy current summary");
   });
 
+  it("reports unavailable when targeting a nonexistent conversation id", async () => {
+    const fixture = createCommandFixture();
+    tempDirs.add(fixture.tempDir);
+    dbPaths.add(fixture.dbPath);
+
+    const result = await fixture.command.handler(
+      createCommandContext("doctor apply 99999", {
+        sessionKey: "agent:main:telegram:direct:doctor-apply-nonexistent",
+      }),
+    );
+
+    expect(result.text).toContain("🩺 Lossless Claw Doctor Apply");
+    expect(result.text).toContain("status: unavailable");
+    expect(result.text).toContain("No LCM conversation found with id 99,999");
+  });
+
   it("uses the normal runtime model chain for doctor apply when no explicit summary model is set", async () => {
     const hostBoundComplete = vi.fn(async () => ({
       text: "HOST BOUND REPAIR",
@@ -4205,6 +4221,10 @@ describe("lcm command helpers", () => {
       kind: "help",
       error:
         "`/lossless doctor apply` accepts an optional conversation id and optional `confirm-offline` for large/hot repair overrides.",
+    });
+    expect(__testing.parseLcmCommand("doctor apply 42 42")).toEqual({
+      kind: "help",
+      error: "`/lossless doctor apply` accepts at most one conversation id.",
     });
     expect(__testing.parseLcmCommand("doctor rollover-splits")).toEqual({
       kind: "doctor_rollover_splits",
