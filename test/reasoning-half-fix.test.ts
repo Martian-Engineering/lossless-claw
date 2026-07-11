@@ -109,6 +109,24 @@ describe("extractMeaningfulMessageText (B2: shared sanitizer)", () => {
     expect(extractMeaningfulMessageText(content)).toBe("Yes — see runbook §3.");
   });
 
+  it("extracts text from an OpenClaw MCP result envelope", () => {
+    const content = JSON.stringify({
+      ok: true,
+      value: {
+        tool: { description: "Tool metadata should not become summary source." },
+        result: {
+          content: [{ type: "text", text: "The meeting notes remain available." }],
+        },
+      },
+      logs: ["transport metadata should not become summary source"],
+      telemetry: { durationMs: 12 },
+    });
+
+    expect(extractMeaningfulMessageText(content)).toBe(
+      "The meeting notes remain available.",
+    );
+  });
+
   it("does not apply structured handling to non-JSON strings", () => {
     expect(
       extractMeaningfulMessageText("Just a plain log line about reasoning."),
