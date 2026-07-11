@@ -2199,6 +2199,7 @@ export class TranscriptReconciler {
             sessionId: params.sessionId,
             sessionFile: params.sessionFile,
             expected: rolloverResolution.preserveExpected,
+            alreadyWarned: rolloverResolution.alreadyWarned,
           });
           return {
             importedMessages: 0,
