@@ -89,6 +89,7 @@ function buildLcmEngine(params: {
     describe: ReturnType<typeof vi.fn>;
   };
   conversationId?: number;
+  conversationSessionKey?: string | null;
   conversationIdBySessionKey?: number;
   conversationFamilyIds?: number[];
   conversationFamilyIdsByRoot?: Record<number, number[]>;
@@ -105,7 +106,9 @@ function buildLcmEngine(params: {
           : {
               conversationId: params.conversationId,
               sessionId: "session-1",
-              sessionKey: "agent:main:main",
+              sessionKey: params.conversationSessionKey === undefined
+                ? "agent:main:main"
+                : params.conversationSessionKey,
               active: true,
               title: null,
               bootstrappedAt: null,
@@ -531,6 +534,75 @@ describe("LCM tools session scoping", () => {
         "alternativeConversation=1987 alternativeSessionKey=agent:main:main alternativeActive=true",
       ),
     );
+  });
+
+  it("lcm_grep does not reuse a stale cron key when the active runtime has no sessionKey", async () => {
+    const retrieval = {
+      grep: vi.fn(async () => ({
+        messages: [],
+        summaries: [],
+        totalMatches: 0,
+      })),
+      expand: vi.fn(),
+      describe: vi.fn(),
+    };
+
+    const tool = createLcmGrepTool({
+      deps: makeDeps(),
+      lcm: buildLcmEngine({
+        retrieval,
+        conversationId: 1987,
+        conversationSessionKey: null,
+        conversationIdBySessionKey: 1884,
+        conversationFamilyIdsByRoot: {
+          1884: [1884],
+          1987: [1987, 1986],
+        },
+      }) as never,
+      sessionId: "active-runtime-session",
+      sessionKey: "agent:main:cron:stale-run",
+    });
+    await tool.execute("call-null-runtime-key", { pattern: "SMOKE_OK" });
+
+    expect(retrieval.grep).toHaveBeenCalledWith(
+      expect.objectContaining({
+        conversationId: 1987,
+        conversationIds: [1987, 1986],
+      }),
+    );
+  });
+
+  it("lcm_grep does not warn when runtime and tool identities resolve to one conversation", async () => {
+    const retrieval = {
+      grep: vi.fn(async () => ({
+        messages: [],
+        summaries: [],
+        totalMatches: 0,
+      })),
+      expand: vi.fn(),
+      describe: vi.fn(),
+    };
+
+    const deps = makeDeps();
+    const tool = createLcmGrepTool({
+      deps,
+      lcm: buildLcmEngine({
+        retrieval,
+        conversationId: 42,
+        conversationIdBySessionKey: 42,
+      }) as never,
+      sessionId: "runtime-session-42",
+      sessionKey: "agent:main:main",
+    });
+    await tool.execute("call-same-conversation", { pattern: "deployment" });
+
+    expect(retrieval.grep).toHaveBeenCalledWith(
+      expect.objectContaining({
+        conversationId: 42,
+        conversationIds: [42],
+      }),
+    );
+    expect(deps.log.warn).not.toHaveBeenCalled();
   });
 
   it("lcm_grep searches across a resolved session family", async () => {

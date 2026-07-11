@@ -219,7 +219,7 @@ export async function resolveLcmConversationScope(input: {
         byRuntimeSession?.active === true
         && byRuntimeSession.conversationId !== bySessionKey.conversationId;
       const conversation = runtimeSessionOverridesStaleKey ? byRuntimeSession : bySessionKey;
-      const conversationSessionKey = conversation.sessionKey?.trim() || normalizedSessionKey;
+      const conversationSessionKey = conversation.sessionKey?.trim();
       if (runtimeSessionOverridesStaleKey) {
         input.deps?.log.warn(
           `[lcm] recall scope: active runtime session overrides stale tool session key requestedSessionKey=${normalizedSessionKey} resolvedConversation=${bySessionKey.conversationId} resolvedSessionKey=${bySessionKey.sessionKey ?? ""} resolvedActive=${bySessionKey.active} runtimeSessionId=${normalizedInputSessionId} alternativeConversation=${byRuntimeSession.conversationId} alternativeSessionKey=${byRuntimeSession.sessionKey ?? ""} alternativeActive=${byRuntimeSession.active}`,
