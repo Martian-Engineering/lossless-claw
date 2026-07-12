@@ -9,6 +9,7 @@ import type { LcmDependencies } from "../types.js";
 import { jsonResult, type AnyAgentTool } from "./common.js";
 import { resolveLcmConversationScope } from "./lcm-conversation-scope.js";
 import {
+  allocateExpansionTokenCaps,
   createExpansionDeadline,
   remainingDeadlineMs,
   type ExpansionDeadline,
@@ -102,6 +103,10 @@ type ConversationBreakdown = {
   truncated: boolean;
   status?: "success" | "failed" | "skipped";
   error?: string;
+  summaryIds?: string[];
+  phase?: DelegatedFailurePhase;
+  elapsedMs?: number;
+  errorCode?: DelegatedFailureCode;
 };
 
 type ExpandQueryReply = {
@@ -181,22 +186,13 @@ type ConversationBucket = {
 };
 
 type BucketExecutionResult =
-  | {
-      conversationId: number;
-      status: "success";
-      candidateCount: number;
-      reply: DelegatedExpandQueryReply;
-    }
-  | {
-      conversationId: number;
-      status: "failed";
-      candidateCount: number;
-      error: string;
-    }
+  | (Extract<DelegatedBucketOutcome, { status: "success" }> & { candidateCount: number })
+  | (Extract<DelegatedBucketOutcome, { status: "failed" }> & { candidateCount: number })
   | {
       conversationId: number;
       status: "skipped";
       candidateCount: number;
+      summaryIds: string[];
       error: string;
     };
 
@@ -496,6 +492,65 @@ function buildExpandQueryReply(params: {
     totalSourceTokens: params.totalSourceTokens,
     truncated: params.truncated,
     ...(params.conversationBreakdown ? { conversationBreakdown: params.conversationBreakdown } : {}),
+  };
+}
+
+/** Build the public per-conversation accounting for delegated bucket outcomes. */
+function buildConversationBreakdown(results: BucketExecutionResult[]): ConversationBreakdown[] {
+  return results.map((result) => {
+    if (result.status === "success") {
+      return {
+        conversationId: result.conversationId,
+        expandedSummaryCount: result.reply.expandedSummaryCount,
+        citedIds: result.reply.citedIds,
+        totalSourceTokens: result.reply.totalSourceTokens,
+        truncated: result.reply.truncated,
+        status: "success",
+      };
+    }
+    if (result.status === "failed") {
+      return {
+        conversationId: result.conversationId,
+        expandedSummaryCount: 0,
+        citedIds: [],
+        totalSourceTokens: 0,
+        truncated: true,
+        status: "failed",
+        summaryIds: result.summaryIds,
+        phase: result.phase,
+        elapsedMs: result.elapsedMs,
+        errorCode: result.code,
+        error: result.error,
+      };
+    }
+    return {
+      conversationId: result.conversationId,
+      expandedSummaryCount: 0,
+      citedIds: [],
+      totalSourceTokens: 0,
+      truncated: true,
+      status: "skipped",
+      error: result.error,
+    };
+  });
+}
+
+/** Preserve the legacy error text while adding structured failure accounting. */
+function buildDelegatedFailureReply(results: BucketExecutionResult[]) {
+  const firstFailure = results.find(
+    (result): result is Extract<BucketExecutionResult, { status: "failed" }> =>
+      result.status === "failed",
+  );
+  const error = firstFailure?.error ?? "Delegated expansion query failed.";
+  return {
+    error,
+    ...(firstFailure ? { errorCode: firstFailure.code } : {}),
+    truncated: true,
+    citedIds: [],
+    sourceConversationIds: [],
+    expandedSummaryCount: 0,
+    totalSourceTokens: 0,
+    conversationBreakdown: buildConversationBreakdown(results),
   };
 }
 
@@ -1380,7 +1435,11 @@ export function createLcmExpandQueryTool(input: {
             delegatedWaitTimeoutSeconds,
           });
           if (delegatedOutcome.status === "failed") {
-            throw new Error(delegatedOutcome.error);
+            return jsonResult(
+              buildDelegatedFailureReply([
+                { ...delegatedOutcome, candidateCount: bucket.candidateCount },
+              ]),
+            );
           }
           const delegatedReply = delegatedOutcome.reply;
 
@@ -1397,25 +1456,18 @@ export function createLcmExpandQueryTool(input: {
         }
 
         const rankedBuckets = [...conversationBuckets].sort(compareConversationBuckets);
-        const bucketResults: BucketExecutionResult[] = [];
-        const bucketsToExpand = rankedBuckets.slice(0, DEFAULT_MAX_CONVERSATION_BUCKETS);
-        const skippedBuckets = rankedBuckets.slice(DEFAULT_MAX_CONVERSATION_BUCKETS);
-        let remainingTokenCap = expansionTokenCap;
-        let firstFailure: string | undefined;
+        const selectedBuckets = rankedBuckets.slice(0, DEFAULT_MAX_CONVERSATION_BUCKETS);
+        const tokenAllocations = allocateExpansionTokenCaps({
+          bucketCount: selectedBuckets.length,
+          tokenCap: expansionTokenCap,
+        });
+        const runnableBuckets = selectedBuckets.slice(0, tokenAllocations.length);
+        const tokenSkippedBuckets = selectedBuckets.slice(tokenAllocations.length);
+        const limitSkippedBuckets = rankedBuckets.slice(DEFAULT_MAX_CONVERSATION_BUCKETS);
 
-        for (const bucket of bucketsToExpand) {
-          if (remainingTokenCap <= 0) {
-            bucketResults.push({
-              conversationId: bucket.conversationId,
-              status: "skipped",
-              candidateCount: bucket.candidateCount,
-              error: "global token budget exhausted",
-            });
-            continue;
-          }
-
-          try {
-            const delegatedOutcome = await runDelegatedExpandQuery({
+        const delegatedOutcomes = await Promise.all(
+          runnableBuckets.map((bucket, index) =>
+            runDelegatedExpandQuery({
               deps: input.deps,
               callerSessionKey,
               requesterAgentId,
@@ -1423,43 +1475,36 @@ export function createLcmExpandQueryTool(input: {
               query: query || undefined,
               prompt,
               maxTokens,
-              tokenCap: remainingTokenCap,
+              tokenCap: tokenAllocations[index] ?? 1,
               requestId,
               childExpansionDepth,
               originSessionKey,
               deadline,
               delegatedWaitTimeoutSeconds,
-            });
-            if (delegatedOutcome.status === "failed") {
-              throw new Error(delegatedOutcome.error);
-            }
-            const delegatedReply = delegatedOutcome.reply;
-            bucketResults.push({
-              conversationId: bucket.conversationId,
-              status: "success",
-              candidateCount: bucket.candidateCount,
-              reply: delegatedReply,
-            });
-            remainingTokenCap = Math.max(
-              0,
-              remainingTokenCap - Math.max(0, delegatedReply.totalSourceTokens),
-            );
-          } catch (error) {
-            const failure = formatExpansionFailure(error);
-            firstFailure ??= failure;
-            bucketResults.push({
-              conversationId: bucket.conversationId,
-              status: "failed",
-              candidateCount: bucket.candidateCount,
-              error: failure,
-            });
-          }
-        }
+            }),
+          ),
+        );
 
-        for (const bucket of skippedBuckets) {
+        const bucketResults: BucketExecutionResult[] = delegatedOutcomes.map(
+          (outcome, index) => ({
+            ...outcome,
+            candidateCount: runnableBuckets[index]?.candidateCount ?? outcome.summaryIds.length,
+          }),
+        );
+        for (const bucket of tokenSkippedBuckets) {
           bucketResults.push({
             conversationId: bucket.conversationId,
             status: "skipped",
+            summaryIds: bucket.summaryIds,
+            candidateCount: bucket.candidateCount,
+            error: "global token budget exhausted",
+          });
+        }
+        for (const bucket of limitSkippedBuckets) {
+          bucketResults.push({
+            conversationId: bucket.conversationId,
+            status: "skipped",
+            summaryIds: bucket.summaryIds,
             candidateCount: bucket.candidateCount,
             error: `skipped after reaching max conversation bucket limit (${DEFAULT_MAX_CONVERSATION_BUCKETS})`,
           });
@@ -1470,30 +1515,8 @@ export function createLcmExpandQueryTool(input: {
             result.status === "success",
         );
         if (successfulResults.length === 0) {
-          throw new Error(firstFailure ?? "Delegated expansion query failed.");
+          return jsonResult(buildDelegatedFailureReply(bucketResults));
         }
-
-        const conversationBreakdown: ConversationBreakdown[] = bucketResults.map((result) => {
-          if (result.status === "success") {
-            return {
-              conversationId: result.conversationId,
-              expandedSummaryCount: result.reply.expandedSummaryCount,
-              citedIds: result.reply.citedIds,
-              totalSourceTokens: result.reply.totalSourceTokens,
-              truncated: result.reply.truncated,
-              status: "success",
-            };
-          }
-          return {
-            conversationId: result.conversationId,
-            expandedSummaryCount: 0,
-            citedIds: [],
-            totalSourceTokens: 0,
-            truncated: true,
-            status: result.status,
-            error: result.error,
-          };
-        });
 
         return jsonResult(
           buildExpandQueryReply({
@@ -1514,7 +1537,7 @@ export function createLcmExpandQueryTool(input: {
             truncated:
               successfulResults.some((result) => result.reply.truncated)
               || bucketResults.some((result) => result.status !== "success"),
-            conversationBreakdown,
+            conversationBreakdown: buildConversationBreakdown(bucketResults),
           }),
         );
       } catch (error) {
