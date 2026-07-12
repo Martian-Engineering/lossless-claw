@@ -64,3 +64,18 @@ Recommended external setup:
 When configuring npm trusted publishing, register the GitHub workflow using the exact workflow filename in this repo: `.github/workflows/publish.yml`.
 
 The publish workflow is intentionally manual. Release issuance should stay deliberate even after trusted publishing is enabled.
+
+## Beta releases
+
+Use a Changesets prerelease when `main` needs broader testing before a stable release:
+
+1. Run `npx changeset pre enter beta` on the reviewed release branch.
+2. Run `npm run version-packages` and refresh `package-lock.json`.
+3. Review and merge the generated prerelease version and changelog.
+4. Dispatch `Publish Package` on the exact merged commit.
+
+The publish workflow maps `X.Y.Z-beta.N` to npm's `beta` dist-tag and marks the
+GitHub Release as a prerelease. Stable `X.Y.Z` versions map to npm's `latest`
+dist-tag. Other prerelease identifiers fail closed.
+
+Never use a beta publication to move or repair `latest` manually.
