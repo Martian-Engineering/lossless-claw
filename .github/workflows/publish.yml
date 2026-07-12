@@ -2,25 +2,24 @@ name: Publish Package
 
 on:
   workflow_dispatch:
-    inputs:
-      ref:
-        description: Optional git ref to publish. Leave blank to use the selected branch or tag.
-        required: false
-        type: string
 
 permissions:
   contents: write
   id-token: write
+
+concurrency:
+  group: npm-publish
+  cancel-in-progress: false
 
 jobs:
   publish:
     runs-on: ubuntu-latest
     environment: npm-publish
     steps:
-      - name: Checkout
+      - name: Checkout approved commit
         uses: actions/checkout@v4
         with:
-          ref: ${{ inputs.ref || github.ref }}
+          ref: ${{ github.sha }}
           fetch-depth: 0
 
       - name: Setup Node
@@ -45,30 +44,89 @@ jobs:
       - name: Read package version and release channel
         id: package
         run: |
-          version="$(node -p "require('./package.json').version")"
-          printf 'version=%s\n' "$version" >> "$GITHUB_OUTPUT"
-          node scripts/release-channel.mjs "$version" >> "$GITHUB_OUTPUT"
-
-      - name: Ensure release tag does not already exist
-        run: |
-          tag="v${{ steps.package.outputs.version }}"
-          if git rev-parse "$tag" >/dev/null 2>&1; then
-            echo "Tag $tag already exists"
+          source_sha="$(git rev-parse HEAD)"
+          if [ "$source_sha" != "$GITHUB_SHA" ]; then
+            echo "Checked out $source_sha, expected approved commit $GITHUB_SHA"
             exit 1
           fi
 
-      - name: Publish to npm
-        run: npm publish --tag "${{ steps.package.outputs.npm_tag }}"
-        env:
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+          version="$(node -p "require('./package.json').version")"
+          {
+            printf 'source_sha=%s\n' "$source_sha"
+            printf 'version=%s\n' "$version"
+            node scripts/release-channel.mjs "$version"
+          } >> "$GITHUB_OUTPUT"
 
-      - name: Create and push release tag
+      - name: Verify release state
+        id: preflight
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
-          tag="v${{ steps.package.outputs.version }}"
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git tag -a "$tag" -m "$tag"
-          git push origin "$tag"
+          package_name="$(node -p "require('./package.json').name")"
+          version="${{ steps.package.outputs.version }}"
+          npm_tag="${{ steps.package.outputs.npm_tag }}"
+          prerelease="${{ steps.package.outputs.prerelease }}"
+          source_sha="${{ steps.package.outputs.source_sha }}"
+          tag="v$version"
+
+          dist_tags="$(npm view "$package_name" dist-tags --json)"
+          channel_version="$(node -e 'const tags=JSON.parse(process.argv[1]); process.stdout.write(tags[process.argv[2]] || "")' "$dist_tags" "$npm_tag")"
+          stable_version="$(node -e 'const tags=JSON.parse(process.argv[1]); process.stdout.write(tags.latest || "")' "$dist_tags")"
+
+          npm_exists=false
+          if npm_state="$(npm view "$package_name@$version" version gitHead --json 2>/dev/null)"; then
+            published_version="$(node -e 'const data=JSON.parse(process.argv[1]); process.stdout.write(data.version || "")' "$npm_state")"
+            published_sha="$(node -e 'const data=JSON.parse(process.argv[1]); process.stdout.write(data.gitHead || "")' "$npm_state")"
+            if [ "$published_version" != "$version" ] || [ "$published_sha" != "$source_sha" ]; then
+              echo "Existing npm version identity does not match $version at $source_sha"
+              exit 1
+            fi
+            if [ "$channel_version" != "$version" ]; then
+              echo "Existing npm version is not the active $npm_tag dist-tag"
+              exit 1
+            fi
+            npm_exists=true
+          elif [ -n "$channel_version" ]; then
+            node scripts/release-channel.mjs --assert-newer "$version" "$channel_version"
+          fi
+
+          tag_exists=false
+          if git rev-parse "refs/tags/$tag" >/dev/null 2>&1; then
+            tag_sha="$(git rev-list -n 1 "refs/tags/$tag")"
+            if [ "$tag_sha" != "$source_sha" ]; then
+              echo "Existing tag $tag points to $tag_sha, expected $source_sha"
+              exit 1
+            fi
+            tag_exists=true
+          fi
+
+          release_exists=false
+          if release_state="$(gh release view "$tag" --repo "$GITHUB_REPOSITORY" --json tagName,isPrerelease,isDraft 2>/dev/null)"; then
+            node -e '
+              const release = JSON.parse(process.argv[1]);
+              const expectedTag = process.argv[2];
+              const expectedPrerelease = process.argv[3] === "true";
+              if (
+                release.tagName !== expectedTag ||
+                release.isDraft ||
+                release.isPrerelease !== expectedPrerelease
+              ) process.exit(1);
+            ' "$release_state" "$tag" "$prerelease"
+            release_exists=true
+          fi
+
+          if [ "$release_exists" = true ] && { [ "$npm_exists" != true ] || [ "$tag_exists" != true ]; }; then
+            echo "GitHub Release exists without matching npm and tag identities"
+            exit 1
+          fi
+
+          {
+            printf 'npm_exists=%s\n' "$npm_exists"
+            printf 'tag_exists=%s\n' "$tag_exists"
+            printf 'release_exists=%s\n' "$release_exists"
+            printf 'previous_channel_version=%s\n' "$channel_version"
+            printf 'stable_version=%s\n' "$stable_version"
+          } >> "$GITHUB_OUTPUT"
 
       - name: Extract release notes from CHANGELOG
         run: |
@@ -87,16 +145,42 @@ jobs:
       - name: Append release verification
         run: |
           version="${{ steps.package.outputs.version }}"
-          source_sha="$(git rev-parse HEAD)"
+          source_sha="${{ steps.package.outputs.source_sha }}"
+          if [ "${{ steps.package.outputs.prerelease }}" = true ]; then
+            rollback_version="${{ steps.preflight.outputs.stable_version }}"
+          else
+            rollback_version="${{ steps.preflight.outputs.previous_channel_version }}"
+          fi
+          if [ -z "$rollback_version" ]; then
+            echo "Cannot determine an exact rollback version"
+            exit 1
+          fi
+
           {
             printf '\n## Release Verification\n\n'
             printf -- '- Source: [%s](https://github.com/%s/commit/%s)\n' "$source_sha" "$GITHUB_REPOSITORY" "$source_sha"
             printf -- '- Package: [@martian-engineering/lossless-claw@%s](https://www.npmjs.com/package/@martian-engineering/lossless-claw/v/%s)\n' "$version" "$version"
             printf -- '- Workflow: [%s](https://github.com/%s/actions/runs/%s)\n' "$GITHUB_RUN_ID" "$GITHUB_REPOSITORY" "$GITHUB_RUN_ID"
-            printf -- '- Rollback: install @martian-engineering/lossless-claw@latest.\n'
+            printf -- '- Rollback: install @martian-engineering/lossless-claw@%s.\n' "$rollback_version"
           } >> release-notes.md
 
+      - name: Publish to npm
+        if: steps.preflight.outputs.npm_exists != 'true'
+        run: npm publish --tag "${{ steps.package.outputs.npm_tag }}"
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+
+      - name: Create and push release tag
+        if: steps.preflight.outputs.tag_exists != 'true'
+        run: |
+          tag="v${{ steps.package.outputs.version }}"
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git tag -a "$tag" -m "$tag"
+          git push origin "$tag"
+
       - name: Create GitHub release
+        if: steps.preflight.outputs.release_exists != 'true'
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
@@ -109,4 +193,4 @@ jobs:
           if [ "${{ steps.package.outputs.prerelease }}" = "true" ]; then
             release_args+=(--prerelease)
           fi
-          gh release create "$tag" "${release_args[@]}"
+          gh release create "$tag" --repo "$GITHUB_REPOSITORY" "${release_args[@]}"

@@ -6,8 +6,12 @@ const script = fileURLToPath(
   new URL("../scripts/release-channel.mjs", import.meta.url),
 );
 
+function run(...args: string[]) {
+  return spawnSync(process.execPath, [script, ...args], { encoding: "utf8" });
+}
+
 function classify(version: string) {
-  return spawnSync(process.execPath, [script, version], { encoding: "utf8" });
+  return run(version);
 }
 
 describe("release-channel CLI", () => {
@@ -34,4 +38,32 @@ describe("release-channel CLI", () => {
       expect(result.stderr).toContain(`Unsupported release version: ${version}`);
     },
   );
+});
+
+describe("release ordering CLI", () => {
+  it.each([
+    ["0.14.0", "0.13.2"],
+    ["0.14.0-beta.1", "0.14.0-beta.0"],
+    ["1.0.0-beta.0", "0.99.9-beta.99"],
+  ])("accepts newer candidate %s over %s", (candidate, current) => {
+    const result = run("--assert-newer", candidate, current);
+
+    expect(result.status).toBe(0);
+    expect(result.stdout).toBe("");
+  });
+
+  it.each([
+    ["0.13.2", "0.13.2"],
+    ["0.13.1", "0.13.2"],
+    ["0.14.0-beta.0", "0.14.0-beta.0"],
+    ["0.14.0-beta.0", "0.14.0-beta.1"],
+    ["0.14.0-beta.0", "0.13.2"],
+  ])("rejects non-newer candidate %s over %s", (candidate, current) => {
+    const result = run("--assert-newer", candidate, current);
+
+    expect(result.status).not.toBe(0);
+    expect(result.stderr).toContain(
+      `Release version ${candidate} must be newer than ${current} on the same channel`,
+    );
+  });
 });
