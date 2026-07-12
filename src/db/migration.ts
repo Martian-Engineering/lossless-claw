@@ -1,7 +1,10 @@
 import type { DatabaseSync } from "node:sqlite";
 import { createHash } from "node:crypto";
 import { getLcmDbFeatures } from "./features.js";
-import { canonicalizeOpenClawInboundMetadataIdentityContent } from "../openclaw-inbound-metadata.js";
+import {
+  canonicalizeOpenClawInboundMetadataIdentityContent,
+  canonicalizeOpenClawInboundMetadataIdentityContentBeforeHistoryRecap,
+} from "../openclaw-inbound-metadata.js";
 import { buildMessageIdentityHash } from "../store/message-identity.js";
 import { parseUtcTimestampOrNull } from "../store/parse-utc-timestamp.js";
 
@@ -64,7 +67,7 @@ const VERSIONED_BACKFILL_STEPS = {
   backfillSummaryDepths: 1,
   backfillSummaryMetadata: 1,
   backfillToolCallColumns: 1,
-  repairOpenClawMetadataIdentityState: 1,
+  repairOpenClawMetadataIdentityState: 2,
 } as const;
 
 type VersionedBackfillStepName = keyof typeof VERSIONED_BACKFILL_STEPS;
@@ -524,7 +527,8 @@ function repairOpenClawMetadataIdentityState(db: DatabaseSync): void {
   const updateCheckpointStmt = db.prepare(
     `UPDATE conversation_bootstrap_state
      SET last_processed_entry_hash = ?
-     WHERE conversation_id = ? AND last_processed_entry_hash = ?`,
+     WHERE conversation_id = ?
+       AND last_processed_entry_hash IN (?, ?)`,
   );
   let lastProcessedMessageId = 0;
 
@@ -547,7 +551,19 @@ function repairOpenClawMetadataIdentityState(db: DatabaseSync): void {
       }
 
       const legacyMessageHash = buildLegacyRawMessageIdentityHash(row.role, row.content);
-      if (row.identity_hash === legacyMessageHash) {
+      const previousCanonicalContent =
+        canonicalizeOpenClawInboundMetadataIdentityContentBeforeHistoryRecap(
+          row.role,
+          row.content,
+        );
+      const previousCanonicalMessageHash = buildLegacyRawMessageIdentityHash(
+        row.role,
+        previousCanonicalContent,
+      );
+      if (
+        row.identity_hash === legacyMessageHash ||
+        row.identity_hash === previousCanonicalMessageHash
+      ) {
         updateIdentityStmt.run(buildMessageIdentityHash(row.role, row.content), row.message_id);
       }
 
@@ -555,6 +571,7 @@ function repairOpenClawMetadataIdentityState(db: DatabaseSync): void {
         buildCanonicalBootstrapEntryHash(row.role, row.content),
         row.conversation_id,
         buildBootstrapEntryHash(row.role, row.content),
+        buildBootstrapEntryHash(row.role, previousCanonicalContent),
       );
     }
 

@@ -45,6 +45,7 @@ function openClawInboundMetadataContent(params: {
   messageId: string;
   senderName: string;
   text: string;
+  historyCount?: number;
 }): string {
   return [
     "Conversation info (untrusted metadata):",
@@ -53,6 +54,7 @@ function openClawInboundMetadataContent(params: {
       chat_id: "telegram:chat-1",
       message_id: params.messageId,
       timestamp: "2026-06-16T00:00:00.000Z",
+      history_count: params.historyCount,
     }),
     "```",
     "",
@@ -62,6 +64,26 @@ function openClawInboundMetadataContent(params: {
     "```",
     "",
     params.text,
+  ].join("\n");
+}
+
+function legacyCanonicalOpenClawIdentityContentWithRecap(params: {
+  senderName: string;
+  trailingContent: string;
+  historyCount: number;
+}): string {
+  return [
+    "Conversation info (untrusted metadata):",
+    "```json",
+    JSON.stringify({ chat_id: "telegram:chat-1", history_count: params.historyCount }),
+    "```",
+    "",
+    "Sender (untrusted metadata):",
+    "```json",
+    JSON.stringify({ name: params.senderName }),
+    "```",
+    "",
+    params.trailingContent,
   ].join("\n");
 }
 
@@ -361,7 +383,7 @@ describe("runLcmMigrations summary depth backfill", () => {
       { step_name: "backfillSummaryDepths", algorithm_version: 1 },
       { step_name: "backfillSummaryMetadata", algorithm_version: 1 },
       { step_name: "backfillToolCallColumns", algorithm_version: 1 },
-      { step_name: "repairOpenClawMetadataIdentityState", algorithm_version: 1 },
+      { step_name: "repairOpenClawMetadataIdentityState", algorithm_version: 2 },
     ]);
 
     const depthRows = db
@@ -807,6 +829,119 @@ describe("runLcmMigrations summary depth backfill", () => {
       128,
       legacyRawBootstrapEntryHash("user", rawMetadataContent),
     );
+
+    runLcmMigrations(db, { fts5Available: false });
+
+    const messageRow = db
+      .prepare(`SELECT identity_hash FROM messages WHERE message_id = ?`)
+      .get(1) as { identity_hash: string | null };
+    const checkpointRow = db
+      .prepare(
+        `SELECT last_processed_entry_hash AS lastProcessedEntryHash
+         FROM conversation_bootstrap_state
+         WHERE conversation_id = ?`,
+      )
+      .get(1) as { lastProcessedEntryHash: string | null };
+
+    expect(messageRow.identity_hash).toBe(buildMessageIdentityHash("user", rawMetadataContent));
+    expect(checkpointRow.lastProcessedEntryHash).toBe(
+      legacyRawBootstrapEntryHash(
+        "user",
+        canonicalizeOpenClawInboundMetadataIdentityContent("user", rawMetadataContent),
+      ),
+    );
+  });
+
+  it("repairs version-1 OpenClaw identity state after recap canonicalization changes", () => {
+    const db = createTestDb("openclaw-recap-identity-repair.db");
+    const recap = [
+      "Chat history since last reply (untrusted, for context):",
+      "#1001 Mon 2026-07-06 15:05:54 GMT+3 Sam Rivera: previous message",
+    ].join("\n");
+    const trailingContent = `${recap}\n\nplease keep this context`;
+    const rawMetadataContent = openClawInboundMetadataContent({
+      messageId: "telegram-recap",
+      senderName: "Syu",
+      text: trailingContent,
+      historyCount: 2,
+    });
+    const versionOneCanonicalContent = legacyCanonicalOpenClawIdentityContentWithRecap({
+      senderName: "Syu",
+      trailingContent,
+      historyCount: 2,
+    });
+
+    db.exec(`
+      CREATE TABLE conversations (
+        conversation_id INTEGER PRIMARY KEY AUTOINCREMENT,
+        session_id TEXT NOT NULL,
+        title TEXT,
+        created_at TEXT NOT NULL DEFAULT (datetime('now')),
+        updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+      );
+
+      CREATE TABLE messages (
+        message_id INTEGER PRIMARY KEY AUTOINCREMENT,
+        conversation_id INTEGER NOT NULL REFERENCES conversations(conversation_id) ON DELETE CASCADE,
+        seq INTEGER NOT NULL,
+        role TEXT NOT NULL CHECK (role IN ('system', 'user', 'assistant', 'tool')),
+        content TEXT NOT NULL,
+        token_count INTEGER NOT NULL,
+        identity_hash TEXT,
+        created_at TEXT NOT NULL DEFAULT (datetime('now')),
+        UNIQUE (conversation_id, seq)
+      );
+
+      CREATE TABLE conversation_bootstrap_state (
+        conversation_id INTEGER PRIMARY KEY REFERENCES conversations(conversation_id) ON DELETE CASCADE,
+        session_file_path TEXT NOT NULL,
+        last_seen_size INTEGER NOT NULL,
+        last_seen_mtime_ms INTEGER NOT NULL,
+        last_processed_offset INTEGER NOT NULL,
+        last_processed_entry_hash TEXT,
+        updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+      );
+
+      CREATE TABLE lcm_migration_state (
+        step_name TEXT NOT NULL,
+        algorithm_version INTEGER NOT NULL,
+        completed_at TEXT NOT NULL DEFAULT (datetime('now')),
+        PRIMARY KEY (step_name, algorithm_version)
+      );
+    `);
+    db.prepare(`INSERT INTO conversations (conversation_id, session_id) VALUES (?, ?)`).run(
+      1,
+      "version-one-openclaw-recap-session",
+    );
+    db.prepare(
+      `INSERT INTO messages (
+         message_id, conversation_id, seq, role, content, token_count, identity_hash
+       ) VALUES (?, ?, ?, ?, ?, ?, ?)`,
+    ).run(
+      1,
+      1,
+      1,
+      "user",
+      rawMetadataContent,
+      1,
+      legacyRawMessageIdentityHash("user", versionOneCanonicalContent),
+    );
+    db.prepare(
+      `INSERT INTO conversation_bootstrap_state (
+         conversation_id, session_file_path, last_seen_size, last_seen_mtime_ms,
+         last_processed_offset, last_processed_entry_hash
+       ) VALUES (?, ?, ?, ?, ?, ?)`,
+    ).run(
+      1,
+      "/tmp/openclaw-session.jsonl",
+      128,
+      1000,
+      128,
+      legacyRawBootstrapEntryHash("user", versionOneCanonicalContent),
+    );
+    db.prepare(
+      `INSERT INTO lcm_migration_state (step_name, algorithm_version) VALUES (?, ?)`,
+    ).run("repairOpenClawMetadataIdentityState", 1);
 
     runLcmMigrations(db, { fts5Available: false });
 
@@ -1424,7 +1559,7 @@ describe("runLcmMigrations summary depth backfill", () => {
     });
 
     expect(logMessages.filter((message) => message.includes("migration step skipped"))).toEqual([
-      "[lcm] migration step skipped: step=repairOpenClawMetadataIdentityState algorithmVersion=1 reason=already-complete",
+      "[lcm] migration step skipped: step=repairOpenClawMetadataIdentityState algorithmVersion=2 reason=already-complete",
       "[lcm] migration step skipped: step=backfillSummaryDepths algorithmVersion=1 reason=already-complete",
       "[lcm] migration step skipped: step=backfillSummaryMetadata algorithmVersion=1 reason=already-complete",
       "[lcm] migration step skipped: step=backfillToolCallColumns algorithmVersion=1 reason=already-complete",
@@ -1523,7 +1658,7 @@ describe("runLcmMigrations summary depth backfill", () => {
       { step_name: "backfillSummaryDepths", algorithm_version: 1 },
       { step_name: "backfillSummaryMetadata", algorithm_version: 1 },
       { step_name: "backfillToolCallColumns", algorithm_version: 1 },
-      { step_name: "repairOpenClawMetadataIdentityState", algorithm_version: 1 },
+      { step_name: "repairOpenClawMetadataIdentityState", algorithm_version: 2 },
     ]);
   });
 });

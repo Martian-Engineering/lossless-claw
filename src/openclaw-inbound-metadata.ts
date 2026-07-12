@@ -1,6 +1,82 @@
 const OPENCLAW_INBOUND_METADATA_BLOCK_RE =
   /^(Conversation info \(untrusted metadata\)|Sender \(untrusted metadata\)):\r?\n```json\r?\n([\s\S]*?)\r?\n```/;
 
+// Recap header text varies by fleet deployment/core version (multiple
+// grammars are simultaneously live -- not every deployment has picked up the
+// same core). One list keeps future header variants a one-line addition; each
+// is tried against every recognized body shape below.
+const OPENCLAW_INBOUND_HISTORY_RECAP_HEADERS = [
+  "Chat history since last reply (untrusted, for context):",
+  "Conversation context (untrusted, chronological, selected for current message):",
+];
+
+const OPENCLAW_INBOUND_CONTEXT_BLOCK_HEADINGS = [
+  "Thread starter (untrusted, for context)",
+  "Reply chain of current user message (untrusted, nearest first)",
+  "Reply target of current user message (untrusted, for context)",
+  "Forwarded message context (untrusted metadata)",
+  "Location (untrusted metadata)",
+];
+
+function escapeOpenClawRecapHeaderRegExpLiteral(value: string): string {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+const OPENCLAW_INBOUND_CONTEXT_BLOCK_RE = new RegExp(
+  `^(?:${OPENCLAW_INBOUND_CONTEXT_BLOCK_HEADINGS.map(
+    escapeOpenClawRecapHeaderRegExpLiteral,
+  ).join("|")}):` + String.raw`\r?\n\`\`\`json\r?\n([\s\S]*?)\r?\n\`\`\``,
+);
+
+const OPENCLAW_INBOUND_HISTORY_RECAP_HEADER_SRC = `(?:${OPENCLAW_INBOUND_HISTORY_RECAP_HEADERS.map(
+  escapeOpenClawRecapHeaderRegExpLiteral,
+).join("|")})`;
+
+// Ground truth: OpenClaw core's formatUntrustedJsonBlock (used for every
+// untrusted-metadata block, including this one) always emits heading + a
+// ```json fence + JSON.stringify(payload, null, 2) + closing fence. The recap
+// heading is fixed text; unlike the metadata blocks its payload is a JSON
+// ARRAY (the bounded chat-history window), not an object. This is the current
+// (post-2026.6.10) emission shape.
+const OPENCLAW_INBOUND_HISTORY_RECAP_BLOCK_RE = new RegExp(
+  `^${OPENCLAW_INBOUND_HISTORY_RECAP_HEADER_SRC}` +
+    String.raw`\r?\n\`\`\`json\r?\n([\s\S]*?)\r?\n\`\`\``,
+);
+
+// Ground truth (2026.6.10-era fleet, predates the JSON-array rendering above):
+// OpenClaw core's formatChatWindowMessage (openclaw-fork
+// src/auto-reply/reply/inbound-meta.ts:233), invoked from the "Chat history
+// since last reply" call site (same file, ~line 723-747, since commit
+// ba53782363 "render chat history since last reply as per-message prose"),
+// renders each history entry as ONE line: an optional "#<message_id>" token,
+// an optional "<weekday> <YYYY-MM-DD> <HH:MM:SS> <tz>" timestamp token (each
+// independently omitted when its source field is absent -- confirmed by that
+// same commit's own "renders chat history as per-message prose" test, which
+// renders `#1001 sam.rivera: ...` with no timestamp at all), then
+// "<sender>: <content>". A line carrying NEITHER token is indistinguishable
+// from ordinary prose, so it is deliberately excluded from recognition here
+// (fail-closed: at least one anchor token is required).
+const OPENCLAW_INBOUND_HISTORY_RECAP_LINE_ID_TOKEN = String.raw`#\S+`;
+const OPENCLAW_INBOUND_HISTORY_RECAP_LINE_TIMESTAMP_TOKEN =
+  String.raw`[A-Za-z]{3} \d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2} \S+`;
+const OPENCLAW_INBOUND_HISTORY_RECAP_LINE_ENTRY_SRC = String.raw`(?:${OPENCLAW_INBOUND_HISTORY_RECAP_LINE_ID_TOKEN} ${OPENCLAW_INBOUND_HISTORY_RECAP_LINE_TIMESTAMP_TOKEN} |${OPENCLAW_INBOUND_HISTORY_RECAP_LINE_ID_TOKEN} |${OPENCLAW_INBOUND_HISTORY_RECAP_LINE_TIMESTAMP_TOKEN} ).+: .+`;
+
+// Unlike the JSON form (self-delimiting via the closing fence), prose lines
+// have no hard terminator: the real emitter just stops emitting lines, and
+// buildInboundUserContextPrefix joins every block (including this one) with
+// blocks.filter(Boolean).join("\n\n"). So the only structurally valid ways
+// for a run of entry lines to end are a blank-line block separator or end of
+// content; the trailing lookahead enforces that. A run that peters out into
+// anything else (a line that is neither a valid entry nor a blank separator)
+// fails the WHOLE match, so it is never partially stripped up to that point.
+const OPENCLAW_INBOUND_HISTORY_RECAP_LINE_BLOCK_RE = new RegExp(
+  `^${OPENCLAW_INBOUND_HISTORY_RECAP_HEADER_SRC}` +
+    String.raw`\r?\n` +
+    `(?:${OPENCLAW_INBOUND_HISTORY_RECAP_LINE_ENTRY_SRC})` +
+    `(?:\r?\n(?:${OPENCLAW_INBOUND_HISTORY_RECAP_LINE_ENTRY_SRC}))*` +
+    String.raw`(?=\r?\n\r?\n|\r?\n?$)`,
+);
+
 // OpenClaw-version-coupled inbound decoration string: the header an OpenClaw
 // runtime prepends to a user turn that carries an ambient room event (channel
 // chatter the agent was not directly addressed by). Treated like the Delivery
@@ -58,7 +134,11 @@ export function extractBodyAfterOpenClawInboundMetadataBlock(content: string): s
   if (!firstMatch) {
     return null;
   }
-  if (parseOpenClawInboundMetadataRecord(firstMatch[1] ?? "", firstMatch[2] ?? "") === null) {
+  const firstRecord = parseOpenClawInboundMetadataRecord(
+    firstMatch[1] ?? "",
+    firstMatch[2] ?? "",
+  );
+  if (firstRecord === null) {
     return null;
   }
 
@@ -70,6 +150,15 @@ export function extractBodyAfterOpenClawInboundMetadataBlock(content: string): s
     parseOpenClawInboundMetadataRecord(secondMatch[1] ?? "", secondMatch[2] ?? "") !== null
   ) {
     remaining = secondCandidate.slice(secondMatch[0].length);
+  }
+
+  if (hasOpenClawInboundHistory(firstRecord)) {
+    const contextSplit = splitLeadingOpenClawInboundContextBlocks(remaining);
+    const recapCandidate = contextSplit.remaining.trimStart();
+    const recapLength = matchLeadingOpenClawInboundHistoryRecap(recapCandidate);
+    if (recapLength > 0) {
+      remaining = recapCandidate.slice(recapLength);
+    }
   }
 
   return stripMetadataSeparator(remaining);
@@ -131,6 +220,13 @@ const VOLATILE_CONVERSATION_INFO_KEYS = new Set([
   "timestamp",
 ]);
 
+const VOLATILE_CONVERSATION_INFO_KEYS_WITH_HISTORY = new Set([
+  ...VOLATILE_CONVERSATION_INFO_KEYS,
+  "history_count",
+  "history_media_count",
+  "history_truncated",
+]);
+
 const SENDER_INFO_KEYS = new Set([
   "label",
   "id",
@@ -140,12 +236,33 @@ const SENDER_INFO_KEYS = new Set([
   "e164",
 ]);
 
+const HISTORY_RECAP_ENTRY_KEYS = new Set(["sender", "timestamp_ms", "message_id", "body", "media"]);
+
 /**
  * Canonicalizes OpenClaw's injected inbound metadata preamble for user-message identity input.
  */
 export function canonicalizeOpenClawInboundMetadataIdentityContent(
   role: string,
   content: string,
+): string {
+  return canonicalizeOpenClawInboundMetadataIdentityContentWithRecapPolicy(role, content, true);
+}
+
+/**
+ * Reproduces the identity canonicalization used before host recaps became volatile.
+ * This is retained only so startup migration can recognize and repair version-1 hashes.
+ */
+export function canonicalizeOpenClawInboundMetadataIdentityContentBeforeHistoryRecap(
+  role: string,
+  content: string,
+): string {
+  return canonicalizeOpenClawInboundMetadataIdentityContentWithRecapPolicy(role, content, false);
+}
+
+function canonicalizeOpenClawInboundMetadataIdentityContentWithRecapPolicy(
+  role: string,
+  content: string,
+  stripHistoryRecap: boolean,
 ): string {
   if (role !== "user") {
     return content;
@@ -159,7 +276,12 @@ export function canonicalizeOpenClawInboundMetadataIdentityContent(
     ? parseOpenClawInboundMetadataRecord(conversationHeading, conversationMatch[2] ?? "")
     : null;
   const canonicalConversationJson = conversationRecord
-    ? canonicalizeMetadataJson(conversationRecord, VOLATILE_CONVERSATION_INFO_KEYS)
+    ? canonicalizeMetadataJson(
+        conversationRecord,
+        stripHistoryRecap && hasOpenClawInboundHistory(conversationRecord)
+          ? VOLATILE_CONVERSATION_INFO_KEYS_WITH_HISTORY
+          : VOLATILE_CONVERSATION_INFO_KEYS,
+      )
     : null;
   if (
     !conversationMatch ||
@@ -182,15 +304,43 @@ export function canonicalizeOpenClawInboundMetadataIdentityContent(
   const canonicalSenderJson = senderRecord
     ? canonicalizeMetadataJson(senderRecord, new Set())
     : null;
+  let afterMetadataBlocks: string;
   if (
     senderMatch &&
     senderHeading === "Sender (untrusted metadata)" &&
     canonicalSenderJson
   ) {
-    remaining = stripMetadataSeparator(senderCandidate.slice(senderMatch[0].length));
+    afterMetadataBlocks = senderCandidate.slice(senderMatch[0].length);
     canonicalBlocks.push(formatCanonicalMetadataBlock(senderHeading, canonicalSenderJson));
   } else {
-    remaining = stripMetadataSeparator(remaining);
+    afterMetadataBlocks = remaining;
+  }
+
+  // The recap is a snapshot of "history since last reply": it grows and
+  // shifts turn to turn even when it decorates the same logical message, so
+  // it is dropped entirely from the identity input rather than canonicalized
+  // (unlike the metadata blocks above, which keep their stable fields).
+  if (
+    stripHistoryRecap &&
+    conversationRecord !== null &&
+    hasOpenClawInboundHistory(conversationRecord)
+  ) {
+    const contextSplit = splitLeadingOpenClawInboundContextBlocks(afterMetadataBlocks);
+    const recapCandidate = contextSplit.remaining.trimStart();
+    const recapLength = matchLeadingOpenClawInboundHistoryRecap(recapCandidate);
+    if (recapLength > 0) {
+      const contextPrefix = stripMetadataSeparator(contextSplit.blocksText).trimEnd();
+      const afterRecap = stripMetadataSeparator(recapCandidate.slice(recapLength));
+      remaining = contextPrefix
+        ? afterRecap.trim().length > 0
+          ? `${contextPrefix}\n\n${afterRecap}`
+          : contextPrefix
+        : afterRecap;
+    } else {
+      remaining = stripMetadataSeparator(afterMetadataBlocks);
+    }
+  } else {
+    remaining = stripMetadataSeparator(afterMetadataBlocks);
   }
 
   return remaining.trim().length > 0
@@ -310,6 +460,87 @@ function parseOpenClawInboundMetadataRecord(
   return Object.keys(parsed).some((key) => knownKeys.has(key))
     ? (parsed as Record<string, unknown>)
     : null;
+}
+
+function hasOpenClawInboundHistory(record: Record<string, unknown>): boolean {
+  const historyCount = record.history_count;
+  return typeof historyCount === "number" && Number.isInteger(historyCount) && historyCount > 0;
+}
+
+function splitLeadingOpenClawInboundContextBlocks(content: string): {
+  blocksText: string;
+  remaining: string;
+} {
+  let remaining = content;
+  let blocksText = "";
+  while (true) {
+    const candidate = remaining.trimStart();
+    const leadingWhitespace = remaining.slice(0, remaining.length - candidate.length);
+    const match = OPENCLAW_INBOUND_CONTEXT_BLOCK_RE.exec(candidate);
+    if (!match || !isValidOpenClawInboundContextPayload(match[1] ?? "")) {
+      return { blocksText, remaining };
+    }
+    blocksText += leadingWhitespace + match[0];
+    remaining = candidate.slice(match[0].length);
+  }
+}
+
+function isValidOpenClawInboundContextPayload(json: string): boolean {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(json);
+  } catch {
+    return false;
+  }
+  return parsed !== null && (typeof parsed === "object" || Array.isArray(parsed));
+}
+
+/**
+ * True when `json` parses to a non-empty array of plain objects each carrying
+ * at least one recognized chat-history-entry key. The recap block serializes
+ * a list (unlike the metadata blocks, which serialize a single object), so it
+ * needs its own array-shaped validation to stay fail-closed on anything else
+ * (malformed JSON, an object, an empty array, or an array of non-object
+ * entries).
+ */
+function isValidOpenClawInboundHistoryRecapPayload(json: string): boolean {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(json);
+  } catch {
+    return false;
+  }
+  return (
+    Array.isArray(parsed) &&
+    parsed.length > 0 &&
+    parsed.every(
+      (entry) =>
+        entry !== null &&
+        typeof entry === "object" &&
+        !Array.isArray(entry) &&
+        Object.keys(entry).some((key) => HISTORY_RECAP_ENTRY_KEYS.has(key)),
+    )
+  );
+}
+
+/**
+ * Length of a structurally validated leading host chat-history recap block in
+ * `candidate` (already trimmed of leading whitespace by the caller), or 0 when
+ * none is present. Recognizes either the current JSON-array form or the
+ * 2026.6.10-era per-line prose form (both are live on the fleet at once, since
+ * not every deployment has picked up the JSON-rendering change yet).
+ * Fail-closed in both forms: a user quoting the header in prose without a
+ * fenced array or a valid entry line immediately following, a
+ * malformed/empty/non-array JSON payload, or a run of prose lines not
+ * properly terminated by a blank line or end of content, all strip nothing.
+ */
+function matchLeadingOpenClawInboundHistoryRecap(candidate: string): number {
+  const jsonMatch = OPENCLAW_INBOUND_HISTORY_RECAP_BLOCK_RE.exec(candidate);
+  if (jsonMatch) {
+    return isValidOpenClawInboundHistoryRecapPayload(jsonMatch[1] ?? "") ? jsonMatch[0].length : 0;
+  }
+  const lineMatch = OPENCLAW_INBOUND_HISTORY_RECAP_LINE_BLOCK_RE.exec(candidate);
+  return lineMatch ? lineMatch[0].length : 0;
 }
 
 function canonicalizeMetadataJson(

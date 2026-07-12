@@ -27,6 +27,19 @@ function channelTimestamped(body: string): string {
   return `[Sun 2026-06-21 13:19 GMT+3] ${body}`;
 }
 
+function historyRecapBlock(): string {
+  return [
+    "Chat history since last reply (untrusted, for context):",
+    "```json",
+    JSON.stringify(
+      [{ sender: "lee.chen", timestamp_ms: 1780000000000, body: "did the build finish?" }],
+      null,
+      2,
+    ),
+    "```",
+  ].join("\n");
+}
+
 describe("F1 degraded-path double-write", () => {
   it("degraded path collapses the timestamp-decorated runtime copy onto the bare persisted row", async () => {
     const engine: LcmContextEngine = createEngine();
@@ -423,6 +436,59 @@ describe("F1 degraded-path double-write", () => {
 
     const stored = await engine.getConversationStore().getMessages(conversation.conversationId);
     expect(stored).toHaveLength(3);
+    const userRows = stored.filter((m) => m.role === "user");
+    expect(userRows.length).toBe(2);
+  });
+
+  it("degraded path KEEPS a recap-bearing metadata-block same-body turn without timestamp evidence", async () => {
+    const engine: LcmContextEngine = createEngine();
+    const sessionId = "f1-degraded-recap-metadata-same-body";
+    const sessionKey = "agent:main:f1-degraded-recap-metadata-same-body";
+
+    const conversation = await engine
+      .getConversationStore()
+      .getOrCreateConversation(sessionId, { sessionKey });
+
+    const priorBody = "ok";
+    const bulk = await engine.getConversationStore().createMessagesBulk([
+      {
+        conversationId: conversation.conversationId,
+        seq: 0,
+        role: "user",
+        content: priorBody,
+        tokenCount: 2,
+        skipReplayTimestampFloodGuard: true,
+      },
+    ]);
+    await engine
+      .getSummaryStore()
+      .appendContextMessages(conversation.conversationId, bulk.map((m) => m.messageId));
+
+    const missingSessionFile = createSessionFilePath("f1-degraded-recap-metadata-same-body");
+    await engine.getSummaryStore().upsertConversationBootstrapState({
+      conversationId: conversation.conversationId,
+      sessionFilePath: missingSessionFile,
+      lastSeenSize: 24_000,
+      lastSeenMtimeMs: 1_700_000_000_000,
+      lastProcessedOffset: 24_000,
+      lastProcessedEntryHash: "checkpoint-hash",
+    });
+
+    const metadataAndRecap =
+      'Conversation info (untrusted metadata):\n```json\n{\n  "chat_id": "telegram:100000001",\n  "sender": "sam.rivera"\n}\n```\n\n' +
+      historyRecapBlock() +
+      "\n\n" +
+      priorBody;
+    await engine.afterTurn({
+      sessionId,
+      sessionKey,
+      sessionFile: missingSessionFile,
+      messages: [makeMessage({ role: "user", content: metadataAndRecap })],
+      prePromptMessageCount: 0,
+      tokenBudget: 4_096,
+    });
+
+    const stored = await engine.getConversationStore().getMessages(conversation.conversationId);
     const userRows = stored.filter((m) => m.role === "user");
     expect(userRows.length).toBe(2);
   });
