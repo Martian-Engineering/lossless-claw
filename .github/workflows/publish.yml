@@ -72,6 +72,12 @@ jobs:
           dist_tags="$(npm view "$package_name" dist-tags --json)"
           channel_version="$(node -e 'const tags=JSON.parse(process.argv[1]); process.stdout.write(tags[process.argv[2]] || "")' "$dist_tags" "$npm_tag")"
           stable_version="$(node -e 'const tags=JSON.parse(process.argv[1]); process.stdout.write(tags.latest || "")' "$dist_tags")"
+          rollback_version="$(node scripts/release-channel.mjs --read-rollback "$version" < CHANGELOG.md)"
+          published_rollback="$(npm view "$package_name@$rollback_version" version)"
+          if [ "$published_rollback" != "$rollback_version" ]; then
+            echo "Rollback version $rollback_version is not published"
+            exit 1
+          fi
 
           npm_exists=false
           if npm_state="$(npm view "$package_name@$version" version gitHead --json 2>/dev/null)"; then
@@ -86,8 +92,19 @@ jobs:
               exit 1
             fi
             npm_exists=true
-          elif [ -n "$channel_version" ]; then
-            node scripts/release-channel.mjs --assert-newer "$version" "$channel_version"
+          else
+            if [ -n "$channel_version" ]; then
+              node scripts/release-channel.mjs --assert-newer "$version" "$channel_version"
+            fi
+            if [ "$prerelease" = true ]; then
+              expected_rollback="$stable_version"
+            else
+              expected_rollback="$channel_version"
+            fi
+            if [ "$rollback_version" != "$expected_rollback" ]; then
+              echo "Rollback marker $rollback_version does not match current release state $expected_rollback"
+              exit 1
+            fi
           fi
 
           tag_exists=false
@@ -124,8 +141,7 @@ jobs:
             printf 'npm_exists=%s\n' "$npm_exists"
             printf 'tag_exists=%s\n' "$tag_exists"
             printf 'release_exists=%s\n' "$release_exists"
-            printf 'previous_channel_version=%s\n' "$channel_version"
-            printf 'stable_version=%s\n' "$stable_version"
+            printf 'rollback_version=%s\n' "$rollback_version"
           } >> "$GITHUB_OUTPUT"
 
       - name: Extract release notes from CHANGELOG
@@ -146,11 +162,7 @@ jobs:
         run: |
           version="${{ steps.package.outputs.version }}"
           source_sha="${{ steps.package.outputs.source_sha }}"
-          if [ "${{ steps.package.outputs.prerelease }}" = true ]; then
-            rollback_version="${{ steps.preflight.outputs.stable_version }}"
-          else
-            rollback_version="${{ steps.preflight.outputs.previous_channel_version }}"
-          fi
+          rollback_version="${{ steps.preflight.outputs.rollback_version }}"
           if [ -z "$rollback_version" ]; then
             echo "Cannot determine an exact rollback version"
             exit 1

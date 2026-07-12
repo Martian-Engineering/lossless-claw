@@ -10,6 +10,13 @@ function run(...args: string[]) {
   return spawnSync(process.execPath, [script, ...args], { encoding: "utf8" });
 }
 
+function runWithInput(input: string, ...args: string[]) {
+  return spawnSync(process.execPath, [script, ...args], {
+    encoding: "utf8",
+    input,
+  });
+}
+
 function classify(version: string) {
   return run(version);
 }
@@ -64,6 +71,88 @@ describe("release ordering CLI", () => {
     expect(result.status).not.toBe(0);
     expect(result.stderr).toContain(
       `Release version ${candidate} must be newer than ${current} on the same channel`,
+    );
+  });
+});
+
+describe("release rollback CLI", () => {
+  it.each([
+    ["0.14.0-beta.0", "0.13.2"],
+    ["0.14.0", "0.13.2"],
+    ["0.14.1-beta.0", "0.14.0"],
+  ])("accepts rollback %s -> %s", (candidate, rollback) => {
+    const result = run("--assert-rollback", candidate, rollback);
+
+    expect(result.status).toBe(0);
+    expect(result.stdout).toBe("");
+  });
+
+  it.each([
+    ["0.14.0-beta.0", "0.14.0"],
+    ["0.14.0", "0.14.0"],
+    ["0.14.0", "0.14.0-beta.0"],
+    ["banana", "0.13.2"],
+  ])("rejects rollback %s -> %s", (candidate, rollback) => {
+    const result = run("--assert-rollback", candidate, rollback);
+
+    expect(result.status).not.toBe(0);
+    expect(result.stderr).toContain(
+      `Rollback version ${rollback} must be a stable version older than ${candidate}`,
+    );
+  });
+});
+
+describe("release rollback metadata CLI", () => {
+  const validChangelog = `# Package
+
+## 0.14.0-beta.0
+
+<!-- release-rollback-version: 0.13.2 -->
+
+Beta notes.
+
+## 0.13.2
+
+Stable notes.
+`;
+
+  it("reads the exact release section rollback", () => {
+    const result = runWithInput(
+      validChangelog,
+      "--read-rollback",
+      "0.14.0-beta.0",
+    );
+
+    expect(result.status).toBe(0);
+    expect(result.stdout).toBe("0.13.2\n");
+  });
+
+  it.each([
+    ["missing", validChangelog.replace("<!-- release-rollback-version: 0.13.2 -->\n\n", "")],
+    [
+      "duplicate",
+      validChangelog.replace(
+        "<!-- release-rollback-version: 0.13.2 -->",
+        "<!-- release-rollback-version: 0.13.2 -->\n<!-- release-rollback-version: 0.13.1 -->",
+      ),
+    ],
+    [
+      "wrong section",
+      validChangelog.replace(
+        "<!-- release-rollback-version: 0.13.2 -->\n\nBeta notes.",
+        "Beta notes.",
+      ).replace("Stable notes.", "<!-- release-rollback-version: 0.13.2 -->\n\nStable notes."),
+    ],
+  ])("rejects %s rollback metadata", (_name, changelog) => {
+    const result = runWithInput(
+      changelog,
+      "--read-rollback",
+      "0.14.0-beta.0",
+    );
+
+    expect(result.status).not.toBe(0);
+    expect(result.stderr).toContain(
+      "Expected exactly one valid rollback marker for 0.14.0-beta.0",
     );
   });
 });

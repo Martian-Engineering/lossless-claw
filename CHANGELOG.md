@@ -2,6 +2,8 @@
 
 ## 0.14.0-beta.0
 
+<!-- release-rollback-version: 0.13.2 -->
+
 This beta opens the next Lossless Claw release line for broader testing. It
 adds a packaged diagnostics CLI and combines the continuity, reconciliation,
 doctor, recall, and compaction fixes merged since `0.13.2`.
