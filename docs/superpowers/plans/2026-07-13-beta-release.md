@@ -29,7 +29,8 @@
 - Retries may skip npm, tag, or GitHub Release creation only after exact source
   identity and release-kind checks pass; identity mismatches fail closed.
 - Beta rollback notes pin the current stable version. Stable rollback notes pin
-  the exact previous `latest` version.
+  the exact previous `latest` version through a source-bound changelog marker
+  validated before first publication and reused on retries.
 - Stable promotion requires `npx changeset pre exit`, version generation,
   lockfile refresh, exact version checks, and a separately reviewed publish.
 

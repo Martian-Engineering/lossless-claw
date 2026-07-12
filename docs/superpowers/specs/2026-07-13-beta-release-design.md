@@ -34,7 +34,8 @@ the first prerelease for that line.
 4. Update `RELEASING.md` to document the beta channel and stable-channel
    protection.
 5. Enter Changesets prerelease mode for `beta` and generate
-   `0.14.0-beta.0`, including the package lock and changelog.
+   `0.14.0-beta.0`, including the package lock, changelog, and immutable
+   rollback marker for stable `0.13.2`.
 6. Open a PR, require exact-head CI and clear review state, then merge.
 7. Dispatch `Publish Package` on the merged release commit. The configured
    `npm-publish` environment remains the human approval gate.
@@ -50,6 +51,8 @@ the first prerelease for that line.
   gate and leave the workflow pending.
 - Pin checkout to the immutable dispatch SHA, serialize publish runs, and refuse
   any non-monotonic npm dist-tag move.
+- Bind rollback truth to one validated marker in the reviewed changelog section
+  so partial-publication retries cannot lose the pre-publish channel version.
 - If `main`, the PR head, checks, or review threads drift before merge or
   publication, rehydrate live state and stop until the new head is reviewed.
 - If npm publishes but a later tag or GitHub Release step fails, rerun the same
