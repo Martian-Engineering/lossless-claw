@@ -134,7 +134,11 @@ export function extractBodyAfterOpenClawInboundMetadataBlock(content: string): s
   if (!firstMatch) {
     return null;
   }
-  if (parseOpenClawInboundMetadataRecord(firstMatch[1] ?? "", firstMatch[2] ?? "") === null) {
+  const firstRecord = parseOpenClawInboundMetadataRecord(
+    firstMatch[1] ?? "",
+    firstMatch[2] ?? "",
+  );
+  if (firstRecord === null) {
     return null;
   }
 
@@ -148,11 +152,13 @@ export function extractBodyAfterOpenClawInboundMetadataBlock(content: string): s
     remaining = secondCandidate.slice(secondMatch[0].length);
   }
 
-  const contextSplit = splitLeadingOpenClawInboundContextBlocks(remaining);
-  const recapCandidate = contextSplit.remaining.trimStart();
-  const recapLength = matchLeadingOpenClawInboundHistoryRecap(recapCandidate);
-  if (recapLength > 0) {
-    remaining = recapCandidate.slice(recapLength);
+  if (hasOpenClawInboundHistory(firstRecord)) {
+    const contextSplit = splitLeadingOpenClawInboundContextBlocks(remaining);
+    const recapCandidate = contextSplit.remaining.trimStart();
+    const recapLength = matchLeadingOpenClawInboundHistoryRecap(recapCandidate);
+    if (recapLength > 0) {
+      remaining = recapCandidate.slice(recapLength);
+    }
   }
 
   return stripMetadataSeparator(remaining);
@@ -302,7 +308,11 @@ function canonicalizeOpenClawInboundMetadataIdentityContentWithRecapPolicy(
   // shifts turn to turn even when it decorates the same logical message, so
   // it is dropped entirely from the identity input rather than canonicalized
   // (unlike the metadata blocks above, which keep their stable fields).
-  if (stripHistoryRecap) {
+  if (
+    stripHistoryRecap &&
+    conversationRecord !== null &&
+    hasOpenClawInboundHistory(conversationRecord)
+  ) {
     const contextSplit = splitLeadingOpenClawInboundContextBlocks(afterMetadataBlocks);
     const recapCandidate = contextSplit.remaining.trimStart();
     const recapLength = matchLeadingOpenClawInboundHistoryRecap(recapCandidate);
@@ -438,6 +448,11 @@ function parseOpenClawInboundMetadataRecord(
   return Object.keys(parsed).some((key) => knownKeys.has(key))
     ? (parsed as Record<string, unknown>)
     : null;
+}
+
+function hasOpenClawInboundHistory(record: Record<string, unknown>): boolean {
+  const historyCount = record.history_count;
+  return typeof historyCount === "number" && Number.isInteger(historyCount) && historyCount > 0;
 }
 
 function splitLeadingOpenClawInboundContextBlocks(content: string): {

@@ -45,6 +45,7 @@ function openClawInboundMetadataContent(params: {
   messageId: string;
   senderName: string;
   text: string;
+  historyCount?: number;
 }): string {
   return [
     "Conversation info (untrusted metadata):",
@@ -53,6 +54,7 @@ function openClawInboundMetadataContent(params: {
       chat_id: "telegram:chat-1",
       message_id: params.messageId,
       timestamp: "2026-06-16T00:00:00.000Z",
+      history_count: params.historyCount,
     }),
     "```",
     "",
@@ -68,11 +70,12 @@ function openClawInboundMetadataContent(params: {
 function legacyCanonicalOpenClawIdentityContentWithRecap(params: {
   senderName: string;
   trailingContent: string;
+  historyCount: number;
 }): string {
   return [
     "Conversation info (untrusted metadata):",
     "```json",
-    JSON.stringify({ chat_id: "telegram:chat-1" }),
+    JSON.stringify({ chat_id: "telegram:chat-1", history_count: params.historyCount }),
     "```",
     "",
     "Sender (untrusted metadata):",
@@ -860,10 +863,12 @@ describe("runLcmMigrations summary depth backfill", () => {
       messageId: "telegram-recap",
       senderName: "Syu",
       text: trailingContent,
+      historyCount: 2,
     });
     const versionOneCanonicalContent = legacyCanonicalOpenClawIdentityContentWithRecap({
       senderName: "Syu",
       trailingContent,
+      historyCount: 2,
     });
 
     db.exec(`

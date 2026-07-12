@@ -23,6 +23,13 @@ function metadataWrapped(body: string): string {
   );
 }
 
+function metadataWrappedWithHistory(body: string): string {
+  return (
+    'Conversation info (untrusted metadata):\n```json\n{\n  "chat_id": "telegram:100000001",\n  "sender": "sam.rivera",\n  "history_count": 2\n}\n```\n\n' +
+    body
+  );
+}
+
 function channelTimestamped(body: string): string {
   return `[Sun 2026-06-21 13:19 GMT+3] ${body}`;
 }
@@ -41,12 +48,7 @@ function historyRecapBlock(entries: Array<{ sender: string; timestamp_ms: number
 }
 
 function metadataWrappedWithRecap(recap: string, body: string): string {
-  return (
-    'Conversation info (untrusted metadata):\n```json\n{\n  "chat_id": "telegram:100000001",\n  "sender": "sam.rivera"\n}\n```\n\n' +
-    recap +
-    "\n\n" +
-    body
-  );
+  return metadataWrappedWithHistory(recap + "\n\n" + body);
 }
 
 function hostJsonBlock(heading: string, payload: unknown): string {
@@ -54,28 +56,26 @@ function hostJsonBlock(heading: string, payload: unknown): string {
 }
 
 function metadataWrappedWithContextAndRecap(recap: string, body: string): string {
-  return (
-    'Conversation info (untrusted metadata):\n```json\n{\n  "chat_id": "telegram:100000001",\n  "sender": "sam.rivera"\n}\n```\n\n' +
+  return metadataWrappedWithHistory(
     hostJsonBlock("Reply target of current user message (untrusted, for context):", {
       sender_label: "lee.chen",
       body: "did the build finish?",
     }) +
-    "\n\n" +
-    recap +
-    "\n\n" +
-    body
+      "\n\n" +
+      recap +
+      "\n\n" +
+      body,
   );
 }
 
 function metadataWrappedWithReplyContext(replyBody: string, body: string): string {
-  return (
-    'Conversation info (untrusted metadata):\n```json\n{\n  "chat_id": "telegram:100000001",\n  "sender": "sam.rivera"\n}\n```\n\n' +
+  return metadataWrappedWithHistory(
     hostJsonBlock("Reply target of current user message (untrusted, for context):", {
       sender_label: "lee.chen",
       body: replyBody,
     }) +
-    "\n\n" +
-    body
+      "\n\n" +
+      body,
   );
 }
 
@@ -160,6 +160,12 @@ describe("openClawInboundBodiesMatch with a host chat-history recap block (issue
     expect(
       openClawInboundBodiesMatch(metadataWrappedWithContextAndRecap(TWO_ENTRY_RECAP, bare), bare),
     ).toBe(true);
+  });
+
+  it("does NOT strip a valid recap-shaped user body when metadata reports no history", () => {
+    const bare = "what's the status on the deploy?";
+    const recapShapedBody = `${TWO_ENTRY_RECAP}\n\n${bare}`;
+    expect(openClawInboundBodiesMatch(metadataWrapped(recapShapedBody), bare)).toBe(false);
   });
 
   it("does NOT strip a leading host-context-shaped body when no valid recap follows", () => {
@@ -247,7 +253,7 @@ describe("openClawInboundBodiesMatch with a host chat-history recap block (issue
 describe("canonicalizeOpenClawInboundMetadataIdentityContent / buildMessageIdentityHash with a recap block", () => {
   it("produces the same identity hash for the same turn whether or not a recap is present", () => {
     const bare = "what's the status on the deploy?";
-    const noRecap = metadataWrapped(bare);
+    const noRecap = metadataWrappedWithHistory(bare);
     const withRecap = metadataWrappedWithRecap(TWO_ENTRY_RECAP, bare);
     expect(buildMessageIdentityHash("user", withRecap)).toBe(buildMessageIdentityHash("user", noRecap));
   });
@@ -318,12 +324,7 @@ function historyRecapLineBlock(
 }
 
 function metadataWrappedWithLineRecap(recap: string, body: string): string {
-  return (
-    'Conversation info (untrusted metadata):\n```json\n{\n  "chat_id": "telegram:100000001",\n  "sender": "sam.rivera"\n}\n```\n\n' +
-    recap +
-    "\n\n" +
-    body
-  );
+  return metadataWrappedWithHistory(recap + "\n\n" + body);
 }
 
 const TWO_ENTRY_LINE_RECAP = historyRecapLineBlock([
@@ -498,12 +499,7 @@ function metadataWrappedWithHeaderLineRecap(
   entryLines: string[],
   body: string,
 ): string {
-  return (
-    'Conversation info (untrusted metadata):\n```json\n{\n  "chat_id": "telegram:100000001",\n  "sender": "sam.rivera"\n}\n```\n\n' +
-    [header, ...entryLines].join("\n") +
-    "\n\n" +
-    body
-  );
+  return metadataWrappedWithHistory([header, ...entryLines].join("\n") + "\n\n" + body);
 }
 
 describe("openClawInboundBodiesMatch with the conversation-context recap header variant (issue #973)", () => {
@@ -534,7 +530,7 @@ describe("openClawInboundBodiesMatch with the conversation-context recap header 
 describe("canonicalizeOpenClawInboundMetadataIdentityContent / buildMessageIdentityHash with a line-format recap block", () => {
   it("produces the same identity hash for the same turn whether or not a line-format recap is present", () => {
     const bare = "what's the status on the deploy?";
-    const noRecap = metadataWrapped(bare);
+    const noRecap = metadataWrappedWithHistory(bare);
     const withRecap = metadataWrappedWithLineRecap(TWO_ENTRY_LINE_RECAP, bare);
     expect(buildMessageIdentityHash("user", withRecap)).toBe(buildMessageIdentityHash("user", noRecap));
   });
