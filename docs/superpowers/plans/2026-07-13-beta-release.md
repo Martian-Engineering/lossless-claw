@@ -25,7 +25,7 @@
 
 **Files:**
 - Create: `scripts/release-channel.mjs`
-- Create: `test/release-channel.test.mjs`
+- Create: `test/release-channel.test.ts`
 - Modify: `.github/workflows/publish.yml`
 
 **Interfaces:**
@@ -71,7 +71,7 @@ describe("release-channel CLI", () => {
 
 - [ ] **Step 2: Run the focused test and confirm it fails because the helper is absent**
 
-Run: `npx vitest run test/release-channel.test.mjs`
+Run: `npx vitest run test/release-channel.test.ts`
 
 Expected: FAIL resolving `../scripts/release-channel.mjs`.
 
@@ -139,7 +139,7 @@ gh release create "$tag" "${release_args[@]}"
 Run:
 
 ```bash
-npx vitest run test/release-channel.test.mjs
+npx vitest run test/release-channel.test.ts
 node scripts/release-channel.mjs 0.14.0-beta.0
 node scripts/release-channel.mjs 0.13.2
 ! node scripts/release-channel.mjs 0.14.0-rc.0
@@ -150,7 +150,7 @@ Expected: test PASS; beta emits `npm_tag=beta` and `prerelease=true`; stable emi
 - [ ] **Step 6: Commit the beta-safe publish behavior**
 
 ```bash
-git add scripts/release-channel.mjs test/release-channel.test.mjs .github/workflows/publish.yml
+git add scripts/release-channel.mjs test/release-channel.test.ts .github/workflows/publish.yml
 git commit -m "ci: make package publishing beta-safe"
 ```
 
