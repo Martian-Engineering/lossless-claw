@@ -1,0 +1,33 @@
+{
+  "mode": "pre",
+  "tag": "beta",
+  "initialVersions": {
+    "@martian-engineering/lossless-claw": "0.13.2"
+  },
+  "changesets": [
+    "agent-oriented-cli",
+    "blue-signs-swim",
+    "bounded-delegated-expansion",
+    "cron-sessionid-recovery",
+    "demote-fork-suffix-append-log",
+    "doctor-skip-deliberate-reset",
+    "doctor-version-split",
+    "fix-stale-recall-scope",
+    "ignored-session-runtime-compact",
+    "prefer-real-tool-results",
+    "preserve-conversation-on-new-soft-reset",
+    "quiet-ambiguous-rollover-rebind-logs",
+    "quiet-control-plane",
+    "qwen-fresh-tail-overrides",
+    "read-mcp-result-envelopes",
+    "read-truncation-recovery",
+    "reasoning-block-text-fallback",
+    "recognize-memory-first-current-turns",
+    "replay-twin-entry-id-guard",
+    "same-turn-collapse-frontier",
+    "scoped-doctor-repair-backup",
+    "strip-host-recap-inbound-reduction",
+    "tidy-dreams-rest",
+    "wet-bags-create"
+  ]
+}
