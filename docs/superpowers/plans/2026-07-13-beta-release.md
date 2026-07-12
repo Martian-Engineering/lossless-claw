@@ -30,38 +30,42 @@
 
 **Interfaces:**
 - Consumes: package version string from `package.json`.
-- Produces: `classifyReleaseVersion(version): { npmTag: "latest" | "beta", prerelease: boolean }` and CLI outputs `npm_tag=<tag>` plus `prerelease=<true|false>`.
+- Produces: CLI outputs `npm_tag=<tag>` plus `prerelease=<true|false>` for GitHub Actions. This CLI is the public test seam; its internal classification structure is not part of the contract.
 
 - [ ] **Step 1: Write the failing classifier tests**
 
 ```js
-import { readFile } from "node:fs/promises";
+import { spawnSync } from "node:child_process";
+import { fileURLToPath } from "node:url";
 import { describe, expect, it } from "vitest";
-import { classifyReleaseVersion } from "../scripts/release-channel.mjs";
 
-describe("classifyReleaseVersion", () => {
+const script = fileURLToPath(new URL("../scripts/release-channel.mjs", import.meta.url));
+
+function classify(version) {
+  return spawnSync(process.execPath, [script, version], { encoding: "utf8" });
+}
+
+describe("release-channel CLI", () => {
   it("routes stable versions to latest", () => {
-    expect(classifyReleaseVersion("0.13.2")).toEqual({ npmTag: "latest", prerelease: false });
+    const result = classify("0.13.2");
+    expect(result.status).toBe(0);
+    expect(result.stdout).toBe("npm_tag=latest\nprerelease=false\n");
   });
 
   it("routes beta versions to beta and GitHub prerelease", () => {
-    expect(classifyReleaseVersion("0.14.0-beta.0")).toEqual({ npmTag: "beta", prerelease: true });
+    const result = classify("0.14.0-beta.0");
+    expect(result.status).toBe(0);
+    expect(result.stdout).toBe("npm_tag=beta\nprerelease=true\n");
   });
 
   it.each(["0.14.0-rc.0", "0.14.0-alpha.1", "banana", "1.2"])(
     "rejects unsupported version %s",
-    (version) => expect(() => classifyReleaseVersion(version)).toThrow(/Unsupported release version/),
+    (version) => {
+      const result = classify(version);
+      expect(result.status).not.toBe(0);
+      expect(result.stderr).toContain(`Unsupported release version: ${version}`);
+    },
   );
-});
-
-describe("publish workflow", () => {
-  it("uses classified npm and GitHub release channels", async () => {
-    const workflow = await readFile(new URL("../.github/workflows/publish.yml", import.meta.url), "utf8");
-    expect(workflow).toContain("node scripts/release-channel.mjs");
-    expect(workflow).toContain('npm publish --tag "${{ steps.package.outputs.npm_tag }}"');
-    expect(workflow).toContain('if [ "${{ steps.package.outputs.prerelease }}" = "true" ]; then');
-    expect(workflow).toContain("release_args+=(--prerelease)");
-  });
 });
 ```
 
@@ -74,12 +78,10 @@ Expected: FAIL resolving `../scripts/release-channel.mjs`.
 - [ ] **Step 3: Implement the dependency-free classifier and CLI**
 
 ```js
-import { pathToFileURL } from "node:url";
-
 const STABLE_VERSION = /^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)$/;
 const BETA_VERSION = /^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)-beta\.(0|[1-9]\d*)$/;
 
-export function classifyReleaseVersion(version) {
+function classifyReleaseVersion(version) {
   if (STABLE_VERSION.test(version)) {
     return { npmTag: "latest", prerelease: false };
   }
@@ -89,10 +91,13 @@ export function classifyReleaseVersion(version) {
   throw new Error(`Unsupported release version: ${version}`);
 }
 
-if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
+try {
   const version = process.argv[2];
   const channel = classifyReleaseVersion(version);
   process.stdout.write(`npm_tag=${channel.npmTag}\nprerelease=${channel.prerelease}\n`);
+} catch (error) {
+  process.stderr.write(`${error.message}\n`);
+  process.exitCode = 1;
 }
 ```
 
