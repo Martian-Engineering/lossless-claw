@@ -48,10 +48,13 @@ the first prerelease for that line.
 - Do not repair npm dist-tags manually as part of the normal path.
 - If the protected environment is awaiting approval, report that as the active
   gate and leave the workflow pending.
+- Pin checkout to the immutable dispatch SHA, serialize publish runs, and refuse
+  any non-monotonic npm dist-tag move.
 - If `main`, the PR head, checks, or review threads drift before merge or
   publication, rehydrate live state and stop until the new head is reviewed.
-- If npm publishes but a later tag or GitHub Release step fails, stop and
-  reconcile from the workflow logs without republishing the same version.
+- If npm publishes but a later tag or GitHub Release step fails, rerun the same
+  workflow commit. Resume only when the existing npm version and tag identities
+  match the approved source SHA; otherwise fail closed.
 
 ## Validation
 

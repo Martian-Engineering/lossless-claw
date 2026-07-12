@@ -19,6 +19,20 @@
 - The `npm-publish` protected environment remains the publication approval gate.
 - Do not change OpenClaw compatibility declarations in this release lane.
 
+## Adversarial Hardening Amendment
+
+- Checkout must use immutable `${{ github.sha }}` and verify it equals `HEAD`
+  after the protected-environment approval wait.
+- npm publication is serialized with `concurrency.group: npm-publish`.
+- Before an unpublished version can move `beta` or `latest`, its SemVer must be
+  strictly newer than the current version on that same channel.
+- Retries may skip npm, tag, or GitHub Release creation only after exact source
+  identity and release-kind checks pass; identity mismatches fail closed.
+- Beta rollback notes pin the current stable version. Stable rollback notes pin
+  the exact previous `latest` version.
+- Stable promotion requires `npx changeset pre exit`, version generation,
+  lockfile refresh, exact version checks, and a separately reviewed publish.
+
 ---
 
 ### Task 1: Add tested release-channel classification
@@ -364,7 +378,7 @@ Confirm package version `0.14.0-beta.0`, no existing tag or npm version, `latest
 
 - [ ] **Step 2: Dispatch the protected publish workflow**
 
-Run: `gh workflow run publish.yml --repo Martian-Engineering/lossless-claw --ref main -f ref=<MERGED_SHA>`
+Run: `gh workflow run publish.yml --repo Martian-Engineering/lossless-claw --ref main`
 
 Expected: a new workflow run enters queued or waiting state for `npm-publish` approval.
 
