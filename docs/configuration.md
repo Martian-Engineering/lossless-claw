@@ -272,7 +272,7 @@ the raw copied transcript.
 | `largeFileSummaryProvider` | `string` | `""` | `LCM_LARGE_FILE_SUMMARY_PROVIDER` | Large-file summarizer provider hint for bare model names. |
 | `expansionModel` | `string` | `""` | `LCM_EXPANSION_MODEL` | `lcm_expand_query` sub-agent model override. |
 | `expansionProvider` | `string` | `""` | `LCM_EXPANSION_PROVIDER` | `lcm_expand_query` sub-agent provider hint for bare model names. |
-| `delegationTimeoutMs` | `integer` | `120000` | `LCM_DELEGATION_TIMEOUT_MS` | Maximum time to wait for delegated expansion work. `lcm_expand_query` advertises a dynamic tool `timeoutMs` default with 30 seconds of extra RPC headroom so OpenClaw's tool watchdog does not fire before this wait completes. |
+| `delegationTimeoutMs` | `integer` | `120000` | `LCM_DELEGATION_TIMEOUT_MS` | Maximum wall-clock budget for delegated expansion work across one `lcm_expand_query` call. Cross-conversation buckets share this deadline. The dynamic tool advertises a `timeoutMs` default with 30 seconds of extra RPC headroom for cancellation, cleanup, and result delivery. |
 | `summaryTimeoutMs` | `integer` | `60000` | `LCM_SUMMARY_TIMEOUT_MS` | Maximum time to wait for one model-backed summarizer call. |
 | `summaryCallWindowMs` | `integer` | `600000` | `LCM_SUMMARY_CALL_WINDOW_MS` | Rolling window for the per-session summarization spend guard. |
 | `summaryMaxCallsPerWindow` | `integer` | `24` | `LCM_SUMMARY_MAX_CALLS_PER_WINDOW` | Maximum model-backed summarization calls per session/window before Lossless opens a non-auth spend backoff. |
