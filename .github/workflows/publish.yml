@@ -84,6 +84,18 @@ jobs:
             exit 1
           fi
 
+      - name: Append release verification
+        run: |
+          version="${{ steps.package.outputs.version }}"
+          source_sha="$(git rev-parse HEAD)"
+          {
+            printf '\n## Release Verification\n\n'
+            printf -- '- Source: [%s](https://github.com/%s/commit/%s)\n' "$source_sha" "$GITHUB_REPOSITORY" "$source_sha"
+            printf -- '- Package: [@martian-engineering/lossless-claw@%s](https://www.npmjs.com/package/@martian-engineering/lossless-claw/v/%s)\n' "$version" "$version"
+            printf -- '- Workflow: [%s](https://github.com/%s/actions/runs/%s)\n' "$GITHUB_RUN_ID" "$GITHUB_REPOSITORY" "$GITHUB_RUN_ID"
+            printf -- '- Rollback: install @martian-engineering/lossless-claw@latest.\n'
+          } >> release-notes.md
+
       - name: Create GitHub release
         env:
           GH_TOKEN: ${{ github.token }}
