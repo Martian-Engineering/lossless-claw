@@ -24,7 +24,7 @@ export function createExpansionDeadline(params: {
     totalDeadlineMs,
     workDeadlineMs: Math.min(
       params.nowMs + delegationTimeoutMs,
-      Math.max(params.nowMs + 1, totalDeadlineMs - headroomMs),
+      Math.max(params.nowMs, totalDeadlineMs - headroomMs),
     ),
   };
 }

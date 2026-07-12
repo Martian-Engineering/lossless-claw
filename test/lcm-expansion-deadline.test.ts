@@ -43,7 +43,7 @@ describe("createExpansionDeadline", () => {
     ).toEqual({
       startedAtMs: 2_000,
       totalDeadlineMs: 22_000,
-      workDeadlineMs: 2_001,
+      workDeadlineMs: 2_000,
     });
   });
 });
