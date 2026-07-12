@@ -1054,18 +1054,9 @@ describe("createLcmExpandQueryTool", () => {
     const methods = callGatewayMock.mock.calls.map(
       ([opts]) => (opts as { method?: string }).method,
     );
-    expect(methods.indexOf("sessions.abort")).toBeGreaterThan(methods.indexOf("agent.wait"));
-    expect(methods.indexOf("sessions.delete")).toBeGreaterThan(methods.indexOf("sessions.abort"));
+    expect(methods.indexOf("sessions.delete")).toBeGreaterThan(methods.indexOf("agent.wait"));
+    expect(methods).not.toContain("sessions.abort");
     expect(methods).toContain("sessions.delete");
-    expect(callGatewayMock).toHaveBeenCalledWith(
-      expect.objectContaining({
-        method: "sessions.abort",
-        params: {
-          key: delegatedSessionKey,
-          runId: "run-timeout",
-        },
-      }),
-    );
     expect(delegatedSessionKey).not.toBe("");
     expect(resolveDelegatedExpansionGrantId(delegatedSessionKey)).toBeNull();
     expect(getExpansionDelegationTelemetrySnapshotForTests()).toMatchObject({
@@ -1084,13 +1075,13 @@ describe("createLcmExpandQueryTool", () => {
     });
 
     let agentCalls = 0;
-    let releaseAbort!: () => void;
-    const abortGate = new Promise<void>((resolve) => {
-      releaseAbort = resolve;
+    let releaseCleanup!: () => void;
+    const cleanupGate = new Promise<void>((resolve) => {
+      releaseCleanup = resolve;
     });
-    let signalAbortStarted!: () => void;
-    const abortStarted = new Promise<void>((resolve) => {
-      signalAbortStarted = resolve;
+    let signalCleanupStarted!: () => void;
+    const cleanupStarted = new Promise<void>((resolve) => {
+      signalCleanupStarted = resolve;
     });
     callGatewayMock.mockImplementation(async (opts: unknown) => {
       const request = opts as { method?: string; params?: Record<string, unknown> };
@@ -1101,9 +1092,9 @@ describe("createLcmExpandQueryTool", () => {
       if (request.method === "agent.wait") {
         return agentCalls === 1 ? { status: "timeout" } : { status: "ok" };
       }
-      if (request.method === "sessions.abort") {
-        signalAbortStarted();
-        await abortGate;
+      if (request.method === "sessions.delete") {
+        signalCleanupStarted();
+        await cleanupGate;
         return { ok: true };
       }
       if (request.method === "sessions.get") {
@@ -1137,7 +1128,7 @@ describe("createLcmExpandQueryTool", () => {
       conversationId: 42,
     });
 
-    await abortStarted;
+    await cleanupStarted;
     const blocked = await tool.execute("call-timeout-blocked", {
       summaryIds: ["sum_a"],
       prompt: "Must wait for timeout cleanup",
@@ -1148,7 +1139,7 @@ describe("createLcmExpandQueryTool", () => {
       reason: "origin_session_in_flight",
     });
 
-    releaseAbort();
+    releaseCleanup();
     await firstPromise;
     const followUp = await tool.execute("call-timeout-follow-up", {
       summaryIds: ["sum_a"],

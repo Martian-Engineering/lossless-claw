@@ -144,7 +144,7 @@ When `allConversations: true` is set, `lcm_expand_query` can synthesize one answ
 - `truncated` — Whether source expansion was truncated or any selected conversation was skipped or failed
 - `conversationBreakdown` — Optional per-conversation success/failure diagnostics for bounded multi-conversation runs
 
-Successful single-conversation results keep the response shape above. When delegated recall fails, the result keeps the human-readable `error` and adds `errorCode`, empty source counters, and a `conversationBreakdown`. Failed entries identify the conversation, attempted summary IDs, failure phase, elapsed time, and error code. A timed-out child run is aborted before its temporary session is cleaned up. Completed conversation buckets still contribute evidence when another bucket times out; timed-out buckets do not contribute guessed answer text or citations.
+Successful single-conversation results keep the response shape above. When delegated recall fails, the result keeps the human-readable `error` and adds `errorCode`, empty source counters, and a `conversationBreakdown`. Failed entries identify the conversation, attempted summary IDs, failure phase, elapsed time, and error code. Timed-out child work is cancelled through the host-owned temporary-session cleanup path. Completed conversation buckets still contribute evidence when another bucket times out; timed-out buckets do not contribute guessed answer text or citations.
 
 **Examples:**
 

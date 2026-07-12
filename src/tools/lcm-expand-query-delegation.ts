@@ -319,7 +319,6 @@ async function runDelegatedQueryAttempt(
   let runId = "";
   let phase: DelegatedFailurePhase = "spawn";
   let timedOut = false;
-  let abortComplete = true;
   let sessionCleanupComplete = false;
   let outcome: DelegatedBucketOutcome;
 
@@ -479,27 +478,7 @@ async function runDelegatedQueryAttempt(
       cleanup: "partial",
     };
   } finally {
-    // Abort timed-out model work before deleting its temporary session.
-    if (timedOut && runId) {
-      const abortTimeoutMs = remainingDeadlineMs(
-        params.deadline.totalDeadlineMs,
-        performance.now(),
-      );
-      if (abortTimeoutMs <= 0) {
-        abortComplete = false;
-      } else {
-        try {
-          await params.deps.callGateway({
-            method: "sessions.abort",
-            params: { key: childSessionKey, runId },
-            timeoutMs: Math.min(GATEWAY_TIMEOUT_MS, abortTimeoutMs),
-          });
-        } catch {
-          abortComplete = false;
-        }
-      }
-    }
-
+    // The host-owned deletion path cancels active child work before removing its session.
     // Cleanup may use only the headroom left before the total tool deadline.
     const cleanupTimeoutMs = remainingDeadlineMs(
       params.deadline.totalDeadlineMs,
@@ -532,7 +511,7 @@ async function runDelegatedQueryAttempt(
   return {
     ...outcome,
     elapsedMs,
-    cleanup: abortComplete && sessionCleanupComplete ? "complete" : "partial",
+    cleanup: sessionCleanupComplete ? "complete" : "partial",
   };
 }
 

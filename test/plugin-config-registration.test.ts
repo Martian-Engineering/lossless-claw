@@ -788,6 +788,37 @@ describe("lcm plugin registration", () => {
     }));
   });
 
+  it("routes delegated session cleanup through the runtime subagent adapter", async () => {
+    const dbPath = join(tmpdir(), `lossless-claw-${Date.now()}-${Math.random().toString(16)}.db`);
+    dbPaths.add(dbPath);
+
+    const { api, getFactory } = buildApi({ enabled: true, dbPath });
+    lcmPlugin.register(api);
+
+    const engine = getFactory()!() as {
+      deps?: {
+        callGateway: (params: {
+          method: string;
+          params?: Record<string, unknown>;
+        }) => Promise<unknown>;
+      };
+    };
+    const deleteSession = api.runtime.subagent.deleteSession as ReturnType<typeof vi.fn>;
+
+    await engine.deps?.callGateway({
+      method: "sessions.delete",
+      params: {
+        key: "agent:main:subagent:delegated-expansion",
+        deleteTranscript: true,
+      },
+    });
+
+    expect(deleteSession).toHaveBeenCalledWith({
+      sessionKey: "agent:main:subagent:delegated-expansion",
+      deleteTranscript: true,
+    });
+  });
+
   it("prefers env summary overrides over plugin config model overrides", () => {
     vi.stubEnv("LCM_SUMMARY_PROVIDER", "anthropic");
     vi.stubEnv("LCM_SUMMARY_MODEL", "claude-3-5-haiku");
