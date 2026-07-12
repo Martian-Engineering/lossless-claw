@@ -595,24 +595,79 @@ export function liveContentIsRecognizedDecoratedBareBody(params: {
 }
 
 /**
+ * Recognized memory/context injected-content markers. They come from several
+ * paths with different provenance:
+ *   - active_memory_plugin, relevant-memories, relevant_memories, and
+ *     hindsight_memories are stripped by DEFAULT_STRIP_INJECTED_CONTEXT_TAGS.
+ *   - inherited-rules, derived-focus, and error-detected are context-prelude
+ *     markers with separate semantics and are not in that default strip list.
+ *   - INTERNAL_CONTEXT_BEGIN_MARKER participates in the internal-context path,
+ *     where complete blocks are validated by hasCompleteInternalContextBlock.
+ *
+ * This helper only checks substring presence, so marker presence alone is NOT
+ * turn-identity evidence. Safety comes from constraining marker-based
+ * recognition to the last assembled user row (see
+ * assembledRowIsStructuralBareCurrentTurn).
+ */
+const INJECTED_CONTEXT_MARKERS = [
+  "<relevant-memories>",
+  "<relevant_memories>",
+  "<hindsight_memories>",
+  "<inherited-rules>",
+  "<derived-focus>",
+  "<error-detected>",
+  "<active_memory_plugin>",
+  INTERNAL_CONTEXT_BEGIN_MARKER,
+] as const;
+
+function liveContentCarriesRecognizedInjectedContextMarker(liveContent: string): boolean {
+  return INJECTED_CONTEXT_MARKERS.some((marker) => liveContent.includes(marker));
+}
+
+/**
  * Recognize whether an assembled user row is a BARE copy of the live current
  * turn (its persisted face): it must be a line-aligned trailing segment of the
  * live content, strictly shorter than it, AND the live content must carry
- * recognized decoration (see liveContentIsRecognizedDecoratedBareBody). The
+ * recognized decoration evidence -- EITHER a channel timestamp (see
+ * liveContentIsRecognizedDecoratedBareBody) OR a recognized injected-context
+ * marker (memory-first turns are not always channel-timestamped). The
  * strictly-shorter guard distinguishes a bare/timestamped body row from the
  * decorated live copy itself (equal length, never collapsed); the decoration
  * gate prevents collapsing an unrelated turn that merely ends with the same
  * trailing line.
+ *
+ * Marker presence is not treated as proof of provenance. Some recognized
+ * plugin tags are ordinary user-typeable text and are stripped from stored
+ * content by DEFAULT_STRIP_INJECTED_CONTEXT_TAGS; other entries in the marker
+ * list have distinct handling outside that default strip policy. For all of
+ * them, marker-based recognition is trusted ONLY when the candidate assembled
+ * row is the LAST assembled user row -- the genuine current turn's bare
+ * persisted face is necessarily the newest user row. This denies the marker
+ * path any earlier row: a distinct live turn that merely ends with an EARLIER
+ * row's body can no longer be recognized via a typed marker. The
+ * channel-timestamp path is server-injected evidence and keeps its existing
+ * any-row matching.
  */
 function assembledRowIsStructuralBareCurrentTurn(params: {
   liveContent: string;
   assembledContent: string;
+  assembledIsLastUserRow: boolean;
 }): boolean {
   if (params.assembledContent === params.liveContent) {
     return false;
   }
   if (params.assembledContent.length >= params.liveContent.length) {
     return false;
+  }
+  if (
+    params.assembledIsLastUserRow &&
+    liveContentCarriesRecognizedInjectedContextMarker(params.liveContent) &&
+    liveContentContainsBareBody({
+      liveContent: params.liveContent,
+      bareContent: params.assembledContent,
+    })
+  ) {
+    return true;
   }
   return liveContentIsRecognizedDecoratedBareBody({
     liveContent: params.liveContent,
@@ -636,6 +691,20 @@ function resolveStructuralCurrentTurnLiveIndex(params: {
   assembledMessages: AgentMessage[];
   liveMessages: AgentMessage[];
 }): number | null {
+  // The genuine current turn's bare persisted face is necessarily the NEWEST
+  // assembled user row, so the forgeable marker path is constrained to it (see
+  // assembledRowIsStructuralBareCurrentTurn). Precompute that row's index once.
+  let lastAssembledUserIndex = -1;
+  for (
+    let assembledIndex = params.assembledMessages.length - 1;
+    assembledIndex >= 0;
+    assembledIndex--
+  ) {
+    if (toStoredMessage(params.assembledMessages[assembledIndex] as AgentMessage).role === "user") {
+      lastAssembledUserIndex = assembledIndex;
+      break;
+    }
+  }
   for (let liveIndex = params.liveMessages.length - 1; liveIndex >= 0; liveIndex--) {
     const stored = toStoredMessage(params.liveMessages[liveIndex] as AgentMessage);
     if (stored.role !== "user") {
@@ -644,8 +713,12 @@ function resolveStructuralCurrentTurnLiveIndex(params: {
     if (!stored.content.trim()) {
       return null;
     }
-    for (const assembledMessage of params.assembledMessages) {
-      const assembledStored = toStoredMessage(assembledMessage);
+    for (
+      let assembledIndex = 0;
+      assembledIndex < params.assembledMessages.length;
+      assembledIndex++
+    ) {
+      const assembledStored = toStoredMessage(params.assembledMessages[assembledIndex] as AgentMessage);
       if (assembledStored.role !== "user") {
         continue;
       }
@@ -653,6 +726,7 @@ function resolveStructuralCurrentTurnLiveIndex(params: {
         assembledRowIsStructuralBareCurrentTurn({
           liveContent: stored.content,
           assembledContent: assembledStored.content,
+          assembledIsLastUserRow: assembledIndex === lastAssembledUserIndex,
         })
       ) {
         return liveIndex;
