@@ -220,6 +220,13 @@ const VOLATILE_CONVERSATION_INFO_KEYS = new Set([
   "timestamp",
 ]);
 
+const VOLATILE_CONVERSATION_INFO_KEYS_WITH_HISTORY = new Set([
+  ...VOLATILE_CONVERSATION_INFO_KEYS,
+  "history_count",
+  "history_media_count",
+  "history_truncated",
+]);
+
 const SENDER_INFO_KEYS = new Set([
   "label",
   "id",
@@ -269,7 +276,12 @@ function canonicalizeOpenClawInboundMetadataIdentityContentWithRecapPolicy(
     ? parseOpenClawInboundMetadataRecord(conversationHeading, conversationMatch[2] ?? "")
     : null;
   const canonicalConversationJson = conversationRecord
-    ? canonicalizeMetadataJson(conversationRecord, VOLATILE_CONVERSATION_INFO_KEYS)
+    ? canonicalizeMetadataJson(
+        conversationRecord,
+        stripHistoryRecap && hasOpenClawInboundHistory(conversationRecord)
+          ? VOLATILE_CONVERSATION_INFO_KEYS_WITH_HISTORY
+          : VOLATILE_CONVERSATION_INFO_KEYS,
+      )
     : null;
   if (
     !conversationMatch ||

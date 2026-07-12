@@ -23,9 +23,24 @@ function metadataWrapped(body: string): string {
   );
 }
 
-function metadataWrappedWithHistory(body: string): string {
+function metadataWrappedWithHistory(
+  body: string,
+  history: { count: number; mediaCount?: number; truncated?: boolean } = { count: 2 },
+): string {
   return (
-    'Conversation info (untrusted metadata):\n```json\n{\n  "chat_id": "telegram:100000001",\n  "sender": "sam.rivera",\n  "history_count": 2\n}\n```\n\n' +
+    "Conversation info (untrusted metadata):\n```json\n" +
+    JSON.stringify(
+      {
+        chat_id: "telegram:100000001",
+        sender: "sam.rivera",
+        history_count: history.count,
+        ...(history.mediaCount === undefined ? {} : { history_media_count: history.mediaCount }),
+        ...(history.truncated === undefined ? {} : { history_truncated: history.truncated }),
+      },
+      null,
+      2,
+    ) +
+    "\n```\n\n" +
     body
   );
 }
@@ -262,6 +277,21 @@ describe("canonicalizeOpenClawInboundMetadataIdentityContent / buildMessageIdent
     const bare = "what's the status on the deploy?";
     const small = metadataWrappedWithRecap(TWO_ENTRY_RECAP, bare);
     const large = metadataWrappedWithRecap(FIVE_ENTRY_RECAP, bare);
+    expect(buildMessageIdentityHash("user", large)).toBe(buildMessageIdentityHash("user", small));
+  });
+
+  it("ignores volatile host recap metadata in the identity hash", () => {
+    const bare = "what's the status on the deploy?";
+    const small = metadataWrappedWithHistory(TWO_ENTRY_RECAP + "\n\n" + bare, {
+      count: 2,
+      mediaCount: 0,
+      truncated: false,
+    });
+    const large = metadataWrappedWithHistory(FIVE_ENTRY_RECAP + "\n\n" + bare, {
+      count: 5,
+      mediaCount: 3,
+      truncated: true,
+    });
     expect(buildMessageIdentityHash("user", large)).toBe(buildMessageIdentityHash("user", small));
   });
 
