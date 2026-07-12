@@ -143,6 +143,10 @@
       "label": "Skip Stateless Sessions",
       "help": "When enabled, matching stateless session keys skip LCM persistence and grant writes"
     },
+    "unsupportedHostMode": {
+      "label": "Unsupported Host Mode",
+      "help": "Controls runtimes that cannot project LCM context: error (default) blocks them; capture-only permits bootstrap, after-turn ingestion, and maintenance without LCM assembly or compaction"
+    },
     "largeFileThresholdTokens": {
       "label": "Large File Threshold Tokens",
       "help": "Token threshold that routes text attachments into large-file summarization"
@@ -482,6 +486,13 @@
       },
       "skipStatelessSessions": {
         "type": "boolean"
+      },
+      "unsupportedHostMode": {
+        "type": "string",
+        "enum": [
+          "error",
+          "capture-only"
+        ]
       },
       "largeFileThresholdTokens": {
         "type": "integer",

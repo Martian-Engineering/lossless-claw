@@ -569,6 +569,20 @@ Why it matters:
 - when enabled, matching stateless sessions skip LCM persistence entirely
 - use carefully, because it affects whether those sessions behave as readers only or are effectively bypassed for writes
 
+### `unsupportedHostMode`
+
+Controls how Lossless behaves on agent runtimes that cannot project LCM-assembled context.
+
+- `error` is the default and requires the full native context-engine lifecycle
+- `capture-only` permits hosts with bootstrap, after-turn ingestion, and maintenance
+- capture-only CLI runs persist transcripts but do not receive LCM-assembled context or LCM-owned compaction
+- CLI-backed child context remains host-managed instead of receiving an LCM-projected parent context
+- native Codex and Pi embedded runs keep the full lifecycle in mixed-runtime installations
+
+Env override:
+
+- `LCM_UNSUPPORTED_HOST_MODE`
+
 ## Recall-path and delegation controls
 
 ### `expansionModel`

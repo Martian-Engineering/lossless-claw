@@ -37,6 +37,7 @@ function baseConfig(file: string, independentLogFileEnabled = true): LcmConfig {
     ignoreSessionPatterns: [],
     statelessSessionPatterns: [],
     skipStatelessSessions: true,
+    unsupportedHostMode: "error",
     contextThreshold: 0.75,
     freshTailCount: 64,
     promptAwareEviction: false,

@@ -10,6 +10,7 @@ const BASE_CONFIG: LcmConfig = {
   ignoreSessionPatterns: [],
   statelessSessionPatterns: [],
   skipStatelessSessions: true,
+  unsupportedHostMode: "error",
   contextThreshold: 0.75,
   freshTailCount: 8,
   promptAwareEviction: false,

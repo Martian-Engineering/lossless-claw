@@ -46,6 +46,7 @@ export type DynamicLeafChunkTokensConfig = {
 };
 
 export type ProactiveThresholdCompactionMode = "deferred" | "inline";
+export type UnsupportedHostMode = "error" | "capture-only";
 export type AutoRotateSessionFileMode = "rotate" | "warn" | "off";
 
 export type AutoRotateSessionFilesConfig = {
@@ -99,6 +100,8 @@ export type LcmConfig = {
   statelessSessionPatterns: string[];
   /** When true, stateless session pattern matching is enforced. */
   skipStatelessSessions: boolean;
+  /** Behavior when an agent runtime cannot project LCM-assembled context. */
+  unsupportedHostMode: UnsupportedHostMode;
   contextThreshold: number;
   /** Optional ordered rules that override contextThreshold for matching runtime contexts. */
   contextThresholdOverrides?: ContextThresholdOverride[];
@@ -326,6 +329,14 @@ function toProactiveThresholdCompactionMode(
 ): ProactiveThresholdCompactionMode | undefined {
   const normalized = toStr(value)?.toLowerCase();
   if (normalized === "inline" || normalized === "deferred") {
+    return normalized;
+  }
+  return undefined;
+}
+
+function toUnsupportedHostMode(value: unknown): UnsupportedHostMode | undefined {
+  const normalized = toStr(value)?.toLowerCase();
+  if (normalized === "error" || normalized === "capture-only") {
     return normalized;
   }
   return undefined;
@@ -697,6 +708,10 @@ export function resolveLcmConfigWithDiagnostics(
         env.LCM_SKIP_STATELESS_SESSIONS !== undefined
           ? env.LCM_SKIP_STATELESS_SESSIONS === "true"
           : toBool(pc.skipStatelessSessions) ?? true,
+      unsupportedHostMode:
+        toUnsupportedHostMode(env.LCM_UNSUPPORTED_HOST_MODE)
+          ?? toUnsupportedHostMode(pc.unsupportedHostMode)
+          ?? "error",
       contextThreshold:
         parseFiniteNumber(env.LCM_CONTEXT_THRESHOLD)
           ?? toNumber(pc.contextThreshold) ?? 0.75,

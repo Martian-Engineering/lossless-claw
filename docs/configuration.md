@@ -8,8 +8,14 @@ a native host that provides the full context-engine lifecycle: session bootstrap
 pre-prompt assembly, after-turn ingestion, maintenance, compaction, and runtime
 LLM completion. Native Codex and Pi embedded runs provide those capabilities;
 generic CLI harnesses such as `claude-cli` and `codex-cli` do not. If you must
-use a generic CLI harness, set `plugins.slots.contextEngine` to `legacy` for
-that run instead of `lossless-claw`.
+use a generic CLI harness, either set `plugins.slots.contextEngine` to `legacy`
+or explicitly set `unsupportedHostMode` to `capture-only`. Capture-only mode
+allows hosts that provide bootstrap, after-turn ingestion, and maintenance to
+continue the agent turn and persist its transcript, but those runs do not
+receive LCM-assembled context or LCM-owned compaction. Native Codex and Pi
+embedded runs retain the full lifecycle in a mixed-runtime installation. CLI
+subagent context remains host-managed rather than receiving an LCM-projected
+parent context.
 
 The optional programmatic `status` / `doctor` / `rotate` control surface requires
 a host that separately advertises context-engine capabilities/control dispatch.
@@ -38,6 +44,7 @@ Most installations only need to override a handful of keys. If you want a comple
   "ignoreSessionPatterns": [],
   "statelessSessionPatterns": [],
   "skipStatelessSessions": true,
+  "unsupportedHostMode": "error",
   "contextThreshold": 0.75,
   "contextThresholdOverrides": [
     {
@@ -202,6 +209,7 @@ output.
 | `ignoreSessionPatterns` | `string[]` | `[]` | `LCM_IGNORE_SESSION_PATTERNS` | Session-key glob patterns that skip LCM entirely. |
 | `statelessSessionPatterns` | `string[]` | `[]` | `LCM_STATELESS_SESSION_PATTERNS` | Session-key glob patterns that may read from LCM but never write to it. |
 | `skipStatelessSessions` | `boolean` | `true` | `LCM_SKIP_STATELESS_SESSIONS` | Enforces `statelessSessionPatterns` when enabled. |
+| `unsupportedHostMode` | `"error" \| "capture-only"` | `"error"` | `LCM_UNSUPPORTED_HOST_MODE` | `error` requires the full native lifecycle. `capture-only` permits hosts with bootstrap, after-turn ingestion, and maintenance while disabling LCM assembly and LCM-owned compaction for those runs; CLI child context remains host-managed. |
 | `newSessionRetainDepth` | `integer` | `2` | `LCM_NEW_SESSION_RETAIN_DEPTH` | Controls what survives `/new`. `-1` keeps all context, `0` keeps summaries only, higher values keep only deeper summaries. |
 | `timezone` | `string` | `TZ` or system timezone | `TZ` | IANA timezone used for timestamp rendering in summaries. |
 | `pruneHeartbeatOk` | `boolean` | `false` | `LCM_PRUNE_HEARTBEAT_OK` | Retroactively removes `HEARTBEAT_OK` turn cycles from persisted storage. |

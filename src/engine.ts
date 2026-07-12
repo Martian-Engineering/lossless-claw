@@ -101,6 +101,11 @@ const LOSSLESS_AGENT_RUN_REQUIRED_HOST_CAPABILITIES: ContextEngineHostCapability
   "compact",
   "runtime-llm-complete",
 ];
+const LOSSLESS_CAPTURE_ONLY_AGENT_RUN_REQUIRED_HOST_CAPABILITIES: ContextEngineHostCapability[] = [
+  "bootstrap",
+  "after-turn",
+  "maintain",
+];
 const LOSSLESS_SUBAGENT_SPAWN_REQUIRED_HOST_CAPABILITIES: ContextEngineHostCapability[] = [
   "thread-bootstrap-projection",
 ];
@@ -358,6 +363,7 @@ export class LcmContextEngine implements ContextEngine {
     // Only claim ownership of compaction when the DB is operational.
     // Without a working schema, ownsCompaction would disable the runtime's
     // built-in compaction safeguard and inflate the context budget.
+    const captureOnlyHostMode = this.config.unsupportedHostMode === "capture-only";
     this.info = {
       id: "lossless-claw",
       name: "Lossless Context Management Engine",
@@ -366,21 +372,45 @@ export class LcmContextEngine implements ContextEngine {
       turnMaintenanceMode: "background",
       hostRequirements: {
         "agent-run": {
-          requiredCapabilities: LOSSLESS_AGENT_RUN_REQUIRED_HOST_CAPABILITIES,
-          unsupportedMessage: [
-            "lossless-claw requires a native OpenClaw runtime with the full context-engine agent-run lifecycle.",
-            "Use the native Codex or Pi embedded runtime, or switch plugins.slots.contextEngine to legacy for CLI harness runs.",
-          ].join(" "),
+          requiredCapabilities: captureOnlyHostMode
+            ? LOSSLESS_CAPTURE_ONLY_AGENT_RUN_REQUIRED_HOST_CAPABILITIES
+            : LOSSLESS_AGENT_RUN_REQUIRED_HOST_CAPABILITIES,
+          unsupportedMessage: captureOnlyHostMode
+            ? [
+                "lossless-claw capture-only mode requires bootstrap, after-turn ingestion, and maintenance support.",
+                "Use a compatible OpenClaw CLI runner or switch plugins.slots.contextEngine to legacy.",
+              ].join(" ")
+            : [
+                "lossless-claw requires a native OpenClaw runtime with the full context-engine agent-run lifecycle.",
+                "Use the native Codex or Pi embedded runtime, enable unsupportedHostMode=capture-only, or switch plugins.slots.contextEngine to legacy for CLI harness runs.",
+              ].join(" "),
         },
         "subagent-spawn": {
-          requiredCapabilities: LOSSLESS_SUBAGENT_SPAWN_REQUIRED_HOST_CAPABILITIES,
-          unsupportedMessage: [
-            "lossless-claw-managed forked children require host thread bootstrap projection.",
-            "Without it, the host may replay a raw parent JSONL branch into the child instead of the LCM-assembled compact view.",
-          ].join(" "),
+          requiredCapabilities: captureOnlyHostMode
+            ? []
+            : LOSSLESS_SUBAGENT_SPAWN_REQUIRED_HOST_CAPABILITIES,
+          unsupportedMessage: captureOnlyHostMode
+            ? "lossless-claw capture-only mode leaves child context projection to the host."
+            : [
+                "lossless-claw-managed forked children require host thread bootstrap projection.",
+                "Without it, the host may replay a raw parent JSONL branch into the child instead of the LCM-assembled compact view.",
+              ].join(" "),
         },
       },
     } as ContextEngineInfo;
+
+    if (captureOnlyHostMode) {
+      logStartupBannerOnce({
+        key: "unsupported-host-capture-only",
+        log: (message) => (this.deps.log.hostWarn ?? this.deps.log.warn)(message),
+        message: [
+          "[lcm] WARNING: unsupportedHostMode=capture-only permits agent runtimes that cannot project LCM-assembled context.",
+          "Compatible CLI runs can be bootstrapped, ingested, and maintained, but LCM context assembly and LCM-owned compaction are unavailable on those runs.",
+          "CLI-backed child context remains host-managed.",
+          "Native Codex and Pi embedded runs retain the full lifecycle.",
+        ].join(" "),
+      });
+    }
 
     this.conversationStore = new ConversationStore(this.db, {
       fts5Available: this.fts5Available,

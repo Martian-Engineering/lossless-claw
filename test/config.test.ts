@@ -30,6 +30,7 @@ describe("resolveLcmConfig", () => {
     expect(config.ignoreSessionPatterns).toEqual([]);
     expect(config.statelessSessionPatterns).toEqual([]);
     expect(config.skipStatelessSessions).toBe(true);
+    expect(config.unsupportedHostMode).toBe("error");
     expect(config.contextThreshold).toBe(0.75);
     expect(config.contextThresholdOverrides).toEqual([]);
     expect(config.freshTailCount).toBe(64);
@@ -110,6 +111,7 @@ describe("resolveLcmConfig", () => {
       ignoreSessionPatterns: ["agent:*:cron:*", "agent:main:subagent:**"],
       statelessSessionPatterns: ["agent:*:ephemeral:**"],
       skipStatelessSessions: false,
+      unsupportedHostMode: "capture-only",
       leafMinFanout: 4,
       condensedMinFanout: 2,
       pruneHeartbeatOk: true,
@@ -143,6 +145,7 @@ describe("resolveLcmConfig", () => {
     ]);
     expect(config.statelessSessionPatterns).toEqual(["agent:*:ephemeral:**"]);
     expect(config.skipStatelessSessions).toBe(false);
+    expect(config.unsupportedHostMode).toBe("capture-only");
     expect(config.contextThreshold).toBe(0.5);
     expect(config.contextThresholdOverrides).toEqual([
       {
@@ -209,6 +212,7 @@ describe("resolveLcmConfig", () => {
       LCM_IGNORE_SESSION_PATTERNS: "agent:*:cron:*, agent:main:subagent:**",
       LCM_STATELESS_SESSION_PATTERNS: "agent:*:ephemeral:**, agent:main:preview:*",
       LCM_SKIP_STATELESS_SESSIONS: "false",
+      LCM_UNSUPPORTED_HOST_MODE: "capture-only",
       LCM_TRANSCRIPT_GC_ENABLED: "true",
       LCM_AUTO_ROTATE_SESSION_FILES_ENABLED: "false",
       LCM_AUTO_ROTATE_SESSION_FILES_CREATE_BACKUPS: "true",
@@ -251,6 +255,7 @@ describe("resolveLcmConfig", () => {
       ignoreSessionPatterns: ["agent:*:test:*"],
       statelessSessionPatterns: ["agent:*:preview:*"],
       skipStatelessSessions: true,
+      unsupportedHostMode: "error",
       transcriptGcEnabled: false,
       proactiveThresholdCompactionMode: "deferred",
       autoRotateSessionFiles: {
@@ -285,6 +290,7 @@ describe("resolveLcmConfig", () => {
       "agent:main:preview:*",
     ]);
     expect(config.skipStatelessSessions).toBe(false);
+    expect(config.unsupportedHostMode).toBe("capture-only");
     expect(config.transcriptGcEnabled).toBe(true);
     expect(config.proactiveThresholdCompactionMode).toBe("inline");
     expect(config.autoRotateSessionFiles).toEqual({
@@ -845,6 +851,13 @@ describe("resolveLcmConfig", () => {
     expect(manifest.configSchema.properties.proactiveThresholdCompactionMode).toEqual({
       type: "string",
       enum: ["deferred", "inline"],
+    });
+  });
+
+  it("ships a manifest with unsupportedHostMode in schema", () => {
+    expect(manifest.configSchema.properties.unsupportedHostMode).toEqual({
+      type: "string",
+      enum: ["error", "capture-only"],
     });
   });
 
