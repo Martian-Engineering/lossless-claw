@@ -177,7 +177,7 @@
     },
     "delegationTimeoutMs": {
       "label": "Delegation Timeout (ms)",
-      "help": "Maximum time to wait for delegated lcm_expand_query sub-agent completion before timing out"
+      "help": "Wall-clock budget shared by delegated work in one lcm_expand_query call; the tool keeps 30 seconds of RPC headroom for cancellation and cleanup"
     },
     "summaryTimeoutMs": {
       "label": "Summary Timeout (ms)",

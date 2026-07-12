@@ -581,12 +581,12 @@ See high-impact settings above.
 
 ### `delegationTimeoutMs`
 
-Maximum time to wait for delegated recall completion.
+Maximum wall-clock budget for delegated recall work across one `lcm_expand_query` call. Cross-conversation buckets share this deadline, and the tool keeps 30 seconds of RPC headroom for cancellation, cleanup, and result delivery.
 
 Why it matters:
 
 - lower values fail faster under slow sub-agent paths
-- higher values tolerate deeper recall but can make calls feel stuck longer
+- higher values give the bounded recall request more time to finish
 
 ### `maxAssemblyTokenBudget`
 

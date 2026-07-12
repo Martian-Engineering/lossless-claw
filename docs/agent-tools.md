@@ -119,7 +119,7 @@ lcm_describe(id: "file_789abc012345")
 
 Answer a focused question by expanding summaries through the DAG. Spawns a bounded sub-agent that walks parent links down to source material and returns a compact answer.
 
-When `allConversations: true` is set, `lcm_expand_query` can now synthesize one answer across multiple conversations. That cross-conversation mode is bounded, not exhaustive: it ranks conversation buckets, expands only the top few, and marks the result truncated when lower-ranked buckets are skipped or fail.
+When `allConversations: true` is set, `lcm_expand_query` can synthesize one answer across multiple conversations. That cross-conversation mode is bounded, not exhaustive: it ranks conversation buckets, expands only the top few under one shared deadline, and marks the result truncated when lower-ranked buckets are skipped or fail. The selected buckets share the existing `tokenCap`, so concurrent recall does not multiply the retrieval budget.
 
 **Parameters:**
 
@@ -141,8 +141,10 @@ When `allConversations: true` is set, `lcm_expand_query` can now synthesize one 
 - `sourceConversationIds` — Conversations that were successfully expanded
 - `expandedSummaryCount` — How many summaries were expanded
 - `totalSourceTokens` — Total tokens read from the DAG
-- `truncated` — Whether the answer was truncated to fit maxTokens
+- `truncated` — Whether source expansion was truncated or any selected conversation was skipped or failed
 - `conversationBreakdown` — Optional per-conversation success/failure diagnostics for bounded multi-conversation runs
+
+Successful single-conversation results keep the response shape above. When delegated recall fails, the result keeps the human-readable `error` and adds `errorCode`, empty source counters, and a `conversationBreakdown`. Failed entries identify the conversation, attempted summary IDs, failure phase, elapsed time, and error code. Timed-out child work is cancelled through the host-owned temporary-session cleanup path. Completed conversation buckets still contribute evidence when another bucket times out; timed-out buckets do not contribute guessed answer text or citations.
 
 **Examples:**
 

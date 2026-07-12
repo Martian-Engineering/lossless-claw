@@ -1033,11 +1033,29 @@ describe("createLcmExpandQueryTool", () => {
 
     expect(result.details).toMatchObject({
       error: "lcm_expand_query timed out waiting for delegated expansion (120s).",
+      errorCode: "DELEGATED_EXPANSION_TIMEOUT",
+      truncated: true,
+      citedIds: [],
+      sourceConversationIds: [],
+      expandedSummaryCount: 0,
+      totalSourceTokens: 0,
+      conversationBreakdown: [
+        expect.objectContaining({
+          conversationId: 42,
+          summaryIds: ["sum_a"],
+          status: "failed",
+          phase: "wait",
+          errorCode: "DELEGATED_EXPANSION_TIMEOUT",
+        }),
+      ],
     });
+    expect(result.details).not.toHaveProperty("runId");
 
     const methods = callGatewayMock.mock.calls.map(
       ([opts]) => (opts as { method?: string }).method,
     );
+    expect(methods.indexOf("sessions.delete")).toBeGreaterThan(methods.indexOf("agent.wait"));
+    expect(methods).not.toContain("sessions.abort");
     expect(methods).toContain("sessions.delete");
     expect(delegatedSessionKey).not.toBe("");
     expect(resolveDelegatedExpansionGrantId(delegatedSessionKey)).toBeNull();
@@ -1046,6 +1064,91 @@ describe("createLcmExpandQueryTool", () => {
       block: 0,
       timeout: 1,
       success: 0,
+    });
+  });
+
+  it("holds the origin slot through timeout cancellation and releases it afterward", async () => {
+    const retrieval = makeRetrieval();
+    retrieval.describe.mockResolvedValue({
+      type: "summary",
+      summary: { conversationId: 42 },
+    });
+
+    let agentCalls = 0;
+    let releaseCleanup!: () => void;
+    const cleanupGate = new Promise<void>((resolve) => {
+      releaseCleanup = resolve;
+    });
+    let signalCleanupStarted!: () => void;
+    const cleanupStarted = new Promise<void>((resolve) => {
+      signalCleanupStarted = resolve;
+    });
+    callGatewayMock.mockImplementation(async (opts: unknown) => {
+      const request = opts as { method?: string; params?: Record<string, unknown> };
+      if (request.method === "agent") {
+        agentCalls += 1;
+        return { runId: agentCalls === 1 ? "run-timeout" : "run-success" };
+      }
+      if (request.method === "agent.wait") {
+        return agentCalls === 1 ? { status: "timeout" } : { status: "ok" };
+      }
+      if (request.method === "sessions.delete") {
+        signalCleanupStarted();
+        await cleanupGate;
+        return { ok: true };
+      }
+      if (request.method === "sessions.get") {
+        return {
+          messages: [
+            {
+              role: "assistant",
+              content: JSON.stringify({
+                answer: "Follow-up expansion succeeded.",
+                citedIds: ["sum_a"],
+                expandedSummaryCount: 1,
+                totalSourceTokens: 100,
+                truncated: false,
+              }),
+            },
+          ],
+        };
+      }
+      return { ok: true };
+    });
+
+    const tool = createLcmExpandQueryTool({
+      deps: makeDeps(),
+      lcm: makeEngine({ retrieval }),
+      sessionId: "agent:main:main",
+      requesterSessionKey: "agent:main:main",
+    });
+    const firstPromise = tool.execute("call-timeout-first", {
+      summaryIds: ["sum_a"],
+      prompt: "First attempt",
+      conversationId: 42,
+    });
+
+    await cleanupStarted;
+    const blocked = await tool.execute("call-timeout-blocked", {
+      summaryIds: ["sum_a"],
+      prompt: "Must wait for timeout cleanup",
+      conversationId: 42,
+    });
+    expect(blocked.details).toMatchObject({
+      errorCode: "EXPANSION_CONCURRENCY_BLOCKED",
+      reason: "origin_session_in_flight",
+    });
+
+    releaseCleanup();
+    await firstPromise;
+    const followUp = await tool.execute("call-timeout-follow-up", {
+      summaryIds: ["sum_a"],
+      prompt: "Retry after timeout cleanup",
+      conversationId: 42,
+    });
+    expect(followUp.details).toMatchObject({
+      answer: "Follow-up expansion succeeded.",
+      citedIds: ["sum_a"],
     });
   });
 
@@ -1101,12 +1204,10 @@ describe("createLcmExpandQueryTool", () => {
     expect(result.details).toMatchObject({
       error: "lcm_expand_query timed out waiting for delegated expansion (300s).",
     });
-    expect(waitCalls).toEqual([
-      {
-        paramsTimeoutMs: 300000,
-        timeoutMs: 300000,
-      },
-    ]);
+    expect(waitCalls).toHaveLength(1);
+    expect(waitCalls[0]?.paramsTimeoutMs).toBe(waitCalls[0]?.timeoutMs);
+    expect(Number(waitCalls[0]?.timeoutMs)).toBeGreaterThanOrEqual(299000);
+    expect(Number(waitCalls[0]?.timeoutMs)).toBeLessThanOrEqual(300000);
   });
 
   it("caps delegated wait below caller-provided dynamic tool timeout", async () => {
@@ -1162,12 +1263,54 @@ describe("createLcmExpandQueryTool", () => {
     expect(result.details).toMatchObject({
       error: "lcm_expand_query timed out waiting for delegated expansion (30s).",
     });
-    expect(waitCalls).toEqual([
-      {
-        paramsTimeoutMs: 30000,
-        timeoutMs: 30000,
-      },
-    ]);
+    expect(waitCalls).toHaveLength(1);
+    expect(waitCalls[0]?.paramsTimeoutMs).toBe(waitCalls[0]?.timeoutMs);
+    expect(Number(waitCalls[0]?.timeoutMs)).toBeGreaterThanOrEqual(29000);
+    expect(Number(waitCalls[0]?.timeoutMs)).toBeLessThanOrEqual(30000);
+  });
+
+  it("does not expand a caller timeout shorter than the cleanup reserve", async () => {
+    const retrieval = makeRetrieval();
+    retrieval.describe.mockResolvedValue({
+      type: "summary",
+      summary: { conversationId: 42 },
+    });
+
+    const waitCalls: number[] = [];
+    callGatewayMock.mockImplementation(async (opts: unknown) => {
+      const request = opts as {
+        method?: string;
+        params?: Record<string, unknown>;
+        timeoutMs?: number;
+      };
+      if (request.method === "agent") {
+        return { runId: "run-short-timeout" };
+      }
+      if (request.method === "agent.wait") {
+        waitCalls.push(Number(request.timeoutMs));
+        return { status: "timeout" };
+      }
+      return { ok: true };
+    });
+
+    const tool = createLcmExpandQueryTool({
+      deps: makeDeps(),
+      lcm: makeEngine({ retrieval }),
+      sessionId: "agent:main:main",
+      requesterSessionKey: "agent:main:main",
+    });
+    const result = await tool.execute("call-short-timeout", {
+      summaryIds: ["sum_a"],
+      prompt: "Summarize root cause",
+      conversationId: 42,
+      timeoutMs: 20_000,
+    });
+
+    expect(waitCalls).toEqual([]);
+    expect(callGatewayMock).not.toHaveBeenCalled();
+    expect(result.details).toMatchObject({
+      error: "lcm_expand_query timed out waiting for delegated expansion (1s).",
+    });
   });
 
   it("cleans up delegated session and grant when agent call fails", async () => {
@@ -1204,6 +1347,15 @@ describe("createLcmExpandQueryTool", () => {
 
     expect(result.details).toMatchObject({
       error: "agent spawn failed",
+      errorCode: "DELEGATED_EXPANSION_SPAWN_FAILED",
+      conversationBreakdown: [
+        expect.objectContaining({
+          conversationId: 42,
+          summaryIds: ["sum_a"],
+          phase: "spawn",
+          errorCode: "DELEGATED_EXPANSION_SPAWN_FAILED",
+        }),
+      ],
     });
 
     const methods = callGatewayMock.mock.calls.map(
@@ -1212,6 +1364,68 @@ describe("createLcmExpandQueryTool", () => {
     expect(methods).toContain("sessions.delete");
     expect(delegatedSessionKey).not.toBe("");
     expect(resolveDelegatedExpansionGrantId(delegatedSessionKey)).toBeNull();
+  });
+
+  it("classifies a missing delegated reply separately from a malformed reply", async () => {
+    const retrieval = makeRetrieval();
+    retrieval.describe.mockResolvedValue({
+      type: "summary",
+      summary: { conversationId: 42 },
+    });
+
+    let returnMalformedReply = false;
+    callGatewayMock.mockImplementation(async (opts: unknown) => {
+      const request = opts as { method?: string };
+      if (request.method === "agent") {
+        return { runId: "run-invalid-reply" };
+      }
+      if (request.method === "agent.wait") {
+        return { status: "ok" };
+      }
+      if (request.method === "sessions.get") {
+        return returnMalformedReply
+          ? { messages: [{ role: "assistant", content: "not JSON" }] }
+          : { messages: [] };
+      }
+      return { ok: true };
+    });
+
+    const tool = createLcmExpandQueryTool({
+      deps: makeDeps(),
+      lcm: makeEngine({ retrieval }),
+      sessionId: "agent:main:main",
+      requesterSessionKey: "agent:main:main",
+    });
+    const missing = await tool.execute("call-missing-reply", {
+      summaryIds: ["sum_a"],
+      prompt: "Answer this",
+      conversationId: 42,
+    });
+    expect(missing.details).toMatchObject({
+      errorCode: "DELEGATED_EXPANSION_REPLY_MISSING",
+      conversationBreakdown: [
+        expect.objectContaining({
+          phase: "read_reply",
+          errorCode: "DELEGATED_EXPANSION_REPLY_MISSING",
+        }),
+      ],
+    });
+
+    returnMalformedReply = true;
+    const malformed = await tool.execute("call-malformed-reply", {
+      summaryIds: ["sum_a"],
+      prompt: "Answer this",
+      conversationId: 42,
+    });
+    expect(malformed.details).toMatchObject({
+      errorCode: "DELEGATED_EXPANSION_REPLY_INVALID",
+      conversationBreakdown: [
+        expect.objectContaining({
+          phase: "parse_reply",
+          errorCode: "DELEGATED_EXPANSION_REPLY_INVALID",
+        }),
+      ],
+    });
   });
 
   it("greps summaries first when query is provided", async () => {
@@ -1688,18 +1902,18 @@ describe("createLcmExpandQueryTool", () => {
       totalMatches: 2,
     });
 
-    let agentCalls = 0;
     callGatewayMock.mockImplementation(async (opts: unknown) => {
-      const request = opts as { method?: string };
+      const request = opts as { method?: string; params?: Record<string, unknown> };
       if (request.method === "agent") {
-        agentCalls += 1;
-        return { runId: `run-timeout-${agentCalls}` };
+        const message = String(request.params?.message ?? "");
+        return {
+          runId: message.includes("Conversation scope: 9") ? "run-timeout" : "run-ok",
+        };
       }
       if (request.method === "agent.wait") {
-        if (agentCalls === 1) {
-          return { status: "timeout" };
-        }
-        return { status: "ok" };
+        return request.params?.runId === "run-timeout"
+          ? { status: "timeout" }
+          : { status: "ok" };
       }
       if (request.method === "sessions.get") {
         return {
@@ -1752,7 +1966,10 @@ describe("createLcmExpandQueryTool", () => {
       conversationBreakdown: expect.arrayContaining([
         expect.objectContaining({
           conversationId: 9,
+          summaryIds: ["sum_timeout"],
           status: "failed",
+          phase: "wait",
+          errorCode: "DELEGATED_EXPANSION_TIMEOUT",
           error: "lcm_expand_query timed out waiting for delegated expansion (120s).",
         }),
         expect.objectContaining({
@@ -1767,7 +1984,169 @@ describe("createLcmExpandQueryTool", () => {
     expect((result.details as { answer?: string }).answer).toContain("failed conversations");
   });
 
-  it("returns partial coverage when the global token budget is exhausted mid-run", async () => {
+  it("preserves every bucket diagnostic when all delegated buckets time out", async () => {
+    const retrieval = makeRetrieval();
+    retrieval.grep.mockResolvedValue({
+      messages: [],
+      summaries: [
+        {
+          summaryId: "sum_new",
+          conversationId: 9,
+          kind: "leaf",
+          snippet: "new",
+          createdAt: new Date("2026-01-02T00:00:00.000Z"),
+        },
+        {
+          summaryId: "sum_old",
+          conversationId: 7,
+          kind: "leaf",
+          snippet: "old",
+          createdAt: new Date("2026-01-01T00:00:00.000Z"),
+        },
+      ],
+      totalMatches: 2,
+    });
+
+    callGatewayMock.mockImplementation(async (opts: unknown) => {
+      const request = opts as { method?: string; params?: Record<string, unknown> };
+      if (request.method === "agent") {
+        const message = String(request.params?.message ?? "");
+        return { runId: message.includes("Conversation scope: 9") ? "run-9" : "run-7" };
+      }
+      if (request.method === "agent.wait") {
+        return { status: "timeout" };
+      }
+      return { ok: true };
+    });
+
+    const tool = createLcmExpandQueryTool({
+      deps: makeDeps(),
+      lcm: makeEngine({ retrieval }),
+      sessionId: "session-1",
+      requesterSessionKey: "agent:main:main",
+    });
+    const result = await tool.execute("call-all-timeout", {
+      query: "release evidence",
+      prompt: "What happened?",
+      allConversations: true,
+      tokenCap: 2000,
+    });
+
+    expect(result.details).toMatchObject({
+      error: "lcm_expand_query timed out waiting for delegated expansion (120s).",
+      errorCode: "DELEGATED_EXPANSION_TIMEOUT",
+      truncated: true,
+      citedIds: [],
+      sourceConversationIds: [],
+      expandedSummaryCount: 0,
+      totalSourceTokens: 0,
+      conversationBreakdown: [
+        expect.objectContaining({
+          conversationId: 9,
+          summaryIds: ["sum_new"],
+          status: "failed",
+          phase: "wait",
+          errorCode: "DELEGATED_EXPANSION_TIMEOUT",
+        }),
+        expect.objectContaining({
+          conversationId: 7,
+          summaryIds: ["sum_old"],
+          status: "failed",
+          phase: "wait",
+          errorCode: "DELEGATED_EXPANSION_TIMEOUT",
+        }),
+      ],
+    });
+  });
+
+  it("starts every selected bucket before waiting for delegated completion", async () => {
+    const retrieval = makeRetrieval();
+    retrieval.grep.mockResolvedValue({
+      messages: [],
+      summaries: [
+        {
+          summaryId: "sum_b",
+          conversationId: 9,
+          kind: "leaf",
+          snippet: "b",
+          createdAt: new Date("2026-01-02T00:00:00.000Z"),
+        },
+        {
+          summaryId: "sum_a",
+          conversationId: 7,
+          kind: "leaf",
+          snippet: "a",
+          createdAt: new Date("2026-01-01T00:00:00.000Z"),
+        },
+      ],
+      totalMatches: 2,
+    });
+
+    let startedBuckets = 0;
+    let signalBothStarted!: () => void;
+    const bothStarted = new Promise<void>((resolve) => {
+      signalBothStarted = resolve;
+    });
+    let releaseWaits!: () => void;
+    const waitGate = new Promise<void>((resolve) => {
+      releaseWaits = resolve;
+    });
+    callGatewayMock.mockImplementation(async (opts: unknown) => {
+      const request = opts as { method?: string; params?: Record<string, unknown> };
+      if (request.method === "agent") {
+        startedBuckets += 1;
+        if (startedBuckets === 2) {
+          signalBothStarted();
+        }
+        return { runId: `run-${startedBuckets}` };
+      }
+      if (request.method === "agent.wait") {
+        await waitGate;
+        return { status: "ok" };
+      }
+      if (request.method === "sessions.get") {
+        return {
+          messages: [
+            {
+              role: "assistant",
+              content: JSON.stringify({
+                answer: "Concurrent bucket completed.",
+                citedIds: [],
+                expandedSummaryCount: 1,
+                totalSourceTokens: 10,
+                truncated: false,
+              }),
+            },
+          ],
+        };
+      }
+      return { ok: true };
+    });
+
+    const tool = createLcmExpandQueryTool({
+      deps: makeDeps(),
+      lcm: makeEngine({ retrieval }),
+      sessionId: "session-1",
+      requesterSessionKey: "agent:main:main",
+    });
+    const resultPromise = tool.execute("call-concurrent-buckets", {
+      query: "release evidence",
+      prompt: "What happened?",
+      allConversations: true,
+      tokenCap: 2000,
+    });
+
+    await bothStarted;
+    expect(startedBuckets).toBe(2);
+    releaseWaits();
+    const result = await resultPromise;
+    expect(result.details).toMatchObject({
+      sourceConversationIds: [7, 9],
+      expandedSummaryCount: 2,
+    });
+  });
+
+  it("partitions the global token budget across concurrent buckets", async () => {
     const retrieval = makeRetrieval();
     retrieval.grep.mockResolvedValue({
       messages: [],
@@ -1790,17 +2169,23 @@ describe("createLcmExpandQueryTool", () => {
       totalMatches: 2,
     });
 
-    let sessionGetCalls = 0;
+    const agentMessages: string[] = [];
+    const sessionConversation = new Map<string, number>();
     callGatewayMock.mockImplementation(async (opts: unknown) => {
-      const request = opts as { method?: string };
+      const request = opts as { method?: string; params?: Record<string, unknown> };
       if (request.method === "agent") {
-        return { runId: "run-budget" };
+        const message = String(request.params?.message ?? "");
+        const conversationId = message.includes("Conversation scope: 9") ? 9 : 7;
+        const sessionKey = String(request.params?.sessionKey ?? "");
+        agentMessages.push(message);
+        sessionConversation.set(sessionKey, conversationId);
+        return { runId: `run-budget-${conversationId}` };
       }
       if (request.method === "agent.wait") {
         return { status: "ok" };
       }
       if (request.method === "sessions.get") {
-        sessionGetCalls += 1;
+        const conversationId = sessionConversation.get(String(request.params?.key ?? "")) ?? 0;
         return {
           messages: [
             {
@@ -1809,10 +2194,10 @@ describe("createLcmExpandQueryTool", () => {
                 {
                   type: "text",
                   text: JSON.stringify({
-                    answer: "Conversation 9 used the whole retrieval budget.",
-                    citedIds: ["sum_large"],
+                    answer: `Conversation ${conversationId} used its retrieval allocation.`,
+                    citedIds: [conversationId === 9 ? "sum_large" : "sum_small"],
                     expandedSummaryCount: 1,
-                    totalSourceTokens: 500,
+                    totalSourceTokens: 250,
                     truncated: false,
                   }),
                 },
@@ -1840,13 +2225,17 @@ describe("createLcmExpandQueryTool", () => {
       tokenCap: 500,
     });
 
-    expect(sessionGetCalls).toBe(1);
+    expect(agentMessages).toHaveLength(2);
+    expect(agentMessages).toEqual([
+      expect.stringContaining("Expansion token budget (total across this run): 250"),
+      expect.stringContaining("Expansion token budget (total across this run): 250"),
+    ]);
     expect(result.details).toMatchObject({
-      sourceConversationIds: [9],
-      citedIds: ["sum_large"],
-      expandedSummaryCount: 1,
+      sourceConversationIds: [7, 9],
+      citedIds: ["sum_large", "sum_small"],
+      expandedSummaryCount: 2,
       totalSourceTokens: 500,
-      truncated: true,
+      truncated: false,
     });
     expect(result.details).toMatchObject({
       conversationBreakdown: expect.arrayContaining([
@@ -1856,12 +2245,10 @@ describe("createLcmExpandQueryTool", () => {
         }),
         expect.objectContaining({
           conversationId: 7,
-          status: "skipped",
-          error: "global token budget exhausted",
+          status: "success",
         }),
       ]),
     });
-    expect((result.details as { answer?: string }).answer).toContain("skipped conversations");
   });
 
   it("falls back to messages for shallow trees when summary grep misses", async () => {

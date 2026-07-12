@@ -33,6 +33,8 @@ Use for:
 - focused questions that need richer detail recovered from summaries
 - evidence-oriented follow-up after `lcm_grep` or `lcm_describe`
 
+Cross-conversation expansion runs its selected conversation buckets under one shared deadline and one shared token budget. Completed buckets still return evidence when a sibling bucket times out. Failure results identify the affected conversation, summary IDs, phase, and error code; they never invent answer text for interrupted work.
+
 This is the best recall tool when the user asks for:
 
 - exact commands
