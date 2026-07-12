@@ -9,6 +9,11 @@ import type { LcmDependencies } from "../types.js";
 import { jsonResult, type AnyAgentTool } from "./common.js";
 import { resolveLcmConversationScope } from "./lcm-conversation-scope.js";
 import {
+  createExpansionDeadline,
+  remainingDeadlineMs,
+  type ExpansionDeadline,
+} from "./lcm-expansion-deadline.js";
+import {
   normalizeSummaryIds,
   resolveRequesterConversationScopeId,
 } from "./lcm-expand-tool.delegation.js";
@@ -36,23 +41,6 @@ function clampPositiveTimeoutMs(value: number): number {
 
 function resolveAdvertisedDynamicToolTimeoutMs(delegatedWaitTimeoutMs: number): number {
   return clampPositiveTimeoutMs(delegatedWaitTimeoutMs + DYNAMIC_TOOL_TIMEOUT_HEADROOM_MS);
-}
-
-function resolveDelegatedWaitTimeoutMs(params: {
-  configuredTimeoutMs: number;
-  requestedDynamicToolTimeoutMs?: number;
-}): number {
-  if (
-    params.requestedDynamicToolTimeoutMs == null
-    || !Number.isFinite(params.requestedDynamicToolTimeoutMs)
-    || params.requestedDynamicToolTimeoutMs <= DYNAMIC_TOOL_TIMEOUT_HEADROOM_MS
-  ) {
-    return params.configuredTimeoutMs;
-  }
-  return Math.min(
-    params.configuredTimeoutMs,
-    Math.max(1, Math.floor(params.requestedDynamicToolTimeoutMs - DYNAMIC_TOOL_TIMEOUT_HEADROOM_MS)),
-  );
 }
 
 function createLcmExpandQuerySchema(dynamicToolTimeoutMs: number) {
@@ -135,6 +123,35 @@ type DelegatedExpandQueryReply = {
   truncated: boolean;
 };
 
+type DelegatedFailurePhase = "spawn" | "wait" | "read_reply" | "parse_reply";
+
+type DelegatedFailureCode =
+  | "DELEGATED_EXPANSION_TIMEOUT"
+  | "DELEGATED_EXPANSION_SPAWN_FAILED"
+  | "DELEGATED_EXPANSION_WAIT_FAILED"
+  | "DELEGATED_EXPANSION_REPLY_MISSING"
+  | "DELEGATED_EXPANSION_REPLY_INVALID";
+
+type DelegatedBucketOutcome =
+  | {
+      status: "success";
+      conversationId: number;
+      summaryIds: string[];
+      elapsedMs: number;
+      reply: DelegatedExpandQueryReply;
+    }
+  | {
+      status: "failed";
+      conversationId: number;
+      summaryIds: string[];
+      elapsedMs: number;
+      phase: DelegatedFailurePhase;
+      code: DelegatedFailureCode;
+      error: string;
+      timedOut: boolean;
+      cleanup: "complete" | "partial";
+    };
+
 type ParsedExpandQueryReply =
   | {
       ok: true;
@@ -195,7 +212,7 @@ type RunDelegatedExpandQueryParams = {
   requestId: string;
   childExpansionDepth: number;
   originSessionKey: string;
-  delegatedWaitTimeoutMs: number;
+  deadline: ExpansionDeadline;
   delegatedWaitTimeoutSeconds: number;
 };
 
@@ -269,6 +286,26 @@ function shouldRetryWithoutOverride(message: string): boolean {
     "401",
     "403",
   ].some((signal) => normalized.includes(signal));
+}
+
+/** Map a delegated failure phase to its stable machine-readable code. */
+function delegatedFailureCode(
+  phase: DelegatedFailurePhase,
+  timedOut: boolean,
+): DelegatedFailureCode {
+  if (timedOut) {
+    return "DELEGATED_EXPANSION_TIMEOUT";
+  }
+  switch (phase) {
+    case "spawn":
+      return "DELEGATED_EXPANSION_SPAWN_FAILED";
+    case "wait":
+      return "DELEGATED_EXPANSION_WAIT_FAILED";
+    case "read_reply":
+      return "DELEGATED_EXPANSION_REPLY_MISSING";
+    case "parse_reply":
+      return "DELEGATED_EXPANSION_REPLY_INVALID";
+  }
 }
 
 function maxDate(left?: Date, right?: Date): Date | undefined {
@@ -811,7 +848,7 @@ async function resolveSummaryCandidates(params: {
  */
 async function runDelegatedExpandQuery(
   params: RunDelegatedExpandQueryParams,
-): Promise<DelegatedExpandQueryReply> {
+): Promise<DelegatedBucketOutcome> {
   const task = buildDelegatedExpandQueryTask({
     summaryIds: params.bucket.summaryIds,
     messageBackedSummaryIds: params.bucket.messageBackedSummaryIds,
@@ -835,18 +872,43 @@ async function runDelegatedExpandQuery(
       ? `${delegatedOverrideProvider}/${delegatedOverrideModel}`
       : delegatedOverrideModel || delegatedOverrideProvider || "configured override";
 
-  const runDelegatedQuery = async (provider?: string, model?: string) => {
+  const runDelegatedQuery = async (
+    provider?: string,
+    model?: string,
+  ): Promise<DelegatedBucketOutcome> => {
+    const attemptStartedAtMs = performance.now();
     const childSessionKey = `agent:${params.requesterAgentId}:subagent:${crypto.randomUUID()}`;
     const childIdem = crypto.randomUUID();
     let grantCreated = false;
+    let runId = "";
+    let phase: DelegatedFailurePhase = "spawn";
+    let timedOut = false;
+    let abortComplete = true;
+    let sessionCleanupComplete = false;
+    let outcome: DelegatedBucketOutcome;
 
     try {
+      const initialWorkTimeoutMs = remainingDeadlineMs(
+        params.deadline.workDeadlineMs,
+        performance.now(),
+      );
+      if (initialWorkTimeoutMs <= 0) {
+        phase = "wait";
+        timedOut = true;
+        throw new Error(
+          `lcm_expand_query timed out waiting for delegated expansion (${params.delegatedWaitTimeoutSeconds}s).`,
+        );
+      }
+
       createDelegatedExpansionGrant({
         delegatedSessionKey: childSessionKey,
         issuerSessionId: params.callerSessionKey || "main",
         allowedConversationIds: [params.bucket.conversationId],
         tokenCap: params.tokenCap,
-        ttlMs: params.delegatedWaitTimeoutMs + 30_000,
+        ttlMs: Math.max(
+          1,
+          remainingDeadlineMs(params.deadline.totalDeadlineMs, performance.now()),
+        ),
       });
       stampDelegatedExpansionContext({
         sessionKey: childSessionKey,
@@ -857,6 +919,13 @@ async function runDelegatedExpandQuery(
       });
       grantCreated = true;
 
+      const spawnTimeoutMs = Math.max(
+        1,
+        Math.min(
+          GATEWAY_TIMEOUT_MS,
+          remainingDeadlineMs(params.deadline.workDeadlineMs, performance.now()),
+        ),
+      );
       const response = (await params.deps.callGateway({
         method: "agent",
         params: {
@@ -873,27 +942,34 @@ async function runDelegatedExpandQuery(
             taskSummary: "Run lcm_expand and return prompt-focused JSON answer",
           }),
         },
-        timeoutMs: GATEWAY_TIMEOUT_MS,
+        timeoutMs: spawnTimeoutMs,
       })) as { runId?: unknown; error?: unknown };
 
-      const runId = typeof response?.runId === "string" ? response.runId.trim() : "";
+      runId = typeof response?.runId === "string" ? response.runId.trim() : "";
       if (!runId) {
         throw new Error(
-          formatExpansionFailure(response?.error ?? response)
-            || "Delegated expansion did not return a runId.",
+          response?.error == null
+            ? "Delegated expansion did not return a runId."
+            : formatExpansionFailure(response.error),
         );
       }
 
+      phase = "wait";
+      const waitTimeoutMs = Math.max(
+        1,
+        remainingDeadlineMs(params.deadline.workDeadlineMs, performance.now()),
+      );
       const wait = (await params.deps.callGateway({
         method: "agent.wait",
         params: {
           runId,
-          timeoutMs: params.delegatedWaitTimeoutMs,
+          timeoutMs: waitTimeoutMs,
         },
-        timeoutMs: params.delegatedWaitTimeoutMs,
+        timeoutMs: waitTimeoutMs,
       })) as { status?: string; error?: unknown };
       const status = typeof wait?.status === "string" ? wait.status : "error";
       if (status === "timeout") {
+        timedOut = true;
         recordExpansionDelegationTelemetry({
           deps: params.deps,
           component: "lcm_expand_query",
@@ -912,14 +988,29 @@ async function runDelegatedExpandQuery(
         throw new Error(formatExpansionFailure(wait?.error));
       }
 
+      const replyTimeoutMs = remainingDeadlineMs(
+        params.deadline.workDeadlineMs,
+        performance.now(),
+      );
+      if (replyTimeoutMs <= 0) {
+        timedOut = true;
+        throw new Error(
+          `lcm_expand_query timed out waiting for delegated expansion (${params.delegatedWaitTimeoutSeconds}s).`,
+        );
+      }
+      phase = "read_reply";
       const replyPayload = (await params.deps.callGateway({
         method: "sessions.get",
         params: { key: childSessionKey, limit: 80 },
-        timeoutMs: GATEWAY_TIMEOUT_MS,
+        timeoutMs: Math.min(GATEWAY_TIMEOUT_MS, replyTimeoutMs),
       })) as { messages?: unknown[] };
       const reply = params.deps.readLatestAssistantReply(
         Array.isArray(replyPayload.messages) ? replyPayload.messages : [],
       );
+      if (!reply?.trim()) {
+        throw new Error("Delegated expansion query returned an empty reply.");
+      }
+      phase = "parse_reply";
       const parsed = parseDelegatedExpandQueryReply(reply, params.bucket.summaryIds.length);
       if (!parsed.ok) {
         throw new Error(parsed.error);
@@ -935,22 +1026,79 @@ async function runDelegatedExpandQuery(
         runId,
       });
 
-      return parsed.value;
+      outcome = {
+        status: "success",
+        conversationId: params.bucket.conversationId,
+        summaryIds: params.bucket.summaryIds,
+        elapsedMs: 0,
+        reply: parsed.value,
+      };
+    } catch (error) {
+      outcome = {
+        status: "failed",
+        conversationId: params.bucket.conversationId,
+        summaryIds: params.bucket.summaryIds,
+        elapsedMs: 0,
+        phase,
+        code: delegatedFailureCode(phase, timedOut),
+        error: formatExpansionFailure(error),
+        timedOut,
+        cleanup: "partial",
+      };
     } finally {
-      try {
-        await params.deps.callGateway({
-          method: "sessions.delete",
-          params: { key: childSessionKey, deleteTranscript: true },
-          timeoutMs: GATEWAY_TIMEOUT_MS,
-        });
-      } catch {
-        // Cleanup is best-effort.
+      if (timedOut && runId) {
+        const abortTimeoutMs = remainingDeadlineMs(
+          params.deadline.totalDeadlineMs,
+          performance.now(),
+        );
+        if (abortTimeoutMs <= 0) {
+          abortComplete = false;
+        } else {
+          try {
+            await params.deps.callGateway({
+              method: "sessions.abort",
+              params: { key: childSessionKey, runId },
+              timeoutMs: Math.min(GATEWAY_TIMEOUT_MS, abortTimeoutMs),
+            });
+          } catch {
+            abortComplete = false;
+          }
+        }
+      }
+
+      const cleanupTimeoutMs = remainingDeadlineMs(
+        params.deadline.totalDeadlineMs,
+        performance.now(),
+      );
+      if (!grantCreated) {
+        sessionCleanupComplete = true;
+      } else if (cleanupTimeoutMs > 0) {
+        try {
+          await params.deps.callGateway({
+            method: "sessions.delete",
+            params: { key: childSessionKey, deleteTranscript: true },
+            timeoutMs: Math.min(GATEWAY_TIMEOUT_MS, cleanupTimeoutMs),
+          });
+          sessionCleanupComplete = true;
+        } catch {
+          // Cleanup is best-effort.
+        }
       }
       if (grantCreated) {
         revokeDelegatedExpansionGrantForSession(childSessionKey, { removeBinding: true });
       }
       clearDelegatedExpansionContext(childSessionKey);
     }
+
+    const elapsedMs = Math.max(0, Math.floor(performance.now() - attemptStartedAtMs));
+    if (outcome.status === "success") {
+      return { ...outcome, elapsedMs };
+    }
+    return {
+      ...outcome,
+      elapsedMs,
+      cleanup: abortComplete && sessionCleanupComplete ? "complete" : "partial",
+    };
   };
 
   if (!expansionProvider && !expansionModel) {
@@ -958,19 +1106,32 @@ async function runDelegatedExpandQuery(
   }
 
   try {
-    return await runDelegatedQuery(delegatedOverrideProvider, delegatedOverrideModel);
-  } catch (error) {
-    const failure = formatExpansionFailure(error);
-    params.deps.log.warn(
-      `[lcm] delegated expansion override failed (${configuredOverrideLabel}) for conversation ${params.bucket.conversationId}: ${failure}`,
-    );
-    if (!shouldRetryWithoutOverride(failure)) {
-      throw new Error(failure);
+    const outcome = await runDelegatedQuery(delegatedOverrideProvider, delegatedOverrideModel);
+    if (outcome.status === "success") {
+      return outcome;
     }
     params.deps.log.warn(
-      `[lcm] retrying delegated expansion without provider/model override after: ${failure}`,
+      `[lcm] delegated expansion override failed (${configuredOverrideLabel}) for conversation ${params.bucket.conversationId}: ${outcome.error}`,
+    );
+    if (!shouldRetryWithoutOverride(outcome.error)) {
+      return outcome;
+    }
+    params.deps.log.warn(
+      `[lcm] retrying delegated expansion without provider/model override after: ${outcome.error}`,
     );
     return await runDelegatedQuery();
+  } catch (error) {
+    return {
+      status: "failed",
+      conversationId: params.bucket.conversationId,
+      summaryIds: params.bucket.summaryIds,
+      elapsedMs: 0,
+      phase: "spawn",
+      code: "DELEGATED_EXPANSION_SPAWN_FAILED",
+      error: formatExpansionFailure(error),
+      timedOut: false,
+      cleanup: "partial",
+    };
   }
 }
 
@@ -1003,6 +1164,7 @@ export function createLcmExpandQueryTool(input: {
       "and return a compact prompt-focused answer. Tool output includes cited summary IDs for follow-up.",
     parameters: createLcmExpandQuerySchema(advertisedDynamicToolTimeoutMs),
     async execute(_toolCallId, params) {
+      const requestStartedAtMs = performance.now();
       const lcm = input.lcm ?? (await input.getLcm?.());
       if (!lcm) {
         throw new Error("LCM engine is unavailable.");
@@ -1027,10 +1189,16 @@ export function createLcmExpandQueryTool(input: {
         typeof p.timeoutMs === "number" && Number.isFinite(p.timeoutMs)
           ? clampPositiveTimeoutMs(p.timeoutMs)
           : undefined;
-      const delegatedWaitTimeoutMs = resolveDelegatedWaitTimeoutMs({
-        configuredTimeoutMs: configuredDelegatedWaitTimeoutMs,
-        requestedDynamicToolTimeoutMs,
+      const deadline = createExpansionDeadline({
+        nowMs: requestStartedAtMs,
+        dynamicToolTimeoutMs: requestedDynamicToolTimeoutMs ?? advertisedDynamicToolTimeoutMs,
+        delegationTimeoutMs: configuredDelegatedWaitTimeoutMs,
+        headroomMs: DYNAMIC_TOOL_TIMEOUT_HEADROOM_MS,
       });
+      const delegatedWaitTimeoutMs = Math.max(
+        1,
+        Math.floor(deadline.workDeadlineMs - deadline.startedAtMs),
+      );
       const delegatedWaitTimeoutSeconds = Math.ceil(delegatedWaitTimeoutMs / 1000);
 
       if (!prompt) {
@@ -1196,7 +1364,7 @@ export function createLcmExpandQueryTool(input: {
             sourceConversationId,
             buckets: conversationBuckets,
           });
-          const delegatedReply = await runDelegatedExpandQuery({
+          const delegatedOutcome = await runDelegatedExpandQuery({
             deps: input.deps,
             callerSessionKey,
             requesterAgentId,
@@ -1208,9 +1376,13 @@ export function createLcmExpandQueryTool(input: {
             requestId,
             childExpansionDepth,
             originSessionKey,
-            delegatedWaitTimeoutMs,
+            deadline,
             delegatedWaitTimeoutSeconds,
           });
+          if (delegatedOutcome.status === "failed") {
+            throw new Error(delegatedOutcome.error);
+          }
+          const delegatedReply = delegatedOutcome.reply;
 
           return jsonResult(
             buildExpandQueryReply({
@@ -1243,7 +1415,7 @@ export function createLcmExpandQueryTool(input: {
           }
 
           try {
-            const delegatedReply = await runDelegatedExpandQuery({
+            const delegatedOutcome = await runDelegatedExpandQuery({
               deps: input.deps,
               callerSessionKey,
               requesterAgentId,
@@ -1255,9 +1427,13 @@ export function createLcmExpandQueryTool(input: {
               requestId,
               childExpansionDepth,
               originSessionKey,
-              delegatedWaitTimeoutMs,
+              deadline,
               delegatedWaitTimeoutSeconds,
             });
+            if (delegatedOutcome.status === "failed") {
+              throw new Error(delegatedOutcome.error);
+            }
+            const delegatedReply = delegatedOutcome.reply;
             bucketResults.push({
               conversationId: bucket.conversationId,
               status: "success",
