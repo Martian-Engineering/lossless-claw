@@ -38,6 +38,7 @@
     "skills/",
     "openclaw.plugin.json",
     "docs/",
+    "!docs/superpowers/",
     "README.md",
     "LICENSE"
   ],
