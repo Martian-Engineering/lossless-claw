@@ -42,10 +42,12 @@ jobs:
       - name: Build package bundle
         run: npm run build
 
-      - name: Read package version
+      - name: Read package version and release channel
         id: package
         run: |
-          printf 'version=%s\n' "$(node -p "require('./package.json').version")" >> "$GITHUB_OUTPUT"
+          version="$(node -p "require('./package.json').version")"
+          printf 'version=%s\n' "$version" >> "$GITHUB_OUTPUT"
+          node scripts/release-channel.mjs "$version" >> "$GITHUB_OUTPUT"
 
       - name: Ensure release tag does not already exist
         run: |
@@ -56,7 +58,7 @@ jobs:
           fi
 
       - name: Publish to npm
-        run: npm publish
+        run: npm publish --tag "${{ steps.package.outputs.npm_tag }}"
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
 
@@ -87,7 +89,12 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           tag="v${{ steps.package.outputs.version }}"
-          gh release create "$tag" \
-            --generate-notes \
-            --notes "$(cat release-notes.md)" \
+          release_args=(
+            --generate-notes
+            --notes "$(cat release-notes.md)"
             --verify-tag
+          )
+          if [ "${{ steps.package.outputs.prerelease }}" = "true" ]; then
+            release_args+=(--prerelease)
+          fi
+          gh release create "$tag" "${release_args[@]}"
