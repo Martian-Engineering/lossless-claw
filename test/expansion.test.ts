@@ -5,6 +5,7 @@ import { buildExpansionToolDefinition } from "../src/expansion.js";
 
 const BASE_CONFIG: LcmConfig = {
   enabled: true,
+  hostFallbackMode: "error",
   databasePath: ":memory:",
   largeFilesDir: "/tmp/lcm-files",
   ignoreSessionPatterns: [],

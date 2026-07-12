@@ -25,6 +25,7 @@ describe("resolveLcmConfig", () => {
   it("uses hardcoded defaults when no env or plugin config", () => {
     const config = resolveLcmConfig({}, {});
     expect(config.enabled).toBe(true);
+    expect(config.hostFallbackMode).toBe("error");
     expect(config.databasePath).toBe(join(homedir(), ".openclaw", "lcm.db"));
     expect(config.largeFilesDir).toBe(join(homedir(), ".openclaw", "lcm-files"));
     expect(config.ignoreSessionPatterns).toEqual([]);
@@ -196,6 +197,25 @@ describe("resolveLcmConfig", () => {
       enabled: true,
       max: 80000,
     });
+  });
+
+  it("resolves hostFallbackMode from plugin config and env override", () => {
+    expect(resolveLcmConfig({}, { hostFallbackMode: "capture-only" }).hostFallbackMode).toBe(
+      "capture-only",
+    );
+    expect(
+      resolveLcmConfig(
+        { LCM_HOST_FALLBACK_MODE: "capture-only" } as NodeJS.ProcessEnv,
+        {},
+      ).hostFallbackMode,
+    ).toBe("capture-only");
+    expect(
+      resolveLcmConfig(
+        { LCM_HOST_FALLBACK_MODE: "error" } as NodeJS.ProcessEnv,
+        { hostFallbackMode: "capture-only" },
+      ).hostFallbackMode,
+    ).toBe("error");
+    expect(resolveLcmConfig({}, { hostFallbackMode: "bogus" }).hostFallbackMode).toBe("error");
   });
 
   it("env vars override plugin config", () => {

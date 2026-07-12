@@ -90,6 +90,14 @@ export type LcmConfigDiagnostics = {
 
 export type LcmConfig = {
   enabled: boolean;
+  /**
+   * How to declare agent-run host requirements. "error" (default): require the full
+   * context-engine lifecycle and fail closed on CLI-backed hosts. "capture-only": relax the
+   * requirement to bootstrap/after-turn/maintain so CLI-backed runs (e.g. claude-cli) continue
+   * with transcript capture and recall tools but WITHOUT lossless prompt assembly; native
+   * runtimes advertise the full set and keep the full engine.
+   */
+  hostFallbackMode: "error" | "capture-only";
   databasePath: string;
   /** Directory for persisting large-file text payloads. */
   largeFilesDir: string;
@@ -682,6 +690,10 @@ export function resolveLcmConfigWithDiagnostics(
         env.LCM_ENABLED !== undefined
           ? env.LCM_ENABLED !== "false"
           : toBool(pc.enabled) ?? true,
+      hostFallbackMode: (() => {
+        const raw = env.LCM_HOST_FALLBACK_MODE?.trim() || toStr(pc.hostFallbackMode) || "";
+        return raw === "capture-only" ? "capture-only" : "error";
+      })(),
       databasePath:
         env.LCM_DATABASE_PATH
         ?? toStr(pc.dbPath)

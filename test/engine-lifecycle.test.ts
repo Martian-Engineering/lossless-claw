@@ -52,6 +52,22 @@ describe("LcmContextEngine metadata", () => {
     });
   });
 
+  it("relaxes agent-run requirements to the generic CLI host set in capture-only mode", () => {
+    const engine = createEngineWithConfig({ hostFallbackMode: "capture-only" });
+    expect(engine.info.hostRequirements?.["agent-run"]).toEqual({
+      requiredCapabilities: ["bootstrap", "after-turn", "maintain"],
+      unsupportedMessage: expect.stringContaining("capture-only"),
+    });
+  });
+
+  it("keeps the subagent-spawn requirement unchanged in capture-only mode", () => {
+    const engine = createEngineWithConfig({ hostFallbackMode: "capture-only" });
+    expect(engine.info.hostRequirements?.["subagent-spawn"]).toEqual({
+      requiredCapabilities: ["thread-bootstrap-projection"],
+      unsupportedMessage: expect.stringContaining("raw parent JSONL branch"),
+    });
+  });
+
   it("requires host thread bootstrap projection for subagent forks", () => {
     const engine = createEngine();
     expect(engine.info.hostRequirements?.["subagent-spawn"]).toEqual({

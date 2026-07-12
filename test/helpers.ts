@@ -47,6 +47,7 @@ export function createTestConfig(
   const tempDir = join(databasePath, "..", "lcm-files");
   return {
     enabled: true,
+    hostFallbackMode: "error",
     databasePath,
     largeFilesDir: tempDir,
     ignoreSessionPatterns: [],

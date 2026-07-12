@@ -31,6 +31,10 @@
       "label": "Enabled",
       "help": "Enable or disable lossless-claw without uninstalling it"
     },
+    "hostFallbackMode": {
+      "label": "Host Fallback Mode",
+      "help": "How to declare agent-run host requirements. \"error\" (default): require the full context-engine lifecycle and fail closed on CLI-backed hosts. \"capture-only\": relax the requirement to bootstrap/after-turn/maintain so CLI-backed runs (e.g. claude-cli) continue with transcript capture and recall tools but WITHOUT lossless prompt assembly; native runtimes keep the full engine."
+    },
     "contextThreshold": {
       "label": "Context Threshold",
       "help": "Fraction of context window that triggers compaction (0.0–1.0)"
@@ -330,6 +334,10 @@
     "properties": {
       "enabled": {
         "type": "boolean"
+      },
+      "hostFallbackMode": {
+        "type": "string",
+        "enum": ["error", "capture-only"]
       },
       "contextThreshold": {
         "type": "number",

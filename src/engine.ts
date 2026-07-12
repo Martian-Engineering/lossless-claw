@@ -104,6 +104,15 @@ const LOSSLESS_AGENT_RUN_REQUIRED_HOST_CAPABILITIES: ContextEngineHostCapability
 const LOSSLESS_SUBAGENT_SPAWN_REQUIRED_HOST_CAPABILITIES: ContextEngineHostCapability[] = [
   "thread-bootstrap-projection",
 ];
+// Opt-in reduced requirement set (config hostFallbackMode="capture-only"): exactly the
+// capability set OpenClaw's generic CLI backends (e.g. claude-cli) advertise. Turns on such
+// hosts run with transcript capture + recall tools but WITHOUT lossless prompt assembly —
+// the CLI harness owns the prompt, so there is no assemble-before-prompt seam to project into.
+const LOSSLESS_AGENT_RUN_CAPTURE_ONLY_HOST_CAPABILITIES: ContextEngineHostCapability[] = [
+  "bootstrap",
+  "after-turn",
+  "maintain",
+];
 const MAX_PREVIOUS_ASSEMBLED_SNAPSHOTS = 100;
 const FORK_BOUNDED_BOOTSTRAP_REASON = "fork-bounded bootstrap import";
 
@@ -365,13 +374,23 @@ export class LcmContextEngine implements ContextEngine {
       ownsCompaction: migrationOk,
       turnMaintenanceMode: "background",
       hostRequirements: {
-        "agent-run": {
-          requiredCapabilities: LOSSLESS_AGENT_RUN_REQUIRED_HOST_CAPABILITIES,
-          unsupportedMessage: [
-            "lossless-claw requires a native OpenClaw runtime with the full context-engine agent-run lifecycle.",
-            "Use the native Codex or Pi embedded runtime, or switch plugins.slots.contextEngine to legacy for CLI harness runs.",
-          ].join(" "),
-        },
+        "agent-run":
+          this.config.hostFallbackMode === "capture-only"
+            ? {
+                requiredCapabilities: LOSSLESS_AGENT_RUN_CAPTURE_ONLY_HOST_CAPABILITIES,
+                unsupportedMessage: [
+                  "lossless-claw (hostFallbackMode=capture-only) still requires the bootstrap, after-turn and maintain host capabilities for transcript capture.",
+                  "This host does not provide them; switch plugins.slots.contextEngine to legacy for such runs.",
+                ].join(" "),
+              }
+            : {
+                requiredCapabilities: LOSSLESS_AGENT_RUN_REQUIRED_HOST_CAPABILITIES,
+                unsupportedMessage: [
+                  "lossless-claw requires a native OpenClaw runtime with the full context-engine agent-run lifecycle.",
+                  "Use the native Codex or Pi embedded runtime, switch plugins.slots.contextEngine to legacy for CLI harness runs,",
+                  'or set plugin config hostFallbackMode:"capture-only" to run CLI-backed turns with transcript capture but no lossless assembly.',
+                ].join(" "),
+              },
         "subagent-spawn": {
           requiredCapabilities: LOSSLESS_SUBAGENT_SPAWN_REQUIRED_HOST_CAPABILITIES,
           unsupportedMessage: [
@@ -381,6 +400,12 @@ export class LcmContextEngine implements ContextEngine {
         },
       },
     } as ContextEngineInfo;
+
+    if (this.config.hostFallbackMode === "capture-only") {
+      this.deps.log.warn(
+        "[lcm] hostFallbackMode=capture-only: agent-run host requirement relaxed to bootstrap/after-turn/maintain. On CLI-backed hosts (e.g. claude-cli) lossless assembly is NOT projected into the prompt; turns are captured to lcm.db and recall tools remain available. Summary compaction on such hosts requires fallbackProviders (no runtime-llm-complete capability).",
+      );
+    }
 
     this.conversationStore = new ConversationStore(this.db, {
       fts5Available: this.fts5Available,
