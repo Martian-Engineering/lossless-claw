@@ -96,6 +96,15 @@ const MAX_PREVIOUS_ASSEMBLED_SNAPSHOTS = 100;
 const FORK_BOUNDED_BOOTSTRAP_REASON = "fork-bounded bootstrap import";
 const CONTEXT_ENGINE_PROJECTION_EPOCH_VERSION = "summary-prefix-v1";
 const DEFERRED_ASSEMBLY_DEGRADED_PRESSURE_RATIO = 0.75;
+/**
+ * Maximum retry attempts before the assemble emergency drain stops forwarding
+ * force=true to consumeDeferredCompactionDebt. After this threshold, the drain
+ * falls back to respecting backoff and degrading the live prompt instead of
+ * retrying compaction. The backoff delay saturates at retryAttempts=7
+ * (2^(7-1)=64x multiplier capped at 30min); 10 adds headroom for the 3 extra
+ * rounds after saturation before giving up on force entirely.
+ */
+const ASSEMBLE_FORCE_MAX_RETRY_ATTEMPTS = 10;
 type CompactionExecutionParams = {
   conversationId: number;
   sessionId: string;
@@ -998,7 +1007,7 @@ export class LcmContextEngine implements ContextEngine {
               }
             : undefined;
         const retryAttempts = maintenance?.retryAttempts ?? 0;
-        const forceAllowed = retryAttempts < 10;
+        const forceAllowed = retryAttempts < ASSEMBLE_FORCE_MAX_RETRY_ATTEMPTS;
         const result = await this.consumeDeferredCompactionDebt({
           conversationId: params.conversationId,
           sessionId: params.sessionId,

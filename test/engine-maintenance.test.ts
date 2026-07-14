@@ -1691,6 +1691,71 @@ describe("LcmContextEngine maintain and assemble budget", () => {
     }
   });
 
+  it("assemble emergency drain stops forwarding force when retryAttempts >= 10", async () => {
+    vi.useFakeTimers({ toFake: ["Date"] });
+    vi.setSystemTime(new Date("2026-07-14T12:00:00.000Z"));
+    try {
+      const engine = createEngineWithConfig({ freshTailCount: 1 });
+      const sessionId = "force-capped-at-max-retry";
+      const tokenBudget = 1000;
+
+      await seedBacklogContext(engine, sessionId, [100, 100, 100]);
+      const conversation = await engine
+        .getConversationStore()
+        .getConversationBySessionId(sessionId);
+      expect(conversation).not.toBeNull();
+
+      // Seed retryAttempts to exactly 10, simulating a persistently-failing compaction
+      await engine.getCompactionMaintenanceStore().requestProactiveCompactionDebt({
+        conversationId: conversation!.conversationId,
+        reason: "threshold",
+        tokenBudget,
+        currentTokenCount: 9999,
+      });
+      for (let i = 0; i < 10; i++) {
+        await engine.getCompactionMaintenanceStore().markProactiveCompactionRunning({
+          conversationId: conversation!.conversationId,
+        });
+        await engine.getCompactionMaintenanceStore().markProactiveCompactionFinished({
+          conversationId: conversation!.conversationId,
+          failureSummary: "compacted but still over target",
+          keepPending: true,
+        });
+      }
+
+      const before = await engine
+        .getCompactionMaintenanceStore()
+        .getConversationCompactionMaintenance(conversation!.conversationId);
+      expect(before?.retryAttempts).toBe(10);
+      expect(before!.nextAttemptAfter!.getTime()).toBeGreaterThan(Date.now());
+
+      // Spy on executeCompactionCore — should NOT be called
+      const privateEngine = engine as unknown as {
+        executeCompactionCore: (params: unknown) => Promise<unknown>;
+      };
+      const executeSpy = vi.spyOn(privateEngine, "executeCompactionCore");
+
+      const enginePrivate = engine as unknown as {
+        maybeConsumeDeferredCompactionDebtForAssemble: (params: {
+          conversationId: number;
+          sessionId: string;
+          tokenBudget: number;
+        }) => Promise<unknown>;
+      };
+
+      await enginePrivate.maybeConsumeDeferredCompactionDebtForAssemble({
+        conversationId: conversation!.conversationId,
+        sessionId,
+        tokenBudget,
+      });
+
+      // retryAttempts >= 10 disables force, so executeCompactionCore is NOT called
+      expect(executeSpy).not.toHaveBeenCalled();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it("maintain() uses the stricter current token budget for deferred threshold debt", async () => {
     const engine = createEngine();
     const privateEngine = engine as unknown as {
