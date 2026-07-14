@@ -2200,6 +2200,7 @@ export class TranscriptReconciler {
         importedMessages: 0,
         blockedByImportCap: false,
         hasOverlap: true,
+        transcriptCovered: true,
       };
     }
 
