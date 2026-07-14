@@ -591,18 +591,17 @@ describe("LcmContextEngine afterTurn dedup guard", () => {
 
     const conversation = await engine.getConversationStore().getConversationBySessionId(sessionId);
     const stored = await engine.getConversationStore().getMessages(conversation!.conversationId);
+    // v2 fix: the ENOENT checkpoint-present branch now returns transcriptCovered:true,
+    // routing through alignRuntimeBatchAgainstCoveredFrontier instead of the
+    // aggressive ingest path. The batch [old B, last D] timestamp-matches existing
+    // messages and is correctly deduplicated rather than ingested as duplicates.
     expect(stored.map((m) => m.content)).toEqual([
       "old A",
       "old B",
       "old C",
       "[summary] compacted older context",
       "last D",
-      "old B",
-      "last D",
     ]);
-    expect(warnLog).toHaveBeenCalledWith(
-      `[lcm] dedup: oversized, storedCount=5 batchLen=2, no overlap found — ingesting full batch`,
-    );
   });
 
   it("ingests oversized no-overlap repeated content without auto-compaction summary proof", async () => {
