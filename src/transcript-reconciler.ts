@@ -2127,11 +2127,15 @@ export class TranscriptReconciler {
         this.host.deps.log.warn(
           `[lcm] afterTurn: session file missing; skipping transcript reconcile full reread; could not stat/read transcript; allowing live afterTurn persistence and seeding placeholder bootstrap_state at offset=0 to unblock next-turn recovery conversation=${conversation.conversationId} reason=${reason} sessionFile=${params.sessionFile}`,
         );
-      } else {
-        this.host.deps.log.warn(
-          `[lcm] afterTurn: session file missing; skipping transcript reconcile full reread; preserving existing checkpoint (offset=${checkpoint.lastProcessedOffset}) conversation=${conversation.conversationId} reason=${reason} sessionFile=${params.sessionFile}`,
-        );
+        return {
+          importedMessages: 0,
+          blockedByImportCap: false,
+          hasOverlap: true,
+        };
       }
+      this.host.deps.log.warn(
+        `[lcm] afterTurn: session file missing; skipping transcript reconcile full reread; preserving existing checkpoint (offset=${checkpoint.lastProcessedOffset}) conversation=${conversation.conversationId} reason=${reason} sessionFile=${params.sessionFile}`,
+      );
       return {
         importedMessages: 0,
         blockedByImportCap: false,
