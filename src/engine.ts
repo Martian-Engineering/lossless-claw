@@ -756,6 +756,8 @@ export class LcmContextEngine implements ContextEngine {
     currentTokenCount?: number;
     runtimeContext?: ContextEngineMaintenanceRuntimeContext;
     legacyParams?: Record<string, unknown>;
+    /** When true, skip the backoff check — used by assemble emergency drain. */
+    force?: boolean;
   }): Promise<(ContextEngineMaintenanceResult & { exhausted?: boolean }) | null> {
     const maintenance = await this.compactionMaintenanceStore.getConversationCompactionMaintenance(
       params.conversationId,
@@ -771,6 +773,7 @@ export class LcmContextEngine implements ContextEngine {
     });
 
     if (
+      !params.force &&
       maintenance.nextAttemptAfter !== null &&
       maintenance.nextAttemptAfter.getTime() > Date.now()
     ) {
@@ -783,6 +786,12 @@ export class LcmContextEngine implements ContextEngine {
         rewrittenEntries: 0,
         reason: "deferred compaction backoff active",
       };
+    }
+
+    if (params.force && maintenance.nextAttemptAfter !== null && maintenance.nextAttemptAfter.getTime() > Date.now()) {
+      this.deps.log.warn(
+        `[lcm] consumeDeferredCompactionDebt: force=true skipping backoff conversation=${params.conversationId} ${sessionLabel} retryAttempts=${maintenance.retryAttempts} nextAttemptAfter=${maintenance.nextAttemptAfter.toISOString()}`,
+      );
     }
 
     await this.compactionMaintenanceStore.markProactiveCompactionRunning({
@@ -995,6 +1004,7 @@ export class LcmContextEngine implements ContextEngine {
           tokenBudget: cappedTokenBudget,
           currentTokenCount: normalizedCurrentTokenCount,
           legacyParams: deferredLegacyParams,
+          force: true,
         });
         drainResult = { exhausted: result?.exhausted === true };
       },
