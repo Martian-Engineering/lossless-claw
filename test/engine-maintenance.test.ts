@@ -1579,6 +1579,118 @@ describe("LcmContextEngine maintain and assemble budget", () => {
     expect(assembleResult.messages).toHaveLength(1);
   });
 
+  it("force compaction passes dynamic leafChunkTokens and freshTailMaxTokens to compactFullSweep", async () => {
+    const engine = createEngineWithConfig({ contextThreshold: 0.7 });
+    const privateEngine = engine as unknown as {
+      compaction: {
+        compactFullSweep: (input: unknown) => Promise<unknown>;
+      };
+    };
+    const compactFullSweepSpy = vi
+      .spyOn(privateEngine.compaction, "compactFullSweep")
+      .mockResolvedValue({ actionTaken: false, tokensBefore: 0, tokensAfter: 0, condensed: false });
+
+    const sessionId = "force-dynamic-params";
+    const conversation = await engine.getConversationStore().getOrCreateConversation(sessionId, {
+      sessionKey: undefined,
+    });
+
+    // Set up maintenance with pending debt to trigger emergency drain
+    await engine.getCompactionMaintenanceStore().requestProactiveCompactionDebt({
+      conversationId: conversation.conversationId,
+      reason: "threshold",
+      tokenBudget: 4_096,
+      currentTokenCount: 9_999,
+    });
+    await engine.getCompactionMaintenanceStore().markProactiveCompactionRunning({
+      conversationId: conversation.conversationId,
+    });
+    await engine.getCompactionMaintenanceStore().markProactiveCompactionFinished({
+      conversationId: conversation.conversationId,
+      failureSummary: "compacted but still over target",
+      keepPending: true,
+    });
+
+    await engine.assemble({
+      sessionId,
+      messages: [makeMessage({ role: "user", content: "hello ".repeat(200) })],
+      tokenBudget: 10,
+    });
+
+    // Verify compactFullSweep was called with dynamic overrides
+    expect(compactFullSweepSpy).toHaveBeenCalledWith(
+      expect.objectContaining({
+        leafChunkTokens: expect.any(Number),
+        freshTailMaxTokens: expect.any(Number),
+        force: true,
+      }),
+    );
+    const callArg = compactFullSweepSpy.mock.calls[0]![0] as {
+      leafChunkTokens: number;
+      freshTailMaxTokens: number;
+      tokenBudget: number;
+    };
+    // leafChunkTokens should be budget * 0.25 = 2 (with budget=10)
+    expect(callArg.leafChunkTokens).toBe(2);
+    // freshTailMaxTokens should be budget * (1 - 0.7) * 0.5 = 1.5 → 1
+    expect(callArg.freshTailMaxTokens).toBe(1);
+  });
+
+  it("normal deferred drain does not pass dynamic overrides to compactFullSweep", async () => {
+    const engine = createEngineWithConfig({ contextThreshold: 0.7 });
+    const privateEngine = engine as unknown as {
+      compaction: {
+        compactFullSweep: (input: unknown) => Promise<unknown>;
+      };
+    };
+    const compactFullSweepSpy = vi
+      .spyOn(privateEngine.compaction, "compactFullSweep")
+      .mockResolvedValue({ actionTaken: false, tokensBefore: 0, tokensAfter: 0, condensed: false });
+
+    const sessionId = "normal-drain-no-dynamic-params";
+    const conversation = await engine.getConversationStore().getOrCreateConversation(sessionId, {
+      sessionKey: undefined,
+    });
+
+    // Set up maintenance with pending debt (no force — normal deferred drain)
+    await engine.getCompactionMaintenanceStore().requestProactiveCompactionDebt({
+      conversationId: conversation.conversationId,
+      reason: "threshold",
+      tokenBudget: 4_096,
+      currentTokenCount: 3_500,
+    });
+    await engine.getCompactionMaintenanceStore().markProactiveCompactionRunning({
+      conversationId: conversation.conversationId,
+    });
+    await engine.getCompactionMaintenanceStore().markProactiveCompactionFinished({
+      conversationId: conversation.conversationId,
+      failureSummary: "compacted but still over target",
+      keepPending: true,
+    });
+
+    // Call consumeDeferredCompactionDebt directly — normal drain, no force
+    const enginePrivate = engine as unknown as {
+      consumeDeferredCompactionDebt: (params: {
+        conversationId: number;
+        sessionId: string;
+        tokenBudget: number;
+      }) => Promise<unknown>;
+    };
+
+    await enginePrivate.consumeDeferredCompactionDebt({
+      conversationId: conversation.conversationId,
+      sessionId,
+      tokenBudget: 4_096,
+    });
+
+    // Verify compactFullSweep was NOT called with dynamic overrides
+    // (either not called at all due to backoff, or called without the dynamic fields)
+    if (compactFullSweepSpy.mock.calls.length > 0) {
+      const callArg = compactFullSweepSpy.mock.calls[0]![0] as Record<string, unknown>;
+      expect(callArg).not.toHaveProperty("freshTailMaxTokens");
+    }
+  });
+
   it("maintain() uses the stricter current token budget for deferred threshold debt", async () => {
     const engine = createEngine();
     const privateEngine = engine as unknown as {

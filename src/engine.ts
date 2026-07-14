@@ -1231,8 +1231,37 @@ export class LcmContextEngine implements ContextEngine {
             ? false
             : !liveContextStillExceedsTarget;
       };
-      const runSweepOnce = (): ReturnType<CompactionEngine["compact"]> =>
-        this.compaction.compact({
+      const runSweepOnce = (): ReturnType<CompactionEngine["compact"]> => {
+        // When force=true, dynamically tune leafChunkTokens and freshTailMaxTokens
+        // for faster convergence based on contextThreshold.
+        if (forceThresholdSweep) {
+          const dynamicLeafChunk = Math.min(
+            Math.floor(tokenBudget * 0.25),
+            resolvedContextThreshold.leafChunkTokens ?? 40000,
+          );
+          const dynamicFreshTail = Math.floor(
+            tokenBudget * (1 - resolvedContextThreshold.contextThreshold) * 0.5,
+          );
+          if (dynamicFreshTail > 0) {
+            // override passed via compact input instead of setter
+          }
+          return this.compaction.compact({
+            conversationId,
+            tokenBudget,
+            contextThreshold: resolvedContextThreshold.contextThreshold,
+            freshTailCount: resolvedContextThreshold.freshTailCount,
+            leafChunkTokens: dynamicLeafChunk,
+            freshTailMaxTokens: dynamicFreshTail > 0 ? dynamicFreshTail : undefined,
+            summarize,
+            force: forceThresholdSweep,
+            hardTrigger: false,
+            summaryModel,
+            ...(runtimeAdjustedSweepTargetTokens !== undefined
+              ? { stopAtTokens: runtimeAdjustedSweepTargetTokens }
+              : {}),
+          });
+        }
+        return this.compaction.compact({
           conversationId,
           tokenBudget,
           contextThreshold: resolvedContextThreshold.contextThreshold,
@@ -1250,6 +1279,7 @@ export class LcmContextEngine implements ContextEngine {
             ? { stopAtTokens: runtimeAdjustedSweepTargetTokens }
             : {}),
         });
+      };
 
       let sweepResult: Awaited<ReturnType<CompactionEngine["compact"]>>;
       try {
