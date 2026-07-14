@@ -1575,8 +1575,8 @@ describe("LcmContextEngine maintain and assemble budget", () => {
 
     // force=true skips backoff in emergency drain path — executeCompactionCore is called
     expect(executeSpy).toHaveBeenCalled();
-    // Assemble still produces a result (degraded live fallback)
-    expect(assembleResult.messages.length).toBeGreaterThan(0);
+    // Assemble still returns a usable single-message result via degraded fallback
+    expect(assembleResult.messages).toHaveLength(1);
   });
 
   it("maintain() uses the stricter current token budget for deferred threshold debt", async () => {
