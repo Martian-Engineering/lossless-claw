@@ -1542,7 +1542,7 @@ describe("LcmContextEngine maintain and assemble budget", () => {
     expect(assembleResult.messages).toHaveLength(1);
   });
 
-  it("assemble() degrades instead of spending during active deferred retry backoff", async () => {
+  it("assemble() emergency drain bypasses backoff and runs compaction with force=true", async () => {
     const engine = createEngine();
     const privateEngine = engine as unknown as {
       executeCompactionCore: (params: unknown) => Promise<unknown>;
@@ -1573,12 +1573,10 @@ describe("LcmContextEngine maintain and assemble budget", () => {
       tokenBudget: 10,
     });
 
-    expect(executeSpy).not.toHaveBeenCalled();
-    expect(assembleResult.messages).toHaveLength(1);
-    const maintenance = await engine
-      .getCompactionMaintenanceStore()
-      .getConversationCompactionMaintenance(conversation.conversationId);
-    expect(maintenance?.pending).toBe(true);
+    // force=true skips backoff in emergency drain path — executeCompactionCore is called
+    expect(executeSpy).toHaveBeenCalled();
+    // Assemble still produces a result (degraded live fallback)
+    expect(assembleResult.messages.length).toBeGreaterThan(0);
   });
 
   it("maintain() uses the stricter current token budget for deferred threshold debt", async () => {
