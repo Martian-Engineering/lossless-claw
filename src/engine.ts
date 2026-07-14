@@ -997,6 +997,8 @@ export class LcmContextEngine implements ContextEngine {
                 ...(telemetry.model ? { model: telemetry.model } : {}),
               }
             : undefined;
+        const retryAttempts = maintenance?.retryAttempts ?? 0;
+        const forceAllowed = retryAttempts < 10;
         const result = await this.consumeDeferredCompactionDebt({
           conversationId: params.conversationId,
           sessionId: params.sessionId,
@@ -1004,7 +1006,7 @@ export class LcmContextEngine implements ContextEngine {
           tokenBudget: cappedTokenBudget,
           currentTokenCount: normalizedCurrentTokenCount,
           legacyParams: deferredLegacyParams,
-          force: true,
+          force: forceAllowed,
         });
         drainResult = { exhausted: result?.exhausted === true };
       },
