@@ -1691,7 +1691,7 @@ describe("LcmContextEngine maintain and assemble budget", () => {
     }
   });
 
-  it("assemble emergency drain stops forwarding force when retryAttempts >= 10", async () => {
+  it("assemble emergency drain stops forwarding force when retryAttempts >= ASSEMBLE_FORCE_MAX_RETRY_ATTEMPTS", async () => {
     vi.useFakeTimers({ toFake: ["Date"] });
     vi.setSystemTime(new Date("2026-07-14T12:00:00.000Z"));
     try {
@@ -1705,14 +1705,14 @@ describe("LcmContextEngine maintain and assemble budget", () => {
         .getConversationBySessionId(sessionId);
       expect(conversation).not.toBeNull();
 
-      // Seed retryAttempts to exactly 10, simulating a persistently-failing compaction
+      // Seed retryAttempts to 3, the effective cap (ASSEMBLE_FORCE_MAX_RETRY_ATTEMPTS)
       await engine.getCompactionMaintenanceStore().requestProactiveCompactionDebt({
         conversationId: conversation!.conversationId,
         reason: "threshold",
         tokenBudget,
         currentTokenCount: 9999,
       });
-      for (let i = 0; i < 10; i++) {
+      for (let i = 0; i < 3; i++) {
         await engine.getCompactionMaintenanceStore().markProactiveCompactionRunning({
           conversationId: conversation!.conversationId,
         });
@@ -1726,7 +1726,7 @@ describe("LcmContextEngine maintain and assemble budget", () => {
       const before = await engine
         .getCompactionMaintenanceStore()
         .getConversationCompactionMaintenance(conversation!.conversationId);
-      expect(before?.retryAttempts).toBe(10);
+      expect(before?.retryAttempts).toBe(3);
       expect(before!.nextAttemptAfter!.getTime()).toBeGreaterThan(Date.now());
 
       // Spy on executeCompactionCore — should NOT be called
@@ -1749,7 +1749,7 @@ describe("LcmContextEngine maintain and assemble budget", () => {
         tokenBudget,
       });
 
-      // retryAttempts >= 10 disables force, so executeCompactionCore is NOT called
+      // retryAttempts >= 3 disables force, so executeCompactionCore is NOT called
       expect(executeSpy).not.toHaveBeenCalled();
     } finally {
       vi.useRealTimers();
