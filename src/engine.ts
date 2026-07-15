@@ -290,6 +290,13 @@ export class LcmContextEngine implements ContextEngine {
   // ── Circuit breaker + summary spend guard ───────────────────────────────
   private readonly compactionGuards: CompactionGuards;
 
+  // Circuit breaker: track consecutive compact attempts per conversation.
+  // When the compact loop spins without making progress (e.g. ENOENT on
+  // transcript file triggers repeated assemble → compact → assemble cycles),
+  // the counter rises. After exceeding the threshold the loop is force-exhausted
+  // to prevent CPU/I/O runaway. Reset when maintenance state clears.
+  private consecutiveCompactAttemptsByConversation = new Map<number, number>();
+
   // ── Large-payload interception at ingest ────────────────────────────────
   private readonly largeFileInterceptor: LargeFileInterceptor;
 
@@ -994,6 +1001,25 @@ export class LcmContextEngine implements ContextEngine {
             params.conversationId,
           );
         if (!maintenance?.pending && !maintenance?.running) {
+          // Maintenance cleared — reset the circuit breaker.
+          this.consecutiveCompactAttemptsByConversation.delete(params.conversationId);
+          return;
+        }
+
+        // Circuit breaker: if the compact loop has been spinning without
+        // progress, force-exhaust to prevent CPU/I/O runaway.
+        const consecutiveAttempts =
+          (this.consecutiveCompactAttemptsByConversation.get(params.conversationId) ?? 0) + 1;
+        this.consecutiveCompactAttemptsByConversation.set(
+          params.conversationId,
+          consecutiveAttempts,
+        );
+        const CIRCUIT_BREAKER_THRESHOLD = 10;
+        if (consecutiveAttempts > CIRCUIT_BREAKER_THRESHOLD) {
+          this.deps.log.warn(
+            `[lcm] circuit-breaker: force-exhausting compact loop conversation=${params.conversationId} ${sessionLabel} consecutiveAttempts=${consecutiveAttempts}`,
+          );
+          drainResult = { exhausted: true };
           return;
         }
 
@@ -1021,6 +1047,11 @@ export class LcmContextEngine implements ContextEngine {
           legacyParams: deferredLegacyParams,
         });
         drainResult = { exhausted: result?.exhausted === true };
+        // If compaction made progress (not exhausted), reset the circuit breaker
+        // so future attempts get a fresh count.
+        if (!drainResult.exhausted) {
+          this.consecutiveCompactAttemptsByConversation.delete(params.conversationId);
+        }
       },
       {
         operationName: "assembleDeferredCompaction",
