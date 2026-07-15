@@ -26,11 +26,6 @@ export type PublishReadyFrontierResult = {
   frontierSummaryIds: string[];
 };
 
-type ChildSummaryIds = {
-  pendingChildNodeIds: string[];
-  canonicalChildSummaryIds: string[];
-};
-
 type ChildSummaryLink =
   | { kind: "pending"; childNodeId: string }
   | { kind: "canonical"; summaryId: string };
@@ -355,18 +350,6 @@ export class PendingSummaryPublisher {
         (total, summary) => total + Math.max(0, summary.sourceMessageTokenCount),
         0,
       ),
-    };
-  }
-
-  private async readChildSummaryIds(nodeId: string): Promise<ChildSummaryIds> {
-    const children = await this.readChildSummaryLinks(nodeId);
-    return {
-      pendingChildNodeIds: children
-        .map((child) => (child.kind === "pending" ? child.childNodeId : null))
-        .filter((childNodeId): childNodeId is string => typeof childNodeId === "string"),
-      canonicalChildSummaryIds: children
-        .map((child) => (child.kind === "canonical" ? child.summaryId : null))
-        .filter((childSummaryId): childSummaryId is string => typeof childSummaryId === "string"),
     };
   }
 

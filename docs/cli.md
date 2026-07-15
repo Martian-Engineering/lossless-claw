@@ -152,7 +152,6 @@ Pass `nextCursor` to the same resource command. A message cursor cannot be used 
 ```bash
 lcm config show --pretty
 lcm config get freshTailCount
-lcm config get autoRotateSessionFiles.enabled
 ```
 
 `lcm config set` accepts a dot path relative to `plugins.entries.lossless-claw.config` and a JSON value:
@@ -163,7 +162,6 @@ lcm config set sweepMaxDepth -1
 lcm config set promptAwareEviction true
 lcm config set summaryModel '"openai/gpt-5.4-mini"'
 lcm config set ignoreSessionPatterns '["agent:*:cron:**"]'
-lcm config set autoRotateSessionFiles.enabled false
 ```
 
 The command checks the path and value against `openclaw.plugin.json`, validates the complete Lossless config, creates an exclusive timestamped sibling backup, preserves the source mode, fsyncs a sibling temporary file, atomically replaces `openclaw.json`, and fsyncs the parent directory on POSIX systems.

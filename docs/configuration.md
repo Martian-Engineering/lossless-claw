@@ -216,7 +216,7 @@ output.
 
 Lossless-claw no longer rewrites active OpenClaw transcripts for transcript GC or session-file rotation. SQLite-backed OpenClaw owns active transcript storage; Lossless stores durable conversation, summary, and recall data in its own SQLite database.
 
-Upgrade note: remove `transcriptGcEnabled` and `autoRotateSessionFiles` from `plugins.entries.lossless-claw.config`. The plugin manifest no longer accepts those keys.
+Upgrade note: remove `transcriptGcEnabled` and `autoRotateSessionFiles` from `plugins.entries.lossless-claw.config` before upgrading. OpenClaw rejects plugin configs containing keys that are absent from the manifest schema, so leaving either removed key in place prevents Lossless Claw from loading.
 
 Lossless-claw writes routine operational JSONL logs by default at `/tmp/openclaw/lossless-claw-YYYY-MM-DD.log`, beside OpenClaw's `/tmp/openclaw/openclaw-YYYY-MM-DD.log`. Routine info and debug lines go to the independent file instead of the shared OpenClaw log. Startup banners and warning/error lines still go through OpenClaw's runtime logger so gateway-level startup and failure diagnostics remain visible. The independent file follows the same practical rotation model as OpenClaw: a dated filename rolls over when the local date changes, stale dated files are pruned after 3 days, and an oversized active file is rotated through `.1.log` to `.5.log`.
 

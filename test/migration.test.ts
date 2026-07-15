@@ -848,16 +848,6 @@ describe("runLcmMigrations summary depth backfill", () => {
         UNIQUE (conversation_id, seq)
       );
 
-      CREATE TABLE conversation_bootstrap_state (
-        conversation_id INTEGER PRIMARY KEY REFERENCES conversations(conversation_id) ON DELETE CASCADE,
-        session_file_path TEXT NOT NULL,
-        last_seen_size INTEGER NOT NULL,
-        last_seen_mtime_ms INTEGER NOT NULL,
-        last_processed_offset INTEGER NOT NULL,
-        last_processed_entry_hash TEXT,
-        updated_at TEXT NOT NULL DEFAULT (datetime('now'))
-      );
-
       CREATE TABLE lcm_migration_state (
         step_name TEXT NOT NULL,
         algorithm_version INTEGER NOT NULL,
@@ -883,19 +873,6 @@ describe("runLcmMigrations summary depth backfill", () => {
       legacyRawMessageIdentityHash("user", versionOneCanonicalContent),
     );
     db.prepare(
-      `INSERT INTO conversation_bootstrap_state (
-         conversation_id, session_file_path, last_seen_size, last_seen_mtime_ms,
-         last_processed_offset, last_processed_entry_hash
-       ) VALUES (?, ?, ?, ?, ?, ?)`,
-    ).run(
-      1,
-      "/tmp/openclaw-session.jsonl",
-      128,
-      1000,
-      128,
-      legacyRawBootstrapEntryHash("user", versionOneCanonicalContent),
-    );
-    db.prepare(
       `INSERT INTO lcm_migration_state (step_name, algorithm_version) VALUES (?, ?)`,
     ).run("repairOpenClawMetadataIdentityState", 1);
 
@@ -904,21 +881,7 @@ describe("runLcmMigrations summary depth backfill", () => {
     const messageRow = db
       .prepare(`SELECT identity_hash FROM messages WHERE message_id = ?`)
       .get(1) as { identity_hash: string | null };
-    const checkpointRow = db
-      .prepare(
-        `SELECT last_processed_entry_hash AS lastProcessedEntryHash
-         FROM conversation_bootstrap_state
-         WHERE conversation_id = ?`,
-      )
-      .get(1) as { lastProcessedEntryHash: string | null };
-
     expect(messageRow.identity_hash).toBe(buildMessageIdentityHash("user", rawMetadataContent));
-    expect(checkpointRow.lastProcessedEntryHash).toBe(
-      legacyRawBootstrapEntryHash(
-        "user",
-        canonicalizeOpenClawInboundMetadataIdentityContent("user", rawMetadataContent),
-      ),
-    );
   });
 
   it("skips FTS tables when fts5 is unavailable", () => {
