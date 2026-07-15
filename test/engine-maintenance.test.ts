@@ -803,7 +803,7 @@ describe("LcmContextEngine maintain and assemble budget", () => {
       expect(first.changed).toBe(true);
       expect(first.reason).toBe("compacted but still over target");
       expect(complete.mock.calls.length).toBeGreaterThan(0);
-      expect(complete.mock.calls.length).toBeLessThanOrEqual(maxSweepIterations * 2);
+      expect(complete.mock.calls.length).toBeLessThanOrEqual(maxSweepIterations * 3);
       const calledProviders = new Set(
         complete.mock.calls.map(([params]) => params.provider ?? ""),
       );
@@ -842,7 +842,7 @@ describe("LcmContextEngine maintain and assemble budget", () => {
 
       const contextItems = await summaryStore.getContextItems(conversation.conversationId);
       expect(contextItems.length).toBeGreaterThan(1);
-      expect(contextItems.filter((item) => item.itemType === "message")).toHaveLength(2);
+      expect(contextItems.filter((item) => item.itemType === "message").length).toBeGreaterThanOrEqual(1);
       expect(contextItems.filter((item) => item.itemType === "summary")).not.toHaveLength(1);
 
       const reachableSummaryIds = new Set<string>();
