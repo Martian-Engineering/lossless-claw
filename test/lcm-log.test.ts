@@ -32,6 +32,7 @@ afterEach(() => {
 function baseConfig(file: string, independentLogFileEnabled = true): LcmConfig {
   return {
     enabled: true,
+    hostFallbackMode: "error",
     databasePath: path.join(tempDir, "lcm.db"),
     largeFilesDir: path.join(tempDir, "lcm-files"),
     ignoreSessionPatterns: [],
