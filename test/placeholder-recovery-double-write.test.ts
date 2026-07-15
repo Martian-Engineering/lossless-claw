@@ -8,6 +8,7 @@
 // the already-persisted decorated runtime row instead of importing it.
 import { SessionManager } from "@earendil-works/pi-coding-agent";
 import { afterEach, describe, expect, it, vi } from "vitest";
+import { readLeafPathMessages } from "../src/transcript.js";
 import {
   appendSessionMessage,
   cleanupEngineTestState,
@@ -137,9 +138,8 @@ describe("placeholder-checkpoint recovery double-write", () => {
     const sessionKey = "agent:agent-one:telegram:multi-turn";
 
     // Turn 1's body ("ok") is the trailing line of turn 2's body ("sounds good\nok").
-    // Both are persisted decorated + unstamped by the live ingest. A newest-first
-    // candidate scan adopts turn 2's row for turn 1's bare face, then re-imports
-    // turn 2 as a duplicate; oldest-first chronological pairing keeps each once.
+    // Both are persisted decorated + unstamped by the live ingest. Recovery must
+    // inspect them chronologically and require exact reduced-body equality.
     await engine.ingest({
       sessionId,
       sessionKey,
@@ -154,6 +154,14 @@ describe("placeholder-checkpoint recovery double-write", () => {
       .getConversationStore()
       .getConversationForSession({ sessionId, sessionKey });
     expect(conversation).not.toBeNull();
+
+    const unstamped = await engine
+      .getConversationStore()
+      .listRecentUnstampedMessagesByRole(conversation!.conversationId, "user", 8);
+    expect(unstamped.map((message) => message.content)).toEqual([
+      decoratedRoomEvent("ok"),
+      decoratedRoomEvent("sounds good\nok"),
+    ]);
 
     // Transcript alternates user/assistant (real transcripts never have two
     // consecutive same-role entries) and carries both turns' bare faces.
@@ -191,6 +199,102 @@ describe("placeholder-checkpoint recovery double-write", () => {
     // Exactly the two decorated rows survive — neither turn re-imported as a duplicate.
     expect(userRows).toHaveLength(2);
     expect(userRows.filter((message) => message.content.includes("sounds good"))).toHaveLength(1);
+  });
+
+  it("does not adopt a decorated row whose different body only ends in the same timestamped text", async () => {
+    const engine = createEngineWithDeps(
+      {},
+      { log: { info: vi.fn(), warn: vi.fn(), error: vi.fn(), debug: vi.fn() } },
+    );
+    const sessionId = "different-body-suffix";
+    const sessionKey = "agent:agent-one:telegram:different-body-suffix";
+
+    // The stored row is a different turn. Its user-authored body merely ends
+    // with a timestamped copy of the incoming transcript's short body.
+    const differentDecoratedBody = decoratedRoomEvent(
+      "context from a different turn\n[Sun 2026-06-21 13:19 GMT+3] ok",
+    );
+    await engine.ingest({
+      sessionId,
+      sessionKey,
+      message: makeMessage({ role: "user", content: differentDecoratedBody }),
+    });
+    const conversation = await engine
+      .getConversationStore()
+      .getConversationForSession({ sessionId, sessionKey });
+    expect(conversation).not.toBeNull();
+
+    const sessionFile = createSessionFilePath("different-body-suffix");
+    const sessionManager = SessionManager.open(sessionFile);
+    appendSessionMessage(sessionManager, makeMessage({ role: "user", content: "ok" }));
+    appendSessionMessage(sessionManager, makeMessage({ role: "assistant", content: "new reply" }));
+
+    await engine.getSummaryStore().upsertConversationBootstrapState({
+      conversationId: conversation!.conversationId,
+      sessionFilePath: sessionFile,
+      lastSeenSize: 0,
+      lastSeenMtimeMs: 0,
+      lastProcessedOffset: 0,
+      lastProcessedEntryHash: null,
+    });
+
+    await engine.afterTurn({
+      sessionId,
+      sessionKey,
+      sessionFile,
+      messages: [],
+      prePromptMessageCount: 0,
+      tokenBudget: 4_096,
+    });
+
+    const userRows = (
+      await engine.getConversationStore().getMessages(conversation!.conversationId)
+    ).filter((message) => message.role === "user");
+    expect(userRows.map((message) => message.content)).toEqual([differentDecoratedBody, "ok"]);
+  });
+
+  it("does not apply inbound-decoration adoption to assistant rows", async () => {
+    const engine = createEngineWithDeps(
+      {},
+      { log: { info: vi.fn(), warn: vi.fn(), error: vi.fn(), debug: vi.fn() } },
+    );
+    const sessionId = "assistant-decoration-shaped-content";
+    const sessionKey = "agent:agent-one:telegram:assistant-decoration-shaped-content";
+
+    await engine.ingest({
+      sessionId,
+      sessionKey,
+      message: makeMessage({ role: "assistant", content: DECORATED_FIRST_TURN }),
+    });
+    const conversation = await engine
+      .getConversationStore()
+      .getConversationForSession({ sessionId, sessionKey });
+    expect(conversation).not.toBeNull();
+
+    const sessionFile = createSessionFilePath("assistant-decoration-shaped-content");
+    const sessionManager = SessionManager.open(sessionFile);
+    appendSessionMessage(sessionManager, makeMessage({ role: "user", content: "new user turn" }));
+    appendSessionMessage(sessionManager, makeMessage({ role: "assistant", content: BODY }));
+
+    const reconcile = await engine.getTranscriptReconciler().reconcileSessionTail({
+      sessionId,
+      sessionKey,
+      conversationId: conversation!.conversationId,
+      historicalMessages: await readLeafPathMessages(sessionFile),
+      skipContentAnchorScan: true,
+      allowNoAnchorImport: true,
+      noAnchorImportReason: "placeholder-checkpoint-recovery",
+    });
+    expect(reconcile).toMatchObject({ importedMessages: 2, hasOverlap: false });
+
+    const messages = await engine
+      .getConversationStore()
+      .getMessages(conversation!.conversationId);
+    expect(messages.map((message) => [message.role, message.content])).toEqual([
+      ["assistant", DECORATED_FIRST_TURN],
+      ["user", "new user turn"],
+      ["assistant", BODY],
+    ]);
   });
 
   it("dedups the bare transcript row on checkpoint-missing recovery too", async () => {

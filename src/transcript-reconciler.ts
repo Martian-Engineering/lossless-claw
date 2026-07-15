@@ -14,7 +14,7 @@ import type { LcmConfig } from "./db/config.js";
 import type { AgentMessage, IngestResult } from "./openclaw-bridge.js";
 import type { TranscriptReconcileResult } from "./reconcile-plan.js";
 import { SessionRolloverDetector } from "./session-rollover.js";
-import type { ConversationRecord, ConversationStore, MessageRole } from "./store/conversation-store.js";
+import type { ConversationRecord, ConversationStore } from "./store/conversation-store.js";
 import type { SummaryStore } from "./store/summary-store.js";
 import type { LcmDependencies } from "./types.js";
 import { readFileSync } from "node:fs";
@@ -28,8 +28,10 @@ import {
   toStoredMessage,
   type StoredMessage,
 } from "./message-content.js";
-import { isOpenClawAmbientInboundRecord } from "./openclaw-inbound-metadata.js";
-import { liveContentIsRecognizedDecoratedBareBody } from "./live-coverage.js";
+import {
+  isOpenClawAmbientInboundRecord,
+  openClawInboundBodiesMatch,
+} from "./openclaw-inbound-metadata.js";
 import {
   createBootstrapEntryHash,
   createLosslessMessageSignature,
@@ -1157,15 +1159,15 @@ export class TranscriptReconciler {
           // conversation re-imports the bare transcript row of a turn the live
           // afterTurn ingest already persisted as a decorated, still-unstamped
           // row. The two faces differ on both identity_hash and content, so the
-          // adopters above miss them; stamp the decorated row's id via the
-          // structural decorated-face match instead of importing a duplicate.
+          // adopters above miss them; stamp the decorated row's id only when its
+          // recognized metadata wrapper reduces to the exact transcript body.
           if (
+            stored.role === "user" &&
             DECORATION_INVARIANT_ADOPTION_NO_ANCHOR_REASONS.has(
               params.noAnchorImportReason ?? "",
             ) &&
             (await this.adoptDecorationInvariantEntryId({
               conversationId,
-              role: stored.role,
               bareContent: stored.content,
               entryId,
             }))
@@ -1215,29 +1217,25 @@ export class TranscriptReconciler {
 
   /**
    * Stamp a brand-new transcript entry id onto a recently-persisted,
-   * still-unstamped runtime row that is the DECORATED face of the same turn
-   * (the bare body is its line-aligned trailing segment under recognized
-   * decoration). Keeps the single decorated row and anchors it, instead of
-   * importing the bare transcript copy as a duplicate. Bounded to the flush-lag
-   * tail window so legacy unstamped history is never mis-adopted.
+   * still-unstamped user runtime row that is the DECORATED face of the same
+   * turn (its recognized metadata wrapper reduces to the exact bare
+   * model-facing body). Keeps the single decorated row and anchors it, instead
+   * of importing the bare transcript copy as a duplicate. Bounded to the
+   * flush-lag tail window so legacy unstamped history is never mis-adopted.
    */
   private async adoptDecorationInvariantEntryId(params: {
     conversationId: number;
-    role: MessageRole;
     bareContent: string;
     entryId: string;
   }): Promise<boolean> {
     const candidates = await this.host.conversationStore.listRecentUnstampedMessagesByRole(
       params.conversationId,
-      params.role,
+      "user",
       FLUSH_LAG_ADOPTION_TAIL_WINDOW,
     );
     for (const candidate of candidates) {
       if (
-        liveContentIsRecognizedDecoratedBareBody({
-          liveContent: candidate.content,
-          bareContent: params.bareContent,
-        }) &&
+        openClawInboundBodiesMatch(candidate.content, params.bareContent) &&
         (await this.host.conversationStore.restampTranscriptEntryId(
           candidate.messageId,
           params.entryId,

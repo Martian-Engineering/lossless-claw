@@ -1092,9 +1092,8 @@ export class ConversationStore {
    * entry id — the flush-lagged runtime rows a transcript catch-up may adopt.
    * Returns id + content so the caller can apply a decoration-invariant match
    * before stamping, rather than the exact identity_hash + content match the SQL
-   * adopters use. Ordered OLDEST-first so a multi-turn recovery pairs each bare
-   * row with its own decorated twin chronologically, instead of letting a short
-   * earlier turn adopt a later, longer row that merely shares a trailing line.
+   * adopters use. Ordered OLDEST-first so a multi-turn recovery consumes
+   * repeated equal bodies in transcript order.
    */
   async listRecentUnstampedMessagesByRole(
     conversationId: ConversationId,
