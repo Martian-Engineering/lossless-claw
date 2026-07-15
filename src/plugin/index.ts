@@ -36,7 +36,7 @@ import type {
 } from "../types.js";
 import { listConfiguredAgentIds, normalizeAgentId } from "./openclaw-agent-ids.js";
 
-const MIN_CONTEXT_ENGINE_OPENCLAW_VERSION = "2026.6.10";
+const MIN_CONTEXT_ENGINE_OPENCLAW_VERSION = "2026.7.2";
 
 type PluginSdkCoreModule = {
   delegateCompactionToRuntime?: RuntimeCompactionDelegateFn;
@@ -151,7 +151,7 @@ async function loadBuildMemorySystemPromptAdditionModule(): Promise<BuildMemoryS
     }
   }
   throw new Error(
-    "[lcm] OpenClaw buildMemorySystemPromptAddition is unavailable; install OpenClaw >=2026.6.10.",
+    `[lcm] OpenClaw buildMemorySystemPromptAddition is unavailable; install OpenClaw >=${MIN_CONTEXT_ENGINE_OPENCLAW_VERSION}.`,
     { cause: importErrors[0] },
   );
 }
@@ -170,7 +170,7 @@ async function loadReadVisibleSessionTranscriptMessageEntriesModule(): Promise<R
     return mod.readVisibleSessionTranscriptMessageEntries as ReadVisibleSessionTranscriptMessageEntries;
   }
   throw new Error(
-    "[lcm] OpenClaw readVisibleSessionTranscriptMessageEntries is unavailable; install the SQLite transcript runtime build.",
+    `[lcm] OpenClaw readVisibleSessionTranscriptMessageEntries is unavailable; install OpenClaw >=${MIN_CONTEXT_ENGINE_OPENCLAW_VERSION}.`,
   );
 }
 

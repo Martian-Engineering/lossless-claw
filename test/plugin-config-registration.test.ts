@@ -355,7 +355,7 @@ describe("lcm plugin registration", () => {
     delete (api as unknown as { registerContextEngine?: unknown }).registerContextEngine;
 
     expect(() => lcmPlugin.register(api)).toThrow(
-      /requires OpenClaw >=2026\.6\.10 with api\.registerContextEngine/,
+      /requires OpenClaw >=2026\.7\.2 with api\.registerContextEngine/,
     );
     expect(createSpy).not.toHaveBeenCalled();
     expect(api.registerCommand).not.toHaveBeenCalled();

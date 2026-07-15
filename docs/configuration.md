@@ -2,22 +2,27 @@
 
 Lossless-claw reads plugin configuration from `plugins.entries.lossless-claw.config`.
 
-Lossless-claw requires OpenClaw `2026.5.22` or newer so the host can enforce
-context-engine runtime capabilities before an agent run starts. Agent runs need
-a native host that provides the full context-engine lifecycle: session bootstrap,
-pre-prompt assembly, after-turn ingestion, maintenance, compaction, and runtime
-LLM completion. Native Codex and Pi embedded runs provide those capabilities;
-generic CLI harnesses such as `claude-cli` and `codex-cli` do not. If you must
-use a generic CLI harness, either set `plugins.slots.contextEngine` to `legacy`
-or explicitly set `hostFallbackMode` to `capture-only`. Capture-only mode lowers
-the installation-wide `agent-run` requirement to bootstrap, after-turn ingestion,
-and maintenance. Generic CLI runs can persist transcripts and use recall tools,
-but they do not receive Lossless prompt assembly or host-triggered Lossless
-compaction. Backend-native compaction remains host-owned. Explicit Lossless
-compaction requires `fallbackProviders` because generic CLI hosts do not provide
-runtime LLM completion. Fully capable native hosts still advertise and execute
-the full lifecycle, and Lossless retains compaction ownership for those runs.
-Subagent forks continue to require `thread-bootstrap-projection`.
+Lossless-claw requires OpenClaw `2026.7.2` or newer so the host can provide the
+branch-safe visible transcript projection used during SQLite session bootstrap
+and enforce context-engine runtime capabilities before an agent run starts.
+Agent runs need a native host that provides the full context-engine lifecycle:
+session bootstrap, pre-prompt assembly, after-turn ingestion, maintenance,
+compaction, and runtime LLM completion. Native Codex and Pi embedded runs provide
+those capabilities. Generic CLI harnesses such as `claude-cli` and `codex-cli`
+do not. For generic CLI harnesses on a supported OpenClaw release, either set
+`plugins.slots.contextEngine` to `legacy` or explicitly set `hostFallbackMode`
+to `capture-only`. Capture-only mode lowers the installation-wide `agent-run`
+requirement to bootstrap, after-turn ingestion, and maintenance. Generic CLI
+runs can persist transcripts and use recall tools, but they do not receive
+Lossless prompt assembly or host-triggered Lossless compaction. Backend-native
+compaction remains host-owned. Explicit Lossless compaction requires
+`fallbackProviders` because generic CLI hosts do not provide runtime LLM
+completion. Fully capable native hosts still advertise and execute the full
+lifecycle, and Lossless retains compaction ownership for those runs. Subagent
+forks continue to require `thread-bootstrap-projection`.
+
+If you cannot upgrade OpenClaw, use a `lossless-claw` release compatible with
+your installed OpenClaw version.
 
 The optional programmatic `status` / `doctor` / `rotate` control surface requires
 a host that separately advertises context-engine capabilities/control dispatch.
