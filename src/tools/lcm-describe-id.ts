@@ -1,10 +1,10 @@
+// Retrieval remains the authority for ID existence; keep this grammar open to
+// future lowercase ID formats instead of duplicating today's 16-hex generator.
 const LCM_BARE_ID_RE = /^(?:sum|file)_[a-z0-9_-]+$/;
 const LCM_ID_TOKEN_RE = /\b(?:sum|file)_[a-z0-9_-]+\b/g;
 const LCM_LOOSE_ID_RE = /\b(?:sum|file)_[A-Za-z0-9_-]*\b/i;
 const LCM_REFERENCE_RE =
   /^\[LCM (?:Tool Output|File|Raw Payload):\s*((?:sum|file)_[a-z0-9_-]+)(?=\s*[|\]])[^\r\n]*\](?:\r?\n[\s\S]*)?$/;
-const LCM_REFERENCE_LINE_RE =
-  /^\[LCM (?:Tool Output|File|Raw Payload):\s*((?:sum|file)_[a-z0-9_-]+)(?=\s*[|\]])/gm;
 
 export type ExtractLcmDescribeIdResult =
   | { ok: true; id: string }
@@ -25,15 +25,6 @@ export function extractLcmDescribeId(raw: string): ExtractLcmDescribeIdResult {
   // Metadata and summaries may contain ID-like filenames or ordinary prose.
   const referenceId = trimmed.match(LCM_REFERENCE_RE)?.[1];
   if (referenceId) {
-    const referenceIds = [
-      ...new Set([...trimmed.matchAll(LCM_REFERENCE_LINE_RE)].map((match) => match[1])),
-    ];
-    if (referenceIds.length > 1) {
-      return {
-        ok: false,
-        error: `Input contains multiple LCM IDs (${referenceIds.join(", ")}). Provide a single reference string.`,
-      };
-    }
     return validateLcmId(referenceId);
   }
 

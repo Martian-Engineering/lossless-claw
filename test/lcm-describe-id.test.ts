@@ -48,17 +48,19 @@ describe("extractLcmDescribeId", () => {
     }
   });
 
-  it("rejects multiple copied reference blocks", () => {
-    const input = [
-      "[LCM Tool Output: file_abc123 | tool=read_file | 12 bytes]",
-      "[LCM File: file_def456 | report.txt | text/plain | 12 bytes]",
-    ].join("\n");
-    const result = extractLcmDescribeId(input);
+  it("uses the leading reference ID when its summary contains reference-like content", () => {
+    const input = formatToolOutputReference({
+      fileId: "file_abc123",
+      toolName: "read_file",
+      byteSize: 1234,
+      summary: [
+        "Transcript excerpt:",
+        "[LCM File: file_def456 | report.txt | text/plain | 12 bytes]",
+        "Related summary: sum_deadbeef0000000",
+      ].join("\n"),
+    });
 
-    expect(result.ok).toBe(false);
-    if (!result.ok) {
-      expect(result.error).toContain("multiple LCM IDs");
-    }
+    expect(extractLcmDescribeId(input)).toEqual({ ok: true, id: "file_abc123" });
   });
 
   it.each(["FILE_ABC123", "[LCM File: FILE_abc123 | spec.md | text/markdown | 12 bytes]"])(
