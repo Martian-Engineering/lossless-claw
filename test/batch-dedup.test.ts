@@ -12,11 +12,9 @@ function makeLog() {
 type FakeConversationStore = {
   conversationId: number;
   messages: MessageRecord[];
-  hasMessageAnswers: boolean[];
 };
 
 function makeConversationStore(initial: FakeConversationStore): ConversationStore {
-  const log = makeLog();
   return {
     getConversationForSession: vi.fn(async () => ({ conversationId: initial.conversationId })),
     getMessageCount: vi.fn(async () => initial.messages.length),
@@ -46,7 +44,16 @@ function makeConversationStore(initial: FakeConversationStore): ConversationStor
         .slice(-limit)
         .map((m) => buildMessageIdentityHash(m.role, m.content));
     }),
-    hasMessage: vi.fn(async () => initial.hasMessageAnswers.shift() ?? false),
+    hasMessage: vi.fn(async (conversationId: number, role: string, content: string) => {
+      expect(conversationId).toBe(initial.conversationId);
+      const identityHash = buildMessageIdentityHash(role, content);
+      return initial.messages.some(
+        (message) =>
+          message.role === role &&
+          message.content === content &&
+          buildMessageIdentityHash(message.role, message.content) === identityHash,
+      );
+    }),
     countMessagesByIdentityHash: vi.fn(
       async (_conversationId: number, role: string, identityHash: string) =>
         initial.messages.filter(
@@ -80,7 +87,7 @@ function storedMessage(role: string, content: string): MessageRecord {
 
 describe("BatchDeduplicator.deduplicateAfterTurnBatch", () => {
   it("returns an empty batch unchanged", async () => {
-    const dedup = makeDedup({ conversationId: 1, messages: [], hasMessageAnswers: [] });
+    const dedup = makeDedup({ conversationId: 1, messages: [] });
     const result = await dedup.deduplicateAfterTurnBatch("s1", undefined, []);
     expect(result).toEqual([]);
   });
@@ -100,7 +107,7 @@ describe("BatchDeduplicator.deduplicateAfterTurnBatch", () => {
   });
 
   it("returns the batch when the stored conversation is empty", async () => {
-    const dedup = makeDedup({ conversationId: 1, messages: [], hasMessageAnswers: [] });
+    const dedup = makeDedup({ conversationId: 1, messages: [] });
     const batch = [makeMessage({ role: "user", content: "hello" })];
     const result = await dedup.deduplicateAfterTurnBatch("s1", undefined, batch);
     expect(result).toEqual(batch);
@@ -110,7 +117,6 @@ describe("BatchDeduplicator.deduplicateAfterTurnBatch", () => {
     const dedup = makeDedup({
       conversationId: 1,
       messages: [storedMessage("user", "a"), storedMessage("assistant", "b")],
-      hasMessageAnswers: [],
     });
     const batch = [
       makeMessage({ role: "user", content: "a" }),
@@ -125,7 +131,6 @@ describe("BatchDeduplicator.deduplicateAfterTurnBatch", () => {
     const dedup = makeDedup({
       conversationId: 1,
       messages: [storedMessage("user", "a"), storedMessage("assistant", "b")],
-      hasMessageAnswers: [],
     });
     const batch = [
       makeMessage({ role: "user", content: "a" }),
@@ -143,7 +148,6 @@ describe("BatchDeduplicator.deduplicateAfterTurnBatch", () => {
         storedMessage("assistant", "old-2"),
         storedMessage("user", "old-3"),
       ],
-      hasMessageAnswers: [],
     });
     const batch = [
       makeMessage({ role: "user", content: "old-3" }),
@@ -159,7 +163,6 @@ describe("BatchDeduplicator.alignRuntimeBatchAgainstCoveredFrontier", () => {
     const dedup = makeDedup({
       conversationId: 1,
       messages: [storedMessage("user", "a"), storedMessage("assistant", "b")],
-      hasMessageAnswers: [],
     });
     const batch = [
       makeMessage({ role: "user", content: "a" }),
@@ -173,7 +176,6 @@ describe("BatchDeduplicator.alignRuntimeBatchAgainstCoveredFrontier", () => {
     const dedup = makeDedup({
       conversationId: 1,
       messages: [storedMessage("user", "a"), storedMessage("assistant", "b")],
-      hasMessageAnswers: [],
     });
     const batch = [
       makeMessage({ role: "user", content: "a" }),
@@ -188,7 +190,6 @@ describe("BatchDeduplicator.alignRuntimeBatchAgainstCoveredFrontier", () => {
     const dedup = makeDedup({
       conversationId: 1,
       messages: [storedMessage("user", "old")],
-      hasMessageAnswers: [],
     });
     const batch = [makeMessage({ role: "user", content: "new" })];
     const result = await dedup.alignRuntimeBatchAgainstCoveredFrontier("s1", undefined, batch);
@@ -201,7 +202,6 @@ describe("BatchDeduplicator.alignRuntimeBatchAgainstCoveredFrontier", () => {
     const dedup = makeDedup({
       conversationId: 1,
       messages: [storedMessage("user", bareContent)],
-      hasMessageAnswers: [],
     });
     const batch = [makeMessage({ role: "user", content: decoratedContent })];
     const result = await dedup.alignRuntimeBatchAgainstCoveredFrontier("s1", undefined, batch);
@@ -212,7 +212,6 @@ describe("BatchDeduplicator.alignRuntimeBatchAgainstCoveredFrontier", () => {
     const dedup = makeDedup({
       conversationId: 1,
       messages: [storedMessage("user", "a"), storedMessage("assistant", "b")],
-      hasMessageAnswers: [true, false],
     });
     const batch = [
       makeMessage({ role: "user", content: "a" }),
