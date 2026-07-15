@@ -253,6 +253,61 @@ describe("placeholder-checkpoint recovery double-write", () => {
     expect(userRows.map((message) => message.content)).toEqual([differentDecoratedBody, "ok"]);
   });
 
+  it("does not adopt when multiple decorated rows reduce to the same bare body", async () => {
+    const engine = createEngineWithDeps(
+      {},
+      { log: { info: vi.fn(), warn: vi.fn(), error: vi.fn(), debug: vi.fn() } },
+    );
+    const sessionId = "ambiguous-identical-bodies";
+    const sessionKey = "agent:agent-one:telegram:ambiguous-identical-bodies";
+
+    await engine.ingest({
+      sessionId,
+      sessionKey,
+      message: makeMessage({ role: "user", content: decoratedRoomEvent("ok") }),
+    });
+    await engine.ingest({
+      sessionId,
+      sessionKey,
+      message: makeMessage({ role: "user", content: decoratedRoomEvent("ok") }),
+    });
+    const conversation = await engine
+      .getConversationStore()
+      .getConversationForSession({ sessionId, sessionKey });
+    expect(conversation).not.toBeNull();
+
+    const sessionFile = createSessionFilePath("ambiguous-identical-bodies");
+    const sessionManager = SessionManager.open(sessionFile);
+    appendSessionMessage(sessionManager, makeMessage({ role: "user", content: "ok" }));
+    appendSessionMessage(sessionManager, makeMessage({ role: "assistant", content: "reply" }));
+    await engine.getSummaryStore().upsertConversationBootstrapState({
+      conversationId: conversation!.conversationId,
+      sessionFilePath: sessionFile,
+      lastSeenSize: 0,
+      lastSeenMtimeMs: 0,
+      lastProcessedOffset: 0,
+      lastProcessedEntryHash: null,
+    });
+
+    await engine.afterTurn({
+      sessionId,
+      sessionKey,
+      sessionFile,
+      messages: [],
+      prePromptMessageCount: 0,
+      tokenBudget: 4_096,
+    });
+
+    const userRows = (
+      await engine.getConversationStore().getMessages(conversation!.conversationId)
+    ).filter((message) => message.role === "user");
+    expect(userRows.map((message) => message.content)).toEqual([
+      decoratedRoomEvent("ok"),
+      decoratedRoomEvent("ok"),
+      "ok",
+    ]);
+  });
+
   it("does not apply inbound-decoration adoption to assistant rows", async () => {
     const engine = createEngineWithDeps(
       {},
