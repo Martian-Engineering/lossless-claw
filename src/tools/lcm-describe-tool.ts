@@ -10,6 +10,7 @@ import { jsonResult } from "./common.js";
 import { resolveLcmConversationScope } from "./lcm-conversation-scope.js";
 import { formatTimestamp } from "../compaction.js";
 import type { DescribeResult } from "../retrieval.js";
+import { extractLcmDescribeId } from "./lcm-describe-id.js";
 
 function formatDisplayTime(
   value: Date | string | number | null | undefined,
@@ -91,93 +92,6 @@ function normalizeRequestedTokenCap(value: unknown): number | undefined {
     return undefined;
   }
   return Math.max(1, Math.trunc(value));
-}
-
-const LCM_BARE_ID_RE = /^(sum|file)_[a-z0-9_-]+$/;
-const LCM_ID_TOKEN_RE = /\b(sum|file)_[a-z0-9_-]+\b/g;
-const LCM_REFERENCE_PREFIX_RE =
-  /^\[LCM (Tool Output|File|Raw Payload):\s*((sum|file)_[a-z0-9_-]+)(?=\s*[|\]])/i;
-
-function isZeroLcmId(id: string): boolean {
-  const suffix = id.slice(id.indexOf("_") + 1);
-  return suffix.length === 0 || /^0+$/.test(suffix);
-}
-
-/**
- * Accept either a bare LCM ID (`sum_xxx`, `file_xxx`) or a single copied
- * reference string such as `[LCM Tool Output: file_xxx | tool=… | N bytes]`
- * and return the embedded ID. Rejects ambiguous input (multiple IDs), zero
- * IDs, malformed IDs, and free-form text that happens to contain an ID.
- */
-type ExtractLcmDescribeIdResult =
-  | { ok: true; id: string }
-  | { ok: false; error: string; hint?: string };
-
-function extractLcmDescribeId(raw: string): ExtractLcmDescribeIdResult {
-  const trimmed = raw.trim();
-
-  // Bare ID: the entire argument must be the ID.
-  if (LCM_BARE_ID_RE.test(trimmed)) {
-    if (isZeroLcmId(trimmed)) {
-      return { ok: false, error: `LCM ID cannot be a zero/empty ID: ${trimmed}` };
-    }
-    return { ok: true, id: trimmed };
-  }
-
-  // Recognized copied reference forms: [LCM Tool Output: id | ...],
-  // [LCM File: id | ...], [LCM Raw Payload: id | ...].
-  const refMatch = trimmed.match(LCM_REFERENCE_PREFIX_RE);
-  if (refMatch && trimmed.endsWith("]")) {
-    const id = refMatch[2] as string;
-    const afterId = trimmed.slice((refMatch.index ?? 0) + refMatch[0].length);
-    const extraIds = [...afterId.matchAll(LCM_ID_TOKEN_RE)].map((m) => m[0] as string);
-    if (extraIds.length > 0) {
-      return {
-        ok: false,
-        error: `Reference string contains multiple LCM IDs (${id}, ${extraIds.join(", ")}). Provide a single reference string.`,
-      };
-    }
-    if (isZeroLcmId(id)) {
-      return { ok: false, error: `LCM ID cannot be a zero/empty ID: ${id}` };
-    }
-    return { ok: true, id };
-  }
-
-  // Not a valid bare ID or reference. Check for ambiguity / malformed input.
-  const tokens = [...trimmed.matchAll(LCM_ID_TOKEN_RE)].map((m) => m[0] as string);
-  if (tokens.length > 1) {
-    return {
-      ok: false,
-      error: `Input contains multiple LCM IDs (${tokens.join(", ")}). Provide a bare ID or a single reference string.`,
-    };
-  }
-
-  const looseTokens = [...trimmed.matchAll(/\b(sum|file)_[A-Za-z0-9_-]*\b/gi)].map(
-    (m) => m[0] as string,
-  );
-  if (looseTokens.length === 1) {
-    const id = looseTokens[0];
-    const suffix = id.slice(id.indexOf("_") + 1);
-    if (suffix.length === 0) {
-      return { ok: false, error: `LCM ID cannot be a zero/empty ID: ${id}` };
-    }
-    if (!/^[a-z0-9_-]+$/.test(suffix)) {
-      return {
-        ok: false,
-        error: `Malformed LCM ID: ${id}. IDs must be lowercase and contain only letters, digits, underscores, and hyphens after the prefix.`,
-      };
-    }
-    if (isZeroLcmId(id)) {
-      return { ok: false, error: `LCM ID cannot be a zero/empty ID: ${id}` };
-    }
-    return {
-      ok: false,
-      error: `Not a recognized LCM ID format: ${raw}`,
-      hint: "Provide a bare ID or a single copied reference string such as [LCM Tool Output: file_xxx | ...].",
-    };
-  }
-
-  return { ok: false, error: `Not a recognized LCM ID: ${raw}` };
 }
 
 function compactDescribeDetails(result: DescribeResult | null) {
