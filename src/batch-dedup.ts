@@ -37,7 +37,10 @@ import type { LcmDependencies } from "./types.js";
  * one. Frontier-coverage comparison only; storage stays byte-verbatim.
  */
 function normalizeFrontierWhitespace(content: string): string {
-  return content.replace(/ +/g, " ");
+  return content.replace(/ +/g, (spaces, offset: number) => {
+    const isMessageBoundary = offset === 0 || offset + spaces.length === content.length;
+    return isMessageBoundary ? spaces : " ";
+  });
 }
 
 export class BatchDeduplicator {
@@ -94,7 +97,10 @@ export class BatchDeduplicator {
     persistedContent: string,
     batchRole: string,
     batchContent: string,
-    options?: { allowUntimestampedInboundBodyMatch?: boolean },
+    options?: {
+      allowCollapsedSpaceRunMatch?: boolean;
+      allowUntimestampedInboundBodyMatch?: boolean;
+    },
   ): boolean {
     if (
       messageIdentity(persistedRole, persistedContent) ===
@@ -112,12 +118,14 @@ export class BatchDeduplicator {
     // only when identical once those space runs are normalized. Newlines and
     // tabs stay significant (comparison only; the verbatim persisted row
     // survives).
-    const normalizedPersisted = normalizeFrontierWhitespace(persistedContent);
-    if (
-      normalizedPersisted.length > 0 &&
-      normalizedPersisted === normalizeFrontierWhitespace(batchContent)
-    ) {
-      return true;
+    if (options?.allowCollapsedSpaceRunMatch === true) {
+      const normalizedPersisted = normalizeFrontierWhitespace(persistedContent);
+      if (
+        normalizedPersisted.length > 0 &&
+        normalizedPersisted === normalizeFrontierWhitespace(batchContent)
+      ) {
+        return true;
+      }
     }
     // A metadata block alone is user-forgeable, so body equality after stripping
     // it is not proof of same-turn decoration. Covered-frontier callers may use
@@ -188,6 +196,7 @@ export class BatchDeduplicator {
               tailMessages[i]!.content,
               storedBatch[i]!.role,
               storedBatch[i]!.content,
+              { allowCollapsedSpaceRunMatch: true },
             )
           ) {
             exactAnchor = true;

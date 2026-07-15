@@ -237,4 +237,166 @@ describe("whitespace-divergent covered-path double-write", () => {
     ).filter((m) => m.role === "user" && m.content.includes(LABEL));
     expect(userBodyRows).toHaveLength(2);
   });
+
+  it.each([
+    ["leading", `  ${VERBATIM}`, ` ${COLLAPSED}`],
+    ["trailing", `${VERBATIM}  `, `${COLLAPSED} `],
+  ])("keeps turns with distinct %s space runs", async (boundary, persisted, runtime) => {
+    const engine: LcmContextEngine = createEngineWithDeps(
+      {},
+      { log: { info: vi.fn(), warn: vi.fn(), error: vi.fn(), debug: vi.fn() } },
+    );
+    const sessionId = `whitespace-${boundary}-distinct`;
+    const sessionKey = `agent:main:whitespace-${boundary}-distinct`;
+    const conversation = await engine
+      .getConversationStore()
+      .getOrCreateConversation(sessionId, { sessionKey });
+
+    const bulk = await engine.getConversationStore().createMessagesBulk([
+      {
+        conversationId: conversation.conversationId,
+        seq: 0,
+        role: "user",
+        content: persisted,
+        tokenCount: 16,
+        skipReplayTimestampFloodGuard: true,
+      },
+    ]);
+    await engine
+      .getSummaryStore()
+      .appendContextMessages(conversation.conversationId, bulk.map((m) => m.messageId));
+
+    const sessionFile = createSessionFilePath(`whitespace-${boundary}-distinct`);
+    writeLeafTranscript(sessionFile, [{ role: "user", content: persisted }]);
+    await engine.getSummaryStore().upsertConversationBootstrapState({
+      conversationId: conversation.conversationId,
+      sessionFilePath: sessionFile,
+      lastSeenSize: 0,
+      lastSeenMtimeMs: 0,
+      lastProcessedOffset: 0,
+      lastProcessedEntryHash: null,
+    });
+
+    await engine.afterTurn({
+      sessionId,
+      sessionKey,
+      sessionFile,
+      messages: [makeMessage({ role: "user", content: runtime })],
+      prePromptMessageCount: 0,
+      tokenBudget: 4_096,
+    });
+
+    const userBodyRows = (
+      await engine.getConversationStore().getMessages(conversation.conversationId)
+    ).filter((m) => m.role === "user" && m.content.includes(LABEL));
+    expect(userBodyRows).toHaveLength(2);
+  });
+
+  it("keeps space-run-divergent turns when transcript coverage is degraded", async () => {
+    const engine: LcmContextEngine = createEngineWithDeps(
+      {},
+      { log: { info: vi.fn(), warn: vi.fn(), error: vi.fn(), debug: vi.fn() } },
+    );
+    const sessionId = "whitespace-degraded-no-collapse";
+    const sessionKey = "agent:main:whitespace-degraded-no-collapse";
+    const conversation = await engine
+      .getConversationStore()
+      .getOrCreateConversation(sessionId, { sessionKey });
+
+    const bulk = await engine.getConversationStore().createMessagesBulk([
+      {
+        conversationId: conversation.conversationId,
+        seq: 0,
+        role: "user",
+        content: VERBATIM,
+        tokenCount: 16,
+        skipReplayTimestampFloodGuard: true,
+      },
+    ]);
+    await engine
+      .getSummaryStore()
+      .appendContextMessages(conversation.conversationId, bulk.map((m) => m.messageId));
+
+    const missingSessionFile = createSessionFilePath("whitespace-degraded-no-collapse");
+    await engine.getSummaryStore().upsertConversationBootstrapState({
+      conversationId: conversation.conversationId,
+      sessionFilePath: missingSessionFile,
+      lastSeenSize: 24_000,
+      lastSeenMtimeMs: 1_700_000_000_000,
+      lastProcessedOffset: 24_000,
+      lastProcessedEntryHash: "checkpoint-hash",
+    });
+
+    await engine.afterTurn({
+      sessionId,
+      sessionKey,
+      sessionFile: missingSessionFile,
+      messages: [makeMessage({ role: "user", content: COLLAPSED })],
+      prePromptMessageCount: 0,
+      tokenBudget: 4_096,
+    });
+
+    const userBodyRows = (
+      await engine.getConversationStore().getMessages(conversation.conversationId)
+    ).filter((m) => m.role === "user" && m.content.includes(LABEL));
+    expect(userBodyRows).toHaveLength(2);
+  });
+
+  it("keeps space-run-divergent turns in degraded oversized suffix matching", async () => {
+    const engine: LcmContextEngine = createEngineWithDeps(
+      {},
+      { log: { info: vi.fn(), warn: vi.fn(), error: vi.fn(), debug: vi.fn() } },
+    );
+    const sessionId = "whitespace-oversized-no-collapse";
+    const sessionKey = "agent:main:whitespace-oversized-no-collapse";
+    const conversation = await engine
+      .getConversationStore()
+      .getOrCreateConversation(sessionId, { sessionKey });
+
+    const bulk = await engine.getConversationStore().createMessagesBulk([
+      {
+        conversationId: conversation.conversationId,
+        seq: 0,
+        role: "assistant",
+        content: "previous reply",
+        tokenCount: 2,
+        skipReplayTimestampFloodGuard: true,
+      },
+      {
+        conversationId: conversation.conversationId,
+        seq: 1,
+        role: "user",
+        content: VERBATIM,
+        tokenCount: 16,
+        skipReplayTimestampFloodGuard: true,
+      },
+    ]);
+    await engine
+      .getSummaryStore()
+      .appendContextMessages(conversation.conversationId, bulk.map((m) => m.messageId));
+
+    const missingSessionFile = createSessionFilePath("whitespace-oversized-no-collapse");
+    await engine.getSummaryStore().upsertConversationBootstrapState({
+      conversationId: conversation.conversationId,
+      sessionFilePath: missingSessionFile,
+      lastSeenSize: 24_000,
+      lastSeenMtimeMs: 1_700_000_000_000,
+      lastProcessedOffset: 24_000,
+      lastProcessedEntryHash: "checkpoint-hash",
+    });
+
+    await engine.afterTurn({
+      sessionId,
+      sessionKey,
+      sessionFile: missingSessionFile,
+      messages: [makeMessage({ role: "user", content: COLLAPSED })],
+      prePromptMessageCount: 0,
+      tokenBudget: 4_096,
+    });
+
+    const userBodyRows = (
+      await engine.getConversationStore().getMessages(conversation.conversationId)
+    ).filter((m) => m.role === "user" && m.content.includes(LABEL));
+    expect(userBodyRows).toHaveLength(2);
+  });
 });
