@@ -2675,4 +2675,70 @@ describe("assemble emergency drain force=true", () => {
       vi.useRealTimers();
     }
   });
+
+  it("retryAttempts >= ASSEMBLE_FORCE_MAX_RETRY_ATTEMPTS disables force in emergency drain", async () => {
+    vi.useFakeTimers({ toFake: ["Date"] });
+    vi.setSystemTime(new Date("2026-07-14T12:00:00.000Z"));
+    try {
+      const engine = createEngineWithConfig({ freshTailCount: 1 });
+      const sessionId = "emergency-drain-force-capped";
+      const tokenBudget = 1000;
+
+      await seedBacklogContext(engine, sessionId, [100, 100, 100]);
+      const conversation = await engine
+        .getConversationStore()
+        .getConversationBySessionId(sessionId);
+      expect(conversation).not.toBeNull();
+
+      await engine.getCompactionMaintenanceStore().requestProactiveCompactionDebt({
+        conversationId: conversation!.conversationId,
+        reason: "threshold",
+        tokenBudget,
+        currentTokenCount: 9999,
+        projectedTokenCount: 9999,
+      });
+
+      // Seed retryAttempts to 3 by cycling running→finished 3 times
+      const store = engine.getCompactionMaintenanceStore();
+      for (let i = 0; i < 3; i++) {
+        await store.markProactiveCompactionRunning({
+          conversationId: conversation!.conversationId,
+        });
+        await store.markProactiveCompactionFinished({
+          conversationId: conversation!.conversationId,
+          failureSummary: "compacted but still over target",
+          keepPending: true,
+        });
+      }
+
+      const maintenance = await store.getConversationCompactionMaintenance(
+        conversation!.conversationId,
+      );
+      expect(maintenance?.retryAttempts).toBe(3);
+      expect(maintenance?.pending).toBe(true);
+
+      const privateEngine = engine as unknown as {
+        maybeConsumeDeferredCompactionDebtForAssemble: (params: {
+          conversationId: number;
+          sessionId: string;
+          sessionKey?: string;
+          tokenBudget: number;
+        }) => Promise<{ exhausted: boolean }>;
+        executeCompactionCore: (params: unknown) => Promise<unknown>;
+      };
+      const executeSpy = vi.spyOn(privateEngine, "executeCompactionCore");
+
+      await privateEngine.maybeConsumeDeferredCompactionDebtForAssemble({
+        conversationId: conversation!.conversationId,
+        sessionId,
+        tokenBudget,
+      });
+
+      // retryAttempts=3 >= ASSEMBLE_FORCE_MAX_RETRY_ATTEMPTS, so force is false
+      // and backoff should still block — executeCompactionCore NOT called
+      expect(executeSpy).not.toHaveBeenCalled();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
 });

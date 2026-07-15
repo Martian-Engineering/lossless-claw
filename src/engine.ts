@@ -100,11 +100,11 @@ const DEFERRED_ASSEMBLY_DEGRADED_PRESSURE_RATIO = 0.75;
  * Maximum retry attempts before the assemble emergency drain stops forwarding
  * force=true to consumeDeferredCompactionDebt. After this threshold, the drain
  * falls back to respecting backoff and degrading the live prompt instead of
- * retrying compaction. The backoff delay saturates at retryAttempts=7
- * (2^(7-1)=64x multiplier capped at 30min); 10 adds headroom for the 3 extra
- * rounds after saturation before giving up on force entirely.
+ * retrying compaction. Set to 3 to limit force retry attempts, matching common
+ * retry budget patterns — after 3 consecutive failures, compaction is unlikely
+ * to succeed and fallback to degraded live prompt is safer.
  */
-const ASSEMBLE_FORCE_MAX_RETRY_ATTEMPTS = 10;
+const ASSEMBLE_FORCE_MAX_RETRY_ATTEMPTS = 3;
 type CompactionExecutionParams = {
   conversationId: number;
   sessionId: string;
@@ -781,13 +781,13 @@ export class LcmContextEngine implements ContextEngine {
       scope: this.resolveSessionQueueKey(params.sessionId, params.sessionKey),
     });
 
-    if (
-      !params.force &&
-      maintenance.nextAttemptAfter !== null &&
-      maintenance.nextAttemptAfter.getTime() > Date.now()
-    ) {
+    const nextAttemptAfter = maintenance.nextAttemptAfter;
+    const backoffActive =
+      nextAttemptAfter !== null && nextAttemptAfter.getTime() > Date.now();
+
+    if (!params.force && backoffActive) {
       this.deps.log.debug(
-        `[lcm] maintain: deferred compaction backoff active conversation=${params.conversationId} ${sessionLabel} retryAttempts=${maintenance.retryAttempts} nextAttemptAfter=${maintenance.nextAttemptAfter.toISOString()} debtReason=${maintenance.reason ?? "null"}`,
+        `[lcm] maintain: deferred compaction backoff active conversation=${params.conversationId} ${sessionLabel} retryAttempts=${maintenance.retryAttempts} nextAttemptAfter=${nextAttemptAfter.toISOString()} debtReason=${maintenance.reason ?? "null"}`,
       );
       return {
         changed: false,
@@ -797,9 +797,9 @@ export class LcmContextEngine implements ContextEngine {
       };
     }
 
-    if (params.force && maintenance.nextAttemptAfter !== null && maintenance.nextAttemptAfter.getTime() > Date.now()) {
+    if (params.force && backoffActive) {
       this.deps.log.warn(
-        `[lcm] consumeDeferredCompactionDebt: force=true skipping backoff conversation=${params.conversationId} ${sessionLabel} retryAttempts=${maintenance.retryAttempts} nextAttemptAfter=${maintenance.nextAttemptAfter.toISOString()}`,
+        `[lcm] consumeDeferredCompactionDebt: force=true skipping backoff conversation=${params.conversationId} ${sessionLabel} retryAttempts=${maintenance.retryAttempts} nextAttemptAfter=${nextAttemptAfter.toISOString()}`,
       );
     }
 
@@ -1251,9 +1251,6 @@ export class LcmContextEngine implements ContextEngine {
           const dynamicFreshTail = Math.floor(
             tokenBudget * (1 - resolvedContextThreshold.contextThreshold) * 0.5,
           );
-          if (dynamicFreshTail > 0) {
-            // override passed via compact input instead of setter
-          }
           return this.compaction.compact({
             conversationId,
             tokenBudget,
