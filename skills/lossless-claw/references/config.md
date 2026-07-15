@@ -575,7 +575,8 @@ Controls the installation-wide `agent-run` host requirement.
 
 - `error` is the default and requires the full context-engine lifecycle
 - `capture-only` accepts hosts that provide bootstrap, after-turn ingestion, and maintenance
-- generic CLI runs in capture-only mode persist transcripts and keep recall tools, but do not receive Lossless prompt assembly or compaction
+- generic CLI runs in capture-only mode persist transcripts and keep recall tools, but do not receive Lossless prompt assembly or host-triggered Lossless compaction
+- backend-native compaction remains host-owned; explicit Lossless compaction requires `fallbackProviders`
 - fully capable native hosts still execute the full lifecycle, and Lossless retains compaction ownership for those runs
 - subagent forks continue to require `thread-bootstrap-projection`
 

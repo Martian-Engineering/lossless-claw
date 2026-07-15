@@ -12,10 +12,12 @@ use a generic CLI harness, either set `plugins.slots.contextEngine` to `legacy`
 or explicitly set `hostFallbackMode` to `capture-only`. Capture-only mode lowers
 the installation-wide `agent-run` requirement to bootstrap, after-turn ingestion,
 and maintenance. Generic CLI runs can persist transcripts and use recall tools,
-but they do not receive Lossless prompt assembly or compaction. Fully capable
-native hosts still advertise and execute the full lifecycle, and Lossless retains
-compaction ownership for those runs. Subagent forks continue to require
-`thread-bootstrap-projection`.
+but they do not receive Lossless prompt assembly or host-triggered Lossless
+compaction. Backend-native compaction remains host-owned. Explicit Lossless
+compaction requires `fallbackProviders` because generic CLI hosts do not provide
+runtime LLM completion. Fully capable native hosts still advertise and execute
+the full lifecycle, and Lossless retains compaction ownership for those runs.
+Subagent forks continue to require `thread-bootstrap-projection`.
 
 The optional programmatic `status` / `doctor` / `rotate` control surface requires
 a host that separately advertises context-engine capabilities/control dispatch.
@@ -209,7 +211,7 @@ output.
 | `ignoreSessionPatterns` | `string[]` | `[]` | `LCM_IGNORE_SESSION_PATTERNS` | Session-key glob patterns that skip LCM entirely. |
 | `statelessSessionPatterns` | `string[]` | `[]` | `LCM_STATELESS_SESSION_PATTERNS` | Session-key glob patterns that may read from LCM but never write to it. |
 | `skipStatelessSessions` | `boolean` | `true` | `LCM_SKIP_STATELESS_SESSIONS` | Enforces `statelessSessionPatterns` when enabled. |
-| `hostFallbackMode` | `"error" \| "capture-only"` | `"error"` | `LCM_HOST_FALLBACK_MODE` | `error` requires the full agent-run lifecycle. `capture-only` accepts bootstrap, after-turn ingestion, and maintenance so generic CLI runs keep transcript capture and recall without Lossless prompt assembly or compaction. Subagent projection requirements remain strict. |
+| `hostFallbackMode` | `"error" \| "capture-only"` | `"error"` | `LCM_HOST_FALLBACK_MODE` | `error` requires the full agent-run lifecycle. `capture-only` accepts bootstrap, after-turn ingestion, and maintenance so generic CLI runs keep transcript capture and recall without Lossless prompt assembly or host-triggered Lossless compaction. Backend-native compaction remains host-owned. Subagent projection requirements remain strict. |
 | `newSessionRetainDepth` | `integer` | `2` | `LCM_NEW_SESSION_RETAIN_DEPTH` | Controls what survives `/new`. `-1` keeps all context, `0` keeps summaries only, higher values keep only deeper summaries. |
 | `timezone` | `string` | `TZ` or system timezone | `TZ` | IANA timezone used for timestamp rendering in summaries. |
 | `pruneHeartbeatOk` | `boolean` | `false` | `LCM_PRUNE_HEARTBEAT_OK` | Retroactively removes `HEARTBEAT_OK` turn cycles from persisted storage. |

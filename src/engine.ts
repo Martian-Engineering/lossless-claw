@@ -367,6 +367,9 @@ export class LcmContextEngine implements ContextEngine {
     // Only claim ownership of compaction when the DB is operational.
     // Without a working schema, ownsCompaction would disable the runtime's
     // built-in compaction safeguard and inflate the context budget.
+    // Capture-only changes agent-run admission, not this global ownership signal.
+    // Generic CLI turns do not consume it; capable native hosts and explicit
+    // Lossless compaction paths still need it to route compaction through LCM.
     this.info = {
       id: "lossless-claw",
       name: "Lossless Context Management Engine",
@@ -407,7 +410,8 @@ export class LcmContextEngine implements ContextEngine {
         log: (message) => (this.deps.log.hostWarn ?? this.deps.log.warn)(message),
         message: [
           "[lcm] WARNING: hostFallbackMode=capture-only relaxes the installation-wide agent-run host requirement to bootstrap/after-turn/maintain.",
-          "Generic CLI runs persist transcripts and keep recall tools, but do not receive Lossless prompt assembly or compaction.",
+          "Generic CLI runs persist transcripts and keep recall tools, but do not receive Lossless prompt assembly or host-triggered Lossless compaction.",
+          "Backend-native compaction remains host-owned; explicit Lossless compaction requires fallbackProviders.",
           "Fully capable native hosts still run the full lifecycle, and subagent forks still require thread-bootstrap-projection.",
         ].join(" "),
       });
