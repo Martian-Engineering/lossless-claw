@@ -39,6 +39,8 @@ The plugin now ships a bundled `lossless-claw` skill plus a small plugin command
 - `/lossless backup` creates a timestamped backup of the current LCM SQLite database
 - `/lossless rotate` rewrites the active session transcript into a compact tail-preserving form without changing the live OpenClaw session identity or current LCM conversation
 - `/lossless doctor` scans for broken or truncated summaries
+- `/lossless doctor apply` repairs broken summaries in the current conversation after the normal safety preflight
+- `/lossless doctor apply <conversation-id> confirm-offline` repairs a specific conversation after its active channel path has been paused or moved away; targeted repair is restricted to authorized OpenClaw command senders and always requires the explicit offline confirmation
 - `/lossless doctor clean` shows read-only high-confidence junk diagnostics for archived subagents, cron sessions, and NULL-key orphaned subagent runs
 - `/lossless status` shows plugin, conversation, and maintenance state including deferred compaction debt
 - `/lcm` is the shorter alias for `/lossless`
@@ -49,6 +51,7 @@ These are plugin slash/native commands, not root shell CLI subcommands. Supporte
 - `/lossless backup`
 - `/lossless rotate`
 - `/lossless doctor`
+- `/lossless doctor apply 42 confirm-offline`
 - `/lossless doctor clean`
 - `/lcm`
 

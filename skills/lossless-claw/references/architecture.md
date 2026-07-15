@@ -42,7 +42,7 @@ The MVP command surface focuses on operational facts:
 
 ## What `/lossless doctor` tells you
 
-The MVP doctor flow is diagnostic only.
+The `/lossless doctor` scan is diagnostic only.
 
 It looks for known summary-health markers that indicate:
 
@@ -50,6 +50,8 @@ It looks for known summary-health markers that indicate:
 - truncated summary artifacts near the end of stored content
 
 This gives users one place to answer the question “is my summary graph healthy?” without introducing a broader mutation surface.
+
+`/lossless doctor apply` is the separate backup-first mutation surface for repairing detected summaries. Current-conversation repair keeps the normal large/hot safety preflight. Targeting another conversation by id requires `/lossless doctor apply <conversation-id> confirm-offline` after the target's active channel path has been isolated.
 
 ## What `/lossless doctor clean` tells you
 

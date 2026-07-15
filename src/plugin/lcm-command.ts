@@ -483,11 +483,16 @@ function parseDoctorApplyArgs(tokens: string[]):
   }
 
   let confirmOffline = false;
+  let explicitConfirmOffline = false;
   let conversationId: number | undefined;
   for (const token of tokens) {
     const normalized = token.toLowerCase();
+    if (normalized === "confirm-offline") {
+      confirmOffline = true;
+      explicitConfirmOffline = true;
+      continue;
+    }
     if (
-      normalized === "confirm-offline" ||
       normalized === "confirm-large" ||
       normalized === "offline" ||
       normalized === "--offline" ||
@@ -500,7 +505,7 @@ function parseDoctorApplyArgs(tokens: string[]):
     const parsedId = Number(token);
     if (
       !Number.isNaN(parsedId) &&
-      Number.isInteger(parsedId) &&
+      Number.isSafeInteger(parsedId) &&
       parsedId > 0 &&
       String(parsedId) === token
     ) {
@@ -518,7 +523,15 @@ function parseDoctorApplyArgs(tokens: string[]):
     return {
       ok: false,
       error:
-        `\`${VISIBLE_COMMAND} doctor apply\` accepts an optional conversation id and optional \`confirm-offline\` for large/hot repair overrides.`,
+        `\`${VISIBLE_COMMAND} doctor apply\` accepts optional \`confirm-offline\` for the current conversation or \`<conversation-id> confirm-offline\` for targeted repair.`,
+    };
+  }
+
+  if (conversationId !== undefined && confirmOffline && !explicitConfirmOffline) {
+    return {
+      ok: false,
+      error:
+        `\`${VISIBLE_COMMAND} doctor apply <conversation-id>\` requires explicit \`confirm-offline\`; other offline aliases apply only to current-conversation repair.`,
     };
   }
 
@@ -631,7 +644,7 @@ function parseLcmCommand(rawArgs: string | undefined): ParsedLcmCommand {
       return {
         kind: "help",
         error:
-          `\`${VISIBLE_COMMAND} doctor\` accepts no arguments, \`rollover-splits\` for global rollover diagnostics, \`apply rollover-splits [confirm]\` for backup-first split repair, \`clean\` for global high-confidence junk diagnostics, \`clean apply [filter-id] [vacuum]\` for cleanup, or \`apply [<conversation-id>] [confirm-offline]\` for the scoped summary repair path.`,
+          `\`${VISIBLE_COMMAND} doctor\` accepts no arguments, \`rollover-splits\` for global rollover diagnostics, \`apply rollover-splits [confirm]\` for backup-first split repair, \`clean\` for global high-confidence junk diagnostics, \`clean apply [filter-id] [vacuum]\` for cleanup, \`apply [confirm-offline]\` for current-conversation repair, or \`apply <conversation-id> confirm-offline\` for targeted repair.`,
       };
     case "help":
       return { kind: "help" };
@@ -1310,8 +1323,8 @@ function buildHelpText(error?: string): string {
       ),
       buildStatLine(formatCommand(`${VISIBLE_COMMAND} doctor apply`), "Repair broken summaries in the current conversation."),
       buildStatLine(
-        formatCommand(`${VISIBLE_COMMAND} doctor apply <conversation-id>`),
-        "Repair broken summaries in a specific conversation by id.",
+        formatCommand(`${VISIBLE_COMMAND} doctor apply <conversation-id> confirm-offline`),
+        "Repair a specific conversation by id after isolating its active channel path.",
       ),
       buildStatLine(
         formatCommand(`${VISIBLE_COMMAND} doctor apply confirm-offline`),
@@ -1550,7 +1563,7 @@ async function buildDoctorText(params: {
       "",
       buildSection("🛠️ Next step", [
         `${formatCommand(`${VISIBLE_COMMAND} doctor apply`)} repairs these in place for the current conversation. ` +
-          `Use ${formatCommand(`${VISIBLE_COMMAND} doctor apply <conversation-id>`)} to target a different conversation.`,
+          `Use ${formatCommand(`${VISIBLE_COMMAND} doctor apply <conversation-id> confirm-offline`)} to target a different conversation after isolating its active channel path.`,
       ]),
     );
   }
@@ -3036,6 +3049,10 @@ async function buildDoctorApplyText(params: {
   options?: DoctorApplyOptions;
 }): Promise<string> {
   const requestedConversationId = params.options?.conversationId;
+  const confirmOffline = params.options?.confirmOffline === true;
+  const nextStepCommand = requestedConversationId !== undefined
+    ? `${VISIBLE_COMMAND} doctor apply ${String(requestedConversationId)} confirm-offline`
+    : `${VISIBLE_COMMAND} doctor apply confirm-offline`;
   const targetSectionLabel = requestedConversationId !== undefined
     ? "📍 Target conversation"
     : "📍 Current conversation";
@@ -3049,7 +3066,7 @@ async function buildDoctorApplyText(params: {
       "",
       "🩺 Lossless Claw Doctor Apply",
       "",
-      buildSection("📍 Target conversation", [
+      buildSection(targetSectionLabel, [
         buildStatLine("status", "unavailable"),
         buildStatLine("reason", current.reason),
         buildStatLine("fallback", "Doctor apply is conversation-scoped, so no global repair ran."),
@@ -3062,8 +3079,7 @@ async function buildDoctorApplyText(params: {
     params.db,
     current.stats.conversationId,
   );
-  const skipRepairMetrics =
-    params.options?.confirmOffline !== true && stats.total > DOCTOR_APPLY_LARGE_TARGET_THRESHOLD;
+  const skipRepairMetrics = !confirmOffline && stats.total > DOCTOR_APPLY_LARGE_TARGET_THRESHOLD;
   const repairMetrics = skipRepairMetrics
     ? null
     : loadDoctorApplyRepairMetrics(params.db, stats);
@@ -3076,7 +3092,10 @@ async function buildDoctorApplyText(params: {
     },
     maintenance,
   });
-  if (preflight.blocked && params.options?.confirmOffline !== true) {
+  const targetedConfirmationReason = requestedConversationId !== undefined && !confirmOffline
+    ? "explicit conversation-id targeting requires `confirm-offline`"
+    : null;
+  if ((preflight.blocked || targetedConfirmationReason !== null) && !confirmOffline) {
     return [
       ...buildHeaderLines(),
       "",
@@ -3106,16 +3125,14 @@ async function buildDoctorApplyText(params: {
             ]
           : []),
         buildStatLine("token threshold", formatNumber(preflight.tokenThreshold)),
+        ...(targetedConfirmationReason
+          ? [buildStatLine("reason", targetedConfirmationReason)]
+          : []),
         ...preflight.reasons.map((reason) => buildStatLine("reason", reason)),
       ]),
       "",
       buildSection("🛠️ Next step", [
-        (() => {
-          const command = requestedConversationId !== undefined
-            ? `${VISIBLE_COMMAND} doctor apply ${formatNumber(requestedConversationId)} confirm-offline`
-            : `${VISIBLE_COMMAND} doctor apply confirm-offline`;
-          return `Run ${formatCommand(command)} only from an isolated/offline maintenance lane after active channel delivery is paused or moved away from this conversation.`;
-        })(),
+        `Run ${formatCommand(nextStepCommand)} only from an isolated/offline maintenance lane after active channel delivery is paused or moved away from this conversation.`,
       ]),
     ].join("\n");
   }
@@ -3184,7 +3201,7 @@ async function buildDoctorApplyText(params: {
   lines.push(
     buildSection("🛠️ Apply", [
       buildStatLine("mode", "in-place summary rewrite"),
-      ...(params.options?.confirmOffline === true
+      ...(confirmOffline
         ? [buildStatLine("safety override", "confirm-offline")]
         : []),
       buildStatLine("repair targets", formatNumber(stats.total)),
