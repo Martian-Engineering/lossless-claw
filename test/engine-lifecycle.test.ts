@@ -9,6 +9,7 @@ import { SessionManager } from "@earendil-works/pi-coding-agent";
 import { createLcmDatabaseConnection } from "../src/db/connection.js";
 import { LcmContextEngine } from "../src/engine.js";
 import type { AgentMessage } from "../src/openclaw-bridge.js";
+import { resetStartupBannerLogsForTests } from "../src/startup-banner-log.js";
 import { createDelegatedExpansionGrant, getRuntimeExpansionAuthManager, resolveDelegatedExpansionGrantId } from "../src/expansion-auth.js";
 import {
   cleanupEngineTestState,
@@ -25,7 +26,11 @@ import {
   tempDirs,
 } from "./helpers.js";
 
-afterEach(cleanupEngineTestState);
+afterEach(() => {
+  cleanupEngineTestState();
+  resetStartupBannerLogsForTests();
+});
+
 describe("LcmContextEngine metadata", () => {
   it("reports the registered lossless-claw engine id", () => {
     const engine = createEngine();
@@ -58,6 +63,24 @@ describe("LcmContextEngine metadata", () => {
       requiredCapabilities: ["bootstrap", "after-turn", "maintain"],
       unsupportedMessage: expect.stringContaining("capture-only"),
     });
+    expect(engine.info.ownsCompaction).toBe(true);
+  });
+
+  it("warns only once per process when capture-only mode is enabled", () => {
+    const hostWarn = vi.fn();
+    const log = {
+      info: vi.fn(),
+      warn: vi.fn(),
+      error: vi.fn(),
+      debug: vi.fn(),
+      hostWarn,
+    };
+
+    createEngineWithDeps({ hostFallbackMode: "capture-only" }, { log });
+    createEngineWithDeps({ hostFallbackMode: "capture-only" }, { log });
+
+    expect(hostWarn).toHaveBeenCalledOnce();
+    expect(hostWarn).toHaveBeenCalledWith(expect.stringContaining("hostFallbackMode=capture-only"));
   });
 
   it("keeps the subagent-spawn requirement unchanged in capture-only mode", () => {

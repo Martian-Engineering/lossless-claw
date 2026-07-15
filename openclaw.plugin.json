@@ -33,7 +33,7 @@
     },
     "hostFallbackMode": {
       "label": "Host Fallback Mode",
-      "help": "How to declare agent-run host requirements. \"error\" (default): require the full context-engine lifecycle and fail closed on CLI-backed hosts. \"capture-only\": relax the requirement to bootstrap/after-turn/maintain so CLI-backed runs (e.g. claude-cli) continue with transcript capture and recall tools but WITHOUT lossless prompt assembly; native runtimes keep the full engine."
+      "help": "Controls the installation-wide agent-run host requirement. error (default) requires the full lifecycle and fails closed on CLI hosts. capture-only accepts bootstrap/after-turn/maintain so generic CLI runs keep transcript capture and recall without Lossless prompt assembly or compaction. Fully capable native hosts still run the full lifecycle. Subagent projection requirements are unchanged."
     },
     "contextThreshold": {
       "label": "Context Threshold",

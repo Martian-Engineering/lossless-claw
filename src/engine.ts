@@ -402,9 +402,15 @@ export class LcmContextEngine implements ContextEngine {
     } as ContextEngineInfo;
 
     if (this.config.hostFallbackMode === "capture-only") {
-      this.deps.log.warn(
-        "[lcm] hostFallbackMode=capture-only: agent-run host requirement relaxed to bootstrap/after-turn/maintain. On CLI-backed hosts (e.g. claude-cli) lossless assembly is NOT projected into the prompt; turns are captured to lcm.db and recall tools remain available. Summary compaction on such hosts requires fallbackProviders (no runtime-llm-complete capability).",
-      );
+      logStartupBannerOnce({
+        key: "host-fallback-capture-only",
+        log: (message) => (this.deps.log.hostWarn ?? this.deps.log.warn)(message),
+        message: [
+          "[lcm] WARNING: hostFallbackMode=capture-only relaxes the installation-wide agent-run host requirement to bootstrap/after-turn/maintain.",
+          "Generic CLI runs persist transcripts and keep recall tools, but do not receive Lossless prompt assembly or compaction.",
+          "Fully capable native hosts still run the full lifecycle, and subagent forks still require thread-bootstrap-projection.",
+        ].join(" "),
+      });
     }
 
     this.conversationStore = new ConversationStore(this.db, {
