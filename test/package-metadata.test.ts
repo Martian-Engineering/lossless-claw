@@ -3,7 +3,7 @@ import { readFileSync } from "node:fs";
 import { join } from "node:path";
 import packageJson from "../package.json" with { type: "json" };
 
-const requiredOpenClawVersion = "2026.6.10";
+const requiredOpenClawVersion = "2026.7.2";
 
 describe("package OpenClaw compatibility metadata", () => {
   it("declares the SQLite transcript runtime minimum OpenClaw version without an upper bound", () => {
@@ -19,7 +19,7 @@ describe("package OpenClaw compatibility metadata", () => {
       readFileSync(join(process.cwd(), path), "utf8");
 
     expect(readProjectFile("README.md")).toContain(
-      `require OpenClaw \`${requiredOpenClawVersion}\` or newer`,
+      `requires OpenClaw \`${requiredOpenClawVersion}\` or newer`,
     );
     expect(readProjectFile("docs/configuration.md")).toContain(
       `requires OpenClaw \`${requiredOpenClawVersion}\` or newer`,
