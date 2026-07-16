@@ -3570,7 +3570,7 @@ export class LcmContextEngine implements ContextEngine {
         }
         return { messages: clamp.messages, estimatedTokens: clamp.serializedTokens };
       };
-      const liveContextTokens = estimateSessionTokenCountForAfterTurn(liveMessages);
+      const liveContextTokens = await this.summaryStore.getContextTokenCount(conversation.conversationId);
       const maintenance = await this.compactionMaintenanceStore.getConversationCompactionMaintenance(
         conversation.conversationId,
       );

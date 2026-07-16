@@ -197,14 +197,12 @@ export function resolveDeferredAssemblyPressure(params: {
   const recordedProjectedTokens = normalizeNonNegativeInteger(
     params.maintenance?.projectedTokenCount,
   );
-  const observedContextTokens = Math.max(
-    params.liveContextTokens,
-    recordedContextTokens ?? 0,
-  );
-  const pressureTokenCount = Math.max(
-    observedContextTokens,
-    recordedProjectedTokens ?? 0,
-  );
+  // Use live context_items as the primary pressure measure. Recorded values
+  // from debt creation time become stale after compaction reduces stored.
+  // Inflating pressure with stale recorded values keeps the system in
+  // permanent emergency drain even though the actual context fits budget.
+  const observedContextTokens = params.liveContextTokens;
+  const pressureTokenCount = observedContextTokens;
   return {
     observedContextTokens,
     projectedTokenCount: recordedProjectedTokens ?? null,
