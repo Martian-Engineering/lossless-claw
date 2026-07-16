@@ -1019,6 +1019,12 @@ export class LcmContextEngine implements ContextEngine {
           this.deps.log.warn(
             `[lcm] circuit-breaker: force-exhausting compact loop conversation=${params.conversationId} ${sessionLabel} consecutiveAttempts=${consecutiveAttempts}`,
           );
+          // Force-exhaust returns exhausted:true without running consumeDeferredCompactionDebt,
+          // so maintenance stays pending. The conversation remains in degraded-assemble until
+          // an external maintain() cycle clears the maintenance state (engine.ts ~943/961).
+          // The counter only resets on maintenance-clear (L1005) or non-exhausted progress
+          // (L1052). The warn fires once per trip; a tripped conversation will re-trip and
+          // re-warn on every subsequent assemble until the host runs maintain().
           drainResult = { exhausted: true };
           return;
         }

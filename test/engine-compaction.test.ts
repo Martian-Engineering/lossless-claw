@@ -591,10 +591,10 @@ describe("LcmContextEngine afterTurn dedup guard", () => {
 
     const conversation = await engine.getConversationStore().getConversationBySessionId(sessionId);
     const stored = await engine.getConversationStore().getMessages(conversation!.conversationId);
-    // v2 fix: the ENOENT checkpoint-present branch now returns transcriptCovered:true,
-    // routing through alignRuntimeBatchAgainstCoveredFrontier instead of the
-    // aggressive ingest path. The batch [old B, last D] timestamp-matches existing
-    // messages and is correctly deduplicated rather than ingested as duplicates.
+    // ENOENT checkpoint-present branch routes through the oversized
+    // ingest path (transcriptCovered fallen). The batch [old B, last D]
+    // timestamp-matches existing messages and is correctly deduplicated
+    // rather than ingested as duplicates.
     expect(stored.map((m) => m.content)).toEqual([
       "old A",
       "old B",
@@ -602,6 +602,53 @@ describe("LcmContextEngine afterTurn dedup guard", () => {
       "[summary] compacted older context",
       "last D",
     ]);
+  });
+
+  it("ingests new messages in partially-overlapping batches under ENOENT checkpoint path", async () => {
+    const warnLog = vi.fn();
+    const engine = createEngineWithDepsOverrides({
+      log: {
+        info: vi.fn(),
+        warn: warnLog,
+        error: vi.fn(),
+        debug: vi.fn(),
+      },
+    });
+    const sessionId = "dedup-partial-overlap-enoent";
+    const oldTimestamp = Date.UTC(2026, 0, 1, 0, 3, 0);
+    const newTimestamp = Date.UTC(2026, 0, 1, 0, 4, 0);
+
+    // Seed: establish checkpoint with 2 messages
+    await engine.afterTurn({
+      sessionId,
+      sessionFile: createSessionFilePath("dedup-partial-overlap-enoent"),
+      messages: [
+        { role: "user", content: "seed A", timestamp: oldTimestamp } as AgentMessage,
+        { role: "assistant", content: "seed B", timestamp: oldTimestamp + 1000 } as AgentMessage,
+      ],
+      prePromptMessageCount: 0,
+      tokenBudget: 4096,
+    });
+
+    // Simulate: session file disappears (ENOENT) but checkpoint exists.
+    // Send a batch where old messages overlap but new ones are genuinely new.
+    // The ENOENT checkpoint path must NOT drop the genuinely new message.
+    await engine.afterTurn({
+      sessionId,
+      sessionFile: createSessionFilePath("dedup-partial-overlap-enoent-2"),
+      messages: [
+        { role: "user", content: "seed A", timestamp: oldTimestamp } as AgentMessage,
+        { role: "user", content: "genuinely new message E", timestamp: newTimestamp } as AgentMessage,
+      ],
+      prePromptMessageCount: 0,
+      tokenBudget: 4096,
+    });
+
+    const conversation = await engine.getConversationStore().getConversationBySessionId(sessionId);
+    const stored = await engine.getConversationStore().getMessages(conversation!.conversationId);
+    // Assert the new message was preserved (not dropped by dedup)
+    const contents = stored.map((m) => m.content);
+    expect(contents).toContain("genuinely new message E");
   });
 
   it("ingests oversized no-overlap repeated content without auto-compaction summary proof", async () => {
