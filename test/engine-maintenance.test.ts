@@ -997,7 +997,7 @@ describe("LcmContextEngine maintain and assemble budget", () => {
         seq: 0,
         role: "user",
         content: "stored context should be skipped while maintenance is pending",
-        tokenCount: 20,
+        tokenCount: 80,
       },
     ]);
     await engine
@@ -1059,7 +1059,7 @@ describe("LcmContextEngine maintain and assemble budget", () => {
         seq: 0,
         role: "user",
         content: "stored content",
-        tokenCount: 20,
+        tokenCount: 80,
       },
     ]);
     await engine
@@ -1144,6 +1144,18 @@ describe("LcmContextEngine maintain and assemble budget", () => {
     const conversation = await engine.getConversationStore().getOrCreateConversation(sessionId, {
       sessionKey: undefined,
     });
+    const [storedMessage] = await engine.getConversationStore().createMessagesBulk([
+      {
+        conversationId: conversation.conversationId,
+        seq: 0,
+        role: "user",
+        content: "stored context message",
+        tokenCount: 30,
+      },
+    ]);
+    await engine
+      .getSummaryStore()
+      .appendContextMessages(conversation.conversationId, [storedMessage.messageId]);
     await engine.getCompactionMaintenanceStore().requestProactiveCompactionDebt({
       conversationId: conversation.conversationId,
       reason: "threshold",
@@ -1192,6 +1204,18 @@ describe("LcmContextEngine maintain and assemble budget", () => {
     const conversation = await engine.getConversationStore().getOrCreateConversation(sessionId, {
       sessionKey: undefined,
     });
+    const [storedMessage] = await engine.getConversationStore().createMessagesBulk([
+      {
+        conversationId: conversation.conversationId,
+        seq: 0,
+        role: "user",
+        content: "stored context message",
+        tokenCount: 500,
+      },
+    ]);
+    await engine
+      .getSummaryStore()
+      .appendContextMessages(conversation.conversationId, [storedMessage.messageId]);
     await engine.getCompactionMaintenanceStore().requestProactiveCompactionDebt({
       conversationId: conversation.conversationId,
       reason: "threshold",
@@ -1249,7 +1273,7 @@ describe("LcmContextEngine maintain and assemble budget", () => {
         seq: 0,
         role: "user",
         content: "stored context should not be used after failed emergency compaction",
-        tokenCount: 20,
+        tokenCount: 150,
       },
     ]);
     await engine
@@ -1320,6 +1344,18 @@ describe("LcmContextEngine maintain and assemble budget", () => {
     const conversation = await engine.getConversationStore().getOrCreateConversation(sessionId, {
       sessionKey: undefined,
     });
+    const [storedMessage] = await engine.getConversationStore().createMessagesBulk([
+      {
+        conversationId: conversation.conversationId,
+        seq: 0,
+        role: "user",
+        content: "stored context message",
+        tokenCount: 11,
+      },
+    ]);
+    await engine
+      .getSummaryStore()
+      .appendContextMessages(conversation.conversationId, [storedMessage.messageId]);
     await engine.getCompactionMaintenanceStore().requestProactiveCompactionDebt({
       conversationId: conversation.conversationId,
       reason: "threshold",
@@ -1372,6 +1408,18 @@ describe("LcmContextEngine maintain and assemble budget", () => {
     const conversation = await engine.getConversationStore().getOrCreateConversation(sessionId, {
       sessionKey: undefined,
     });
+    const [storedMessage] = await engine.getConversationStore().createMessagesBulk([
+      {
+        conversationId: conversation.conversationId,
+        seq: 0,
+        role: "user",
+        content: "stored context message",
+        tokenCount: 5000,
+      },
+    ]);
+    await engine
+      .getSummaryStore()
+      .appendContextMessages(conversation.conversationId, [storedMessage.messageId]);
     await engine.getCompactionMaintenanceStore().requestProactiveCompactionDebt({
       conversationId: conversation.conversationId,
       reason: "threshold",
@@ -1419,6 +1467,18 @@ describe("LcmContextEngine maintain and assemble budget", () => {
     const conversation = await engine.getConversationStore().getOrCreateConversation(sessionId, {
       sessionKey: undefined,
     });
+    const [storedMessage] = await engine.getConversationStore().createMessagesBulk([
+      {
+        conversationId: conversation.conversationId,
+        seq: 0,
+        role: "user",
+        content: "stored context message",
+        tokenCount: 5000,
+      },
+    ]);
+    await engine
+      .getSummaryStore()
+      .appendContextMessages(conversation.conversationId, [storedMessage.messageId]);
     await engine.getCompactionMaintenanceStore().requestProactiveCompactionDebt({
       conversationId: conversation.conversationId,
       reason: "threshold",
@@ -1450,7 +1510,7 @@ describe("LcmContextEngine maintain and assemble budget", () => {
         conversationId: conversation.conversationId,
         sessionId,
         tokenBudget: 4_096,
-        currentTokenCount: 300,
+        currentTokenCount: 5000,
         compactionTarget: "threshold",
       }),
     );
@@ -1517,6 +1577,18 @@ describe("LcmContextEngine maintain and assemble budget", () => {
     const conversation = await engine.getConversationStore().getOrCreateConversation(sessionId, {
       sessionKey: undefined,
     });
+    const [storedMessage] = await engine.getConversationStore().createMessagesBulk([
+      {
+        conversationId: conversation.conversationId,
+        seq: 0,
+        role: "user",
+        content: "stored context message",
+        tokenCount: 90,
+      },
+    ]);
+    await engine
+      .getSummaryStore()
+      .appendContextMessages(conversation.conversationId, [storedMessage.messageId]);
     await engine.getCompactionMaintenanceStore().requestProactiveCompactionDebt({
       conversationId: conversation.conversationId,
       reason: "threshold",
