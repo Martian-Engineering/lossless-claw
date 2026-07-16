@@ -1666,6 +1666,63 @@ describe("LcmContextEngine maintain and assemble budget", () => {
     expect(maintenance?.pending).toBe(true);
   });
 
+  it("assemble() does not trigger emergency drain when recorded values are stale after compaction", async () => {
+    const log = {
+      info: vi.fn(),
+      warn: vi.fn(),
+      error: vi.fn(),
+      debug: vi.fn(),
+    };
+    const engine = createEngineWithDepsOverrides({ log });
+    const privateEngine = engine as unknown as {
+      executeCompactionCore: (params: unknown) => Promise<unknown>;
+    };
+    const sessionId = "assemble-stale-recorded-no-emergency";
+    const conversation = await engine.getConversationStore().getOrCreateConversation(sessionId, {
+      sessionKey: undefined,
+    });
+    // Store a modest amount of context_items
+    const [storedMessage] = await engine.getConversationStore().createMessagesBulk([
+      {
+        conversationId: conversation.conversationId,
+        seq: 0,
+        role: "user",
+        content: "recent small context after compaction",
+        tokenCount: 100,
+      },
+    ]);
+    await engine
+      .getSummaryStore()
+      .appendContextMessages(conversation.conversationId, [storedMessage.messageId]);
+    // Maintenance debt with high stale recorded values (from before compaction)
+    await engine.getCompactionMaintenanceStore().requestProactiveCompactionDebt({
+      conversationId: conversation.conversationId,
+      reason: "threshold",
+      tokenBudget: 4_096,
+      currentTokenCount: 5_000,
+      projectedTokenCount: 6_000,
+    });
+    const executeCompactionCoreSpy = vi.spyOn(privateEngine, "executeCompactionCore");
+
+    const assembleResult = await engine.assemble({
+      sessionId,
+      messages: [makeMessage({ role: "user", content: "current delivery turn" })],
+      tokenBudget: 4_096,
+    });
+
+    const maintenance = await engine
+      .getCompactionMaintenanceStore()
+      .getConversationCompactionMaintenance(conversation.conversationId);
+    // Should NOT trigger emergency drain: stored context (100) is well below
+    // threshold (0.75 * 4096 = 3072), even though recorded values are high
+    expect(executeCompactionCoreSpy).not.toHaveBeenCalled();
+    expect(maintenance?.pending).toBe(true);
+    expect(assembleResult.messages).toHaveLength(1);
+    expect(log.warn).not.toHaveBeenCalledWith(
+      expect.stringContaining("[lcm] assemble: emergency deferred compaction debt draining pre-assembly"),
+    );
+  });
+
   it("maintain() uses the stricter current token budget for deferred threshold debt", async () => {
     const engine = createEngine();
     const privateEngine = engine as unknown as {
