@@ -536,7 +536,7 @@ describe("LcmContextEngine afterTurn dedup guard", () => {
     );
   });
 
-  it("ingests oversized no-overlap batches that only timestamp-match around auto-compaction summaries", async () => {
+  it("deduplicates full replays and preserves partial-overlap rows when a tracked transcript is missing", async () => {
     const warnLog = vi.fn();
     const engine = createEngineWithDepsOverrides({
       log: {
@@ -591,16 +591,39 @@ describe("LcmContextEngine afterTurn dedup guard", () => {
 
     const conversation = await engine.getConversationStore().getConversationBySessionId(sessionId);
     const stored = await engine.getConversationStore().getMessages(conversation!.conversationId);
-    // v2 fix: the ENOENT checkpoint-present branch now returns transcriptCovered:true,
-    // routing through alignRuntimeBatchAgainstCoveredFrontier instead of the
-    // aggressive ingest path. The batch [old B, last D] timestamp-matches existing
-    // messages and is correctly deduplicated rather than ingested as duplicates.
+    // The preserved checkpoint proves that both timestamped rows already exist,
+    // so the missing transcript path can skip the full replay without claiming
+    // that the transcript itself was covered this turn.
     expect(stored.map((m) => m.content)).toEqual([
       "old A",
       "old B",
       "old C",
       "[summary] compacted older context",
       "last D",
+    ]);
+
+    await engine.afterTurn({
+      sessionId,
+      sessionFile: createSessionFilePath("dedup-oversized-no-overlap-partial-live"),
+      messages: [
+        { role: "assistant", content: "old B", timestamp: oldBTimestamp } as AgentMessage,
+        { role: "assistant", content: "new E", timestamp: Date.UTC(2026, 0, 1, 0, 0, 5) } as AgentMessage,
+      ],
+      prePromptMessageCount: 0,
+      tokenBudget: 4096,
+    });
+
+    const afterPartialOverlap = await engine
+      .getConversationStore()
+      .getMessages(conversation!.conversationId);
+    expect(afterPartialOverlap.map((m) => m.content)).toEqual([
+      "old A",
+      "old B",
+      "old C",
+      "[summary] compacted older context",
+      "last D",
+      "old B",
+      "new E",
     ]);
   });
 

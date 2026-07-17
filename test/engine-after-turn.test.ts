@@ -1494,6 +1494,30 @@ describe("LcmContextEngine afterTurn", () => {
     ).toBe(false);
   });
 
+  it("distinguishes missing transcripts with and without a preserved checkpoint", async () => {
+    const engine = createEngine();
+    const sessionId = "after-turn-missing-transcript-checkpoint-proof";
+    await engine.getConversationStore().getOrCreateConversation(sessionId);
+
+    const withoutCheckpoint = await engine
+      .getTranscriptReconciler()
+      .reconcileTranscriptTailForAfterTurn({
+        sessionId,
+        sessionFile: createSessionFilePath("missing-transcript-without-checkpoint"),
+      });
+    expect(withoutCheckpoint.transcriptCovered).toBeUndefined();
+    expect(withoutCheckpoint.transcriptUnavailableWithCheckpoint).toBeUndefined();
+
+    const withCheckpoint = await engine
+      .getTranscriptReconciler()
+      .reconcileTranscriptTailForAfterTurn({
+        sessionId,
+        sessionFile: createSessionFilePath("missing-transcript-with-checkpoint"),
+      });
+    expect(withCheckpoint.transcriptCovered).toBeUndefined();
+    expect(withCheckpoint.transcriptUnavailableWithCheckpoint).toBe(true);
+  });
+
   it("afterTurn fails closed when the transcript reconcile throws: no batch persistence, no checkpoint advance", async () => {
     // The catch handler used to leave the initialized in-sync default in place,
     // so a thrown reconcile persisted the live batch AND refreshed the

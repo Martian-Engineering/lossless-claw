@@ -2204,7 +2204,7 @@ export class TranscriptReconciler {
         importedMessages: 0,
         blockedByImportCap: false,
         hasOverlap: true,
-        transcriptCovered: true,
+        transcriptUnavailableWithCheckpoint: true,
       };
     }
 
@@ -2317,6 +2317,7 @@ export class TranscriptReconciler {
           importedMessages: 0,
           blockedByImportCap: false,
           hasOverlap: true,
+          ...(checkpoint ? { transcriptUnavailableWithCheckpoint: true } : {}),
         };
       }
       if (sessionFileState.size === 0) {

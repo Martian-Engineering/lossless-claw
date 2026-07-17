@@ -33,6 +33,7 @@ import {
   extractToolPairingIdFromRecord,
   extractToolResultIdForPairing,
 } from "./tool-pairing.js";
+import { resolveTranscriptMessageCreatedAt } from "./transcript.js";
 import type { LcmDependencies } from "./types.js";
 
 type RedactSensitiveText = (content: string) => string;
@@ -351,6 +352,69 @@ export class BatchDeduplicator {
       return [];
     }
     return batch;
+  }
+
+  /**
+   * Remove an exact full replay when the transcript is unavailable but its
+   * checkpoint was preserved. Any batch that is not fully persisted returns
+   * to the degraded deduplicator, which prefers duplicates over dropping an
+   * ambiguous genuinely new row.
+   */
+  async deduplicateAfterTurnBatchAgainstPreservedCheckpoint(
+    sessionId: string,
+    sessionKey: string | undefined,
+    batch: AgentMessage[],
+  ): Promise<AgentMessage[]> {
+    if (batch.length === 0) return batch;
+
+    const conversation = await this.conversationStore.getConversationForSession({
+      sessionId,
+      sessionKey,
+    });
+    if (!conversation) return batch;
+
+    if (await this.batchIsFullyPersistedAtDistinctSourceTimes(conversation.conversationId, batch)) {
+      this.deps.log.debug(
+        `[lcm] afterTurn: transcript unavailable with preserved checkpoint; skipping fully persisted runtime replay conversation=${conversation.conversationId} batchLen=${batch.length}`,
+      );
+      return [];
+    }
+    return this.deduplicateAfterTurnBatch(sessionId, sessionKey, batch, {
+      oversizedNoOverlap: "ingest",
+    });
+  }
+
+  /**
+   * Prove that every runtime row is already stored at its original source
+   * timestamp. Repeated rows within the same second are ambiguous because the
+   * store truncates timestamps to seconds, so they deliberately fail open.
+   */
+  private async batchIsFullyPersistedAtDistinctSourceTimes(
+    conversationId: number,
+    batch: AgentMessage[],
+  ): Promise<boolean> {
+    const claimedSourceTimes = new Set<string>();
+    for (const message of batch) {
+      const createdAt = resolveTranscriptMessageCreatedAt(message);
+      const parsedCreatedAt = createdAt instanceof Date ? createdAt : new Date(createdAt ?? "");
+      if (!Number.isFinite(parsedCreatedAt.getTime())) return false;
+
+      const stored = toStoredMessage(message);
+      const sourceTimeKey = parsedCreatedAt.toISOString().slice(0, 19);
+      if (claimedSourceTimes.has(sourceTimeKey)) return false;
+      claimedSourceTimes.add(sourceTimeKey);
+      if (
+        !(await this.conversationStore.hasPersistedIdentityAtCreatedAtSecond(
+          conversationId,
+          stored.role,
+          stored.content,
+          createdAt,
+        ))
+      ) {
+        return false;
+      }
+    }
+    return true;
   }
 
   async deduplicateAfterTurnBatch(

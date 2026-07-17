@@ -116,4 +116,11 @@ export type TranscriptReconcileResult = {
    * transcript was missing, unreadable, or skipped.
    */
   transcriptCovered?: boolean;
+  /**
+   * True when this call could not read the transcript but preserved an
+   * existing checkpoint. The persisted frontier can still remove a fully
+   * replayed runtime batch, but ambiguous rows must use degraded dedup because
+   * the unavailable transcript cannot be relied on to deliver them later.
+   */
+  transcriptUnavailableWithCheckpoint?: boolean;
 };
