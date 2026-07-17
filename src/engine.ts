@@ -3570,7 +3570,9 @@ export class LcmContextEngine implements ContextEngine {
         }
         return { messages: clamp.messages, estimatedTokens: clamp.serializedTokens };
       };
-      const liveContextTokens = await this.summaryStore.getContextTokenCount(conversation.conversationId);
+      const storedContextTokens = await this.summaryStore.getContextTokenCount(
+        conversation.conversationId,
+      );
       const maintenance = await this.compactionMaintenanceStore.getConversationCompactionMaintenance(
         conversation.conversationId,
       );
@@ -3588,12 +3590,12 @@ export class LcmContextEngine implements ContextEngine {
           tokenBudget * DEFERRED_ASSEMBLY_DEGRADED_PRESSURE_RATIO,
         );
         let pressure = resolveDeferredAssemblyPressure({
-          liveContextTokens,
+          storedContextTokens,
           maintenance,
         });
         if (pressure.pressureTokenCount > tokenBudget) {
           this.deps.log.warn(
-            `[lcm] assemble: emergency deferred compaction debt draining pre-assembly conversation=${conversation.conversationId} ${sessionLabel} currentTokenCount=${pressure.observedContextTokens} projectedTokenCount=${pressure.projectedTokenCount ?? "null"} tokenBudget=${tokenBudget} reason=over-budget`,
+            `[lcm] assemble: emergency deferred compaction debt draining pre-assembly conversation=${conversation.conversationId} ${sessionLabel} storedContextTokens=${pressure.storedContextTokens} projectedTokenCount=${pressure.projectedTokenCount ?? "null"} tokenBudget=${tokenBudget} reason=over-budget`,
           );
           let emergencyDrainResult: { exhausted: boolean } | null = null;
           try {
@@ -3602,7 +3604,7 @@ export class LcmContextEngine implements ContextEngine {
               sessionId: params.sessionId,
               sessionKey: params.sessionKey,
               tokenBudget,
-              currentTokenCount: pressure.observedContextTokens,
+              currentTokenCount: pressure.storedContextTokens,
             });
           } catch (error) {
             this.deps.log.warn(
@@ -3615,7 +3617,7 @@ export class LcmContextEngine implements ContextEngine {
             );
           if (latestMaintenance?.pending || latestMaintenance?.running) {
             pressure = resolveDeferredAssemblyPressure({
-              liveContextTokens,
+              storedContextTokens,
               maintenance: latestMaintenance,
             });
             if (pressure.pressureTokenCount > pressureThreshold) {
@@ -3640,7 +3642,7 @@ export class LcmContextEngine implements ContextEngine {
           };
         } else {
           this.deps.log.debug(
-            `[lcm] assemble: deferred compaction debt left pending conversation=${conversation.conversationId} ${sessionLabel} currentTokenCount=${pressure.observedContextTokens} projectedTokenCount=${pressure.projectedTokenCount ?? "null"} tokenBudget=${tokenBudget} reason=not-over-budget`,
+            `[lcm] assemble: deferred compaction debt left pending conversation=${conversation.conversationId} ${sessionLabel} storedContextTokens=${pressure.storedContextTokens} projectedTokenCount=${pressure.projectedTokenCount ?? "null"} tokenBudget=${tokenBudget} reason=not-over-budget`,
           );
         }
       }
@@ -3650,7 +3652,7 @@ export class LcmContextEngine implements ContextEngine {
           tokenBudget,
         });
         this.deps.log.warn(
-          `[lcm] assemble: degraded live fallback conversation=${conversation.conversationId} ${sessionLabel} reason=${deferredAssemblyDegradation.reason} currentTokenCount=${deferredAssemblyDegradation.pressure.observedContextTokens} projectedTokenCount=${deferredAssemblyDegradation.pressure.projectedTokenCount ?? "null"} tokenBudget=${tokenBudget} pressureThreshold=${Math.floor(tokenBudget * DEFERRED_ASSEMBLY_DEGRADED_PRESSURE_RATIO)} outputMessages=${degraded.messages.length} estimatedTokens=${degraded.estimatedTokens}`,
+          `[lcm] assemble: degraded live fallback conversation=${conversation.conversationId} ${sessionLabel} reason=${deferredAssemblyDegradation.reason} storedContextTokens=${deferredAssemblyDegradation.pressure.storedContextTokens} projectedTokenCount=${deferredAssemblyDegradation.pressure.projectedTokenCount ?? "null"} tokenBudget=${tokenBudget} pressureThreshold=${Math.floor(tokenBudget * DEFERRED_ASSEMBLY_DEGRADED_PRESSURE_RATIO)} outputMessages=${degraded.messages.length} estimatedTokens=${degraded.estimatedTokens}`,
         );
         return degraded;
       }
@@ -3953,7 +3955,7 @@ export class LcmContextEngine implements ContextEngine {
         const overflowDiagnostics = shouldLogOverflowDiagnostics({
           diagnostics: assembled.debug.overflowDiagnostics,
           assembledTokens: assembled.estimatedTokens,
-          liveContextTokens,
+          storedContextTokens,
         })
           ? ` overflowDiagnostics=${formatOverflowDiagnosticsForLog({
               diagnostics: assembled.debug.overflowDiagnostics,

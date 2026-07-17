@@ -183,30 +183,28 @@ export function buildDegradedLiveAssembleResult(params: {
   };
 }
 
+/**
+ * Resolve deferred compaction pressure from the canonical stored projection.
+ *
+ * Debt-time current and projected counts remain diagnostic because compaction
+ * can make them stale. Only the current `context_items` total decides whether
+ * another assemble-time drain could reduce the model context.
+ */
 export function resolveDeferredAssemblyPressure(params: {
-  liveContextTokens: number;
+  storedContextTokens: number;
   maintenance: ConversationCompactionMaintenanceRecord | null;
 }): {
-  observedContextTokens: number;
+  storedContextTokens: number;
   projectedTokenCount: number | null;
   pressureTokenCount: number;
 } {
-  const recordedContextTokens = normalizeNonNegativeInteger(
-    params.maintenance?.currentTokenCount,
-  );
   const recordedProjectedTokens = normalizeNonNegativeInteger(
     params.maintenance?.projectedTokenCount,
   );
-  // Use live context_items as the primary pressure measure. Recorded values
-  // from debt creation time become stale after compaction reduces stored.
-  // Inflating pressure with stale recorded values keeps the system in
-  // permanent emergency drain even though the actual context fits budget.
-  const observedContextTokens = params.liveContextTokens;
-  const pressureTokenCount = observedContextTokens;
   return {
-    observedContextTokens,
+    storedContextTokens: params.storedContextTokens,
     projectedTokenCount: recordedProjectedTokens ?? null,
-    pressureTokenCount,
+    pressureTokenCount: params.storedContextTokens,
   };
 }
 
