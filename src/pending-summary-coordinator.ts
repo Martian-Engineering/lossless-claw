@@ -175,12 +175,12 @@ export class PendingCompactionCoordinator {
     publishPolicy?: PendingCompactionPublishPolicy;
   }): Promise<PendingCompactionCoordinatorResult> {
     const publishPolicy = input.publishPolicy ?? "publish-if-ready";
-    await this.pendingSummaryStore.deleteFinishedBatches({
-      conversationId: input.conversationId,
-      olderThan: new Date(Date.now() - PENDING_BATCH_RETENTION_MS),
-    });
     let batch = await this.pendingSummaryStore.getActiveBatchForConversation(input.conversationId);
     if (!batch) {
+      await this.pendingSummaryStore.deleteFinishedBatches({
+        conversationId: input.conversationId,
+        olderThan: new Date(Date.now() - PENDING_BATCH_RETENTION_MS),
+      });
       if (publishPolicy === "publish-ready-only") {
         return { status: "idle", reason: "no active pending summary batch" };
       }

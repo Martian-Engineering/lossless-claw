@@ -3,7 +3,7 @@ import { readFileSync } from "node:fs";
 import { join } from "node:path";
 import packageJson from "../package.json" with { type: "json" };
 
-const requiredOpenClawVersion = "2026.7.2";
+const requiredOpenClawVersion = "2026.7.2-beta.2";
 
 describe("package OpenClaw compatibility metadata", () => {
   it("declares the SQLite transcript runtime minimum OpenClaw version without an upper bound", () => {

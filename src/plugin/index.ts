@@ -37,7 +37,7 @@ import type {
 } from "../types.js";
 import { listConfiguredAgentIds, normalizeAgentId } from "./openclaw-agent-ids.js";
 
-const MIN_CONTEXT_ENGINE_OPENCLAW_VERSION = "2026.7.2";
+const MIN_CONTEXT_ENGINE_OPENCLAW_VERSION = "2026.7.2-beta.2";
 
 type PluginSdkCoreModule = {
   delegateCompactionToRuntime?: RuntimeCompactionDelegateFn;

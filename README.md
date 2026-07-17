@@ -114,7 +114,7 @@ The command defaults to `${OPENCLAW_STATE_DIR:-~/.openclaw}` and `${OPENCLAW_STA
 - Node.js 22+
 - An LLM provider configured in OpenClaw (used for summarization)
 
-> **Compatibility:** `lossless-claw` requires OpenClaw `2026.7.2` or newer. That release provides the branch-safe visible transcript projection used to bootstrap SQLite-backed sessions. If you cannot upgrade OpenClaw, stay on a `lossless-claw` release compatible with your installed OpenClaw version.
+> **Compatibility:** `lossless-claw` requires OpenClaw `2026.7.2-beta.2` or newer. That beta is the first published build with the branch-safe visible transcript projection used to bootstrap SQLite-backed sessions; stable `2026.7.1` does not provide it. If you cannot use a beta or upgrade OpenClaw, stay on a `lossless-claw` release compatible with your installed OpenClaw version.
 
 ### Install the plugin
 
