@@ -78,6 +78,7 @@ describe("PendingCompactionCoordinator", () => {
       },
       summarize: async (sourceText) => `leaf(${sourceText})`,
     });
+    const deleteFinishedBatches = vi.spyOn(pendingSummaryStore, "deleteFinishedBatches");
 
     await expect(
       coordinator.runOnce({
@@ -85,11 +86,14 @@ describe("PendingCompactionCoordinator", () => {
         sessionKey: "agent:main:pending-coordinator-incremental",
       }),
     ).resolves.toMatchObject({ status: "planned", nodeCount: 1 });
+    expect(deleteFinishedBatches).toHaveBeenCalledTimes(1);
+    deleteFinishedBatches.mockClear();
 
     const getContextItems = vi.spyOn(summaryStore, "getContextItems");
     await expect(
       coordinator.runOnce({ conversationId: conversation.conversationId }),
     ).resolves.toMatchObject({ status: "prepared" });
+    expect(deleteFinishedBatches).not.toHaveBeenCalled();
     expect(getContextItems).not.toHaveBeenCalled();
   });
 

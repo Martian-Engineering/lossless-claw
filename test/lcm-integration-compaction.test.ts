@@ -400,11 +400,21 @@ describe("LCM integration: compaction", () => {
     });
 
     expect(result.actionTaken).toBe(false);
+    expect(result.authFailure).toBeUndefined();
     expect(summarize).not.toHaveBeenCalled();
     expect(sumStore._summaries.find((summary) => summary.kind === "leaf")).toBeUndefined();
     expect(
       sumStore._summaries.some((summary) => summary.content.includes("[Truncated from 0 tokens]")),
     ).toBe(false);
+
+    const sweepResult = await emptySourceEngine.compactFullSweep({
+      conversationId: CONV_ID,
+      tokenBudget: 10_000,
+      summarize,
+      force: true,
+    });
+    expect(sweepResult.actionTaken).toBe(false);
+    expect(sweepResult.authFailure).toBeUndefined();
   });
 
   it("leaf-trigger accounting respects fresh tail token caps", async () => {

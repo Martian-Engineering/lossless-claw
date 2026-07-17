@@ -131,10 +131,13 @@ type PassResult = {
   /** Token count of the newly created summary. */
   addedTokens: number;
 };
-type CondensedPassSkipped = {
+type LeafPassResult = PassResult & {
+  content: string;
+};
+type EmptySourcePassSkipped = {
   skipped: "empty-source";
 };
-type CondensedPassResult = PassResult | CondensedPassSkipped;
+type CondensedPassResult = PassResult | EmptySourcePassSkipped;
 type LeafChunkSelection = {
   items: ContextItemRecord[];
   rawTokensOutsideTail: number;
@@ -929,6 +932,14 @@ export class CompactionEngine {
         authFailure: true,
       };
     }
+    if ("skipped" in leafResult) {
+      return {
+        actionTaken: false,
+        tokensBefore,
+        tokensAfter: tokensBefore,
+        condensed: false,
+      };
+    }
     // Delta tracking: compute token change from pass results instead of re-querying DB
     const tokensAfterLeaf = tokensBefore - leafResult.removedTokens + leafResult.addedTokens;
 
@@ -1160,6 +1171,9 @@ export class CompactionEngine {
       );
       if (!leafResult) {
         hadAuthFailure = true;
+        break;
+      }
+      if ("skipped" in leafResult) {
         break;
       }
       const passTokensAfter = passTokensBefore - leafResult.removedTokens + leafResult.addedTokens;
@@ -2150,7 +2164,7 @@ export class CompactionEngine {
     summarize: CompactionSummarizeFn,
     previousSummaryContent?: string,
     summaryModel?: string,
-  ): Promise<{ summaryId: string; level: CompactionLevel; content: string; removedTokens: number; addedTokens: number } | null> {
+  ): Promise<LeafPassResult | EmptySourcePassSkipped | null> {
     // Fetch full message content for each context item
     const messageContents: { messageId: number; content: string; createdAt: Date; tokenCount: number }[] =
       [];
@@ -2185,7 +2199,7 @@ export class CompactionEngine {
       this.log.warn(
         `[lcm] leaf compaction skipped summary write; conversationId=${conversationId}; chunkMessages=${messageContents.length}; sourceMessages=${messageItems.length}; sanitized_source=empty`,
       );
-      return null;
+      return { skipped: "empty-source" };
     }
     const fileIds = dedupeOrderedIds(
       messageContents.flatMap((message) => extractFileIdsFromContent(message.content)),

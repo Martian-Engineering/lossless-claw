@@ -1600,6 +1600,37 @@ export class ConversationStore {
   }
 
   /**
+   * Return recent unstamped rows of one role for projection reconciliation.
+   *
+   * The caller performs the decoration-aware comparison before stamping an
+   * entry id, so this query deliberately preserves the stored content.
+   */
+  async listRecentUnstampedMessagesByRole(
+    conversationId: ConversationId,
+    role: MessageRole,
+    tailWindow: number,
+  ): Promise<Array<{ messageId: MessageId; content: string }>> {
+    const rows = this.db
+      .prepare(
+        `SELECT message_id, content
+         FROM (
+           SELECT message_id, content, transcript_entry_id, role, seq
+           FROM messages
+           WHERE conversation_id = ?
+           ORDER BY seq DESC
+           LIMIT ?
+         )
+         WHERE transcript_entry_id IS NULL AND role = ?
+         ORDER BY seq ASC`,
+      )
+      .all(conversationId, Math.max(1, Math.floor(tailWindow)), role) as unknown as Array<{
+      message_id: number;
+      content: string;
+    }>;
+    return rows.map((row) => ({ messageId: row.message_id, content: row.content }));
+  }
+
+  /**
    * Whether the newest persisted row has the same identity hash and preserved
    * reasoning content. Used to dedup adjacent delivery-mirror messages whose
    * text content is already covered by the immediately preceding response entry.

@@ -2,9 +2,11 @@
 
 Lossless-claw reads plugin configuration from `plugins.entries.lossless-claw.config`.
 
-Lossless-claw requires OpenClaw `2026.7.2` or newer so the host can provide the
-branch-safe visible transcript projection used during SQLite session bootstrap
-and enforce context-engine runtime capabilities before an agent run starts.
+Lossless-claw requires OpenClaw `2026.7.2-beta.2` or newer so the host can provide
+the branch-safe visible transcript projection used during SQLite session bootstrap
+and enforce context-engine runtime capabilities before an agent run starts. That
+beta is the first published build with the required API; stable `2026.7.1` does
+not provide it.
 Agent runs need a native host that provides the full context-engine lifecycle:
 session bootstrap, pre-prompt assembly, after-turn ingestion, maintenance,
 compaction, and runtime LLM completion. Native Codex and Pi embedded runs provide
@@ -21,8 +23,8 @@ completion. Fully capable native hosts still advertise and execute the full
 lifecycle, and Lossless retains compaction ownership for those runs. Subagent
 forks continue to require `thread-bootstrap-projection`.
 
-If you cannot upgrade OpenClaw, use a `lossless-claw` release compatible with
-your installed OpenClaw version.
+If you cannot use a beta or upgrade OpenClaw, use a `lossless-claw` release
+compatible with your installed OpenClaw version.
 
 The optional programmatic `status` / `doctor` / `rotate` control surface requires
 a host that separately advertises context-engine capabilities/control dispatch.
