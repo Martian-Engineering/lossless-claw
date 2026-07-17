@@ -803,7 +803,7 @@ describe("LcmContextEngine maintain and assemble budget", () => {
       expect(first.changed).toBe(true);
       expect(first.reason).toBe("compacted but still over target");
       expect(complete.mock.calls.length).toBeGreaterThan(0);
-      expect(complete.mock.calls.length).toBeLessThanOrEqual(maxSweepIterations * 3);
+      expect(complete.mock.calls.length).toBeLessThanOrEqual(maxSweepIterations * 2);
       const calledProviders = new Set(
         complete.mock.calls.map(([params]) => params.provider ?? ""),
       );
@@ -842,7 +842,7 @@ describe("LcmContextEngine maintain and assemble budget", () => {
 
       const contextItems = await summaryStore.getContextItems(conversation.conversationId);
       expect(contextItems.length).toBeGreaterThan(1);
-      expect(contextItems.filter((item) => item.itemType === "message").length).toBeGreaterThanOrEqual(1);
+      expect(contextItems.filter((item) => item.itemType === "message")).toHaveLength(2);
       expect(contextItems.filter((item) => item.itemType === "summary")).not.toHaveLength(1);
 
       const reachableSummaryIds = new Set<string>();
@@ -1573,71 +1573,17 @@ describe("LcmContextEngine maintain and assemble budget", () => {
       tokenBudget: 10,
     });
 
-    // force=true skips backoff in emergency drain path — executeCompactionCore is called
-    expect(executeSpy).toHaveBeenCalled();
+    expect(executeSpy).toHaveBeenCalledWith(expect.objectContaining({ force: true }));
     // Assemble still returns a usable single-message result via degraded fallback
     expect(assembleResult.messages).toHaveLength(1);
   });
 
-  it("force compaction passes dynamic leafChunkTokens and freshTailMaxTokens to compactFullSweep", async () => {
-    const engine = createEngineWithConfig({ contextThreshold: 0.7 });
-    const privateEngine = engine as unknown as {
-      compaction: {
-        compactFullSweep: (input: unknown) => Promise<unknown>;
-      };
-    };
-    const compactFullSweepSpy = vi
-      .spyOn(privateEngine.compaction, "compactFullSweep")
-      .mockResolvedValue({ actionTaken: false, tokensBefore: 0, tokensAfter: 0, condensed: false });
-
-    const sessionId = "force-dynamic-params";
-    const conversation = await engine.getConversationStore().getOrCreateConversation(sessionId, {
-      sessionKey: undefined,
+  it("normal deferred drain keeps configured compaction sweep sizing", async () => {
+    const engine = createEngineWithConfig({
+      contextThreshold: 0.7,
+      freshTailCount: 2,
+      leafChunkTokens: 2_000,
     });
-
-    // Set up maintenance with pending debt to trigger emergency drain
-    await engine.getCompactionMaintenanceStore().requestProactiveCompactionDebt({
-      conversationId: conversation.conversationId,
-      reason: "threshold",
-      tokenBudget: 4_096,
-      currentTokenCount: 9_999,
-    });
-    await engine.getCompactionMaintenanceStore().markProactiveCompactionRunning({
-      conversationId: conversation.conversationId,
-    });
-    await engine.getCompactionMaintenanceStore().markProactiveCompactionFinished({
-      conversationId: conversation.conversationId,
-      failureSummary: "compacted but still over target",
-      keepPending: true,
-    });
-
-    await engine.assemble({
-      sessionId,
-      messages: [makeMessage({ role: "user", content: "hello ".repeat(200) })],
-      tokenBudget: 10,
-    });
-
-    // Verify compactFullSweep was called with dynamic overrides
-    expect(compactFullSweepSpy).toHaveBeenCalledWith(
-      expect.objectContaining({
-        leafChunkTokens: expect.any(Number),
-        freshTailMaxTokens: expect.any(Number),
-        force: true,
-      }),
-    );
-    const callArg = compactFullSweepSpy.mock.calls[0]![0] as {
-      leafChunkTokens: number;
-      freshTailMaxTokens: number;
-      tokenBudget: number;
-    };
-    // leafChunkTokens should be budget * 0.25 = 2 (with budget=10)
-    expect(callArg.leafChunkTokens).toBe(2);
-    // freshTailMaxTokens should be budget * (1 - 0.7) * 0.5 = 1.5 → 1
-    expect(callArg.freshTailMaxTokens).toBe(1);
-  });
-
-  it("normal deferred drain does not pass dynamic overrides to compactFullSweep", async () => {
-    const engine = createEngineWithConfig({ contextThreshold: 0.7 });
     const privateEngine = engine as unknown as {
       compaction: {
         compactFullSweep: (input: unknown) => Promise<unknown>;
@@ -1652,20 +1598,16 @@ describe("LcmContextEngine maintain and assemble budget", () => {
       sessionKey: undefined,
     });
 
-    // Set up maintenance with pending debt (no force — normal deferred drain)
+    // Create pending threshold debt without a backoff so the normal drain runs.
     await engine.getCompactionMaintenanceStore().requestProactiveCompactionDebt({
       conversationId: conversation.conversationId,
       reason: "threshold",
       tokenBudget: 4_096,
       currentTokenCount: 3_500,
-    });
-    await engine.getCompactionMaintenanceStore().markProactiveCompactionRunning({
-      conversationId: conversation.conversationId,
-    });
-    await engine.getCompactionMaintenanceStore().markProactiveCompactionFinished({
-      conversationId: conversation.conversationId,
-      failureSummary: "compacted but still over target",
-      keepPending: true,
+      contextThreshold: 0.7,
+      contextThresholdSource: "global",
+      contextFreshTailCount: 2,
+      contextLeafChunkTokens: 2_000,
     });
 
     // Call consumeDeferredCompactionDebt directly — normal drain, no force
@@ -1683,77 +1625,75 @@ describe("LcmContextEngine maintain and assemble budget", () => {
       tokenBudget: 4_096,
     });
 
-    // Verify compactFullSweep was NOT called with dynamic overrides
-    // (either not called at all due to backoff, or called without the dynamic fields)
-    if (compactFullSweepSpy.mock.calls.length > 0) {
-      const callArg = compactFullSweepSpy.mock.calls[0]![0] as Record<string, unknown>;
-      expect(callArg).not.toHaveProperty("freshTailMaxTokens");
-    }
+    expect(compactFullSweepSpy).toHaveBeenCalledOnce();
+    expect(compactFullSweepSpy).toHaveBeenCalledWith(
+      expect.objectContaining({
+        freshTailCount: 2,
+        leafChunkTokens: 2_000,
+      }),
+    );
+    const callArg = compactFullSweepSpy.mock.calls[0]![0] as Record<string, unknown>;
+    expect(callArg).not.toHaveProperty("freshTailMaxTokens");
   });
 
-  it("assemble emergency drain stops forwarding force when retryAttempts >= ASSEMBLE_FORCE_MAX_RETRY_ATTEMPTS", async () => {
-    vi.useFakeTimers({ toFake: ["Date"] });
-    vi.setSystemTime(new Date("2026-07-14T12:00:00.000Z"));
-    try {
-      const engine = createEngineWithConfig({ freshTailCount: 1 });
-      const sessionId = "force-capped-at-max-retry";
-      const tokenBudget = 1000;
-
-      await seedBacklogContext(engine, sessionId, [100, 100, 100]);
-      const conversation = await engine
-        .getConversationStore()
-        .getConversationBySessionId(sessionId);
-      expect(conversation).not.toBeNull();
-
-      // Seed retryAttempts to 3, the effective cap (ASSEMBLE_FORCE_MAX_RETRY_ATTEMPTS)
-      await engine.getCompactionMaintenanceStore().requestProactiveCompactionDebt({
-        conversationId: conversation!.conversationId,
-        reason: "threshold",
-        tokenBudget,
-        currentTokenCount: 9999,
+  it("assemble emergency drain forwards force below the retry cap and stops at the cap", async () => {
+    const engine = createEngine();
+    const sessionId = "force-capped-at-max-retry";
+    const tokenBudget = 1_000;
+    const conversation = await engine.getConversationStore().getOrCreateConversation(sessionId, {
+      sessionKey: undefined,
+    });
+    const store = engine.getCompactionMaintenanceStore();
+    await store.requestProactiveCompactionDebt({
+      conversationId: conversation.conversationId,
+      reason: "threshold",
+      tokenBudget,
+      currentTokenCount: 9_999,
+    });
+    for (let i = 0; i < 2; i++) {
+      await store.markProactiveCompactionRunning({ conversationId: conversation.conversationId });
+      await store.markProactiveCompactionFinished({
+        conversationId: conversation.conversationId,
+        failureSummary: "compacted but still over target",
+        keepPending: true,
       });
-      for (let i = 0; i < 3; i++) {
-        await engine.getCompactionMaintenanceStore().markProactiveCompactionRunning({
-          conversationId: conversation!.conversationId,
-        });
-        await engine.getCompactionMaintenanceStore().markProactiveCompactionFinished({
-          conversationId: conversation!.conversationId,
-          failureSummary: "compacted but still over target",
-          keepPending: true,
-        });
-      }
-
-      const before = await engine
-        .getCompactionMaintenanceStore()
-        .getConversationCompactionMaintenance(conversation!.conversationId);
-      expect(before?.retryAttempts).toBe(3);
-      expect(before!.nextAttemptAfter!.getTime()).toBeGreaterThan(Date.now());
-
-      // Spy on executeCompactionCore — should NOT be called
-      const privateEngine = engine as unknown as {
-        executeCompactionCore: (params: unknown) => Promise<unknown>;
-      };
-      const executeSpy = vi.spyOn(privateEngine, "executeCompactionCore");
-
-      const enginePrivate = engine as unknown as {
-        maybeConsumeDeferredCompactionDebtForAssemble: (params: {
-          conversationId: number;
-          sessionId: string;
-          tokenBudget: number;
-        }) => Promise<unknown>;
-      };
-
-      await enginePrivate.maybeConsumeDeferredCompactionDebtForAssemble({
-        conversationId: conversation!.conversationId,
-        sessionId,
-        tokenBudget,
-      });
-
-      // retryAttempts >= 3 disables force, so executeCompactionCore is NOT called
-      expect(executeSpy).not.toHaveBeenCalled();
-    } finally {
-      vi.useRealTimers();
     }
+
+    const privateEngine = engine as unknown as {
+      maybeConsumeDeferredCompactionDebtForAssemble: (params: {
+        conversationId: number;
+        sessionId: string;
+        tokenBudget: number;
+      }) => Promise<unknown>;
+      consumeDeferredCompactionDebt: (params: unknown) => Promise<unknown>;
+    };
+    const consumeSpy = vi
+      .spyOn(privateEngine, "consumeDeferredCompactionDebt")
+      .mockResolvedValue(null);
+
+    await privateEngine.maybeConsumeDeferredCompactionDebtForAssemble({
+      conversationId: conversation.conversationId,
+      sessionId,
+      tokenBudget,
+    });
+    expect(consumeSpy).toHaveBeenLastCalledWith(expect.objectContaining({ force: true }));
+
+    await store.markProactiveCompactionRunning({ conversationId: conversation.conversationId });
+    await store.markProactiveCompactionFinished({
+      conversationId: conversation.conversationId,
+      failureSummary: "compacted but still over target",
+      keepPending: true,
+    });
+    expect(
+      (await store.getConversationCompactionMaintenance(conversation.conversationId))?.retryAttempts,
+    ).toBe(3);
+
+    await privateEngine.maybeConsumeDeferredCompactionDebtForAssemble({
+      conversationId: conversation.conversationId,
+      sessionId,
+      tokenBudget,
+    });
+    expect(consumeSpy).toHaveBeenLastCalledWith(expect.objectContaining({ force: false }));
   });
 
   it("maintain() uses the stricter current token budget for deferred threshold debt", async () => {

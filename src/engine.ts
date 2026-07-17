@@ -907,6 +907,7 @@ export class LcmContextEngine implements ContextEngine {
         contextThresholdOverride: resolvedContextThreshold,
         runtimeContext: params.runtimeContext,
         legacyParams: params.legacyParams,
+        force: params.force,
       });
       const blockedByAuthCircuitBreaker = result.reason === "circuit breaker open";
       // #639 Mode 2: terminal compaction exhaustion (no eligible candidates while
@@ -1240,34 +1241,8 @@ export class LcmContextEngine implements ContextEngine {
             ? false
             : !liveContextStillExceedsTarget;
       };
-      const runSweepOnce = (): ReturnType<CompactionEngine["compact"]> => {
-        // When force=true, dynamically tune leafChunkTokens and freshTailMaxTokens
-        // for faster convergence based on contextThreshold.
-        if (forceThresholdSweep) {
-          const dynamicLeafChunk = Math.min(
-            Math.floor(tokenBudget * 0.25),
-            resolvedContextThreshold.leafChunkTokens ?? 40000,
-          );
-          const dynamicFreshTail = Math.floor(
-            tokenBudget * (1 - resolvedContextThreshold.contextThreshold) * 0.5,
-          );
-          return this.compaction.compact({
-            conversationId,
-            tokenBudget,
-            contextThreshold: resolvedContextThreshold.contextThreshold,
-            freshTailCount: resolvedContextThreshold.freshTailCount,
-            leafChunkTokens: dynamicLeafChunk,
-            freshTailMaxTokens: dynamicFreshTail > 0 ? dynamicFreshTail : undefined,
-            summarize,
-            force: forceThresholdSweep,
-            hardTrigger: false,
-            summaryModel,
-            ...(runtimeAdjustedSweepTargetTokens !== undefined
-              ? { stopAtTokens: runtimeAdjustedSweepTargetTokens }
-              : {}),
-          });
-        }
-        return this.compaction.compact({
+      const runSweepOnce = (): ReturnType<CompactionEngine["compact"]> =>
+        this.compaction.compact({
           conversationId,
           tokenBudget,
           contextThreshold: resolvedContextThreshold.contextThreshold,
@@ -1285,7 +1260,6 @@ export class LcmContextEngine implements ContextEngine {
             ? { stopAtTokens: runtimeAdjustedSweepTargetTokens }
             : {}),
         });
-      };
 
       let sweepResult: Awaited<ReturnType<CompactionEngine["compact"]>>;
       try {
