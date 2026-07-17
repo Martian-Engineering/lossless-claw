@@ -36,6 +36,8 @@
     "doctor-contract-api.d.ts",
     "doctor-contract-api.js",
     "skills/",
+    "plugins/",
+    ".agents/plugins/marketplace.json",
     "openclaw.plugin.json",
     "docs/",
     "!docs/superpowers/",
