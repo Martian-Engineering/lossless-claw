@@ -11,7 +11,6 @@ import {
   resetExpansionDelegationGuardForTests,
   stampDelegatedExpansionContext,
 } from "../src/tools/lcm-expansion-recursion-guard.js";
-import { createLcmDescribeTool } from "../src/tools/lcm-describe-tool.js";
 import { createLcmExpandQueryTool } from "../src/tools/lcm-expand-query-tool.js";
 import { createLcmGrepTool } from "../src/tools/lcm-grep-tool.js";
 import type { LcmDependencies } from "../src/types.js";
@@ -169,12 +168,6 @@ function makeEngine(params: {
   } as unknown as LcmContextEngine;
 }
 
-function readToolText(result: { content: Array<{ type?: string; text?: string }> }): string {
-  return result.content
-    .map((part) => (part.type === "text" && typeof part.text === "string" ? part.text : ""))
-    .join("\n");
-}
-
 describe("createLcmExpandQueryTool", () => {
   beforeEach(() => {
     vi.clearAllMocks();
@@ -311,50 +304,12 @@ describe("createLcmExpandQueryTool", () => {
     });
   });
 
-  it("expands a compacted fact from a grep-discovered summary ID", async () => {
+  it("routes a grep-discovered summary ID into delegated expansion", async () => {
     const retrieval = makeRetrieval();
     const createdAt = new Date("2026-01-02T00:00:00.000Z");
     const summaryId = "sum_crabpot_lcm_fact";
     const summaryContent =
       "Release-gate summary preserved CRABPOT_LCM_FACT is blue-lantern-42 after rotate.";
-    const describedSummary = {
-      id: summaryId,
-      type: "summary",
-      summary: {
-        conversationId: 42,
-        kind: "leaf",
-        content: summaryContent,
-        depth: 0,
-        tokenCount: 16,
-        descendantCount: 0,
-        descendantTokenCount: 0,
-        sourceMessageTokenCount: 16,
-        fileIds: [],
-        parentIds: [],
-        childIds: [],
-        messageIds: [],
-        earliestAt: createdAt,
-        latestAt: createdAt,
-        createdAt,
-        subtree: [
-          {
-            summaryId,
-            parentSummaryId: null,
-            depthFromRoot: 0,
-            depth: 0,
-            kind: "leaf",
-            tokenCount: 16,
-            descendantCount: 0,
-            descendantTokenCount: 0,
-            sourceMessageTokenCount: 16,
-            childCount: 0,
-            earliestAt: createdAt,
-            latestAt: createdAt,
-            path: summaryId,
-          },
-        ],
-      },
-    };
     retrieval.grep.mockResolvedValue({
       messages: [],
       summaries: [
@@ -368,7 +323,13 @@ describe("createLcmExpandQueryTool", () => {
       ],
       totalMatches: 1,
     });
-    retrieval.describe.mockResolvedValue(describedSummary);
+    retrieval.describe.mockResolvedValue({
+      type: "summary",
+      summary: {
+        conversationId: 42,
+        latestAt: createdAt,
+      },
+    });
 
     const deps = makeDeps();
     const lcm = makeEngine({ retrieval, conversationId: 42 });
@@ -383,12 +344,13 @@ describe("createLcmExpandQueryTool", () => {
       scope: "summaries",
       limit: 10,
     });
-    const grepText = readToolText(grepResult);
+    const grepText = (grepResult.content[0] as { text: string }).text;
     const matchedSummaryId = grepText.match(/\bsum_[a-z0-9_]+\b/)?.[0];
     if (!matchedSummaryId) {
       throw new Error(`Expected lcm_grep output to include ${summaryId}`);
     }
     expect(matchedSummaryId).toBe(summaryId);
+    expect(grepText).toContain(`[conv=42 ${summaryId}]`);
     expect(retrieval.grep).toHaveBeenCalledWith(
       expect.objectContaining({
         query: "CRABPOT_LCM_FACT",
@@ -398,19 +360,9 @@ describe("createLcmExpandQueryTool", () => {
       }),
     );
 
-    const describeTool = createLcmDescribeTool({
-      deps,
-      lcm,
-      sessionId: "agent:main:main",
-    });
-    const describeResult = await describeTool.execute("call-describe-summary", {
-      id: matchedSummaryId,
-    });
-    const describeText = readToolText(describeResult);
-    expect(describeText).toContain(`LCM_SUMMARY ${summaryId}`);
-    expect(describeText).toContain("blue-lantern-42");
-
     let delegatedMessage = "";
+    // The gateway is the unit-test boundary, so prove the child receives the
+    // discovered ID plus evidence-retrieval instructions before stubbing its reply.
     callGatewayMock.mockImplementation(async (opts: unknown) => {
       const request = opts as { method?: string; params?: Record<string, unknown> };
       if (request.method === "agent") {
@@ -461,9 +413,13 @@ describe("createLcmExpandQueryTool", () => {
       timeoutMs: 60_000,
     });
 
-    expect(retrieval.describe.mock.calls.map(([id]) => id)).toEqual([summaryId, summaryId]);
+    expect(retrieval.describe).toHaveBeenCalledWith(summaryId);
     expect(delegatedMessage).toContain(`Seed summary IDs: ${summaryId}`);
     expect(delegatedMessage).toContain("What is CRABPOT_LCM_FACT?");
+    expect(delegatedMessage).toContain("lcm_describe");
+    expect(delegatedMessage).toContain(
+      "Synthesize the final answer from retrieved evidence, not assumptions.",
+    );
     expect(expandResult.details).toMatchObject({
       answer: "blue-lantern-42",
       citedIds: [summaryId],
