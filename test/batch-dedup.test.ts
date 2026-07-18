@@ -1,6 +1,11 @@
 import { describe, expect, it, vi } from "vitest";
 import { BatchDeduplicator } from "../src/batch-dedup.js";
-import type { ConversationStore, MessageRecord } from "../src/store/conversation-store.js";
+import type { AgentMessage } from "../src/openclaw-bridge.js";
+import type {
+  ConversationStore,
+  MessagePartRecord,
+  MessageRecord,
+} from "../src/store/conversation-store.js";
 import { buildMessageIdentityHash } from "../src/store/message-identity.js";
 import type { SummaryStore } from "../src/store/summary-store.js";
 import { makeMessage } from "./helpers.js";
@@ -12,6 +17,7 @@ function makeLog() {
 type FakeConversationStore = {
   conversationId: number;
   messages: MessageRecord[];
+  toolCallIdsByMessageId?: Record<number, string[]>;
 };
 
 function makeConversationStore(initial: FakeConversationStore): ConversationStore {
@@ -60,21 +66,45 @@ function makeConversationStore(initial: FakeConversationStore): ConversationStor
           (m) => buildMessageIdentityHash(m.role, m.content) === identityHash && m.role === role,
         ).length,
     ),
+    getMessageParts: vi.fn(async (messageId: number) =>
+      (initial.toolCallIdsByMessageId?.[messageId] ?? []).map(
+        (toolCallId, ordinal): MessagePartRecord => ({
+          partId: `${messageId}:${ordinal}`,
+          messageId,
+          sessionId: "s1",
+          partType: "tool",
+          ordinal,
+          textContent: null,
+          toolCallId,
+          toolName: null,
+          toolInput: null,
+          toolOutput: null,
+          metadata: null,
+        }),
+      ),
+    ),
   } as unknown as ConversationStore;
 }
 
-function makeDedup(store: FakeConversationStore) {
+type RedactSensitiveText = (content: string) => string;
+
+function makeDedup(store: FakeConversationStore, redactSensitiveText?: RedactSensitiveText) {
   return new BatchDeduplicator(
     makeConversationStore(store),
     {} as unknown as SummaryStore,
     "/tmp/lcm-batch-dedup-test",
     { log: makeLog() },
+    redactSensitiveText,
   );
 }
 
-function storedMessage(role: string, content: string): MessageRecord {
+function redactTenantSecret(content: string): string {
+  return content.replace(/tenant-secret-[a-z]+/g, "***");
+}
+
+function storedMessage(role: string, content: string, messageId = 0): MessageRecord {
   return {
-    messageId: 0,
+    messageId,
     conversationId: 1,
     seq: 0,
     role: role as MessageRecord["role"],
@@ -83,6 +113,14 @@ function storedMessage(role: string, content: string): MessageRecord {
     createdAt: new Date(),
     largeContent: null,
   };
+}
+
+function toolResultMessage(content: string, toolCallId: string): AgentMessage {
+  return {
+    ...makeMessage({ role: "toolResult", content }),
+    toolCallId,
+    toolName: "read",
+  } as AgentMessage;
 }
 
 describe("BatchDeduplicator.deduplicateAfterTurnBatch", () => {
@@ -155,6 +193,167 @@ describe("BatchDeduplicator.deduplicateAfterTurnBatch", () => {
     ];
     const result = await dedup.deduplicateAfterTurnBatch("s1", undefined, batch);
     expect(result).toEqual([batch[1]]);
+  });
+
+  it("trims a replay when one row is exactly the host-redacted form of the stored row", async () => {
+    const dedup = makeDedup(
+      {
+        conversationId: 1,
+        messages: [
+          storedMessage("tool", "tool output tenant-secret-alpha", 1),
+          storedMessage("assistant", "exact replay anchor"),
+        ],
+        toolCallIdsByMessageId: { 1: ["call-secret"] },
+      },
+      redactTenantSecret,
+    );
+    const batch = [
+      toolResultMessage("tool output ***", "call-secret"),
+      makeMessage({ role: "assistant", content: "exact replay anchor" }),
+      makeMessage({ role: "user", content: "new turn" }),
+    ];
+
+    const result = await dedup.deduplicateAfterTurnBatch("s1", undefined, batch);
+
+    expect(result).toEqual([batch[2]]);
+  });
+
+  it("uses an exact neighbor to anchor a redaction-divergent oversized suffix replay", async () => {
+    const dedup = makeDedup(
+      {
+        conversationId: 1,
+        messages: [
+          storedMessage("user", "older turn"),
+          storedMessage("assistant", "older reply"),
+          storedMessage("tool", "tool output tenant-secret-alpha", 1),
+          storedMessage("assistant", "exact replay anchor"),
+        ],
+        toolCallIdsByMessageId: { 1: ["call-secret"] },
+      },
+      redactTenantSecret,
+    );
+    const batch = [
+      toolResultMessage("tool output ***", "call-secret"),
+      makeMessage({ role: "assistant", content: "exact replay anchor" }),
+      makeMessage({ role: "user", content: "new turn" }),
+    ];
+
+    const result = await dedup.deduplicateAfterTurnBatch("s1", undefined, batch);
+
+    expect(result).toEqual([batch[2]]);
+  });
+
+  it("does not collapse different raw values that redact to the same text", async () => {
+    const dedup = makeDedup(
+      {
+        conversationId: 1,
+        messages: [
+          storedMessage("tool", "tool output tenant-secret-alpha", 1),
+          storedMessage("assistant", "exact replay anchor"),
+        ],
+        toolCallIdsByMessageId: { 1: ["call-secret"] },
+      },
+      redactTenantSecret,
+    );
+    const batch = [
+      toolResultMessage("tool output tenant-secret-beta", "call-secret"),
+      makeMessage({ role: "assistant", content: "exact replay anchor" }),
+      makeMessage({ role: "user", content: "new turn" }),
+    ];
+
+    const result = await dedup.deduplicateAfterTurnBatch("s1", undefined, batch);
+
+    expect(result).toEqual(batch);
+  });
+
+  it("does not collapse a raw value against an unproven persisted redaction", async () => {
+    const dedup = makeDedup(
+      {
+        conversationId: 1,
+        messages: [
+          storedMessage("tool", "tool output ***", 1),
+          storedMessage("assistant", "exact replay anchor"),
+        ],
+        toolCallIdsByMessageId: { 1: ["call-alpha"] },
+      },
+      redactTenantSecret,
+    );
+    const batch = [
+      toolResultMessage("tool output tenant-secret-beta", "call-beta"),
+      makeMessage({ role: "assistant", content: "exact replay anchor" }),
+      makeMessage({ role: "user", content: "new turn" }),
+    ];
+
+    const result = await dedup.deduplicateAfterTurnBatch("s1", undefined, batch);
+
+    expect(result).toEqual(batch);
+  });
+
+  it("trims a persisted host-redacted tool replay when the tool call id is unchanged", async () => {
+    const dedup = makeDedup(
+      {
+        conversationId: 1,
+        messages: [
+          storedMessage("tool", "tool output ***", 1),
+          storedMessage("assistant", "exact replay anchor"),
+        ],
+        toolCallIdsByMessageId: { 1: ["call-secret"] },
+      },
+      redactTenantSecret,
+    );
+    const batch = [
+      toolResultMessage("tool output tenant-secret-alpha", "call-secret"),
+      makeMessage({ role: "assistant", content: "exact replay anchor" }),
+      makeMessage({ role: "user", content: "new turn" }),
+    ];
+
+    const result = await dedup.deduplicateAfterTurnBatch("s1", undefined, batch);
+
+    expect(result).toEqual([batch[2]]);
+  });
+
+  it("does not let a distant exact row anchor consecutive redaction-only matches", async () => {
+    const dedup = makeDedup(
+      {
+        conversationId: 1,
+        messages: [
+          storedMessage("tool", "first output ***", 1),
+          storedMessage("tool", "second output ***", 2),
+          storedMessage("assistant", "distant exact anchor"),
+        ],
+        toolCallIdsByMessageId: {
+          1: ["call-first"],
+          2: ["call-second"],
+        },
+      },
+      redactTenantSecret,
+    );
+    const batch = [
+      toolResultMessage("first output tenant-secret-alpha", "call-first"),
+      toolResultMessage("second output tenant-secret-beta", "call-second"),
+      makeMessage({ role: "assistant", content: "distant exact anchor" }),
+      makeMessage({ role: "user", content: "new turn" }),
+    ];
+
+    const result = await dedup.deduplicateAfterTurnBatch("s1", undefined, batch);
+
+    expect(result).toEqual(batch);
+  });
+
+  it("does not treat a lone redaction-only match as enough evidence to trim", async () => {
+    const dedup = makeDedup(
+      {
+        conversationId: 1,
+        messages: [storedMessage("tool", "tool output tenant-secret-alpha", 1)],
+        toolCallIdsByMessageId: { 1: ["call-secret"] },
+      },
+      redactTenantSecret,
+    );
+    const batch = [toolResultMessage("tool output ***", "call-secret")];
+
+    const result = await dedup.deduplicateAfterTurnBatch("s1", undefined, batch);
+
+    expect(result).toEqual(batch);
   });
 });
 

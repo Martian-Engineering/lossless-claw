@@ -6,6 +6,7 @@
  *
  * Extracted from engine.ts (Phase 2 of the engine decomposition).
  */
+import { createRequire } from "node:module";
 import {
   formatFileReference,
   formatRawPayloadReference,
@@ -27,7 +28,60 @@ import { openClawInboundBodiesMatch } from "./openclaw-inbound-metadata.js";
 import type { ConversationStore, MessageRecord } from "./store/conversation-store.js";
 import { buildMessageIdentityHash } from "./store/message-identity.js";
 import type { LargeFileRecord, SummaryStore } from "./store/summary-store.js";
+import {
+  extractAssistantToolCallIdsForPairing,
+  extractToolPairingIdFromRecord,
+  extractToolResultIdForPairing,
+} from "./tool-pairing.js";
 import type { LcmDependencies } from "./types.js";
+
+type RedactSensitiveText = (content: string) => string;
+type StoredIncomingMatch =
+  | "exact"
+  | "externalized"
+  | "unproven-externalized"
+  | "redacted";
+type CoveredStoredIncomingMatch = StoredIncomingMatch | "decorated";
+type AlignmentMatch = CoveredStoredIncomingMatch | "unanchored-inbound";
+
+function isStrongReplayAnchor(match: AlignmentMatch | undefined): boolean {
+  return match === "exact" || match === "decorated";
+}
+
+function redactedMatchesHaveAdjacentAnchor(matches: readonly AlignmentMatch[]): boolean {
+  return matches.every(
+    (match, index) =>
+      match !== "redacted" ||
+      isStrongReplayAnchor(matches[index - 1]) ||
+      isStrongReplayAnchor(matches[index + 1]),
+  );
+}
+
+/** Load the host redactor without making the optional OpenClaw peer mandatory. */
+function loadOpenClawRedactor(): RedactSensitiveText | undefined {
+  try {
+    const require = createRequire(import.meta.url);
+    const loggingCore = require("openclaw/plugin-sdk/logging-core") as {
+      redactSensitiveText?: unknown;
+    };
+    return typeof loggingCore.redactSensitiveText === "function"
+      ? (loggingCore.redactSensitiveText as RedactSensitiveText)
+      : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+function incomingToolCallIds(message: AgentMessage): Set<string> {
+  const ids = extractAssistantToolCallIdsForPairing(message);
+  const toolResultId = extractToolResultIdForPairing(message);
+  if (toolResultId) ids.push(toolResultId);
+  return new Set(ids);
+}
+
+function sameNonEmptyIds(left: ReadonlySet<string>, right: ReadonlySet<string>): boolean {
+  return left.size > 0 && left.size === right.size && [...left].every((id) => right.has(id));
+}
 
 /**
  * Collapse only the whitespace OpenClaw core actually rewrites on the runtime
@@ -49,7 +103,48 @@ export class BatchDeduplicator {
     private readonly summaryStore: SummaryStore,
     private readonly largeFilesDir: string,
     private readonly deps: Pick<LcmDependencies, "log">,
+    private readonly redactSensitiveText: RedactSensitiveText | undefined = loadOpenClawRedactor(),
   ) {}
+
+  /**
+   * Accept host redaction only when both faces carry the same complete set of
+   * tool-call ids and applying redaction to one complete message produces the
+   * other. The provenance gate keeps different secret-bearing tool calls from
+   * collapsing; redactor failure degrades to exact-only dedup.
+   */
+  private async messagesDifferOnlyByHostRedaction(
+    persisted: MessageRecord,
+    incoming: StoredMessage,
+    incomingMessage: AgentMessage,
+  ): Promise<boolean> {
+    if (persisted.role !== incoming.role || !this.redactSensitiveText) return false;
+    const incomingIds = incomingToolCallIds(incomingMessage);
+    if (incomingIds.size === 0) return false;
+    const storedIds = await this.storedToolCallIds(persisted.messageId);
+    if (!sameNonEmptyIds(storedIds, incomingIds)) return false;
+    try {
+      const redactedPersisted = this.redactSensitiveText(persisted.content);
+      if (redactedPersisted !== persisted.content && redactedPersisted === incoming.content) {
+        return true;
+      }
+      const redactedIncoming = this.redactSensitiveText(incoming.content);
+      return redactedIncoming !== incoming.content && redactedIncoming === persisted.content;
+    } catch {
+      return false;
+    }
+  }
+
+  /** Read stable tool-call provenance from the stored message parts. */
+  private async storedToolCallIds(messageId: number): Promise<Set<string>> {
+    const ids = new Set<string>();
+    for (const part of await this.conversationStore.getMessageParts(messageId)) {
+      if (part.toolCallId) ids.add(part.toolCallId);
+      const metadata = parsePartMetadata(part.metadata);
+      const metadataId = metadata ? extractToolPairingIdFromRecord(metadata) : undefined;
+      if (metadataId) ids.add(metadataId);
+    }
+    return ids;
+  }
 
   /**
    * Remove messages from the batch that already exist in the DB for this session.
@@ -170,11 +265,12 @@ export class BatchDeduplicator {
       const tailMessages = tail.slice(tail.length - k);
       const tailSlice = tailHashes.slice(tailHashes.length - k);
       let aligned = true;
-      let exactAnchor = false;
+      const matches: AlignmentMatch[] = [];
       for (let i = 0; i < k; i += 1) {
         const match = await this.matchStoredMessageToIncoming(
           tailMessages[i]!,
           storedBatch[i]!,
+          batch[i]!,
           batchHashes[i]!,
           tailSlice[i]!,
           rawPayloadContents[i],
@@ -199,7 +295,7 @@ export class BatchDeduplicator {
               { allowCollapsedSpaceRunMatch: true },
             )
           ) {
-            exactAnchor = true;
+            matches.push("decorated");
             continue;
           }
           if (
@@ -211,17 +307,22 @@ export class BatchDeduplicator {
               { allowUntimestampedInboundBodyMatch: true },
             )
           ) {
+            matches.push("unanchored-inbound");
             continue;
           }
           aligned = false;
           break;
         }
-        exactAnchor ||= match === "exact";
+        matches.push(match);
       }
       // Externalized-only matches are ambiguous in the same way as suffix
       // fallback anchors: they may be a replay or a legitimate repeated upload.
       // Trim only when at least one matched message still has exact identity.
-      if (aligned && exactAnchor) {
+      if (
+        aligned &&
+        matches.some(isStrongReplayAnchor) &&
+        redactedMatchesHaveAdjacentAnchor(matches)
+      ) {
         return batch.slice(k);
       }
     }
@@ -302,14 +403,20 @@ export class BatchDeduplicator {
     if (batchAtBoundaryHash !== lastDbIdentityHash) {
       const lastDbMessage = await this.conversationStore.getLastMessage(conversationId);
       const batchAtBoundary = storedBatch[storedMessageCount - 1]!;
+      const batchAtBoundaryMessage = batch[storedMessageCount - 1]!;
       if (
         !lastDbMessage ||
-        !this.runtimeRowCoversPersistedFrontierRow(
+        (!this.runtimeRowCoversPersistedFrontierRow(
           lastDbMessage.role,
           lastDbMessage.content,
           batchAtBoundary.role,
           batchAtBoundary.content,
-        )
+        ) &&
+          !(await this.messagesDifferOnlyByHostRedaction(
+            lastDbMessage,
+            batchAtBoundary,
+            batchAtBoundaryMessage,
+          )))
       ) {
         // Prefix mismatch — attempt suffix fallback before giving up.
         return this.deduplicateSuffixFallback(
@@ -340,10 +447,12 @@ export class BatchDeduplicator {
     if (storedMessages.length !== storedMessageCount) {
       return batch;
     }
+    const matches: CoveredStoredIncomingMatch[] = [];
     for (let i = 0; i < storedMessageCount; i += 1) {
       const match = await this.matchStoredMessageToIncoming(
         storedMessages[i]!,
         storedBatch[i]!,
+        batch[i]!,
         batchHashes[i]!,
         recentDbHashes[i]!,
         rawPayloadContents[i],
@@ -367,8 +476,15 @@ export class BatchDeduplicator {
         ) {
           return batch;
         }
+        matches.push("decorated");
+      } else {
+        matches.push(match);
       }
     }
+
+    // A redacted value is intentionally lossy. Require an adjacent unchanged
+    // or structurally decorated row before treating it as replay evidence.
+    if (!redactedMatchesHaveAdjacentAnchor(matches)) return batch;
 
     return batch.slice(storedMessageCount);
   }
@@ -400,10 +516,12 @@ export class BatchDeduplicator {
       );
       if (tailMessages.length === batch.length && tailHashes.length === batch.length) {
         let tailMatch = true;
+        const matches: CoveredStoredIncomingMatch[] = [];
         for (let i = 0; i < batch.length; i++) {
           const match = await this.matchStoredMessageToIncomingOrDecoratedCoverage(
             tailMessages[i]!,
             storedBatch[i]!,
+            batch[i]!,
             batchHashes[i]!,
             tailHashes[i]!,
             rawPayloadContents[i],
@@ -412,8 +530,9 @@ export class BatchDeduplicator {
             tailMatch = false;
             break;
           }
+          matches.push(match);
         }
-        if (tailMatch) {
+        if (tailMatch && redactedMatchesHaveAdjacentAnchor(matches)) {
           this.deps.log.debug(
             `[lcm] dedup: tail-match detected, batch already fully stored ` +
               `(storedCount=${storedMessageCount} batchLen=${batch.length}), skipping entire batch`,
@@ -466,18 +585,19 @@ export class BatchDeduplicator {
 
     const lastStoredHash = allRecentHashes[allRecentHashes.length - 1]!;
     const lastStoredMessage = allStored[allStored.length - 1]!;
-    let ambiguousExternalizedOverlap = false;
+    let ambiguousWeakOverlap = false;
 
     for (let k = batch.length - 1; k >= 0; k--) {
       const lastMatch = await this.matchStoredMessageToIncomingOrDecoratedCoverage(
         lastStoredMessage,
         storedBatch[k]!,
+        batch[k]!,
         batchHashes[k]!,
         lastStoredHash,
         rawPayloadContents[k],
       );
       if (lastMatch === "unproven-externalized") {
-        ambiguousExternalizedOverlap = true;
+        ambiguousWeakOverlap = true;
         continue;
       }
       if (!lastMatch) continue;
@@ -485,17 +605,18 @@ export class BatchDeduplicator {
       const matchLen = Math.min(k + 1, allRecentHashes.length);
       const startDb = allRecentHashes.length - matchLen;
       let suffixMatch = true;
-      let exactAnchor = lastMatch === "exact" || lastMatch === "decorated";
+      const matches: CoveredStoredIncomingMatch[] = [];
       for (let j = 0; j < matchLen; j++) {
         const match = await this.matchStoredMessageToIncomingOrDecoratedCoverage(
           allStored[startDb + j]!,
           storedBatch[k - matchLen + 1 + j]!,
+          batch[k - matchLen + 1 + j]!,
           batchHashes[k - matchLen + 1 + j]!,
           allRecentHashes[startDb + j]!,
           rawPayloadContents[k - matchLen + 1 + j],
         );
         if (match === "unproven-externalized") {
-          ambiguousExternalizedOverlap = true;
+          ambiguousWeakOverlap = true;
           suffixMatch = false;
           break;
         }
@@ -503,8 +624,10 @@ export class BatchDeduplicator {
           suffixMatch = false;
           break;
         }
-        exactAnchor ||= match === "exact" || match === "decorated";
+        matches.push(match);
       }
+      const exactAnchor = matches.some(isStrongReplayAnchor);
+      const redactionAnchored = redactedMatchesHaveAdjacentAnchor(matches);
       const newSlice = batch.slice(k + 1);
       // Outside the transcript-covered path, an externalized-only anchor is
       // ambiguous: it may be a replay prefix or a new turn that repeats the
@@ -512,6 +635,7 @@ export class BatchDeduplicator {
       if (
         suffixMatch &&
         exactAnchor &&
+        redactionAnchored &&
         (newSlice.length > 0 || matchLen > 1 || lastMatch === "decorated")
       ) {
         this.deps.log.debug(
@@ -521,15 +645,15 @@ export class BatchDeduplicator {
         );
         return newSlice;
       }
-      if (suffixMatch && !exactAnchor) {
-        ambiguousExternalizedOverlap = true;
+      if (suffixMatch && (!exactAnchor || !redactionAnchored)) {
+        ambiguousWeakOverlap = true;
       }
     }
 
-    if (ambiguousExternalizedOverlap) {
+    if (ambiguousWeakOverlap) {
       this.deps.log.warn(
         `[lcm] dedup: ${context}, storedCount=${storedMessageCount} batchLen=${batch.length}, ` +
-          `externalized-only overlap is ambiguous — ingesting full batch`,
+          `externalized/redacted-only overlap is ambiguous — ingesting full batch`,
       );
       return batch;
     }
@@ -553,13 +677,15 @@ export class BatchDeduplicator {
   private async matchStoredMessageToIncomingOrDecoratedCoverage(
     storedMessage: MessageRecord,
     incoming: StoredMessage,
+    incomingMessage: AgentMessage,
     incomingHash: string,
     storedHash: string,
     incomingRawPayloadContent?: string | null,
-  ): Promise<"exact" | "externalized" | "unproven-externalized" | "decorated" | null> {
+  ): Promise<CoveredStoredIncomingMatch | null> {
     const match = await this.matchStoredMessageToIncoming(
       storedMessage,
       incoming,
+      incomingMessage,
       incomingHash,
       storedHash,
       incomingRawPayloadContent,
@@ -580,10 +706,11 @@ export class BatchDeduplicator {
   private async matchStoredMessageToIncoming(
     storedMessage: MessageRecord,
     incoming: StoredMessage,
+    incomingMessage: AgentMessage,
     incomingHash: string,
     storedHash: string,
     incomingRawPayloadContent?: string | null,
-  ): Promise<"exact" | "externalized" | "unproven-externalized" | null> {
+  ): Promise<StoredIncomingMatch | null> {
     if (
       storedHash === incomingHash &&
       storedMessage.role === incoming.role &&
@@ -591,11 +718,19 @@ export class BatchDeduplicator {
     ) {
       return "exact";
     }
-    return this.messagesAreExternalizedEquivalent(
+    const externalizedMatch = await this.messagesAreExternalizedEquivalent(
       storedMessage,
       incoming,
       incomingRawPayloadContent,
     );
+    if (externalizedMatch) return externalizedMatch;
+    return (await this.messagesDifferOnlyByHostRedaction(
+      storedMessage,
+      incoming,
+      incomingMessage,
+    ))
+      ? "redacted"
+      : null;
   }
 
   private async countPersistedIdentityOverlaps(
