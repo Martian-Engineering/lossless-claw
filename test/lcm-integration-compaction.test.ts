@@ -2196,6 +2196,31 @@ describe("LCM integration: compaction", () => {
     expect(result.actionTaken).toBe(false);
     expect(summarize).not.toHaveBeenCalled();
   });
+
+  it("compactLeaf skips when messageContents is empty (all messages missing from store)", async () => {
+    await ingestMessages(convStore, sumStore, 5, {
+      contentFn: (i) => `Turn ${i}: content to compact`,
+      tokenCountFn: () => 100,
+    });
+
+    // Remove messages from the mock store so getMessageById returns null.
+    // Context items still reference the message IDs, simulating stale references.
+    convStore._messages.length = 0;
+
+    const summarize = vi.fn(async () => "should not be called");
+
+    const result = await compactionEngine.compactLeaf({
+      conversationId: CONV_ID,
+      tokenBudget: 1000,
+      summarize,
+      force: true,
+    });
+
+    expect(result.actionTaken).toBe(false);
+    expect(result.tokensAfter).toBe(result.tokensBefore);
+    expect((result as any).authFailure).toBeFalsy();
+    expect(summarize).not.toHaveBeenCalled();
+  });
 });
 
 // ═════════════════════════════════════════════════════════════════════════════

@@ -867,8 +867,16 @@ export class CompactionEngine {
         authFailure: true,
       };
     }
+    if ("skipped" in leafResult) {
+      return {
+        actionTaken: false,
+        tokensBefore,
+        tokensAfter: tokensBefore,
+        condensed: false,
+      };
+    }
     // Delta tracking: compute token change from pass results instead of re-querying DB
-    const tokensAfterLeaf = tokensBefore - leafResult.removedTokens + leafResult.addedTokens;
+    const tokensAfterLeaf = Math.max(0, tokensBefore - leafResult.removedTokens + leafResult.addedTokens);
 
     await this.persistCompactionEvents({
       conversationId,
@@ -906,7 +914,7 @@ export class CompactionEngine {
         if (!condenseResult || "skipped" in condenseResult) {
           break;
         }
-        const passTokensAfter = passTokensBefore - condenseResult.removedTokens + condenseResult.addedTokens;
+        const passTokensAfter = Math.max(0, passTokensBefore - condenseResult.removedTokens + condenseResult.addedTokens);
         await this.persistCompactionEvents({
           conversationId,
           tokensBefore: passTokensBefore,
@@ -1100,7 +1108,10 @@ export class CompactionEngine {
         hadAuthFailure = true;
         break;
       }
-      const passTokensAfter = passTokensBefore - leafResult.removedTokens + leafResult.addedTokens;
+      if ("skipped" in leafResult) {
+        break;
+      }
+      const passTokensAfter = Math.max(0, passTokensBefore - leafResult.removedTokens + leafResult.addedTokens);
       await this.persistCompactionEvents({
         conversationId,
         tokensBefore: passTokensBefore,
@@ -1116,6 +1127,9 @@ export class CompactionEngine {
       previousSummaryContent = leafResult.content;
       runningTokens = passTokensAfter;
 
+      if (stopAtTokens !== undefined && runningTokens <= stopAtTokens) {
+        break;
+      }
       if (passTokensAfter >= passTokensBefore || passTokensAfter >= previousTokens) {
         break;
       }
@@ -1174,7 +1188,7 @@ export class CompactionEngine {
       if ("skipped" in condenseResult) {
         return "no-progress";
       }
-      const passTokensAfter = passTokensBefore - condenseResult.removedTokens + condenseResult.addedTokens;
+      const passTokensAfter = Math.max(0, passTokensBefore - condenseResult.removedTokens + condenseResult.addedTokens);
       await this.persistCompactionEvents({
         conversationId,
         tokensBefore: passTokensBefore,
@@ -2176,7 +2190,7 @@ export class CompactionEngine {
     summarize: CompactionSummarizeFn,
     previousSummaryContent?: string,
     summaryModel?: string,
-  ): Promise<{ summaryId: string; level: CompactionLevel; content: string; removedTokens: number; addedTokens: number } | null> {
+  ): Promise<PassResult & { content: string } | null | CondensedPassSkipped> {
     // Fetch full message content for each context item
     const messageContents: { messageId: number; content: string; createdAt: Date; tokenCount: number }[] =
       [];
@@ -2195,6 +2209,13 @@ export class CompactionEngine {
       }
     }
 
+    if (messageContents.length === 0) {
+      this.log.warn(
+        `[lcm] leaf compaction skipped; no valid messages; conversationId=${conversationId}; items=${messageItems.length}`,
+      );
+      return { skipped: "empty-source" };
+    }
+
     const concatenated = messageContents
       .map((message) => {
         // Strip injected plugin context blocks (memory/hindsight XML tags) first,
@@ -2207,6 +2228,13 @@ export class CompactionEngine {
       })
       .filter((s): s is string => s !== null)
       .join("\n\n");
+    if (!concatenated.trim()) {
+      this.log.warn(
+        `[lcm] leaf compaction skipped; no meaningful content; conversationId=${conversationId}; chunkMessages=${messageContents.length}`,
+      );
+      return { skipped: "empty-source" };
+    }
+
     const fileIds = dedupeOrderedIds(
       messageContents.flatMap((message) => extractFileIdsFromContent(message.content)),
     );
