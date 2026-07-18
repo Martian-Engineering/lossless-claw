@@ -12,6 +12,7 @@ import {
   stampDelegatedExpansionContext,
 } from "../src/tools/lcm-expansion-recursion-guard.js";
 import { createLcmExpandQueryTool } from "../src/tools/lcm-expand-query-tool.js";
+import { createLcmGrepTool } from "../src/tools/lcm-grep-tool.js";
 import type { LcmDependencies } from "../src/types.js";
 
 const callGatewayMock = vi.fn();
@@ -140,6 +141,7 @@ function makeEngine(params: {
 }): LcmContextEngine {
   return {
     info: { id: "lcm", name: "LCM", version: "0.0.0" },
+    timezone: "UTC",
     getRetrieval: () => params.retrieval,
     getSummaryStore: () => params.summaryStore ?? makeSummaryStore(),
     getConversationStore: () => ({
@@ -299,6 +301,132 @@ describe("createLcmExpandQueryTool", () => {
       block: 0,
       timeout: 0,
       success: 1,
+    });
+  });
+
+  it("routes a grep-discovered summary ID into delegated expansion", async () => {
+    const retrieval = makeRetrieval();
+    const createdAt = new Date("2026-01-02T00:00:00.000Z");
+    const summaryId = "sum_crabpot_lcm_fact";
+    const summaryContent =
+      "Release-gate summary preserved CRABPOT_LCM_FACT is blue-lantern-42 after rotate.";
+    retrieval.grep.mockResolvedValue({
+      messages: [],
+      summaries: [
+        {
+          summaryId,
+          conversationId: 42,
+          kind: "leaf",
+          snippet: summaryContent,
+          createdAt,
+        },
+      ],
+      totalMatches: 1,
+    });
+    retrieval.describe.mockResolvedValue({
+      type: "summary",
+      summary: {
+        conversationId: 42,
+        latestAt: createdAt,
+      },
+    });
+
+    const deps = makeDeps();
+    const lcm = makeEngine({ retrieval, conversationId: 42 });
+    const grepTool = createLcmGrepTool({
+      deps,
+      lcm,
+      sessionId: "agent:main:main",
+    });
+    const grepResult = await grepTool.execute("call-grep-summary", {
+      pattern: "CRABPOT_LCM_FACT",
+      mode: "regex",
+      scope: "summaries",
+      limit: 10,
+    });
+    const grepText = (grepResult.content[0] as { text: string }).text;
+    const matchedSummaryId = grepText.match(/\bsum_[a-z0-9_]+\b/)?.[0];
+    if (!matchedSummaryId) {
+      throw new Error(`Expected lcm_grep output to include ${summaryId}`);
+    }
+    expect(matchedSummaryId).toBe(summaryId);
+    expect(grepText).toContain(`[conv=42 ${summaryId}]`);
+    expect(retrieval.grep).toHaveBeenCalledWith(
+      expect.objectContaining({
+        query: "CRABPOT_LCM_FACT",
+        mode: "regex",
+        scope: "summaries",
+        conversationId: 42,
+      }),
+    );
+
+    let delegatedMessage = "";
+    // The gateway is the unit-test boundary, so prove the child receives the
+    // discovered ID plus evidence-retrieval instructions before stubbing its reply.
+    callGatewayMock.mockImplementation(async (opts: unknown) => {
+      const request = opts as { method?: string; params?: Record<string, unknown> };
+      if (request.method === "agent") {
+        delegatedMessage = String(request.params?.message ?? "");
+        return { runId: "run-crabpot-flow" };
+      }
+      if (request.method === "agent.wait") {
+        return { status: "ok" };
+      }
+      if (request.method === "sessions.get") {
+        return {
+          messages: [
+            {
+              role: "assistant",
+              content: [
+                {
+                  type: "text",
+                  text: JSON.stringify({
+                    answer: "blue-lantern-42",
+                    citedIds: [summaryId],
+                    expandedSummaryCount: 1,
+                    totalSourceTokens: 16,
+                    truncated: false,
+                  }),
+                },
+              ],
+            },
+          ],
+        };
+      }
+      if (request.method === "sessions.delete") {
+        return { ok: true };
+      }
+      return {};
+    });
+
+    const expandQueryTool = createLcmExpandQueryTool({
+      deps,
+      lcm,
+      sessionId: "agent:main:main",
+      requesterSessionKey: "agent:main:main",
+    });
+    const expandResult = await expandQueryTool.execute("call-expand-query", {
+      summaryIds: [matchedSummaryId],
+      prompt: "What is CRABPOT_LCM_FACT? Answer with only the remembered value.",
+      conversationId: 42,
+      maxTokens: 400,
+      timeoutMs: 60_000,
+    });
+
+    expect(retrieval.describe).toHaveBeenCalledWith(summaryId);
+    expect(delegatedMessage).toContain(`Seed summary IDs: ${summaryId}`);
+    expect(delegatedMessage).toContain("What is CRABPOT_LCM_FACT?");
+    expect(delegatedMessage).toContain("lcm_describe");
+    expect(delegatedMessage).toContain(
+      "Synthesize the final answer from retrieved evidence, not assumptions.",
+    );
+    expect(expandResult.details).toMatchObject({
+      answer: "blue-lantern-42",
+      citedIds: [summaryId],
+      sourceConversationId: 42,
+      expandedSummaryCount: 1,
+      totalSourceTokens: 16,
+      truncated: false,
     });
   });
 
