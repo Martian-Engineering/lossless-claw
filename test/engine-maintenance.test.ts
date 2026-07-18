@@ -1555,7 +1555,7 @@ describe("LcmContextEngine maintain and assemble budget", () => {
     expect(assembleResult.messages).toHaveLength(1);
   });
 
-  it("assemble() degrades instead of spending during active deferred retry backoff", async () => {
+  it("assemble() emergency drain bypasses backoff and runs compaction with force=true", async () => {
     const engine = createEngine();
     const privateEngine = engine as unknown as {
       executeCompactionCore: (params: unknown) => Promise<unknown>;
@@ -1586,12 +1586,127 @@ describe("LcmContextEngine maintain and assemble budget", () => {
       tokenBudget: 10,
     });
 
-    expect(executeSpy).not.toHaveBeenCalled();
+    expect(executeSpy).toHaveBeenCalledWith(expect.objectContaining({ force: true }));
+    // Assemble still returns a usable single-message result via degraded fallback
     expect(assembleResult.messages).toHaveLength(1);
-    const maintenance = await engine
-      .getCompactionMaintenanceStore()
-      .getConversationCompactionMaintenance(conversation.conversationId);
-    expect(maintenance?.pending).toBe(true);
+  });
+
+  it("normal deferred drain keeps configured compaction sweep sizing", async () => {
+    const engine = createEngineWithConfig({
+      contextThreshold: 0.7,
+      freshTailCount: 2,
+      leafChunkTokens: 2_000,
+    });
+    const privateEngine = engine as unknown as {
+      compaction: {
+        compactFullSweep: (input: unknown) => Promise<unknown>;
+      };
+    };
+    const compactFullSweepSpy = vi
+      .spyOn(privateEngine.compaction, "compactFullSweep")
+      .mockResolvedValue({ actionTaken: false, tokensBefore: 0, tokensAfter: 0, condensed: false });
+
+    const sessionId = "normal-drain-no-dynamic-params";
+    const conversation = await engine.getConversationStore().getOrCreateConversation(sessionId, {
+      sessionKey: undefined,
+    });
+
+    // Create pending threshold debt without a backoff so the normal drain runs.
+    await engine.getCompactionMaintenanceStore().requestProactiveCompactionDebt({
+      conversationId: conversation.conversationId,
+      reason: "threshold",
+      tokenBudget: 4_096,
+      currentTokenCount: 3_500,
+      contextThreshold: 0.7,
+      contextThresholdSource: "global",
+      contextFreshTailCount: 2,
+      contextLeafChunkTokens: 2_000,
+    });
+
+    // Call consumeDeferredCompactionDebt directly — normal drain, no force
+    const enginePrivate = engine as unknown as {
+      consumeDeferredCompactionDebt: (params: {
+        conversationId: number;
+        sessionId: string;
+        tokenBudget: number;
+      }) => Promise<unknown>;
+    };
+
+    await enginePrivate.consumeDeferredCompactionDebt({
+      conversationId: conversation.conversationId,
+      sessionId,
+      tokenBudget: 4_096,
+    });
+
+    expect(compactFullSweepSpy).toHaveBeenCalledOnce();
+    expect(compactFullSweepSpy).toHaveBeenCalledWith(
+      expect.objectContaining({
+        freshTailCount: 2,
+        leafChunkTokens: 2_000,
+      }),
+    );
+    const callArg = compactFullSweepSpy.mock.calls[0]![0] as Record<string, unknown>;
+    expect(callArg).not.toHaveProperty("freshTailMaxTokens");
+  });
+
+  it("assemble emergency drain forwards force below the retry cap and stops at the cap", async () => {
+    const engine = createEngine();
+    const sessionId = "force-capped-at-max-retry";
+    const tokenBudget = 1_000;
+    const conversation = await engine.getConversationStore().getOrCreateConversation(sessionId, {
+      sessionKey: undefined,
+    });
+    const store = engine.getCompactionMaintenanceStore();
+    await store.requestProactiveCompactionDebt({
+      conversationId: conversation.conversationId,
+      reason: "threshold",
+      tokenBudget,
+      currentTokenCount: 9_999,
+    });
+    for (let i = 0; i < 2; i++) {
+      await store.markProactiveCompactionRunning({ conversationId: conversation.conversationId });
+      await store.markProactiveCompactionFinished({
+        conversationId: conversation.conversationId,
+        failureSummary: "compacted but still over target",
+        keepPending: true,
+      });
+    }
+
+    const privateEngine = engine as unknown as {
+      maybeConsumeDeferredCompactionDebtForAssemble: (params: {
+        conversationId: number;
+        sessionId: string;
+        tokenBudget: number;
+      }) => Promise<unknown>;
+      consumeDeferredCompactionDebt: (params: unknown) => Promise<unknown>;
+    };
+    const consumeSpy = vi
+      .spyOn(privateEngine, "consumeDeferredCompactionDebt")
+      .mockResolvedValue(null);
+
+    await privateEngine.maybeConsumeDeferredCompactionDebtForAssemble({
+      conversationId: conversation.conversationId,
+      sessionId,
+      tokenBudget,
+    });
+    expect(consumeSpy).toHaveBeenLastCalledWith(expect.objectContaining({ force: true }));
+
+    await store.markProactiveCompactionRunning({ conversationId: conversation.conversationId });
+    await store.markProactiveCompactionFinished({
+      conversationId: conversation.conversationId,
+      failureSummary: "compacted but still over target",
+      keepPending: true,
+    });
+    expect(
+      (await store.getConversationCompactionMaintenance(conversation.conversationId))?.retryAttempts,
+    ).toBe(3);
+
+    await privateEngine.maybeConsumeDeferredCompactionDebtForAssemble({
+      conversationId: conversation.conversationId,
+      sessionId,
+      tokenBudget,
+    });
+    expect(consumeSpy).toHaveBeenLastCalledWith(expect.objectContaining({ force: false }));
   });
 
   it("maintain() uses the stricter current token budget for deferred threshold debt", async () => {

@@ -129,6 +129,15 @@ const HOST_SESSION_END_REASON_DELETED = "deleted";
 const HOST_SESSION_END_REASON_RESET = "reset";
 const CONTEXT_ENGINE_PROJECTION_EPOCH_VERSION = "summary-prefix-v1";
 const DEFERRED_ASSEMBLY_DEGRADED_PRESSURE_RATIO = 0.75;
+/**
+ * Maximum retry attempts before the assemble emergency drain stops forwarding
+ * force=true to consumeDeferredCompactionDebt. After this threshold, the drain
+ * falls back to respecting backoff and degrading the live prompt instead of
+ * retrying compaction. Set to 3 to limit force retry attempts, matching common
+ * retry budget patterns — after 3 consecutive failures, compaction is unlikely
+ * to succeed and fallback to degraded live prompt is safer.
+ */
+const ASSEMBLE_FORCE_MAX_RETRY_ATTEMPTS = 3;
 type CompactionExecutionParams = {
   conversationId: number;
   sessionId: string;
@@ -815,6 +824,8 @@ export class LcmContextEngine implements ContextEngine {
     currentTokenCount?: number;
     runtimeContext?: ContextEngineMaintenanceRuntimeContext;
     legacyParams?: Record<string, unknown>;
+    /** When true, skip the backoff check — used by assemble emergency drain. */
+    force?: boolean;
   }): Promise<(ContextEngineMaintenanceResult & { exhausted?: boolean }) | null> {
     const maintenance = await this.compactionMaintenanceStore.getConversationCompactionMaintenance(
       params.conversationId,
@@ -829,12 +840,13 @@ export class LcmContextEngine implements ContextEngine {
       scope: this.resolveSessionQueueKey(params.sessionId, params.sessionKey),
     });
 
-    if (
-      maintenance.nextAttemptAfter !== null &&
-      maintenance.nextAttemptAfter.getTime() > Date.now()
-    ) {
+    const nextAttemptAfter = maintenance.nextAttemptAfter;
+    const backoffActive =
+      nextAttemptAfter !== null && nextAttemptAfter.getTime() > Date.now();
+
+    if (!params.force && backoffActive) {
       this.deps.log.debug(
-        `[lcm] maintain: deferred compaction backoff active conversation=${params.conversationId} ${sessionLabel} retryAttempts=${maintenance.retryAttempts} nextAttemptAfter=${maintenance.nextAttemptAfter.toISOString()} debtReason=${maintenance.reason ?? "null"}`,
+        `[lcm] maintain: deferred compaction backoff active conversation=${params.conversationId} ${sessionLabel} retryAttempts=${maintenance.retryAttempts} nextAttemptAfter=${nextAttemptAfter.toISOString()} debtReason=${maintenance.reason ?? "null"}`,
       );
       return {
         changed: false,
@@ -842,6 +854,12 @@ export class LcmContextEngine implements ContextEngine {
         rewrittenEntries: 0,
         reason: "deferred compaction backoff active",
       };
+    }
+
+    if (params.force && backoffActive) {
+      this.deps.log.warn(
+        `[lcm] consumeDeferredCompactionDebt: force=true skipping backoff conversation=${params.conversationId} ${sessionLabel} retryAttempts=${maintenance.retryAttempts} nextAttemptAfter=${nextAttemptAfter.toISOString()}`,
+      );
     }
 
     await this.compactionMaintenanceStore.markProactiveCompactionRunning({
@@ -948,6 +966,7 @@ export class LcmContextEngine implements ContextEngine {
         contextThresholdOverride: resolvedContextThreshold,
         runtimeContext: params.runtimeContext,
         legacyParams: params.legacyParams,
+        force: params.force,
       });
       const blockedByAuthCircuitBreaker = result.reason === "circuit breaker open";
       // #639 Mode 2: terminal compaction exhaustion (no eligible candidates while
@@ -1047,6 +1066,8 @@ export class LcmContextEngine implements ContextEngine {
                 ...(telemetry.model ? { model: telemetry.model } : {}),
               }
             : undefined;
+        const retryAttempts = maintenance?.retryAttempts ?? 0;
+        const forceAllowed = retryAttempts < ASSEMBLE_FORCE_MAX_RETRY_ATTEMPTS;
         const result = await this.consumeDeferredCompactionDebt({
           conversationId: params.conversationId,
           sessionId: params.sessionId,
@@ -1054,6 +1075,7 @@ export class LcmContextEngine implements ContextEngine {
           tokenBudget: cappedTokenBudget,
           currentTokenCount: normalizedCurrentTokenCount,
           legacyParams: deferredLegacyParams,
+          force: forceAllowed,
         });
         drainResult = { exhausted: result?.exhausted === true };
       },
