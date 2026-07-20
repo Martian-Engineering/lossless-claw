@@ -61,18 +61,6 @@ export function estimateContentTokensForRole(params: {
   return estimateTokens(fallbackContent);
 }
 
-/**
- * Estimate live transcript tokens at the model boundary.
- *
- * Uses full-message serialization so structured tool-call payloads count.
- * A text-block-only estimate undercounts tool-heavy transcripts by 2-3x,
- * which previously let over-budget prompts pass every live pressure check
- * while the host's LLM-boundary estimate rejected them.
- */
-export function estimateSessionTokenCountForAfterTurn(messages: AgentMessage[]): number {
-  return estimateSerializedMessagesTokens(messages);
-}
-
 export function normalizeNonNegativeInteger(value: unknown): number | undefined {
   if (typeof value !== "number" || !Number.isFinite(value) || value < 0) {
     return undefined;

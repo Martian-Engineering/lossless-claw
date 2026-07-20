@@ -848,7 +848,7 @@ describe("LcmContextEngine afterTurn", () => {
     });
   });
 
-  it("afterTurn falls back to context_items token count when runtimeContext.currentTokenCount is absent", async () => {
+  it("afterTurn leaves live token pressure unset when runtimeContext.currentTokenCount is absent", async () => {
     const engine = createEngine();
     const sessionId = "after-turn-local-current-token-count-fallback";
     const privateEngine = engine as unknown as {
@@ -886,15 +886,10 @@ describe("LcmContextEngine afterTurn", () => {
       },
     });
 
-    const conversation = await engine.getConversationStore().getConversationBySessionId(sessionId);
-    expect(conversation).not.toBeNull();
-    const ctxTokenCount = await engine.getSummaryStore().getContextTokenCount(conversation!.conversationId);
-
-    // Uses context_items token count (from DB), not serialized estimate from all messages.
     expect(evaluateSpy).toHaveBeenCalledWith(
       expect.any(Number),
       4_096,
-      ctxTokenCount,
+      undefined,
       { contextThreshold: 0.75 },
     );
   });
@@ -4612,61 +4607,36 @@ describe("LcmContextEngine afterTurn", () => {
     );
   });
 
-  it("afterTurn falls back to context_items token count when runtimeContext has no currentTokenCount", async () => {
-    const engine = createEngine();
-    const conversationStore = engine.getConversationStore();
-    const summaryStore = engine.getSummaryStore();
-    const sessionId = "after-turn-context-items-fallback";
-
-    // Create a conversation and seed context_items directly.
-    const conversation = await conversationStore.createConversation({
-      sessionId,
-      sessionKey: undefined,
-    });
-    const messages = await conversationStore.createMessagesBulk([
-      { conversationId: conversation.conversationId, seq: 0, role: "user", content: "previous turn", tokenCount: 200, skipReplayTimestampFloodGuard: true },
-      { conversationId: conversation.conversationId, seq: 1, role: "assistant", content: "previous reply", tokenCount: 150, skipReplayTimestampFloodGuard: true },
-      { conversationId: conversation.conversationId, seq: 2, role: "user", content: "more context", tokenCount: 150, skipReplayTimestampFloodGuard: true },
-    ]);
-    await summaryStore.appendContextMessages(conversation.conversationId, messages.map((m) => m.messageId));
-    const ctxTokenCount = await summaryStore.getContextTokenCount(conversation.conversationId);
-    expect(ctxTokenCount).toBe(500);
-
-    // Messages passed to afterTurn are much larger than seeded context_items.
-    const oversizedMessages = Array.from({ length: 20 }, (_, i) =>
-      makeMessage({ role: i % 2 === 0 ? "user" : "assistant", content: "x".repeat(1000) }),
-    );
-
-    const evaluateSpy = vi.spyOn(
-      (engine as unknown as { compaction: { evaluate: (...args: unknown[]) => unknown } }).compaction,
-      "evaluate",
-    ).mockResolvedValue({
-      shouldCompact: false,
-      reason: "none",
-      currentTokens: 500,
-      threshold: 3000,
-    });
-
-    const sessionFile = createSessionFilePath("after-turn-context-items-fallback");
-    writeLeafTranscript(sessionFile, [
-      { role: "user", content: "seed" },
-    ]);
+  it("afterTurn does not project stored context as additional live pressure", async () => {
+    const engine = createEngineWithConfig({ freshTailCount: 1 });
+    const sessionId = "after-turn-stored-context-is-not-live-pressure";
+    await seedBacklogContext(engine, sessionId, [100, 100, 100]);
+    const conversation = await engine.getConversationStore().getConversationBySessionId(sessionId);
+    expect(conversation).not.toBeNull();
+    const privateEngine = engine as unknown as {
+      scheduleDeferredCompactionDebtDrain: (params: unknown) => void;
+    };
+    const scheduleSpy = vi
+      .spyOn(privateEngine, "scheduleDeferredCompactionDebtDrain")
+      .mockImplementation(() => undefined);
 
     await engine.afterTurn({
       sessionId,
-      sessionFile,
-      messages: oversizedMessages,
+      sessionFile: createSessionFilePath(sessionId),
+      messages: [],
       prePromptMessageCount: 0,
-      tokenBudget: 4096,
-      // No runtimeContext with currentTokenCount — fallback to context_items
+      tokenBudget: 600,
     });
 
-    const evaluateCall = evaluateSpy.mock.calls[0];
-    expect(evaluateCall).toBeDefined();
-    const budget = evaluateCall[1] as number;
-    const observedTokenCount = evaluateCall[2] as number;
-    expect(budget).toBe(4096);
-    expect(observedTokenCount).toBe(500); // context_items, not ~5000 from all messages
+    await expect(
+      engine.getSummaryStore().getContextTokenCount(conversation!.conversationId),
+    ).resolves.toBe(300);
+    await expect(
+      engine
+        .getCompactionMaintenanceStore()
+        .getConversationCompactionMaintenance(conversation!.conversationId),
+    ).resolves.toBeNull();
+    expect(scheduleSpy).not.toHaveBeenCalled();
   });
 
   it("afterTurn skips compaction when ingest fails", async () => {
