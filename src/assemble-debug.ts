@@ -152,13 +152,13 @@ export function describeAssembledPrefixChange(
 export function shouldLogOverflowDiagnostics(params: {
   diagnostics: AssemblyOverflowDiagnostics;
   assembledTokens: number;
-  liveContextTokens: number;
+  storedContextTokens: number;
 }): boolean {
   const budget = Math.max(1, params.diagnostics.tokenBudget);
   return (
     params.diagnostics.totalContextTokens > budget ||
     params.assembledTokens >= Math.floor(budget * 0.9) ||
-    params.liveContextTokens >= Math.floor(budget * 0.9) ||
+    params.storedContextTokens >= Math.floor(budget * 0.9) ||
     params.diagnostics.duplicateRefClusters.length > 0 ||
     params.diagnostics.duplicateMessageClusters.length > 0
   );

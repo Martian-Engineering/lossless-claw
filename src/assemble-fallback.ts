@@ -180,35 +180,32 @@ export function buildDegradedLiveAssembleResult(params: {
   return {
     messages,
     estimatedTokens: estimateAgentMessageTokens(messages),
+    promptAuthority: "preassembly_may_overflow",
   };
 }
 
+/**
+ * Resolve deferred compaction pressure from the canonical stored projection.
+ *
+ * Debt-time current and projected counts remain diagnostic because compaction
+ * can make them stale. Only the current `context_items` total decides whether
+ * another assemble-time drain could reduce the model context.
+ */
 export function resolveDeferredAssemblyPressure(params: {
-  liveContextTokens: number;
+  storedContextTokens: number;
   maintenance: ConversationCompactionMaintenanceRecord | null;
 }): {
-  observedContextTokens: number;
+  storedContextTokens: number;
   projectedTokenCount: number | null;
   pressureTokenCount: number;
 } {
-  const recordedContextTokens = normalizeNonNegativeInteger(
-    params.maintenance?.currentTokenCount,
-  );
   const recordedProjectedTokens = normalizeNonNegativeInteger(
     params.maintenance?.projectedTokenCount,
   );
-  const observedContextTokens = Math.max(
-    params.liveContextTokens,
-    recordedContextTokens ?? 0,
-  );
-  const pressureTokenCount = Math.max(
-    observedContextTokens,
-    recordedProjectedTokens ?? 0,
-  );
   return {
-    observedContextTokens,
+    storedContextTokens: params.storedContextTokens,
     projectedTokenCount: recordedProjectedTokens ?? null,
-    pressureTokenCount,
+    pressureTokenCount: params.storedContextTokens,
   };
 }
 

@@ -997,7 +997,7 @@ describe("LcmContextEngine maintain and assemble budget", () => {
         seq: 0,
         role: "user",
         content: "stored context should be skipped while maintenance is pending",
-        tokenCount: 20,
+        tokenCount: 80,
       },
     ]);
     await engine
@@ -1026,6 +1026,10 @@ describe("LcmContextEngine maintain and assemble budget", () => {
       "current delivery turn",
     ]);
     expect(assembleResult.estimatedTokens).toBeLessThanOrEqual(100);
+    expect(assembleResult).toHaveProperty(
+      "promptAuthority",
+      "preassembly_may_overflow",
+    );
     expect(log.warn).toHaveBeenCalledWith(
       expect.stringContaining("[lcm] assemble: degraded live fallback"),
     );
@@ -1059,7 +1063,7 @@ describe("LcmContextEngine maintain and assemble budget", () => {
         seq: 0,
         role: "user",
         content: "stored content",
-        tokenCount: 20,
+        tokenCount: 80,
       },
     ]);
     await engine
@@ -1144,6 +1148,18 @@ describe("LcmContextEngine maintain and assemble budget", () => {
     const conversation = await engine.getConversationStore().getOrCreateConversation(sessionId, {
       sessionKey: undefined,
     });
+    const [storedMessage] = await engine.getConversationStore().createMessagesBulk([
+      {
+        conversationId: conversation.conversationId,
+        seq: 0,
+        role: "user",
+        content: "stored context message",
+        tokenCount: 30,
+      },
+    ]);
+    await engine
+      .getSummaryStore()
+      .appendContextMessages(conversation.conversationId, [storedMessage.messageId]);
     await engine.getCompactionMaintenanceStore().requestProactiveCompactionDebt({
       conversationId: conversation.conversationId,
       reason: "threshold",
@@ -1168,6 +1184,10 @@ describe("LcmContextEngine maintain and assemble budget", () => {
       "critical runtime policy",
       "current delivery turn",
     ]);
+    expect(assembleResult).toHaveProperty(
+      "promptAuthority",
+      "preassembly_may_overflow",
+    );
     const maintenance = await engine
       .getCompactionMaintenanceStore()
       .getConversationCompactionMaintenance(conversation.conversationId);
@@ -1192,6 +1212,18 @@ describe("LcmContextEngine maintain and assemble budget", () => {
     const conversation = await engine.getConversationStore().getOrCreateConversation(sessionId, {
       sessionKey: undefined,
     });
+    const [storedMessage] = await engine.getConversationStore().createMessagesBulk([
+      {
+        conversationId: conversation.conversationId,
+        seq: 0,
+        role: "user",
+        content: "stored context message",
+        tokenCount: 500,
+      },
+    ]);
+    await engine
+      .getSummaryStore()
+      .appendContextMessages(conversation.conversationId, [storedMessage.messageId]);
     await engine.getCompactionMaintenanceStore().requestProactiveCompactionDebt({
       conversationId: conversation.conversationId,
       reason: "threshold",
@@ -1249,7 +1281,7 @@ describe("LcmContextEngine maintain and assemble budget", () => {
         seq: 0,
         role: "user",
         content: "stored context should not be used after failed emergency compaction",
-        tokenCount: 20,
+        tokenCount: 150,
       },
     ]);
     await engine
@@ -1292,6 +1324,10 @@ describe("LcmContextEngine maintain and assemble budget", () => {
     expect(assembleResult.messages.map((message) => message.content)).toEqual([
       "current emergency turn",
     ]);
+    expect(assembleResult).toHaveProperty(
+      "promptAuthority",
+      "preassembly_may_overflow",
+    );
     expect(log.warn).toHaveBeenCalledWith(
       expect.stringContaining(
         "[lcm] assemble: emergency deferred compaction debt draining pre-assembly",
@@ -1320,6 +1356,18 @@ describe("LcmContextEngine maintain and assemble budget", () => {
     const conversation = await engine.getConversationStore().getOrCreateConversation(sessionId, {
       sessionKey: undefined,
     });
+    const [storedMessage] = await engine.getConversationStore().createMessagesBulk([
+      {
+        conversationId: conversation.conversationId,
+        seq: 0,
+        role: "user",
+        content: "stored context message",
+        tokenCount: 11,
+      },
+    ]);
+    await engine
+      .getSummaryStore()
+      .appendContextMessages(conversation.conversationId, [storedMessage.messageId]);
     await engine.getCompactionMaintenanceStore().requestProactiveCompactionDebt({
       conversationId: conversation.conversationId,
       reason: "threshold",
@@ -1372,6 +1420,18 @@ describe("LcmContextEngine maintain and assemble budget", () => {
     const conversation = await engine.getConversationStore().getOrCreateConversation(sessionId, {
       sessionKey: undefined,
     });
+    const [storedMessage] = await engine.getConversationStore().createMessagesBulk([
+      {
+        conversationId: conversation.conversationId,
+        seq: 0,
+        role: "user",
+        content: "stored context message",
+        tokenCount: 5000,
+      },
+    ]);
+    await engine
+      .getSummaryStore()
+      .appendContextMessages(conversation.conversationId, [storedMessage.messageId]);
     await engine.getCompactionMaintenanceStore().requestProactiveCompactionDebt({
       conversationId: conversation.conversationId,
       reason: "threshold",
@@ -1410,8 +1470,14 @@ describe("LcmContextEngine maintain and assemble budget", () => {
     expect(assembleResult.messages).toHaveLength(1);
   });
 
-  it("assemble() uses projected deferred pressure for emergency drain without passing it as observed tokens", async () => {
-    const engine = createEngine();
+  it("assemble() drains stored over-budget context while keeping projected debt as telemetry", async () => {
+    const log = {
+      info: vi.fn(),
+      warn: vi.fn(),
+      error: vi.fn(),
+      debug: vi.fn(),
+    };
+    const engine = createEngineWithDepsOverrides({ log });
     const privateEngine = engine as unknown as {
       executeCompactionCore: (params: unknown) => Promise<unknown>;
     };
@@ -1419,6 +1485,18 @@ describe("LcmContextEngine maintain and assemble budget", () => {
     const conversation = await engine.getConversationStore().getOrCreateConversation(sessionId, {
       sessionKey: undefined,
     });
+    const [storedMessage] = await engine.getConversationStore().createMessagesBulk([
+      {
+        conversationId: conversation.conversationId,
+        seq: 0,
+        role: "user",
+        content: "stored context message",
+        tokenCount: 5000,
+      },
+    ]);
+    await engine
+      .getSummaryStore()
+      .appendContextMessages(conversation.conversationId, [storedMessage.messageId]);
     await engine.getCompactionMaintenanceStore().requestProactiveCompactionDebt({
       conversationId: conversation.conversationId,
       reason: "threshold",
@@ -1450,13 +1528,80 @@ describe("LcmContextEngine maintain and assemble budget", () => {
         conversationId: conversation.conversationId,
         sessionId,
         tokenBudget: 4_096,
-        currentTokenCount: 300,
+        currentTokenCount: 5000,
         compactionTarget: "threshold",
       }),
     );
     expect(maintenance?.pending).toBe(false);
     expect(maintenance?.running).toBe(false);
     expect(assembleResult.messages).toHaveLength(1);
+    expect(log.warn).toHaveBeenCalledWith(
+      expect.stringContaining("storedContextTokens=5000"),
+    );
+    expect(log.warn).toHaveBeenCalledWith(
+      expect.stringContaining("projectedTokenCount=5000"),
+    );
+  });
+
+  it("assemble() refreshes stored pressure after a partial emergency drain", async () => {
+    const log = {
+      info: vi.fn(),
+      warn: vi.fn(),
+      error: vi.fn(),
+      debug: vi.fn(),
+    };
+    const engine = createEngineWithDepsOverrides({ log });
+    const privateEngine = engine as unknown as {
+      executeCompactionCore: (params: unknown) => Promise<unknown>;
+    };
+    const sessionId = "assemble-refreshes-pressure-after-partial-drain";
+    const conversation = await engine.getConversationStore().getOrCreateConversation(sessionId, {
+      sessionKey: undefined,
+    });
+    const [storedMessage] = await engine.getConversationStore().createMessagesBulk([
+      {
+        conversationId: conversation.conversationId,
+        seq: 0,
+        role: "user",
+        content: "context compacted below the degradation threshold",
+        tokenCount: 100,
+      },
+    ]);
+    await engine
+      .getSummaryStore()
+      .appendContextMessages(conversation.conversationId, [storedMessage.messageId]);
+    await engine.getCompactionMaintenanceStore().requestProactiveCompactionDebt({
+      conversationId: conversation.conversationId,
+      reason: "threshold",
+      tokenBudget: 4_096,
+      currentTokenCount: 5_000,
+      projectedTokenCount: 6_000,
+    });
+    const contextTokenCountSpy = vi
+      .spyOn(engine.getSummaryStore(), "getContextTokenCount")
+      .mockResolvedValueOnce(5_000)
+      .mockResolvedValue(100);
+    vi.spyOn(privateEngine, "executeCompactionCore").mockResolvedValue({
+      ok: false,
+      compacted: true,
+      reason: "compacted but still over target",
+    });
+
+    const assembleResult = await engine.assemble({
+      sessionId,
+      messages: [makeMessage({ role: "user", content: "current delivery turn" })],
+      tokenBudget: 4_096,
+    });
+
+    const maintenance = await engine
+      .getCompactionMaintenanceStore()
+      .getConversationCompactionMaintenance(conversation.conversationId);
+    expect(contextTokenCountSpy).toHaveBeenCalledTimes(2);
+    expect(maintenance?.pending).toBe(true);
+    expect(assembleResult.messages.length).toBeGreaterThan(0);
+    expect(log.warn).not.toHaveBeenCalledWith(
+      expect.stringContaining("[lcm] assemble: degraded live fallback"),
+    );
   });
 
   it("assemble() does not wait for the session queue when deferred threshold debt is not urgent", async () => {
@@ -1517,6 +1662,18 @@ describe("LcmContextEngine maintain and assemble budget", () => {
     const conversation = await engine.getConversationStore().getOrCreateConversation(sessionId, {
       sessionKey: undefined,
     });
+    const [storedMessage] = await engine.getConversationStore().createMessagesBulk([
+      {
+        conversationId: conversation.conversationId,
+        seq: 0,
+        role: "user",
+        content: "stored context message",
+        tokenCount: 90,
+      },
+    ]);
+    await engine
+      .getSummaryStore()
+      .appendContextMessages(conversation.conversationId, [storedMessage.messageId]);
     await engine.getCompactionMaintenanceStore().requestProactiveCompactionDebt({
       conversationId: conversation.conversationId,
       reason: "threshold",
@@ -1564,6 +1721,18 @@ describe("LcmContextEngine maintain and assemble budget", () => {
     const conversation = await engine.getConversationStore().getOrCreateConversation(sessionId, {
       sessionKey: undefined,
     });
+    const [storedMessage] = await engine.getConversationStore().createMessagesBulk([
+      {
+        conversationId: conversation.conversationId,
+        seq: 0,
+        role: "user",
+        content: "stored context requiring emergency drain",
+        tokenCount: 90,
+      },
+    ]);
+    await engine
+      .getSummaryStore()
+      .appendContextMessages(conversation.conversationId, [storedMessage.messageId]);
     await engine.getCompactionMaintenanceStore().requestProactiveCompactionDebt({
       conversationId: conversation.conversationId,
       reason: "threshold",
@@ -1707,6 +1876,69 @@ describe("LcmContextEngine maintain and assemble budget", () => {
       tokenBudget,
     });
     expect(consumeSpy).toHaveBeenLastCalledWith(expect.objectContaining({ force: false }));
+  });
+
+  it("assemble() does not trigger emergency drain when recorded values are stale after compaction", async () => {
+    const log = {
+      info: vi.fn(),
+      warn: vi.fn(),
+      error: vi.fn(),
+      debug: vi.fn(),
+    };
+    const engine = createEngineWithDepsOverrides({ log });
+    const privateEngine = engine as unknown as {
+      executeCompactionCore: (params: unknown) => Promise<unknown>;
+    };
+    const sessionId = "assemble-stale-recorded-no-emergency";
+    const conversation = await engine.getConversationStore().getOrCreateConversation(sessionId, {
+      sessionKey: undefined,
+    });
+    // Store a modest amount of context_items.
+    const [storedMessage] = await engine.getConversationStore().createMessagesBulk([
+      {
+        conversationId: conversation.conversationId,
+        seq: 0,
+        role: "user",
+        content: "recent small context after compaction",
+        tokenCount: 100,
+      },
+    ]);
+    await engine
+      .getSummaryStore()
+      .appendContextMessages(conversation.conversationId, [storedMessage.messageId]);
+    // Maintenance debt retains high values recorded before compaction.
+    await engine.getCompactionMaintenanceStore().requestProactiveCompactionDebt({
+      conversationId: conversation.conversationId,
+      reason: "threshold",
+      tokenBudget: 4_096,
+      currentTokenCount: 5_000,
+      projectedTokenCount: 6_000,
+    });
+    const executeCompactionCoreSpy = vi.spyOn(privateEngine, "executeCompactionCore");
+
+    const assembleResult = await engine.assemble({
+      sessionId,
+      messages: [makeMessage({ role: "user", content: "current delivery turn" })],
+      tokenBudget: 4_096,
+    });
+
+    const maintenance = await engine
+      .getCompactionMaintenanceStore()
+      .getConversationCompactionMaintenance(conversation.conversationId);
+    // Stored context (100) is well below threshold (0.75 * 4096 = 3072),
+    // so neither recorded value may trigger emergency drain.
+    expect(executeCompactionCoreSpy).not.toHaveBeenCalled();
+    expect(maintenance?.pending).toBe(true);
+    expect(assembleResult.messages).toHaveLength(1);
+    expect(log.warn).not.toHaveBeenCalledWith(
+      expect.stringContaining("[lcm] assemble: emergency deferred compaction debt draining pre-assembly"),
+    );
+    expect(log.debug).toHaveBeenCalledWith(
+      expect.stringContaining("storedContextTokens=100"),
+    );
+    expect(log.debug).toHaveBeenCalledWith(
+      expect.stringContaining("projectedTokenCount=6000"),
+    );
   });
 
   it("maintain() uses the stricter current token budget for deferred threshold debt", async () => {
