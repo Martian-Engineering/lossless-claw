@@ -33,6 +33,7 @@ import type {
   RuntimeCompactionDelegateFn,
   StartupSessionFileCandidate,
 } from "../types.js";
+import { listConfiguredAgentIds, normalizeAgentId } from "./openclaw-agent-ids.js";
 
 const MIN_CONTEXT_ENGINE_OPENCLAW_VERSION = "2026.5.28";
 
@@ -93,12 +94,6 @@ function createRuntimeCompactionDelegate(log: LcmDependencies["log"]): RuntimeCo
     }
     return await delegate(params);
   };
-}
-
-/** Return a stable normalized agent id. */
-function normalizeAgentId(agentId: string | undefined): string {
-  const normalized = (agentId ?? "").trim();
-  return normalized.length > 0 ? normalized : "main";
 }
 
 type RuntimeSessionStoreEntry = {
@@ -299,28 +294,6 @@ function getRuntimeAgentSessionApi(api: OpenClawPluginApi): RuntimeAgentSessionA
     return undefined;
   }
   return sessionApi as RuntimeAgentSessionApi;
-}
-
-/** List configured OpenClaw agent ids whose session stores can be active at startup. */
-function listConfiguredAgentIds(config: unknown): string[] {
-  const agents = isRecord(config) ? config.agents : undefined;
-  const list = isRecord(agents) && Array.isArray(agents.list) ? agents.list : [];
-  const seen = new Set<string>();
-  const ids: string[] = [];
-
-  for (const entry of list) {
-    if (!isRecord(entry) || entry.enabled === false || typeof entry.id !== "string") {
-      continue;
-    }
-    const agentId = normalizeAgentId(entry.id);
-    if (seen.has(agentId)) {
-      continue;
-    }
-    seen.add(agentId);
-    ids.push(agentId);
-  }
-
-  return ids.length > 0 ? ids : ["main"];
 }
 
 /** Read a string value from an unknown object field. */

@@ -19,6 +19,7 @@ import type {
 import { applyScopedDoctorRepair } from "./lcm-doctor-apply.js";
 import { createLcmDatabaseBackup } from "./lcm-db-backup.js";
 import { describeLogError } from "../lcm-log.js";
+import { listConfiguredAgentIds } from "./openclaw-agent-ids.js";
 import {
   applyDoctorCleaners,
   getDoctorCleanerApplyUnavailableReason,
@@ -1665,8 +1666,9 @@ function buildRolloverSplitScanSection(scan: ReturnType<typeof scanRolloverSplit
 
 async function buildDoctorCleanersText(params: {
   db: DatabaseSync;
+  agentIds: string[];
 }): Promise<string> {
-  const scan = scanDoctorCleaners(params.db);
+  const scan = scanDoctorCleaners(params.db, undefined, params.agentIds);
   const lines = [
     ...buildHeaderLines(),
     "",
@@ -2887,6 +2889,7 @@ async function buildUnfocusText(params: {
 async function buildDoctorCleanersApplyText(params: {
   db: DatabaseSync;
   config: LcmConfig;
+  agentIds: string[];
   filterId?: DoctorCleanerId;
   vacuum: boolean;
 }): Promise<string> {
@@ -2918,7 +2921,7 @@ async function buildDoctorCleanersApplyText(params: {
     return lines.join("\n");
   }
 
-  const before = scanDoctorCleaners(params.db, filterIds);
+  const before = scanDoctorCleaners(params.db, filterIds, params.agentIds);
   lines.splice(
     lines.length - 1,
     0,
@@ -2949,6 +2952,7 @@ async function buildDoctorCleanersApplyText(params: {
     result = applyDoctorCleaners(params.db, {
       databasePath: params.config.databasePath,
       filterIds,
+      agentIds: params.agentIds,
       vacuum: params.vacuum,
     });
   } catch (error) {
@@ -3307,6 +3311,10 @@ export function createLcmCommand(params: {
     acceptsArgs: true,
     handler: async (ctx) => {
       const parsed = parseLcmCommand(ctx.args);
+      const doctorCleanerAgentIds = listConfiguredAgentIds(
+        asRecord(ctx)?.config,
+        params.openClawConfig,
+      );
       switch (parsed.kind) {
         case "status":
           return {
@@ -3411,11 +3419,17 @@ export function createLcmCommand(params: {
                 text: await buildDoctorCleanersApplyText({
                   db: await getDb(),
                   config: params.config,
+                  agentIds: doctorCleanerAgentIds,
                   filterId: parsed.filterId,
                   vacuum: parsed.vacuum,
                 }),
               }
-            : { text: await buildDoctorCleanersText({ db: await getDb() }) };
+            : {
+                text: await buildDoctorCleanersText({
+                  db: await getDb(),
+                  agentIds: doctorCleanerAgentIds,
+                }),
+              };
         case "help":
           return { text: buildHelpText(parsed.error) };
       }
