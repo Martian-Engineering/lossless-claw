@@ -848,7 +848,7 @@ describe("LcmContextEngine afterTurn", () => {
     });
   });
 
-  it("afterTurn falls back to local message token estimates when runtimeContext.currentTokenCount is absent", async () => {
+  it("afterTurn leaves live token pressure unset when runtimeContext.currentTokenCount is absent", async () => {
     const engine = createEngine();
     const sessionId = "after-turn-local-current-token-count-fallback";
     const privateEngine = engine as unknown as {
@@ -869,9 +869,14 @@ describe("LcmContextEngine afterTurn", () => {
     });
 
     const turnMessage = makeMessage({ role: "assistant", content: "tiny" });
+    const sessionFile = createSessionFilePath("after-turn-local-current-token-count-fallback");
+    writeLeafTranscript(sessionFile, [
+      { role: "user", content: "seed" },
+    ]);
+
     await engine.afterTurn({
       sessionId,
-      sessionFile: createSessionFilePath("after-turn-local-current-token-count-fallback"),
+      sessionFile,
       messages: [turnMessage],
       prePromptMessageCount: 0,
       tokenBudget: 4_096,
@@ -881,11 +886,10 @@ describe("LcmContextEngine afterTurn", () => {
       },
     });
 
-    // Local estimates use full-message serialization so structured payloads count.
     expect(evaluateSpy).toHaveBeenCalledWith(
       expect.any(Number),
       4_096,
-      estimateSerializedMessageTokens(turnMessage),
+      undefined,
       { contextThreshold: 0.75 },
     );
   });
@@ -4601,6 +4605,38 @@ describe("LcmContextEngine afterTurn", () => {
     expect(debugLog).toHaveBeenCalledWith(
       expect.stringContaining("using runtime prompt token count currentTokenCount=204800"),
     );
+  });
+
+  it("afterTurn does not project stored context as additional live pressure", async () => {
+    const engine = createEngineWithConfig({ freshTailCount: 1 });
+    const sessionId = "after-turn-stored-context-is-not-live-pressure";
+    await seedBacklogContext(engine, sessionId, [100, 100, 100]);
+    const conversation = await engine.getConversationStore().getConversationBySessionId(sessionId);
+    expect(conversation).not.toBeNull();
+    const privateEngine = engine as unknown as {
+      scheduleDeferredCompactionDebtDrain: (params: unknown) => void;
+    };
+    const scheduleSpy = vi
+      .spyOn(privateEngine, "scheduleDeferredCompactionDebtDrain")
+      .mockImplementation(() => undefined);
+
+    await engine.afterTurn({
+      sessionId,
+      sessionFile: createSessionFilePath(sessionId),
+      messages: [],
+      prePromptMessageCount: 0,
+      tokenBudget: 600,
+    });
+
+    await expect(
+      engine.getSummaryStore().getContextTokenCount(conversation!.conversationId),
+    ).resolves.toBe(300);
+    await expect(
+      engine
+        .getCompactionMaintenanceStore()
+        .getConversationCompactionMaintenance(conversation!.conversationId),
+    ).resolves.toBeNull();
+    expect(scheduleSpy).not.toHaveBeenCalled();
   });
 
   it("afterTurn skips compaction when ingest fails", async () => {

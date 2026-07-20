@@ -89,7 +89,7 @@ import { createBootstrapEntryHash, readBootstrapMessageFromJsonLine } from "./me
 import { canonicalizeOpenClawInboundMetadataIdentityContent } from "./openclaw-inbound-metadata.js";
 import { PROMPT_RECALL_MAX_MESSAGES, PROMPT_RECALL_SEARCH_CANDIDATE_LIMIT, buildPromptRecallProjectionFingerprint, extractPromptRecallIdentifiers, extractPromptRecallSnippet, findPromptRecallIdentifierIndex, isPromptRecallEligibleRole, normalizePromptRecallCoverageText, normalizePromptRecallText, renderPromptRecallMessage } from "./prompt-recall.js";
 import { listTranscriptToolResultEntryIdsByCallId } from "./replay-metadata.js";
-import { estimateSessionTokenCountForAfterTurn, extractRuntimePromptTokenCount } from "./token-accounting.js";
+import { extractRuntimePromptTokenCount } from "./token-accounting.js";
 import { asRecord, formatDurationMs, resolvePositiveInteger } from "./value-utils.js";
 
 type AgentMessage = Parameters<ContextEngine["ingest"]>[0]["message"];
@@ -3201,7 +3201,10 @@ export class LcmContextEngine implements ContextEngine {
       );
     }
 
-    const estimatedContextTokens = estimateSessionTokenCountForAfterTurn(params.messages);
+    const conversation = await this.conversationStore.getConversationForSession({
+      sessionId: params.sessionId,
+      sessionKey: params.sessionKey,
+    });
     const runtimePromptTokens = extractRuntimePromptTokenCount(asRecord(params.runtimeContext));
     const suppliedCurrentTokenCount = this.normalizeObservedTokenCount(
       params.currentTokenCount ??
@@ -3211,17 +3214,12 @@ export class LcmContextEngine implements ContextEngine {
         }
       ).currentTokenCount,
     );
-    const observedCurrentTokenCount =
-      runtimePromptTokens ?? suppliedCurrentTokenCount ?? estimatedContextTokens;
+    const observedCurrentTokenCount = runtimePromptTokens ?? suppliedCurrentTokenCount;
     if (runtimePromptTokens !== undefined) {
       this.deps.log.debug(
-        `[lcm] afterTurn: using runtime prompt token count currentTokenCount=${runtimePromptTokens} estimatedTokenCount=${estimatedContextTokens}`,
+        `[lcm] afterTurn: using runtime prompt token count currentTokenCount=${runtimePromptTokens}`,
       );
     }
-    const conversation = await this.conversationStore.getConversationForSession({
-      sessionId: params.sessionId,
-      sessionKey: params.sessionKey,
-    });
     if (!conversation) {
       this.deps.log.debug(
         `[lcm] afterTurn: conversation lookup missed ${sessionLabel} ingestBatch=${ingestBatch.length} duration=${formatDurationMs(Date.now() - startedAt)}`,
@@ -3272,7 +3270,7 @@ export class LcmContextEngine implements ContextEngine {
       | {
           reason: string;
           tokenBudget: number;
-          currentTokenCount: number;
+          currentTokenCount?: number;
         }
       | null = null;
 
