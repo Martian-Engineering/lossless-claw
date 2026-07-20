@@ -184,8 +184,33 @@ export type OpenClawPluginApi = {
     eventName: string,
     handler: (event: PluginLifecycleEvent, ctx: PluginLifecycleContext) => unknown | Promise<unknown>,
   ) => void;
+  session?: {
+    controls?: {
+      registerSessionAction?: (action: PluginSessionActionRegistration) => void;
+    };
+  };
   [key: string]: any;
 };
+
+export type PluginSessionActionRegistration = {
+  id: string;
+  description?: string;
+  schema?: unknown;
+  requiredScopes?: string[];
+  handler: (ctx: PluginSessionActionContext) => Promise<PluginSessionActionResult>;
+};
+
+export type PluginSessionActionContext = {
+  pluginId: string;
+  actionId: string;
+  sessionKey?: string;
+  payload?: Record<string, unknown>;
+  client?: { connId?: string; scopes: string[] };
+};
+
+export type PluginSessionActionResult =
+  | { ok?: true; result?: unknown }
+  | { ok: false; error: string; code?: string; details?: unknown };
 
 export type AgentMessage = {
   role: string;

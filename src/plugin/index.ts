@@ -1726,6 +1726,35 @@ function wirePluginHandlers(
       : shared.waitForEngine().then((nextEngine) => new MemorySupplementContextEngine(nextEngine));
   });
 
+  // Expose the already-implemented ContextEngine.control() through the host's
+  // session-action surface. Without this the control path is unreachable: the
+  // host has no ContextEngine control contract, so control() is never invoked.
+  api.session?.controls?.registerSessionAction?.({
+    id: "lcm-control",
+    description: "Run an LCM control operation (status | doctor | rotate) for a session.",
+    schema: {
+      type: "object",
+      properties: { operation: { enum: ["status", "doctor", "rotate"] } },
+      required: ["operation"],
+    },
+    handler: async (ctx) => {
+      const operation = ctx.payload?.operation;
+      if (operation !== "status" && operation !== "doctor" && operation !== "rotate") {
+        return { ok: false, error: `unsupported operation: ${String(operation)}`, code: "unsupported_operation" };
+      }
+      try {
+        const engine = await shared.waitForEngine();
+        return { ok: true, result: await engine.control({ operation, sessionKey: ctx.sessionKey }) };
+      } catch (err) {
+        return {
+          ok: false,
+          error: err instanceof Error ? err.message : String(err),
+          code: (err as { reason?: string })?.reason ?? "unavailable",
+        };
+      }
+    },
+  });
+
   api.registerTool(
     (ctx) =>
       createLcmGrepTool({
