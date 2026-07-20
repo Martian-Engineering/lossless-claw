@@ -49,6 +49,7 @@ type CleanerDefinition = {
   description: string;
   candidatePredicateSql: string;
   predicateSql: string;
+  sessionKeyLane?: "cron" | "subagent";
   needsFirstMessage?: boolean;
 };
 
@@ -72,16 +73,18 @@ const CLEANER_DEFINITIONS: CleanerDefinition[] = [
   {
     id: "archived_subagents",
     label: "Archived subagents",
-    description: "Archived subagent conversations keyed as agent:main:subagent:*.",
-    candidatePredicateSql: "(c.active = 0 AND c.session_key LIKE 'agent:main:subagent:%')",
-    predicateSql: "(c.active = 0 AND c.session_key LIKE 'agent:main:subagent:%')",
+    description: "Archived subagent conversations for configured OpenClaw agent IDs.",
+    candidatePredicateSql: "(c.active = 0)",
+    predicateSql: "(c.active = 0)",
+    sessionKeyLane: "subagent",
   },
   {
     id: "cron_sessions",
     label: "Cron sessions",
-    description: "Background cron conversations keyed as agent:main:cron:*.",
-    candidatePredicateSql: "(c.session_key LIKE 'agent:main:cron:%')",
-    predicateSql: "(c.session_key LIKE 'agent:main:cron:%')",
+    description: "Background cron conversations for configured OpenClaw agent IDs.",
+    candidatePredicateSql: "1",
+    predicateSql: "1",
+    sessionKeyLane: "cron",
   },
   {
     id: "null_subagent_context",
@@ -105,6 +108,48 @@ function getCleanerDefinitions(filterIds?: DoctorCleanerId[]): CleanerDefinition
   }
   const requested = new Set(filterIds);
   return CLEANER_DEFINITIONS.filter((definition) => requested.has(definition.id));
+}
+
+function normalizeCleanerAgentIds(agentIds?: string[]): string[] {
+  const normalized = [...new Set(agentIds?.map((agentId) => agentId.trim()).filter(Boolean))];
+  return normalized.length > 0 ? normalized : ["main"];
+}
+
+function buildConfiguredSessionKeyPredicateSql(lane: "cron" | "subagent"): string {
+  const prefixSql = `('agent:' || configured_agent.agent_id || ':${lane}:')`;
+  return `EXISTS (
+                SELECT 1
+                FROM temp.doctor_cleaner_agent_ids configured_agent
+                WHERE length(c.session_key) > length(${prefixSql})
+                  AND substr(c.session_key, 1, length(${prefixSql})) = ${prefixSql} COLLATE BINARY
+              )`;
+}
+
+function buildCleanerPredicateSql(
+  definition: CleanerDefinition,
+  kind: "candidate" | "matched",
+): string {
+  const basePredicate = kind === "candidate"
+    ? definition.candidatePredicateSql
+    : definition.predicateSql;
+  if (!definition.sessionKeyLane) {
+    return basePredicate;
+  }
+  return `(${basePredicate} AND ${buildConfiguredSessionKeyPredicateSql(definition.sessionKeyLane)})`;
+}
+
+function stageCleanerAgentIds(db: DatabaseSync, agentIds?: string[]): void {
+  db.exec(`
+    CREATE TEMP TABLE doctor_cleaner_agent_ids (
+      agent_id TEXT PRIMARY KEY
+    ) WITHOUT ROWID
+  `);
+  const insert = db.prepare(
+    `INSERT INTO temp.doctor_cleaner_agent_ids (agent_id) VALUES (?)`,
+  );
+  for (const agentId of normalizeCleanerAgentIds(agentIds)) {
+    insert.run(agentId);
+  }
 }
 
 function truncatePreview(value: string | null): string | null {
@@ -141,7 +186,7 @@ function buildMatchedConversationsSql(params: {
       return `${selectSql}
               FROM conversations c
               ${joinSql}
-              WHERE ${definition.predicateSql}`;
+              WHERE ${buildCleanerPredicateSql(definition, "matched")}`;
     })
     .join(`\nUNION ALL\n`);
 }
@@ -154,7 +199,7 @@ function buildCandidateConversationsSql(definitions: CleanerDefinition[]): strin
     .map(
       (definition) => `SELECT c.conversation_id
               FROM conversations c
-              WHERE ${definition.candidatePredicateSql}`,
+              WHERE ${buildCleanerPredicateSql(definition, "candidate")}`,
     )
     .join(`\nUNION\n`);
 }
@@ -163,13 +208,19 @@ function dropTempCleanerScanTables(db: DatabaseSync): void {
   db.exec(`DROP TABLE IF EXISTS temp.doctor_cleaner_scan_matches`);
   db.exec(`DROP TABLE IF EXISTS temp.doctor_cleaner_scan_message_stats`);
   db.exec(`DROP TABLE IF EXISTS temp.doctor_cleaner_candidate_conversations`);
+  db.exec(`DROP TABLE IF EXISTS temp.doctor_cleaner_agent_ids`);
 }
 
-function stageCleanerScanTables(db: DatabaseSync, definitions: CleanerDefinition[]): void {
+function stageCleanerScanTables(
+  db: DatabaseSync,
+  definitions: CleanerDefinition[],
+  agentIds?: string[],
+): void {
   dropTempCleanerScanTables(db);
   if (definitions.length === 0) {
     return;
   }
+  stageCleanerAgentIds(db, agentIds);
   db.exec(`
     CREATE TEMP TABLE doctor_cleaner_candidate_conversations (
       conversation_id INTEGER PRIMARY KEY
@@ -263,6 +314,7 @@ export function getDoctorCleanerFilterIds(): DoctorCleanerId[] {
 export function scanDoctorCleaners(
   db: DatabaseSync,
   filterIds?: DoctorCleanerId[],
+  agentIds?: string[],
 ): DoctorCleanerScan {
   const definitions = getCleanerDefinitions(filterIds);
   if (definitions.length === 0) {
@@ -273,7 +325,7 @@ export function scanDoctorCleaners(
     };
   }
   try {
-    stageCleanerScanTables(db, definitions);
+    stageCleanerScanTables(db, definitions, agentIds);
     const counts = db
       .prepare(
         `WITH filter_counts AS (
@@ -391,6 +443,7 @@ function dropTempCleanerTables(db: DatabaseSync): void {
   db.exec(`DROP TABLE IF EXISTS temp.doctor_cleaner_message_ids`);
   db.exec(`DROP TABLE IF EXISTS temp.doctor_cleaner_summary_ids`);
   db.exec(`DROP TABLE IF EXISTS temp.doctor_cleaner_conversation_ids`);
+  db.exec(`DROP TABLE IF EXISTS temp.doctor_cleaner_agent_ids`);
 }
 
 function stageTempCleanerFirstMessages(db: DatabaseSync): void {
@@ -426,6 +479,7 @@ function stageTempCleanerFirstMessages(db: DatabaseSync): void {
 function stageCleanerConversationIds(
   db: DatabaseSync,
   definitions: CleanerDefinition[],
+  agentIds?: string[],
 ): void {
   dropTempCleanerTables(db);
   db.exec(`CREATE TEMP TABLE doctor_cleaner_conversation_ids (conversation_id INTEGER PRIMARY KEY)`);
@@ -435,6 +489,7 @@ function stageCleanerConversationIds(
   if (definitions.length === 0) {
     return;
   }
+  stageCleanerAgentIds(db, agentIds);
 
   const needsFirstMessage = definitions.some((definition) => definition.needsFirstMessage);
   if (needsFirstMessage) {
@@ -569,6 +624,7 @@ export function applyDoctorCleaners(
   options: {
     databasePath: string;
     filterIds?: DoctorCleanerId[];
+    agentIds?: string[];
     vacuum?: boolean;
   },
 ): DoctorCleanerApplyResult {
@@ -607,7 +663,7 @@ export function applyDoctorCleaners(
   try {
     db.exec("BEGIN IMMEDIATE");
     transactionActive = true;
-    stageCleanerConversationIds(db, definitions);
+    stageCleanerConversationIds(db, definitions, options.agentIds);
     const counts = readTempCleanerDeleteCounts(db);
     deletedMessages = counts.messageCount;
     if (counts.conversationCount > 0) {

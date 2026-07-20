@@ -56,7 +56,7 @@ The native OpenClaw command surface provides in-session operations:
 - `/lossless doctor` scans for broken or truncated summaries
 - `/lossless doctor apply` repairs broken summaries in the current conversation after the normal safety preflight
 - `/lossless doctor apply <conversation-id> confirm-offline` repairs a specific conversation after its active channel path has been paused or moved away; targeted repair is restricted to authorized OpenClaw command senders and always requires the explicit offline confirmation
-- `/lossless doctor clean` shows read-only high-confidence junk diagnostics for archived subagents, cron sessions, and NULL-key orphaned subagent runs
+- `/lossless doctor clean` shows read-only high-confidence junk diagnostics for archived subagents and cron sessions under every configured OpenClaw agent id, plus NULL-key orphaned subagent runs
 - `/lossless status` shows plugin, conversation, and maintenance state including deferred compaction debt
 - `/lcm` is the shorter alias for `/lossless`
 

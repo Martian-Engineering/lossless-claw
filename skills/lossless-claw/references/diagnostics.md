@@ -85,12 +85,13 @@ Use this when the user wants read-only diagnostics for high-confidence junk patt
 
 It should help confirm:
 
-- whether archived subagent sessions are present
-- whether cron sessions are accumulating unexpectedly
+- whether archived subagent sessions are present under any configured OpenClaw agent id
+- whether cron sessions are accumulating unexpectedly under any configured OpenClaw agent id
 - whether NULL-key orphaned subagent conversations are present
 - which high-confidence filters match the most conversations and messages
 
 This command is read-only. Use it to identify likely cleanup candidates before taking any separate cleanup action.
+Its keyed-session filters require an exact configured agent-id segment, an exact `cron` or `subagent` lane segment, and a non-empty lane suffix.
 
 ## Interpreting common states
 
