@@ -59,8 +59,8 @@ The cleaners flow is also diagnostic first.
 
 It reports high-confidence junk patterns that are structurally safe to review as standalone cleanup candidates, including:
 
-- archived subagent sessions
-- cron sessions
+- archived subagent sessions under configured OpenClaw agent ids
+- cron sessions under configured OpenClaw agent ids
 - NULL-key orphaned subagent context conversations
 
-This keeps cleanup discovery separate from summary-health diagnostics while still using the same native command surface.
+The keyed-session predicates compare exact colon-delimited agent and lane prefixes, so an agent id cannot consume another session-key segment. This keeps cleanup discovery separate from summary-health diagnostics while still using the same native command surface.
