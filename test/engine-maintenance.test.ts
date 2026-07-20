@@ -1531,6 +1531,67 @@ describe("LcmContextEngine maintain and assemble budget", () => {
     );
   });
 
+  it("assemble() refreshes stored pressure after a partial emergency drain", async () => {
+    const log = {
+      info: vi.fn(),
+      warn: vi.fn(),
+      error: vi.fn(),
+      debug: vi.fn(),
+    };
+    const engine = createEngineWithDepsOverrides({ log });
+    const privateEngine = engine as unknown as {
+      executeCompactionCore: (params: unknown) => Promise<unknown>;
+    };
+    const sessionId = "assemble-refreshes-pressure-after-partial-drain";
+    const conversation = await engine.getConversationStore().getOrCreateConversation(sessionId, {
+      sessionKey: undefined,
+    });
+    const [storedMessage] = await engine.getConversationStore().createMessagesBulk([
+      {
+        conversationId: conversation.conversationId,
+        seq: 0,
+        role: "user",
+        content: "context compacted below the degradation threshold",
+        tokenCount: 100,
+      },
+    ]);
+    await engine
+      .getSummaryStore()
+      .appendContextMessages(conversation.conversationId, [storedMessage.messageId]);
+    await engine.getCompactionMaintenanceStore().requestProactiveCompactionDebt({
+      conversationId: conversation.conversationId,
+      reason: "threshold",
+      tokenBudget: 4_096,
+      currentTokenCount: 5_000,
+      projectedTokenCount: 6_000,
+    });
+    const contextTokenCountSpy = vi
+      .spyOn(engine.getSummaryStore(), "getContextTokenCount")
+      .mockResolvedValueOnce(5_000)
+      .mockResolvedValue(100);
+    vi.spyOn(privateEngine, "executeCompactionCore").mockResolvedValue({
+      ok: false,
+      compacted: true,
+      reason: "compacted but still over target",
+    });
+
+    const assembleResult = await engine.assemble({
+      sessionId,
+      messages: [makeMessage({ role: "user", content: "current delivery turn" })],
+      tokenBudget: 4_096,
+    });
+
+    const maintenance = await engine
+      .getCompactionMaintenanceStore()
+      .getConversationCompactionMaintenance(conversation.conversationId);
+    expect(contextTokenCountSpy).toHaveBeenCalledTimes(2);
+    expect(maintenance?.pending).toBe(true);
+    expect(assembleResult.messages.length).toBeGreaterThan(0);
+    expect(log.warn).not.toHaveBeenCalledWith(
+      expect.stringContaining("[lcm] assemble: degraded live fallback"),
+    );
+  });
+
   it("assemble() does not wait for the session queue when deferred threshold debt is not urgent", async () => {
     const engine = createEngine();
     const privateEngine = engine as unknown as {

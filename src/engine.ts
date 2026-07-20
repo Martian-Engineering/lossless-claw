@@ -3570,7 +3570,7 @@ export class LcmContextEngine implements ContextEngine {
         }
         return { messages: clamp.messages, estimatedTokens: clamp.serializedTokens };
       };
-      const storedContextTokens = await this.summaryStore.getContextTokenCount(
+      let storedContextTokens = await this.summaryStore.getContextTokenCount(
         conversation.conversationId,
       );
       const maintenance = await this.compactionMaintenanceStore.getConversationCompactionMaintenance(
@@ -3611,6 +3611,9 @@ export class LcmContextEngine implements ContextEngine {
               `[lcm] assemble: deferred compaction execution failed for ${sessionLabel}: ${describeLogError(error)}`,
             );
           }
+          storedContextTokens = await this.summaryStore.getContextTokenCount(
+            conversation.conversationId,
+          );
           const latestMaintenance =
             await this.compactionMaintenanceStore.getConversationCompactionMaintenance(
               conversation.conversationId,
