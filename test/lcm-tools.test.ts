@@ -4,6 +4,7 @@ import {
   resetDelegatedExpansionGrantsForTests,
 } from "../src/expansion-auth.js";
 import { formatTimestamp } from "../src/compaction.js";
+import { formatToolOutputReference } from "../src/large-files.js";
 import { createLcmDescribeTool } from "../src/tools/lcm-describe-tool.js";
 import { createLcmExpandTool } from "../src/tools/lcm-expand-tool.js";
 import { createLcmGrepTool } from "../src/tools/lcm-grep-tool.js";
@@ -447,6 +448,45 @@ describe("LCM tools session scoping", () => {
     expect((result.details as { error?: string }).error).toContain(
       "`endLine` must be greater than or equal to `startLine`",
     );
+  });
+
+  it("lcm_describe extracts file_xxx from a full [LCM Tool Output: ...] reference string", async () => {
+    const retrieval = {
+      grep: vi.fn(),
+      expand: vi.fn(),
+      describe: vi.fn(async () => ({
+        id: "file_abc123",
+        type: "file" as const,
+        file: {
+          conversationId: 42,
+          fileName: "large.log",
+          mimeType: "text/plain",
+          byteSize: 1234,
+          lineCount: 56,
+          createdAt: new Date("2026-01-01T00:00:00.000Z"),
+        },
+      })),
+    };
+
+    const tool = createLcmDescribeTool({
+      deps: makeDeps(),
+      lcm: buildLcmEngine({ retrieval, conversationId: 42 }) as never,
+      sessionId: "session-1",
+    });
+    const result = await tool.execute("call-describe-reference", {
+      id: formatToolOutputReference({
+        fileId: "file_abc123",
+        toolName: "read_file",
+        byteSize: 1234,
+        summary: "Relevant lines from the requested file.",
+      }),
+    });
+
+    expect(retrieval.describe).toHaveBeenCalledWith(
+      "file_abc123",
+      expect.any(Object),
+    );
+    expect((result.content[0] as { text: string }).text).toContain("LCM File: file_abc123");
   });
 
   it("lcm_grep resolves conversation scope via sessionKey continuity before sessionId lookup", async () => {

@@ -31,6 +31,10 @@
       "label": "Enabled",
       "help": "Enable or disable lossless-claw without uninstalling it"
     },
+    "hostFallbackMode": {
+      "label": "Host Fallback Mode",
+      "help": "Controls the installation-wide agent-run host requirement. error (default) requires the full lifecycle and fails closed on CLI hosts. capture-only accepts bootstrap/after-turn/maintain so generic CLI runs keep transcript capture and recall without Lossless prompt assembly or host-triggered Lossless compaction. Backend-native compaction remains host-owned. Fully capable native hosts still run the full lifecycle. Subagent projection requirements are unchanged."
+    },
     "contextThreshold": {
       "label": "Context Threshold",
       "help": "Fraction of context window that triggers compaction (0.0–1.0)"
@@ -330,6 +334,10 @@
     "properties": {
       "enabled": {
         "type": "boolean"
+      },
+      "hostFallbackMode": {
+        "type": "string",
+        "enum": ["error", "capture-only"]
       },
       "contextThreshold": {
         "type": "number",

@@ -28,7 +28,10 @@ import {
   toStoredMessage,
   type StoredMessage,
 } from "./message-content.js";
-import { isOpenClawAmbientInboundRecord } from "./openclaw-inbound-metadata.js";
+import {
+  isOpenClawAmbientInboundRecord,
+  openClawInboundBodiesMatch,
+} from "./openclaw-inbound-metadata.js";
 import {
   createBootstrapEntryHash,
   createLosslessMessageSignature,
@@ -79,6 +82,16 @@ const CROSS_CONVERSATION_RAW_ID_GUARDED_NO_ANCHOR_REASONS = new Set([
   "checkpoint-missing-recovery",
   "rotate-checkpoint-missing",
   "placeholder-checkpoint-recovery",
+]);
+
+// No-anchor recovery reasons where the runtime may have already persisted the
+// turn as a decorated, still-unstamped row before the transcript caught up. Both
+// "never ingested" recovery lanes (an all-zero placeholder checkpoint, or no
+// checkpoint row at all) reach the same import path, so the bare transcript row
+// is adopted onto that decorated row on either, instead of imported as a duplicate.
+const DECORATION_INVARIANT_ADOPTION_NO_ANCHOR_REASONS = new Set([
+  "placeholder-checkpoint-recovery",
+  "checkpoint-missing-recovery",
 ]);
 
 export type BootstrapCheckpointFileState = {
@@ -1142,6 +1155,26 @@ export class TranscriptReconciler {
             adoptedMessages += 1;
             continue;
           }
+          // A placeholder/checkpoint recovery on a brand-new
+          // conversation re-imports the bare transcript row of a turn the live
+          // afterTurn ingest already persisted as a decorated, still-unstamped
+          // row. The two faces differ on both identity_hash and content, so the
+          // adopters above miss them; stamp the decorated row's id only when its
+          // recognized metadata wrapper reduces to the exact transcript body.
+          if (
+            stored.role === "user" &&
+            DECORATION_INVARIANT_ADOPTION_NO_ANCHOR_REASONS.has(
+              params.noAnchorImportReason ?? "",
+            ) &&
+            (await this.adoptDecorationInvariantEntryId({
+              conversationId,
+              bareContent: stored.content,
+              entryId,
+            }))
+          ) {
+            adoptedMessages += 1;
+            continue;
+          }
         }
       }
       const result = await this.host.ingestSingle({
@@ -1180,6 +1213,37 @@ export class TranscriptReconciler {
     // overlap — the caller then refreshes the checkpoint instead of
     // re-entering this path every turn.
     return { blockedByImportCap: false, importedMessages, hasOverlap: adoptedMessages > 0 };
+  }
+
+  /**
+   * Stamp a brand-new transcript entry id onto a recently-persisted,
+   * still-unstamped user runtime row that is the DECORATED face of the same
+   * turn (its recognized metadata wrapper reduces to the exact bare
+   * model-facing body). When that body matches exactly one candidate, keeps the
+   * decorated row and anchors it instead of importing the bare transcript copy
+   * as a duplicate. Bounded to the flush-lag tail window and fails closed on
+   * ambiguous repeated bodies so legacy or unrelated rows are never mis-adopted.
+   */
+  private async adoptDecorationInvariantEntryId(params: {
+    conversationId: number;
+    bareContent: string;
+    entryId: string;
+  }): Promise<boolean> {
+    const candidates = await this.host.conversationStore.listRecentUnstampedMessagesByRole(
+      params.conversationId,
+      "user",
+      FLUSH_LAG_ADOPTION_TAIL_WINDOW,
+    );
+    const matches = candidates.filter((candidate) =>
+      openClawInboundBodiesMatch(candidate.content, params.bareContent),
+    );
+    if (matches.length !== 1) {
+      return false;
+    }
+    return this.host.conversationStore.restampTranscriptEntryId(
+      matches[0].messageId,
+      params.entryId,
+    );
   }
 
   /**
@@ -2199,6 +2263,7 @@ export class TranscriptReconciler {
             sessionId: params.sessionId,
             sessionFile: params.sessionFile,
             expected: rolloverResolution.preserveExpected,
+            alreadyWarned: rolloverResolution.alreadyWarned,
           });
           return {
             importedMessages: 0,

@@ -104,6 +104,15 @@ const LOSSLESS_AGENT_RUN_REQUIRED_HOST_CAPABILITIES: ContextEngineHostCapability
 const LOSSLESS_SUBAGENT_SPAWN_REQUIRED_HOST_CAPABILITIES: ContextEngineHostCapability[] = [
   "thread-bootstrap-projection",
 ];
+// Opt-in reduced requirement set (config hostFallbackMode="capture-only"): exactly the
+// capability set OpenClaw's generic CLI backends (e.g. claude-cli) advertise. Turns on such
+// hosts run with transcript capture + recall tools but WITHOUT lossless prompt assembly —
+// the CLI harness owns the prompt, so there is no assemble-before-prompt seam to project into.
+const LOSSLESS_AGENT_RUN_CAPTURE_ONLY_HOST_CAPABILITIES: ContextEngineHostCapability[] = [
+  "bootstrap",
+  "after-turn",
+  "maintain",
+];
 const MAX_PREVIOUS_ASSEMBLED_SNAPSHOTS = 100;
 const FORK_BOUNDED_BOOTSTRAP_REASON = "fork-bounded bootstrap import";
 
@@ -120,6 +129,15 @@ const HOST_SESSION_END_REASON_DELETED = "deleted";
 const HOST_SESSION_END_REASON_RESET = "reset";
 const CONTEXT_ENGINE_PROJECTION_EPOCH_VERSION = "summary-prefix-v1";
 const DEFERRED_ASSEMBLY_DEGRADED_PRESSURE_RATIO = 0.75;
+/**
+ * Maximum retry attempts before the assemble emergency drain stops forwarding
+ * force=true to consumeDeferredCompactionDebt. After this threshold, the drain
+ * falls back to respecting backoff and degrading the live prompt instead of
+ * retrying compaction. Set to 3 to limit force retry attempts, matching common
+ * retry budget patterns — after 3 consecutive failures, compaction is unlikely
+ * to succeed and fallback to degraded live prompt is safer.
+ */
+const ASSEMBLE_FORCE_MAX_RETRY_ATTEMPTS = 3;
 type CompactionExecutionParams = {
   conversationId: number;
   sessionId: string;
@@ -358,6 +376,9 @@ export class LcmContextEngine implements ContextEngine {
     // Only claim ownership of compaction when the DB is operational.
     // Without a working schema, ownsCompaction would disable the runtime's
     // built-in compaction safeguard and inflate the context budget.
+    // Capture-only changes agent-run admission, not this global ownership signal.
+    // Generic CLI turns do not consume it; capable native hosts and explicit
+    // Lossless compaction paths still need it to route compaction through LCM.
     this.info = {
       id: "lossless-claw",
       name: "Lossless Context Management Engine",
@@ -365,13 +386,23 @@ export class LcmContextEngine implements ContextEngine {
       ownsCompaction: migrationOk,
       turnMaintenanceMode: "background",
       hostRequirements: {
-        "agent-run": {
-          requiredCapabilities: LOSSLESS_AGENT_RUN_REQUIRED_HOST_CAPABILITIES,
-          unsupportedMessage: [
-            "lossless-claw requires a native OpenClaw runtime with the full context-engine agent-run lifecycle.",
-            "Use the native Codex or Pi embedded runtime, or switch plugins.slots.contextEngine to legacy for CLI harness runs.",
-          ].join(" "),
-        },
+        "agent-run":
+          this.config.hostFallbackMode === "capture-only"
+            ? {
+                requiredCapabilities: LOSSLESS_AGENT_RUN_CAPTURE_ONLY_HOST_CAPABILITIES,
+                unsupportedMessage: [
+                  "lossless-claw (hostFallbackMode=capture-only) still requires the bootstrap, after-turn and maintain host capabilities for transcript capture.",
+                  "This host does not provide them; switch plugins.slots.contextEngine to legacy for such runs.",
+                ].join(" "),
+              }
+            : {
+                requiredCapabilities: LOSSLESS_AGENT_RUN_REQUIRED_HOST_CAPABILITIES,
+                unsupportedMessage: [
+                  "lossless-claw requires a native OpenClaw runtime with the full context-engine agent-run lifecycle.",
+                  "Use the native Codex or Pi embedded runtime, switch plugins.slots.contextEngine to legacy for CLI harness runs,",
+                  'or set plugin config hostFallbackMode:"capture-only" to run CLI-backed turns with transcript capture but no lossless assembly.',
+                ].join(" "),
+              },
         "subagent-spawn": {
           requiredCapabilities: LOSSLESS_SUBAGENT_SPAWN_REQUIRED_HOST_CAPABILITIES,
           unsupportedMessage: [
@@ -381,6 +412,19 @@ export class LcmContextEngine implements ContextEngine {
         },
       },
     } as ContextEngineInfo;
+
+    if (this.config.hostFallbackMode === "capture-only") {
+      logStartupBannerOnce({
+        key: "host-fallback-capture-only",
+        log: (message) => (this.deps.log.hostWarn ?? this.deps.log.warn)(message),
+        message: [
+          "[lcm] WARNING: hostFallbackMode=capture-only relaxes the installation-wide agent-run host requirement to bootstrap/after-turn/maintain.",
+          "Generic CLI runs persist transcripts and keep recall tools, but do not receive Lossless prompt assembly or host-triggered Lossless compaction.",
+          "Backend-native compaction remains host-owned; explicit Lossless compaction requires fallbackProviders.",
+          "Fully capable native hosts still run the full lifecycle, and subagent forks still require thread-bootstrap-projection.",
+        ].join(" "),
+      });
+    }
 
     this.conversationStore = new ConversationStore(this.db, {
       fts5Available: this.fts5Available,
@@ -780,6 +824,8 @@ export class LcmContextEngine implements ContextEngine {
     currentTokenCount?: number;
     runtimeContext?: ContextEngineMaintenanceRuntimeContext;
     legacyParams?: Record<string, unknown>;
+    /** When true, skip the backoff check — used by assemble emergency drain. */
+    force?: boolean;
   }): Promise<(ContextEngineMaintenanceResult & { exhausted?: boolean }) | null> {
     const maintenance = await this.compactionMaintenanceStore.getConversationCompactionMaintenance(
       params.conversationId,
@@ -794,12 +840,13 @@ export class LcmContextEngine implements ContextEngine {
       scope: this.resolveSessionQueueKey(params.sessionId, params.sessionKey),
     });
 
-    if (
-      maintenance.nextAttemptAfter !== null &&
-      maintenance.nextAttemptAfter.getTime() > Date.now()
-    ) {
+    const nextAttemptAfter = maintenance.nextAttemptAfter;
+    const backoffActive =
+      nextAttemptAfter !== null && nextAttemptAfter.getTime() > Date.now();
+
+    if (!params.force && backoffActive) {
       this.deps.log.debug(
-        `[lcm] maintain: deferred compaction backoff active conversation=${params.conversationId} ${sessionLabel} retryAttempts=${maintenance.retryAttempts} nextAttemptAfter=${maintenance.nextAttemptAfter.toISOString()} debtReason=${maintenance.reason ?? "null"}`,
+        `[lcm] maintain: deferred compaction backoff active conversation=${params.conversationId} ${sessionLabel} retryAttempts=${maintenance.retryAttempts} nextAttemptAfter=${nextAttemptAfter.toISOString()} debtReason=${maintenance.reason ?? "null"}`,
       );
       return {
         changed: false,
@@ -807,6 +854,12 @@ export class LcmContextEngine implements ContextEngine {
         rewrittenEntries: 0,
         reason: "deferred compaction backoff active",
       };
+    }
+
+    if (params.force && backoffActive) {
+      this.deps.log.warn(
+        `[lcm] consumeDeferredCompactionDebt: force=true skipping backoff conversation=${params.conversationId} ${sessionLabel} retryAttempts=${maintenance.retryAttempts} nextAttemptAfter=${nextAttemptAfter.toISOString()}`,
+      );
     }
 
     await this.compactionMaintenanceStore.markProactiveCompactionRunning({
@@ -913,6 +966,7 @@ export class LcmContextEngine implements ContextEngine {
         contextThresholdOverride: resolvedContextThreshold,
         runtimeContext: params.runtimeContext,
         legacyParams: params.legacyParams,
+        force: params.force,
       });
       const blockedByAuthCircuitBreaker = result.reason === "circuit breaker open";
       // #639 Mode 2: terminal compaction exhaustion (no eligible candidates while
@@ -1012,6 +1066,8 @@ export class LcmContextEngine implements ContextEngine {
                 ...(telemetry.model ? { model: telemetry.model } : {}),
               }
             : undefined;
+        const retryAttempts = maintenance?.retryAttempts ?? 0;
+        const forceAllowed = retryAttempts < ASSEMBLE_FORCE_MAX_RETRY_ATTEMPTS;
         const result = await this.consumeDeferredCompactionDebt({
           conversationId: params.conversationId,
           sessionId: params.sessionId,
@@ -1019,6 +1075,7 @@ export class LcmContextEngine implements ContextEngine {
           tokenBudget: cappedTokenBudget,
           currentTokenCount: normalizedCurrentTokenCount,
           legacyParams: deferredLegacyParams,
+          force: forceAllowed,
         });
         drainResult = { exhausted: result?.exhausted === true };
       },
@@ -1890,6 +1947,7 @@ export class LcmContextEngine implements ContextEngine {
                   sessionId: params.sessionId,
                   sessionFile: params.sessionFile,
                   expected: rolloverResolution.preserveExpected,
+                  alreadyWarned: rolloverResolution.alreadyWarned,
                 });
                 return {
                   bootstrapped: false,

@@ -69,6 +69,16 @@ What it should help confirm:
 - whether truncation markers exist
 - which conversations are affected most
 
+### `/lossless doctor apply`
+
+Use this only after `/lossless doctor` identifies broken summaries. The command rewrites affected summary content in place after creating a database backup.
+
+- `/lossless doctor apply` repairs the current conversation and keeps the normal large/hot safety preflight.
+- `/lossless doctor apply confirm-offline` overrides that preflight for the current conversation after its active channel path has been isolated.
+- `/lossless doctor apply <conversation-id> confirm-offline` targets a specific conversation, including an archived or non-current conversation. Targeted repair always requires the explicit offline confirmation.
+
+Conversation ids are gateway-wide maintenance identifiers rather than sender ownership credentials. Only authorized OpenClaw command senders can invoke the command; before targeting an id, pause or move active delivery away from that conversation and verify the displayed session key is the intended lane.
+
 ### `/lossless doctor clean`
 
 Use this when the user wants read-only diagnostics for high-confidence junk patterns before any cleanup.

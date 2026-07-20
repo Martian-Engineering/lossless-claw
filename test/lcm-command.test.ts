@@ -1732,7 +1732,12 @@ describe("lcm command", () => {
       "sum_current_directive (fallback), sum_current_emergency (emergency), sum_current_new (new), sum_current_old (old)",
     );
     expect(result.text).toContain("**🛠️ Next step**");
-    expect(result.text).toContain("`/lossless doctor apply` repairs these in place for the current conversation.");
+    expect(result.text).toContain(
+      "`/lossless doctor apply` repairs these in place for the current conversation.",
+    );
+    expect(result.text).toContain(
+      "`/lossless doctor apply <conversation-id> confirm-offline`",
+    );
     expect(result.text).not.toContain("sum_other_new");
     expect(result.text).not.toContain(`conversation id: ${otherConversation.conversationId}`);
   });
@@ -3099,6 +3104,8 @@ describe("lcm command", () => {
     const untouched = await fixture.summaryStore.getSummary("sum_unresolved_apply_other");
 
     expect(result.text).toContain("🩺 Lossless Claw Doctor Apply");
+    expect(result.text).toContain("**📍 Current conversation**");
+    expect(result.text).not.toContain("**📍 Target conversation**");
     expect(result.text).toContain("status: unavailable");
     expect(result.text).toContain(
       "No LCM conversation is stored yet for active session key `agent:main:telegram:direct:not-stored` or active session id `doctor-apply-unresolved-missing`.",
@@ -3107,6 +3114,182 @@ describe("lcm command", () => {
     expect(result.text).not.toContain("detected summaries:");
     expect(summarize).not.toHaveBeenCalled();
     expect(untouched?.content).toContain("[Truncated from 204 tokens]");
+  });
+
+  it("requires offline confirmation before repairing a conversation by id", async () => {
+    const summarize = vi.fn(async () => "REPAIRED BY ID");
+    const fixture = createCommandFixture({ summarize: summarize as LcmSummarizeFn });
+    tempDirs.add(fixture.tempDir);
+    dbPaths.add(fixture.dbPath);
+
+    const currentConversation = await fixture.conversationStore.createConversation({
+      sessionId: "doctor-apply-current-id",
+      sessionKey: "agent:main:telegram:direct:doctor-apply-current-id",
+    });
+    const otherConversation = await fixture.conversationStore.createConversation({
+      sessionId: "doctor-apply-other-id",
+      sessionKey: "agent:main:telegram:direct:doctor-apply-other-id",
+    });
+
+    await fixture.summaryStore.insertSummary({
+      summaryId: "sum_current_id",
+      conversationId: currentConversation.conversationId,
+      kind: "leaf",
+      depth: 0,
+      content: "healthy current summary",
+      tokenCount: 9,
+    });
+    const [message] = await fixture.conversationStore.createMessagesBulk([
+      {
+        conversationId: otherConversation.conversationId,
+        seq: 0,
+        role: "user",
+        content: "other repair source",
+        tokenCount: 7,
+      },
+    ]);
+    await fixture.summaryStore.insertSummary({
+      summaryId: "sum_other_id",
+      conversationId: otherConversation.conversationId,
+      kind: "leaf",
+      depth: 0,
+      content: `broken other summary\n${"[Truncated from 123 tokens]"}`,
+      tokenCount: 11,
+      sourceMessageTokenCount: 7,
+    });
+    await fixture.summaryStore.linkSummaryToMessages("sum_other_id", [message.messageId]);
+
+    const blocked = await fixture.command.handler(
+      createCommandContext(`doctor apply ${otherConversation.conversationId}`, {
+        sessionKey: "agent:main:telegram:direct:doctor-apply-current-id",
+      }),
+    );
+
+    const unchangedOther = await fixture.summaryStore.getSummary("sum_other_id");
+    expect(blocked.text).toContain("status: blocked");
+    expect(blocked.text).toContain("explicit conversation-id targeting requires `confirm-offline`");
+    expect(blocked.text).toContain(
+      `/lossless doctor apply ${otherConversation.conversationId} confirm-offline`,
+    );
+    expect(summarize).not.toHaveBeenCalled();
+    expect(unchangedOther?.content).toContain("[Truncated from 123 tokens]");
+
+    const result = await fixture.command.handler(
+      createCommandContext(
+        `doctor apply ${otherConversation.conversationId} confirm-offline`,
+        {
+          sessionKey: "agent:main:telegram:direct:doctor-apply-current-id",
+        },
+      ),
+    );
+
+    const repairedOther = await fixture.summaryStore.getSummary("sum_other_id");
+    const untouchedCurrent = await fixture.summaryStore.getSummary("sum_current_id");
+
+    expect(result.text).toContain("🩺 Lossless Claw Doctor Apply");
+    expect(result.text).toContain(`conversation id: ${otherConversation.conversationId}`);
+    expect(result.text).toContain("safety override: confirm-offline");
+    expect(result.text).toContain("repaired summaries: 1");
+    expect(summarize).toHaveBeenCalledTimes(1);
+    expect(repairedOther?.content).toContain("REPAIRED BY ID");
+    expect(repairedOther?.content).not.toContain("[Truncated from 123 tokens]");
+    expect(untouchedCurrent?.content).toBe("healthy current summary");
+  });
+
+  it("preserves a large targeted id through the blocked preflight and offline override", async () => {
+    const summarize = vi.fn(async (_text: string) => "TARGETED OFFLINE REPAIR");
+    const fixture = createCommandFixture({ summarize: summarize as LcmSummarizeFn });
+    tempDirs.add(fixture.tempDir);
+    dbPaths.add(fixture.dbPath);
+    const targetConversationId = 1_234;
+    fixture.db
+      .prepare(
+        `INSERT INTO conversations (conversation_id, session_id, session_key)
+         VALUES (?, ?, ?)`,
+      )
+      .run(
+        targetConversationId,
+        "doctor-apply-large-target-id",
+        "agent:main:telegram:direct:doctor-apply-large-target-id",
+      );
+
+    const messages = await fixture.conversationStore.createMessagesBulk(
+      Array.from({ length: 26 }, (_, index) => ({
+        conversationId: targetConversationId,
+        seq: index,
+        role: "user",
+        content: `targeted repair source ${index}`,
+        tokenCount: 5,
+      })),
+    );
+    for (let index = 0; index < 26; index += 1) {
+      const summaryId = `sum_large_targeted_${index}`;
+      await fixture.summaryStore.insertSummary({
+        summaryId,
+        conversationId: targetConversationId,
+        kind: "leaf",
+        depth: 0,
+        content: `broken targeted leaf ${index}\n${"[Truncated from 512 tokens]"}`,
+        tokenCount: 11,
+        sourceMessageTokenCount: 5,
+      });
+      await fixture.summaryStore.linkSummaryToMessages(summaryId, [messages[index].messageId]);
+    }
+    fixture.db
+      .prepare(
+        `INSERT INTO conversation_compaction_maintenance (
+           conversation_id,
+           pending,
+           requested_at,
+           reason,
+           running,
+           updated_at
+         ) VALUES (?, 1, ?, ?, 0, datetime('now'))`,
+      )
+      .run(targetConversationId, "2026-07-15T00:00:00.000Z", "budget-trigger");
+
+    const blocked = await fixture.command.handler(
+      createCommandContext(`doctor apply ${targetConversationId}`, {
+        sessionKey: "agent:main:telegram:direct:doctor-apply-caller",
+      }),
+    );
+
+    expect(blocked.text).toContain("status: blocked");
+    expect(blocked.text).toContain("repair targets: 26");
+    expect(blocked.text).toContain("explicit conversation-id targeting requires `confirm-offline`");
+    expect(blocked.text).toContain("doctor target count 26 exceeds safe inline limit 25");
+    expect(blocked.text).toContain("compaction maintenance is pending (budget-trigger)");
+    expect(blocked.text).toContain(`/lossless doctor apply ${targetConversationId} confirm-offline`);
+    expect(blocked.text).not.toContain("1,234 confirm-offline");
+    expect(summarize).not.toHaveBeenCalled();
+
+    const result = await fixture.command.handler(
+      createCommandContext(`doctor apply ${targetConversationId} confirm-offline`, {
+        sessionKey: "agent:main:telegram:direct:doctor-apply-caller",
+      }),
+    );
+
+    const repaired = await fixture.summaryStore.getSummary("sum_large_targeted_0");
+    expect(result.text).toContain("safety override: confirm-offline");
+    expect(result.text).toContain("repaired summaries: 26");
+    expect(summarize).toHaveBeenCalledTimes(26);
+    expect(repaired?.content).toBe("TARGETED OFFLINE REPAIR");
+  });
+
+  it("reports unavailable when targeting a nonexistent conversation id", async () => {
+    const fixture = createCommandFixture();
+    tempDirs.add(fixture.tempDir);
+    dbPaths.add(fixture.dbPath);
+
+    const result = await fixture.command.handler(
+      createCommandContext("doctor apply 99999", {
+        sessionKey: "agent:main:telegram:direct:doctor-apply-nonexistent",
+      }),
+    );
+
+    expect(result.text).toContain("🩺 Lossless Claw Doctor Apply");
+    expect(result.text).toContain("status: unavailable");
+    expect(result.text).toContain("No LCM conversation found with id 99,999");
   });
 
   it("uses the normal runtime model chain for doctor apply when no explicit summary model is set", async () => {
@@ -4232,6 +4415,45 @@ describe("lcm command helpers", () => {
       kind: "doctor",
       apply: true,
       applyOptions: { confirmOffline: true },
+    });
+    expect(__testing.parseLcmCommand("doctor apply offline")).toEqual({
+      kind: "doctor",
+      apply: true,
+      applyOptions: { confirmOffline: true },
+    });
+    expect(__testing.parseLcmCommand("doctor apply 42")).toEqual({
+      kind: "doctor",
+      apply: true,
+      applyOptions: { confirmOffline: false, conversationId: 42 },
+    });
+    expect(__testing.parseLcmCommand("doctor apply 42 confirm-offline")).toEqual({
+      kind: "doctor",
+      apply: true,
+      applyOptions: { confirmOffline: true, conversationId: 42 },
+    });
+    expect(__testing.parseLcmCommand("doctor apply 42 offline")).toEqual({
+      kind: "help",
+      error:
+        "`/lossless doctor apply <conversation-id>` requires explicit `confirm-offline`; other offline aliases apply only to current-conversation repair.",
+    });
+    expect(__testing.parseLcmCommand("doctor apply confirm-large 42")).toEqual({
+      kind: "help",
+      error:
+        "`/lossless doctor apply <conversation-id>` requires explicit `confirm-offline`; other offline aliases apply only to current-conversation repair.",
+    });
+    expect(__testing.parseLcmCommand("doctor apply not-a-number")).toEqual({
+      kind: "help",
+      error:
+        "`/lossless doctor apply` accepts optional `confirm-offline` for the current conversation or `<conversation-id> confirm-offline` for targeted repair.",
+    });
+    expect(__testing.parseLcmCommand("doctor apply 42 42")).toEqual({
+      kind: "help",
+      error: "`/lossless doctor apply` accepts at most one conversation id.",
+    });
+    expect(__testing.parseLcmCommand("doctor apply 9007199254740992")).toEqual({
+      kind: "help",
+      error:
+        "`/lossless doctor apply` accepts optional `confirm-offline` for the current conversation or `<conversation-id> confirm-offline` for targeted repair.",
     });
     expect(__testing.parseLcmCommand("doctor rollover-splits")).toEqual({
       kind: "doctor_rollover_splits",

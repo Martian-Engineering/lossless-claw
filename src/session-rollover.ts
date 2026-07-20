@@ -36,11 +36,48 @@ const AMBIGUOUS_ROLLOVER_OVERLAP_WINDOW = 50;
  */
 const AMBIGUOUS_ROLLOVER_OVERLAP_WIDE_WINDOW = 500;
 
+/**
+ * A single-occurrence identity match only proves a foreign/conflicting
+ * transcript when the shared content is itself substantial. Trivial,
+ * generic content (health-check pings, "ok", "test") recurs by coincidence
+ * across genuinely unrelated sessions, so — like heartbeat noise — it
+ * cannot discriminate lineage. This floor only matters in combination with
+ * deliberate-rollover evidence (see `hasDeliberateRolloverEvidence` below):
+ * a substantial overlap (e.g. a specific persisted sentence reappearing)
+ * still fails closed even when a /new marker and archive sibling are both
+ * present, because that is exactly the shape a foreign session reusing a
+ * stale sessionKey would produce.
+ *
+ * Two known edges, both accepted deliberately: the check is length-only, so
+ * a short deployment-specific token that happens to be lineage-discriminating
+ * would still bypass; and the bypass can fire even when the trivial message
+ * is the only candidate in the new transcript. Both require the
+ * deliberate-rollover evidence pair (marker + archive sibling) to be reached
+ * at all, which is the actual defense. The threshold value is pinned by a
+ * boundary test in rollover-identity-scope.test.ts ("bypasses/fails closed
+ * at the trivial-content boundary") so a future bump is a deliberate review
+ * point, not an incidental one.
+ */
+const TRIVIAL_ROLLOVER_OVERLAP_CONTENT_MAX_LENGTH = 8;
+
+function isTrivialRolloverOverlapContent(content: string): boolean {
+  return content.trim().length <= TRIVIAL_ROLLOVER_OVERLAP_CONTENT_MAX_LENGTH;
+}
+
 export type AmbiguousSessionKeyRuntimeRollover = {
   conversationId: number;
   activeSessionId: string;
   sessionKey: string;
   trackedSessionFile: string;
+  /**
+   * True when Lossless's own softResetPrunedAt marker AND an on-disk
+   * `.reset.` archive sibling both attest that this generation's prior
+   * conversation was deliberately archived via /new (see
+   * `hasSoftResetArchiveEvidence`). Only used to narrow the identity-overlap
+   * freshness gate for trivial content — see
+   * `TRIVIAL_ROLLOVER_OVERLAP_CONTENT_MAX_LENGTH` above.
+   */
+  hasDeliberateRolloverEvidence: boolean;
 };
 
 /**
@@ -48,10 +85,13 @@ export type AmbiguousSessionKeyRuntimeRollover = {
  * the lane healed in place. When it did not, `preserveExpected` is true only for
  * a transient freshness failure (the new transcript cannot be judged yet and the
  * next turn re-evaluates); a conflicting or anomalous failure leaves it false.
+ * `alreadyWarned` is true when this exact freeze (same sessionKey + old + new
+ * sessionId + freshness reason) already emitted its once-only WARN in a prior
+ * call this process, so callers should log any restatement at debug instead.
  */
 export type AmbiguousRolloverResolution =
   | { rebound: true }
-  | { rebound: false; preserveExpected: boolean };
+  | { rebound: false; preserveExpected: boolean; alreadyWarned: boolean };
 
 /**
  * Freshness verdicts where the new transcript simply lacks the evidence to prove
@@ -84,12 +124,39 @@ export type ApplySessionReplacementFn = (params: {
 }) => Promise<void>;
 
 export class SessionRolloverDetector {
+  /**
+   * Once-only WARN memo for ambiguous-rollover freezes: keyed by session
+   * generation (sessionKey + old sessionId + new sessionId), valued by the
+   * freshness reason last warned about. Nothing about a failed freshness
+   * check mutates persisted state (see `evaluateAmbiguousRolloverFreshness`),
+   * so without this a still-frozen lane re-derives and re-warns identically
+   * on every subsequent bootstrap/afterTurn call. A reason change for the
+   * same generation still warns once more, since that is a materially
+   * different situation worth surfacing again.
+   *
+   * Bounded with FIFO eviction at `WARNED_AMBIGUOUS_ROLLOVER_GENERATIONS_CAP`
+   * entries (mirrors `TranscriptReconciler`'s `AFTER_TURN_RECONCILE_KEY_CAP`)
+   * so a long-lived host process that accumulates many distinct frozen
+   * generations doesn't grow this map indefinitely. A generation whose entry
+   * gets evicted just re-warns once more on its next call, which is harmless
+   * noise, so plain size-capped FIFO is enough; no LRU needed.
+   */
+  private readonly warnedAmbiguousRolloverGenerations = new Map<string, string>();
+  private static readonly WARNED_AMBIGUOUS_ROLLOVER_GENERATIONS_CAP = 500;
+
   constructor(
     private readonly conversationStore: ConversationStore,
     private readonly summaryStore: SummaryStore,
     private readonly deps: Pick<LcmDependencies, "log">,
     private readonly applySessionReplacement: ApplySessionReplacementFn,
   ) {}
+
+  private ambiguousRolloverGenerationKey(
+    rollover: Pick<AmbiguousSessionKeyRuntimeRollover, "sessionKey" | "activeSessionId">,
+    sessionId: string,
+  ): string {
+    return `${rollover.sessionKey} ${rollover.activeSessionId} ${sessionId}`;
+  }
 
   /**
    * True when the host left an on-disk reset archive sibling beside a tracked
@@ -290,6 +357,15 @@ export class SessionRolloverDetector {
       return null;
     }
 
+    // Computed once regardless of whether the tracked file still stat()s:
+    // the ENOENT branch below needs it to decide whether a missing file is
+    // a handled soft reset, and the freshness gate downstream needs it to
+    // narrow identity-overlap for trivial content on a deliberate /new.
+    const hasDeliberateRolloverEvidence = await this.hasSoftResetArchiveEvidence({
+      softResetPrunedAt: activeBootstrapState?.softResetPrunedAt,
+      trackedSessionFile,
+    });
+
     try {
       await stat(trackedSessionFile);
     } catch (err) {
@@ -307,12 +383,7 @@ export class SessionRolloverDetector {
       // warns on genuine loss, so that case is already handled there. Log at
       // debug (not warn) for host-contract-drift diagnosis without double-
       // warning or firing on a transient mid-rotation ENOENT.
-      if (
-        !(await this.hasSoftResetArchiveEvidence({
-          softResetPrunedAt: activeBootstrapState?.softResetPrunedAt,
-          trackedSessionFile,
-        }))
-      ) {
+      if (!hasDeliberateRolloverEvidence) {
         this.deps.log.debug(
           `[lcm] ${params.phase}: tracked transcript missing without /new reset-archive evidence; declining ambiguous-rollover rebind (destructive guard handles genuine loss) conversation=${activeByKey.conversationId} sessionKey=${normalizedSessionKey} file=${trackedSessionFile}`,
         );
@@ -325,6 +396,7 @@ export class SessionRolloverDetector {
       activeSessionId: activeByKey.sessionId,
       sessionKey: normalizedSessionKey,
       trackedSessionFile,
+      hasDeliberateRolloverEvidence,
     };
   }
 
@@ -339,9 +411,14 @@ export class SessionRolloverDetector {
     // bootstrap/afterTurn pass that judged the rollover and could not heal it)
     // warns.
     expected?: boolean;
+    // True when this exact freeze already emitted its once-only WARN via
+    // rotateAmbiguousRolloverForProvablyFreshTranscript's own freshness log
+    // for this session generation; a repeat restatement here should not
+    // re-warn either.
+    alreadyWarned?: boolean;
   }): void {
     const message = `[lcm] ${params.phase}: ${AMBIGUOUS_SESSION_KEY_RUNTIME_ROLLOVER_REASON}; preserving conversation=${params.rollover.conversationId} session=${params.sessionId} sessionKey=${params.rollover.sessionKey} oldSessionId=${params.rollover.activeSessionId} oldFile=${params.rollover.trackedSessionFile}${params.sessionFile ? ` newFile=${params.sessionFile}` : ""}`;
-    if (params.expected) {
+    if (params.expected || params.alreadyWarned) {
       this.deps.log.debug(message);
     } else {
       this.deps.log.warn(message);
@@ -360,6 +437,14 @@ export class SessionRolloverDetector {
   private async evaluateAmbiguousRolloverFreshness(params: {
     conversationId: number;
     candidateMessages: AgentMessage[];
+    /**
+     * True when a /new marker + archive sibling both attest the prior
+     * generation was deliberately rotated (see
+     * `AmbiguousSessionKeyRuntimeRollover.hasDeliberateRolloverEvidence`).
+     * Defaults to false so callers outside the /new soft-reset path (e.g.
+     * isolated-cron rollover) keep the unmodified, fully fail-closed check.
+     */
+    hasDeliberateRolloverEvidence?: boolean;
   }): Promise<{
     fresh: boolean;
     reason: string;
@@ -480,6 +565,7 @@ export class SessionRolloverDetector {
       };
     }
     let checkedCandidateIdentity = false;
+    let bypassedTrivialDeliberateOverlap = false;
     for (const message of params.candidateMessages) {
       const stored = toStoredMessage(message);
       if (
@@ -490,6 +576,16 @@ export class SessionRolloverDetector {
       }
       checkedCandidateIdentity = true;
       if (persistedIdentities.has(messageIdentity(stored.role, stored.content))) {
+        // A deliberate /new (marker + archive sibling) plus trivial
+        // overlapping content is the rapid-rollover health-check shape
+        // (e.g. a lone "ping" repeated across sessions) — not evidence of a
+        // foreign transcript reusing the key. Substantial overlapping
+        // content still fails closed even here: see
+        // TRIVIAL_ROLLOVER_OVERLAP_CONTENT_MAX_LENGTH's docstring.
+        if (params.hasDeliberateRolloverEvidence && isTrivialRolloverOverlapContent(stored.content)) {
+          bypassedTrivialDeliberateOverlap = true;
+          continue;
+        }
         return {
           fresh: false,
           reason: "identity-overlap-with-persisted-history",
@@ -507,7 +603,14 @@ export class SessionRolloverDetector {
       };
     }
 
-    return { fresh: true, reason: "fresh", lastPersistedAt: lastPersisted.createdAt, firstCandidateAt };
+    return {
+      fresh: true,
+      reason: bypassedTrivialDeliberateOverlap
+        ? "fresh-trivial-identity-overlap-deliberate-rollover"
+        : "fresh",
+      lastPersistedAt: lastPersisted.createdAt,
+      firstCandidateAt,
+    };
   }
 
   /**
@@ -532,22 +635,45 @@ export class SessionRolloverDetector {
       verdict = await this.evaluateAmbiguousRolloverFreshness({
         conversationId: params.rollover.conversationId,
         candidateMessages: params.candidateMessages,
+        hasDeliberateRolloverEvidence: params.rollover.hasDeliberateRolloverEvidence,
       });
     } catch (err) {
       this.deps.log.warn(
         `[lcm] ${params.phase}: ambiguous rollover freshness check failed conversation=${params.rollover.conversationId} error=${describeLogError(err)}`,
       );
-      return { rebound: false, preserveExpected: false };
+      return { rebound: false, preserveExpected: false, alreadyWarned: false };
     }
     if (!verdict.fresh) {
       const preserveExpected = isTransientAmbiguousRolloverFreshness(verdict.reason);
       const message = `[lcm] ${params.phase}: ambiguous rollover not provably fresh conversation=${params.rollover.conversationId} sessionKey=${params.rollover.sessionKey} freshness=${verdict.reason} lastPersistedAt=${verdict.lastPersistedAt?.toISOString() ?? "none"} firstCandidateAt=${verdict.firstCandidateAt !== null ? new Date(verdict.firstCandidateAt).toISOString() : "none"}`;
       if (preserveExpected) {
         this.deps.log.info(message);
+        return { rebound: false, preserveExpected, alreadyWarned: false };
+      }
+      // Once-only WARN: a genuine freeze re-derives identically on every
+      // subsequent call (nothing about a failed attempt mutates state), so
+      // only the first occurrence of a given (generation, reason) pair
+      // warns; repeats log at debug. A reason change for the same
+      // generation is a materially different situation and warns again.
+      const generationKey = this.ambiguousRolloverGenerationKey(params.rollover, params.sessionId);
+      const alreadyWarned = this.warnedAmbiguousRolloverGenerations.get(generationKey) === verdict.reason;
+      if (alreadyWarned) {
+        this.deps.log.debug(message);
       } else {
         this.deps.log.warn(message);
+        if (
+          !this.warnedAmbiguousRolloverGenerations.has(generationKey)
+          && this.warnedAmbiguousRolloverGenerations.size
+            >= SessionRolloverDetector.WARNED_AMBIGUOUS_ROLLOVER_GENERATIONS_CAP
+        ) {
+          const oldest = this.warnedAmbiguousRolloverGenerations.keys().next().value;
+          if (typeof oldest === "string") {
+            this.warnedAmbiguousRolloverGenerations.delete(oldest);
+          }
+        }
+        this.warnedAmbiguousRolloverGenerations.set(generationKey, verdict.reason);
       }
-      return { rebound: false, preserveExpected };
+      return { rebound: false, preserveExpected, alreadyWarned };
     }
 
     const rebound = await this.conversationStore.rebindConversationSession(
@@ -559,7 +685,7 @@ export class SessionRolloverDetector {
       this.deps.log.warn(
         `[lcm] ${params.phase}: ambiguous rollover rebind failed conversation=${params.rollover.conversationId} sessionKey=${params.rollover.sessionKey} oldSessionId=${params.rollover.activeSessionId} newSessionId=${params.sessionId}; leaving lane frozen`,
       );
-      return { rebound: false, preserveExpected: false };
+      return { rebound: false, preserveExpected: false, alreadyWarned: false };
     }
 
     // Expected success: the lane healed in place. Logged at info so the

@@ -2,22 +2,9 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { __testing as fileLogTesting } from "../src/lcm-file-log.js";
 import { createLcmLogger } from "../src/lcm-log.js";
 import type { LcmConfig } from "../src/db/config.js";
-
-vi.mock("openclaw/plugin-sdk/logging-core", () => ({
-  redactSensitiveText: (text: string, options?: { patterns?: string[] }) => {
-    let next = text;
-    for (const rawPattern of options?.patterns ?? []) {
-      const match = rawPattern.match(/^\/(.+)\/([gimsuy]*)$/);
-      const pattern = match
-        ? new RegExp(match[1], match[2].includes("g") ? match[2] : `${match[2]}g`)
-        : new RegExp(rawPattern, "gi");
-      next = next.replace(pattern, "[REDACTED]");
-    }
-    return next;
-  },
-}));
 
 let tempDir: string;
 
@@ -27,11 +14,13 @@ beforeEach(() => {
 
 afterEach(() => {
   fs.rmSync(tempDir, { recursive: true, force: true });
+  fileLogTesting.resetOpenClawRedactor();
 });
 
 function baseConfig(file: string, independentLogFileEnabled = true): LcmConfig {
   return {
     enabled: true,
+    hostFallbackMode: "error",
     databasePath: path.join(tempDir, "lcm.db"),
     largeFilesDir: path.join(tempDir, "lcm-files"),
     ignoreSessionPatterns: [],
@@ -191,6 +180,18 @@ describe("createLcmLogger", () => {
   });
 
   it("applies OpenClaw custom redaction patterns to independent logs", () => {
+    fileLogTesting.setOpenClawRedactor((text, options) => {
+      let next = text;
+      for (const rawPattern of options?.patterns ?? []) {
+        const match = rawPattern.match(/^\/(.+)\/([gimsuy]*)$/);
+        const pattern = match
+          ? new RegExp(match[1], match[2].includes("g") ? match[2] : `${match[2]}g`)
+          : new RegExp(rawPattern, "gi");
+        next = next.replace(pattern, "[REDACTED]");
+      }
+      return next;
+    });
+
     const file = path.join(tempDir, "lossless-claw-test.log");
     const customSecret = "tenant-secret-12345";
     const { logger } = createRuntimeLogger(file, {

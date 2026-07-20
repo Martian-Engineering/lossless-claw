@@ -10,6 +10,7 @@ import { jsonResult } from "./common.js";
 import { resolveLcmConversationScope } from "./lcm-conversation-scope.js";
 import { formatTimestamp } from "../compaction.js";
 import type { DescribeResult } from "../retrieval.js";
+import { extractLcmDescribeId } from "./lcm-describe-id.js";
 
 function formatDisplayTime(
   value: Date | string | number | null | undefined,
@@ -135,10 +136,12 @@ export function createLcmDescribeTool(input: {
       "from compacted conversation history. Returns summary content, lineage, " +
       "token counts, and file exploration results. " +
       "ALSO USE THIS when you see a `[LCM Tool Output: file_xxx | tool=… | N bytes]` " +
-      "reference in the conversation — that means an older tool result was elided " +
-      "for context efficiency. Call lcm_describe(id=file_xxx, expandFile=true) to " +
-      "fetch the original output content before answering questions that depend on " +
-      "its specifics. If the inlined content is truncated, use lcm_grep(scope='files', " +
+      "or `[LCM File: file_xxx | …]` reference in the conversation — that means an " +
+      "older tool result or large file was elided for context efficiency. You may " +
+      "pass the full reference string as `id`; Lossless extracts the file_xxx ID " +
+      "automatically. Call lcm_describe(id=file_xxx, expandFile=true) to fetch the " +
+      "content before answering questions that depend on its specifics. " +
+      "If the inlined content is truncated, use lcm_grep(scope='files', " +
       "fileIds=[file_xxx]) to search the bounded file prefix.",
     parameters: LcmDescribeSchema,
     async execute(_toolCallId, params) {
@@ -149,7 +152,17 @@ export function createLcmDescribeTool(input: {
       const retrieval = lcm.getRetrieval();
       const timezone = lcm.timezone;
       const p = params as Record<string, unknown>;
-      const id = (p.id as string).trim();
+      const rawId = typeof p.id === "string" ? p.id : "";
+      const extracted = extractLcmDescribeId(rawId);
+      if (!extracted.ok) {
+        return jsonResult({
+          error: extracted.error,
+          hint:
+            extracted.hint ??
+            "Use a bare ID such as sum_xxx or file_xxx, or a single reference string such as [LCM Tool Output: file_xxx | ...].",
+        });
+      }
+      const id = extracted.id;
       const conversationScope = await resolveLcmConversationScope({
         lcm,
         deps: input.deps,

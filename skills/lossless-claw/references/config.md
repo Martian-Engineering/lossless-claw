@@ -582,6 +582,21 @@ Why it matters:
 - when enabled, matching stateless sessions skip LCM persistence entirely
 - use carefully, because it affects whether those sessions behave as readers only or are effectively bypassed for writes
 
+### `hostFallbackMode`
+
+Controls the installation-wide `agent-run` host requirement.
+
+- `error` is the default and requires the full context-engine lifecycle
+- `capture-only` accepts hosts that provide bootstrap, after-turn ingestion, and maintenance
+- generic CLI runs in capture-only mode persist transcripts and keep recall tools, but do not receive Lossless prompt assembly or host-triggered Lossless compaction
+- backend-native compaction remains host-owned; explicit Lossless compaction requires `fallbackProviders`
+- fully capable native hosts still execute the full lifecycle, and Lossless retains compaction ownership for those runs
+- subagent forks continue to require `thread-bootstrap-projection`
+
+Env override:
+
+- `LCM_HOST_FALLBACK_MODE`
+
 ## Recall-path and delegation controls
 
 ### `expansionModel`

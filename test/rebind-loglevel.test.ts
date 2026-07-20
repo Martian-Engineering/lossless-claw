@@ -17,6 +17,7 @@ const ROLLOVER: AmbiguousSessionKeyRuntimeRollover = {
   activeSessionId: "old-session",
   sessionKey: "agent:main:main",
   trackedSessionFile: "/tmp/old-transcript.jsonl",
+  hasDeliberateRolloverEvidence: false,
 };
 
 const NEW_SESSION_ID = "new-session";
@@ -86,7 +87,7 @@ describe("ambiguous-rollover rebind happy-path log levels", () => {
       createReplacement: false,
     });
 
-    expect(rebound).toEqual({ rebound: false, preserveExpected: true });
+    expect(rebound).toEqual({ rebound: false, preserveExpected: true, alreadyWarned: false });
     expect(log.warn).not.toHaveBeenCalled();
     expect(log.info).toHaveBeenCalledWith(
       expect.stringContaining("freshness=candidate-missing-timestamp"),
@@ -108,7 +109,7 @@ describe("ambiguous-rollover rebind happy-path log levels", () => {
       createReplacement: false,
     });
 
-    expect(rebound).toEqual({ rebound: false, preserveExpected: false });
+    expect(rebound).toEqual({ rebound: false, preserveExpected: false, alreadyWarned: false });
     expect(log.info).not.toHaveBeenCalled();
     expect(log.warn).toHaveBeenCalledWith(expect.stringContaining("not provably fresh"));
   });
@@ -145,7 +146,7 @@ describe("ambiguous-rollover rebind anomaly log levels stay at warn", () => {
       createReplacement: false,
     });
 
-    expect(rebound).toEqual({ rebound: false, preserveExpected: false });
+    expect(rebound).toEqual({ rebound: false, preserveExpected: false, alreadyWarned: false });
     expect(log.warn).toHaveBeenCalledWith(expect.stringContaining("rebind failed"));
   });
 
@@ -164,7 +165,7 @@ describe("ambiguous-rollover rebind anomaly log levels stay at warn", () => {
       createReplacement: false,
     });
 
-    expect(rebound).toEqual({ rebound: false, preserveExpected: false });
+    expect(rebound).toEqual({ rebound: false, preserveExpected: false, alreadyWarned: false });
     expect(log.warn).toHaveBeenCalledWith(
       expect.stringContaining("ambiguous rollover freshness check failed"),
     );

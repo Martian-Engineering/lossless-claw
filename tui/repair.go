@@ -20,6 +20,7 @@ import (
 	"strconv"
 	"strings"
 	"time"
+	"unicode/utf8"
 )
 
 const (
@@ -40,6 +41,8 @@ var (
 	execCLICommand      = exec.CommandContext
 	cliOutputTokenSlack = 128
 )
+
+const cliOutputMaxOverageFactor = 3
 
 // cliSummarizationSystemPrompt is the system directive sent to CLI-delegated
 // summarizers (claude CLI, codex CLI). It constrains the CLI to output only
@@ -1082,16 +1085,9 @@ func summarizeViaCLI(ctx context.Context, model, prompt string, targetTokens int
 		return "", fmt.Errorf("claude CLI: %w", err)
 	}
 	result := strings.TrimSpace(string(out))
-	if result == "" {
-		return "", fmt.Errorf("claude CLI returned empty output")
-	}
-	estimatedTokens := estimateTokenCount(result)
-	if estimatedTokens > targetTokens+cliOutputTokenSlack {
-		return "", fmt.Errorf(
-			"claude CLI output exceeded target token budget: got %d tokens for target %d",
-			estimatedTokens,
-			targetTokens,
-		)
+	result, err = normalizeCLISummaryOutput("claude", result, targetTokens)
+	if err != nil {
+		return "", err
 	}
 	return result, nil
 }
@@ -1176,18 +1172,72 @@ func summarizeViaCodexCLI(ctx context.Context, model, prompt string, targetToken
 		return "", fmt.Errorf("read codex CLI output: %w", err)
 	}
 	result := strings.TrimSpace(string(data))
-	if result == "" {
-		return "", fmt.Errorf("codex CLI returned empty output")
-	}
-	estimatedTokens := estimateTokenCount(result)
-	if estimatedTokens > targetTokens+cliOutputTokenSlack {
-		return "", fmt.Errorf(
-			"codex CLI output exceeded target token budget: got %d tokens for target %d",
-			estimatedTokens,
-			targetTokens,
-		)
+	result, err = normalizeCLISummaryOutput("codex", result, targetTokens)
+	if err != nil {
+		return "", err
 	}
 	return result, nil
+}
+
+func normalizeCLISummaryOutput(cliName, result string, targetTokens int) (string, error) {
+	result = strings.TrimSpace(result)
+	if result == "" {
+		return "", fmt.Errorf("%s CLI returned empty output", cliName)
+	}
+	if targetTokens <= 0 {
+		return result, nil
+	}
+
+	estimatedTokens := estimateTokenCount(result)
+	maxTokens := targetTokens * cliOutputMaxOverageFactor
+	if slackLimit := targetTokens + cliOutputTokenSlack; slackLimit > maxTokens {
+		maxTokens = slackLimit
+	}
+	if estimatedTokens <= maxTokens {
+		return result, nil
+	}
+	return capSummaryText(result, estimatedTokens, maxTokens), nil
+}
+
+func capSummaryText(content string, originalTokens, maxTokens int) string {
+	suffixes := []string{
+		fmt.Sprintf("\n[Capped from %d tokens to ~%d]", originalTokens, maxTokens),
+		fmt.Sprintf("\n[Capped to ~%d]", maxTokens),
+		"\n[Capped]",
+		"",
+	}
+
+	for _, suffix := range suffixes {
+		contentBudget := maxTokens - estimateTokenCount(suffix)
+		if contentBudget < 0 {
+			contentBudget = 0
+		}
+		capped := truncateTextToEstimatedTokens(content, contentBudget) + suffix
+		if estimateTokenCount(capped) <= maxTokens {
+			return strings.TrimSpace(capped)
+		}
+	}
+
+	return truncateTextToEstimatedTokens(content, maxTokens)
+}
+
+func truncateTextToEstimatedTokens(content string, maxTokens int) string {
+	content = strings.TrimSpace(content)
+	if maxTokens <= 0 || content == "" {
+		return ""
+	}
+	maxChars := maxTokens * 4
+	if len(content) <= maxChars {
+		return content
+	}
+	cut := maxChars
+	for cut > 0 && !utf8.RuneStart(content[cut]) {
+		cut--
+	}
+	if cut <= 0 {
+		return ""
+	}
+	return strings.TrimSpace(content[:cut])
 }
 
 func (c *anthropicClient) summarizeOpenAI(ctx context.Context, model, prompt string, targetTokens int) (string, error) {
