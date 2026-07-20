@@ -1,12 +1,12 @@
 import { mkdtempSync, rmSync, writeFileSync, existsSync, mkdirSync, appendFileSync } from "node:fs";
-import { tmpdir } from "node:os";
+import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import { closeLcmConnection, createLcmDatabaseConnection } from "../src/db/connection.js";
 import { runLcmMigrations } from "../src/db/migration.js";
 import { ConversationStore } from "../src/store/conversation-store.js";
 import { SummaryStore } from "../src/store/summary-store.js";
-import { runSessionMigration } from "../src/migrate-sessions.js";
+import { defaultStateDir, runSessionMigration } from "../src/migrate-sessions.js";
 
 const roots: string[] = [];
 
@@ -375,5 +375,42 @@ describe("runSessionMigration", () => {
         expect.objectContaining({ file: expect.stringContaining("good.jsonl"), status: "imported" }),
       ]),
     );
+  });
+});
+
+describe("defaultStateDir", () => {
+  const ORIG = process.env.OPENCLAW_STATE_DIR;
+
+  afterEach(() => {
+    if (ORIG === undefined) {
+      delete process.env.OPENCLAW_STATE_DIR;
+    } else {
+      process.env.OPENCLAW_STATE_DIR = ORIG;
+    }
+  });
+
+  it("falls back to ~/.openclaw when OPENCLAW_STATE_DIR is unset", () => {
+    delete process.env.OPENCLAW_STATE_DIR;
+    expect(defaultStateDir()).toBe(join(homedir(), ".openclaw"));
+  });
+
+  it("returns OPENCLAW_STATE_DIR when set", () => {
+    process.env.OPENCLAW_STATE_DIR = "/custom/state";
+    expect(defaultStateDir()).toBe("/custom/state");
+  });
+
+  it("trims whitespace from OPENCLAW_STATE_DIR", () => {
+    process.env.OPENCLAW_STATE_DIR = "  /custom/state  ";
+    expect(defaultStateDir()).toBe("/custom/state");
+  });
+
+  it("falls back when OPENCLAW_STATE_DIR is an empty string", () => {
+    process.env.OPENCLAW_STATE_DIR = "";
+    expect(defaultStateDir()).toBe(join(homedir(), ".openclaw"));
+  });
+
+  it("falls back when OPENCLAW_STATE_DIR is whitespace only", () => {
+    process.env.OPENCLAW_STATE_DIR = "   ";
+    expect(defaultStateDir()).toBe(join(homedir(), ".openclaw"));
   });
 });
