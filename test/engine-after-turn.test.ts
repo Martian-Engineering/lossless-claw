@@ -848,7 +848,7 @@ describe("LcmContextEngine afterTurn", () => {
     });
   });
 
-  it("afterTurn falls back to local message token estimates when runtimeContext.currentTokenCount is absent", async () => {
+  it("afterTurn falls back to context_items token count when runtimeContext.currentTokenCount is absent", async () => {
     const engine = createEngine();
     const sessionId = "after-turn-local-current-token-count-fallback";
     const privateEngine = engine as unknown as {
@@ -869,9 +869,14 @@ describe("LcmContextEngine afterTurn", () => {
     });
 
     const turnMessage = makeMessage({ role: "assistant", content: "tiny" });
+    const sessionFile = createSessionFilePath("after-turn-local-current-token-count-fallback");
+    writeLeafTranscript(sessionFile, [
+      { role: "user", content: "seed" },
+    ]);
+
     await engine.afterTurn({
       sessionId,
-      sessionFile: createSessionFilePath("after-turn-local-current-token-count-fallback"),
+      sessionFile,
       messages: [turnMessage],
       prePromptMessageCount: 0,
       tokenBudget: 4_096,
@@ -881,11 +886,15 @@ describe("LcmContextEngine afterTurn", () => {
       },
     });
 
-    // Local estimates use full-message serialization so structured payloads count.
+    const conversation = await engine.getConversationStore().getConversationBySessionId(sessionId);
+    expect(conversation).not.toBeNull();
+    const ctxTokenCount = await engine.getSummaryStore().getContextTokenCount(conversation!.conversationId);
+
+    // Uses context_items token count (from DB), not serialized estimate from all messages.
     expect(evaluateSpy).toHaveBeenCalledWith(
       expect.any(Number),
       4_096,
-      estimateSerializedMessageTokens(turnMessage),
+      ctxTokenCount,
       { contextThreshold: 0.75 },
     );
   });
