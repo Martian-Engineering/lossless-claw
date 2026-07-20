@@ -3201,7 +3201,15 @@ export class LcmContextEngine implements ContextEngine {
       );
     }
 
-    const estimatedContextTokens = estimateSessionTokenCountForAfterTurn(params.messages);
+    const conversation = await this.conversationStore.getConversationForSession({
+      sessionId: params.sessionId,
+      sessionKey: params.sessionKey,
+    });
+    const contextItemsTokenCount = conversation
+      ? await this.summaryStore.getContextTokenCount(conversation.conversationId)
+      : undefined;
+    const estimatedContextTokens =
+      contextItemsTokenCount ?? estimateSessionTokenCountForAfterTurn(params.messages);
     const runtimePromptTokens = extractRuntimePromptTokenCount(asRecord(params.runtimeContext));
     const suppliedCurrentTokenCount = this.normalizeObservedTokenCount(
       params.currentTokenCount ??
@@ -3215,13 +3223,9 @@ export class LcmContextEngine implements ContextEngine {
       runtimePromptTokens ?? suppliedCurrentTokenCount ?? estimatedContextTokens;
     if (runtimePromptTokens !== undefined) {
       this.deps.log.debug(
-        `[lcm] afterTurn: using runtime prompt token count currentTokenCount=${runtimePromptTokens} estimatedTokenCount=${estimatedContextTokens}`,
+        `[lcm] afterTurn: using runtime prompt token count currentTokenCount=${runtimePromptTokens} contextItemsTokenCount=${contextItemsTokenCount} estimatedTokenCount=${estimatedContextTokens}`,
       );
     }
-    const conversation = await this.conversationStore.getConversationForSession({
-      sessionId: params.sessionId,
-      sessionKey: params.sessionKey,
-    });
     if (!conversation) {
       this.deps.log.debug(
         `[lcm] afterTurn: conversation lookup missed ${sessionLabel} ingestBatch=${ingestBatch.length} duration=${formatDurationMs(Date.now() - startedAt)}`,
