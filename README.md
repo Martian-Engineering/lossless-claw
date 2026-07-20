@@ -354,7 +354,7 @@ LCM_SUMMARY_MODEL=openai/gpt-5.4-mini
 LCM_EXPANSION_MODEL=openai/gpt-5.4-mini
 ```
 
-- **freshTailCount=64** protects the last 64 messages from compaction, giving the model more recent context for continuity.
+- **freshTailCount=64** protects the last 64 messages from compaction, expanding through the newest user when needed so its assistant/tool suffix cannot be separated from the active instruction.
 - **leafChunkTokens=20000** limits how large each leaf compaction chunk can grow before LCM summarizes it. Increase this when your summary provider is quota-limited and frequent leaf compactions are exhausting that quota.
 - **incrementalMaxDepth=1** runs one condensed pass after each leaf compaction by default. Set to `0` for leaf-only behavior, a larger positive integer for a deeper cap, or `-1` for unlimited cascading.
 - **contextThreshold=0.75** triggers compaction when context reaches 75% of the model's window, leaving headroom for the model's response.

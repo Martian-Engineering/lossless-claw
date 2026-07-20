@@ -1280,9 +1280,12 @@ function resolveFreshTailOrdinal(
   let protectedCount = 0;
   let protectedTokens = 0;
   let tailStartOrdinal = Infinity;
+  const latestUserOrdinal = rawMessages.findLast((item) => item.sourceRole === "user")?.ordinal;
 
   for (let idx = rawMessages.length - 1; idx >= 0; idx--) {
-    if (protectedCount >= freshTailCount) {
+    const latestUserProtected =
+      latestUserOrdinal === undefined || tailStartOrdinal <= latestUserOrdinal;
+    if (latestUserProtected && protectedCount >= freshTailCount) {
       break;
     }
 
@@ -1292,6 +1295,7 @@ function resolveFreshTailOrdinal(
     }
 
     const wouldExceedBudget =
+      latestUserProtected &&
       protectedCount > 0 &&
       typeof tokenCap === "number" &&
       protectedTokens + item.tokens > tokenCap;

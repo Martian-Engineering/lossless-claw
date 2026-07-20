@@ -132,7 +132,7 @@ The fresh tail:
 - is always included during assembly
 - is excluded from leaf summarization
 - may be capped by `freshTailMaxTokens`
-- still preserves the newest message even when that one message exceeds the cap
+- expands through the newest user message when count or token limits would split its assistant/tool suffix
 
 Relevant code:
 
@@ -164,8 +164,8 @@ That policy is removed from automatic scheduling. The important reason is not th
 | --- | --- |
 | `contextThreshold` | The only automatic compaction trigger. |
 | `proactiveThresholdCompactionMode` | Chooses inline vs deferred threshold full sweep. |
-| `freshTailCount` | Protects newest raw messages during assembly and compaction. |
-| `freshTailMaxTokens` | Optional cap for protected fresh-tail size. |
+| `freshTailCount` | Protects newest raw messages during assembly and compaction, expanding through the newest user when needed. |
+| `freshTailMaxTokens` | Optional cap for protected fresh-tail size; the newest user-led suffix may exceed it. |
 | `leafChunkTokens` | Maximum raw material per leaf summary during sweep; default remains 20k. |
 | `leafMinFanout` | Minimum raw-message or depth-0 summary fanout for useful compaction. |
 | `condensedMinFanout` | Normal same-depth condensation grouping for depth 1+. |

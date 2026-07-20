@@ -58,7 +58,7 @@ export interface CompactionConfig {
   contextThreshold: number;
   /** Number of fresh tail turns to protect (default 8) */
   freshTailCount: number;
-  /** Optional token cap for the protected fresh tail; newest message is always preserved. */
+  /** Optional token cap for the protected fresh tail; the newest user-led suffix is preserved. */
   freshTailMaxTokens?: number;
   /** Minimum number of depth-0 summaries needed for condensation. */
   leafMinFanout: number;
@@ -1470,9 +1470,12 @@ export class CompactionEngine {
     let protectedCount = 0;
     let protectedTokens = 0;
     let tailStartOrdinal = Infinity;
+    const latestUserOrdinal = await this.resolveLatestRawUserOrdinal(rawMessageItems);
 
     for (let idx = rawMessageItems.length - 1; idx >= 0; idx--) {
-      if (protectedCount >= freshTailCount) {
+      const latestUserProtected =
+        latestUserOrdinal === undefined || tailStartOrdinal <= latestUserOrdinal;
+      if (latestUserProtected && protectedCount >= freshTailCount) {
         break;
       }
 
@@ -1483,6 +1486,7 @@ export class CompactionEngine {
 
       const messageTokens = await this.getMessageTokenCount(item.messageId);
       const wouldExceedBudget =
+        latestUserProtected &&
         protectedCount > 0 &&
         typeof freshTailMaxTokens === "number" &&
         protectedTokens + messageTokens > freshTailMaxTokens;
@@ -1496,6 +1500,23 @@ export class CompactionEngine {
     }
 
     return tailStartOrdinal;
+  }
+
+  /** Find the newest raw user ordinal so fresh-tail limits cannot split its turn. */
+  private async resolveLatestRawUserOrdinal(
+    rawMessageItems: ContextItemRecord[],
+  ): Promise<number | undefined> {
+    for (let idx = rawMessageItems.length - 1; idx >= 0; idx--) {
+      const item = rawMessageItems[idx];
+      if (!item?.messageId) {
+        continue;
+      }
+      const message = await this.conversationStore.getMessageById(item.messageId);
+      if (message?.role === "user") {
+        return item.ordinal;
+      }
+    }
+    return undefined;
   }
 
   /** Resolve message token count with a content-length fallback. */

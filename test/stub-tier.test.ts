@@ -47,6 +47,8 @@ interface SeedToolMsg {
   payload: string;
   /** When true, externalize the payload to large_files and store fileId in large_content. */
   externalize?: boolean;
+  /** When true, start a later user turn before this tool call. */
+  startsNewTurn?: boolean;
 }
 
 function seedConversation(
@@ -72,6 +74,15 @@ function seedConversation(
   ).run(conversationId, seq);
 
   for (const tm of toolMessages) {
+    if (tm.startsNewTurn) {
+      db.prepare(
+        `INSERT INTO messages (conversation_id, seq, role, content, token_count) VALUES (?, ?, 'user', ?, ?)`,
+      ).run(conversationId, seq++, `continue with ${tm.toolCallId}`, 4);
+      db.prepare(
+        `INSERT INTO context_items (conversation_id, ordinal, item_type, message_id) VALUES (?, ?, 'message', last_insert_rowid())`,
+      ).run(conversationId, seq);
+    }
+
     // assistant tool_use
     const assistantContent = JSON.stringify([
       { type: "tool_use", id: tm.toolCallId, name: tm.toolName, input: { q: "x" } },
@@ -181,8 +192,8 @@ describe("stub-tier stratification", () => {
       { toolCallId: "call-3", toolName: "Bash", payload: bigPayload("B3", 32), externalize: true },
       { toolCallId: "call-4", toolName: "Edit", payload: "ok", externalize: false },
       { toolCallId: "call-5", toolName: "Grep", payload: bigPayload("G5", 8), externalize: true },
-      // Final entry — will land in the fresh tail (freshTailCount=2 below).
-      { toolCallId: "call-6", toolName: "Read", payload: bigPayload("R6", 24), externalize: true },
+      // The new user boundary makes this pair the protected current turn.
+      { toolCallId: "call-6", toolName: "Read", payload: bigPayload("R6", 24), externalize: true, startsNewTurn: true },
     ]);
 
     const conversationStore = new ConversationStore(db);
@@ -390,10 +401,10 @@ describe("stub-tier drilldown round-trip", () => {
     const originalPayload = bigPayload("END-TO-END", 20);
     const { fileIds } = seedConversation(db, storageDir, [
       { toolCallId: "drill-1", toolName: "Read", payload: originalPayload, externalize: true },
-      // Push the externalized result outside the fresh tail so it gets stubbed.
       { toolCallId: "filler-1", toolName: "Read", payload: "ok", externalize: false },
       { toolCallId: "filler-2", toolName: "Read", payload: "ok", externalize: false },
-      { toolCallId: "filler-3", toolName: "Read", payload: "ok", externalize: false },
+      // Start a later protected turn so drill-1 remains evictable.
+      { toolCallId: "filler-3", toolName: "Read", payload: "ok", externalize: false, startsNewTurn: true },
     ]);
 
     const conversationStore = new ConversationStore(db);
