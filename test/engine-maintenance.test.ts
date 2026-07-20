@@ -1709,6 +1709,18 @@ describe("LcmContextEngine maintain and assemble budget", () => {
     const conversation = await engine.getConversationStore().getOrCreateConversation(sessionId, {
       sessionKey: undefined,
     });
+    const [storedMessage] = await engine.getConversationStore().createMessagesBulk([
+      {
+        conversationId: conversation.conversationId,
+        seq: 0,
+        role: "user",
+        content: "stored context requiring emergency drain",
+        tokenCount: 90,
+      },
+    ]);
+    await engine
+      .getSummaryStore()
+      .appendContextMessages(conversation.conversationId, [storedMessage.messageId]);
     await engine.getCompactionMaintenanceStore().requestProactiveCompactionDebt({
       conversationId: conversation.conversationId,
       reason: "threshold",
