@@ -1026,6 +1026,10 @@ describe("LcmContextEngine maintain and assemble budget", () => {
       "current delivery turn",
     ]);
     expect(assembleResult.estimatedTokens).toBeLessThanOrEqual(100);
+    expect(assembleResult).toHaveProperty(
+      "promptAuthority",
+      "preassembly_may_overflow",
+    );
     expect(log.warn).toHaveBeenCalledWith(
       expect.stringContaining("[lcm] assemble: degraded live fallback"),
     );
@@ -1180,6 +1184,10 @@ describe("LcmContextEngine maintain and assemble budget", () => {
       "critical runtime policy",
       "current delivery turn",
     ]);
+    expect(assembleResult).toHaveProperty(
+      "promptAuthority",
+      "preassembly_may_overflow",
+    );
     const maintenance = await engine
       .getCompactionMaintenanceStore()
       .getConversationCompactionMaintenance(conversation.conversationId);
@@ -1316,6 +1324,10 @@ describe("LcmContextEngine maintain and assemble budget", () => {
     expect(assembleResult.messages.map((message) => message.content)).toEqual([
       "current emergency turn",
     ]);
+    expect(assembleResult).toHaveProperty(
+      "promptAuthority",
+      "preassembly_may_overflow",
+    );
     expect(log.warn).toHaveBeenCalledWith(
       expect.stringContaining(
         "[lcm] assemble: emergency deferred compaction debt draining pre-assembly",

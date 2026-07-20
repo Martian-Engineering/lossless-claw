@@ -36,6 +36,8 @@ export type ContextEngineProjection = {
 export type AssembleResult = {
   messages: AgentMessage[];
   estimatedTokens: number;
+  /** Ask OpenClaw to include pre-assembly history in its overflow precheck. */
+  promptAuthority?: "assembled" | "preassembly_may_overflow";
   systemPromptAddition?: string;
   contextProjection?: ContextEngineProjection;
 };
