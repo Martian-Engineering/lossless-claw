@@ -3,12 +3,16 @@ package main
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
 func TestResolveOpenclawStateDirDefaultsToDotOpenclaw(t *testing.T) {
 	t.Setenv("OPENCLAW_STATE_DIR", "")
-	dir := resolveOpenclawStateDir()
+	dir, err := resolveOpenclawStateDir()
+	if err != nil {
+		t.Fatalf("resolveOpenclawStateDir: %v", err)
+	}
 	home, err := os.UserHomeDir()
 	if err != nil {
 		t.Fatalf("UserHomeDir: %v", err)
@@ -21,9 +25,34 @@ func TestResolveOpenclawStateDirDefaultsToDotOpenclaw(t *testing.T) {
 
 func TestResolveOpenclawStateDirUsesEnvVar(t *testing.T) {
 	t.Setenv("OPENCLAW_STATE_DIR", "/custom/state")
-	dir := resolveOpenclawStateDir()
+	dir, err := resolveOpenclawStateDir()
+	if err != nil {
+		t.Fatalf("resolveOpenclawStateDir: %v", err)
+	}
 	if dir != "/custom/state" {
 		t.Fatalf("expected /custom/state, got %q", dir)
+	}
+}
+
+func TestResolveOpenclawStateDirTrimsWhitespace(t *testing.T) {
+	t.Setenv("OPENCLAW_STATE_DIR", "  /custom/state  ")
+	dir, err := resolveOpenclawStateDir()
+	if err != nil {
+		t.Fatalf("resolveOpenclawStateDir: %v", err)
+	}
+	if dir != "/custom/state" {
+		t.Fatalf("expected /custom/state, got %q", dir)
+	}
+}
+
+func TestResolveOpenclawStateDirFallsBackOnWhitespaceOnly(t *testing.T) {
+	t.Setenv("OPENCLAW_STATE_DIR", "   ")
+	dir, err := resolveOpenclawStateDir()
+	if err != nil {
+		t.Fatalf("resolveOpenclawStateDir: %v", err)
+	}
+	if strings.HasPrefix(dir, "/") {
+		t.Fatalf("expected fallback path starting with home, got absolute %q", dir)
 	}
 }
 
