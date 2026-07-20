@@ -35,8 +35,13 @@ const getArg = (n) => {
 };
 const hasFlag = (n) => args.includes(`--${n}`);
 
-const logPath = getArg("log") ?? join(homedir(), ".openclaw", "logs", "gateway.log");
-const dbPath = getArg("db") ?? join(homedir(), ".openclaw", "lcm.db");
+function resolveOpenclawDir() {
+  const explicit = process.env.OPENCLAW_STATE_DIR?.trim();
+  return explicit || join(homedir(), ".openclaw");
+}
+
+const logPath = getArg("log") ?? join(resolveOpenclawDir(), "logs", "gateway.log");
+const dbPath = getArg("db") ?? join(resolveOpenclawDir(), "lcm.db");
 const snapshotSecs = Number(getArg("snapshot-secs") ?? 30);
 const quiet = hasFlag("quiet");
 

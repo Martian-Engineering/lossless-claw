@@ -21,6 +21,7 @@
 
 import { existsSync, statSync } from "node:fs";
 import { homedir } from "node:os";
+import { join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 
 const args = process.argv.slice(2);
@@ -48,6 +49,11 @@ if (!existsSync(dbPath)) {
 }
 const log = (msg) => { if (verbose) console.error(`[bench] ${msg}`); };
 
+function resolveOpenclawDir() {
+  const explicit = process.env.OPENCLAW_STATE_DIR?.trim();
+  return explicit || join(homedir(), ".openclaw");
+}
+
 const cwd = process.cwd();
 const repoRootHint = `Run from repo root (cwd has src/db/migration.ts). Current cwd: ${cwd}`;
 if (!existsSync(`${cwd}/src/db/migration.ts`)) {
@@ -70,7 +76,7 @@ const { LcmContextEngine } = await import(`${cwd}/src/engine.ts`);
 const config = {
   enabled: true,
   databasePath: dbPath,
-  largeFilesDir: `${homedir()}/.openclaw/lcm-files`,
+  largeFilesDir: join(resolveOpenclawDir(), "lcm-files"),
   ignoreSessionPatterns: [],
   statelessSessionPatterns: [],
   skipStatelessSessions: false,

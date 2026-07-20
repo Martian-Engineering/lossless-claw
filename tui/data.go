@@ -207,12 +207,23 @@ type lineMessage struct {
 	Timestamp any             `json:"timestamp"`
 }
 
-func resolveDataPaths() (appDataPaths, error) {
+func resolveOpenclawStateDir() (string, error) {
+	d := strings.TrimSpace(os.Getenv("OPENCLAW_STATE_DIR"))
+	if d != "" {
+		return d, nil
+	}
 	home, err := os.UserHomeDir()
 	if err != nil {
-		return appDataPaths{}, fmt.Errorf("resolve home dir: %w", err)
+		return "", fmt.Errorf("resolve home dir: %w", err)
 	}
-	base := filepath.Join(home, ".openclaw")
+	return filepath.Join(home, ".openclaw"), nil
+}
+
+func resolveDataPaths() (appDataPaths, error) {
+	base, err := resolveOpenclawStateDir()
+	if err != nil {
+		return appDataPaths{}, err
+	}
 	return appDataPaths{
 		agentsDir:        filepath.Join(base, "agents"),
 		lcmDBPath:        filepath.Join(base, "lcm.db"),
