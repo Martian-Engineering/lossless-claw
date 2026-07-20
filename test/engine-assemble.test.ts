@@ -93,6 +93,7 @@ describe("LcmContextEngine.assemble canonical path", () => {
       mode: "thread_bootstrap",
       epoch: expect.stringMatching(/^summary-prefix-v1:\d+:[a-f0-9]{32}$/),
     });
+    expect(result).not.toHaveProperty("promptAuthority");
   });
 
   async function seedPromptRecallFixture(params: {

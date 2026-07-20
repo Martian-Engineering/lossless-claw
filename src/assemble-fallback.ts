@@ -180,6 +180,7 @@ export function buildDegradedLiveAssembleResult(params: {
   return {
     messages,
     estimatedTokens: estimateAgentMessageTokens(messages),
+    promptAuthority: "preassembly_may_overflow",
   };
 }
 
