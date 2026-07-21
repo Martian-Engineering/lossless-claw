@@ -10,6 +10,7 @@ import type { DatabaseSync } from "node:sqlite";
 import type {
   AssembleResult,
   ContextEngine,
+  ContextEngineControlOperation,
   ContextEngineFactory,
   OpenClawPluginApi,
 } from "../openclaw-bridge.js";
@@ -1738,18 +1739,18 @@ function wirePluginHandlers(
       required: ["operation"],
     },
     handler: async (ctx) => {
-      const operation = ctx.payload?.operation;
-      if (operation !== "status" && operation !== "doctor" && operation !== "rotate") {
-        return { ok: false, error: `unsupported operation: ${String(operation)}`, code: "unsupported_operation" };
-      }
+      // Operation validation is left to normalizeControlOperation() inside
+      // control(); it already throws LcmProgrammaticControlUnavailableError
+      // with a structured reasonCode. Duplicating it here would shadow that.
       try {
         const engine = await shared.waitForEngine();
+        const operation = ctx.payload?.operation as ContextEngineControlOperation;
         return { ok: true, result: await engine.control({ operation, sessionKey: ctx.sessionKey }) };
       } catch (err) {
         return {
           ok: false,
           error: err instanceof Error ? err.message : String(err),
-          code: (err as { reason?: string })?.reason ?? "unavailable",
+          code: (err as { reasonCode?: string })?.reasonCode ?? "unavailable",
         };
       }
     },
