@@ -11,6 +11,7 @@ import { estimateTokens } from "../src/estimate-tokens.js";
 import { formatFileReference } from "../src/large-files.js";
 import type { AgentMessage } from "../src/openclaw-bridge.js";
 import { buildMessageIdentityHash } from "../src/store/message-identity.js";
+import { attachTranscriptEntryMeta } from "../src/transcript.js";
 import {
   cleanupEngineTestState,
   firstCompleteCall,
@@ -624,6 +625,83 @@ describe("LcmContextEngine afterTurn dedup guard", () => {
       "last D",
       "old B",
       "new E",
+    ]);
+    // Partial overlap is ambiguous without the transcript. Re-ingesting the
+    // known row is intentional: duplicates are safer than dropping new E.
+    expect(afterPartialOverlap.filter((message) => message.content === "old B")).toHaveLength(2);
+  });
+
+  it("fails open when a missing-transcript replay only has re-stamped envelope timestamps", async () => {
+    const engine = createEngine();
+    const sessionId = "dedup-missing-transcript-envelope-timestamp";
+    const firstTimestamp = Date.UTC(2026, 0, 1, 0, 0, 1);
+    const secondTimestamp = Date.UTC(2026, 0, 1, 0, 0, 2);
+
+    await engine.afterTurn({
+      sessionId,
+      sessionFile: createSessionFilePath("dedup-missing-transcript-envelope-timestamp"),
+      messages: [
+        { role: "user", content: "old A", timestamp: firstTimestamp - 1000 } as AgentMessage,
+        { role: "assistant", content: "old B", timestamp: firstTimestamp } as AgentMessage,
+        { role: "user", content: "old C", timestamp: secondTimestamp } as AgentMessage,
+      ],
+      prePromptMessageCount: 0,
+      tokenBudget: 4096,
+    });
+
+    await engine.afterTurn({
+      sessionId,
+      sessionFile: createSessionFilePath("dedup-missing-transcript-envelope-timestamp-summary"),
+      messages: [
+        { role: "user", content: "old A", timestamp: firstTimestamp - 1000 } as AgentMessage,
+        { role: "assistant", content: "old B", timestamp: firstTimestamp } as AgentMessage,
+        { role: "user", content: "old C", timestamp: secondTimestamp } as AgentMessage,
+        {
+          role: "assistant",
+          content: "last D",
+          timestamp: secondTimestamp + 2000,
+        } as AgentMessage,
+      ],
+      prePromptMessageCount: 0,
+      tokenBudget: 4096,
+      autoCompactionSummary: "[summary] compacted older context",
+    });
+
+    await engine.afterTurn({
+      sessionId,
+      sessionFile: createSessionFilePath("dedup-missing-transcript-envelope-timestamp-replay"),
+      messages: [
+        attachTranscriptEntryMeta(
+          { role: "assistant", content: "old B" } as AgentMessage,
+          {
+            entryId: "restamped-old-b",
+            parentId: null,
+            timestamp: new Date(firstTimestamp).toISOString(),
+          },
+        ),
+        attachTranscriptEntryMeta(
+          { role: "assistant", content: "last D" } as AgentMessage,
+          {
+            entryId: "restamped-last-d",
+            parentId: "restamped-old-b",
+            timestamp: new Date(secondTimestamp + 2000).toISOString(),
+          },
+        ),
+      ],
+      prePromptMessageCount: 0,
+      tokenBudget: 4096,
+    });
+
+    const conversation = await engine.getConversationStore().getConversationBySessionId(sessionId);
+    const stored = await engine.getConversationStore().getMessages(conversation!.conversationId);
+    expect(stored.map((message) => message.content)).toEqual([
+      "old A",
+      "old B",
+      "old C",
+      "[summary] compacted older context",
+      "last D",
+      "old B",
+      "last D",
     ]);
   });
 

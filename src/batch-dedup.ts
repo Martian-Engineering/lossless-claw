@@ -33,7 +33,7 @@ import {
   extractToolPairingIdFromRecord,
   extractToolResultIdForPairing,
 } from "./tool-pairing.js";
-import { resolveTranscriptMessageCreatedAt } from "./transcript.js";
+import { resolveTranscriptMessageInnerTimestamp } from "./transcript.js";
 import type { LcmDependencies } from "./types.js";
 
 type RedactSensitiveText = (content: string) => string;
@@ -373,7 +373,12 @@ export class BatchDeduplicator {
     });
     if (!conversation) return batch;
 
-    if (await this.batchIsFullyPersistedAtDistinctSourceTimes(conversation.conversationId, batch)) {
+    if (
+      await this.batchIsFullyPersistedAtDistinctSourceSeconds(
+        conversation.conversationId,
+        batch,
+      )
+    ) {
       this.deps.log.debug(
         `[lcm] afterTurn: transcript unavailable with preserved checkpoint; skipping fully persisted runtime replay conversation=${conversation.conversationId} batchLen=${batch.length}`,
       );
@@ -385,24 +390,28 @@ export class BatchDeduplicator {
   }
 
   /**
-   * Prove that every runtime row is already stored at its original source
-   * timestamp. Repeated rows within the same second are ambiguous because the
-   * store truncates timestamps to seconds, so they deliberately fail open.
+   * Prove that every runtime row is already stored at its inner source-time
+   * second. Envelope timestamps are re-stamped on append and therefore fail
+   * open. Repeated rows within one second also fail open because the store
+   * truncates timestamps to seconds.
    */
-  private async batchIsFullyPersistedAtDistinctSourceTimes(
+  private async batchIsFullyPersistedAtDistinctSourceSeconds(
     conversationId: number,
     batch: AgentMessage[],
   ): Promise<boolean> {
-    const claimedSourceTimes = new Set<string>();
+    const claimedSourceSeconds = new Set<string>();
     for (const message of batch) {
-      const createdAt = resolveTranscriptMessageCreatedAt(message);
-      const parsedCreatedAt = createdAt instanceof Date ? createdAt : new Date(createdAt ?? "");
+      const innerTimestamp = resolveTranscriptMessageInnerTimestamp(message);
+      if (innerTimestamp === null) return false;
+      const createdAt =
+        typeof innerTimestamp === "number" ? new Date(innerTimestamp) : innerTimestamp;
+      const parsedCreatedAt = createdAt instanceof Date ? createdAt : new Date(createdAt);
       if (!Number.isFinite(parsedCreatedAt.getTime())) return false;
 
       const stored = toStoredMessage(message);
       const sourceTimeKey = parsedCreatedAt.toISOString().slice(0, 19);
-      if (claimedSourceTimes.has(sourceTimeKey)) return false;
-      claimedSourceTimes.add(sourceTimeKey);
+      if (claimedSourceSeconds.has(sourceTimeKey)) return false;
+      claimedSourceSeconds.add(sourceTimeKey);
       if (
         !(await this.conversationStore.hasPersistedIdentityAtCreatedAtSecond(
           conversationId,

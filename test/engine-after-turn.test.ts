@@ -1497,7 +1497,7 @@ describe("LcmContextEngine afterTurn", () => {
   it("distinguishes missing transcripts with and without a preserved checkpoint", async () => {
     const engine = createEngine();
     const sessionId = "after-turn-missing-transcript-checkpoint-proof";
-    await engine.getConversationStore().getOrCreateConversation(sessionId);
+    const conversation = await engine.getConversationStore().getOrCreateConversation(sessionId);
 
     const withoutCheckpoint = await engine
       .getTranscriptReconciler()
@@ -1508,11 +1508,22 @@ describe("LcmContextEngine afterTurn", () => {
     expect(withoutCheckpoint.transcriptCovered).toBeUndefined();
     expect(withoutCheckpoint.transcriptUnavailableWithCheckpoint).toBeUndefined();
 
+    const withCheckpointSessionFile = createSessionFilePath(
+      "missing-transcript-with-checkpoint",
+    );
+    await engine.getSummaryStore().upsertConversationBootstrapState({
+      conversationId: conversation.conversationId,
+      sessionFilePath: withCheckpointSessionFile,
+      lastSeenSize: 512,
+      lastSeenMtimeMs: 1_700_000_000_000,
+      lastProcessedOffset: 512,
+      lastProcessedEntryHash: "preserved-checkpoint-hash",
+    });
     const withCheckpoint = await engine
       .getTranscriptReconciler()
       .reconcileTranscriptTailForAfterTurn({
         sessionId,
-        sessionFile: createSessionFilePath("missing-transcript-with-checkpoint"),
+        sessionFile: withCheckpointSessionFile,
       });
     expect(withCheckpoint.transcriptCovered).toBeUndefined();
     expect(withCheckpoint.transcriptUnavailableWithCheckpoint).toBe(true);
