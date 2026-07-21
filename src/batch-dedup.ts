@@ -33,7 +33,7 @@ import {
   extractToolPairingIdFromRecord,
   extractToolResultIdForPairing,
 } from "./tool-pairing.js";
-import { resolveTranscriptMessageInnerTimestamp } from "./transcript.js";
+import { getTranscriptEntryId } from "./transcript.js";
 import type { LcmDependencies } from "./types.js";
 
 type RedactSensitiveText = (content: string) => string;
@@ -355,10 +355,10 @@ export class BatchDeduplicator {
   }
 
   /**
-   * Remove an exact full replay when the transcript is unavailable but its
-   * checkpoint was preserved. Any batch that is not fully persisted returns
-   * to the degraded deduplicator, which prefers duplicates over dropping an
-   * ambiguous genuinely new row.
+   * Remove a full replay with already-persisted transcript identities when the
+   * transcript is unavailable but its checkpoint was preserved. Batches
+   * without complete identity proof retain the established degraded dedup
+   * behavior; this path adds no timestamp-based reason to drop them.
    */
   async deduplicateAfterTurnBatchAgainstPreservedCheckpoint(
     sessionId: string,
@@ -374,7 +374,7 @@ export class BatchDeduplicator {
     if (!conversation) return batch;
 
     if (
-      await this.batchIsFullyPersistedAtDistinctSourceSeconds(
+      await this.batchIsFullyPersistedByTranscriptEntryId(
         conversation.conversationId,
         batch,
       )
@@ -390,36 +390,19 @@ export class BatchDeduplicator {
   }
 
   /**
-   * Prove that every runtime row is already stored at its inner source-time
-   * second. Envelope timestamps are re-stamped on append and therefore fail
-   * open. Repeated rows within one second also fail open because the store
-   * truncates timestamps to seconds.
+   * Prove that every runtime row carries a canonical transcript entry id that
+   * is already persisted. Missing or unfamiliar ids fail open because content
+   * and second-truncated timestamps cannot distinguish a replay from a
+   * genuinely new same-second repeat.
    */
-  private async batchIsFullyPersistedAtDistinctSourceSeconds(
+  private async batchIsFullyPersistedByTranscriptEntryId(
     conversationId: number,
     batch: AgentMessage[],
   ): Promise<boolean> {
-    const claimedSourceSeconds = new Set<string>();
     for (const message of batch) {
-      const innerTimestamp = resolveTranscriptMessageInnerTimestamp(message);
-      if (innerTimestamp === null) return false;
-      const createdAt =
-        typeof innerTimestamp === "number" ? new Date(innerTimestamp) : innerTimestamp;
-      const parsedCreatedAt = createdAt instanceof Date ? createdAt : new Date(createdAt);
-      if (!Number.isFinite(parsedCreatedAt.getTime())) return false;
-
-      const stored = toStoredMessage(message);
-      const sourceTimeKey = parsedCreatedAt.toISOString().slice(0, 19);
-      if (claimedSourceSeconds.has(sourceTimeKey)) return false;
-      claimedSourceSeconds.add(sourceTimeKey);
-      if (
-        !(await this.conversationStore.hasPersistedIdentityAtCreatedAtSecond(
-          conversationId,
-          stored.role,
-          stored.content,
-          createdAt,
-        ))
-      ) {
+      const entryId = getTranscriptEntryId(message);
+      if (!entryId) return false;
+      if (!(await this.conversationStore.hasMessageByTranscriptEntryId(conversationId, entryId))) {
         return false;
       }
     }

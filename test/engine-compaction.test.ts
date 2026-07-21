@@ -550,14 +550,37 @@ describe("LcmContextEngine afterTurn dedup guard", () => {
     const sessionId = "dedup-oversized-no-overlap-all-persisted";
     const oldBTimestamp = Date.UTC(2026, 0, 1, 0, 0, 1);
     const lastDTimestamp = Date.UTC(2026, 0, 1, 0, 0, 4);
+    const messageWithEntryId = (
+      role: "user" | "assistant",
+      content: string,
+      timestamp: number,
+      entryId: string,
+      parentId: string | null,
+    ): AgentMessage =>
+      attachTranscriptEntryMeta(
+        { role, content, timestamp } as AgentMessage,
+        { entryId, parentId, timestamp: new Date(timestamp).toISOString() },
+      );
 
     await engine.afterTurn({
       sessionId,
       sessionFile: createSessionFilePath("dedup-oversized-no-overlap-all-persisted"),
       messages: [
-        { role: "user", content: "old A", timestamp: Date.UTC(2026, 0, 1, 0, 0, 0) } as AgentMessage,
-        { role: "assistant", content: "old B", timestamp: oldBTimestamp } as AgentMessage,
-        { role: "user", content: "old C", timestamp: Date.UTC(2026, 0, 1, 0, 0, 2) } as AgentMessage,
+        messageWithEntryId(
+          "user",
+          "old A",
+          Date.UTC(2026, 0, 1, 0, 0, 0),
+          "old-a",
+          null,
+        ),
+        messageWithEntryId("assistant", "old B", oldBTimestamp, "old-b", "old-a"),
+        messageWithEntryId(
+          "user",
+          "old C",
+          Date.UTC(2026, 0, 1, 0, 0, 2),
+          "old-c",
+          "old-b",
+        ),
       ],
       prePromptMessageCount: 0,
       tokenBudget: 4096,
@@ -567,10 +590,22 @@ describe("LcmContextEngine afterTurn dedup guard", () => {
       sessionId,
       sessionFile: createSessionFilePath("dedup-oversized-no-overlap-all-persisted-summary"),
       messages: [
-        { role: "user", content: "old A", timestamp: Date.UTC(2026, 0, 1, 0, 0, 0) } as AgentMessage,
-        { role: "assistant", content: "old B", timestamp: oldBTimestamp } as AgentMessage,
-        { role: "user", content: "old C", timestamp: Date.UTC(2026, 0, 1, 0, 0, 2) } as AgentMessage,
-        { role: "assistant", content: "last D", timestamp: lastDTimestamp } as AgentMessage,
+        messageWithEntryId(
+          "user",
+          "old A",
+          Date.UTC(2026, 0, 1, 0, 0, 0),
+          "old-a",
+          null,
+        ),
+        messageWithEntryId("assistant", "old B", oldBTimestamp, "old-b", "old-a"),
+        messageWithEntryId(
+          "user",
+          "old C",
+          Date.UTC(2026, 0, 1, 0, 0, 2),
+          "old-c",
+          "old-b",
+        ),
+        messageWithEntryId("assistant", "last D", lastDTimestamp, "last-d", "old-c"),
       ],
       prePromptMessageCount: 0,
       tokenBudget: 4096,
@@ -583,8 +618,8 @@ describe("LcmContextEngine afterTurn dedup guard", () => {
       sessionId,
       sessionFile: createSessionFilePath("dedup-oversized-no-overlap-all-persisted-2"),
       messages: [
-        { role: "assistant", content: "old B", timestamp: oldBTimestamp } as AgentMessage,
-        { role: "assistant", content: "last D", timestamp: lastDTimestamp } as AgentMessage,
+        messageWithEntryId("assistant", "old B", oldBTimestamp, "old-b", "old-a"),
+        messageWithEntryId("assistant", "last D", lastDTimestamp, "last-d", "old-c"),
       ],
       prePromptMessageCount: 0,
       tokenBudget: 4096,
@@ -603,13 +638,29 @@ describe("LcmContextEngine afterTurn dedup guard", () => {
       "last D",
     ]);
 
+    const partialBatch = [
+      messageWithEntryId("assistant", "old B", oldBTimestamp, "old-b", "old-a"),
+      messageWithEntryId(
+        "assistant",
+        "new E",
+        Date.UTC(2026, 0, 1, 0, 0, 5),
+        "new-e",
+        "last-d",
+      ),
+    ];
+    const partialDeduped = await engine
+      .getBatchDeduplicator()
+      .deduplicateAfterTurnBatchAgainstPreservedCheckpoint(
+        sessionId,
+        undefined,
+        partialBatch,
+      );
+    expect(partialDeduped).toEqual(partialBatch);
+
     await engine.afterTurn({
       sessionId,
       sessionFile: createSessionFilePath("dedup-oversized-no-overlap-partial-live"),
-      messages: [
-        { role: "assistant", content: "old B", timestamp: oldBTimestamp } as AgentMessage,
-        { role: "assistant", content: "new E", timestamp: Date.UTC(2026, 0, 1, 0, 0, 5) } as AgentMessage,
-      ],
+      messages: partialBatch,
       prePromptMessageCount: 0,
       tokenBudget: 4096,
     });
@@ -623,12 +674,11 @@ describe("LcmContextEngine afterTurn dedup guard", () => {
       "old C",
       "[summary] compacted older context",
       "last D",
-      "old B",
       "new E",
     ]);
-    // Partial overlap is ambiguous without the transcript. Re-ingesting the
-    // known row is intentional: duplicates are safer than dropping new E.
-    expect(afterPartialOverlap.filter((message) => message.content === "old B")).toHaveLength(2);
+    // The missing-transcript helper returns the ambiguous batch intact. The
+    // later raw-id guard can safely remove old B by its exact persisted id.
+    expect(afterPartialOverlap.filter((message) => message.content === "old B")).toHaveLength(1);
   });
 
   it("fails open when a missing-transcript replay only has re-stamped envelope timestamps", async () => {
