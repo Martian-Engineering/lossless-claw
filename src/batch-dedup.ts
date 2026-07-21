@@ -33,6 +33,7 @@ import {
   extractToolPairingIdFromRecord,
   extractToolResultIdForPairing,
 } from "./tool-pairing.js";
+import { getTranscriptEntryId } from "./transcript.js";
 import type { LcmDependencies } from "./types.js";
 
 type RedactSensitiveText = (content: string) => string;
@@ -351,6 +352,61 @@ export class BatchDeduplicator {
       return [];
     }
     return batch;
+  }
+
+  /**
+   * Remove a full replay with already-persisted transcript identities when the
+   * transcript is unavailable but its checkpoint was preserved. Batches
+   * without complete identity proof retain the established degraded dedup
+   * behavior; this path adds no timestamp-based reason to drop them.
+   */
+  async deduplicateAfterTurnBatchAgainstPreservedCheckpoint(
+    sessionId: string,
+    sessionKey: string | undefined,
+    batch: AgentMessage[],
+  ): Promise<AgentMessage[]> {
+    if (batch.length === 0) return batch;
+
+    const conversation = await this.conversationStore.getConversationForSession({
+      sessionId,
+      sessionKey,
+    });
+    if (!conversation) return batch;
+
+    if (
+      await this.batchIsFullyPersistedByTranscriptEntryId(
+        conversation.conversationId,
+        batch,
+      )
+    ) {
+      this.deps.log.debug(
+        `[lcm] afterTurn: transcript unavailable with preserved checkpoint; skipping fully persisted runtime replay conversation=${conversation.conversationId} batchLen=${batch.length}`,
+      );
+      return [];
+    }
+    return this.deduplicateAfterTurnBatch(sessionId, sessionKey, batch, {
+      oversizedNoOverlap: "ingest",
+    });
+  }
+
+  /**
+   * Prove that every runtime row carries a canonical transcript entry id that
+   * is already persisted. Missing or unfamiliar ids fail open because content
+   * and second-truncated timestamps cannot distinguish a replay from a
+   * genuinely new same-second repeat.
+   */
+  private async batchIsFullyPersistedByTranscriptEntryId(
+    conversationId: number,
+    batch: AgentMessage[],
+  ): Promise<boolean> {
+    for (const message of batch) {
+      const entryId = getTranscriptEntryId(message);
+      if (!entryId) return false;
+      if (!(await this.conversationStore.hasMessageByTranscriptEntryId(conversationId, entryId))) {
+        return false;
+      }
+    }
+    return true;
   }
 
   async deduplicateAfterTurnBatch(

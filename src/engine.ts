@@ -3051,6 +3051,18 @@ export class LcmContextEngine implements ContextEngine {
         await runRuntimeAutoRotate();
         return;
       }
+    } else if (transcriptReconcileResult.transcriptUnavailableWithCheckpoint) {
+      dedupedNewMessages =
+        await this.batchDeduplicator.deduplicateAfterTurnBatchAgainstPreservedCheckpoint(
+          params.sessionId,
+          params.sessionKey,
+          newMessages,
+        );
+      if (newMessages.length > 0 && dedupedNewMessages.length < newMessages.length) {
+        this.deps.log.debug(
+          `[lcm] afterTurn: transcript unavailable with preserved checkpoint; runtime batch deduplicated to ${dedupedNewMessages.length}/${newMessages.length} messages ${sessionLabel}`,
+        );
+      }
     } else if (transcriptReconcileResult.transcriptCovered) {
       // The transcript reconcile read the file to its frontier, so the DB
       // tail is exact — use precise alignment instead of the heuristic
