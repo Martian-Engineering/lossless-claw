@@ -1,5 +1,27 @@
 # @martian-engineering/lossless-claw
 
+## 0.15.0
+
+### Minor Changes
+
+- [#981](https://github.com/Martian-Engineering/lossless-claw/pull/981) [`189efba`](https://github.com/Martian-Engineering/lossless-claw/commit/189efbaf792cd93ee10579747168ff0f75b2511a) Thanks [@cxbAsDev](https://github.com/cxbAsDev)! - `/lossless doctor apply` can now repair a specific conversation with `doctor apply <conversation-id> confirm-offline`. Targeted repair is limited to authorized OpenClaw command senders and requires the explicit offline confirmation after the target's active channel path is isolated. The existing current-conversation behavior is unchanged when no id is provided.
+
+### Patch Changes
+
+- [#979](https://github.com/Martian-Engineering/lossless-claw/pull/979) [`dffba95`](https://github.com/Martian-Engineering/lossless-claw/commit/dffba9511a9567e9cf8dc22fae23b06bf983a964) Thanks [@cxbAsDev](https://github.com/cxbAsDev)! - `lcm_describe` now accepts full copied reference strings such as `[LCM Tool Output: file_xxx | ...]` and `[LCM File: file_xxx | ...]` as `id`, extracting the embedded `file_xxx` or `sum_xxx` ID automatically. Bare IDs continue to work; ambiguous input (multiple IDs), zero/empty IDs, and malformed IDs now return clear errors.
+
+- [#935](https://github.com/Martian-Engineering/lossless-claw/pull/935) [`2b84753`](https://github.com/Martian-Engineering/lossless-claw/commit/2b847535747838c3f2ba29e7a268cfc7f4e7ccf5) Thanks [@gorkem2020](https://github.com/gorkem2020)! - Preserve conversation continuity when never-ingested recovery encounters an exact metadata-decorated runtime copy of a bare transcript row.
+
+- [#991](https://github.com/Martian-Engineering/lossless-claw/pull/991) [`1b12e4b`](https://github.com/Martian-Engineering/lossless-claw/commit/1b12e4beca9e3e23e3405ee5413dd801d398c247) Thanks [@gorkem2020](https://github.com/gorkem2020)! - Fix the ambiguous-rollover identity-scope wedge on rapid same-day /new resets. `messageIdentity` compares role+content only, unscoped by session generation, so a lane whose first post-reset turn happened to repeat trivial content (e.g. a literal "ping" health check) collided with the prior generation's persisted history and the freshness gate froze the lane instead of rotating it, re-warning on every subsequent bootstrap/afterTurn call. Identity overlap on trivial, low-entropy content no longer blocks rotation when the rollover is independently proven deliberate (a durable /new marker plus its archive sibling); substantial overlapping content still fails closed exactly as before, so a foreign session reusing a stale sessionKey is still rejected. A genuine freeze now warns once per session generation instead of on every turn. The once-only memo is capped (FIFO-evicted past 500 distinct generations) so a long-lived host process doesn't accumulate it indefinitely; a generation whose entry is evicted may warn once more on its next occurrence.
+
+- [#996](https://github.com/Martian-Engineering/lossless-claw/pull/996) [`c4a69c7`](https://github.com/Martian-Engineering/lossless-claw/commit/c4a69c7c7add4bd15da447e9c5264821cd5b11d0) Thanks [@Kaspnov](https://github.com/Kaspnov)! - Add an opt-in `hostFallbackMode: "capture-only"` setting so generic CLI backends can persist turns and use recall tools without Lossless prompt assembly or host-triggered Lossless compaction. Strict full-lifecycle validation remains the default, backend-native compaction remains host-owned, and subagent projection requirements remain unchanged.
+
+- [#830](https://github.com/Martian-Engineering/lossless-claw/pull/830) [`bc261ec`](https://github.com/Martian-Engineering/lossless-claw/commit/bc261ec2441261d1a7d9199600a8e86a4e7957e0) Thanks [@mpz4life](https://github.com/mpz4life)! - Prevent duplicate tool-call replay ingestion when OpenClaw stores a host-redacted form of sensitive message content.
+
+- [#808](https://github.com/Martian-Engineering/lossless-claw/pull/808) [`be366bd`](https://github.com/Martian-Engineering/lossless-claw/commit/be366bda3c10e4094567a2dccb9bbb9478e6f27b) Thanks [@holgergruenhagen](https://github.com/holgergruenhagen)! - Tolerate and cap oversized CLI summary output instead of failing historical backfill.
+
+- [#939](https://github.com/Martian-Engineering/lossless-claw/pull/939) [`763ad06`](https://github.com/Martian-Engineering/lossless-claw/commit/763ad06d3ce92331f265a5e0c0adfc6563e1adc4) Thanks [@gorkem2020](https://github.com/gorkem2020)! - Recognize the specific OpenClaw runtime/transcript whitespace divergence, where core collapses runs of spaces in the runtime message to a single space while the transcript persists them verbatim, as one user turn during afterTurn frontier-coverage. This prevents a store double-write of the same turn without collapsing newlines, tabs, or leading and trailing whitespace, so two turns that differ in meaningful whitespace (line breaks or tab indentation) are never merged. Storage stays byte-verbatim; the persisted row is the survivor.
+
 ## 0.14.0
 
 <!-- release-rollback-version: 0.13.2 -->
