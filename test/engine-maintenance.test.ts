@@ -527,6 +527,61 @@ describe("LcmContextEngine maintain and assemble budget", () => {
     expect(maintenance?.running).toBe(false);
   });
 
+  it("background deferred compaction refreshes token pressure after pending publication", async () => {
+    const engine = createEngine();
+    const privateEngine = engine as unknown as {
+      consumeDeferredCompactionDebt: (params: unknown) => Promise<unknown>;
+      drainDeferredCompactionDebtIfIdle: (params: unknown) => Promise<void>;
+      scheduleDeferredCompactionDebtDrain: (params: unknown) => void;
+    };
+    const sessionId = "background-deferred-compaction-refresh-pressure";
+    const conversation = await engine.getConversationStore().getOrCreateConversation(sessionId, {
+      sessionKey: undefined,
+    });
+    const [storedMessage] = await engine.getConversationStore().createMessagesBulk([
+      {
+        conversationId: conversation.conversationId,
+        seq: 0,
+        role: "user",
+        content: "small stored context after pending publication",
+        tokenCount: 100,
+      },
+    ]);
+    await engine
+      .getSummaryStore()
+      .appendContextMessages(conversation.conversationId, [storedMessage.messageId]);
+    await engine.getCompactionMaintenanceStore().requestProactiveCompactionDebt({
+      conversationId: conversation.conversationId,
+      reason: "threshold",
+      tokenBudget: 4_096,
+      currentTokenCount: 9_000,
+    });
+    vi.spyOn(privateEngine, "consumeDeferredCompactionDebt").mockResolvedValueOnce({
+      changed: true,
+      bytesFreed: 0,
+      rewrittenEntries: 0,
+      reason: "pending summaries published",
+    });
+    const scheduleSpy = vi
+      .spyOn(privateEngine, "scheduleDeferredCompactionDebtDrain")
+      .mockImplementation(() => undefined);
+
+    await privateEngine.drainDeferredCompactionDebtIfIdle({
+      conversationId: conversation.conversationId,
+      sessionId,
+      tokenBudget: 4_096,
+      currentTokenCount: 9_000,
+      reason: "threshold",
+      queueKey: sessionId,
+    });
+
+    expect(scheduleSpy).toHaveBeenCalledWith(
+      expect.objectContaining({
+        currentTokenCount: 100,
+      }),
+    );
+  });
+
   it("manual compact keeps threshold debt pending after a partial pending publish", async () => {
     const complete = vi.fn(async () => ({
       content: [{ type: "text", text: "prepared summary" }],
