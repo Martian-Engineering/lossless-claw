@@ -89,6 +89,28 @@ describe("pending summary planner", () => {
     expect(nodes.map((node) => node.sourceMessageIds)).toEqual([[10, 11]]);
   });
 
+  it("plans under-threshold bridge runs before later eligible work", () => {
+    const nodes = planPendingLeafNodes({
+      items: [
+        summary(0, "sum_prefix", 0, 3),
+        message(1, 10, 3),
+        summary(2, "sum_middle", 0, 3),
+        message(3, 11, 6),
+        message(4, 12, 6),
+        message(5, 13, 2),
+      ],
+      freshTailCount: 1,
+      leafChunkTokens: 10,
+      nodeIdPrefix: "leaf",
+    });
+
+    expect(nodes.map((node) => [node.nodeId, node.ordinalStart, node.ordinalEnd])).toEqual([
+      ["leaf-leaf-1-1", 1, 1],
+      ["leaf-leaf-3-4", 3, 4],
+    ]);
+    expect(nodes.map((node) => node.sourceMessageIds)).toEqual([[10], [11, 12]]);
+  });
+
   it("plans condensed parents over adjacent same-depth nodes", () => {
     const leafNodes = planPendingLeafNodes({
       items: [message(0, 10, 5), message(1, 11, 5), message(2, 12, 5)],
