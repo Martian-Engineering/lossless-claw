@@ -95,7 +95,7 @@ import { appendUncoveredVolatileLiveInputsWithinBudget, isVolatileLiveInputMessa
 import { buildMessageParts, extractMessageContent, filterPersistableMessages, hasPersistableMessageRole, isOpenClawRuntimeContextLeak, toStoredMessage } from "./message-content.js";
 import { batchHasRawReplayIds, filterPersistedRawIdReplayBatch } from "./raw-id-replay-filter.js";
 import { PROMPT_RECALL_MAX_MESSAGES, PROMPT_RECALL_SEARCH_CANDIDATE_LIMIT, buildPromptRecallProjectionFingerprint, extractPromptRecallIdentifiers, extractPromptRecallSnippet, findPromptRecallIdentifierIndex, isPromptRecallEligibleRole, normalizePromptRecallCoverageText, normalizePromptRecallText, renderPromptRecallMessage } from "./prompt-recall.js";
-import { estimateSessionTokenCountForAfterTurn, extractRuntimePromptTokenCount } from "./token-accounting.js";
+import { extractRuntimePromptTokenCount } from "./token-accounting.js";
 import { asRecord, formatDurationMs, resolvePositiveInteger } from "./value-utils.js";
 import {
   openClawInboundBodiesMatch,
@@ -138,6 +138,8 @@ const HOST_SESSION_END_REASON_DELETED = "deleted";
 const HOST_SESSION_END_REASON_RESET = "reset";
 const CONTEXT_ENGINE_PROJECTION_EPOCH_VERSION = "summary-prefix-v1";
 const DEFERRED_ASSEMBLY_DEGRADED_PRESSURE_RATIO = 0.75;
+/** Stop bypassing compaction backoff after repeated emergency failures. */
+const ASSEMBLE_FORCE_MAX_RETRY_ATTEMPTS = 3;
 type CompactionExecutionParams = {
   conversationId: number;
   sessionId: string;
@@ -1023,6 +1025,8 @@ export class LcmContextEngine implements ContextEngine {
     currentTokenCount?: number;
     runtimeContext?: ContextEngineMaintenanceRuntimeContext;
     legacyParams?: Record<string, unknown>;
+    /** Skip retry backoff for a bounded assemble-time emergency attempt. */
+    force?: boolean;
     sessionQueueHeld?: boolean;
     pendingPublishPolicy?: PendingCompactionPublishPolicy;
   }): Promise<(ContextEngineMaintenanceResult & { exhausted?: boolean }) | null> {
@@ -1039,12 +1043,12 @@ export class LcmContextEngine implements ContextEngine {
       scope: this.resolveSessionQueueKey(params.sessionId, params.sessionKey),
     });
 
-    if (
-      maintenance.nextAttemptAfter !== null &&
-      maintenance.nextAttemptAfter.getTime() > Date.now()
-    ) {
+    const nextAttemptAfter = maintenance.nextAttemptAfter;
+    const backoffActive =
+      nextAttemptAfter !== null && nextAttemptAfter.getTime() > Date.now();
+    if (!params.force && backoffActive) {
       this.deps.log.debug(
-        `[lcm] maintain: deferred compaction backoff active conversation=${params.conversationId} ${sessionLabel} retryAttempts=${maintenance.retryAttempts} nextAttemptAfter=${maintenance.nextAttemptAfter.toISOString()} debtReason=${maintenance.reason ?? "null"}`,
+        `[lcm] maintain: deferred compaction backoff active conversation=${params.conversationId} ${sessionLabel} retryAttempts=${maintenance.retryAttempts} nextAttemptAfter=${nextAttemptAfter.toISOString()} debtReason=${maintenance.reason ?? "null"}`,
       );
       return {
         changed: false,
@@ -1052,6 +1056,11 @@ export class LcmContextEngine implements ContextEngine {
         rewrittenEntries: 0,
         reason: "deferred compaction backoff active",
       };
+    }
+    if (params.force && backoffActive) {
+      this.deps.log.warn(
+        `[lcm] consumeDeferredCompactionDebt: force=true skipping backoff conversation=${params.conversationId} ${sessionLabel} retryAttempts=${maintenance.retryAttempts} nextAttemptAfter=${nextAttemptAfter.toISOString()}`,
+      );
     }
 
     await this.compactionMaintenanceStore.markProactiveCompactionRunning({
@@ -1158,6 +1167,7 @@ export class LcmContextEngine implements ContextEngine {
         contextThresholdOverride: resolvedContextThreshold,
         runtimeContext: params.runtimeContext,
         legacyParams: params.legacyParams,
+        force: params.force === true,
         sessionQueueHeld: params.sessionQueueHeld === true,
         publishPolicy: params.pendingPublishPolicy ?? "publish-if-ready",
       });
@@ -1518,6 +1528,7 @@ export class LcmContextEngine implements ContextEngine {
                 ...(telemetry.model ? { model: telemetry.model } : {}),
               }
             : undefined;
+        const forceAllowed = maintenance.retryAttempts < ASSEMBLE_FORCE_MAX_RETRY_ATTEMPTS;
         const result = await this.consumeDeferredCompactionDebt({
           conversationId: params.conversationId,
           sessionId: params.sessionId,
@@ -1525,6 +1536,7 @@ export class LcmContextEngine implements ContextEngine {
           tokenBudget: cappedTokenBudget,
           currentTokenCount: normalizedCurrentTokenCount,
           legacyParams: deferredLegacyParams,
+          force: forceAllowed,
           sessionQueueHeld: true,
           pendingPublishPolicy: "publish-if-ready",
         });
@@ -3698,7 +3710,10 @@ export class LcmContextEngine implements ContextEngine {
       );
     }
 
-    const estimatedContextTokens = estimateSessionTokenCountForAfterTurn(params.messages);
+    const conversation = await this.conversationStore.getConversationForSession({
+      sessionId,
+      sessionKey,
+    });
     const runtimePromptTokens = extractRuntimePromptTokenCount(asRecord(params.runtimeContext));
     const suppliedCurrentTokenCount = this.normalizeObservedTokenCount(
       params.currentTokenCount ??
@@ -3708,22 +3723,12 @@ export class LcmContextEngine implements ContextEngine {
         }
       ).currentTokenCount,
     );
-    const observedCurrentTokenCount =
-      runtimePromptTokens ?? suppliedCurrentTokenCount ?? estimatedContextTokens;
+    const observedCurrentTokenCount = runtimePromptTokens ?? suppliedCurrentTokenCount;
     if (runtimePromptTokens !== undefined) {
       this.deps.log.debug(
-        `[lcm] afterTurn: using runtime prompt token count currentTokenCount=${runtimePromptTokens} estimatedTokenCount=${estimatedContextTokens}`,
+        `[lcm] afterTurn: using runtime prompt token count currentTokenCount=${runtimePromptTokens}`,
       );
-      if (estimatedContextTokens > runtimePromptTokens) {
-        this.deps.log.debug(
-          `[lcm] afterTurn: local prompt estimate exceeds runtime prompt token count; keeping runtime currentTokenCount=${observedCurrentTokenCount}`,
-        );
-      }
     }
-    const conversation = await this.conversationStore.getConversationForSession({
-      sessionId,
-      sessionKey,
-    });
     if (!conversation) {
       this.deps.log.debug(
         `[lcm] afterTurn: conversation lookup missed ${sessionLabel} ingestBatch=${ingestBatch.length} duration=${formatDurationMs(Date.now() - startedAt)}`,
@@ -3758,14 +3763,14 @@ export class LcmContextEngine implements ContextEngine {
       | {
           reason: string;
           tokenBudget: number;
-          currentTokenCount: number;
+          currentTokenCount?: number;
         }
       | null = null;
     let pendingSummaryPreparationDrain:
       | {
           reason: string;
           tokenBudget: number;
-          currentTokenCount: number;
+          currentTokenCount?: number;
         }
       | null = null;
 
@@ -4106,7 +4111,9 @@ export class LcmContextEngine implements ContextEngine {
         }
         return { messages: clamp.messages, estimatedTokens: clamp.serializedTokens };
       };
-      const liveContextTokens = estimateSessionTokenCountForAfterTurn(liveMessages);
+      let storedContextTokens = await this.summaryStore.getContextTokenCount(
+        conversation.conversationId,
+      );
       const maintenance = await this.compactionMaintenanceStore.getConversationCompactionMaintenance(
         conversation.conversationId,
       );
@@ -4124,12 +4131,12 @@ export class LcmContextEngine implements ContextEngine {
           tokenBudget * DEFERRED_ASSEMBLY_DEGRADED_PRESSURE_RATIO,
         );
         let pressure = resolveDeferredAssemblyPressure({
-          liveContextTokens,
+          storedContextTokens,
           maintenance,
         });
         if (pressure.pressureTokenCount > tokenBudget) {
           this.deps.log.warn(
-            `[lcm] assemble: emergency deferred compaction debt draining pre-assembly conversation=${conversation.conversationId} ${sessionLabel} currentTokenCount=${pressure.observedContextTokens} projectedTokenCount=${pressure.projectedTokenCount ?? "null"} tokenBudget=${tokenBudget} reason=over-budget`,
+            `[lcm] assemble: emergency deferred compaction debt draining pre-assembly conversation=${conversation.conversationId} ${sessionLabel} storedContextTokens=${pressure.storedContextTokens} projectedTokenCount=${pressure.projectedTokenCount ?? "null"} tokenBudget=${tokenBudget} reason=over-budget`,
           );
           let emergencyDrainResult: { exhausted: boolean } | null = null;
           try {
@@ -4138,20 +4145,23 @@ export class LcmContextEngine implements ContextEngine {
               sessionId: params.sessionId,
               sessionKey: params.sessionKey,
               tokenBudget,
-              currentTokenCount: pressure.observedContextTokens,
+              currentTokenCount: pressure.storedContextTokens,
             });
           } catch (error) {
             this.deps.log.warn(
               `[lcm] assemble: deferred compaction execution failed for ${sessionLabel}: ${describeLogError(error)}`,
             );
           }
+          storedContextTokens = await this.summaryStore.getContextTokenCount(
+            conversation.conversationId,
+          );
           const latestMaintenance =
             await this.compactionMaintenanceStore.getConversationCompactionMaintenance(
               conversation.conversationId,
             );
           if (latestMaintenance?.pending || latestMaintenance?.running) {
             pressure = resolveDeferredAssemblyPressure({
-              liveContextTokens,
+              storedContextTokens,
               maintenance: latestMaintenance,
             });
             if (pressure.pressureTokenCount > pressureThreshold) {
@@ -4176,7 +4186,7 @@ export class LcmContextEngine implements ContextEngine {
           };
         } else {
           this.deps.log.debug(
-            `[lcm] assemble: deferred compaction debt left pending conversation=${conversation.conversationId} ${sessionLabel} currentTokenCount=${pressure.observedContextTokens} projectedTokenCount=${pressure.projectedTokenCount ?? "null"} tokenBudget=${tokenBudget} reason=not-over-budget`,
+            `[lcm] assemble: deferred compaction debt left pending conversation=${conversation.conversationId} ${sessionLabel} storedContextTokens=${pressure.storedContextTokens} projectedTokenCount=${pressure.projectedTokenCount ?? "null"} tokenBudget=${tokenBudget} reason=not-over-budget`,
           );
         }
       }
@@ -4186,7 +4196,7 @@ export class LcmContextEngine implements ContextEngine {
           tokenBudget,
         });
         this.deps.log.warn(
-          `[lcm] assemble: degraded live fallback conversation=${conversation.conversationId} ${sessionLabel} reason=${deferredAssemblyDegradation.reason} currentTokenCount=${deferredAssemblyDegradation.pressure.observedContextTokens} projectedTokenCount=${deferredAssemblyDegradation.pressure.projectedTokenCount ?? "null"} tokenBudget=${tokenBudget} pressureThreshold=${Math.floor(tokenBudget * DEFERRED_ASSEMBLY_DEGRADED_PRESSURE_RATIO)} outputMessages=${degraded.messages.length} estimatedTokens=${degraded.estimatedTokens}`,
+          `[lcm] assemble: degraded live fallback conversation=${conversation.conversationId} ${sessionLabel} reason=${deferredAssemblyDegradation.reason} storedContextTokens=${deferredAssemblyDegradation.pressure.storedContextTokens} projectedTokenCount=${deferredAssemblyDegradation.pressure.projectedTokenCount ?? "null"} tokenBudget=${tokenBudget} pressureThreshold=${Math.floor(tokenBudget * DEFERRED_ASSEMBLY_DEGRADED_PRESSURE_RATIO)} outputMessages=${degraded.messages.length} estimatedTokens=${degraded.estimatedTokens}`,
         );
         return degraded;
       }
@@ -4413,7 +4423,7 @@ export class LcmContextEngine implements ContextEngine {
         const overflowDiagnostics = shouldLogOverflowDiagnostics({
           diagnostics: assembled.debug.overflowDiagnostics,
           assembledTokens: assembled.estimatedTokens,
-          liveContextTokens,
+          storedContextTokens,
         })
           ? ` overflowDiagnostics=${formatOverflowDiagnosticsForLog({
               diagnostics: assembled.debug.overflowDiagnostics,
