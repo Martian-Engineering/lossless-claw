@@ -3246,6 +3246,12 @@ export class LcmContextEngine implements ContextEngine {
           sessionFile: params.sessionFile,
         });
       } catch (err) {
+        if (isMissingFileError(err)) {
+          this.deps.log.debug(
+            `[lcm] afterTurn: bootstrap checkpoint refresh skipped (session file missing) for ${sessionLabel} sessionFile=${params.sessionFile}`,
+          );
+          return;
+        }
         this.deps.log.warn(
           `[lcm] afterTurn: bootstrap checkpoint refresh failed for ${sessionLabel}: ${describeLogError(err)}`,
         );
