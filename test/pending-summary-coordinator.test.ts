@@ -843,6 +843,122 @@ describe("PendingCompactionCoordinator", () => {
     ]);
   });
 
+  it("self-heals past a sub-threshold raw gap after a published batch", async () => {
+    const { db, conversationStore, pendingSummaryStore, summaryStore } = createStores();
+    const conversation = await conversationStore.createConversation({
+      sessionId: "pending-coordinator-published-gap-session",
+      sessionKey: "agent:main:pending-coordinator-published-gap",
+    });
+    for (const summaryId of ["sum_published_prefix", "sum_published_middle"]) {
+      await summaryStore.insertSummary({
+        summaryId,
+        conversationId: conversation.conversationId,
+        kind: "leaf",
+        depth: 0,
+        content: `existing canonical summary ${summaryId}`,
+        tokenCount: 3,
+      });
+    }
+    await summaryStore.appendContextSummary(conversation.conversationId, "sum_published_prefix");
+    const messages = await conversationStore.createMessagesBulk([
+      {
+        conversationId: conversation.conversationId,
+        seq: 1,
+        role: "tool",
+        content: "small raw island left by the previous publish",
+        tokenCount: 3,
+      },
+      {
+        conversationId: conversation.conversationId,
+        seq: 2,
+        role: "user",
+        content: "eligible suffix first half",
+        tokenCount: 6,
+      },
+      {
+        conversationId: conversation.conversationId,
+        seq: 3,
+        role: "assistant",
+        content: "eligible suffix second half",
+        tokenCount: 6,
+      },
+      {
+        conversationId: conversation.conversationId,
+        seq: 4,
+        role: "user",
+        content: "fresh tail remains raw",
+        tokenCount: 2,
+      },
+    ]);
+    await summaryStore.appendContextMessage(conversation.conversationId, messages[0]!.messageId);
+    await summaryStore.appendContextSummary(conversation.conversationId, "sum_published_middle");
+    await summaryStore.appendContextMessages(
+      conversation.conversationId,
+      messages.slice(1).map((message) => message.messageId),
+    );
+
+    await pendingSummaryStore.createBatch({
+      batchId: "batch_already_published_with_ready_suffix",
+      conversationId: conversation.conversationId,
+      status: "published",
+      sourceProjectionFingerprint: "historical projection",
+      compactableStartOrdinal: 0,
+      compactableEndOrdinal: 0,
+      promptVersion: "pending-summary-dag:v1",
+      model: "test-model",
+    });
+    await pendingSummaryStore.insertNode({
+      nodeId: "stranded_ready_suffix",
+      batchId: "batch_already_published_with_ready_suffix",
+      conversationId: conversation.conversationId,
+      kind: "leaf",
+      depth: 0,
+      status: "ready",
+      ordinalStart: 3,
+      ordinalEnd: 4,
+      sourceFingerprint: "historical ready suffix",
+      promptVersion: "pending-summary-dag:v1",
+      model: "test-model",
+    });
+    db.prepare(
+      `UPDATE pending_summary_nodes
+       SET content = 'stranded prepared summary', token_count = 2
+       WHERE node_id = 'stranded_ready_suffix'`,
+    ).run();
+
+    const coordinator = new PendingCompactionCoordinator({
+      conversationStore,
+      pendingSummaryStore,
+      summaryStore,
+      model: "test-model",
+      leaseOwner: "test-worker",
+      config: {
+        freshTailCount: 1,
+        leafChunkTokens: 10,
+        condensedMinFanout: 99,
+        condensedMinSourceTokens: 1,
+        condensedChunkTokens: 100,
+      },
+      summarize: async (sourceText) => `leaf(${sourceText})`,
+    });
+
+    const planned = await coordinator.runOnce({
+      conversationId: conversation.conversationId,
+      sessionKey: "agent:main:pending-coordinator-published-gap",
+    });
+    expect(planned).toMatchObject({ status: "planned", nodeCount: 2 });
+    expect(planned).not.toMatchObject({
+      status: "idle",
+      reason: "no publishable pending summary coverage planned",
+    });
+    await expect(
+      pendingSummaryStore.getBatch("batch_already_published_with_ready_suffix"),
+    ).resolves.toMatchObject({ status: "published" });
+    await expect(
+      pendingSummaryStore.getNode("stranded_ready_suffix"),
+    ).resolves.toMatchObject({ status: "ready" });
+  });
+
   it("preserves mixed canonical and pending child order when condensing", async () => {
     const { conversationStore, pendingSummaryStore, summaryStore } = createStores();
     const conversation = await conversationStore.createConversation({

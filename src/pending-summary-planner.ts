@@ -209,7 +209,60 @@ export function planPendingLeafNodes(
   }
 
   flushChunk();
-  return nodes;
+  if (nodes.length === 0) {
+    return nodes;
+  }
+
+  // Eligible work after a canonical summary can otherwise become permanently
+  // unreachable when a smaller raw run sits before it. Add only the undersized
+  // message ranges needed to bridge the prefix through the last eligible leaf;
+  // an undersized trailing suffix remains raw.
+  const lastEligibleOrdinal = Math.max(...nodes.map((node) => node.ordinalEnd));
+  const bridgeNodes: PendingSummaryPlannerNode[] = [];
+  let bridge: PendingSummaryPlannerSnapshotItem[] = [];
+  let bridgeTokens = 0;
+  const flushBridge = () => {
+    if (bridge.length === 0) {
+      return;
+    }
+    const ordinalStart = bridge[0]!.ordinal;
+    const ordinalEnd = bridge[bridge.length - 1]!.ordinal;
+    bridgeNodes.push({
+      nodeId: makeLeafNodeId(input.nodeIdPrefix, ordinalStart, ordinalEnd),
+      canonicalSummaryId: null,
+      kind: "leaf",
+      depth: 0,
+      ordinalStart,
+      ordinalEnd,
+      tokenCount: bridgeTokens,
+      sourceFingerprints: bridge.map((item) => item.sourceFingerprint),
+      sourceMessageIds: bridge
+        .map((item) => item.messageId)
+        .filter((messageId): messageId is number => typeof messageId === "number"),
+      childNodeIds: [],
+      childSummaryIds: [],
+    });
+    bridge = [];
+    bridgeTokens = 0;
+  };
+
+  for (const item of items) {
+    if (item.ordinal > lastEligibleOrdinal) {
+      break;
+    }
+    const covered = nodes.some(
+      (node) => item.ordinal >= node.ordinalStart && item.ordinal <= node.ordinalEnd,
+    );
+    if (item.itemType !== "message" || covered) {
+      flushBridge();
+      continue;
+    }
+    bridge.push(item);
+    bridgeTokens += normalizeNonNegativeInteger(item.tokenCount);
+  }
+  flushBridge();
+
+  return [...nodes, ...bridgeNodes].sort(compareNodesForPlanning);
 }
 
 /**
