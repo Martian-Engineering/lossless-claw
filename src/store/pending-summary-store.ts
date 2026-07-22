@@ -424,6 +424,21 @@ export class PendingSummaryStore {
     return row ? toBatchRecord(row) : null;
   }
 
+  /** Return whether this debt window already published a canonical batch. */
+  async hasPublishedBatchSince(conversationId: number, since: Date): Promise<boolean> {
+    const row = this.db
+      .prepare(
+        `SELECT 1
+         FROM pending_compaction_batches
+         WHERE conversation_id = ?
+           AND status = 'published'
+           AND julianday(published_at) >= julianday(?)
+         LIMIT 1`,
+      )
+      .get(conversationId, since.toISOString());
+    return row !== undefined;
+  }
+
   /** Mark a pending compaction batch as published. */
   async markBatchPublished(input: { batchId: string; publishedAt?: Date }): Promise<void> {
     this.db

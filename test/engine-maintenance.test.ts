@@ -582,6 +582,85 @@ describe("LcmContextEngine maintain and assemble budget", () => {
     );
   });
 
+  it("maintain() clears stale backoff after a pending batch satisfies stored pressure", async () => {
+    vi.useFakeTimers({ toFake: ["Date"] });
+    vi.setSystemTime(new Date("2026-07-22T20:00:00.000Z"));
+    try {
+      const engine = createEngine();
+      const privateEngine = engine as unknown as {
+        executeCompactionCore: (params: unknown) => Promise<unknown>;
+      };
+      const sessionId = "maintain-published-batch-clears-stale-backoff";
+      const conversation = await engine.getConversationStore().getOrCreateConversation(sessionId, {
+        sessionKey: undefined,
+      });
+      const [storedMessage] = await engine.getConversationStore().createMessagesBulk([
+        {
+          conversationId: conversation.conversationId,
+          seq: 0,
+          role: "user",
+          content: "small canonical context after publication",
+          tokenCount: 100,
+        },
+      ]);
+      await engine
+        .getSummaryStore()
+        .appendContextMessages(conversation.conversationId, [storedMessage.messageId]);
+      await engine.getCompactionMaintenanceStore().requestProactiveCompactionDebt({
+        conversationId: conversation.conversationId,
+        reason: "threshold",
+        requestedAt: new Date("2026-07-22T20:00:00.000Z"),
+        tokenBudget: 4_096,
+        currentTokenCount: 9_000,
+      });
+      const batch = await engine.getPendingSummaryStore().createBatch({
+        batchId: "pcb_published_pressure_satisfied",
+        conversationId: conversation.conversationId,
+        status: "planning",
+        sourceProjectionFingerprint: "published pressure projection",
+        compactableStartOrdinal: 0,
+        compactableEndOrdinal: 0,
+        promptVersion: "pending-summary-dag:v1",
+        model: "test-model",
+      });
+      await engine.getPendingSummaryStore().markBatchPublished({
+        batchId: batch.batchId,
+        publishedAt: new Date("2026-07-22T20:00:01.000Z"),
+      });
+      await engine.getCompactionMaintenanceStore().markProactiveCompactionRunning({
+        conversationId: conversation.conversationId,
+      });
+      await engine.getCompactionMaintenanceStore().markProactiveCompactionFinished({
+        conversationId: conversation.conversationId,
+        failureSummary: "compacted but still over target",
+        keepPending: true,
+      });
+      vi.setSystemTime(new Date("2026-07-22T20:00:02.000Z"));
+      const executeCompactionCoreSpy = vi.spyOn(privateEngine, "executeCompactionCore");
+
+      const result = await engine.maintain({
+        sessionId,
+        sessionFile: createSessionFilePath("maintain-published-batch-clears-stale-backoff"),
+        runtimeContext: {
+          allowDeferredCompactionExecution: true,
+          tokenBudget: 4_096,
+        },
+      });
+
+      const maintenance = await engine
+        .getCompactionMaintenanceStore()
+        .getConversationCompactionMaintenance(conversation.conversationId);
+      expect(executeCompactionCoreSpy).not.toHaveBeenCalled();
+      expect(result.reason).toBe("pending summary publication satisfied stored threshold");
+      expect(maintenance?.pending).toBe(false);
+      expect(maintenance?.running).toBe(false);
+      expect(maintenance?.lastFailureSummary).toBeNull();
+      expect(maintenance?.nextAttemptAfter).toBeNull();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it("manual compact keeps threshold debt pending after a partial pending publish", async () => {
     const complete = vi.fn(async () => ({
       content: [{ type: "text", text: "prepared summary" }],
