@@ -1050,6 +1050,67 @@ export class LcmContextEngine implements ContextEngine {
       scope: this.resolveSessionQueueKey(params.sessionId, params.sessionKey),
     });
 
+    // A published pending batch rewrites the canonical projection, so token
+    // observations captured before that publication are no longer valid. Clear
+    // satisfied threshold debt even when the stale row currently has backoff.
+    if (maintenance.reason?.trim() === "threshold" && maintenance.requestedAt) {
+      const [activeBatch, publishedInDebtWindow] = await Promise.all([
+        this.pendingSummaryStore.getActiveBatchForConversation(params.conversationId),
+        this.pendingSummaryStore.hasPublishedBatchSince(
+          params.conversationId,
+          maintenance.requestedAt,
+        ),
+      ]);
+      if (!activeBatch && publishedInDebtWindow) {
+        const recordedTokenBudget =
+          maintenance.tokenBudget && maintenance.tokenBudget > 0
+            ? maintenance.tokenBudget
+            : null;
+        const tokenBudget = this.applyAssemblyBudgetCap(
+          recordedTokenBudget != null
+            ? Math.min(params.tokenBudget, recordedTokenBudget)
+            : params.tokenBudget,
+        );
+        const persistedThreshold = persistedContextThresholdOverride(maintenance);
+        const storedDecision = await this.compaction.evaluate(
+          params.conversationId,
+          tokenBudget,
+          undefined,
+          {
+            contextThreshold:
+              persistedThreshold?.contextThreshold ??
+              this.contextThresholdResolver.resolve({
+                sessionKey: params.sessionKey,
+                runtime: readRuntimeModelContext(
+                  asRecord(params.runtimeContext),
+                  asRecord(params.legacyParams),
+                ),
+              }).contextThreshold,
+            ...(persistedThreshold?.freshTailCount !== undefined
+              ? { freshTailCount: persistedThreshold.freshTailCount }
+              : {}),
+          },
+        );
+        if (!storedDecision.shouldCompact) {
+          await this.compactionMaintenanceStore.markProactiveCompactionFinished({
+            conversationId: params.conversationId,
+            finishedAt: new Date(),
+            failureSummary: null,
+            keepPending: false,
+          });
+          this.deps.log.info(
+            `[lcm] maintain: pending summary publication satisfied stored threshold conversation=${params.conversationId} ${sessionLabel} storedTokens=${storedDecision.storedTokens} tokenBudget=${tokenBudget}`,
+          );
+          return {
+            changed: false,
+            bytesFreed: 0,
+            rewrittenEntries: 0,
+            reason: "pending summary publication satisfied stored threshold",
+          };
+        }
+      }
+    }
+
     const nextAttemptAfter = maintenance.nextAttemptAfter;
     const backoffActive =
       nextAttemptAfter !== null && nextAttemptAfter.getTime() > Date.now();
