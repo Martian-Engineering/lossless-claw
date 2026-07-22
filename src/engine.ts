@@ -1006,7 +1006,14 @@ export class LcmContextEngine implements ContextEngine {
         !retryBackoffActive &&
         !pendingSummariesReadyForPublish
       ) {
-        this.scheduleDeferredCompactionDebtDrain(params);
+        const currentTokenCount =
+          result?.changed === true && result.reason === "pending summaries published"
+            ? await this.summaryStore.getContextTokenCount(params.conversationId)
+            : params.currentTokenCount;
+        this.scheduleDeferredCompactionDebtDrain({
+          ...params,
+          currentTokenCount,
+        });
       }
     } finally {
       this.deferredCompactionDrains.delete(params.queueKey);
