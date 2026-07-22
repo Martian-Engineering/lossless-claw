@@ -1,4 +1,4 @@
-import { execFileSync } from "node:child_process";
+import { execFileSync as runNodeFileSync } from "node:child_process";
 import { describe, expect, it } from "vitest";
 import { DatabaseSync } from "node:sqlite";
 import { mkdirSync, mkdtempSync, unlinkSync, writeFileSync } from "node:fs";
@@ -487,7 +487,7 @@ describe("stub-tier blob-migrate script", () => {
     const { db, dbPath, stateDir } = setupScriptDb();
     db.close();
 
-    const raw = execFileSync(
+    const raw = runNodeFileSync(
       process.execPath,
       [BLOB_MIGRATE_SCRIPT, "--db", dbPath, "--dry-run"],
       {
@@ -511,7 +511,7 @@ describe("stub-tier blob-migrate script", () => {
     ]);
     db.close();
 
-    const raw = execFileSync(
+    const raw = runNodeFileSync(
       process.execPath,
       [BLOB_MIGRATE_SCRIPT, "--db", dbPath, "--revert", "--dry-run", "--storage-dir", storageDir],
       {
