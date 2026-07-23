@@ -291,6 +291,9 @@ describe("pending summary compaction engine e2e (mocked LLM)", () => {
       const conversationId = await conversationIdFor(engine, sessionId);
       const batchId = await waitForReadyNodes(engine, conversationId, 3);
       const preparedCalls = complete.mock.calls.length;
+      const tokensBefore = await engine
+        .getSummaryStore()
+        .getContextTokenCount(conversationId);
 
       // Manual compaction is a compaction event: it must publish the prepared
       // frontier immediately, below threshold, with zero further LLM spend.
@@ -305,6 +308,14 @@ describe("pending summary compaction engine e2e (mocked LLM)", () => {
         compacted: true,
         reason: "pending summaries published",
       });
+      const tokensAfter = await engine
+        .getSummaryStore()
+        .getContextTokenCount(conversationId);
+      expect(result.result).toMatchObject({
+        tokensBefore,
+        tokensAfter,
+      });
+      expect(tokensAfter).toBeLessThan(tokensBefore);
       expect(complete.mock.calls.length).toBe(preparedCalls);
 
       await expect(engine.getPendingSummaryStore().getBatch(batchId)).resolves.toMatchObject({
@@ -313,6 +324,10 @@ describe("pending summary compaction engine e2e (mocked LLM)", () => {
       const contextItems = await engine.getSummaryStore().getContextItems(conversationId);
       expect(contextItems.filter((item) => item.itemType === "summary")).toHaveLength(3);
       expect(contextItems[contextItems.length - 1]?.itemType).toBe("message");
+      const persistedRawTokens = (
+        await engine.getConversationStore().getMessages(conversationId)
+      ).reduce((total, message) => total + message.tokenCount, 0);
+      expect(persistedRawTokens).toBeGreaterThan(tokensAfter);
       const nodes = await engine.getPendingSummaryStore().getNodesByBatch(batchId);
       expect(nodes.every((node) => node.status === "promoted" && node.content === null)).toBe(
         true,
