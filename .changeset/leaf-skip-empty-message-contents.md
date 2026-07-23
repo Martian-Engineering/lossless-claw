@@ -1,5 +1,5 @@
 ---
-"lossless-claw": patch
+"@martian-engineering/lossless-claw": patch
 ---
 
-Guard leaf compaction against empty messageContents. When selectOldestLeafChunk returns items whose messageId fields are all null, or whose referenced messages no longer exist, messageContents is empty. Previously leafPass would still call summarizer, create a summary with removedTokens=0, and grow the context (tokensAfter = tokensBefore + tokenCount). Now it returns null early, letting callers bail without wasted LLM calls or context inflation.
+Skip leaf compaction when selected raw messages are missing or contain no meaningful content, preventing zero-source fallback summaries and context growth. Full sweeps continue past empty-source chunks, clamp tracked token deltas at zero, and stop leaf passes once `stopAtTokens` is reached.

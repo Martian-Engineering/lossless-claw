@@ -131,10 +131,11 @@ type PassResult = {
   /** Token count of the newly created summary. */
   addedTokens: number;
 };
-type CondensedPassSkipped = {
+type CompactionPassSkipped = {
   skipped: "empty-source";
 };
-type CondensedPassResult = PassResult | CondensedPassSkipped;
+type LeafPassResult = (PassResult & { content: string }) | CompactionPassSkipped;
+type CondensedPassResult = PassResult | CompactionPassSkipped;
 type LeafChunkSelection = {
   items: ContextItemRecord[];
   rawTokensOutsideTail: number;
@@ -1079,6 +1080,7 @@ export class CompactionEngine {
     // Delta tracking: maintain a running token count instead of re-querying DB
     // after each pass. The arithmetic is exact: tokensAfter = tokensBefore - removed + added.
     let runningTokens = tokensBefore;
+    let leafScanAfterOrdinal: number | undefined;
     while (true) {
       if (sweepBudgetExhausted("leaf")) {
         break;
@@ -1087,6 +1089,7 @@ export class CompactionEngine {
         conversationId,
         leafChunkTokensOverride,
         freshTailCountOverride,
+        leafScanAfterOrdinal,
       );
       if (leafChunk.items.length === 0) {
         break;
@@ -1109,7 +1112,9 @@ export class CompactionEngine {
         break;
       }
       if ("skipped" in leafResult) {
-        break;
+        leafScanAfterOrdinal = leafChunk.items[leafChunk.items.length - 1]?.ordinal;
+        await yieldToEventLoop();
+        continue;
       }
       const passTokensAfter = Math.max(0, passTokensBefore - leafResult.removedTokens + leafResult.addedTokens);
       await this.persistCompactionEvents({
@@ -1585,6 +1590,7 @@ export class CompactionEngine {
     conversationId: number,
     leafChunkTokensOverride?: number,
     freshTailCountOverride?: number,
+    afterOrdinal?: number,
   ): Promise<LeafChunkSelection> {
     const contextItems = await this.getContextItemsCached(conversationId);
     const freshTailOrdinal = await this.resolveFreshTailOrdinal(contextItems, freshTailCountOverride);
@@ -1607,6 +1613,9 @@ export class CompactionEngine {
     for (const item of contextItems) {
       if (item.ordinal >= freshTailOrdinal) {
         break;
+      }
+      if (afterOrdinal !== undefined && item.ordinal <= afterOrdinal) {
+        continue;
       }
 
       if (!started) {
@@ -2190,7 +2199,7 @@ export class CompactionEngine {
     summarize: CompactionSummarizeFn,
     previousSummaryContent?: string,
     summaryModel?: string,
-  ): Promise<PassResult & { content: string } | null | CondensedPassSkipped> {
+  ): Promise<LeafPassResult | null> {
     // Fetch full message content for each context item
     const messageContents: { messageId: number; content: string; createdAt: Date; tokenCount: number }[] =
       [];
