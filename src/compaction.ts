@@ -1450,6 +1450,7 @@ export class CompactionEngine {
   private async resolveFreshTailOrdinal(
     contextItems: ContextItemRecord[],
     freshTailCountOverride?: number,
+    messageCache = new Map<number, MessageRecord | null>(),
   ): Promise<number> {
     const freshTailCount =
       (freshTailCountOverride !== undefined && freshTailCountOverride > 0
@@ -1470,7 +1471,10 @@ export class CompactionEngine {
     let protectedCount = 0;
     let protectedTokens = 0;
     let tailStartOrdinal = Infinity;
-    const latestUserOrdinal = await this.resolveLatestRawUserOrdinal(rawMessageItems);
+    const latestUserOrdinal = await this.resolveLatestRawUserOrdinal(
+      rawMessageItems,
+      messageCache,
+    );
 
     for (let idx = rawMessageItems.length - 1; idx >= 0; idx--) {
       const latestUserProtected =
@@ -1484,7 +1488,7 @@ export class CompactionEngine {
         continue;
       }
 
-      const messageTokens = await this.getMessageTokenCount(item.messageId);
+      const messageTokens = await this.getMessageTokenCount(item.messageId, messageCache);
       const wouldExceedBudget =
         latestUserProtected &&
         protectedCount > 0 &&
@@ -1505,13 +1509,14 @@ export class CompactionEngine {
   /** Find the newest raw user ordinal so fresh-tail limits cannot split its turn. */
   private async resolveLatestRawUserOrdinal(
     rawMessageItems: ContextItemRecord[],
+    messageCache: Map<number, MessageRecord | null>,
   ): Promise<number | undefined> {
     for (let idx = rawMessageItems.length - 1; idx >= 0; idx--) {
       const item = rawMessageItems[idx];
       if (!item?.messageId) {
         continue;
       }
-      const message = await this.conversationStore.getMessageById(item.messageId);
+      const message = await this.getMessageByIdCached(item.messageId, messageCache);
       if (message?.role === "user") {
         return item.ordinal;
       }
@@ -1519,9 +1524,25 @@ export class CompactionEngine {
     return undefined;
   }
 
+  /** Read one message at most once while resolving a fresh-tail boundary. */
+  private async getMessageByIdCached(
+    messageId: number,
+    messageCache: Map<number, MessageRecord | null>,
+  ): Promise<MessageRecord | null> {
+    if (!messageCache.has(messageId)) {
+      messageCache.set(messageId, await this.conversationStore.getMessageById(messageId));
+    }
+    return messageCache.get(messageId) ?? null;
+  }
+
   /** Resolve message token count with a content-length fallback. */
-  private async getMessageTokenCount(messageId: number): Promise<number> {
-    const message = await this.conversationStore.getMessageById(messageId);
+  private async getMessageTokenCount(
+    messageId: number,
+    messageCache?: Map<number, MessageRecord | null>,
+  ): Promise<number> {
+    const message = messageCache
+      ? await this.getMessageByIdCached(messageId, messageCache)
+      : await this.conversationStore.getMessageById(messageId);
     if (!message) {
       return 0;
     }
@@ -1541,7 +1562,12 @@ export class CompactionEngine {
     freshTailCountOverride?: number,
   ): Promise<number> {
     const contextItems = await this.getContextItemsCached(conversationId);
-    const freshTailOrdinal = await this.resolveFreshTailOrdinal(contextItems, freshTailCountOverride);
+    const messageCache = new Map<number, MessageRecord | null>();
+    const freshTailOrdinal = await this.resolveFreshTailOrdinal(
+      contextItems,
+      freshTailCountOverride,
+      messageCache,
+    );
     let rawTokens = 0;
 
     for (const item of contextItems) {
@@ -1551,7 +1577,7 @@ export class CompactionEngine {
       if (item.itemType !== "message" || item.messageId == null) {
         continue;
       }
-      rawTokens += await this.getMessageTokenCount(item.messageId);
+      rawTokens += await this.getMessageTokenCount(item.messageId, messageCache);
     }
 
     return rawTokens;
