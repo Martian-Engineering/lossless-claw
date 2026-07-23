@@ -1104,9 +1104,12 @@ export class LcmContextEngine implements ContextEngine {
           force: forceAllowed,
         });
         drainResult = { exhausted: result?.exhausted === true };
-        // If compaction made progress (not exhausted), reset the circuit breaker
-        // so future attempts get a fresh count.
-        if (!drainResult.exhausted) {
+        // Only reset the circuit breaker when compaction actually made
+        // progress (changed === true), not on every non-exhausted return.
+        // Without this guard, failures (ENOENT, etc.) that return
+        // exhausted=false would perpetually reset the counter and prevent
+        // the circuit breaker from ever triggering.
+        if (result?.changed === true) {
           this.consecutiveCompactAttemptsByConversation.delete(params.conversationId);
         }
       },
