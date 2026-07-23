@@ -142,4 +142,9 @@ describe("openclaw.plugin.json manifest drift guard (#570)", () => {
       { name: "lcm", kind: "runtime-slash" },
     ]);
   });
+
+  it("describes largeFilesDir relative to OPENCLAW_STATE_DIR without duplicate keys", () => {
+    expect(manifest.uiHints.largeFilesDir?.help).toContain("OPENCLAW_STATE_DIR");
+    expect(manifest.configSchema.properties.largeFilesDir?.description).toContain("OPENCLAW_STATE_DIR");
+  });
 });
