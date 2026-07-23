@@ -99,6 +99,10 @@ const HANDLED_CONVERSATION_ID_TABLES = new Set([
   "conversation_compaction_telemetry",
   "conversation_compaction_maintenance",
   "focus_briefs",
+  "message_transcript_anchor_trust",
+  "conversation_transcript_epochs",
+  "pending_compaction_batches",
+  "pending_summary_nodes",
 ]);
 
 const EMPTY_COUNTS: RolloverSplitCounts = {
@@ -490,6 +494,125 @@ function reparentSimpleConversationTables(db: DatabaseSync, group: SafeGroup): v
   }
 }
 
+const TRANSCRIPT_EPOCH_MODE_RANK = new Map([
+  ["verified", 0],
+  ["repairable", 1],
+  ["legacy_prefix", 2],
+  ["corrupt", 3],
+]);
+
+function getTranscriptEpochModeRank(mode: string): number {
+  return TRANSCRIPT_EPOCH_MODE_RANK.get(mode) ?? TRANSCRIPT_EPOCH_MODE_RANK.get("corrupt")!;
+}
+
+function reparentTranscriptAnchorState(db: DatabaseSync, group: SafeGroup): void {
+  if (group.sourceConversationIds.length === 0) {
+    return;
+  }
+  const sourcePlaceholders = placeholders(group.sourceConversationIds);
+  if (hasTable(db, "message_transcript_anchor_trust")) {
+    db.prepare(
+      `UPDATE message_transcript_anchor_trust
+       SET conversation_id = ?,
+           updated_at = datetime('now')
+       WHERE conversation_id IN (${sourcePlaceholders})`,
+    ).run(group.targetConversationId, ...group.sourceConversationIds);
+  }
+
+  if (!hasTable(db, "conversation_transcript_epochs")) {
+    return;
+  }
+  const epochRows = db
+    .prepare(
+      `SELECT conversation_id, migration_mode
+       FROM conversation_transcript_epochs
+       WHERE conversation_id IN (${placeholders(group.orderedConversationIds)})`,
+    )
+    .all(...group.orderedConversationIds) as Array<{
+      conversation_id: number;
+      migration_mode: string;
+    }>;
+  if (epochRows.length === 0) {
+    return;
+  }
+
+  const worstMode = epochRows.reduce(
+    (mode, row) =>
+      getTranscriptEpochModeRank(row.migration_mode) > getTranscriptEpochModeRank(mode)
+        ? row.migration_mode
+        : mode,
+    "verified",
+  );
+  const targetEpoch = epochRows.find((row) => row.conversation_id === group.targetConversationId);
+  db.prepare(
+    `DELETE FROM conversation_transcript_epochs
+     WHERE conversation_id IN (${sourcePlaceholders})`,
+  ).run(...group.sourceConversationIds);
+  const mergedMetadata = JSON.stringify({
+    reason: "rollover split repair merged transcript epoch state",
+    sourceConversationIds: group.sourceConversationIds,
+  });
+  if (targetEpoch) {
+    if (getTranscriptEpochModeRank(worstMode) > getTranscriptEpochModeRank(targetEpoch.migration_mode)) {
+      db.prepare(
+        `UPDATE conversation_transcript_epochs
+         SET migration_mode = ?,
+             metadata_json = ?,
+             updated_at = datetime('now')
+         WHERE conversation_id = ?`,
+      ).run(worstMode, mergedMetadata, group.targetConversationId);
+    }
+    return;
+  }
+
+  const targetConversation = db
+    .prepare(
+      `SELECT session_id, session_key
+       FROM conversations
+       WHERE conversation_id = ?`,
+    )
+    .get(group.targetConversationId) as { session_id: string; session_key: string | null } | undefined;
+  if (!targetConversation) {
+    throw new Error("rollover split target conversation disappeared during transcript epoch repair");
+  }
+  db.prepare(
+    `INSERT INTO conversation_transcript_epochs (
+       conversation_id,
+       session_id,
+       session_key,
+       migration_mode,
+       metadata_json
+     ) VALUES (?, ?, ?, ?, ?)`,
+  ).run(
+    group.targetConversationId,
+    targetConversation.session_id,
+    targetConversation.session_key,
+    worstMode,
+    mergedMetadata,
+  );
+}
+
+// Pending compaction batches are hidden prepared work keyed to per-conversation
+// context ordinals and source projection fingerprints. A lane merge rewrites
+// conversation ids and resequences context items, which invalidates every batch
+// in the lane (sources and target alike), so the repair drops them. Nodes are
+// deleted before batches so the delete order is valid even without cascades;
+// node link rows cascade off pending_summary_nodes.
+function deleteInvalidatedPendingCompactionState(db: DatabaseSync, group: SafeGroup): void {
+  if (!hasTable(db, "pending_compaction_batches")) {
+    return;
+  }
+  const idPlaceholders = placeholders(group.orderedConversationIds);
+  db.prepare(
+    `DELETE FROM pending_summary_nodes
+     WHERE conversation_id IN (${idPlaceholders})`,
+  ).run(...group.orderedConversationIds);
+  db.prepare(
+    `DELETE FROM pending_compaction_batches
+     WHERE conversation_id IN (${idPlaceholders})`,
+  ).run(...group.orderedConversationIds);
+}
+
 function clearSourceStateAndMarkTarget(db: DatabaseSync, group: SafeGroup): void {
   const sourcePlaceholders = placeholders(group.sourceConversationIds);
   for (const table of [
@@ -497,6 +620,9 @@ function clearSourceStateAndMarkTarget(db: DatabaseSync, group: SafeGroup): void
     "conversation_compaction_maintenance",
     "conversation_compaction_telemetry",
   ]) {
+    if (!hasTable(db, table)) {
+      continue;
+    }
     db.prepare(
       `DELETE FROM ${quoteSqlIdentifier(table)}
        WHERE conversation_id IN (${sourcePlaceholders})`,
@@ -658,6 +784,8 @@ function verifyRepairedTargets(db: DatabaseSync, targetConversationIds: number[]
 }
 
 function repairSafeGroup(db: DatabaseSync, group: SafeGroup): void {
+  deleteInvalidatedPendingCompactionState(db, group);
+  reparentTranscriptAnchorState(db, group);
   reparentMessages(db, group);
   reparentContextItems(db, group);
   reparentSimpleConversationTables(db, group);

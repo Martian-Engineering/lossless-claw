@@ -74,13 +74,6 @@ function seedFixture(): void {
       1000, 600, 650, 150, 0.75, 'default', 'previous failure',
       '2026-07-02T06:00:00.000Z');
 
-    INSERT INTO conversation_bootstrap_state (
-      conversation_id, session_file_path, last_seen_size, last_seen_mtime_ms,
-      last_processed_offset, last_processed_entry_hash, session_header_id,
-      last_processed_entry_id, fork_bounded, fork_source_message_count, updated_at
-    ) VALUES (2, '/sessions/live.jsonl', 2048, 1000, 1800, 'hash', 'header',
-      'entry-2', 1, 9, '2026-07-02T06:00:00.000Z');
-
     INSERT INTO focus_briefs (
       brief_id, conversation_id, session_key, prompt, content, status,
       token_count, target_tokens, source_context_hash, created_at, updated_at
@@ -178,7 +171,7 @@ describe("conversation selection and pagination", () => {
 });
 
 describe("getConversationDiagnostics", () => {
-  it("returns compaction, bootstrap, focus, file, context, and depth diagnostics", () => {
+  it("returns compaction, focus, file, context, and depth diagnostics", () => {
     const db = openReadOnlyDatabase(databasePath);
     const diagnostics = getConversationDiagnostics(
       db,
@@ -207,11 +200,7 @@ describe("getConversationDiagnostics", () => {
       currentTokenCount: 600,
       lastFailureSummary: "previous failure",
     });
-    expect(diagnostics.bootstrap).toMatchObject({
-      sessionFilePath: "/sessions/live.jsonl",
-      lastProcessedEntryId: "entry-2",
-      forkBounded: true,
-    });
+    expect(diagnostics.bootstrap).toBeNull();
     expect(diagnostics.focusBriefs).toMatchObject({
       count: 1,
       activeBrief: { briefId: "brief-active", tokenCount: 20 },

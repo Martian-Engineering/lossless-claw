@@ -131,10 +131,13 @@ type PassResult = {
   /** Token count of the newly created summary. */
   addedTokens: number;
 };
-type CondensedPassSkipped = {
+type LeafPassResult = PassResult & {
+  content: string;
+};
+type EmptySourcePassSkipped = {
   skipped: "empty-source";
 };
-type CondensedPassResult = PassResult | CondensedPassSkipped;
+type CondensedPassResult = PassResult | EmptySourcePassSkipped;
 type LeafChunkSelection = {
   items: ContextItemRecord[];
   rawTokensOutsideTail: number;
@@ -623,6 +626,9 @@ function extractMessagePartSummaryText(part: MessagePartRecord): string {
   return sections.join("\n\n").trim();
 }
 
+/** Store capability required to rehydrate message-parts-backed leaf source. */
+export type LeafSummaryMessageContentStore = Pick<ConversationStore, "getMessageParts">;
+
 /** Identify whether a stored message part represents a media attachment. */
 function isMediaAttachmentPart(part: CreateMessagePartInput | { partType: string; metadata: string | null }): boolean {
   if (MEDIA_ATTACHMENT_PART_TYPES.has(part.partType)) {
@@ -637,6 +643,66 @@ function isMediaAttachmentPart(part: CreateMessagePartInput | { partType: string
         ? ((metadata.raw as Record<string, unknown>).type as string).trim().toLowerCase()
         : "";
   return MEDIA_ATTACHMENT_RAW_TYPES.has(rawType);
+}
+
+function annotateLeafSummaryMediaContent(content: string, parts: MessagePartRecord[]): string {
+  const hasMediaParts = parts.some((part) => isMediaAttachmentPart(part));
+  if (!hasMediaParts) {
+    return content;
+  }
+
+  const partText = parts
+    .filter((part) => !isMediaAttachmentPart(part))
+    .map((part) => (typeof part.textContent === "string" ? part.textContent : ""))
+    .map((text) => stripEmbeddedMediaPayloads(text))
+    .map((text) => text.trim())
+    .filter(Boolean)
+    .join("\n")
+    .trim();
+  const fallbackText = extractMeaningfulMessageText(content);
+  const meaningfulText = (partText || fallbackText).trim();
+
+  if (!meaningfulText) {
+    return "[Media attachment]";
+  }
+  if (meaningfulText.includes("[with media attachment]")) {
+    return meaningfulText;
+  }
+  return `${meaningfulText} [with media attachment]`;
+}
+
+/** Resolve the sanitized message text used as source for leaf summaries. */
+export async function resolveLeafSummaryMessageContent(
+  store: LeafSummaryMessageContentStore,
+  msg: MessageRecord,
+): Promise<string> {
+  const parts = await store.getMessageParts(msg.messageId);
+  const annotatedContent = annotateLeafSummaryMediaContent(msg.content, parts);
+  const storedText = extractMeaningfulMessageText(annotatedContent);
+  if (storedText) {
+    return storedText;
+  }
+
+  if (parts.length === 0) {
+    return "";
+  }
+
+  const rehydrated = contentFromParts(
+    parts.map((part) => ({ ...part })),
+    runtimeRoleForSummary(msg.role),
+    msg.content,
+  );
+  const rehydratedText = extractMeaningfulStructuredText(rehydrated);
+  if (rehydratedText) {
+    return rehydratedText;
+  }
+
+  return parts
+    .map(extractMessagePartSummaryText)
+    .map((text) => text.trim())
+    .filter(Boolean)
+    .join("\n\n")
+    .trim();
 }
 
 // ── CompactionEngine ─────────────────────────────────────────────────────────
@@ -715,9 +781,8 @@ export class CompactionEngine {
       liveTokens > 0
         ? await this.countRawTokensOutsideFreshTail(conversationId, options?.freshTailCount)
         : undefined;
-    const projectedTokens =
-      liveTokens > 0 ? liveTokens + (rawTokensOutsideTail ?? 0) : undefined;
-    const currentTokens = Math.max(storedTokens, projectedTokens ?? liveTokens);
+    const projectedTokens = liveTokens > 0 ? Math.max(storedTokens, liveTokens) : undefined;
+    const currentTokens = Math.max(storedTokens, liveTokens);
     const threshold = Math.floor(
       resolveContextThreshold(this.config, options?.contextThreshold) * tokenBudget,
     );
@@ -865,6 +930,14 @@ export class CompactionEngine {
         tokensAfter: tokensBefore,
         condensed: false,
         authFailure: true,
+      };
+    }
+    if ("skipped" in leafResult) {
+      return {
+        actionTaken: false,
+        tokensBefore,
+        tokensAfter: tokensBefore,
+        condensed: false,
       };
     }
     // Delta tracking: compute token change from pass results instead of re-querying DB
@@ -1098,6 +1171,9 @@ export class CompactionEngine {
       );
       if (!leafResult) {
         hadAuthFailure = true;
+        break;
+      }
+      if ("skipped" in leafResult) {
         break;
       }
       const passTokensAfter = passTokensBefore - leafResult.removedTokens + leafResult.addedTokens;
@@ -1987,10 +2063,7 @@ export class CompactionEngine {
   }): Promise<{ content: string; level: CompactionLevel } | null> {
     const sourceText = typeof params.sourceText === "string" ? params.sourceText.trim() : "";
     if (!sourceText) {
-      return {
-        content: "[Truncated from 0 tokens]",
-        level: "fallback",
-      };
+      return null;
     }
     const inputTokens = Math.max(1, estimateTokens(sourceText));
     const fallbackMaxTokens =
@@ -2080,91 +2153,6 @@ export class CompactionEngine {
     return { content: summaryText, level };
   }
 
-  // ── Private: Media Annotation ────────────────────────────────────────────
-
-  /**
-   * Annotate a message's content with media context when it has file/media
-   * attachments. This gives the summarizer enough context to produce a
-   * meaningful summary instead of trying to compress raw file paths.
-   *
-   * - Media-only messages: content is replaced with "[Media attachment]".
-   * - Media-mostly messages: text is preserved and annotated with
-   *   " [with media attachment]".
-   * - Text-only messages: returned unchanged.
-   */
-  private async annotateMediaContent(
-    messageId: number,
-    content: string,
-    preloadedParts?: MessagePartRecord[],
-  ): Promise<string> {
-    const parts = preloadedParts ?? (await this.conversationStore.getMessageParts(messageId));
-    const hasMediaParts = parts.some((part) => isMediaAttachmentPart(part));
-    if (!hasMediaParts) {
-      return content;
-    }
-
-    const partText = parts
-      .filter((part) => !isMediaAttachmentPart(part))
-      .map((part) => (typeof part.textContent === "string" ? part.textContent : ""))
-      .map((text) => stripEmbeddedMediaPayloads(text))
-      .map((text) => text.trim())
-      .filter(Boolean)
-      .join("\n")
-      .trim();
-    const fallbackText = extractMeaningfulMessageText(content);
-    const meaningfulText = (partText || fallbackText).trim();
-
-    if (!meaningfulText) {
-      return "[Media attachment]";
-    }
-    if (meaningfulText.includes("[with media attachment]")) {
-      return meaningfulText;
-    }
-    return `${meaningfulText} [with media attachment]`;
-  }
-
-  /**
-   * Reconstruct the text used by leaf summaries from stored message data.
-   *
-   * Plain `messages.content` is preferred when present, but structured tool
-   * calls/results often store their actual payload in `message_parts` while the
-   * fallback content column is empty. Rehydrating through the assembler helper
-   * keeps compaction aligned with the prompt assembly path.
-   */
-  private async resolveLeafSummaryMessageContent(msg: MessageRecord): Promise<string> {
-    const parts = await this.conversationStore.getMessageParts(msg.messageId);
-    const annotatedContent = await this.annotateMediaContent(
-      msg.messageId,
-      msg.content,
-      parts,
-    );
-    const storedText = extractMeaningfulMessageText(annotatedContent);
-    if (storedText) {
-      return storedText;
-    }
-
-    if (parts.length === 0) {
-      return "";
-    }
-
-    const rehydrated = contentFromParts(
-      parts.map((part) => ({ ...part })),
-      runtimeRoleForSummary(msg.role),
-      msg.content,
-    );
-    const rehydratedText = extractMeaningfulStructuredText(rehydrated);
-    if (rehydratedText) {
-      return rehydratedText;
-    }
-
-    return parts
-      .map(extractMessagePartSummaryText)
-      .map((text) => text.trim())
-      .filter(Boolean)
-      .join("\n\n")
-      .trim();
-  }
-
   // ── Private: Leaf Pass ───────────────────────────────────────────────────
 
   /**
@@ -2176,7 +2164,7 @@ export class CompactionEngine {
     summarize: CompactionSummarizeFn,
     previousSummaryContent?: string,
     summaryModel?: string,
-  ): Promise<{ summaryId: string; level: CompactionLevel; content: string; removedTokens: number; addedTokens: number } | null> {
+  ): Promise<LeafPassResult | EmptySourcePassSkipped | null> {
     // Fetch full message content for each context item
     const messageContents: { messageId: number; content: string; createdAt: Date; tokenCount: number }[] =
       [];
@@ -2188,7 +2176,7 @@ export class CompactionEngine {
       if (msg) {
         messageContents.push({
           messageId: msg.messageId,
-          content: await this.resolveLeafSummaryMessageContent(msg),
+          content: await resolveLeafSummaryMessageContent(this.conversationStore, msg),
           createdAt: msg.createdAt,
           tokenCount: this.resolveMessageTokenCount(msg),
         });
@@ -2207,6 +2195,12 @@ export class CompactionEngine {
       })
       .filter((s): s is string => s !== null)
       .join("\n\n");
+    if (!concatenated.trim()) {
+      this.log.warn(
+        `[lcm] leaf compaction skipped summary write; conversationId=${conversationId}; chunkMessages=${messageContents.length}; sourceMessages=${messageItems.length}; sanitized_source=empty`,
+      );
+      return { skipped: "empty-source" };
+    }
     const fileIds = dedupeOrderedIds(
       messageContents.flatMap((message) => extractFileIdsFromContent(message.content)),
     );

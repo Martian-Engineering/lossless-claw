@@ -86,15 +86,7 @@ function makeDeps(overrides?: Partial<LcmDependencies>): LcmDependencies {
       delegationTimeoutMs: 120000,
       timezone: "UTC",
       pruneHeartbeatOk: false,
-      transcriptGcEnabled: false,
       proactiveThresholdCompactionMode: "deferred",
-      autoRotateSessionFiles: {
-        enabled: true,
-        createBackups: false,
-        sizeBytes: 2 * 1024 * 1024,
-        startup: "rotate",
-        runtime: "rotate",
-      },
       summaryMaxOverageFactor: 3,
     },
     complete: vi.fn(),
@@ -107,7 +99,6 @@ function makeDeps(overrides?: Partial<LcmDependencies>): LcmDependencies {
     buildSubagentSystemPrompt: () => "subagent prompt",
     readLatestAssistantReply,
     resolveAgentDir: () => "/tmp/openclaw-agent",
-    resolveSessionIdFromSessionKey: async () => undefined,
     agentLaneSubagent: "subagent",
     log: {
       info: vi.fn(),

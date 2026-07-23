@@ -1,0 +1,584 @@
+// Pending summary compaction proof runner exercises the issue-807 lifecycle.
+import { DatabaseSync } from "node:sqlite";
+import { pathToFileURL } from "node:url";
+import { getLcmDbFeatures } from "../../src/db/features.js";
+import { runLcmMigrations } from "../../src/db/migration.js";
+import { PendingCompactionCoordinator } from "../../src/pending-summary-coordinator.js";
+import { ConversationStore } from "../../src/store/conversation-store.js";
+import { PendingSummaryStore } from "../../src/store/pending-summary-store.js";
+import { SummaryStore, type ContextItemRecord } from "../../src/store/summary-store.js";
+
+type ProofCheckpoint = {
+  canonicalSummaries: number;
+  contextItems: Array<Pick<ContextItemRecord, "itemType" | "messageId" | "ordinal" | "summaryId">>;
+  label: string;
+  pendingNodes: Array<{
+    canonicalSummaryId: string | null;
+    depth: number;
+    kind: string;
+    nodeId: string;
+    ordinalEnd: number;
+    ordinalStart: number;
+    status: string;
+  }>;
+  summarizeCalls: Array<{ isCondensed: boolean; sourceText: string }>;
+};
+
+export type PendingSummaryCompactionProofReport = {
+  batchId: string;
+  checkpoints: ProofCheckpoint[];
+  failures: string[];
+  ok: boolean;
+  publishedSummaryId: string | null;
+};
+
+type Stores = {
+  conversationStore: ConversationStore;
+  pendingSummaryStore: PendingSummaryStore;
+  summaryStore: SummaryStore;
+};
+
+function createStores(): Stores & { db: DatabaseSync } {
+  const db = new DatabaseSync(":memory:");
+  db.exec("PRAGMA foreign_keys = ON");
+  const { fts5Available } = getLcmDbFeatures(db);
+  runLcmMigrations(db, { fts5Available });
+  return {
+    db,
+    conversationStore: new ConversationStore(db, { fts5Available }),
+    pendingSummaryStore: new PendingSummaryStore(db),
+    summaryStore: new SummaryStore(db, { fts5Available }),
+  };
+}
+
+export type PendingSummaryStaleRecoveryProofReport = {
+  failures: string[];
+  ok: boolean;
+  publishedSummaryContent: string | null;
+  replannedBatchId: string | null;
+  staleBatchId: string | null;
+};
+
+/**
+ * Prove the resilience arc: prepared work whose sources change in place is
+ * rejected as stale (never published), a fresh batch replans the same
+ * projection, and the recovery publish reflects the mutated sources.
+ */
+export async function runPendingSummaryStaleRecoveryProof(): Promise<PendingSummaryStaleRecoveryProofReport> {
+  const { db, ...stores } = createStores();
+  const failures: string[] = [];
+
+  const conversation = await stores.conversationStore.createConversation({
+    sessionId: "pending-summary-stale-proof-session",
+    sessionKey: "agent:main:pending-summary-stale-proof",
+  });
+  const messages = await stores.conversationStore.createMessagesBulk([
+    {
+      conversationId: conversation.conversationId,
+      seq: 1,
+      role: "user",
+      content: "original source alpha",
+      tokenCount: 10,
+    },
+    {
+      conversationId: conversation.conversationId,
+      seq: 2,
+      role: "assistant",
+      content: "original source bravo",
+      tokenCount: 10,
+    },
+    {
+      conversationId: conversation.conversationId,
+      seq: 3,
+      role: "user",
+      content: "fresh tail stays raw",
+      tokenCount: 10,
+    },
+  ]);
+  await stores.summaryStore.appendContextMessages(
+    conversation.conversationId,
+    messages.map((message) => message.messageId),
+  );
+
+  const coordinator = new PendingCompactionCoordinator({
+    ...stores,
+    model: "proof-model",
+    leaseOwner: "proof-worker",
+    config: {
+      freshTailCount: 1,
+      leafChunkTokens: 20,
+      condensedMinFanout: 99,
+      condensedMinSourceTokens: 1,
+      condensedChunkTokens: 100,
+    },
+    summarize: async (sourceText) => `stale-proof summary over:\n${sourceText}`,
+  });
+  const runOnce = () => coordinator.runOnce({ conversationId: conversation.conversationId });
+
+  // Prepare the single leaf covering the two compactable messages.
+  const planned = await runOnce();
+  if (planned.status !== "planned") {
+    failures.push(`expected planned step, got ${planned.status}`);
+    return { failures, ok: false, publishedSummaryContent: null, replannedBatchId: null, staleBatchId: null };
+  }
+  const prepared = await runOnce();
+  if (prepared.status !== "prepared") {
+    failures.push(`expected prepared step, got ${prepared.status}`);
+  }
+
+  // Mutate a summarized source message IN PLACE. The prepared content no
+  // longer matches its sources, so the batch must never publish.
+  db.prepare(`UPDATE messages SET content = ?, token_count = ? WHERE message_id = ?`).run(
+    "mutated source truth",
+    12,
+    messages[0]!.messageId,
+  );
+
+  const staleStep = await runOnce();
+  if (staleStep.status !== "stale") {
+    failures.push(`expected stale step after source mutation, got ${staleStep.status}`);
+  }
+  const staleBatch = await stores.pendingSummaryStore.getBatch(planned.batchId);
+  if (staleBatch?.status !== "stale") {
+    failures.push(`stale batch should be marked stale, got ${staleBatch?.status}`);
+  }
+  const staleNodes = await stores.pendingSummaryStore.getNodesByBatch(planned.batchId);
+  if (!staleNodes.every((node) => node.status === "stale")) {
+    failures.push("all nodes of the stale batch should be marked stale");
+  }
+  if ((await stores.summaryStore.getSummariesByConversation(conversation.conversationId)).length !== 0) {
+    failures.push("stale rejection must not write canonical summaries");
+  }
+
+  // Recovery: a fresh batch replans the same projection and publishes work
+  // built from the mutated sources.
+  const replanned = await runOnce();
+  if (replanned.status !== "planned") {
+    failures.push(`expected replanned step, got ${replanned.status}`);
+    return { failures, ok: false, publishedSummaryContent: null, replannedBatchId: null, staleBatchId: planned.batchId };
+  }
+  if (replanned.batchId === planned.batchId) {
+    failures.push("replan should create a new batch id");
+  }
+  const reprepared = await runOnce();
+  if (reprepared.status !== "prepared") {
+    failures.push(`expected re-prepared step, got ${reprepared.status}`);
+  }
+  const published = await runOnce();
+  if (published.status !== "published") {
+    failures.push(`expected recovery publish, got ${published.status}`);
+  }
+
+  const contextItems = await stores.summaryStore.getContextItems(conversation.conversationId);
+  const summaryItem = contextItems.find((item) => item.itemType === "summary");
+  const publishedSummary = summaryItem?.summaryId
+    ? await stores.summaryStore.getSummary(summaryItem.summaryId)
+    : null;
+  if (!publishedSummary?.content.includes("mutated source truth")) {
+    failures.push("recovery publish should summarize the mutated source content");
+  }
+  if (publishedSummary?.content.includes("original source alpha")) {
+    failures.push("recovery publish must not reuse stale pre-mutation content");
+  }
+
+  return {
+    failures,
+    ok: failures.length === 0,
+    publishedSummaryContent: publishedSummary?.content ?? null,
+    replannedBatchId: replanned.batchId,
+    staleBatchId: planned.batchId,
+  };
+}
+
+/** Run an isolated proof that hidden pending summaries publish atomically. */
+export async function runPendingSummaryCompactionProof(): Promise<PendingSummaryCompactionProofReport> {
+  const stores = createStores();
+  const checkpoints: ProofCheckpoint[] = [];
+  const failures: string[] = [];
+  const summarizeCalls: Array<{ isCondensed: boolean; sourceText: string }> = [];
+  let batchId = "";
+
+  const conversation = await stores.conversationStore.createConversation({
+    sessionId: "pending-summary-proof-session",
+    sessionKey: "agent:main:pending-summary-proof",
+  });
+  const messages = await stores.conversationStore.createMessagesBulk([
+    {
+      conversationId: conversation.conversationId,
+      seq: 1,
+      role: "user",
+      content: "alpha raw message to compact",
+      tokenCount: 4,
+    },
+    {
+      conversationId: conversation.conversationId,
+      seq: 2,
+      role: "assistant",
+      content: "bravo raw message to compact",
+      tokenCount: 4,
+    },
+      {
+        conversationId: conversation.conversationId,
+        seq: 3,
+        role: "user",
+        content: "charlie raw message to compact",
+        tokenCount: 8,
+      },
+    {
+      conversationId: conversation.conversationId,
+      seq: 4,
+      role: "assistant",
+      content: "delta raw fresh tail",
+      tokenCount: 8,
+    },
+  ]);
+  await stores.summaryStore.appendContextMessages(
+    conversation.conversationId,
+    messages.map((message) => message.messageId),
+  );
+
+  const coordinator = new PendingCompactionCoordinator({
+    ...stores,
+    model: "proof-model",
+    leaseOwner: "proof-worker",
+    config: {
+      freshTailCount: 1,
+      leafChunkTokens: 8,
+      condensedMinFanout: 2,
+      condensedMinSourceTokens: 1,
+      condensedChunkTokens: 100,
+    },
+    summarize: async (sourceText, _aggressive, options) => {
+      const isCondensed = options?.isCondensed === true;
+      summarizeCalls.push({ isCondensed, sourceText });
+      return isCondensed
+        ? `proof condensed summary over:\n${sourceText}`
+        : `proof leaf summary over:\n${sourceText}`;
+    },
+  });
+
+  const record = async (label: string): Promise<void> => {
+    const activeBatch = await stores.pendingSummaryStore.getActiveBatchForConversation(
+      conversation.conversationId,
+    );
+    if (activeBatch) {
+      batchId = activeBatch.batchId;
+    }
+    const pendingNodes = batchId
+      ? await stores.pendingSummaryStore.getNodesByBatch(batchId)
+      : [];
+    const canonicalSummaries = await stores.summaryStore.getSummariesByConversation(
+      conversation.conversationId,
+    );
+    checkpoints.push({
+      label,
+      canonicalSummaries: canonicalSummaries.length,
+      contextItems: (await stores.summaryStore.getContextItems(conversation.conversationId)).map(
+        (item) => ({
+          itemType: item.itemType,
+          messageId: item.messageId,
+          ordinal: item.ordinal,
+          summaryId: item.summaryId,
+        }),
+      ),
+      pendingNodes: pendingNodes.map((node) => ({
+        canonicalSummaryId: node.canonicalSummaryId,
+        depth: node.depth,
+        kind: node.kind,
+        nodeId: node.nodeId,
+        ordinalEnd: node.ordinalEnd,
+        ordinalStart: node.ordinalStart,
+        status: node.status,
+      })),
+      summarizeCalls: [...summarizeCalls],
+    });
+  };
+
+  await record("seeded-raw-context");
+  const planned = await coordinator.runOnce({
+    conversationId: conversation.conversationId,
+    sessionKey: "agent:main:pending-summary-proof",
+  });
+  if (planned.status !== "planned") {
+    failures.push(`expected planned step, got ${planned.status}`);
+  }
+  await record("after-plan");
+
+  await coordinator.runOnce({ conversationId: conversation.conversationId });
+  await coordinator.runOnce({ conversationId: conversation.conversationId });
+  await record("after-leaf-preparation");
+
+  await coordinator.runOnce({ conversationId: conversation.conversationId });
+  await record("after-condensed-preparation");
+
+  const ready = await coordinator.runOnce({
+    conversationId: conversation.conversationId,
+    publishPolicy: "prepare-only",
+  });
+  if (ready.status !== "ready") {
+    failures.push(`expected ready step, got ${ready.status}`);
+  }
+  await record("after-ready-no-publish");
+
+  const [extensionMessage] = await stores.conversationStore.createMessagesBulk([
+    {
+      conversationId: conversation.conversationId,
+      seq: 5,
+      role: "user",
+      content: "echo raw message extends compactable prefix",
+      tokenCount: 4,
+    },
+  ]);
+  await stores.summaryStore.appendContextMessage(
+    conversation.conversationId,
+    extensionMessage!.messageId,
+  );
+
+  const extended = await coordinator.runOnce({
+    conversationId: conversation.conversationId,
+    publishPolicy: "prepare-only",
+  });
+  if (extended.status !== "planned") {
+    failures.push(`expected extension planned step, got ${extended.status}`);
+  }
+  await record("after-tail-growth-extension-plan");
+
+  await coordinator.runOnce({
+    conversationId: conversation.conversationId,
+    publishPolicy: "prepare-only",
+  });
+  await record("after-extension-leaf-preparation");
+
+  await coordinator.runOnce({
+    conversationId: conversation.conversationId,
+    publishPolicy: "prepare-only",
+  });
+  await record("after-extension-condensed-preparation");
+
+  const extendedReady = await coordinator.runOnce({
+    conversationId: conversation.conversationId,
+    publishPolicy: "prepare-only",
+  });
+  if (extendedReady.status !== "ready") {
+    failures.push(`expected extended ready step, got ${extendedReady.status}`);
+  }
+  await record("after-extension-ready-no-publish");
+
+  const published = await coordinator.runOnce({ conversationId: conversation.conversationId });
+  if (published.status !== "published") {
+    failures.push(`expected published step, got ${published.status}`);
+  }
+  await record("after-publish");
+
+  const publishedContext = await stores.summaryStore.getContextItems(conversation.conversationId);
+  const publishedSummaryId = publishedContext[0]?.summaryId ?? null;
+  const publishedSummary = publishedSummaryId
+    ? await stores.summaryStore.getSummary(publishedSummaryId)
+    : null;
+  const publishedParents = publishedSummaryId
+    ? await stores.summaryStore.getSummaryParents(publishedSummaryId)
+    : [];
+
+  validateProof({ checkpoints, failures, publishedParents, publishedSummary });
+  return {
+    batchId,
+    checkpoints,
+    failures,
+    ok: failures.length === 0,
+    publishedSummaryId,
+  };
+}
+
+function validateProof(input: {
+  checkpoints: ProofCheckpoint[];
+  failures: string[];
+  publishedParents: unknown[];
+  publishedSummary: { content: string; kind: string; depth: number } | null;
+}): void {
+  const byLabel = new Map(input.checkpoints.map((checkpoint) => [checkpoint.label, checkpoint]));
+  for (const label of [
+    "seeded-raw-context",
+    "after-plan",
+    "after-leaf-preparation",
+    "after-condensed-preparation",
+    "after-ready-no-publish",
+    "after-tail-growth-extension-plan",
+    "after-extension-leaf-preparation",
+    "after-extension-condensed-preparation",
+    "after-extension-ready-no-publish",
+  ]) {
+    const checkpoint = byLabel.get(label);
+    if (!checkpoint) {
+      input.failures.push(`missing checkpoint ${label}`);
+      continue;
+    }
+    if (checkpoint.canonicalSummaries !== 0) {
+      input.failures.push(`${label} wrote canonical summaries before publish`);
+    }
+    if (!checkpoint.contextItems.every((item) => item.itemType === "message")) {
+      input.failures.push(`${label} changed canonical context before publish`);
+    }
+  }
+
+  const afterPlan = byLabel.get("after-plan");
+  if (afterPlan?.pendingNodes.length !== 3) {
+    input.failures.push("after-plan should contain two leaf nodes and one condensed node");
+  }
+  const afterLeaves = byLabel.get("after-leaf-preparation");
+  if (
+    afterLeaves?.pendingNodes.filter((node) => node.kind === "leaf" && node.status === "ready")
+      .length !== 2
+  ) {
+    input.failures.push("after-leaf-preparation should have two ready leaves");
+  }
+  if (
+    afterLeaves?.pendingNodes.some(
+      (node) => node.kind === "condensed" && node.status !== "planned",
+    )
+  ) {
+    input.failures.push("condensed parent should stay planned until leaves are ready");
+  }
+
+  const afterCondensed = byLabel.get("after-condensed-preparation");
+  const condensedCall = afterCondensed?.summarizeCalls.find((call) => call.isCondensed);
+  if (!condensedCall?.sourceText.includes("proof leaf summary over:")) {
+    input.failures.push("condensed summary did not use hidden leaf summaries as source");
+  }
+  if (
+    afterCondensed?.pendingNodes.filter((node) => node.kind === "condensed" && node.status === "ready")
+      .length !== 1
+  ) {
+    input.failures.push("after-condensed-preparation should have one ready condensed parent");
+  }
+
+  const afterReady = byLabel.get("after-ready-no-publish");
+  if (
+    afterReady?.pendingNodes.filter((node) => node.status === "ready").length !== 3
+  ) {
+    input.failures.push("after-ready-no-publish should leave all pending nodes ready");
+  }
+  if (afterReady?.canonicalSummaries !== 0) {
+    input.failures.push("prepare-only ready step should not publish canonical summaries");
+  }
+  if (!afterReady?.contextItems.every((item) => item.itemType === "message")) {
+    input.failures.push("prepare-only ready step should not swap canonical context");
+  }
+
+  const afterExtensionPlan = byLabel.get("after-tail-growth-extension-plan");
+  if (afterExtensionPlan?.pendingNodes.length !== 4) {
+    input.failures.push("after-tail-growth-extension-plan should add only the suffix leaf");
+  }
+  if (afterExtensionPlan?.pendingNodes.filter((node) => node.status === "ready").length !== 3) {
+    input.failures.push("after-tail-growth-extension-plan should preserve the original ready frontier");
+  }
+  if (
+    afterExtensionPlan?.pendingNodes.filter(
+      (node) => node.status === "planned" && node.ordinalStart === 3 && node.ordinalEnd === 3,
+    ).length !== 1
+  ) {
+    input.failures.push("after-tail-growth-extension-plan should plan the newly compactable suffix leaf");
+  }
+  if (
+    afterExtensionPlan?.pendingNodes.some(
+      (node) => node.kind === "condensed" && node.status === "planned",
+    )
+  ) {
+    input.failures.push(
+      "after-tail-growth-extension-plan must not rebuild a condensed parent over the ready prefix",
+    );
+  }
+
+  const afterExtensionLeaves = byLabel.get("after-extension-leaf-preparation");
+  if (
+    !afterExtensionLeaves?.pendingNodes.some(
+      (node) =>
+        node.kind === "leaf" &&
+        node.status === "ready" &&
+        node.ordinalStart === 3 &&
+        node.ordinalEnd === 3,
+    )
+  ) {
+    input.failures.push("after-extension-leaf-preparation should ready the suffix leaf");
+  }
+
+  const afterExtensionCondensed = byLabel.get("after-extension-condensed-preparation");
+  const extensionCondensedCalls =
+    afterExtensionCondensed?.summarizeCalls.filter((call) => call.isCondensed) ?? [];
+  const rawLeafCalls =
+    afterExtensionCondensed?.summarizeCalls.filter((call) => !call.isCondensed) ?? [];
+  if (
+    !afterExtensionCondensed?.pendingNodes.some(
+      (node) =>
+        node.kind === "condensed" &&
+        node.status === "ready" &&
+        node.ordinalStart === 0 &&
+        node.ordinalEnd === 2,
+    )
+  ) {
+    input.failures.push("after-extension-condensed-preparation should keep the prefix condensed parent ready");
+  }
+  if (rawLeafCalls.length !== 3) {
+    input.failures.push("extension should prepare only the newly compactable suffix leaf");
+  }
+  if (
+    extensionCondensedCalls.some((call) =>
+      call.sourceText.includes("delta raw fresh tail"),
+    )
+  ) {
+    input.failures.push("extension must not re-summarize a condensed parent for the tiny suffix");
+  }
+
+  const afterExtensionReady = byLabel.get("after-extension-ready-no-publish");
+  if (afterExtensionReady?.canonicalSummaries !== 0) {
+    input.failures.push("extended prepare-only ready step should not publish canonical summaries");
+  }
+  if (!afterExtensionReady?.contextItems.every((item) => item.itemType === "message")) {
+    input.failures.push("extended prepare-only ready step should not swap canonical context");
+  }
+
+  const afterPublish = byLabel.get("after-publish");
+  if (afterPublish?.canonicalSummaries !== 4) {
+    input.failures.push("after-publish should promote three leaves plus the condensed prefix summary");
+  }
+  if (
+    afterPublish?.contextItems.length !== 3 ||
+    afterPublish.contextItems[0]?.itemType !== "summary" ||
+    afterPublish.contextItems[1]?.itemType !== "summary" ||
+    afterPublish.contextItems[2]?.itemType !== "message"
+  ) {
+    input.failures.push("after-publish should swap the mixed-depth frontier and keep fresh tail raw");
+  }
+  const promotedCoverage = afterPublish?.pendingNodes.filter(
+    (node) => node.status === "promoted",
+  );
+  if (
+    promotedCoverage?.length !== 4 ||
+    !promotedCoverage.some(
+      (node) => node.kind === "condensed" && node.ordinalStart === 0 && node.ordinalEnd === 2,
+    ) ||
+    !promotedCoverage.some(
+      (node) => node.kind === "leaf" && node.ordinalStart === 3 && node.ordinalEnd === 3,
+    )
+  ) {
+    input.failures.push("after-publish should promote the mixed-depth frontier and its leaf ancestors");
+  }
+  if (
+    !input.publishedSummary ||
+    input.publishedSummary.kind !== "condensed" ||
+    input.publishedSummary.depth !== 1
+  ) {
+    input.failures.push("published frontier summary should be the condensed prefix parent");
+  }
+  if (input.publishedParents.length !== 2) {
+    input.failures.push("published condensed summary should link to its two leaf parents");
+  }
+}
+
+if (import.meta.url === pathToFileURL(process.argv[1] ?? "").href) {
+  const report = await runPendingSummaryCompactionProof();
+  const staleRecoveryReport = await runPendingSummaryStaleRecoveryProof();
+  process.stdout.write(`${JSON.stringify({ report, staleRecoveryReport }, null, 2)}\n`);
+  if (!report.ok || !staleRecoveryReport.ok) {
+    process.exitCode = 1;
+  }
+}

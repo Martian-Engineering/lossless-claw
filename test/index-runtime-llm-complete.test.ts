@@ -11,6 +11,7 @@ type RuntimeLlmComplete = ReturnType<typeof vi.fn>;
 
 function buildApi(params?: {
   runtimeLlmComplete?: RuntimeLlmComplete;
+  pluginConfig?: Record<string, unknown>;
 }): {
   api: OpenClawPluginApi;
   getFactory: () => RegisteredEngineFactory;
@@ -48,6 +49,7 @@ function buildApi(params?: {
     pluginConfig: {
       enabled: true,
       dbPath,
+      ...(params?.pluginConfig ?? {}),
     },
     runtime,
     logger: {
@@ -106,6 +108,10 @@ function getRegisteredEngine(api: OpenClawPluginApi, getFactory: () => Registere
         temperature?: number;
         reasoningIfSupported?: string;
       }) => Promise<CompletionResult>;
+      resolveModel: (modelRef?: string, providerHint?: string) => {
+        provider: string;
+        model: string;
+      };
     };
     config: { databasePath: string };
   };
@@ -194,6 +200,28 @@ describe("createLcmDependencies.complete runtime.llm bridge", () => {
     }
   });
 
+  it("resolves configured fallback provider candidates instead of the primary summary model", async () => {
+    const { api, getFactory, dbPath } = buildApi({
+      pluginConfig: {
+        summaryModel: "openai/gpt-5.5",
+        fallbackProviders: [{ provider: "minimax", model: "MiniMax-M2.7" }],
+      },
+    });
+    const engine = getRegisteredEngine(api, getFactory);
+
+    try {
+      expect(engine.deps.resolveModel("openai/gpt-5.5", "openai")).toEqual({
+        provider: "openai",
+        model: "gpt-5.5",
+      });
+      expect(engine.deps.resolveModel("minimax/MiniMax-M2.7", "minimax")).toEqual({
+        provider: "minimax",
+        model: "MiniMax-M2.7",
+      });
+    } finally {
+      closeLcmConnection(dbPath);
+    }
+  });
 
   it("omits agentId for plugin-wide runtime llm even when deps.complete receives one", async () => {
     const runtimeLlmComplete = vi.fn(async () => ({

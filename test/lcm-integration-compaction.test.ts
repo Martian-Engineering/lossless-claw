@@ -365,6 +365,58 @@ describe("LCM integration: compaction", () => {
     expect(leafSummary?.sourceMessageTokenCount).toBe(520);
   });
 
+  it("skips leaf persistence when structured source projects to empty text", async () => {
+    const emptySourceEngine = new CompactionEngine(convStore as any, sumStore as any, {
+      ...defaultCompactionConfig,
+      freshTailCount: 0,
+      leafChunkTokens: 1_000,
+    });
+    await convStore.createConversation({ sessionId: "empty-structured-source-session" });
+
+    const toolResult = await convStore.createMessage({
+      conversationId: CONV_ID,
+      seq: 1,
+      role: "tool",
+      content: JSON.stringify({
+        workers: [
+          {
+            session_id: "worker-1",
+            status: "running",
+            project_path: "/tmp/project",
+          },
+        ],
+        count: 1,
+      }),
+      tokenCount: 300,
+    });
+    await sumStore.appendContextMessage(CONV_ID, toolResult.messageId);
+
+    const summarize = vi.fn(async () => "should not be called");
+    const result = await emptySourceEngine.compactLeaf({
+      conversationId: CONV_ID,
+      tokenBudget: 10_000,
+      summarize,
+      force: true,
+    });
+
+    expect(result.actionTaken).toBe(false);
+    expect(result.authFailure).toBeUndefined();
+    expect(summarize).not.toHaveBeenCalled();
+    expect(sumStore._summaries.find((summary) => summary.kind === "leaf")).toBeUndefined();
+    expect(
+      sumStore._summaries.some((summary) => summary.content.includes("[Truncated from 0 tokens]")),
+    ).toBe(false);
+
+    const sweepResult = await emptySourceEngine.compactFullSweep({
+      conversationId: CONV_ID,
+      tokenBudget: 10_000,
+      summarize,
+      force: true,
+    });
+    expect(sweepResult.actionTaken).toBe(false);
+    expect(sweepResult.authFailure).toBeUndefined();
+  });
+
   it("leaf-trigger accounting respects fresh tail token caps", async () => {
     const tokenAwareEngine = new CompactionEngine(convStore as any, sumStore as any, {
       ...defaultCompactionConfig,
@@ -2032,7 +2084,7 @@ describe("LCM integration: compaction", () => {
     });
   });
 
-  it("evaluate compacts when observed tokens plus raw backlog exceed the threshold", async () => {
+  it("evaluate does not add raw backlog to an observed projection count", async () => {
     const backlogEngine = new CompactionEngine(convStore as any, sumStore as any, {
       ...defaultCompactionConfig,
       freshTailCount: 1,
@@ -2044,13 +2096,13 @@ describe("LCM integration: compaction", () => {
 
     const decision = await backlogEngine.evaluate(CONV_ID, 600, 300);
     expect(decision).toMatchObject({
-      shouldCompact: true,
-      reason: "threshold",
+      shouldCompact: false,
+      reason: "none",
       storedTokens: 300,
       observedTokens: 300,
       rawTokensOutsideTail: 200,
-      projectedTokens: 500,
-      currentTokens: 500,
+      projectedTokens: 300,
+      currentTokens: 300,
       threshold: 450,
     });
   });
@@ -2072,8 +2124,8 @@ describe("LCM integration: compaction", () => {
       storedTokens: 200,
       observedTokens: 250,
       rawTokensOutsideTail: 100,
-      projectedTokens: 350,
-      currentTokens: 350,
+      projectedTokens: 250,
+      currentTokens: 250,
       threshold: 450,
     });
   });
@@ -2201,4 +2253,3 @@ describe("LCM integration: compaction", () => {
 // ═════════════════════════════════════════════════════════════════════════════
 // Test Suite: Full-sweep bounds (iteration cap + wall-clock deadline)
 // ═════════════════════════════════════════════════════════════════════════════
-

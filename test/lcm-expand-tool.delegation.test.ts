@@ -97,9 +97,6 @@ describe("runDelegatedExpansionLoop recursion guard", () => {
     const getConversationBySessionId = vi.fn(async () => ({ conversationId: 42 }));
 
     const result = await resolveRequesterConversationScopeId({
-      deps: {
-        resolveSessionIdFromSessionKey: vi.fn(async () => "archived-runtime-session"),
-      },
       requesterSessionKey: "agent:main:main",
       lcm: {
         getConversationStore: () => ({
@@ -111,10 +108,6 @@ describe("runDelegatedExpansionLoop recursion guard", () => {
 
     expect(result).toBeUndefined();
     expect(getConversationForSession).toHaveBeenCalledWith({
-      sessionKey: "agent:main:main",
-    });
-    expect(getConversationForSession).toHaveBeenCalledWith({
-      sessionId: "archived-runtime-session",
       sessionKey: "agent:main:main",
     });
     expect(getConversationBySessionId).not.toHaveBeenCalled();

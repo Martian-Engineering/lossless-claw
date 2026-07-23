@@ -31,11 +31,12 @@ import type {
   RuntimeLlmCompleteFn,
   RuntimeLlmModelOverride,
   RuntimeCompactionDelegateFn,
-  StartupSessionFileCandidate,
+  SessionTranscriptReadTarget,
+  VisibleSessionTranscriptMessageEntry,
 } from "../types.js";
 import { listConfiguredAgentIds, normalizeAgentId } from "./openclaw-agent-ids.js";
 
-const MIN_CONTEXT_ENGINE_OPENCLAW_VERSION = "2026.5.28";
+const MIN_CONTEXT_ENGINE_OPENCLAW_VERSION = "2026.7.2-beta.2";
 
 type PluginSdkCoreModule = {
   delegateCompactionToRuntime?: RuntimeCompactionDelegateFn;
@@ -96,33 +97,6 @@ function createRuntimeCompactionDelegate(log: LcmDependencies["log"]): RuntimeCo
   };
 }
 
-type RuntimeSessionStoreEntry = {
-  sessionId?: unknown;
-  sessionFile?: unknown;
-  totalTokens?: unknown;
-  totalTokensFresh?: unknown;
-  inputTokens?: unknown;
-  input?: unknown;
-  promptTokens?: unknown;
-  prompt_tokens?: unknown;
-  cacheRead?: unknown;
-  cache_read?: unknown;
-  cacheWrite?: unknown;
-  cache_write?: unknown;
-  [key: string]: unknown;
-};
-
-type RuntimeAgentSessionApi = {
-  resolveStorePath: (store?: string, opts?: { agentId?: string }) => string;
-  loadSessionStore: (storePath: string) => Record<string, RuntimeSessionStoreEntry | undefined>;
-  resolveSessionFilePath: (
-    sessionId: string,
-    entry?: RuntimeSessionStoreEntry,
-    opts?: { agentId?: string; storePath?: string },
-  ) => string;
-};
-type RuntimeAgentSessionApiCandidate = Partial<RuntimeAgentSessionApi>;
-
 type RuntimeConfigSnapshotApi = {
   current?: () => unknown;
   loadConfig?: () => unknown;
@@ -142,8 +116,19 @@ type MemorySupplementModule = {
   buildMemorySystemPromptAddition?: unknown;
 };
 
+type ReadVisibleSessionTranscriptMessageEntries = (
+  target: SessionTranscriptReadTarget,
+) => Promise<VisibleSessionTranscriptMessageEntry[]>;
+
+type SessionTranscriptRuntimeModule = {
+  readVisibleSessionTranscriptMessageEntries?: unknown;
+};
+
 let buildMemorySystemPromptAdditionPromise:
   | Promise<BuildMemorySystemPromptAddition>
+  | undefined;
+let readVisibleSessionTranscriptMessageEntriesPromise:
+  | Promise<ReadVisibleSessionTranscriptMessageEntries>
   | undefined;
 
 /** Return the OpenClaw helper that renders active memory supplements for context engines. */
@@ -166,8 +151,26 @@ async function loadBuildMemorySystemPromptAdditionModule(): Promise<BuildMemoryS
     }
   }
   throw new Error(
-    "[lcm] OpenClaw buildMemorySystemPromptAddition is unavailable; install OpenClaw >=2026.5.28.",
+    `[lcm] OpenClaw buildMemorySystemPromptAddition is unavailable; install OpenClaw >=${MIN_CONTEXT_ENGINE_OPENCLAW_VERSION}.`,
     { cause: importErrors[0] },
+  );
+}
+
+/** Return OpenClaw's branch-safe visible transcript projection helper. */
+async function loadReadVisibleSessionTranscriptMessageEntries(): Promise<ReadVisibleSessionTranscriptMessageEntries> {
+  readVisibleSessionTranscriptMessageEntriesPromise ??=
+    loadReadVisibleSessionTranscriptMessageEntriesModule();
+  return readVisibleSessionTranscriptMessageEntriesPromise;
+}
+
+/** Import the transcript projection helper from the supported OpenClaw SDK surface. */
+async function loadReadVisibleSessionTranscriptMessageEntriesModule(): Promise<ReadVisibleSessionTranscriptMessageEntries> {
+  const mod = (await import("openclaw/plugin-sdk/session-transcript-runtime")) as SessionTranscriptRuntimeModule;
+  if (typeof mod.readVisibleSessionTranscriptMessageEntries === "function") {
+    return mod.readVisibleSessionTranscriptMessageEntries as ReadVisibleSessionTranscriptMessageEntries;
+  }
+  throw new Error(
+    `[lcm] OpenClaw readVisibleSessionTranscriptMessageEntries is unavailable; install OpenClaw >=${MIN_CONTEXT_ENGINE_OPENCLAW_VERSION}.`,
   );
 }
 
@@ -276,26 +279,6 @@ function readRuntimeConfigSnapshot(api: OpenClawPluginApi): unknown {
   return undefined;
 }
 
-/** Return the runtime session registry API when the host exposes it. */
-function getRuntimeAgentSessionApi(api: OpenClawPluginApi): RuntimeAgentSessionApi | undefined {
-  const runtime = api.runtime as unknown as {
-    agent?: { session?: RuntimeAgentSessionApiCandidate };
-    channel?: { session?: RuntimeAgentSessionApiCandidate };
-  };
-  const sessionApi = runtime.agent?.session ?? runtime.channel?.session;
-  if (!sessionApi) {
-    return undefined;
-  }
-  if (
-    typeof sessionApi.resolveStorePath !== "function" ||
-    typeof sessionApi.loadSessionStore !== "function" ||
-    typeof sessionApi.resolveSessionFilePath !== "function"
-  ) {
-    return undefined;
-  }
-  return sessionApi as RuntimeAgentSessionApi;
-}
-
 /** Read a string value from an unknown object field. */
 function getStringField(
   record: Record<string, unknown> | undefined,
@@ -303,43 +286,6 @@ function getStringField(
 ): string | undefined {
   const value = record?.[key];
   return typeof value === "string" && value.trim() ? value.trim() : undefined;
-}
-
-/** Normalize non-negative numeric counters from runtime session store entries. */
-function toNonNegativeInteger(value: unknown): number | undefined {
-  if (typeof value !== "number" || !Number.isFinite(value) || value < 0) {
-    return undefined;
-  }
-  return Math.floor(value);
-}
-
-const RECOVERED_SYSTEM_PROMPT_TOKEN_FLOOR = 4_096;
-
-/** Estimate session total tokens from persisted LCM context + host usage counters. */
-function estimateRecoveredSessionTotalTokens(params: {
-  contextTokenEstimate: number;
-  sessionEntry: RuntimeSessionStoreEntry;
-}): number {
-  const entry = params.sessionEntry;
-  const inputTokens =
-    toNonNegativeInteger(entry.inputTokens)
-    ?? toNonNegativeInteger(entry.input)
-    ?? toNonNegativeInteger(entry.promptTokens)
-    ?? toNonNegativeInteger(entry.prompt_tokens)
-    ?? 0;
-  const cacheRead = toNonNegativeInteger(entry.cacheRead) ?? toNonNegativeInteger(entry.cache_read) ?? 0;
-  const cacheWrite = toNonNegativeInteger(entry.cacheWrite) ?? toNonNegativeInteger(entry.cache_write) ?? 0;
-  const contextTokens = Math.max(0, Math.floor(params.contextTokenEstimate));
-  const runtimePromptTokens = inputTokens + cacheRead + cacheWrite;
-  // Include a conservative baseline for non-transcript prompt overhead
-  // (system prompt and policy wrappers) when rebuilding startup totals.
-  return Math.max(RECOVERED_SYSTEM_PROMPT_TOKEN_FLOOR, contextTokens + runtimePromptTokens);
-}
-
-/** Return true when the runtime store already has authoritative token accounting. */
-function hasFreshTotalTokens(sessionEntry: RuntimeSessionStoreEntry): boolean {
-  return sessionEntry.totalTokensFresh === true
-    && toNonNegativeInteger(sessionEntry.totalTokens) !== undefined;
 }
 
 type PluginEnvSnapshot = {
@@ -596,8 +542,8 @@ function hasReadOnlyRuntimeInspectionSignal(api: OpenClawPluginApi): boolean {
   return inspection?.readOnly === true || diagnostics?.readOnly === true;
 }
 
-/** Startup maintenance may write transcripts, summaries, checkpoints, or session stores. */
-function canRunStartupMaintenance(api: OpenClawPluginApi): boolean {
+/** Runtime DB initialization is disabled for read-only inspection registrations. */
+function canInitializeRuntimeDatabase(api: OpenClawPluginApi): boolean {
   if (isReadOnlyRegistrationMode(readPluginRegistrationMode(api))) {
     return false;
   }
@@ -1322,11 +1268,6 @@ function createLcmDependencies(
   }
 
   logStartupBannerOnce({
-    key: "transcript-gc-enabled",
-    log: (message) => (log.hostInfo ?? log.info)(message),
-    message: `[lcm] Transcript GC ${config.transcriptGcEnabled ? "enabled" : "disabled"} (default false)`,
-  });
-  logStartupBannerOnce({
     key: "proactive-threshold-compaction-mode",
     log: (message) => (log.hostInfo ?? log.info)(message),
     message: `[lcm] Proactive threshold compaction mode: ${config.proactiveThresholdCompactionMode} (default deferred)`,
@@ -1479,11 +1420,15 @@ function createLcmDependencies(
       }
     },
     resolveModel: (modelRef, providerHint) => {
-      const raw =
-        (envSnapshot.lcmSummaryModel ||
-         config.summaryModel ||
-         modelRef?.trim() ||
-         envSnapshot.openclawDefaultModel).trim();
+      const explicitModelRef = modelRef?.trim() ?? "";
+      const raw = (
+        explicitModelRef.includes("/")
+          ? explicitModelRef
+          : envSnapshot.lcmSummaryModel ||
+            config.summaryModel ||
+            explicitModelRef ||
+            envSnapshot.openclawDefaultModel
+      ).trim();
       if (!raw) {
         throw new Error("No model configured for LCM summarization.");
       }
@@ -1514,147 +1459,11 @@ function createLcmDependencies(
     buildSubagentSystemPrompt,
     readLatestAssistantReply,
     resolveAgentDir: () => api.resolvePath("."),
-    resolveSessionIdFromSessionKey: async (sessionKey) => {
-      const key = sessionKey.trim();
-      if (!key) {
-        return undefined;
-      }
 
-      try {
-        const sessionApi = getRuntimeAgentSessionApi(api);
-        if (!sessionApi) {
-          return undefined;
-        }
-        const cfg = readRuntimeConfigSnapshot(api);
-        const sessionConfig = isRecord(cfg) && isRecord(cfg.session) ? cfg.session : undefined;
-        const parsed = parseAgentSessionKey(key);
-        const agentId = normalizeAgentId(parsed?.agentId);
-        const storePath = sessionApi.resolveStorePath(getStringField(sessionConfig, "store"), {
-          agentId,
-        });
-        const store = sessionApi.loadSessionStore(storePath) as Record<
-          string,
-          { sessionId?: string } | undefined
-        >;
-        const sessionId = store[key]?.sessionId;
-        return typeof sessionId === "string" && sessionId.trim() ? sessionId.trim() : undefined;
-      } catch {
-        return undefined;
-      }
-    },
-    resolveSessionTranscriptFile: async ({ agentId: requestedAgentId, sessionId, sessionKey }) => {
-      const normalizedSessionId = sessionId.trim();
-      if (!normalizedSessionId) {
-        return undefined;
-      }
-
-      try {
-        const sessionApi = getRuntimeAgentSessionApi(api);
-        if (!sessionApi) {
-          return undefined;
-        }
-        const cfg = readRuntimeConfigSnapshot(api);
-        const sessionConfig = isRecord(cfg) && isRecord(cfg.session) ? cfg.session : undefined;
-        const normalizedSessionKey = sessionKey?.trim();
-        const parsed = normalizedSessionKey ? parseAgentSessionKey(normalizedSessionKey) : null;
-        const agentId = normalizeAgentId(parsed?.agentId ?? requestedAgentId);
-        const storePath = sessionApi.resolveStorePath(getStringField(sessionConfig, "store"), {
-          agentId,
-        });
-        const store = sessionApi.loadSessionStore(storePath) as Record<
-          string,
-          { sessionId?: string; sessionFile?: string } | undefined
-        >;
-        const entry =
-          (normalizedSessionKey ? store[normalizedSessionKey] : undefined)
-          ?? Object.values(store).find((candidate) => candidate?.sessionId === normalizedSessionId);
-        const transcriptPath = sessionApi.resolveSessionFilePath(
-          normalizedSessionId,
-          entry,
-          {
-            agentId,
-            storePath,
-          },
-        );
-        return transcriptPath.trim() || undefined;
-      } catch {
-        return undefined;
-      }
-    },
-    listStartupSessionFileCandidates: async () => {
-      const sessionApi = getRuntimeAgentSessionApi(api);
-      if (!sessionApi) {
-        return [];
-      }
-
-      let cfg: unknown = registrationConfig.openClawConfig;
-      try {
-        const liveConfig = readRuntimeConfigSnapshot(api);
-        if (liveConfig !== undefined) {
-          cfg = liveConfig;
-        }
-      } catch {
-        // Fall back to the registration config snapshot when live config is unavailable.
-      }
-
-      const sessionConfig = isRecord(cfg) && isRecord(cfg.session) ? cfg.session : undefined;
-      const storeConfig = getStringField(sessionConfig, "store");
-      const candidates: StartupSessionFileCandidate[] = [];
-      const seen = new Set<string>();
-
-      for (const agentId of listConfiguredAgentIds(cfg)) {
-        let storePath: string;
-        let store: Record<string, RuntimeSessionStoreEntry | undefined>;
-        try {
-          storePath = sessionApi.resolveStorePath(storeConfig, { agentId });
-          store = sessionApi.loadSessionStore(storePath);
-        } catch {
-          continue;
-        }
-
-        for (const [rawSessionKey, rawEntry] of Object.entries(store)) {
-          const sessionKey = rawSessionKey.trim();
-          if (!sessionKey || !isRecord(rawEntry)) {
-            continue;
-          }
-          const parsed = parseAgentSessionKey(sessionKey);
-          if (parsed?.agentId && normalizeAgentId(parsed.agentId) !== agentId) {
-            continue;
-          }
-          const sessionId = getStringField(rawEntry, "sessionId");
-          if (!sessionId) {
-            continue;
-          }
-
-          let sessionFile: string;
-          try {
-            sessionFile = sessionApi.resolveSessionFilePath(sessionId, rawEntry, {
-              agentId,
-              storePath,
-            }).trim();
-          } catch {
-            continue;
-          }
-          if (!sessionFile) {
-            continue;
-          }
-
-          const dedupeKey = `${sessionId}\0${sessionKey}\0${sessionFile}`;
-          if (seen.has(dedupeKey)) {
-            continue;
-          }
-          seen.add(dedupeKey);
-          candidates.push({
-            sessionId,
-            sessionKey,
-            sessionFile,
-            agentId,
-            storePath,
-          });
-        }
-      }
-
-      return candidates;
+    readVisibleSessionTranscriptMessageEntries: async (target) => {
+      const readVisibleSessionTranscriptMessageEntries =
+        await loadReadVisibleSessionTranscriptMessageEntries();
+      return readVisibleSessionTranscriptMessageEntries(target);
     },
     agentLaneSubagent: "subagent",
     log,
@@ -1779,170 +1588,7 @@ const lcmPlugin = {
     const deps = createLcmDependencies(api, registrationConfig);
     const dbPath = deps.config.databasePath;
     const normalizedDbPath = normalizePath(dbPath);
-    const allowStartupMaintenance = canRunStartupMaintenance(api);
-
-    /** Start the non-blocking startup scan for oversized LCM-managed transcripts. */
-    function scheduleStartupAutoRotate(nextEngine: LcmContextEngine): void {
-      void nextEngine.autoRotateManagedSessionFilesAtStartup({
-        listStartupSessionFileCandidates: deps.listStartupSessionFileCandidates,
-      }).catch((error) => {
-        deps.log.warn(
-          `[lcm] auto-rotate: phase=startup action=warn durationMs=0 reason=startup-scan-failed error=${describeLogError(error).replace(/\s+/g, "_")}`,
-        );
-      });
-    }
-
-    /** Recover session-store totalTokens for active conversations after restart. */
-    async function recoverStartupSessionTotalTokens(nextEngine: LcmContextEngine): Promise<void> {
-      const sessionApi = getRuntimeAgentSessionApi(api);
-      if (!sessionApi) {
-        return;
-      }
-
-      let cfg: unknown = registrationConfig.openClawConfig;
-      try {
-        const liveConfig = readRuntimeConfigSnapshot(api);
-        if (liveConfig !== undefined) {
-          cfg = liveConfig;
-        }
-      } catch {
-        // Fall back to the registration config snapshot when live config is unavailable.
-      }
-      const sessionConfig = isRecord(cfg) && isRecord(cfg.session) ? cfg.session : undefined;
-      const storeConfig = getStringField(sessionConfig, "store");
-
-      const activeConversations = await nextEngine.getConversationStore().listActiveConversations();
-      if (activeConversations.length === 0) {
-        return;
-      }
-
-      const loadedStores = new Map<string, Record<string, RuntimeSessionStoreEntry | undefined>>();
-      const pendingUpdates = new Map<string, Map<string, number>>();
-      for (const conversation of activeConversations) {
-        const sessionId = conversation.sessionId?.trim();
-        if (!sessionId) {
-          continue;
-        }
-        const sessionKey = conversation.sessionKey?.trim();
-        const parsed = sessionKey ? parseAgentSessionKey(sessionKey) : null;
-        const agentId = normalizeAgentId(parsed?.agentId);
-
-        let storePath: string;
-        try {
-          storePath = sessionApi.resolveStorePath(storeConfig, { agentId }).trim();
-        } catch {
-          continue;
-        }
-        if (!storePath) {
-          continue;
-        }
-
-        let store = loadedStores.get(storePath);
-        if (!store) {
-          try {
-            store = sessionApi.loadSessionStore(storePath);
-          } catch {
-            continue;
-          }
-          loadedStores.set(storePath, store);
-        }
-
-        const lookupKey =
-          (sessionKey && isRecord(store[sessionKey]) ? sessionKey : undefined)
-          ?? Object.entries(store).find(([, entry]) => {
-            if (!isRecord(entry)) {
-              return false;
-            }
-            const entrySessionId = entry.sessionId;
-            return typeof entrySessionId === "string" && entrySessionId.trim() === sessionId;
-          })?.[0];
-        if (!lookupKey) {
-          continue;
-        }
-        const rawEntry = store[lookupKey];
-        if (!isRecord(rawEntry)) {
-          continue;
-        }
-        const sessionEntry = rawEntry as RuntimeSessionStoreEntry;
-        if (hasFreshTotalTokens(sessionEntry)) {
-          continue;
-        }
-        const contextTokenEstimate = await nextEngine
-          .getSummaryStore()
-          .getContextTokenCount(conversation.conversationId);
-        const estimatedTotalTokens = estimateRecoveredSessionTotalTokens({
-          contextTokenEstimate,
-          sessionEntry,
-        });
-        let storeUpdates = pendingUpdates.get(storePath);
-        if (!storeUpdates) {
-          storeUpdates = new Map<string, number>();
-          pendingUpdates.set(storePath, storeUpdates);
-        }
-        storeUpdates.set(lookupKey, estimatedTotalTokens);
-      }
-
-      let recovered = 0;
-      for (const [storePath, storeUpdates] of pendingUpdates) {
-        let currentStore: Record<string, RuntimeSessionStoreEntry | undefined>;
-        try {
-          currentStore = sessionApi.loadSessionStore(storePath);
-        } catch {
-          continue;
-        }
-
-        let changed = false;
-        for (const [lookupKey, estimatedTotalTokens] of storeUpdates) {
-          const rawEntry = currentStore[lookupKey];
-          if (!isRecord(rawEntry)) {
-            continue;
-          }
-          const sessionEntry = rawEntry as RuntimeSessionStoreEntry;
-          if (hasFreshTotalTokens(sessionEntry)) {
-            continue;
-          }
-
-          currentStore[lookupKey] = {
-            ...sessionEntry,
-            totalTokens: estimatedTotalTokens,
-            totalTokensFresh: true,
-          };
-          changed = true;
-          recovered += 1;
-        }
-
-        if (changed) {
-          await writeFile(storePath, `${JSON.stringify(currentStore, null, 2)}\n`, "utf8");
-        }
-      }
-
-      if (recovered > 0) {
-        (deps.log.hostInfo ?? deps.log.info)(
-          `[lcm] startup totalTokens recovery updated ${recovered} session ${recovered === 1 ? "entry" : "entries"}`,
-        );
-      }
-    }
-
-    /** Run startup totalTokens recovery asynchronously to avoid delaying init. */
-    function scheduleStartupSessionTotalTokensRecovery(nextEngine: LcmContextEngine): void {
-      void recoverStartupSessionTotalTokens(nextEngine).catch((error) => {
-        deps.log.warn(
-          `[lcm] startup totalTokens recovery failed: ${describeLogError(error)}`,
-        );
-      });
-    }
-
-    /** Schedule all startup maintenance with this registration's runtime surfaces. */
-    function scheduleStartupMaintenance(nextEngine: LcmContextEngine): void {
-      scheduleStartupAutoRotate(nextEngine);
-      scheduleStartupSessionTotalTokensRecovery(nextEngine);
-    }
-
-    function logStartupMaintenanceSchedulingError(error: unknown): void {
-      deps.log.warn(
-        `[lcm] startup maintenance scheduling failed: ${describeLogError(error)}`,
-      );
-    }
+    const allowRuntimeDatabaseInit = canInitializeRuntimeDatabase(api);
 
     // ── Singleton check ─────────────────────────────────────────────
     // OpenClaw v2026.4.5+ calls register() per-agent-context (main,
@@ -1951,12 +1597,6 @@ const lcmPlugin = {
     const existingInit = getSharedInit(normalizedDbPath);
     if (existingInit && !existingInit.stopped) {
       deps.log.debug(`[lcm] Reusing shared engine init for db=${normalizedDbPath}`);
-      if (allowStartupMaintenance) {
-        existingInit.runStartupMaintenanceOnce(
-          scheduleStartupMaintenance,
-          logStartupMaintenanceSchedulingError,
-        );
-      }
       wirePluginHandlers(api, deps, existingInit, registrationConfig.openClawConfig);
       return;
     }
@@ -1969,36 +1609,11 @@ const lcmPlugin = {
     let resolveDeferredInit: ((engine: LcmContextEngine) => void) | null = null;
     let rejectDeferredInit: ((error: Error) => void) | null = null;
     let stopped = false;
-    let startupMaintenanceStarted = false;
     let shared: SharedLcmInit | null = null;
 
     /** Normalize unknown failures into stable Error instances. */
     function toInitError(error: unknown): Error {
       return error instanceof Error ? error : new Error(String(error));
-    }
-
-    /** Schedule prompt-mutating startup maintenance once for live runtime registrations. */
-    function runStartupMaintenanceOnce(
-      scheduleStartupMaintenanceForEngine: (engine: LcmContextEngine) => void,
-      logScheduleError: (error: unknown) => void,
-    ): void {
-      if (startupMaintenanceStarted) {
-        return;
-      }
-      startupMaintenanceStarted = true;
-      if (shared) {
-        shared.startupMaintenanceStarted = true;
-      }
-
-      const cachedEngine = lcm;
-      if (cachedEngine) {
-        scheduleStartupMaintenanceForEngine(cachedEngine);
-        return;
-      }
-
-      void waitForEngine()
-        .then((nextEngine) => scheduleStartupMaintenanceForEngine(nextEngine))
-        .catch((error) => logScheduleError(error));
     }
 
     /** Build a live DB+engine pair and roll back the DB handle if engine init fails. */
@@ -2013,12 +1628,6 @@ const lcmPlugin = {
         (deps.log.hostInfo ?? deps.log.info)(
           `[lcm] Engine initialized for db=${normalizedDbPath} duration=${Date.now() - startedAt}ms`,
         );
-        if (allowStartupMaintenance) {
-          runStartupMaintenanceOnce(
-            scheduleStartupMaintenance,
-            logStartupMaintenanceSchedulingError,
-          );
-        }
         return nextEngine;
       } catch (error) {
         closeLcmConnection(nextDatabase);
@@ -2062,7 +1671,7 @@ const lcmPlugin = {
 
     /** Return the initialized engine, waiting for deferred startup when the DB is lock-contended. */
     async function waitForEngine(): Promise<LcmContextEngine> {
-      if (!allowStartupMaintenance) {
+      if (!allowRuntimeDatabaseInit) {
         throw new Error("[lcm] Engine initialization is disabled during read-only plugin registration");
       }
       if (stopped) {
@@ -2103,7 +1712,7 @@ const lcmPlugin = {
       return database;
     }
 
-    if (allowStartupMaintenance) {
+    if (allowRuntimeDatabaseInit) {
       try {
         const nextEngine = initializeEngine();
         initPromise = Promise.resolve(nextEngine);
@@ -2135,14 +1744,12 @@ const lcmPlugin = {
 
     const nextShared: SharedLcmInit = {
       stopped: false,
-      startupMaintenanceStarted,
       getCachedEngine: () => lcm,
       waitForEngine,
       waitForDatabase,
-      runStartupMaintenanceOnce,
     };
     shared = nextShared;
-    if (allowStartupMaintenance) {
+    if (allowRuntimeDatabaseInit) {
       setSharedInit(normalizedDbPath, nextShared);
     }
 

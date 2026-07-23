@@ -5,7 +5,6 @@
  */
 import { extractStructuredText } from "./message-content.js";
 import type { AgentMessage } from "./openclaw-bridge.js";
-import { getTranscriptEntryId, readLeafPathMessages } from "./transcript.js";
 import { asRecord, safeString, toJson } from "./value-utils.js";
 
 export function extractRawIdsFromPartMetadata(metadata: string | null | undefined): string[] {
@@ -292,37 +291,4 @@ export function extractTranscriptToolCallId(message: AgentMessage): string | und
   }
 
   return undefined;
-}
-
-export async function listTranscriptToolResultEntryIdsByCallId(
-  sessionFile: string,
-): Promise<Map<string, string>> {
-  const leafPathMessages = await readLeafPathMessages(sessionFile);
-  const entryIdsByCallId = new Map<string, string>();
-  const duplicateCallIds = new Set<string>();
-
-  for (const message of leafPathMessages) {
-    if (message.role !== "toolResult") {
-      continue;
-    }
-    const entryId = getTranscriptEntryId(message);
-    if (!entryId) {
-      continue;
-    }
-    const toolCallId = extractTranscriptToolCallId(message);
-    if (!toolCallId) {
-      continue;
-    }
-    if (entryIdsByCallId.has(toolCallId)) {
-      duplicateCallIds.add(toolCallId);
-      continue;
-    }
-    entryIdsByCallId.set(toolCallId, entryId);
-  }
-
-  for (const duplicateCallId of duplicateCallIds) {
-    entryIdsByCallId.delete(duplicateCallId);
-  }
-
-  return entryIdsByCallId;
 }

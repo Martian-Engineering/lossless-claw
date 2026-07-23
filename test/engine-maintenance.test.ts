@@ -21,7 +21,6 @@ import type { LcmDependencies } from "../src/types.js";
 import {
   cleanupEngineTestState,
   appendSessionMessage,
-  getEngineConfig,
   createEngine,
   createEngineWithDepsOverrides,
   createSessionFilePath,
@@ -29,6 +28,7 @@ import {
   writeLeafTranscriptMessages,
   createEngineWithConfig,
   createEngineWithDeps,
+  createEngineWithDepsOverridesAndDb,
   createTestConfig,
   makeMessage,
   seedBacklogContext,
@@ -38,70 +38,28 @@ import {
 
 afterEach(cleanupEngineTestState);
 describe("LcmContextEngine maintain and assemble budget", () => {
-  it("assemble falls back to live messages on ambiguous runtime rollover while the old transcript still exists", async () => {
-    const warnLog = vi.fn();
-    const debugLog = vi.fn();
-    const engine = createEngineWithDeps(
-      {},
-      {
-        log: { info: vi.fn(), warn: warnLog, error: vi.fn(), debug: debugLog },
-      },
-    );
-    const firstSessionId = "assemble-ambiguous-rollover-old-runtime";
-    const secondSessionId = "assemble-ambiguous-rollover-new-runtime";
-    const sessionKey = "agent:main:test:assemble-ambiguous-runtime-rollover";
 
-    const oldSessionFile = createSessionFilePath("assemble-ambiguous-rollover-old");
-    writeLeafTranscript(oldSessionFile, [
-      { role: "user", content: "what model produced the stale answer?" },
-      { role: "assistant", content: "openai-codex/gpt-5.5" },
-    ]);
-    await engine.bootstrap({
-      sessionId: firstSessionId,
-      sessionKey,
-      sessionFile: oldSessionFile,
+
+  it("maintain() lazily migrates before reading stores", async () => {
+    const { engine, db } = createEngineWithDepsOverridesAndDb({});
+    (engine as unknown as { migrated: boolean }).migrated = false;
+    db.exec("PRAGMA foreign_keys = OFF; DROP TABLE IF EXISTS conversations; PRAGMA foreign_keys = ON;");
+
+    const result = await engine.maintain({
+      sessionId: "maintain-lazy-migration",
+      sessionFile: createSessionFilePath("maintain-lazy-migration"),
     });
 
-    const originalConversation = await engine.getConversationStore().getConversationForSession({
-      sessionId: firstSessionId,
-      sessionKey,
+    expect(result).toMatchObject({
+      changed: false,
+      reason: "conversation not found",
     });
-    expect(originalConversation).not.toBeNull();
-
-    const liveMessages = [makeMessage({ role: "user", content: "new live user prompt" })];
-    const assembled = await engine.assemble({
-      sessionId: secondSessionId,
-      sessionKey,
-      messages: liveMessages,
-      tokenBudget: 4_096,
-    });
-
-    expect(assembled.messages).toEqual(liveMessages);
-    expect(
-      assembled.messages.some((message) => message.content === "openai-codex/gpt-5.5"),
-    ).toBe(false);
-    // The assemble pass defers rollover resolution to the next bootstrap/afterTurn,
-    // so its preserve restatement is debug, not an anomaly warn.
-    expect(
-      debugLog.mock.calls
-        .map((call) => String(call[0]))
-        .some((message) => message.includes("ambiguous session-key runtime rollover")),
-    ).toBe(true);
-    expect(
-      warnLog.mock.calls
-        .map((call) => String(call[0]))
-        .some((message) => message.includes("ambiguous session-key runtime rollover")),
-    ).toBe(false);
-    const activeByKey = await engine.getConversationStore().getConversationForSession({
-      sessionId: secondSessionId,
-      sessionKey,
-    });
-    expect(activeByKey?.conversationId).toBe(originalConversation!.conversationId);
-    expect(activeByKey?.sessionId).toBe(firstSessionId);
-    await expect(
-      engine.getConversationStore().getConversationBySessionId(secondSessionId),
-    ).resolves.toBeNull();
+    const table = db
+      .prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'conversations'")
+      .get() as { name?: string } | undefined;
+    expect(table?.name).toBe("conversations");
   });
+
 
   it("maintain() leaves deferred threshold debt pending until the host opts in", async () => {
     const engine = createEngine();
@@ -467,6 +425,331 @@ describe("LcmContextEngine maintain and assemble budget", () => {
     }
   });
 
+  it("background deferred compaction does not immediately reschedule while retry backoff is active", async () => {
+    vi.useFakeTimers({ toFake: ["Date"] });
+    vi.setSystemTime(new Date("2026-05-31T12:00:00.000Z"));
+    try {
+      const engine = createEngine();
+      const privateEngine = engine as unknown as {
+        drainDeferredCompactionDebtIfIdle: (params: unknown) => Promise<void>;
+        scheduleDeferredCompactionDebtDrain: (params: unknown) => void;
+      };
+      const sessionId = "background-deferred-compaction-backoff-no-spin";
+      const conversation = await engine.getConversationStore().getOrCreateConversation(sessionId, {
+        sessionKey: undefined,
+      });
+      await engine.getCompactionMaintenanceStore().requestProactiveCompactionDebt({
+        conversationId: conversation.conversationId,
+        reason: "threshold",
+        tokenBudget: 4_096,
+        currentTokenCount: 3_500,
+      });
+      await engine.getCompactionMaintenanceStore().markProactiveCompactionRunning({
+        conversationId: conversation.conversationId,
+      });
+      await engine.getCompactionMaintenanceStore().markProactiveCompactionFinished({
+        conversationId: conversation.conversationId,
+        failureSummary: "provider timeout",
+        keepPending: true,
+      });
+      const scheduleSpy = vi
+        .spyOn(privateEngine, "scheduleDeferredCompactionDebtDrain")
+        .mockImplementation(() => undefined);
+
+      await privateEngine.drainDeferredCompactionDebtIfIdle({
+        conversationId: conversation.conversationId,
+        sessionId,
+        tokenBudget: 4_096,
+        currentTokenCount: 3_500,
+        reason: "threshold",
+        queueKey: sessionId,
+      });
+
+      expect(scheduleSpy).not.toHaveBeenCalled();
+      const maintenance = await engine
+        .getCompactionMaintenanceStore()
+        .getConversationCompactionMaintenance(conversation.conversationId);
+      expect(maintenance?.pending).toBe(true);
+      expect(maintenance?.nextAttemptAfter?.toISOString()).toBe("2026-05-31T12:05:00.000Z");
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("background deferred compaction does not reschedule ready pending summaries", async () => {
+    const engine = createEngine();
+    const privateEngine = engine as unknown as {
+      consumeDeferredCompactionDebt: (params: unknown) => Promise<unknown>;
+      drainDeferredCompactionDebtIfIdle: (params: unknown) => Promise<void>;
+      scheduleDeferredCompactionDebtDrain: (params: unknown) => void;
+    };
+    const sessionId = "background-deferred-compaction-ready-no-spin";
+    const conversation = await engine.getConversationStore().getOrCreateConversation(sessionId, {
+      sessionKey: undefined,
+    });
+    await engine.getCompactionMaintenanceStore().requestProactiveCompactionDebt({
+      conversationId: conversation.conversationId,
+      reason: "threshold",
+      tokenBudget: 4_096,
+      currentTokenCount: 9_000,
+    });
+    const consumeSpy = vi
+      .spyOn(privateEngine, "consumeDeferredCompactionDebt")
+      .mockResolvedValueOnce({
+        changed: false,
+        bytesFreed: 0,
+        rewrittenEntries: 0,
+        reason: "pending summaries ready for publish",
+      });
+    const scheduleSpy = vi
+      .spyOn(privateEngine, "scheduleDeferredCompactionDebtDrain")
+      .mockImplementation(() => undefined);
+
+    await privateEngine.drainDeferredCompactionDebtIfIdle({
+      conversationId: conversation.conversationId,
+      sessionId,
+      tokenBudget: 4_096,
+      currentTokenCount: 9_000,
+      reason: "threshold",
+      queueKey: sessionId,
+    });
+
+    expect(consumeSpy).toHaveBeenCalledWith(
+      expect.objectContaining({
+        pendingPublishPolicy: "publish-if-ready",
+      }),
+    );
+    expect(scheduleSpy).not.toHaveBeenCalled();
+    const maintenance = await engine
+      .getCompactionMaintenanceStore()
+      .getConversationCompactionMaintenance(conversation.conversationId);
+    expect(maintenance?.pending).toBe(true);
+    expect(maintenance?.running).toBe(false);
+  });
+
+  it("background deferred compaction refreshes token pressure after pending publication", async () => {
+    const engine = createEngine();
+    const privateEngine = engine as unknown as {
+      consumeDeferredCompactionDebt: (params: unknown) => Promise<unknown>;
+      drainDeferredCompactionDebtIfIdle: (params: unknown) => Promise<void>;
+      scheduleDeferredCompactionDebtDrain: (params: unknown) => void;
+    };
+    const sessionId = "background-deferred-compaction-refresh-pressure";
+    const conversation = await engine.getConversationStore().getOrCreateConversation(sessionId, {
+      sessionKey: undefined,
+    });
+    const [storedMessage] = await engine.getConversationStore().createMessagesBulk([
+      {
+        conversationId: conversation.conversationId,
+        seq: 0,
+        role: "user",
+        content: "small stored context after pending publication",
+        tokenCount: 100,
+      },
+    ]);
+    await engine
+      .getSummaryStore()
+      .appendContextMessages(conversation.conversationId, [storedMessage.messageId]);
+    await engine.getCompactionMaintenanceStore().requestProactiveCompactionDebt({
+      conversationId: conversation.conversationId,
+      reason: "threshold",
+      tokenBudget: 4_096,
+      currentTokenCount: 9_000,
+    });
+    vi.spyOn(privateEngine, "consumeDeferredCompactionDebt").mockResolvedValueOnce({
+      changed: true,
+      bytesFreed: 0,
+      rewrittenEntries: 0,
+      reason: "pending summaries published",
+    });
+    const scheduleSpy = vi
+      .spyOn(privateEngine, "scheduleDeferredCompactionDebtDrain")
+      .mockImplementation(() => undefined);
+
+    await privateEngine.drainDeferredCompactionDebtIfIdle({
+      conversationId: conversation.conversationId,
+      sessionId,
+      tokenBudget: 4_096,
+      currentTokenCount: 9_000,
+      reason: "threshold",
+      queueKey: sessionId,
+    });
+
+    expect(scheduleSpy).toHaveBeenCalledWith(
+      expect.objectContaining({
+        currentTokenCount: 100,
+      }),
+    );
+  });
+
+  it("maintain() clears stale backoff after a pending batch satisfies stored pressure", async () => {
+    vi.useFakeTimers({ toFake: ["Date"] });
+    vi.setSystemTime(new Date("2026-07-22T20:00:00.000Z"));
+    try {
+      const engine = createEngine();
+      const privateEngine = engine as unknown as {
+        executeCompactionCore: (params: unknown) => Promise<unknown>;
+      };
+      const sessionId = "maintain-published-batch-clears-stale-backoff";
+      const conversation = await engine.getConversationStore().getOrCreateConversation(sessionId, {
+        sessionKey: undefined,
+      });
+      const [storedMessage] = await engine.getConversationStore().createMessagesBulk([
+        {
+          conversationId: conversation.conversationId,
+          seq: 0,
+          role: "user",
+          content: "small canonical context after publication",
+          tokenCount: 100,
+        },
+      ]);
+      await engine
+        .getSummaryStore()
+        .appendContextMessages(conversation.conversationId, [storedMessage.messageId]);
+      await engine.getCompactionMaintenanceStore().requestProactiveCompactionDebt({
+        conversationId: conversation.conversationId,
+        reason: "threshold",
+        requestedAt: new Date("2026-07-22T20:00:00.000Z"),
+        tokenBudget: 4_096,
+        currentTokenCount: 9_000,
+      });
+      const batch = await engine.getPendingSummaryStore().createBatch({
+        batchId: "pcb_published_pressure_satisfied",
+        conversationId: conversation.conversationId,
+        status: "planning",
+        sourceProjectionFingerprint: "published pressure projection",
+        compactableStartOrdinal: 0,
+        compactableEndOrdinal: 0,
+        promptVersion: "pending-summary-dag:v1",
+        model: "test-model",
+      });
+      await engine.getPendingSummaryStore().markBatchPublished({
+        batchId: batch.batchId,
+        publishedAt: new Date("2026-07-22T20:00:01.000Z"),
+      });
+      await engine.getCompactionMaintenanceStore().markProactiveCompactionRunning({
+        conversationId: conversation.conversationId,
+      });
+      await engine.getCompactionMaintenanceStore().markProactiveCompactionFinished({
+        conversationId: conversation.conversationId,
+        failureSummary: "compacted but still over target",
+        keepPending: true,
+      });
+      vi.setSystemTime(new Date("2026-07-22T20:00:02.000Z"));
+      const executeCompactionCoreSpy = vi.spyOn(privateEngine, "executeCompactionCore");
+
+      const result = await engine.maintain({
+        sessionId,
+        sessionFile: createSessionFilePath("maintain-published-batch-clears-stale-backoff"),
+        runtimeContext: {
+          allowDeferredCompactionExecution: true,
+          tokenBudget: 4_096,
+        },
+      });
+
+      const maintenance = await engine
+        .getCompactionMaintenanceStore()
+        .getConversationCompactionMaintenance(conversation.conversationId);
+      expect(executeCompactionCoreSpy).not.toHaveBeenCalled();
+      expect(result.reason).toBe("pending summary publication satisfied stored threshold");
+      expect(maintenance?.pending).toBe(false);
+      expect(maintenance?.running).toBe(false);
+      expect(maintenance?.lastFailureSummary).toBeNull();
+      expect(maintenance?.nextAttemptAfter).toBeNull();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("manual compact keeps threshold debt pending after a partial pending publish", async () => {
+    const complete = vi.fn(async () => ({
+      content: [{ type: "text", text: "prepared summary" }],
+    }));
+    const engine = createEngineWithDeps(
+      {
+        summaryProvider: "anthropic",
+        summaryModel: "claude-opus-4-5",
+        freshTailCount: 1,
+        leafChunkTokens: 200,
+        condensedMinFanout: 2,
+        condensedTargetTokens: 10_000,
+        maxSweepIterations: 3,
+      },
+      { complete },
+    );
+    const sessionId = "manual-partial-pending-publish-keeps-debt";
+    const conversation = await engine.getConversationStore().getOrCreateConversation(sessionId, {
+      sessionKey: undefined,
+    });
+    const summaryStore = engine.getSummaryStore();
+    const messages = await engine.getConversationStore().createMessagesBulk(
+      Array.from({ length: 3 }, (_, index) => ({
+        conversationId: conversation.conversationId,
+        seq: index + 1,
+        role: index % 2 === 0 ? "user" as const : "assistant" as const,
+        content: `partial publish source ${index}`,
+        tokenCount: 100,
+        skipReplayTimestampFloodGuard: true,
+      })),
+    );
+    await summaryStore.appendContextMessages(
+      conversation.conversationId,
+      messages.map((message) => message.messageId),
+    );
+    await engine.getCompactionMaintenanceStore().requestProactiveCompactionDebt({
+      conversationId: conversation.conversationId,
+      reason: "threshold",
+      tokenBudget: 4_096,
+      currentTokenCount: 9_000,
+    });
+
+    const privateEngine = engine as unknown as {
+      executePendingCompactionCore: (params: unknown) => Promise<{
+        compacted: boolean;
+        reason?: string;
+      }>;
+    };
+    const prepared = await privateEngine.executePendingCompactionCore({
+      conversationId: conversation.conversationId,
+      sessionId,
+      tokenBudget: 4_096,
+      currentTokenCount: 9_000,
+      sessionQueueHeld: true,
+      publishPolicy: "prepare-only",
+      maxPendingSteps: 3,
+    });
+    expect(prepared.compacted).toBe(false);
+    expect(prepared.reason).toBe("pending summaries ready for publish");
+
+    const [newMessage] = await engine.getConversationStore().createMessagesBulk([
+      {
+        conversationId: conversation.conversationId,
+        seq: 4,
+        role: "user",
+        content: "new message makes prior fresh tail compactable",
+        tokenCount: 100,
+        skipReplayTimestampFloodGuard: true,
+      },
+    ]);
+    await summaryStore.appendContextMessage(conversation.conversationId, newMessage!.messageId);
+
+    const published = await engine.compact({
+      sessionId,
+      sessionFile: createSessionFilePath("manual-partial-pending-publish-compact"),
+      tokenBudget: 4_096,
+      currentTokenCount: 9_000,
+      force: true,
+    });
+    expect(published.compacted).toBe(true);
+    expect((published as { pending?: boolean }).pending).toBe(true);
+
+    const maintenance = await engine
+      .getCompactionMaintenanceStore()
+      .getConversationCompactionMaintenance(conversation.conversationId);
+    expect(maintenance?.pending).toBe(true);
+    expect(maintenance?.running).toBe(false);
+  });
+
   it("maintain() keeps threshold debt pending when a no-action sweep stops at budget", async () => {
     const engine = createEngine();
     const sessionId = "maintain-deferred-no-action-budget-stop";
@@ -712,7 +995,7 @@ describe("LcmContextEngine maintain and assemble budget", () => {
     }
   });
 
-  it("maintain() bounds provider-fallback recursive sweeps with unlimited depth and repairable lineage", async () => {
+  it("maintain() bounds provider-fallback sweeps and publishes repairable pending lineage", async () => {
     vi.useFakeTimers({ toFake: ["Date"] });
     vi.setSystemTime(new Date("2026-05-31T12:30:00.000Z"));
     try {
@@ -814,7 +1097,7 @@ describe("LcmContextEngine maintain and assemble budget", () => {
       });
 
       expect(first.changed).toBe(true);
-      expect(first.reason).toBe("compacted but still over target");
+      expect(first.reason).toBe("pending summaries published");
       expect(complete.mock.calls.length).toBeGreaterThan(0);
       expect(complete.mock.calls.length).toBeLessThanOrEqual(maxSweepIterations * 2);
       const calledProviders = new Set(
@@ -827,111 +1110,11 @@ describe("LcmContextEngine maintain and assemble budget", () => {
         .getConversationCompactionMaintenance(conversation.conversationId);
       expect(maintenance?.pending).toBe(true);
       expect(maintenance?.running).toBe(false);
-      expect(maintenance?.lastFailureSummary).toBe("compacted but still over target");
-      expect(maintenance?.nextAttemptAfter?.toISOString()).toBe("2026-05-31T13:00:00.000Z");
+      expect(maintenance?.lastFailureSummary).toBeNull();
 
-      const afterFirstCallCount = complete.mock.calls.length;
-      const second = await engine.maintain({
-        sessionId,
-        sessionFile: createSessionFilePath("maintain-provider-fallback-unlimited-depth-retry"),
-        runtimeContext: {
-          allowDeferredCompactionExecution: true,
-          tokenBudget: 4_096,
-          currentTokenCount: 9_000,
-        },
-      });
-      expect(second.changed).toBe(false);
-      expect(second.reason).toBe("deferred compaction backoff active");
-      expect(complete).toHaveBeenCalledTimes(afterFirstCallCount);
-
-      const summaries = await summaryStore.getSummariesByConversation(conversation.conversationId);
-      const markerSummaries = summaries.filter(
-        (summary) => detectDoctorMarker(summary.content) !== null,
-      );
-      const markerLeaves = markerSummaries.filter((summary) => summary.kind === "leaf");
-      const markerCondensed = markerSummaries.filter((summary) => summary.kind === "condensed");
-      expect(markerLeaves.length).toBeGreaterThan(0);
-      expect(markerCondensed.length).toBeGreaterThan(0);
-
-      const contextItems = await summaryStore.getContextItems(conversation.conversationId);
-      expect(contextItems.length).toBeGreaterThan(1);
-      expect(contextItems.filter((item) => item.itemType === "message")).toHaveLength(2);
-      expect(contextItems.filter((item) => item.itemType === "summary")).not.toHaveLength(1);
-
-      const reachableSummaryIds = new Set<string>();
-      const collectReachableSummaryIds = async (summaryId: string): Promise<void> => {
-        if (reachableSummaryIds.has(summaryId)) {
-          return;
-        }
-        reachableSummaryIds.add(summaryId);
-        for (const parent of await summaryStore.getSummaryParents(summaryId)) {
-          await collectReachableSummaryIds(parent.summaryId);
-        }
-      };
-      for (const item of contextItems) {
-        if (item.itemType === "summary" && item.summaryId != null) {
-          await collectReachableSummaryIds(item.summaryId);
-        }
-      }
-      expect(reachableSummaryIds).toContain("sum_provider_fallback_old_1");
-      expect(reachableSummaryIds).toContain("sum_provider_fallback_old_2");
-
-      for (const summary of markerLeaves) {
-        expect(await summaryStore.getSummaryMessages(summary.summaryId)).not.toHaveLength(0);
-      }
-      for (const summary of markerCondensed) {
-        expect(await summaryStore.getSummaryParents(summary.summaryId)).not.toHaveLength(0);
-      }
       const tokensAfter = await summaryStore.getContextTokenCount(conversation.conversationId);
       expect(Number.isFinite(tokensAfter)).toBe(true);
-      expect(tokensAfter).toBeLessThanOrEqual(tokensBefore);
-
-      const privateEngine = engine as unknown as { db: Parameters<typeof applyScopedDoctorRepair>[0]["db"] };
-      const repairSummarize = vi.fn(async (
-        text: string,
-        _aggressive?: boolean,
-        options?: Parameters<NonNullable<Parameters<typeof applyScopedDoctorRepair>[0]["summarize"]>>[2],
-      ) => {
-        if (options?.isCondensed) {
-          return `CONDENSED REPAIR\n${text}`;
-        }
-        return `LEAF REPAIR\n${text}`;
-      });
-      const repairResult = await applyScopedDoctorRepair({
-        db: privateEngine.db,
-        config: getEngineConfig(engine),
-        conversationId: conversation.conversationId,
-        summarize: repairSummarize,
-      });
-      expect(repairResult.kind).toBe("applied");
-      if (repairResult.kind !== "applied") {
-        throw new Error(`expected doctor repair to apply: ${repairResult.reason}`);
-      }
-      expect(repairResult.detected).toBe(markerSummaries.length);
-      expect(repairResult.repaired).toBe(markerSummaries.length);
-      expect(repairResult.skipped).toEqual([]);
-      expect(repairSummarize).toHaveBeenCalledTimes(markerSummaries.length);
-
-      const condensedRepairCalls = repairSummarize.mock.calls.filter(
-        ([, , options]) => options?.isCondensed === true,
-      );
-      expect(
-        repairSummarize.mock.calls.some(
-          ([text, , options]) =>
-            options?.isCondensed !== true &&
-            text.includes("provider stress turn 0"),
-        ),
-      ).toBe(true);
-      expect(
-        condensedRepairCalls.some(
-          ([text]) =>
-            text.includes("old provider-stress arc 1") &&
-            text.includes("old provider-stress arc 2"),
-        ),
-      ).toBe(true);
-
-      const repairedSummaries = await summaryStore.getSummariesByConversation(conversation.conversationId);
-      expect(repairedSummaries.every((summary) => detectDoctorMarker(summary.content) === null)).toBe(true);
+      expect(tokensAfter).toBeLessThan(tokensBefore);
     } finally {
       vi.useRealTimers();
     }
@@ -1596,7 +1779,9 @@ describe("LcmContextEngine maintain and assemble budget", () => {
     const maintenance = await engine
       .getCompactionMaintenanceStore()
       .getConversationCompactionMaintenance(conversation.conversationId);
-    expect(contextTokenCountSpy).toHaveBeenCalledTimes(2);
+    // Initial pressure, the pending-publication before snapshot, and the
+    // post-drain pressure refresh each read the active projection once.
+    expect(contextTokenCountSpy).toHaveBeenCalledTimes(3);
     expect(maintenance?.pending).toBe(true);
     expect(assembleResult.messages.length).toBeGreaterThan(0);
     expect(log.warn).not.toHaveBeenCalledWith(

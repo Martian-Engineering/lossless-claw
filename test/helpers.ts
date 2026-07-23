@@ -12,7 +12,7 @@ import { SessionManager } from "@earendil-works/pi-coding-agent";
 import { expect, vi } from "vitest";
 import type { LcmConfig } from "../src/db/config.js";
 import { closeLcmConnection, createLcmDatabaseConnection } from "../src/db/connection.js";
-import { LcmContextEngine, type RotateSessionStorageResult } from "../src/engine.js";
+import { LcmContextEngine } from "../src/engine.js";
 import type { AgentMessage } from "../src/openclaw-bridge.js";
 import { resetDelegatedExpansionGrantsForTests } from "../src/expansion-auth.js";
 import type { LcmDependencies } from "../src/types.js";
@@ -23,13 +23,6 @@ export function appendSessionMessage(manager: SessionManager, message: AgentMess
   return manager.appendMessage(
     message as unknown as Parameters<SessionManager["appendMessage"]>[0],
   );
-}
-
-export function expectUnavailableRotate(
-  result: RotateSessionStorageResult,
-): Extract<RotateSessionStorageResult, { kind: "unavailable" }> {
-  expect(result.kind).toBe("unavailable");
-  return result as Extract<RotateSessionStorageResult, { kind: "unavailable" }>;
 }
 
 export function getEngineConfig(engine: LcmContextEngine): LcmConfig {
@@ -81,16 +74,8 @@ export function createTestConfig(
     summaryTimeoutMs: 60_000,
     timezone: "UTC",
     pruneHeartbeatOk: false,
-    transcriptGcEnabled: false,
     enableSummaryThinking: true,
     proactiveThresholdCompactionMode: "deferred",
-    autoRotateSessionFiles: {
-      enabled: true,
-      createBackups: false,
-      sizeBytes: 2 * 1024 * 1024,
-      startup: "rotate",
-      runtime: "rotate",
-    },
     independentLogFile: {
       enabled: false,
       maxFileBytes: 100 * 1024 * 1024,
@@ -135,6 +120,9 @@ export function parseAgentSessionKey(sessionKey: string): { agentId: string; suf
   };
 }
 
+export class TestLcmContextEngine extends LcmContextEngine {
+}
+
 export function createTestDeps(
   config: LcmConfig,
   overrides?: Partial<LcmDependencies>,
@@ -163,8 +151,7 @@ export function createTestDeps(
       return undefined;
     },
     resolveAgentDir: () => process.env.HOME ?? tmpdir(),
-    resolveSessionIdFromSessionKey: async () => undefined,
-    resolveSessionTranscriptFile: async () => undefined,
+    readVisibleSessionTranscriptMessageEntries: undefined,
     agentLaneSubagent: "subagent",
     log: {
       info: vi.fn(),
@@ -181,7 +168,7 @@ export function createEngine(): LcmContextEngine {
   tempDirs.push(tempDir);
   const config = createTestConfig(join(tempDir, "lcm.db"));
   const db = createLcmDatabaseConnection(config.databasePath);
-  return new LcmContextEngine(createTestDeps(config), db);
+  return new TestLcmContextEngine(createTestDeps(config), db);
 }
 
 export function createEngineWithDepsOverrides(overrides: Partial<LcmDependencies>): LcmContextEngine {
@@ -189,7 +176,7 @@ export function createEngineWithDepsOverrides(overrides: Partial<LcmDependencies
   tempDirs.push(tempDir);
   const config = createTestConfig(join(tempDir, "lcm.db"));
   const db = createLcmDatabaseConnection(config.databasePath);
-  return new LcmContextEngine(
+  return new TestLcmContextEngine(
     {
       ...createTestDeps(config),
       ...overrides,
@@ -198,10 +185,30 @@ export function createEngineWithDepsOverrides(overrides: Partial<LcmDependencies
   );
 }
 
+export function createEngineWithDepsOverridesAndDb(
+  overrides: Partial<LcmDependencies>,
+  configOverrides: Partial<LcmConfig> = {},
+): { engine: LcmContextEngine; db: ReturnType<typeof createLcmDatabaseConnection> } {
+  const tempDir = mkdtempSync(join(tmpdir(), "lossless-claw-engine-"));
+  tempDirs.push(tempDir);
+  const config = createTestConfig(join(tempDir, "lcm.db"), configOverrides);
+  const db = createLcmDatabaseConnection(config.databasePath);
+  return {
+    engine: new TestLcmContextEngine(
+      {
+        ...createTestDeps(config),
+        ...overrides,
+      },
+      db,
+    ),
+    db,
+  };
+}
+
 export function createEngineAtDatabasePath(databasePath: string): LcmContextEngine {
   const config = createTestConfig(databasePath);
   const db = createLcmDatabaseConnection(config.databasePath);
-  return new LcmContextEngine(createTestDeps(config), db);
+  return new TestLcmContextEngine(createTestDeps(config), db);
 }
 
 export function createSessionFilePath(name: string): string {
@@ -246,7 +253,7 @@ export function createEngineWithConfig(overrides: Partial<LcmConfig>): LcmContex
     ...overrides,
   };
   const db = createLcmDatabaseConnection(config.databasePath);
-  return new LcmContextEngine(createTestDeps(config), db);
+  return new TestLcmContextEngine(createTestDeps(config), db);
 }
 
 export function createEngineWithDeps(
@@ -260,7 +267,7 @@ export function createEngineWithDeps(
     ...configOverrides,
   };
   const db = createLcmDatabaseConnection(config.databasePath);
-  return new LcmContextEngine(createTestDeps(config, depOverrides), db);
+  return new TestLcmContextEngine(createTestDeps(config, depOverrides), db);
 }
 
 export async function withTempHome<T>(run: (homeDir: string) => Promise<T>): Promise<T> {
