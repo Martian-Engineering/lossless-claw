@@ -1779,7 +1779,9 @@ describe("LcmContextEngine maintain and assemble budget", () => {
     const maintenance = await engine
       .getCompactionMaintenanceStore()
       .getConversationCompactionMaintenance(conversation.conversationId);
-    expect(contextTokenCountSpy).toHaveBeenCalledTimes(2);
+    // Initial pressure, the pending-publication before snapshot, and the
+    // post-drain pressure refresh each read the active projection once.
+    expect(contextTokenCountSpy).toHaveBeenCalledTimes(3);
     expect(maintenance?.pending).toBe(true);
     expect(assembleResult.messages.length).toBeGreaterThan(0);
     expect(log.warn).not.toHaveBeenCalledWith(

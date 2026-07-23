@@ -1417,6 +1417,10 @@ export class LcmContextEngine implements ContextEngine {
         ? params.maxPendingSteps
         : this.config.maxSweepIterations;
     const maxSteps = Math.max(1, Math.floor(configuredMaxSteps));
+    const tokensBeforePublication =
+      params.publishPolicy === "prepare-only"
+        ? undefined
+        : await this.summaryStore.getContextTokenCount(params.conversationId);
     for (let step = 0; step < maxSteps; step += 1) {
       lastResult = await coordinator.runOnce({
         conversationId: params.conversationId,
@@ -1424,13 +1428,20 @@ export class LcmContextEngine implements ContextEngine {
         publishPolicy: params.publishPolicy,
       });
       if (lastResult.status === "published") {
+        const tokensAfterPublication = await this.summaryStore.getContextTokenCount(
+          params.conversationId,
+        );
         return {
           ok: true,
           compacted: true,
           ...(lastResult.remainingCompactableWork === true ? { pending: true } : {}),
           reason: "pending summaries published",
           summaryId: lastResult.frontierSummaryIds[0],
-          result: lastResult,
+          result: {
+            ...lastResult,
+            tokensBefore: tokensBeforePublication ?? tokensAfterPublication,
+            tokensAfter: tokensAfterPublication,
+          },
         };
       }
       if (lastResult.status === "failed") {
