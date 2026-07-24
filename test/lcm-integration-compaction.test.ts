@@ -2196,9 +2196,80 @@ describe("LCM integration: compaction", () => {
     expect(result.actionTaken).toBe(false);
     expect(summarize).not.toHaveBeenCalled();
   });
+
+  it("compactLeaf skips when messageContents is empty (all messages missing from store)", async () => {
+    await ingestMessages(convStore, sumStore, 5, {
+      contentFn: (i) => `Turn ${i}: content to compact`,
+      tokenCountFn: () => 100,
+    });
+
+    // Remove messages from the mock store so getMessageById returns null.
+    // Context items still reference the message IDs, simulating stale references.
+    convStore._messages.length = 0;
+
+    const summarize = vi.fn(async () => "should not be called");
+
+    const result = await compactionEngine.compactLeaf({
+      conversationId: CONV_ID,
+      tokenBudget: 1000,
+      summarize,
+      force: true,
+    });
+
+    expect(result.actionTaken).toBe(false);
+    expect(result.tokensAfter).toBe(result.tokensBefore);
+    expect(result.authFailure).toBeUndefined();
+    expect(summarize).not.toHaveBeenCalled();
+  });
+
+  it("compactFullSweep continues past an empty-source raw chunk", async () => {
+    const sweepEngine = new CompactionEngine(convStore as any, sumStore as any, {
+      ...defaultCompactionConfig,
+      freshTailCount: 0,
+      leafChunkTokens: 200,
+      summaryPrefixTargetTokens: 10_000,
+    });
+    await ingestMessages(convStore, sumStore, 2, {
+      contentFn: (i) => `Missing source ${i}`,
+      tokenCountFn: () => 100,
+    });
+    await sumStore.insertSummary({
+      summaryId: "sum_empty_source_boundary",
+      conversationId: CONV_ID,
+      kind: "leaf",
+      content: "Existing summary boundary",
+      tokenCount: 20,
+    });
+    await sumStore.appendContextSummary(CONV_ID, "sum_empty_source_boundary");
+    await ingestMessages(convStore, sumStore, 2, {
+      contentFn: (i) => `Valid source ${i}`,
+      tokenCountFn: () => 100,
+    });
+
+    convStore._messages.splice(0, 2);
+    const summarize = vi.fn(async () => "Valid leaf summary");
+
+    const result = await sweepEngine.compactFullSweep({
+      conversationId: CONV_ID,
+      tokenBudget: 1_000,
+      summarize,
+      force: true,
+    });
+
+    expect(result.actionTaken).toBe(true);
+    expect(result.authFailure).toBeUndefined();
+    expect(summarize).toHaveBeenCalledOnce();
+    expect(summarize).toHaveBeenCalledWith(
+      expect.any(String),
+      expect.any(Boolean),
+      expect.objectContaining({ previousSummary: "Existing summary boundary" }),
+    );
+    expect(sumStore._summaries.some((summary) => summary.content === "Valid leaf summary")).toBe(
+      true,
+    );
+  });
 });
 
 // ═════════════════════════════════════════════════════════════════════════════
 // Test Suite: Full-sweep bounds (iteration cap + wall-clock deadline)
 // ═════════════════════════════════════════════════════════════════════════════
-

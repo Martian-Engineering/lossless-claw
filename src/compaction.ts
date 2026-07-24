@@ -131,10 +131,11 @@ type PassResult = {
   /** Token count of the newly created summary. */
   addedTokens: number;
 };
-type CondensedPassSkipped = {
+type CompactionPassSkipped = {
   skipped: "empty-source";
 };
-type CondensedPassResult = PassResult | CondensedPassSkipped;
+type LeafPassResult = (PassResult & { content: string }) | CompactionPassSkipped;
+type CondensedPassResult = PassResult | CompactionPassSkipped;
 type LeafChunkSelection = {
   items: ContextItemRecord[];
   rawTokensOutsideTail: number;
@@ -867,8 +868,16 @@ export class CompactionEngine {
         authFailure: true,
       };
     }
+    if ("skipped" in leafResult) {
+      return {
+        actionTaken: false,
+        tokensBefore,
+        tokensAfter: tokensBefore,
+        condensed: false,
+      };
+    }
     // Delta tracking: compute token change from pass results instead of re-querying DB
-    const tokensAfterLeaf = tokensBefore - leafResult.removedTokens + leafResult.addedTokens;
+    const tokensAfterLeaf = Math.max(0, tokensBefore - leafResult.removedTokens + leafResult.addedTokens);
 
     await this.persistCompactionEvents({
       conversationId,
@@ -906,7 +915,7 @@ export class CompactionEngine {
         if (!condenseResult || "skipped" in condenseResult) {
           break;
         }
-        const passTokensAfter = passTokensBefore - condenseResult.removedTokens + condenseResult.addedTokens;
+        const passTokensAfter = Math.max(0, passTokensBefore - condenseResult.removedTokens + condenseResult.addedTokens);
         await this.persistCompactionEvents({
           conversationId,
           tokensBefore: passTokensBefore,
@@ -1071,6 +1080,7 @@ export class CompactionEngine {
     // Delta tracking: maintain a running token count instead of re-querying DB
     // after each pass. The arithmetic is exact: tokensAfter = tokensBefore - removed + added.
     let runningTokens = tokensBefore;
+    let leafScanAfterOrdinal: number | undefined;
     while (true) {
       if (sweepBudgetExhausted("leaf")) {
         break;
@@ -1079,6 +1089,7 @@ export class CompactionEngine {
         conversationId,
         leafChunkTokensOverride,
         freshTailCountOverride,
+        leafScanAfterOrdinal,
       );
       if (leafChunk.items.length === 0) {
         break;
@@ -1089,18 +1100,28 @@ export class CompactionEngine {
 
       sweepIterations++;
       const passTokensBefore = runningTokens;
+      const passPreviousSummaryContent =
+        previousSummaryContent ??
+        (leafScanAfterOrdinal !== undefined
+          ? await this.resolvePriorLeafSummaryContext(conversationId, leafChunk.items)
+          : undefined);
       const leafResult = await this.leafPass(
         conversationId,
         leafChunk.items,
         summarize,
-        previousSummaryContent,
+        passPreviousSummaryContent,
         input.summaryModel,
       );
       if (!leafResult) {
         hadAuthFailure = true;
         break;
       }
-      const passTokensAfter = passTokensBefore - leafResult.removedTokens + leafResult.addedTokens;
+      if ("skipped" in leafResult) {
+        leafScanAfterOrdinal = leafChunk.items[leafChunk.items.length - 1]?.ordinal;
+        await yieldToEventLoop();
+        continue;
+      }
+      const passTokensAfter = Math.max(0, passTokensBefore - leafResult.removedTokens + leafResult.addedTokens);
       await this.persistCompactionEvents({
         conversationId,
         tokensBefore: passTokensBefore,
@@ -1116,6 +1137,9 @@ export class CompactionEngine {
       previousSummaryContent = leafResult.content;
       runningTokens = passTokensAfter;
 
+      if (stopAtTokens !== undefined && runningTokens <= stopAtTokens) {
+        break;
+      }
       if (passTokensAfter >= passTokensBefore || passTokensAfter >= previousTokens) {
         break;
       }
@@ -1174,7 +1198,7 @@ export class CompactionEngine {
       if ("skipped" in condenseResult) {
         return "no-progress";
       }
-      const passTokensAfter = passTokensBefore - condenseResult.removedTokens + condenseResult.addedTokens;
+      const passTokensAfter = Math.max(0, passTokensBefore - condenseResult.removedTokens + condenseResult.addedTokens);
       await this.persistCompactionEvents({
         conversationId,
         tokensBefore: passTokensBefore,
@@ -1571,6 +1595,7 @@ export class CompactionEngine {
     conversationId: number,
     leafChunkTokensOverride?: number,
     freshTailCountOverride?: number,
+    afterOrdinal?: number,
   ): Promise<LeafChunkSelection> {
     const contextItems = await this.getContextItemsCached(conversationId);
     const freshTailOrdinal = await this.resolveFreshTailOrdinal(contextItems, freshTailCountOverride);
@@ -1593,6 +1618,9 @@ export class CompactionEngine {
     for (const item of contextItems) {
       if (item.ordinal >= freshTailOrdinal) {
         break;
+      }
+      if (afterOrdinal !== undefined && item.ordinal <= afterOrdinal) {
+        continue;
       }
 
       if (!started) {
@@ -2176,7 +2204,7 @@ export class CompactionEngine {
     summarize: CompactionSummarizeFn,
     previousSummaryContent?: string,
     summaryModel?: string,
-  ): Promise<{ summaryId: string; level: CompactionLevel; content: string; removedTokens: number; addedTokens: number } | null> {
+  ): Promise<LeafPassResult | null> {
     // Fetch full message content for each context item
     const messageContents: {
       messageId: number;
@@ -2201,6 +2229,13 @@ export class CompactionEngine {
       }
     }
 
+    if (messageContents.length === 0) {
+      this.log.warn(
+        `[lcm] leaf compaction skipped; no valid messages; conversationId=${conversationId}; items=${messageItems.length}`,
+      );
+      return { skipped: "empty-source" };
+    }
+
     const concatenated = messageContents
       .map((message) => {
         // Strip injected plugin context blocks (memory/hindsight XML tags) first,
@@ -2215,6 +2250,13 @@ export class CompactionEngine {
       })
       .filter((s): s is string => s !== null)
       .join("\n\n");
+    if (!concatenated.trim()) {
+      this.log.warn(
+        `[lcm] leaf compaction skipped; no meaningful content; conversationId=${conversationId}; chunkMessages=${messageContents.length}`,
+      );
+      return { skipped: "empty-source" };
+    }
+
     const fileIds = dedupeOrderedIds(
       messageContents.flatMap((message) => extractFileIdsFromContent(message.content)),
     );
