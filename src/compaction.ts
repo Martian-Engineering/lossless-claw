@@ -1100,11 +1100,16 @@ export class CompactionEngine {
 
       sweepIterations++;
       const passTokensBefore = runningTokens;
+      const passPreviousSummaryContent =
+        previousSummaryContent ??
+        (leafScanAfterOrdinal !== undefined
+          ? await this.resolvePriorLeafSummaryContext(conversationId, leafChunk.items)
+          : undefined);
       const leafResult = await this.leafPass(
         conversationId,
         leafChunk.items,
         summarize,
-        previousSummaryContent,
+        passPreviousSummaryContent,
         input.summaryModel,
       );
       if (!leafResult) {

@@ -2259,6 +2259,11 @@ describe("LCM integration: compaction", () => {
     expect(result.actionTaken).toBe(true);
     expect(result.authFailure).toBeUndefined();
     expect(summarize).toHaveBeenCalledOnce();
+    expect(summarize).toHaveBeenCalledWith(
+      expect.any(String),
+      expect.any(Boolean),
+      expect.objectContaining({ previousSummary: "Existing summary boundary" }),
+    );
     expect(sumStore._summaries.some((summary) => summary.content === "Valid leaf summary")).toBe(
       true,
     );
