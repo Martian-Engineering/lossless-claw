@@ -227,7 +227,7 @@ export async function runPendingSummaryCompactionProof(): Promise<PendingSummary
     {
       conversationId: conversation.conversationId,
       seq: 4,
-      role: "assistant",
+      role: "user",
       content: "delta raw fresh tail",
       tokenCount: 8,
     },

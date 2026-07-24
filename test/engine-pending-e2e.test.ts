@@ -95,7 +95,7 @@ describe("pending summary compaction engine e2e (mocked LLM)", () => {
       await seedBacklogContext(engine, sessionId, [120, 120, 120]);
       await engine.ingest({
         sessionId,
-        message: makeMessage({ role: "assistant", content: "fresh tail" }),
+        message: makeMessage({ role: "user", content: "fresh tail" }),
       });
       const conversationId = await conversationIdFor(engine, sessionId);
       await expect(
@@ -161,7 +161,7 @@ describe("pending summary compaction engine e2e (mocked LLM)", () => {
       await seedBacklogContext(engine, sessionId, [120, 120, 120]);
       await engine.ingest({
         sessionId,
-        message: makeMessage({ role: "assistant", content: "fresh tail turn one" }),
+        message: makeMessage({ role: "user", content: "fresh tail turn one" }),
       });
 
       // Far below threshold, the afterTurn leaf trigger schedules a real
@@ -199,7 +199,11 @@ describe("pending summary compaction engine e2e (mocked LLM)", () => {
       });
       await engine.ingest({
         sessionId,
-        message: makeMessage({ role: "assistant", content: "fresh tail turn three" }),
+        message: makeMessage({ role: "assistant", content: "big turn response" }),
+      });
+      await engine.ingest({
+        sessionId,
+        message: makeMessage({ role: "user", content: "fresh tail turn three" }),
       });
       await runAfterTurn(engine, sessionId, sessionFile, {
         tokenBudget: 10_000,
@@ -282,7 +286,7 @@ describe("pending summary compaction engine e2e (mocked LLM)", () => {
       await seedBacklogContext(engine, sessionId, [120, 120, 120]);
       await engine.ingest({
         sessionId,
-        message: makeMessage({ role: "assistant", content: "fresh tail turn" }),
+        message: makeMessage({ role: "user", content: "fresh tail turn" }),
       });
       await runAfterTurn(engine, sessionId, sessionFile, {
         tokenBudget: 10_000,
