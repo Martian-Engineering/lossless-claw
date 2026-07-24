@@ -1163,6 +1163,65 @@ describe("LcmContextEngine fidelity and token budget", () => {
     ).toHaveLength(2);
   });
 
+  it("deduplicates reordered aliased multi-part externalized tool-result replays", async () => {
+    const engine = createEngineWithConfig({ largeFileTokenThreshold: 20 });
+    const sessionId = "batch-ingest-aliased-multi-large-tool-replay-session";
+    const firstOutput = `${"first aliased multi-part output\n".repeat(160)}done`;
+    const secondOutput = `${"second aliased multi-part output\n".repeat(160)}done`;
+    const persistedMessage = {
+      role: "toolResult",
+      toolName: "exec",
+      content: [
+        {
+          type: "tool_result",
+          tool_use_id: "call_aliased_multi_a",
+          name: "exec",
+          content: [{ type: "text", text: firstOutput }],
+        },
+        {
+          type: "tool_result",
+          tool_use_id: "call_aliased_multi_b",
+          name: "exec",
+          content: [{ type: "text", text: secondOutput }],
+        },
+      ],
+      timestamp: Date.now(),
+    } as AgentMessage;
+    const replayedMessage = {
+      ...persistedMessage,
+      content: [
+        {
+          type: "toolResult",
+          toolCallId: "call_aliased_multi_b",
+          name: "exec",
+          output: secondOutput,
+        },
+        {
+          type: "toolResult",
+          toolCallId: "call_aliased_multi_a",
+          name: "exec",
+          output: firstOutput,
+        },
+      ],
+    } as AgentMessage;
+
+    await expect(
+      engine.ingestBatch({ sessionId, messages: [persistedMessage] }),
+    ).resolves.toMatchObject({ ingestedCount: 1 });
+
+    const replay = await engine.ingestBatch({
+      sessionId,
+      messages: [replayedMessage],
+    });
+    expect(replay.ingestedCount).toBe(0);
+
+    const conversation = await engine.getConversationStore().getConversationBySessionId(sessionId);
+    const stored = await engine
+      .getConversationStore()
+      .getMessages(conversation!.conversationId);
+    expect(stored).toHaveLength(1);
+  });
+
   it("keeps externalized tool rows when call ids swap between parts", async () => {
     const engine = createEngineWithConfig({ largeFileTokenThreshold: 20 });
     const sessionId = "batch-ingest-swapped-externalized-ids-session";

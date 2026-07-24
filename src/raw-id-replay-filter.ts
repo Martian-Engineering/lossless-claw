@@ -259,6 +259,13 @@ export async function filterPersistedRawIdReplayBatch(params: {
         if (externalizedText === undefined) {
           continue;
         }
+        const incomingPartIndex = replayIdsByPart.findIndex((partRawIds) =>
+          partRawIds.includes(rawId),
+        );
+        if (incomingPartIndex < 0) {
+          continue;
+        }
+        const incomingPartMetadata = parts[incomingPartIndex]?.metadata;
         const externalizedByteSize = Buffer.byteLength(externalizedText, "utf8");
         const rawIdArgs = [
           rawId,
@@ -304,7 +311,7 @@ export async function filterPersistedRawIdReplayBatch(params: {
           }
           if (
             !contentMatches ||
-            !externalizedReplayMetadataMatches(row.metadata, parts[0]?.metadata)
+            !externalizedReplayMetadataMatches(row.metadata, incomingPartMetadata)
           ) {
             continue;
           }
