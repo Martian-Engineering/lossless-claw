@@ -380,8 +380,51 @@ describe("LCM integration: compaction", () => {
 
     const trigger = await tokenAwareEngine.evaluateLeafTrigger(CONV_ID);
 
-    expect(trigger.rawTokensOutsideTail).toBeGreaterThanOrEqual(250);
+    expect(trigger.rawTokensOutsideTail).toBeGreaterThanOrEqual(150);
+    expect(trigger.rawTokensOutsideTail).toBeLessThan(250);
     expect(trigger.shouldCompact).toBe(true);
+  });
+
+  it("keeps the newest user and following assistant suffix outside compaction candidates", async () => {
+    const tokenAwareEngine = new CompactionEngine(convStore as any, sumStore as any, {
+      ...defaultCompactionConfig,
+      freshTailCount: 64,
+      freshTailMaxTokens: 100,
+      leafChunkTokens: 30,
+    });
+
+    await ingestMessages(convStore, sumStore, 3, {
+      contentFn: (i) => ["Older user", "Current user instruction", "Large assistant suffix"][i] ?? "",
+      roleFn: (i) => (i < 2 ? "user" : "assistant"),
+      tokenCountFn: (i) => [40, 20, 200][i] ?? 0,
+    });
+
+    const trigger = await tokenAwareEngine.evaluateLeafTrigger(CONV_ID);
+
+    expect(trigger.rawTokensOutsideTail).toBe(40);
+    expect(trigger.shouldCompact).toBe(true);
+  });
+
+  it("reads each raw message once while resolving the newest user boundary", async () => {
+    const tokenAwareEngine = new CompactionEngine(convStore as any, sumStore as any, {
+      ...defaultCompactionConfig,
+      freshTailCount: 64,
+      freshTailMaxTokens: 100,
+      leafChunkTokens: 30,
+    });
+    const messages = await ingestMessages(convStore, sumStore, 4, {
+      contentFn: (i) =>
+        ["Older user", "Current user", "Large assistant suffix", "Tool result"][i] ?? "",
+      roleFn: (i) => ["user", "user", "assistant", "tool"][i] as "user" | "assistant" | "tool",
+      tokenCountFn: (i) => [40, 20, 200, 30][i] ?? 0,
+    });
+    convStore.getMessageById.mockClear();
+
+    await tokenAwareEngine.evaluateLeafTrigger(CONV_ID);
+
+    const fetchedIds = convStore.getMessageById.mock.calls.map(([messageId]) => messageId);
+    expect(fetchedIds).toHaveLength(messages.length);
+    expect(new Set(fetchedIds)).toEqual(new Set(messages.map((message) => message.messageId)));
   });
 
   it("compactLeaf uses preceding summary context for soft leaf continuity", async () => {
@@ -2071,9 +2114,9 @@ describe("LCM integration: compaction", () => {
       reason: "none",
       storedTokens: 200,
       observedTokens: 250,
-      rawTokensOutsideTail: 100,
-      projectedTokens: 350,
-      currentTokens: 350,
+      rawTokensOutsideTail: 0,
+      projectedTokens: 250,
+      currentTokens: 250,
       threshold: 450,
     });
   });

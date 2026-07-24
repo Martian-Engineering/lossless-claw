@@ -74,7 +74,7 @@ Debugging:
 
 ### `freshTailCount`
 
-Keeps the newest messages raw instead of compacting them.
+Keeps the newest messages raw instead of compacting them. If the configured count would split the newest user turn, Lossless expands the protected tail to include that user and its following assistant/tool suffix.
 
 Why it matters:
 
@@ -92,7 +92,7 @@ Optional token cap for the protected fresh tail.
 Why it matters:
 
 - Prevents a few huge tool results from making the "fresh" suffix effectively uncompactable.
-- Still preserves the newest message even if that single message exceeds the cap.
+- Still preserves the newest user message and its following assistant/tool suffix even when that turn exceeds the cap.
 
 Good starting range:
 

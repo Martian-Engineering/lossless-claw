@@ -235,7 +235,7 @@ describe("LCM integration: ingest -> assemble", () => {
     expect(result.messages).toHaveLength(3);
   });
 
-  it("fresh tail token cap drops older oversized tail messages from assembly", async () => {
+  it("fresh tail token cap preserves the newest user boundary and following suffix", async () => {
     await ingestMessages(convStore, sumStore, 4, {
       contentFn: (i) => `M${i} ${"z".repeat(396)}`,
       tokenCountFn: (_i, content) => estimateTokens(content),
@@ -248,8 +248,26 @@ describe("LCM integration: ingest -> assemble", () => {
       freshTailMaxTokens: 110,
     });
 
-    expect(result.messages).toHaveLength(1);
-    expect(extractMessageText(result.messages[0]?.content)).toContain("M3");
+    expect(result.messages).toHaveLength(2);
+    expect(result.messages.map((message) => extractMessageText(message.content))).toEqual([
+      expect.stringContaining("M2"),
+      expect.stringContaining("M3"),
+    ]);
+  });
+
+  it("fresh tail count preserves the newest user boundary and following suffix", async () => {
+    await ingestMessages(convStore, sumStore, 2, {
+      contentFn: (i) => (i === 0 ? "Current user instruction" : "Assistant response"),
+      roleFn: (i) => (i === 0 ? "user" : "assistant"),
+    });
+
+    const result = await assembler.assemble({
+      conversationId: CONV_ID,
+      tokenBudget: 1,
+      freshTailCount: 1,
+    });
+
+    expect(result.messages.map((message) => message.role)).toEqual(["user", "assistant"]);
   });
 
   it("fresh tail token cap still preserves the newest message when it alone exceeds the cap", async () => {
@@ -266,6 +284,7 @@ describe("LCM integration: ingest -> assemble", () => {
     });
 
     const contents = result.messages.map((message) => extractMessageText(message.content));
+    expect(contents.some((text) => text.includes("Older"))).toBe(true);
     expect(contents.some((text) => text.includes("Huge tail"))).toBe(true);
   });
 
@@ -607,4 +626,3 @@ describe("LCM integration: ingest -> assemble", () => {
 // ═════════════════════════════════════════════════════════════════════════════
 // Test Suite: Compaction
 // ═════════════════════════════════════════════════════════════════════════════
-

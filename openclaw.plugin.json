@@ -57,7 +57,7 @@
     },
     "freshTailMaxTokens": {
       "label": "Fresh Tail Max Tokens",
-      "help": "Optional token cap for the protected fresh tail; the newest message is always preserved"
+      "help": "Optional token cap for the protected fresh tail; the newest user message and its following assistant/tool suffix are always preserved"
     },
     "promptAwareEviction": {
       "label": "Prompt-Aware Eviction",
