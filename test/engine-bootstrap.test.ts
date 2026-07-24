@@ -1128,6 +1128,39 @@ describe("LcmContextEngine.bootstrap", () => {
     ]);
   });
 
+  it("preserves the newest user-led suffix when rotate count would split it", async () => {
+    const sessionFile = createSessionFilePath("lcm-rotate-user-led-tail");
+    const sessionKey = "agent:main:rotate-user-led-tail";
+    const sessionId = "rotate-user-led-tail-session";
+    const sm = SessionManager.open(sessionFile);
+    const currentTurn = [
+      { role: "user", content: [{ type: "text", text: "current user" }] },
+      { role: "assistant", content: [{ type: "text", text: "current assistant" }] },
+    ] as AgentMessage[];
+    for (const message of currentTurn) {
+      appendSessionMessage(sm, message);
+    }
+
+    const engine = createEngineWithConfig({ freshTailCount: 1 });
+    await engine.bootstrap({ sessionId, sessionKey, sessionFile });
+
+    const rotate = await engine.rotateSessionStorage({
+      sessionId,
+      sessionKey,
+      sessionFile,
+    });
+
+    expect(rotate).toMatchObject({
+      kind: "rotated",
+      preservedTailMessageCount: 2,
+    });
+    expect(
+      readSessionMessages(sessionFile).map(
+        (message) => (message.content[0] as { text: string }).text,
+      ),
+    ).toEqual(["current user", "current assistant"]);
+  });
+
   it("summarizes raw context outside the fresh tail before rotating the transcript", async () => {
     const sessionFile = createSessionFilePath("lcm-rotate-storage-leaf-coverage");
     const sessionKey = "agent:main:rotate-leaf-coverage";
@@ -2105,8 +2138,9 @@ describe("LcmContextEngine.bootstrap", () => {
     expect(autoRotateLogs.some((message) => message.includes("backupPath="))).toBe(false);
     const summaryLog = autoRotateLogs.find((message) => message.includes("action=summary"));
     expect(summaryLog).toContain("backupCreated=0");
-    expect(readSessionMessages(sessionFile)).toHaveLength(1);
-    expect(readSessionMessages(sessionFile)[0]?.role).toBe(messages[messages.length - 1]?.role);
+    expect(readSessionMessages(sessionFile).map((message) => message.role)).toEqual(
+      messages.slice(-2).map((message) => message.role),
+    );
   });
 
   it("startup scan ignores stale active LCM conversations outside indexed candidates", async () => {

@@ -1023,13 +1023,23 @@ export class SessionRotationService {
       }
     }
 
-    const keepTailMessageCount = normalizeRotateTailMessageCount(
+    const configuredTailMessageCount = normalizeRotateTailMessageCount(
       this.host.config.freshTailCount,
       messageIndices.length,
     );
+    const configuredTailStartOffset = messageIndices.length - configuredTailMessageCount;
+    const latestUserOffset = messageIndices.findLastIndex((index) => {
+      const entry = branch[index];
+      return entry?.type === "message" && asRecord(entry.message)?.role === "user";
+    });
+    const tailStartOffset =
+      latestUserOffset >= 0
+        ? Math.min(configuredTailStartOffset, latestUserOffset)
+        : configuredTailStartOffset;
+    const keepTailMessageCount = messageIndices.length - tailStartOffset;
     const anchorIndex =
       keepTailMessageCount > 0
-        ? (messageIndices[messageIndices.length - keepTailMessageCount] ?? branch.length)
+        ? (messageIndices[tailStartOffset] ?? branch.length)
         : branch.length;
 
     const latestPreludeEntries = new Map<string, TranscriptRawEntry>();
@@ -1147,10 +1157,12 @@ export class SessionRotationService {
   /**
    * Summarize raw context that would be removed from the host transcript.
    *
-   * Rotate only preserves the configured fresh tail in JSONL. Before rewriting
-   * that file, force leaf-only compaction until every older raw context item has
-   * been replaced by a leaf summary. This avoids unrelated condensation work
-   * while making the transcript trim depend on LCM summary coverage.
+   * Rotate preserves the configured fresh tail in JSONL, expanding through the
+   * newest user when needed to keep its assistant/tool suffix together. Before
+   * rewriting that file, force leaf-only compaction until every older raw
+   * context item has been replaced by a leaf summary. This avoids unrelated
+   * condensation work while making the transcript trim depend on LCM summary
+   * coverage.
    */
   private async compactRawContextOutsideFreshTailForRotate(params: {
     sessionId: string;
