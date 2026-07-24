@@ -2178,8 +2178,13 @@ export class CompactionEngine {
     summaryModel?: string,
   ): Promise<{ summaryId: string; level: CompactionLevel; content: string; removedTokens: number; addedTokens: number } | null> {
     // Fetch full message content for each context item
-    const messageContents: { messageId: number; content: string; createdAt: Date; tokenCount: number }[] =
-      [];
+    const messageContents: {
+      messageId: number;
+      role: MessageRole;
+      content: string;
+      createdAt: Date;
+      tokenCount: number;
+    }[] = [];
     for (const item of messageItems) {
       if (item.messageId == null) {
         continue;
@@ -2188,6 +2193,7 @@ export class CompactionEngine {
       if (msg) {
         messageContents.push({
           messageId: msg.messageId,
+          role: msg.role,
           content: await this.resolveLeafSummaryMessageContent(msg),
           createdAt: msg.createdAt,
           tokenCount: this.resolveMessageTokenCount(msg),
@@ -2203,7 +2209,9 @@ export class CompactionEngine {
         const cleaned = stripInjectedContextBlocks(message.content, this.config.stripInjectedContextTags);
         const text = extractMeaningfulMessageText(cleaned);
         if (!text) return null;
-        return `[${formatTimestamp(message.createdAt, this.config.timezone)}]\n${text}`;
+        // Role stays in the header line so the summarizer can tell an operator
+        // instruction from material a tool fetched out of another conversation.
+        return `[${formatTimestamp(message.createdAt, this.config.timezone)} | ${message.role}]\n${text}`;
       })
       .filter((s): s is string => s !== null)
       .join("\n\n");
