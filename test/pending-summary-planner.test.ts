@@ -39,6 +39,28 @@ function summary(
 }
 
 describe("pending summary planner", () => {
+  it("keeps the newest user-led suffix outside pending leaf plans", () => {
+    const items = [
+      { ...message(0, 10, 5), role: "user" },
+      { ...message(1, 11, 5), role: "assistant" },
+      { ...message(2, 12, 5), role: "user" },
+      { ...message(3, 13, 50), role: "assistant" },
+    ] satisfies Array<PendingSummaryPlannerSnapshotItem & { role: "user" | "assistant" }>;
+
+    const nodes = planPendingLeafNodes({
+      items,
+      freshTailCount: 1,
+      freshTailMaxTokens: 10,
+      leafChunkTokens: 5,
+      nodeIdPrefix: "leaf",
+    });
+
+    expect(nodes.map((node) => [node.ordinalStart, node.ordinalEnd])).toEqual([
+      [0, 0],
+      [1, 1],
+    ]);
+  });
+
   it("plans leaf chunks from raw message runs outside the fresh tail", () => {
     const nodes = planPendingLeafNodes({
       items: [

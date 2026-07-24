@@ -1,4 +1,5 @@
 import type { SummaryKind } from "./store/summary-store.js";
+import type { MessageRole } from "./store/conversation-store.js";
 
 export type PendingSummaryPlannerItemType = "message" | "summary";
 
@@ -8,6 +9,7 @@ export type PendingSummaryPlannerSnapshotItem = {
   tokenCount: number;
   sourceFingerprint: string;
   messageId?: number;
+  role?: MessageRole;
   summaryId?: string;
   depth?: number;
 };
@@ -114,12 +116,17 @@ export function resolvePendingFreshTailOrdinal(input: {
       ? Math.max(0, Math.floor(input.freshTailMaxTokens))
       : undefined;
   const messageItems = sortItemsByOrdinal(input.items).filter((item) => item.itemType === "message");
+  const latestUserOrdinal = [...messageItems]
+    .reverse()
+    .find((item) => item.role === "user")?.ordinal;
   let protectedCount = 0;
   let protectedTokens = 0;
   let tailStartOrdinal = Infinity;
 
   for (let index = messageItems.length - 1; index >= 0; index--) {
-    if (protectedCount >= freshTailCount) {
+    const latestUserProtected =
+      latestUserOrdinal === undefined || tailStartOrdinal <= latestUserOrdinal;
+    if (latestUserProtected && protectedCount >= freshTailCount) {
       break;
     }
 
@@ -130,6 +137,7 @@ export function resolvePendingFreshTailOrdinal(input: {
 
     const tokenCount = normalizeNonNegativeInteger(item.tokenCount);
     const exceedsTokenCap =
+      latestUserProtected &&
       protectedCount > 0 &&
       typeof freshTailMaxTokens === "number" &&
       protectedTokens + tokenCount > freshTailMaxTokens;

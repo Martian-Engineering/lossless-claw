@@ -137,7 +137,7 @@ async function formatMessageForSummary(
   if (!content) {
     return "";
   }
-  return [`[${message.createdAt.toISOString()}]`, content].join("\n").trim();
+  return [`[${message.createdAt.toISOString()} | ${message.role}]`, content].join("\n").trim();
 }
 
 /**
@@ -777,11 +777,13 @@ export class PendingCompactionCoordinator {
           ordinal: item.ordinal,
           itemType: "message",
           messageId: message.messageId,
+          role: message.role,
           tokenCount: normalizeNonNegativeInteger(message.tokenCount),
           sourceFingerprint: digestText("pending-message-item", [
             String(item.ordinal),
             String(message.messageId),
             String(message.seq),
+            message.role,
             String(message.tokenCount),
             message.createdAt.toISOString(),
             digestText("message-content", [message.content]),

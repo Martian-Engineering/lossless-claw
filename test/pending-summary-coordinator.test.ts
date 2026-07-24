@@ -128,7 +128,7 @@ describe("PendingCompactionCoordinator", () => {
       {
         conversationId: conversation.conversationId,
         seq: 4,
-        role: "assistant",
+        role: "user",
         content: "fresh tail stays raw",
         tokenCount: 4,
       },
@@ -296,6 +296,7 @@ describe("PendingCompactionCoordinator", () => {
     await expect(
       coordinator.runOnce({ conversationId: conversation.conversationId }),
     ).resolves.toMatchObject({ status: "prepared" });
+    expect(summarizedSource).toContain("| tool]");
     expect(summarizedSource).toContain("Pending message-parts source detail.");
   });
 
@@ -323,7 +324,7 @@ describe("PendingCompactionCoordinator", () => {
       {
         conversationId: conversation.conversationId,
         seq: 3,
-        role: "assistant",
+        role: "user",
         content: "fresh tail message",
         tokenCount: 120,
       },
@@ -451,7 +452,7 @@ describe("PendingCompactionCoordinator", () => {
       {
         conversationId: conversation.conversationId,
         seq: 3,
-        role: "assistant",
+        role: "user",
         content: "fresh tail message",
         tokenCount: 4,
       },
@@ -538,7 +539,7 @@ describe("PendingCompactionCoordinator", () => {
       {
         conversationId: conversation.conversationId,
         seq: 2,
-        role: "assistant",
+        role: "user",
         content: "fresh tail message",
         tokenCount: 4,
       },
@@ -610,7 +611,7 @@ describe("PendingCompactionCoordinator", () => {
       {
         conversationId: conversation.conversationId,
         seq: 2,
-        role: "assistant",
+        role: "user",
         content: "fresh tail message",
         tokenCount: 4,
       },
@@ -698,7 +699,7 @@ describe("PendingCompactionCoordinator", () => {
       {
         conversationId: conversation.conversationId,
         seq: 2,
-        role: "assistant",
+        role: "user",
         content: "fresh tail message",
         tokenCount: 4,
       },
@@ -989,7 +990,7 @@ describe("PendingCompactionCoordinator", () => {
       {
         conversationId: conversation.conversationId,
         seq: 2,
-        role: "assistant",
+        role: "user",
         content: "fresh tail message",
         tokenCount: 4,
       },
@@ -1135,7 +1136,7 @@ describe("PendingCompactionCoordinator", () => {
       {
         conversationId: conversation.conversationId,
         seq: 4,
-        role: "assistant",
+        role: "user",
         content: "new fresh tail moves prior tail into compactable prefix",
         tokenCount: 10,
       },
@@ -1389,6 +1390,13 @@ describe("PendingCompactionCoordinator", () => {
         conversationId: conversation.conversationId,
         seq: 11,
         role: "assistant",
+        content: "large turn response",
+        tokenCount: 5,
+      },
+      {
+        conversationId: conversation.conversationId,
+        seq: 12,
+        role: "user",
         content: "new fresh tail",
         tokenCount: 5,
       },
@@ -1414,7 +1422,12 @@ describe("PendingCompactionCoordinator", () => {
       ["alpha", "bravo", "charlie", "delta"].map((label, index) => ({
         conversationId: conversation.conversationId,
         seq: index + 1,
-        role: index % 2 === 0 ? ("user" as const) : ("assistant" as const),
+        role:
+          index === 3
+            ? ("user" as const)
+            : index % 2 === 0
+              ? ("user" as const)
+              : ("assistant" as const),
         content: `${label} compactable message`,
         tokenCount: 8,
       })),
@@ -1519,7 +1532,12 @@ describe("PendingCompactionCoordinator", () => {
       ["alpha", "bravo", "charlie", "delta"].map((label, index) => ({
         conversationId: conversation.conversationId,
         seq: index + 1,
-        role: index % 2 === 0 ? ("user" as const) : ("assistant" as const),
+        role:
+          index === 3
+            ? ("user" as const)
+            : index % 2 === 0
+              ? ("user" as const)
+              : ("assistant" as const),
         content: `${label} compactable message`,
         tokenCount: 8,
       })),
@@ -1570,7 +1588,7 @@ describe("PendingCompactionCoordinator", () => {
 
     // Two chunks of growth: enough new child work to satisfy the fanout.
     const suffixMessages = await conversationStore.createMessagesBulk(
-      ["echo", "foxtrot"].map((label, index) => ({
+      ["echo", "foxtrot", "golf"].map((label, index) => ({
         conversationId: conversation.conversationId,
         seq: 5 + index,
         role: index % 2 === 0 ? ("user" as const) : ("assistant" as const),
@@ -1657,7 +1675,7 @@ describe("PendingCompactionCoordinator", () => {
       {
         conversationId: conversation.conversationId,
         seq: 2,
-        role: "assistant",
+        role: "user",
         content: "original fresh tail",
         tokenCount: 4,
       },
