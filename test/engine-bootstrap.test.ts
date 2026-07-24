@@ -3711,6 +3711,72 @@ describe("LcmContextEngine.bootstrap", () => {
     expect(stored.map((message) => message.content)).toEqual(["db only user", "db only assistant"]);
   });
 
+  it("persists a bootstrap checkpoint when reconcile finds no anchor or overlap, so afterTurn does not freeze in checkpoint-missing", async () => {
+    // When ingest() runs before bootstrap() (race), the conversation has
+    // messages but no bootstrap_state.  If the transcript content does not
+    // overlap with the DB messages, reconcile finds no anchor.  Without a
+    // checkpoint row, afterTurn classifies the conversation as
+    // "checkpoint-missing" and skips all persistence permanently.
+    //
+    // This test asserts that bootstrap creates the checkpoint even in the
+    // no-overlap case, so afterTurn can recover on the next turn.
+    const sessionFile = createSessionFilePath("bootstrap-checkpoint-no-overlap");
+    const sm = SessionManager.open(sessionFile);
+    appendSessionMessage(sm, {
+      role: "user",
+      content: [{ type: "text", text: "transcript only user" }],
+    } as AgentMessage);
+    appendSessionMessage(sm, {
+      role: "assistant",
+      content: [{ type: "text", text: "transcript only assistant" }],
+    } as AgentMessage);
+
+    const engine = createEngine();
+    const sessionId = "bootstrap-checkpoint-no-overlap";
+
+    // Simulate ingest-before-bootstrap: store messages that do NOT overlap
+    // with the transcript content above.
+    await engine.ingest({
+      sessionId,
+      message: { role: "user", content: "db preamble" } as AgentMessage,
+    });
+    await engine.ingest({
+      sessionId,
+      message: { role: "assistant", content: "db preamble response" } as AgentMessage,
+    });
+
+    const result = await engine.bootstrap({ sessionId, sessionFile });
+    expect(result.bootstrapped).toBe(false);
+    expect(result.importedMessages).toBe(0);
+    // The conversation has pre-existing messages with no transcript overlap.
+    expect(result.reason).toBe("conversation already has messages");
+
+    const conversation = await engine
+      .getConversationStore()
+      .getConversationBySessionId(sessionId);
+    expect(conversation).not.toBeNull();
+    expect(conversation!.bootstrappedAt).not.toBeNull();
+
+    // The key invariant: bootstrap_state must exist so afterTurn can
+    // find a checkpoint.
+    const bootstrapState = await engine
+      .getSummaryStore()
+      .getConversationBootstrapState(conversation!.conversationId);
+    expect(bootstrapState).not.toBeNull();
+    expect(bootstrapState!.sessionFilePath).toBe(sessionFile);
+    expect(bootstrapState!.lastSeenSize).toBe(statSync(sessionFile).size);
+    expect(bootstrapState!.lastProcessedOffset).toBe(statSync(sessionFile).size);
+
+    // DB messages are preserved (no import, no corruption).
+    const stored = await engine
+      .getConversationStore()
+      .getMessages(conversation!.conversationId);
+    expect(stored.map((m) => m.content)).toEqual([
+      "db preamble",
+      "db preamble response",
+    ]);
+  });
+
   it("does not advance the bootstrap checkpoint when reconcile aborts at the import cap", async () => {
     const warnLog = vi.fn();
     const tempDir = mkdtempSync(join(tmpdir(), "lossless-claw-engine-"));
