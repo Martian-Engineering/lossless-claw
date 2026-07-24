@@ -2338,6 +2338,16 @@ export class LcmContextEngine implements ContextEngine {
             await persistBootstrapState(conversationId);
           }
 
+          // Without a bootstrap_state checkpoint the afterTurn reconcile
+          // classifies the conversation as "checkpoint-missing" and skips all
+          // persistence, permanently freezing the conversation with only the
+          // pre-bootstrap messages.  A conversation that reached this point
+          // has enough forward progress (bootstrapped_at set, messages in DB)
+          // to warrant a checkpoint so afterTurn can recover on the next turn.
+          if (!bootstrapState && !conversation.bootstrappedAt) {
+            await persistBootstrapState(conversationId);
+          }
+
           if (conversation.bootstrappedAt) {
             return {
               bootstrapped: false,
