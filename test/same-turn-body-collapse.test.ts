@@ -590,8 +590,9 @@ describe("openClawInboundBodiesMatch with plugin-injected context blocks between
   // Memory plugins prepend their blocks to the model-facing body via
   // before_prompt_build, so on decorated channels the runtime face is
   // metadata prelude + injected tag blocks + body, while the persisted bare
-  // row carries only the body (tags stripped at persist). The reduction must
-  // strip validated, COMPLETE leading blocks for the known tag names only.
+  // row carries only the body (injection happens at prompt-build, after
+  // persist). The reduction must strip validated, COMPLETE leading blocks
+  // for the known tag names only.
   const INJECTED_BLOCKS =
     "<derived-focus>\n[UNTRUSTED DATA]\nfocus text\n[END UNTRUSTED DATA]\n</derived-focus>\n" +
     "<inherited-rules>\nrule text\n</inherited-rules>\n" +

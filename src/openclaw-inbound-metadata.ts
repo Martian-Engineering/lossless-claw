@@ -472,11 +472,12 @@ function hasOpenClawInboundHistory(record: Record<string, unknown>): boolean {
 // Injected-context tag blocks that memory/context plugins prepend to the
 // model-facing body via before_prompt_build. On decorated channels they sit
 // between the metadata prelude and the user body on the RUNTIME face only;
-// persisted rows never carry them (stripped at persist), so reducing them off
-// the runtime side is what lets the same-turn collapse see through a
-// memory-bearing decorated copy. Only a COMPLETE <tag>...</tag> block for
-// these exact names is stripped; an unclosed or unknown tag stays in the body
-// and blocks the match (fail-closed).
+// persisted rows never carry them (plugins inject at prompt-build, strictly
+// after the bare row is persisted), so reducing them off the runtime side is
+// what lets the same-turn collapse see through a memory-bearing decorated
+// copy. Only a COMPLETE <tag>...</tag> block for these exact names is
+// stripped; an unclosed or unknown tag stays in the body and blocks the match
+// (fail-closed).
 // Exported as the single source of truth for injected-context TAG names:
 // live-coverage.ts derives its marker-recognition list from this same const,
 // so the reduction here and the recognition gate there can never disagree on

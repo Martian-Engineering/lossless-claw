@@ -5,9 +5,11 @@
 See through plugin-injected context blocks on decorated channel turns.
 
 Memory/context plugins prepend blocks like `<relevant-memories>` to the
-model-facing body via `before_prompt_build`. On decorated channels those blocks
-sit between the inbound metadata prelude and the user body, which defeated both
-the same-turn body collapse and the current-turn live-face recognition: the
+model-facing body via `before_prompt_build`, at prompt-build time — strictly
+after the bare transcript row is persisted, so persisted rows never carry
+them. On decorated channels those blocks sit between the inbound metadata
+prelude and the user body, which defeated both the same-turn body collapse and
+the current-turn live-face recognition: the
 memory-bearing live copy was neither collapsed onto its bare persisted row nor
 re-appended after assembly, so the injected context silently vanished from the
 outbound prompt. The inbound-body reduction now strips validated, complete
