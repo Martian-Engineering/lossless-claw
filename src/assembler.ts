@@ -1992,7 +1992,7 @@ export class ContextAssembler {
     // Downgrading the role requires upstream support; tracked in issue #71.
     return {
       ordinal: item.ordinal,
-      message: { role: "user" as const, content } as AgentMessage,
+      message: { role: "user" as const, content, __openclaw: { kind: "compaction" } } as AgentMessage,
       tokens,
       isMessage: false,
       text: summary.content,
