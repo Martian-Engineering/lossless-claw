@@ -152,6 +152,7 @@ export function extractBodyAfterOpenClawInboundMetadataBlock(content: string): s
     remaining = secondCandidate.slice(secondMatch[0].length);
   }
 
+  remaining = stripLeadingInjectedContextTagBlocks(remaining);
   if (hasOpenClawInboundHistory(firstRecord)) {
     const contextSplit = splitLeadingOpenClawInboundContextBlocks(remaining);
     const recapCandidate = contextSplit.remaining.trimStart();
@@ -160,6 +161,7 @@ export function extractBodyAfterOpenClawInboundMetadataBlock(content: string): s
       remaining = recapCandidate.slice(recapLength);
     }
   }
+  remaining = stripLeadingInjectedContextTagBlocks(remaining);
 
   return stripMetadataSeparator(remaining);
 }
@@ -465,6 +467,43 @@ function parseOpenClawInboundMetadataRecord(
 function hasOpenClawInboundHistory(record: Record<string, unknown>): boolean {
   const historyCount = record.history_count;
   return typeof historyCount === "number" && Number.isInteger(historyCount) && historyCount > 0;
+}
+
+// Injected-context tag blocks that memory/context plugins prepend to the
+// model-facing body via before_prompt_build. On decorated channels they sit
+// between the metadata prelude and the user body on the RUNTIME face only;
+// persisted rows never carry them (stripped at persist), so reducing them off
+// the runtime side is what lets the same-turn collapse see through a
+// memory-bearing decorated copy. Only a COMPLETE <tag>...</tag> block for
+// these exact names is stripped; an unclosed or unknown tag stays in the body
+// and blocks the match (fail-closed).
+const OPENCLAW_INJECTED_CONTEXT_TAG_NAMES = [
+  "relevant-memories",
+  "relevant_memories",
+  "hindsight_memories",
+  "inherited-rules",
+  "derived-focus",
+  "error-detected",
+  "active_memory_plugin",
+] as const;
+
+function stripLeadingInjectedContextTagBlocks(content: string): string {
+  let remaining = content;
+  while (true) {
+    const candidate = remaining.trimStart();
+    const name = OPENCLAW_INJECTED_CONTEXT_TAG_NAMES.find((tag) =>
+      candidate.startsWith(`<${tag}>`),
+    );
+    if (name === undefined) {
+      return remaining;
+    }
+    const closeTag = `</${name}>`;
+    const closeIndex = candidate.indexOf(closeTag);
+    if (closeIndex < 0) {
+      return remaining;
+    }
+    remaining = candidate.slice(closeIndex + closeTag.length);
+  }
 }
 
 function splitLeadingOpenClawInboundContextBlocks(content: string): {

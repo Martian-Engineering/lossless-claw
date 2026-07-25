@@ -968,3 +968,68 @@ describe("engine.assemble preserves webchat decoration + memory (no-preamble, me
     expect(bodyTurns.filter((content) => content === REPEAT)).toHaveLength(2);
   });
 });
+
+describe("appendUncoveredVolatileLiveInputsWithinBudget: decorated channel turn whose assembled face is the metadata-decorated row", () => {
+  // The real Slack/Telegram failing shape: assemble reconstructs the current
+  // turn as a plain body row PLUS the metadata-decorated persisted row (the
+  // decorated row lands LAST), while the live face is timestamp + metadata
+  // prelude + injected memory blocks + body. The live memory-bearing copy must
+  // be recognized as the decorated face of that last row and appended.
+  const CHANNEL_BODY = "morning check: did the deploy pipeline finish?";
+  const INJECTED =
+    "<derived-focus>\nfocus\n</derived-focus>\n" +
+    "<inherited-rules>\nrules\n</inherited-rules>\n" +
+    "<relevant-memories>\nmemories\n</relevant-memories>";
+  const liveDecorated = `[Sat 2026-07-25 11:25 GMT+3] ${metadataDecorated(
+    INJECTED + "\n\n" + CHANNEL_BODY,
+  )}`;
+
+  it("appends the live memory-bearing copy when the last assembled user row is the decorated persisted face", () => {
+    const assembledMessages: AgentMessage[] = [
+      { role: "user", content: "earlier persisted turn" },
+      { role: "assistant", content: "earlier reply" },
+      { role: "user", content: CHANNEL_BODY },
+      { role: "user", content: metadataDecorated(CHANNEL_BODY) },
+    ] as AgentMessage[];
+    const liveMessages: AgentMessage[] = [
+      { role: "user", content: liveDecorated },
+    ] as AgentMessage[];
+
+    const result = appendUncoveredVolatileLiveInputsWithinBudget({
+      assembledMessages,
+      assembledEstimatedTokens: 10,
+      liveMessages,
+      tokenBudget: 1_000_000,
+    });
+
+    const userContents = result.messages
+      .filter((message) => (message as { role: string }).role === "user")
+      .map((message) => (message as { content: string }).content);
+    expect(userContents[userContents.length - 1]).toBe(liveDecorated);
+    expect(userContents).toHaveLength(4);
+  });
+
+  it("does NOT append when the decorated faces carry DIFFERENT bodies (fail-closed)", () => {
+    const assembledMessages: AgentMessage[] = [
+      { role: "user", content: "earlier persisted turn" },
+      { role: "assistant", content: "earlier reply" },
+      { role: "user", content: metadataDecorated("a completely different question") },
+    ] as AgentMessage[];
+    const liveMessages: AgentMessage[] = [
+      { role: "user", content: liveDecorated },
+    ] as AgentMessage[];
+
+    const result = appendUncoveredVolatileLiveInputsWithinBudget({
+      assembledMessages,
+      assembledEstimatedTokens: 10,
+      liveMessages,
+      tokenBudget: 1_000_000,
+    });
+
+    const userContents = result.messages
+      .filter((message) => (message as { role: string }).role === "user")
+      .map((message) => (message as { content: string }).content);
+    expect(userContents).toHaveLength(2);
+    expect(userContents).not.toContain(liveDecorated);
+  });
+});

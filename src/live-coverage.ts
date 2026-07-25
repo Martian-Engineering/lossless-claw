@@ -7,7 +7,10 @@ import { contentFromParts } from "./assembler.js";
 import { buildMessageParts, toStoredMessage, toSyntheticMessagePartRecord } from "./message-content.js";
 import { createLiveCoverageSignature, hashAgentMessageForAssemblyProtection, messagesHaveSameLiveCoverageSignature } from "./message-signatures.js";
 import type { AgentMessage } from "./openclaw-bridge.js";
-import { stripLeadingOpenClawInboundTimestamp } from "./openclaw-inbound-metadata.js";
+import {
+  extractBodyAfterOpenClawInboundMetadataBlock,
+  stripLeadingOpenClawInboundTimestamp,
+} from "./openclaw-inbound-metadata.js";
 import { estimateAgentMessageTokens } from "./token-accounting.js";
 import { buildToolPairIndexesByAssembledIndex, expandProtectedToolPairIndexes, expandToolPairLiveSortIndexes } from "./tool-pairing.js";
 import { sanitizeToolUseResultPairing } from "./transcript-repair.js";
@@ -668,6 +671,30 @@ function assembledRowIsStructuralBareCurrentTurn(params: {
     })
   ) {
     return true;
+  }
+  // Decorated channels can persist the metadata-decorated face itself as the
+  // current-turn row. Injected plugin blocks on the live side then interpose
+  // between the metadata prelude and the body, so raw containment fails even
+  // though both faces reduce to the same body. Reduce BOTH through the
+  // metadata extraction (which strips timestamp, metadata, recap, and
+  // validated injected blocks) and require full-body equality — still gated
+  // on the last assembled user row plus a recognized injected marker.
+  if (
+    params.assembledIsLastUserRow &&
+    liveContentCarriesRecognizedInjectedContextMarker(params.liveContent)
+  ) {
+    const liveBody = extractBodyAfterOpenClawInboundMetadataBlock(params.liveContent.trimStart());
+    const assembledBody = extractBodyAfterOpenClawInboundMetadataBlock(
+      params.assembledContent.trimStart(),
+    );
+    if (
+      liveBody !== null &&
+      assembledBody !== null &&
+      liveBody.trim().length > 0 &&
+      liveBody.trim() === assembledBody.trim()
+    ) {
+      return true;
+    }
   }
   return liveContentIsRecognizedDecoratedBareBody({
     liveContent: params.liveContent,

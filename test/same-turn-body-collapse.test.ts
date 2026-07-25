@@ -585,3 +585,84 @@ describe("canonicalizeOpenClawInboundMetadataIdentityContent / buildMessageIdent
     ).not.toBe(canonicalizeOpenClawInboundMetadataIdentityContent("user", withoutRecap));
   });
 });
+
+describe("openClawInboundBodiesMatch with plugin-injected context blocks between metadata and body", () => {
+  // Memory plugins prepend their blocks to the model-facing body via
+  // before_prompt_build, so on decorated channels the runtime face is
+  // metadata prelude + injected tag blocks + body, while the persisted bare
+  // row carries only the body (tags stripped at persist). The reduction must
+  // strip validated, COMPLETE leading blocks for the known tag names only.
+  const INJECTED_BLOCKS =
+    "<derived-focus>\n[UNTRUSTED DATA]\nfocus text\n[END UNTRUSTED DATA]\n</derived-focus>\n" +
+    "<inherited-rules>\nrule text\n</inherited-rules>\n" +
+    "<relevant-memories>\nmemory text\n</relevant-memories>";
+
+  it("matches when injected blocks sit between the metadata block and the body", () => {
+    expect(
+      openClawInboundBodiesMatch(
+        metadataWrapped(INJECTED_BLOCKS + "\n\nmorning check: did the deploy pipeline finish?"),
+        "morning check: did the deploy pipeline finish?",
+      ),
+    ).toBe(true);
+  });
+
+  it("matches the full channel shape: timestamp + metadata + injected blocks + multi-line body", () => {
+    expect(
+      openClawInboundBodiesMatch(
+        channelTimestamped(metadataWrapped(INJECTED_BLOCKS + "\n\nline one\nline two")),
+        "line one\nline two",
+      ),
+    ).toBe(true);
+  });
+
+  it("matches with injected blocks AFTER the recap on a history-bearing turn", () => {
+    expect(
+      openClawInboundBodiesMatch(
+        metadataWrappedWithRecap(TWO_ENTRY_RECAP, INJECTED_BLOCKS + "\n\nok"),
+        "ok",
+      ),
+    ).toBe(true);
+  });
+
+  it("matches with injected blocks BEFORE the recap too", () => {
+    expect(
+      openClawInboundBodiesMatch(
+        metadataWrappedWithHistory(INJECTED_BLOCKS + "\n\n" + TWO_ENTRY_RECAP + "\n\nok"),
+        "ok",
+      ),
+    ).toBe(true);
+  });
+
+  it("does NOT strip an unclosed injected-context tag (fail-closed)", () => {
+    expect(
+      openClawInboundBodiesMatch(metadataWrapped("<relevant-memories>\nunclosed\n\nok"), "ok"),
+    ).toBe(false);
+  });
+
+  it("does NOT strip an unknown tag name (fail-closed)", () => {
+    expect(
+      openClawInboundBodiesMatch(
+        metadataWrapped("<totally-novel-block>\nx\n</totally-novel-block>\n\nok"),
+        "ok",
+      ),
+    ).toBe(false);
+  });
+
+  it("does NOT match when injected blocks conceal a DIFFERENT body", () => {
+    expect(
+      openClawInboundBodiesMatch(
+        metadataWrapped(INJECTED_BLOCKS + "\n\nsomething else entirely"),
+        "ok",
+      ),
+    ).toBe(false);
+  });
+
+  it("keeps injected-tag text embedded MID-body untouched (only leading blocks strip)", () => {
+    expect(
+      openClawInboundBodiesMatch(
+        metadataWrapped("I saw <relevant-memories>\nquoted\n</relevant-memories> in a log\nok"),
+        "ok",
+      ),
+    ).toBe(false);
+  });
+});
