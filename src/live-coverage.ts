@@ -9,6 +9,7 @@ import { createLiveCoverageSignature, hashAgentMessageForAssemblyProtection, mes
 import type { AgentMessage } from "./openclaw-bridge.js";
 import {
   extractBodyAfterOpenClawInboundMetadataBlock,
+  OPENCLAW_INJECTED_CONTEXT_TAG_NAMES,
   stripLeadingOpenClawInboundTimestamp,
 } from "./openclaw-inbound-metadata.js";
 import { estimateAgentMessageTokens } from "./token-accounting.js";
@@ -613,13 +614,7 @@ export function liveContentIsRecognizedDecoratedBareBody(params: {
  * assembledRowIsStructuralBareCurrentTurn).
  */
 const INJECTED_CONTEXT_MARKERS = [
-  "<relevant-memories>",
-  "<relevant_memories>",
-  "<hindsight_memories>",
-  "<inherited-rules>",
-  "<derived-focus>",
-  "<error-detected>",
-  "<active_memory_plugin>",
+  ...OPENCLAW_INJECTED_CONTEXT_TAG_NAMES.map((tag) => `<${tag}>` as const),
   INTERNAL_CONTEXT_BEGIN_MARKER,
 ] as const;
 

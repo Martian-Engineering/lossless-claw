@@ -477,7 +477,11 @@ function hasOpenClawInboundHistory(record: Record<string, unknown>): boolean {
 // memory-bearing decorated copy. Only a COMPLETE <tag>...</tag> block for
 // these exact names is stripped; an unclosed or unknown tag stays in the body
 // and blocks the match (fail-closed).
-const OPENCLAW_INJECTED_CONTEXT_TAG_NAMES = [
+// Exported as the single source of truth for injected-context TAG names:
+// live-coverage.ts derives its marker-recognition list from this same const,
+// so the reduction here and the recognition gate there can never disagree on
+// which tags count as injected plugin context.
+export const OPENCLAW_INJECTED_CONTEXT_TAG_NAMES = [
   "relevant-memories",
   "relevant_memories",
   "hindsight_memories",

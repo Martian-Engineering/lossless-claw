@@ -665,4 +665,14 @@ describe("openClawInboundBodiesMatch with plugin-injected context blocks between
       ),
     ).toBe(false);
   });
+
+  it("boundary pin: memory blocks BEFORE the metadata prelude leave extraction null (shape not reduced)", () => {
+    // The reduction requires the metadata block first; a face with injected
+    // blocks ahead of the prelude is not a recognized decorated shape. Not an
+    // observed channel emission; pinned so the boundary is deliberate.
+    const memoryFirst =
+      "<relevant-memories>\nmemory text\n</relevant-memories>\n\n" + metadataWrapped("ok");
+    expect(extractBodyAfterOpenClawInboundMetadataBlock(memoryFirst)).toBeNull();
+    expect(openClawInboundBodiesMatch(memoryFirst, "ok")).toBe(false);
+  });
 });
