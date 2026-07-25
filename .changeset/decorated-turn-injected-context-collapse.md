@@ -17,3 +17,11 @@ leading injected-context tag blocks (known tag names only, fail-closed), and
 the structural current-turn recognizer accepts a metadata-decorated assembled
 face whose extracted body equals the live copy's extracted body (the last
 assembled user row and recognized-marker gates are unchanged).
+
+The line-form history recap matcher is now a linear line walker instead of a
+composite backtracking regex. The old pattern went catastrophic (minutes of
+event-loop blocking per call) on entry runs that fail the trailing terminator
+check while containing per-line ambiguity, a shape real group-chat recaps
+produce and which the reduction above newly exposes to routine traffic.
+Semantics are unchanged and pinned by tests, including the all-or-nothing
+fail-closed rejection of an unterminated run.

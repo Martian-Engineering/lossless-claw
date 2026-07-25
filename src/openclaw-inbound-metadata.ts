@@ -56,26 +56,107 @@ const OPENCLAW_INBOUND_HISTORY_RECAP_BLOCK_RE = new RegExp(
 // "<sender>: <content>". A line carrying NEITHER token is indistinguishable
 // from ordinary prose, so it is deliberately excluded from recognition here
 // (fail-closed: at least one anchor token is required).
-const OPENCLAW_INBOUND_HISTORY_RECAP_LINE_ID_TOKEN = String.raw`#\S+`;
-const OPENCLAW_INBOUND_HISTORY_RECAP_LINE_TIMESTAMP_TOKEN =
-  String.raw`[A-Za-z]{3} \d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2} \S+`;
-const OPENCLAW_INBOUND_HISTORY_RECAP_LINE_ENTRY_SRC = String.raw`(?:${OPENCLAW_INBOUND_HISTORY_RECAP_LINE_ID_TOKEN} ${OPENCLAW_INBOUND_HISTORY_RECAP_LINE_TIMESTAMP_TOKEN} |${OPENCLAW_INBOUND_HISTORY_RECAP_LINE_ID_TOKEN} |${OPENCLAW_INBOUND_HISTORY_RECAP_LINE_TIMESTAMP_TOKEN} ).+: .+`;
+const OPENCLAW_INBOUND_HISTORY_RECAP_LINE_ID_PREFIX_RE = /^#\S+ /;
+const OPENCLAW_INBOUND_HISTORY_RECAP_LINE_TIMESTAMP_PREFIX_RE =
+  /^[A-Za-z]{3} \d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2} \S+ /;
 
 // Unlike the JSON form (self-delimiting via the closing fence), prose lines
 // have no hard terminator: the real emitter just stops emitting lines, and
 // buildInboundUserContextPrefix joins every block (including this one) with
 // blocks.filter(Boolean).join("\n\n"). So the only structurally valid ways
 // for a run of entry lines to end are a blank-line block separator or end of
-// content; the trailing lookahead enforces that. A run that peters out into
-// anything else (a line that is neither a valid entry nor a blank separator)
-// fails the WHOLE match, so it is never partially stripped up to that point.
-const OPENCLAW_INBOUND_HISTORY_RECAP_LINE_BLOCK_RE = new RegExp(
-  `^${OPENCLAW_INBOUND_HISTORY_RECAP_HEADER_SRC}` +
-    String.raw`\r?\n` +
-    `(?:${OPENCLAW_INBOUND_HISTORY_RECAP_LINE_ENTRY_SRC})` +
-    `(?:\r?\n(?:${OPENCLAW_INBOUND_HISTORY_RECAP_LINE_ENTRY_SRC}))*` +
-    String.raw`(?=\r?\n\r?\n|\r?\n?$)`,
-);
+// content. A run that peters out into anything else (a line that is neither a
+// valid entry nor a blank separator) fails the WHOLE match, so it is never
+// partially stripped up to that point.
+//
+// Deliberately implemented as a line walker rather than one composite
+// `(?:ENTRY)(?:\r?\n(?:ENTRY))*(?=terminator)` regex: entry lines are
+// internally ambiguous (three optional-prefix alternates, sender/content
+// split at any ": "), so on a long run whose terminator check fails the
+// backtracking engine explores the cross-product of every per-line ambiguity
+// and goes catastrophic (minutes of blocking on a ~200-entry colon-heavy
+// recap; the shape real group chats produce whenever a recap entry contains
+// its own newlines). A shorter run can never satisfy the terminator that the
+// maximal run failed (the next char after an intermediate entry is always its
+// successor line, never a blank separator or end), so the walk is all-or-
+// nothing greedy and strictly linear.
+function matchLeadingOpenClawInboundHistoryRecapLineBlock(candidate: string): number {
+  const header = OPENCLAW_INBOUND_HISTORY_RECAP_HEADERS.find((headerText) =>
+    candidate.startsWith(headerText),
+  );
+  if (header === undefined) {
+    return 0;
+  }
+  let cursor = header.length;
+  if (candidate.startsWith("\r\n", cursor)) {
+    cursor += 2;
+  } else if (candidate.startsWith("\n", cursor)) {
+    cursor += 1;
+  } else {
+    return 0;
+  }
+
+  let matchedEnd = -1;
+  while (cursor < candidate.length) {
+    const newlineIndex = candidate.indexOf("\n", cursor);
+    let lineTextEnd = newlineIndex === -1 ? candidate.length : newlineIndex;
+    if (lineTextEnd > cursor && candidate.charCodeAt(lineTextEnd - 1) === 13) {
+      lineTextEnd -= 1;
+    }
+    if (!isOpenClawInboundHistoryRecapEntryLine(candidate.slice(cursor, lineTextEnd))) {
+      break;
+    }
+    matchedEnd = lineTextEnd;
+    if (newlineIndex === -1) {
+      break;
+    }
+    cursor = newlineIndex + 1;
+  }
+  if (matchedEnd < 0) {
+    return 0;
+  }
+
+  const rest = candidate.slice(matchedEnd);
+  const terminated =
+    rest.length === 0 ||
+    rest === "\n" ||
+    rest === "\r\n" ||
+    rest.startsWith("\n\n") ||
+    rest.startsWith("\n\r\n") ||
+    rest.startsWith("\r\n\n") ||
+    rest.startsWith("\r\n\r\n");
+  return terminated ? matchedEnd : 0;
+}
+
+// "<sender>: <content>" with both sides non-empty: at least one character
+// before the first eligible ": " and at least one after it. (A CR-only
+// content survives the composite-regex form via `.` matching \r; the walker
+// treats it as empty and rejects -- the conservative direction.)
+function recapEntryLineHasSenderAndContent(remainder: string): boolean {
+  const separatorIndex = remainder.indexOf(": ", 1);
+  return separatorIndex !== -1 && separatorIndex + 2 < remainder.length;
+}
+
+function isOpenClawInboundHistoryRecapEntryLine(line: string): boolean {
+  const idMatch = OPENCLAW_INBOUND_HISTORY_RECAP_LINE_ID_PREFIX_RE.exec(line);
+  if (idMatch) {
+    const afterId = line.slice(idMatch[0].length);
+    const timestampMatch =
+      OPENCLAW_INBOUND_HISTORY_RECAP_LINE_TIMESTAMP_PREFIX_RE.exec(afterId);
+    if (
+      timestampMatch &&
+      recapEntryLineHasSenderAndContent(afterId.slice(timestampMatch[0].length))
+    ) {
+      return true;
+    }
+    return recapEntryLineHasSenderAndContent(afterId);
+  }
+  const timestampMatch = OPENCLAW_INBOUND_HISTORY_RECAP_LINE_TIMESTAMP_PREFIX_RE.exec(line);
+  return (
+    timestampMatch !== null &&
+    recapEntryLineHasSenderAndContent(line.slice(timestampMatch[0].length))
+  );
+}
 
 // OpenClaw-version-coupled inbound decoration string: the header an OpenClaw
 // runtime prepends to a user turn that carries an ambient room event (channel
@@ -583,8 +664,7 @@ function matchLeadingOpenClawInboundHistoryRecap(candidate: string): number {
   if (jsonMatch) {
     return isValidOpenClawInboundHistoryRecapPayload(jsonMatch[1] ?? "") ? jsonMatch[0].length : 0;
   }
-  const lineMatch = OPENCLAW_INBOUND_HISTORY_RECAP_LINE_BLOCK_RE.exec(candidate);
-  return lineMatch ? lineMatch[0].length : 0;
+  return matchLeadingOpenClawInboundHistoryRecapLineBlock(candidate);
 }
 
 function canonicalizeMetadataJson(
