@@ -45,7 +45,31 @@ describe("line-form history recap matching stays linear (no backtracking blowup)
     const elapsedMs = Number(process.hrtime.bigint() - startedAt) / 1e6;
 
     expect(matched).toBe(false);
-    expect(elapsedMs).toBeLessThan(2000);
+    // Measured ~0.1ms for this shape. The ceiling is deliberately far above
+    // that so a loaded CI runner cannot flake, but three orders of magnitude
+    // BELOW the old 2s bound, which a mild (non-catastrophic) backtracking
+    // regression of a few hundred ms per call would have passed.
+    expect(elapsedMs).toBeLessThan(250);
+  });
+
+  it("stays under the same ceiling when the entry run grows 64x (linear, not quadratic)", () => {
+    // An absolute ceiling alone cannot tell linear from quadratic. Growing the
+    // run to 2560 entries does: measured ~1ms (the walker visits each line
+    // once), whereas a quadratic reintroduction would land in the hundreds of
+    // ms from the same 0.1ms base, and a catastrophic one would not return.
+    const lines: string[] = [];
+    for (let i = 0; i < 2560; i += 1) {
+      lines.push(`#10${i} ${TS} sam.rivera: status: ok: retry: none: queue: ${i}: still: fine`);
+    }
+    lines.push("a continuation line with no anchor token that breaks the run");
+    const recap = `${RECAP_HEADER}\n${lines.join("\n")}`;
+
+    const startedAt = process.hrtime.bigint();
+    const matched = openClawInboundBodiesMatch(face(`${recap}\n\n${BODY}`), BODY);
+    const elapsedMs = Number(process.hrtime.bigint() - startedAt) / 1e6;
+
+    expect(matched).toBe(false);
+    expect(elapsedMs).toBeLessThan(250);
   });
 });
 

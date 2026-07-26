@@ -677,3 +677,51 @@ describe("openClawInboundBodiesMatch with plugin-injected context blocks between
     expect(openClawInboundBodiesMatch(memoryFirst, "ok")).toBe(false);
   });
 });
+
+// Injected-block stripping lives in the body-match layer ONLY. Identity
+// canonicalization keeps those blocks verbatim, which is prior behavior rather
+// than an oversight: body-match is the relaxation that lets a decorated live
+// turn collapse onto its bare persisted row, while identity stays conservative.
+// Neither half may move alone. If identity began stripping, two live faces
+// carrying different injected content would collide on one hash; if body-match
+// stopped stripping, the decorated turn would no longer collapse at all. Rows
+// already written at the current identity version have no repair path, so the
+// asymmetry is pinned here rather than "aligned" later by accident.
+describe("injected-context stripping is a body-match relaxation, never an identity change", () => {
+  const bare = "what's the status on the deploy?";
+  const injected = [
+    "<relevant-memories>",
+    "- the deploy queue drains at midnight",
+    "</relevant-memories>",
+  ].join("\n");
+  const decorated = metadataWrapped(`${injected}\n\n${bare}`);
+
+  it("body-match sees through a leading injected block", () => {
+    expect(openClawInboundBodiesMatch(decorated, bare)).toBe(true);
+  });
+
+  it("identity canonicalization keeps the injected block verbatim", () => {
+    const canonicalDecorated = canonicalizeOpenClawInboundMetadataIdentityContent("user", decorated);
+    expect(canonicalDecorated).toContain("relevant-memories");
+    expect(canonicalDecorated).not.toBe(
+      canonicalizeOpenClawInboundMetadataIdentityContent("user", metadataWrapped(bare)),
+    );
+  });
+
+  it("so a decorated turn and its bare row hash differently, by design", () => {
+    expect(buildMessageIdentityHash("user", decorated)).not.toBe(
+      buildMessageIdentityHash("user", metadataWrapped(bare)),
+    );
+  });
+
+  it("and two different injected payloads on the same body stay distinct in identity", () => {
+    const otherInjected = [
+      "<relevant-memories>",
+      "- the deploy queue drains at noon",
+      "</relevant-memories>",
+    ].join("\n");
+    expect(buildMessageIdentityHash("user", decorated)).not.toBe(
+      buildMessageIdentityHash("user", metadataWrapped(`${otherInjected}\n\n${bare}`)),
+    );
+  });
+});
