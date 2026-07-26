@@ -10,7 +10,7 @@
  */
 
 import { describe, it, expect, vi } from "vitest";
-import { ContextAssembler } from "../src/assembler.js";
+import { ContextAssembler, type AssembleContextResult } from "../src/assembler.js";
 import type {
   SummaryStore,
   ContextItemRecord,
@@ -21,24 +21,6 @@ import type {
   MessageRecord,
   MessagePartRecord,
 } from "../src/store/conversation-store.js";
-
-// ── types ────────────────────────────────────────────────────────────────────
-
-type AgentMessage = {
-  role: string;
-  content: string;
-  [key: string]: unknown;
-};
-
-type AssembleContextResult = {
-  messages: AgentMessage[];
-  estimatedTokens: number;
-  stats: {
-    rawMessageCount: number;
-    summaryCount: number;
-    totalContextItems: number;
-  };
-};
 
 // ── mock factories ───────────────────────────────────────────────────────────
 
@@ -162,11 +144,11 @@ describe("ContextAssembler compaction marker", () => {
 
     // Find the message that came from the summary
     const compactionMessage = result.messages.find(
-      (m: AgentMessage) => m.__openclaw !== undefined,
+      (m) => (m as any).__openclaw !== undefined,
     );
 
     expect(compactionMessage).toBeDefined();
-    expect(compactionMessage!.__openclaw).toEqual({ kind: "compaction" });
+    expect((compactionMessage as any).__openclaw).toEqual({ kind: "compaction" });
   });
 
   // TC-6: message-only items do not produce __openclaw markers
@@ -198,7 +180,7 @@ describe("ContextAssembler compaction marker", () => {
 
     // None of the messages should have __openclaw
     for (const msg of result.messages) {
-      expect(msg.__openclaw).toBeUndefined();
+      expect((msg as any).__openclaw).toBeUndefined();
     }
   });
 });
