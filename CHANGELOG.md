@@ -2,6 +2,8 @@
 
 ## 0.15.0
 
+<!-- release-rollback-version: 0.14.0 -->
+
 ### Minor Changes
 
 - [#981](https://github.com/Martian-Engineering/lossless-claw/pull/981) [`189efba`](https://github.com/Martian-Engineering/lossless-claw/commit/189efbaf792cd93ee10579747168ff0f75b2511a) Thanks [@cxbAsDev](https://github.com/cxbAsDev)! - `/lossless doctor apply` can now repair a specific conversation with `doctor apply <conversation-id> confirm-offline`. Targeted repair is limited to authorized OpenClaw command senders and requires the explicit offline confirmation after the target's active channel path is isolated. The existing current-conversation behavior is unchanged when no id is provided.
