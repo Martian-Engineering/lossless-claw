@@ -196,9 +196,9 @@ export type LcmConfig = {
   /** Cooldown in milliseconds before the circuit breaker auto-resets (default 30 min). */
   circuitBreakerCooldownMs: number;
   /** Maximum consecutive non-progress compaction attempts before the
-   *  deferred compaction loop is force-exhausted. Set to 0 to disable.
-   *  Uses the durable maintenance-store retryAttempts counter so the
-   *  breaker survives restarts. Default: 10. */
+   *  deferred compaction loop is force-exhausted. Set to 0 to disable
+   *  the breaker (no limit). Uses the durable maintenance-store
+   *  retryAttempts counter so the breaker survives restarts. Default: 10. */
   compactionLoopMaxConsecutiveFailures?: number;
   /**
    * Anti-replay flood threshold for EXTERNAL-input roles (currently `user`).

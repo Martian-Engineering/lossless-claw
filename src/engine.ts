@@ -1059,7 +1059,7 @@ export class LcmContextEngine implements ContextEngine {
         // process-local counter so the breaker survives restarts.
         const retryAttempts = maintenance?.retryAttempts ?? 0;
         const maxFailures = this.config.compactionLoopMaxConsecutiveFailures ?? 10;
-        if (retryAttempts >= maxFailures) {
+        if (maxFailures > 0 && retryAttempts >= maxFailures) {
           this.deps.log.warn(
             `[lcm] circuit-breaker: force-exhausting compact loop conversation=${params.conversationId} ${sessionLabel} retryAttempts=${retryAttempts} maxFailures=${maxFailures}`,
           );

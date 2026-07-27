@@ -492,6 +492,13 @@ describe("Circuit Breaker", () => {
     // Assemble should not crash even when the breaker trips.
     expect(assembled.messages.length).toBeGreaterThan(0);
 
+    // After the breaker tripped, retryAttempts should remain at 10
+    // (compaction was skipped, so no reset occurred).
+    const afterMaintenance = await maintenanceStore.getConversationCompactionMaintenance(
+      conversation.conversationId,
+    );
+    expect(afterMaintenance?.retryAttempts).toBe(10);
+
     // Clean up the maintenance state.
     await maintenanceStore.markProactiveCompactionFinished({
       conversationId: conversation.conversationId,
