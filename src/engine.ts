@@ -308,12 +308,6 @@ export class LcmContextEngine implements ContextEngine {
   // ── Circuit breaker + summary spend guard ───────────────────────────────
   private readonly compactionGuards: CompactionGuards;
 
-  // Circuit breaker: track consecutive compact attempts per conversation.
-  // When the compact loop spins without making progress (e.g. ENOENT on
-  // transcript file triggers repeated assemble → compact → assemble cycles),
-  // the counter rises. After exceeding the threshold the loop is force-exhausted
-  // to prevent CPU/I/O runaway. Reset when maintenance state clears.
-  private consecutiveCompactAttemptsByConversation = new Map<number, number>();
 
   // ── Large-payload interception at ingest ────────────────────────────────
   private readonly largeFileInterceptor: LargeFileInterceptor;
@@ -1055,23 +1049,19 @@ export class LcmContextEngine implements ContextEngine {
             params.conversationId,
           );
         if (!maintenance?.pending && !maintenance?.running) {
-          // Maintenance cleared — reset the circuit breaker.
-          this.consecutiveCompactAttemptsByConversation.delete(params.conversationId);
           return;
         }
 
         // Circuit breaker: if the compact loop has been spinning without
-        // progress, force-exhaust to prevent CPU/I/O runaway.
-        const consecutiveAttempts =
-          (this.consecutiveCompactAttemptsByConversation.get(params.conversationId) ?? 0) + 1;
-        this.consecutiveCompactAttemptsByConversation.set(
-          params.conversationId,
-          consecutiveAttempts,
-        );
-        const CIRCUIT_BREAKER_THRESHOLD = 10;
-        if (consecutiveAttempts > CIRCUIT_BREAKER_THRESHOLD) {
+        // progress, force-exhaust to prevent CPU/I/O runaway. Uses the
+        // durable maintenance-store retryAttempts counter (incremented by
+        // markProactiveCompactionFinished on each failure) instead of a
+        // process-local counter so the breaker survives restarts.
+        const retryAttempts = maintenance?.retryAttempts ?? 0;
+        const maxFailures = this.config.compactionLoopMaxConsecutiveFailures ?? 10;
+        if (retryAttempts >= maxFailures) {
           this.deps.log.warn(
-            `[lcm] circuit-breaker: force-exhausting compact loop conversation=${params.conversationId} ${sessionLabel} consecutiveAttempts=${consecutiveAttempts}`,
+            `[lcm] circuit-breaker: force-exhausting compact loop conversation=${params.conversationId} ${sessionLabel} retryAttempts=${retryAttempts} maxFailures=${maxFailures}`,
           );
           drainResult = { exhausted: true };
           return;
@@ -1092,7 +1082,6 @@ export class LcmContextEngine implements ContextEngine {
                 ...(telemetry.model ? { model: telemetry.model } : {}),
               }
             : undefined;
-        const retryAttempts = maintenance?.retryAttempts ?? 0;
         const forceAllowed = retryAttempts < ASSEMBLE_FORCE_MAX_RETRY_ATTEMPTS;
         const result = await this.consumeDeferredCompactionDebt({
           conversationId: params.conversationId,
@@ -1104,14 +1093,9 @@ export class LcmContextEngine implements ContextEngine {
           force: forceAllowed,
         });
         drainResult = { exhausted: result?.exhausted === true };
-        // Only reset the circuit breaker when compaction actually made
-        // progress (changed === true), not on every non-exhausted return.
-        // Without this guard, failures (ENOENT, etc.) that return
-        // exhausted=false would perpetually reset the counter and prevent
-        // the circuit breaker from ever triggering.
-        if (result?.changed === true) {
-          this.consecutiveCompactAttemptsByConversation.delete(params.conversationId);
-        }
+        // Maintenance-store retryAttempts handles counter reset: successful
+        // compaction calls markProactiveCompactionFinished without a failure
+        // summary, which resets retryAttempts to 0. No manual reset needed.
       },
       {
         operationName: "assembleDeferredCompaction",

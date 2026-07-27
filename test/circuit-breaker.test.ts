@@ -440,28 +440,11 @@ describe("Circuit Breaker", () => {
     }
   });
 
-  it("should not reset assemble compact-loop counter on changed=false (non-exhausted failures)", async () => {
-    // Regression: prior to ad7485ad the circuit breaker reset condition was
-    // `!drainResult.exhausted`, which was true for *all* failure paths
-    // (ENOENT, etc.), causing perpetual counter resets. The fix changes the
-    // reset condition to `result.changed === true` so only genuine compaction
-    // progress (cooling signal) resets the counter.
-    await engine.bootstrap({ sessionId, sessionFile, sessionKey });
-
-    // Access the private counter map via `as any`.
-    const counterMap: Map<number, number> = (engine as any).consecutiveCompactAttemptsByConversation;
-    const conversationId = (engine as any).getConversationStore
-      ? await (engine as any).getConversationStore().getConversationForSession({ sessionId, sessionKey })
-      : null;
-
-    // Sanity: counter map exists as a Map.
-    expect(counterMap).toBeInstanceOf(Map);
-  });
-
-  it("should trip assemble compact-loop circuit breaker after threshold exceeded", async () => {
-    // Set up a session with a deferred compaction maintenance state (pending)
-    // so that assemble's maybeConsumeDeferredCompactionDebtForAssemble
-    // enters the circuit-breaker guarded path.
+  it("should force-exhaust deferred compaction loop when retryAttempts >= maxFailures", async () => {
+    // Regression: replace the process-local compact-loop counter with the
+    // durable maintenance-store retryAttempts field. When retryAttempts
+    // reaches compactionLoopMaxConsecutiveFailures, the deferred compaction
+    // drain must force-exhaust to prevent CPU/I/O runaway.
     await engine.bootstrap({ sessionId, sessionFile, sessionKey });
 
     const conversation = await (engine as any).getConversationStore().getConversationForSession({
@@ -472,23 +455,32 @@ describe("Circuit Breaker", () => {
 
     const maintenanceStore = (engine as any).compactionMaintenanceStore;
 
-    // Create a pending maintenance entry to activate the compact-loop logic.
+    // Create a pending maintenance entry to activate compact-loop logic.
     await maintenanceStore.requestProactiveCompactionDebt({
       conversationId: conversation.conversationId,
-      reason: "test forced pending",
+      reason: "threshold",
     });
 
-    // Access the private counter map.
-    const counterMap: Map<number, number> = (engine as any).consecutiveCompactAttemptsByConversation;
+    // Simulate 10 consecutive failures — each call to
+    // markProactiveCompactionFinished with a backoff-worthy failure
+    // increments retryAttempts.
+    for (let i = 0; i < 10; i++) {
+      await maintenanceStore.markProactiveCompactionFinished({
+        conversationId: conversation.conversationId,
+        failureSummary: "ENOENT: transcript file moved or deleted",
+        keepPending: true,
+      });
+    }
 
-    // Manually simulate 11 consecutive attempts — exceeding the threshold of 10.
-    // In production, each failed consumeDeferredCompactionDebt call increments
-    // the counter. Here we set the counter directly to verify the threshold logic.
-    counterMap.set(conversation.conversationId, 11);
+    // Verify retryAttempts has reached the threshold.
+    const maintenance = await maintenanceStore.getConversationCompactionMaintenance(
+      conversation.conversationId,
+    );
+    expect(maintenance?.retryAttempts).toBe(10);
 
     // Trigger the deferred drain path via assemble. The maintenance entry
-    // is pending, so the code should check the circuit breaker and see
-    // the counter > 10, returning exhausted=true without calling the summarizer.
+    // is pending, so the code should check retryAttempts >= maxFailures (10)
+    // and return exhausted=true without calling the summarizer.
     const liveMessages = [makeMessage({ role: "user", content: "hello" })];
     const assembled = await engine.assemble({
       sessionId,
@@ -497,15 +489,108 @@ describe("Circuit Breaker", () => {
       tokenBudget: 8_000,
     });
 
-    // The assemble result itself should return something (live or degraded).
+    // Assemble should not crash even when the breaker trips.
     expect(assembled.messages.length).toBeGreaterThan(0);
 
-    // After the breaker trip, the counter should remain set
-    // (not reset by changed=true because no actual progress was made).
-    // Clean up the maintenance state so we don't leak across tests.
+    // Clean up the maintenance state.
     await maintenanceStore.markProactiveCompactionFinished({
       conversationId: conversation.conversationId,
     });
+  });
+
+  it("should allow deferred compaction when retryAttempts < maxFailures", async () => {
+    // When retryAttempts is below the configured threshold, the deferred
+    // compaction drain should proceed normally instead of force-exhausting.
+    await engine.bootstrap({ sessionId, sessionFile, sessionKey });
+
+    const conversation = await (engine as any).getConversationStore().getConversationForSession({
+      sessionId,
+      sessionKey,
+    });
+    if (!conversation) return;
+
+    const maintenanceStore = (engine as any).compactionMaintenanceStore;
+
+    // Create a pending maintenance entry.
+    await maintenanceStore.requestProactiveCompactionDebt({
+      conversationId: conversation.conversationId,
+      reason: "threshold",
+    });
+
+    // Only 2 failures — well below the default maxFailures of 10.
+    for (let i = 0; i < 2; i++) {
+      await maintenanceStore.markProactiveCompactionFinished({
+        conversationId: conversation.conversationId,
+        failureSummary: "ENOENT: transcript file moved or deleted",
+        keepPending: true,
+      });
+    }
+
+    const maintenance = await maintenanceStore.getConversationCompactionMaintenance(
+      conversation.conversationId,
+    );
+    expect(maintenance?.retryAttempts).toBe(2);
+
+    // Trigger the deferred drain path via assemble.
+    const liveMessages = [makeMessage({ role: "user", content: "hello" })];
+    const assembled = await engine.assemble({
+      sessionId,
+      sessionKey,
+      messages: liveMessages,
+      tokenBudget: 8_000,
+    });
+
+    // Assemble should succeed without the breaker tripping.
+    expect(assembled.messages.length).toBeGreaterThan(0);
+
+    // Clean up.
+    await maintenanceStore.markProactiveCompactionFinished({
+      conversationId: conversation.conversationId,
+    });
+  });
+
+  it("should reset retryAttempts after successful compaction", async () => {
+    // markProactiveCompactionFinished with no failureSummary resets
+    // retryAttempts to 0, confirming the maintenance store handles the
+    // counter reset instead of a process-local map.
+    await engine.bootstrap({ sessionId, sessionFile, sessionKey });
+
+    const conversation = await (engine as any).getConversationStore().getConversationForSession({
+      sessionId,
+      sessionKey,
+    });
+    if (!conversation) return;
+
+    const maintenanceStore = (engine as any).compactionMaintenanceStore;
+
+    // Set up pending maintenance with a non-zero retryAttempts.
+    await maintenanceStore.requestProactiveCompactionDebt({
+      conversationId: conversation.conversationId,
+      reason: "threshold",
+    });
+
+    for (let i = 0; i < 5; i++) {
+      await maintenanceStore.markProactiveCompactionFinished({
+        conversationId: conversation.conversationId,
+        failureSummary: "ENOENT: transcript file moved or deleted",
+        keepPending: true,
+      });
+    }
+
+    let maintenance = await maintenanceStore.getConversationCompactionMaintenance(
+      conversation.conversationId,
+    );
+    expect(maintenance?.retryAttempts).toBe(5);
+
+    // Successful completion (no failureSummary) resets retryAttempts.
+    await maintenanceStore.markProactiveCompactionFinished({
+      conversationId: conversation.conversationId,
+    });
+
+    maintenance = await maintenanceStore.getConversationCompactionMaintenance(
+      conversation.conversationId,
+    );
+    expect(maintenance?.retryAttempts).toBe(0);
   });
 
   it("should trip after auth failure during later full-sweep passes", async () => {
