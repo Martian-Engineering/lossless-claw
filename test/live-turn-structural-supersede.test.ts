@@ -1032,4 +1032,50 @@ describe("appendUncoveredVolatileLiveInputsWithinBudget: decorated channel turn 
     expect(userContents).toHaveLength(2);
     expect(userContents).not.toContain(liveDecorated);
   });
+
+  it("does NOT append when bodies differ only by user-authored whitespace (fail-closed)", () => {
+    const assembledMessages: AgentMessage[] = [
+      { role: "user", content: "earlier persisted turn" },
+      { role: "assistant", content: "earlier reply" },
+      { role: "user", content: metadataDecorated(` ${CHANNEL_BODY} `) },
+    ] as AgentMessage[];
+    const liveMessages: AgentMessage[] = [{ role: "user", content: liveDecorated }] as AgentMessage[];
+
+    const result = appendUncoveredVolatileLiveInputsWithinBudget({
+      assembledMessages,
+      assembledEstimatedTokens: 10,
+      liveMessages,
+      tokenBudget: 1_000_000,
+    });
+
+    const userContents = result.messages
+      .filter((message) => (message as { role: string }).role === "user")
+      .map((message) => (message as { content: string }).content);
+    expect(userContents).toHaveLength(2);
+    expect(userContents).not.toContain(liveDecorated);
+  });
+
+  it("does NOT strip a user-authored known tag from the assembled face", () => {
+    const assembledBody =
+      "<derived-focus>\nuser-authored note\n</derived-focus>\n\n" + CHANNEL_BODY;
+    const assembledMessages: AgentMessage[] = [
+      { role: "user", content: "earlier persisted turn" },
+      { role: "assistant", content: "earlier reply" },
+      { role: "user", content: metadataDecorated(assembledBody) },
+    ] as AgentMessage[];
+    const liveMessages: AgentMessage[] = [{ role: "user", content: liveDecorated }] as AgentMessage[];
+
+    const result = appendUncoveredVolatileLiveInputsWithinBudget({
+      assembledMessages,
+      assembledEstimatedTokens: 10,
+      liveMessages,
+      tokenBudget: 1_000_000,
+    });
+
+    const userContents = result.messages
+      .filter((message) => (message as { role: string }).role === "user")
+      .map((message) => (message as { content: string }).content);
+    expect(userContents).toHaveLength(2);
+    expect(userContents).not.toContain(liveDecorated);
+  });
 });

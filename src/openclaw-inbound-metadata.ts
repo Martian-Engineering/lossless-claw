@@ -208,6 +208,16 @@ export function contentBeginsWithOpenClawInboundMetadataBlock(content: string): 
  * prelude, or null when the content does not begin with one.
  */
 export function extractBodyAfterOpenClawInboundMetadataBlock(content: string): string | null {
+  return extractBodyAfterOpenClawInboundMetadataBlockWithPolicy(content, true);
+}
+
+// Shared metadata/recap reduction. The body matcher first disables injected
+// stripping to preserve an exact user-authored-tag match, then enables it as
+// the plugin-injection fallback.
+function extractBodyAfterOpenClawInboundMetadataBlockWithPolicy(
+  content: string,
+  stripInjectedContext: boolean,
+): string | null {
   const afterTimestamp = stripLeadingOpenClawInboundTimestamp(content.trimStart());
   const { metadataCandidate } = splitOpenClawInboundMetadataPrelude(afterTimestamp);
   const firstCandidate = metadataCandidate.trimStart();
@@ -233,7 +243,9 @@ export function extractBodyAfterOpenClawInboundMetadataBlock(content: string): s
     remaining = secondCandidate.slice(secondMatch[0].length);
   }
 
-  remaining = stripLeadingInjectedContextTagBlocks(remaining);
+  if (stripInjectedContext) {
+    remaining = stripLeadingInjectedContextTagBlocks(remaining);
+  }
   if (hasOpenClawInboundHistory(firstRecord)) {
     const contextSplit = splitLeadingOpenClawInboundContextBlocks(remaining);
     const recapCandidate = contextSplit.remaining.trimStart();
@@ -242,7 +254,9 @@ export function extractBodyAfterOpenClawInboundMetadataBlock(content: string): s
       remaining = recapCandidate.slice(recapLength);
     }
   }
-  remaining = stripLeadingInjectedContextTagBlocks(remaining);
+  if (stripInjectedContext) {
+    remaining = stripLeadingInjectedContextTagBlocks(remaining);
+  }
 
   return stripMetadataSeparator(remaining);
 }
@@ -259,6 +273,30 @@ export function extractBodyAfterOpenClawInboundMetadataBlock(content: string): s
  * different body is never treated as the same turn (fail-closed).
  */
 export function openClawInboundBodiesMatch(liveContent: string, bareContent: string): boolean {
+  const bareBody = stripLeadingOpenClawInboundTimestamp(bareContent);
+  const exactLiveBodyAfterMetadata = extractBodyAfterOpenClawInboundMetadataBlockWithPolicy(
+    liveContent,
+    false,
+  );
+  if (exactLiveBodyAfterMetadata === null) {
+    return false;
+  }
+  const exactLiveBody = stripLeadingOpenClawInboundTimestamp(exactLiveBodyAfterMetadata);
+  return exactLiveBody.trim().length > 0 && exactLiveBody === bareBody;
+}
+
+/**
+ * Match after stripping known injected-context blocks from the runtime face.
+ * Use only where another strong signal proves the aligned rows are the same
+ * turn, because the tag names themselves are user-typeable.
+ */
+export function openClawInboundBodiesMatchWithInjectedContext(
+  liveContent: string,
+  bareContent: string,
+): boolean {
+  if (openClawInboundBodiesMatch(liveContent, bareContent)) {
+    return true;
+  }
   const liveBodyAfterMetadata = extractBodyAfterOpenClawInboundMetadataBlock(liveContent);
   if (liveBodyAfterMetadata === null) {
     return false;
@@ -266,6 +304,29 @@ export function openClawInboundBodiesMatch(liveContent: string, bareContent: str
   const liveBody = stripLeadingOpenClawInboundTimestamp(liveBodyAfterMetadata);
   const bareBody = stripLeadingOpenClawInboundTimestamp(bareContent);
   return liveBody.trim().length > 0 && liveBody === bareBody;
+}
+
+/**
+ * True when a live metadata-decorated face reduces to the same non-empty body
+ * as an assembled face. Injected tags are stripped only from the live side;
+ * the assembled side stays verbatim because those tags are user-typeable.
+ * Use only after the caller proves both faces belong to the current turn.
+ */
+export function openClawInboundDecoratedBodiesMatch(
+  liveContent: string,
+  assembledContent: string,
+): boolean {
+  const liveBody = extractBodyAfterOpenClawInboundMetadataBlock(liveContent);
+  const assembledBody = extractBodyAfterOpenClawInboundMetadataBlockWithPolicy(
+    assembledContent,
+    false,
+  );
+  return (
+    liveBody !== null &&
+    assembledBody !== null &&
+    liveBody.trim().length > 0 &&
+    liveBody === assembledBody
+  );
 }
 
 const CONVERSATION_INFO_KEYS = new Set([

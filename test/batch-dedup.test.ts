@@ -123,6 +123,21 @@ function toolResultMessage(content: string, toolCallId: string): AgentMessage {
   } as AgentMessage;
 }
 
+function metadataWrappedWithInjectedContext(body: string): string {
+  return [
+    "Conversation info (untrusted metadata):",
+    "```json",
+    JSON.stringify({ chat_id: "telegram:100000001", sender: "sam.rivera" }, null, 2),
+    "```",
+    "",
+    "<derived-focus>",
+    "injected focus",
+    "</derived-focus>",
+    "",
+    body,
+  ].join("\n");
+}
+
 describe("BatchDeduplicator.deduplicateAfterTurnBatch", () => {
   it("returns an empty batch unchanged", async () => {
     const dedup = makeDedup({ conversationId: 1, messages: [] });
@@ -404,6 +419,46 @@ describe("BatchDeduplicator.alignRuntimeBatchAgainstCoveredFrontier", () => {
     });
     const batch = [makeMessage({ role: "user", content: decoratedContent })];
     const result = await dedup.alignRuntimeBatchAgainstCoveredFrontier("s1", undefined, batch);
+    expect(result).toEqual([]);
+  });
+
+  it("keeps an injected-context body match when no strong frontier anchor exists", async () => {
+    const bareContent = "please summarize";
+    const dedup = makeDedup({
+      conversationId: 1,
+      messages: [storedMessage("user", bareContent)],
+    });
+    const batch = [
+      makeMessage({
+        role: "user",
+        content: metadataWrappedWithInjectedContext(bareContent),
+      }),
+    ];
+
+    const result = await dedup.alignRuntimeBatchAgainstCoveredFrontier("s1", undefined, batch);
+
+    expect(result).toEqual(batch);
+  });
+
+  it("uses an injected-context body match only alongside a strong frontier anchor", async () => {
+    const bareContent = "please summarize";
+    const dedup = makeDedup({
+      conversationId: 1,
+      messages: [
+        storedMessage("assistant", "prior exact reply", 1),
+        { ...storedMessage("user", bareContent, 2), seq: 1 },
+      ],
+    });
+    const batch = [
+      makeMessage({ role: "assistant", content: "prior exact reply" }),
+      makeMessage({
+        role: "user",
+        content: metadataWrappedWithInjectedContext(bareContent),
+      }),
+    ];
+
+    const result = await dedup.alignRuntimeBatchAgainstCoveredFrontier("s1", undefined, batch);
+
     expect(result).toEqual([]);
   });
 
