@@ -478,17 +478,6 @@ describe("Circuit Breaker", () => {
     );
     expect(maintenance?.retryAttempts).toBe(10);
 
-    // Trigger the deferred drain path via assemble. The maintenance entry
-    // is pending, so the code should check retryAttempts >= maxFailures (10)
-    // and return exhausted=true without calling the summarizer.
-    const liveMessages = [makeMessage({ role: "user", content: "hello" })];
-    const assembled = await engine.assemble({
-      sessionId,
-      sessionKey,
-      messages: liveMessages,
-      tokenBudget: 8_000,
-    });
-
     // Spy on consumeDeferredCompactionDebt to verify the breaker prevents
     // the compaction call. When retryAttempts >= maxFailures, the method
     // must return exhausted=true without calling consumeDeferredCompactionDebt.
@@ -499,8 +488,16 @@ describe("Circuit Breaker", () => {
       return origConsume(...args);
     };
 
-    // Assemble should not crash even when the breaker trips.
-    expect(assembled.messages.length).toBeGreaterThan(0);
+    // Trigger the deferred drain path via assemble. The maintenance entry
+    // is pending, so the code should check retryAttempts >= maxFailures (10)
+    // and return exhausted=true without calling the summarizer.
+    const liveMessages = [makeMessage({ role: "user", content: "hello" })];
+    const assembled = await engine.assemble({
+      sessionId,
+      sessionKey,
+      messages: liveMessages,
+      tokenBudget: 8_000,
+    });
 
     // Circuit breaker must have skipped the summarizer call.
     expect(consumeDeferredCalled).toBe(false);
