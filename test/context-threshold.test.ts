@@ -227,27 +227,46 @@ describe("persistedContextThresholdOverride", () => {
   });
 });
 
-describe("ContextThresholdResolver.couldAnyRuleMatch", () => {
+describe("ContextThresholdResolver.couldAnyRuleProduce", () => {
+  const persistedTenth = { contextThreshold: 0.1 };
+
   it("is false when no rules are configured", () => {
     const resolver = new ContextThresholdResolver(0.75, []);
-    expect(resolver.couldAnyRuleMatch({ runtime: {} })).toBe(false);
+    expect(resolver.couldAnyRuleProduce({ runtime: {}, persisted: persistedTenth })).toBe(false);
   });
 
   it("treats absent window metadata as satisfiable for window-range rules", () => {
     const resolver = new ContextThresholdResolver(0.75, [
       { match: { modelContextWindowMax: 250_000 }, contextThreshold: 0.1 },
     ]);
-    expect(resolver.couldAnyRuleMatch({ runtime: {} })).toBe(true);
-    expect(resolver.couldAnyRuleMatch({ runtime: { modelContextWindow: 500_000 } })).toBe(false);
+    expect(resolver.couldAnyRuleProduce({ runtime: {}, persisted: persistedTenth })).toBe(true);
+    expect(
+      resolver.couldAnyRuleProduce({
+        runtime: { modelContextWindow: 500_000 },
+        persisted: persistedTenth,
+      }),
+    ).toBe(false);
   });
 
   it("rejects on a known session key that fails the rule's session pattern", () => {
     const resolver = new ContextThresholdResolver(0.75, [
       { match: { sessionPattern: "agent:alpha:**" }, contextThreshold: 0.1 },
     ]);
-    expect(resolver.couldAnyRuleMatch({ sessionKey: "agent:beta:main", runtime: {} })).toBe(false);
-    expect(resolver.couldAnyRuleMatch({ sessionKey: "agent:alpha:main", runtime: {} })).toBe(true);
-    expect(resolver.couldAnyRuleMatch({ runtime: {} })).toBe(true);
+    expect(
+      resolver.couldAnyRuleProduce({
+        sessionKey: "agent:beta:main",
+        runtime: {},
+        persisted: persistedTenth,
+      }),
+    ).toBe(false);
+    expect(
+      resolver.couldAnyRuleProduce({
+        sessionKey: "agent:alpha:main",
+        runtime: {},
+        persisted: persistedTenth,
+      }),
+    ).toBe(true);
+    expect(resolver.couldAnyRuleProduce({ runtime: {}, persisted: persistedTenth })).toBe(true);
   });
 
   it("rejects on present model metadata that fails the rule's model matcher", () => {
@@ -255,9 +274,85 @@ describe("ContextThresholdResolver.couldAnyRuleMatch", () => {
       { match: { model: "openai/gpt-5.5" }, contextThreshold: 0.1 },
     ]);
     expect(
-      resolver.couldAnyRuleMatch({ runtime: { model: "claude", modelRef: "anthropic/claude" } }),
+      resolver.couldAnyRuleProduce({
+        runtime: { model: "claude", modelRef: "anthropic/claude" },
+        persisted: persistedTenth,
+      }),
     ).toBe(false);
-    expect(resolver.couldAnyRuleMatch({ runtime: {} })).toBe(true);
+    expect(resolver.couldAnyRuleProduce({ runtime: {}, persisted: persistedTenth })).toBe(true);
+  });
+
+  it("rejects a plausibly-matching rule whose threshold differs from the persisted value", () => {
+    const resolver = new ContextThresholdResolver(0.75, [
+      { match: { modelContextWindowMax: 250_000 }, contextThreshold: 0.4 },
+    ]);
+    expect(
+      resolver.couldAnyRuleProduce({ runtime: {}, persisted: { contextThreshold: 0.1 } }),
+    ).toBe(false);
+  });
+
+  it("requires recorded sizing fields to match the rule's payload", () => {
+    const resolver = new ContextThresholdResolver(0.75, [
+      {
+        match: { modelContextWindowMax: 250_000 },
+        contextThreshold: 0.1,
+        freshTailCount: 16,
+        leafChunkTokens: 12_000,
+      },
+    ]);
+    expect(
+      resolver.couldAnyRuleProduce({
+        runtime: {},
+        persisted: { contextThreshold: 0.1, freshTailCount: 16, leafChunkTokens: 12_000 },
+      }),
+    ).toBe(true);
+    expect(
+      resolver.couldAnyRuleProduce({
+        runtime: {},
+        persisted: { contextThreshold: 0.1, freshTailCount: 8, leafChunkTokens: 12_000 },
+      }),
+    ).toBe(false);
+    expect(
+      resolver.couldAnyRuleProduce({
+        runtime: {},
+        persisted: { contextThreshold: 0.1, freshTailCount: 16, leafChunkTokens: 9_000 },
+      }),
+    ).toBe(false);
+  });
+
+  it("treats sizing the row never recorded as producible by a sizing-carrying rule", () => {
+    // Rows written before the sizing columns existed persist only the
+    // threshold; an absent field means "not recorded", not "recorded absent".
+    const resolver = new ContextThresholdResolver(0.75, [
+      {
+        match: { modelContextWindowMax: 250_000 },
+        contextThreshold: 0.1,
+        freshTailCount: 16,
+      },
+    ]);
+    expect(
+      resolver.couldAnyRuleProduce({ runtime: {}, persisted: { contextThreshold: 0.1 } }),
+    ).toBe(true);
+  });
+
+  it("requires one rule to both plausibly match and produce the payload", () => {
+    const resolver = new ContextThresholdResolver(0.75, [
+      { match: { modelContextWindowMax: 250_000 }, contextThreshold: 0.4 },
+      { match: { sessionPattern: "agent:alpha:**" }, contextThreshold: 0.1 },
+    ]);
+    expect(
+      resolver.couldAnyRuleProduce({ runtime: {}, persisted: { contextThreshold: 0.1 } }),
+    ).toBe(true);
+    // A session key that fails the producing rule's pattern leaves only the
+    // wrong-threshold rule standing: matching and producing must not be
+    // satisfied by two different rules.
+    expect(
+      resolver.couldAnyRuleProduce({
+        sessionKey: "agent:beta:main",
+        runtime: {},
+        persisted: { contextThreshold: 0.1 },
+      }),
+    ).toBe(false);
   });
 });
 
@@ -273,13 +368,13 @@ describe("reconcilePersistedContextThreshold", () => {
     const result = reconcilePersistedContextThreshold({
       persisted: undefined,
       live: liveGlobal,
-      anyRuleCouldMatch: false,
+      anyRuleCouldProducePersisted: false,
     });
     expect(result.resolved).toBe(liveGlobal);
     expect(result.supersededStalePersisted).toBe(false);
   });
 
-  it("keeps a persisted override while a configured rule could still match", () => {
+  it("keeps a persisted override while a configured rule could still produce it", () => {
     const persisted = {
       contextThreshold: 0.1,
       source: "override" as const,
@@ -289,13 +384,13 @@ describe("reconcilePersistedContextThreshold", () => {
     const result = reconcilePersistedContextThreshold({
       persisted,
       live: liveGlobal,
-      anyRuleCouldMatch: true,
+      anyRuleCouldProducePersisted: true,
     });
     expect(result.resolved).toBe(persisted);
     expect(result.supersededStalePersisted).toBe(false);
   });
 
-  it("supersedes a persisted override when no configured rule could match", () => {
+  it("supersedes a persisted override when no configured rule could produce it", () => {
     const persisted = {
       contextThreshold: 0.02,
       source: "override" as const,
@@ -305,7 +400,7 @@ describe("reconcilePersistedContextThreshold", () => {
     const result = reconcilePersistedContextThreshold({
       persisted,
       live: liveGlobal,
-      anyRuleCouldMatch: false,
+      anyRuleCouldProducePersisted: false,
     });
     expect(result.resolved).toBe(liveGlobal);
     expect(result.supersededStalePersisted).toBe(true);
@@ -321,7 +416,7 @@ describe("reconcilePersistedContextThreshold", () => {
     const result = reconcilePersistedContextThreshold({
       persisted,
       live: liveGlobal,
-      anyRuleCouldMatch: false,
+      anyRuleCouldProducePersisted: false,
     });
     expect(result.resolved).toBe(liveGlobal);
     expect(result.supersededStalePersisted).toBe(true);
@@ -338,7 +433,7 @@ describe("reconcilePersistedContextThreshold", () => {
     const result = reconcilePersistedContextThreshold({
       persisted,
       live: liveGlobal,
-      anyRuleCouldMatch: false,
+      anyRuleCouldProducePersisted: false,
     });
     expect(result.resolved).toBe(persisted);
     expect(result.supersededStalePersisted).toBe(false);
@@ -360,7 +455,7 @@ describe("reconcilePersistedContextThreshold", () => {
     const result = reconcilePersistedContextThreshold({
       persisted,
       live: liveOverride,
-      anyRuleCouldMatch: true,
+      anyRuleCouldProducePersisted: true,
     });
     expect(result.resolved).toBe(liveOverride);
     expect(result.supersededStalePersisted).toBe(true);

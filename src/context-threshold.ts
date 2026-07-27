@@ -155,6 +155,37 @@ function rulePossiblyMatches(params: {
   return true;
 }
 
+// Whether a rule's configured payload could have produced the persisted
+// resolution. The threshold must match exactly; the sizing fields must match
+// wherever the row recorded them. A row without a recorded sizing field
+// predates those columns (legacy schema), so an absent value means
+// "not recorded", never "recorded as absent" — it cannot count against the
+// rule, and the engine's runtime fill-in covers it on the kept path.
+function rulePayloadProduces(
+  rule: ContextThresholdOverride,
+  persisted: Pick<
+    ResolvedContextThreshold,
+    "contextThreshold" | "freshTailCount" | "leafChunkTokens"
+  >,
+): boolean {
+  if (rule.contextThreshold !== persisted.contextThreshold) {
+    return false;
+  }
+  if (
+    persisted.freshTailCount !== undefined &&
+    rule.freshTailCount !== persisted.freshTailCount
+  ) {
+    return false;
+  }
+  if (
+    persisted.leafChunkTokens !== undefined &&
+    rule.leafChunkTokens !== persisted.leafChunkTokens
+  ) {
+    return false;
+  }
+  return true;
+}
+
 // Summarize which matchers selected the winning rule for log lines.
 function describeRuleMatch(
   rule: ContextThresholdOverride,
@@ -220,22 +251,22 @@ export function persistedContextThresholdOverride(maintenance: {
  * The persisted value protects drains that lack the runtime metadata which
  * originally selected an override; it stays authoritative only while live
  * config could still plausibly produce it. A persisted override with no
- * possibly-matching rule left, and a persisted global that diverges from the
- * configured global, are provably stale (the config changed after the row was
- * written) and are superseded so a dead experiment value cannot wedge
- * compaction forever.
+ * plausibly-matching rule that could produce its payload, and a persisted
+ * global that diverges from the configured global, are provably stale (the
+ * config changed after the row was written) and are superseded so a dead
+ * experiment value cannot wedge compaction forever.
  */
 export function reconcilePersistedContextThreshold(params: {
   persisted: ResolvedContextThreshold | undefined;
   live: ResolvedContextThreshold;
-  anyRuleCouldMatch: boolean;
+  anyRuleCouldProducePersisted: boolean;
 }): { resolved: ResolvedContextThreshold; supersededStalePersisted: boolean } {
   const { persisted, live } = params;
   if (!persisted) {
     return { resolved: live, supersededStalePersisted: false };
   }
   if (persisted.source === "override") {
-    if (params.anyRuleCouldMatch) {
+    if (params.anyRuleCouldProducePersisted) {
       return { resolved: persisted, supersededStalePersisted: false };
     }
     return { resolved: live, supersededStalePersisted: true };
@@ -332,16 +363,26 @@ export class ContextThresholdResolver {
   }
 
   /**
-   * Whether any configured rule could match this context when matchers whose
-   * runtime metadata is absent are treated as satisfiable. Backs the stale
-   * check in {@link reconcilePersistedContextThreshold}.
+   * Whether any configured rule could have produced the persisted resolution:
+   * the rule must both plausibly match this context (matchers whose runtime
+   * metadata is absent count as satisfiable) and carry a payload that yields
+   * the persisted threshold and recorded sizing. A rule that merely might
+   * match is not enough — an unrelated surviving override must not keep a
+   * removed rule's stale value alive. Backs the stale check in
+   * {@link reconcilePersistedContextThreshold}.
    */
-  couldAnyRuleMatch(params: {
+  couldAnyRuleProduce(params: {
     sessionKey?: string;
     runtime: RuntimeModelContext;
+    persisted: Pick<
+      ResolvedContextThreshold,
+      "contextThreshold" | "freshTailCount" | "leafChunkTokens"
+    >;
   }): boolean {
-    return this.rules.some((compiled) =>
-      rulePossiblyMatches({ compiled, sessionKey: params.sessionKey, runtime: params.runtime }),
+    return this.rules.some(
+      (compiled) =>
+        rulePossiblyMatches({ compiled, sessionKey: params.sessionKey, runtime: params.runtime }) &&
+        rulePayloadProduces(compiled.rule, params.persisted),
     );
   }
 }

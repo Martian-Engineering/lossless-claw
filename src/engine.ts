@@ -896,7 +896,8 @@ export class LcmContextEngine implements ContextEngine {
       // may lack the runtime model metadata that originally selected it, and
       // re-resolving could silently flip the compaction decision. That trust
       // ends where live config can no longer produce the persisted value —
-      // a stale row otherwise outlives the config edit and wedges compaction
+      // some plausibly-matching rule must still carry the persisted payload,
+      // or the stale row outlives the config edit and wedges compaction
       // forever (#942). New debt rows also persist selected fresh-tail and
       // leaf chunk sizing; the runtime fallback only helps older rows written
       // before those columns existed.
@@ -904,10 +905,13 @@ export class LcmContextEngine implements ContextEngine {
       const reconciledContextThreshold = reconcilePersistedContextThreshold({
         persisted: persistedContextThreshold,
         live: runtimeResolvedContextThreshold,
-        anyRuleCouldMatch: this.contextThresholdResolver.couldAnyRuleMatch({
-          sessionKey: params.sessionKey,
-          runtime: runtimeModelContext,
-        }),
+        anyRuleCouldProducePersisted:
+          persistedContextThreshold !== undefined &&
+          this.contextThresholdResolver.couldAnyRuleProduce({
+            sessionKey: params.sessionKey,
+            runtime: runtimeModelContext,
+            persisted: persistedContextThreshold,
+          }),
       });
       if (reconciledContextThreshold.supersededStalePersisted && persistedContextThreshold) {
         this.deps.log.info(

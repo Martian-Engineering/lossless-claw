@@ -258,6 +258,68 @@ describe("LcmContextEngine maintain and assemble budget", () => {
     );
   });
 
+  it("maintain() supersedes a persisted override threshold no remaining rule could produce", async () => {
+    // Debt recorded by a since-removed 0.02 override experiment. An unrelated
+    // override rule is still configured and plausibly matches a metadata-less
+    // drain, but it produces a different threshold: rule presence alone must
+    // not keep the stale 0.02 alive when no current rule can produce it.
+    const engine = createEngineWithConfig({
+      contextThreshold: 0.75,
+      contextThresholdOverrides: [
+        {
+          match: { modelContextWindowMax: 250_000 },
+          contextThreshold: 0.4,
+        },
+      ],
+    });
+    const sessionId = "maintain-deferred-stale-persisted-unrelated-rule";
+    const conversation = await engine.getConversationStore().getOrCreateConversation(sessionId, {
+      sessionKey: undefined,
+    });
+    await engine.getCompactionMaintenanceStore().requestProactiveCompactionDebt({
+      conversationId: conversation.conversationId,
+      reason: "threshold",
+      tokenBudget: 500_000,
+      currentTokenCount: 80_000,
+      contextThreshold: 0.02,
+      contextThresholdSource: "override",
+      contextFreshTailCount: 16,
+      contextLeafChunkTokens: 12000,
+    });
+    const privateEngine = engine as unknown as {
+      executeCompactionCore: (params: unknown) => Promise<unknown>;
+    };
+    const executeCompactionCoreSpy = vi.spyOn(
+      privateEngine,
+      "executeCompactionCore",
+    ).mockResolvedValue({
+      ok: true,
+      compacted: true,
+      reason: "compacted",
+    });
+
+    await engine.maintain({
+      sessionId,
+      sessionFile: createSessionFilePath(
+        "maintain-deferred-stale-persisted-unrelated-rule-maintain",
+      ),
+      runtimeContext: {
+        allowDeferredCompactionExecution: true,
+        tokenBudget: 500_000,
+        currentTokenCount: 80_000,
+      },
+    });
+
+    expect(executeCompactionCoreSpy).toHaveBeenCalledWith(
+      expect.objectContaining({
+        contextThresholdOverride: expect.objectContaining({
+          contextThreshold: 0.75,
+          source: "global",
+        }),
+      }),
+    );
+  });
+
   it("maintain() supersedes a persisted global threshold that diverges from live config", async () => {
     // The global contextThreshold was lowered for an experiment, debt was
     // recorded at 0.02, then the config was reverted to 0.75: the drain must
