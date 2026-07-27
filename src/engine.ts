@@ -2334,17 +2334,10 @@ export class LcmContextEngine implements ContextEngine {
             };
           }
 
-          if (reconcile.hasOverlap) {
-            await persistBootstrapState(conversationId);
-          }
-
-          // Without a bootstrap_state checkpoint the afterTurn reconcile
-          // classifies the conversation as "checkpoint-missing" and skips all
-          // persistence, permanently freezing the conversation with only the
-          // pre-bootstrap messages.  A conversation that reached this point
-          // has enough forward progress (bootstrapped_at set, messages in DB)
-          // to warrant a checkpoint so afterTurn can recover on the next turn.
-          if (!bootstrapState && !conversation.bootstrappedAt) {
+          // The first bootstrap attempt must establish a checkpoint even when
+          // the DB frontier does not overlap the transcript. Otherwise the next
+          // afterTurn cannot resume from the current transcript offset.
+          if (reconcile.hasOverlap || (!bootstrapState && !conversation.bootstrappedAt)) {
             await persistBootstrapState(conversationId);
           }
 

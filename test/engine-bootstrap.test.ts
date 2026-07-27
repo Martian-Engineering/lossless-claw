@@ -3767,13 +3767,30 @@ describe("LcmContextEngine.bootstrap", () => {
     expect(bootstrapState!.lastSeenSize).toBe(statSync(sessionFile).size);
     expect(bootstrapState!.lastProcessedOffset).toBe(statSync(sessionFile).size);
 
-    // DB messages are preserved (no import, no corruption).
+    const nextTurn = [
+      makeMessage({ role: "user", content: "next transcript user" }),
+      makeMessage({ role: "assistant", content: "next transcript assistant" }),
+    ];
+    for (const message of nextTurn) {
+      appendSessionMessage(sm, message as AgentMessage);
+    }
+    await engine.afterTurn({
+      sessionId,
+      sessionFile,
+      messages: nextTurn,
+      prePromptMessageCount: 0,
+      tokenBudget: 4096,
+    });
+
+    // DB messages are preserved and the next turn advances normally.
     const stored = await engine
       .getConversationStore()
       .getMessages(conversation!.conversationId);
     expect(stored.map((m) => m.content)).toEqual([
       "db preamble",
       "db preamble response",
+      "next transcript user",
+      "next transcript assistant",
     ]);
   });
 
