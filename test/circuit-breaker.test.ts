@@ -489,8 +489,21 @@ describe("Circuit Breaker", () => {
       tokenBudget: 8_000,
     });
 
+    // Spy on consumeDeferredCompactionDebt to verify the breaker prevents
+    // the compaction call. When retryAttempts >= maxFailures, the method
+    // must return exhausted=true without calling consumeDeferredCompactionDebt.
+    let consumeDeferredCalled = false;
+    const origConsume = (engine as any).consumeDeferredCompactionDebt.bind(engine);
+    (engine as any).consumeDeferredCompactionDebt = async (...args: any[]) => {
+      consumeDeferredCalled = true;
+      return origConsume(...args);
+    };
+
     // Assemble should not crash even when the breaker trips.
     expect(assembled.messages.length).toBeGreaterThan(0);
+
+    // Circuit breaker must have skipped the summarizer call.
+    expect(consumeDeferredCalled).toBe(false);
 
     // After the breaker tripped, retryAttempts should remain at 10
     // (compaction was skipped, so no reset occurred).
@@ -538,6 +551,15 @@ describe("Circuit Breaker", () => {
     );
     expect(maintenance?.retryAttempts).toBe(2);
 
+    // Spy on consumeDeferredCompactionDebt to verify it IS invoked when
+    // retryAttempts < maxFailures (breaker does not trip).
+    let consumeDeferredCalled = false;
+    const origConsume = (engine as any).consumeDeferredCompactionDebt.bind(engine);
+    (engine as any).consumeDeferredCompactionDebt = async (...args: any[]) => {
+      consumeDeferredCalled = true;
+      return origConsume(...args);
+    };
+
     // Trigger the deferred drain path via assemble.
     const liveMessages = [makeMessage({ role: "user", content: "hello" })];
     const assembled = await engine.assemble({
@@ -549,6 +571,9 @@ describe("Circuit Breaker", () => {
 
     // Assemble should succeed without the breaker tripping.
     expect(assembled.messages.length).toBeGreaterThan(0);
+
+    // Circuit breaker should NOT have tripped: compaction was invoked.
+    expect(consumeDeferredCalled).toBe(true);
 
     // Clean up.
     await maintenanceStore.markProactiveCompactionFinished({
