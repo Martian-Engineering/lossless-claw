@@ -271,6 +271,10 @@ export function reconcilePersistedContextThreshold(params: {
     }
     return { resolved: live, supersededStalePersisted: true };
   }
+  // Persisted globals are validated by scalar equality only, unlike
+  // overrides, which prove rule-plus-payload producibility above: the
+  // configured global is a single threshold today. If global-level sizing
+  // ever becomes configurable, this check must grow a payload comparison.
   if (live.source === "override" || live.contextThreshold !== persisted.contextThreshold) {
     return { resolved: live, supersededStalePersisted: true };
   }

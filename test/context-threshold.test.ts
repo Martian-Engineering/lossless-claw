@@ -460,4 +460,34 @@ describe("reconcilePersistedContextThreshold", () => {
     expect(result.resolved).toBe(liveOverride);
     expect(result.supersededStalePersisted).toBe(true);
   });
+
+  it("prefers an equal-threshold live override over a persisted global, adopting its payload", () => {
+    // The override wins on source even when the thresholds are numerically
+    // equal, and the drain adopts the override's sizing over the sizing
+    // recorded with the persisted global.
+    const persisted = {
+      contextThreshold: 0.75,
+      source: "global" as const,
+      reason: "persisted deferred threshold debt",
+      specificity: 0,
+      freshTailCount: 4,
+    };
+    const liveOverride = {
+      contextThreshold: 0.75,
+      source: "override" as const,
+      reason: "sessionPattern=agent:alpha:**",
+      specificity: 50,
+      freshTailCount: 8,
+      leafChunkTokens: 9_000,
+    };
+    const result = reconcilePersistedContextThreshold({
+      persisted,
+      live: liveOverride,
+      anyRuleCouldProducePersisted: true,
+    });
+    expect(result.resolved).toBe(liveOverride);
+    expect(result.resolved.freshTailCount).toBe(8);
+    expect(result.resolved.leafChunkTokens).toBe(9_000);
+    expect(result.supersededStalePersisted).toBe(true);
+  });
 });
