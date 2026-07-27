@@ -1014,17 +1014,18 @@ export class SessionRotationService {
     conversationId: number;
     sessionFile: string;
   }): Promise<RotateTranscriptRewriteResult> {
+    // SQLite-backed sessions never reach the rewrite path (auto-rotate
+    // skips them upstream). Block at the top before any I/O.
+    if (isSqliteSessionFile(params.sessionFile)) {
+      throw new Error("sqlite sessions cannot be rotated via file rewrite");
+    }
+
     const { header, entries: branch } = await readLeafPathRawEntries(params.sessionFile);
     if (!header) {
       // SessionManager.open used to synthesize a header (and rewrite the
       // file) here; reading is now side-effect free, so a headerless file is
       // the host's problem to recover, not ours to rotate.
       throw new Error("session file has no session header; refusing to rotate");
-    }
-    // SQLite-backed sessions never reach the rewrite path (auto-rotate
-    // skips them upstream), but stat here anyway as a defense-in-depth.
-    if (isSqliteSessionFile(params.sessionFile)) {
-      throw new Error("sqlite sessions cannot be rotated via file rewrite");
     }
     const originalStats = await stat(params.sessionFile);
 
@@ -1102,10 +1103,6 @@ export class SessionRotationService {
     ].join("\n") + "\n";
     await writeFile(params.sessionFile, serialized, "utf8");
 
-    // Defense-in-depth: sqlite sessions never reach rotate-rewrite.
-    if (isSqliteSessionFile(params.sessionFile)) {
-      throw new Error("sqlite sessions cannot be rotated via file rewrite");
-    }
     const rewrittenStats = await stat(params.sessionFile);
     await this.host.refreshBootstrapState({
       conversationId: params.conversationId,

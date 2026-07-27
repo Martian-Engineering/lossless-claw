@@ -116,6 +116,9 @@ export type TranscriptHeader = {
  */
 export async function readTranscriptHeader(sessionFile: string): Promise<TranscriptHeader> {
   const empty: TranscriptHeader = { sessionHeaderId: null, parentSession: null };
+  if (isSqliteSessionFile(sessionFile)) {
+    return empty;
+  }
   try {
     const stream = createReadStream(sessionFile, { encoding: "utf8" });
     const lines = createInterface({
