@@ -16,7 +16,7 @@ import type { AgentMessage } from "./openclaw-bridge.js";
 import { isIsolatedCronSessionKey } from "./session-patterns.js";
 import type { ArchiveCause, ConversationStore } from "./store/conversation-store.js";
 import { getTranscriptEntryMeta } from "./transcript.js";
-import { isMissingFileError } from "./value-utils.js";
+import { isMissingFileError, isSqliteSessionFile } from "./value-utils.js";
 import type { SummaryStore } from "./store/summary-store.js";
 import type { LcmDependencies } from "./types.js";
 
@@ -242,6 +242,12 @@ export class SessionRolloverDetector {
       return false;
     }
 
+    // OpenClaw 7.2+: SQLite-backed sessions always have their transcript
+    // present in SQLite; skip the stat-based rotation check.
+    if (isSqliteSessionFile(trackedSessionFile)) {
+      return false;
+    }
+
     try {
       await stat(trackedSessionFile);
       return false;
@@ -365,6 +371,12 @@ export class SessionRolloverDetector {
       softResetPrunedAt: activeBootstrapState?.softResetPrunedAt,
       trackedSessionFile,
     });
+
+    // OpenClaw 7.2+: SQLite-backed sessions always have their transcript
+    // present in SQLite; skip the stat-based ambiguity check.
+    if (isSqliteSessionFile(trackedSessionFile)) {
+      return null;
+    }
 
     try {
       await stat(trackedSessionFile);

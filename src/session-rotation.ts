@@ -20,7 +20,7 @@ import {
   withExclusiveDatabaseLock,
 } from "./transaction-mutex.js";
 import { readLeafPathRawEntries, type TranscriptRawEntry } from "./transcript.js";
-import { asRecord, isMissingFileError, normalizeSessionFilePathForComparison } from "./value-utils.js";
+import { asRecord, isMissingFileError, isSqliteSessionFile, normalizeSessionFilePathForComparison } from "./value-utils.js";
 import type { CompactionEngine } from "./compaction.js";
 import type { CompactionGuards } from "./compaction-guards.js";
 import type { LcmConfig } from "./db/config.js";
@@ -354,6 +354,10 @@ export class SessionRotationService {
       skip("missing-session-file");
       return;
     }
+    if (isSqliteSessionFile(sessionFile)) {
+      skip("sqlite-session");
+      return;
+    }
     if (this.host.shouldIgnoreSession({ sessionId, sessionKey })) {
       skip("session-excluded");
       return;
@@ -598,6 +602,9 @@ export class SessionRotationService {
     }
 
     let sizeBytes: number;
+    if (isSqliteSessionFile(sessionFile)) {
+      return { kind: "skipped" };
+    }
     try {
       sizeBytes = (await stat(sessionFile)).size;
     } catch (error) {
@@ -1014,6 +1021,11 @@ export class SessionRotationService {
       // the host's problem to recover, not ours to rotate.
       throw new Error("session file has no session header; refusing to rotate");
     }
+    // SQLite-backed sessions never reach the rewrite path (auto-rotate
+    // skips them upstream), but stat here anyway as a defense-in-depth.
+    if (isSqliteSessionFile(params.sessionFile)) {
+      throw new Error("sqlite sessions cannot be rotated via file rewrite");
+    }
     const originalStats = await stat(params.sessionFile);
 
     const messageIndices: number[] = [];
@@ -1090,6 +1102,10 @@ export class SessionRotationService {
     ].join("\n") + "\n";
     await writeFile(params.sessionFile, serialized, "utf8");
 
+    // Defense-in-depth: sqlite sessions never reach rotate-rewrite.
+    if (isSqliteSessionFile(params.sessionFile)) {
+      throw new Error("sqlite sessions cannot be rotated via file rewrite");
+    }
     const rewrittenStats = await stat(params.sessionFile);
     await this.host.refreshBootstrapState({
       conversationId: params.conversationId,

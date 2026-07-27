@@ -90,7 +90,7 @@ import { canonicalizeOpenClawInboundMetadataIdentityContent } from "./openclaw-i
 import { PROMPT_RECALL_MAX_MESSAGES, PROMPT_RECALL_SEARCH_CANDIDATE_LIMIT, buildPromptRecallProjectionFingerprint, extractPromptRecallIdentifiers, extractPromptRecallSnippet, findPromptRecallIdentifierIndex, isPromptRecallEligibleRole, normalizePromptRecallCoverageText, normalizePromptRecallText, renderPromptRecallMessage } from "./prompt-recall.js";
 import { listTranscriptToolResultEntryIdsByCallId } from "./replay-metadata.js";
 import { extractRuntimePromptTokenCount } from "./token-accounting.js";
-import { asRecord, formatDurationMs, resolvePositiveInteger } from "./value-utils.js";
+import { asRecord, formatDurationMs, isSqliteSessionFile, resolvePositiveInteger } from "./value-utils.js";
 
 type AgentMessage = Parameters<ContextEngine["ingest"]>[0]["message"];
 const LOSSLESS_AGENT_RUN_REQUIRED_HOST_CAPABILITIES: ContextEngineHostCapability[] = [
@@ -1859,7 +1859,8 @@ export class LcmContextEngine implements ContextEngine {
     this.ensureMigrated();
     const startedAt = Date.now();
     const sessionLabel = formatSessionLabel(params.sessionId, params.sessionKey);
-    const sessionFileStats = await stat(params.sessionFile);
+    const sqliteSession = isSqliteSessionFile(params.sessionFile);
+    const sessionFileStats = sqliteSession ? { size: 0, mtimeMs: 0 } : await stat(params.sessionFile);
     const sessionFileSize = sessionFileStats.size;
     const sessionFileMtimeMs = Math.trunc(sessionFileStats.mtimeMs);
     const parentSessionReference = await readSessionParentSessionReference(params.sessionFile);

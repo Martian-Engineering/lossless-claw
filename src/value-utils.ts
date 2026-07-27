@@ -19,9 +19,15 @@ export function isMissingFileError(error: unknown): boolean {
   return code === "ENOENT" || code === "ENOTDIR";
 }
 
+export function isSqliteSessionFile(sessionFile: string | null | undefined): boolean {
+  return (sessionFile?.startsWith("sqlite:") ?? false);
+}
+
 export function normalizeSessionFilePathForComparison(filePath: string): string {
   const trimmed = filePath.trim();
-  return trimmed ? resolvePath(trimmed) : "";
+  if (!trimmed) return "";
+  if (trimmed.startsWith("sqlite:")) return trimmed;
+  return resolvePath(trimmed);
 }
 
 export function toJson(value: unknown): string {

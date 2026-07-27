@@ -58,7 +58,7 @@ import {
   resolveTranscriptMessageCreatedAt,
   resolveTranscriptMessageInnerTimestamp,
 } from "./transcript.js";
-import { asRecord, formatDurationMs, isMissingFileError, safeString } from "./value-utils.js";
+import { asRecord, formatDurationMs, isMissingFileError, isSqliteSessionFile, safeString } from "./value-utils.js";
 
 /**
  * How deep into the conversation tail a flush-lagged runtime row can sit.
@@ -2507,15 +2507,17 @@ export class TranscriptReconciler {
     );
     let sessionFileState: { size: number; mtimeMs: number } | undefined;
     let sessionFileStatError: unknown;
-    try {
-      const sessionFileStats = await stat(params.sessionFile);
-      sessionFileState = {
-        size: sessionFileStats.size,
-        mtimeMs: Math.trunc(sessionFileStats.mtimeMs),
-      };
-    } catch (error) {
-      sessionFileStatError = error;
-      // Leave undefined: without stat proof, do not use append-only guards or slow-read caps.
+    if (!isSqliteSessionFile(params.sessionFile)) {
+      try {
+        const sessionFileStats = await stat(params.sessionFile);
+        sessionFileState = {
+          size: sessionFileStats.size,
+          mtimeMs: Math.trunc(sessionFileStats.mtimeMs),
+        };
+      } catch (error) {
+        sessionFileStatError = error;
+        // Leave undefined: without stat proof, do not use append-only guards or slow-read caps.
+      }
     }
     const transcriptEpochShrank = checkpointIsPastTranscriptEof(
       checkpoint,
@@ -2697,7 +2699,16 @@ export class TranscriptReconciler {
     forkSourceMessageCount?: number;
   }): Promise<void> {
     const latestDbMessage = await this.host.conversationStore.getLastMessage(params.conversationId);
-    const fileStats = params.fileStats ?? (await stat(params.sessionFile));
+    let fileStats: { size: number; mtimeMs: number };
+    if (params.fileStats) {
+      fileStats = params.fileStats;
+    } else if (isSqliteSessionFile(params.sessionFile)) {
+      // OpenClaw 7.2+: SQLite-backed sessions have no filesystem file.
+      // Use a 0-size placeholder; the read path will return null.
+      fileStats = { size: 0, mtimeMs: Date.now() };
+    } else {
+      fileStats = await stat(params.sessionFile);
+    }
     // The checkpoint marks the whole file processed (offset = size), so the
     // exact resume anchor is the envelope id of the file's last message entry.
     let lastProcessedEntryId: string | null = null;
