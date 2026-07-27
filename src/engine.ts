@@ -26,6 +26,7 @@ import {
   ContextThresholdResolver,
   describeResolvedContextThreshold,
   persistedContextThresholdOverride,
+  reconcilePersistedContextThreshold,
   type ResolvedContextThreshold,
 } from "./context-threshold.js";
 import { LargeFileInterceptor } from "./large-file-interceptor.js";
@@ -883,32 +884,51 @@ export class LcmContextEngine implements ContextEngine {
       const resolvedProjectedTokenCount = this.normalizeObservedTokenCount(
         maintenance.projectedTokenCount ?? undefined,
       );
+      const runtimeModelContext = readRuntimeModelContext(
+        asRecord(params.runtimeContext),
+        asRecord(params.legacyParams),
+      );
       const runtimeResolvedContextThreshold = this.contextThresholdResolver.resolve({
         sessionKey: params.sessionKey,
-        runtime: readRuntimeModelContext(
-          asRecord(params.runtimeContext),
-          asRecord(params.legacyParams),
-        ),
+        runtime: runtimeModelContext,
       });
       // Prefer the threshold persisted with the debt row: a background drain
       // may lack the runtime model metadata that originally selected it, and
-      // re-resolving could silently flip the compaction decision. New debt rows
-      // also persist selected fresh-tail and leaf chunk sizing; the runtime
-      // fallback only helps older rows written before those columns existed.
+      // re-resolving could silently flip the compaction decision. That trust
+      // ends where live config can no longer produce the persisted value —
+      // a stale row otherwise outlives the config edit and wedges compaction
+      // forever (#942). New debt rows also persist selected fresh-tail and
+      // leaf chunk sizing; the runtime fallback only helps older rows written
+      // before those columns existed.
       const persistedContextThreshold = persistedContextThresholdOverride(maintenance);
-      const resolvedContextThreshold = persistedContextThreshold
-        ? {
-            ...persistedContextThreshold,
-            ...(persistedContextThreshold.freshTailCount === undefined &&
-            runtimeResolvedContextThreshold.freshTailCount !== undefined
-              ? { freshTailCount: runtimeResolvedContextThreshold.freshTailCount }
-              : {}),
-            ...(persistedContextThreshold.leafChunkTokens === undefined &&
-            runtimeResolvedContextThreshold.leafChunkTokens !== undefined
-              ? { leafChunkTokens: runtimeResolvedContextThreshold.leafChunkTokens }
-              : {}),
-          }
-        : runtimeResolvedContextThreshold;
+      const reconciledContextThreshold = reconcilePersistedContextThreshold({
+        persisted: persistedContextThreshold,
+        live: runtimeResolvedContextThreshold,
+        anyRuleCouldMatch: this.contextThresholdResolver.couldAnyRuleMatch({
+          sessionKey: params.sessionKey,
+          runtime: runtimeModelContext,
+        }),
+      });
+      if (reconciledContextThreshold.supersededStalePersisted && persistedContextThreshold) {
+        this.deps.log.info(
+          `[lcm] maintain: stale persisted context threshold superseded by live config conversation=${params.conversationId} ${sessionLabel} persistedThreshold=${persistedContextThreshold.contextThreshold} persistedSource=${persistedContextThreshold.source} liveThreshold=${runtimeResolvedContextThreshold.contextThreshold} liveSource=${runtimeResolvedContextThreshold.source}`,
+        );
+      }
+      const resolvedContextThreshold =
+        persistedContextThreshold &&
+        reconciledContextThreshold.resolved === persistedContextThreshold
+          ? {
+              ...persistedContextThreshold,
+              ...(persistedContextThreshold.freshTailCount === undefined &&
+              runtimeResolvedContextThreshold.freshTailCount !== undefined
+                ? { freshTailCount: runtimeResolvedContextThreshold.freshTailCount }
+                : {}),
+              ...(persistedContextThreshold.leafChunkTokens === undefined &&
+              runtimeResolvedContextThreshold.leafChunkTokens !== undefined
+                ? { leafChunkTokens: runtimeResolvedContextThreshold.leafChunkTokens }
+                : {}),
+            }
+          : reconciledContextThreshold.resolved;
 
       const isThresholdDebt = maintenance.reason?.trim() === "threshold";
       if (!isThresholdDebt) {

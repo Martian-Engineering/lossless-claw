@@ -4,6 +4,7 @@ import { describe, expect, it } from "vitest";
 import {
   ContextThresholdResolver,
   persistedContextThresholdOverride,
+  reconcilePersistedContextThreshold,
 } from "../src/context-threshold.js";
 import { readRuntimeModelContext } from "../src/runtime-model.js";
 
@@ -223,5 +224,145 @@ describe("persistedContextThresholdOverride", () => {
         contextLeafChunkTokens: null,
       }),
     ).toBeUndefined();
+  });
+});
+
+describe("ContextThresholdResolver.couldAnyRuleMatch", () => {
+  it("is false when no rules are configured", () => {
+    const resolver = new ContextThresholdResolver(0.75, []);
+    expect(resolver.couldAnyRuleMatch({ runtime: {} })).toBe(false);
+  });
+
+  it("treats absent window metadata as satisfiable for window-range rules", () => {
+    const resolver = new ContextThresholdResolver(0.75, [
+      { match: { modelContextWindowMax: 250_000 }, contextThreshold: 0.1 },
+    ]);
+    expect(resolver.couldAnyRuleMatch({ runtime: {} })).toBe(true);
+    expect(resolver.couldAnyRuleMatch({ runtime: { modelContextWindow: 500_000 } })).toBe(false);
+  });
+
+  it("rejects on a known session key that fails the rule's session pattern", () => {
+    const resolver = new ContextThresholdResolver(0.75, [
+      { match: { sessionPattern: "agent:alpha:**" }, contextThreshold: 0.1 },
+    ]);
+    expect(resolver.couldAnyRuleMatch({ sessionKey: "agent:beta:main", runtime: {} })).toBe(false);
+    expect(resolver.couldAnyRuleMatch({ sessionKey: "agent:alpha:main", runtime: {} })).toBe(true);
+    expect(resolver.couldAnyRuleMatch({ runtime: {} })).toBe(true);
+  });
+
+  it("rejects on present model metadata that fails the rule's model matcher", () => {
+    const resolver = new ContextThresholdResolver(0.75, [
+      { match: { model: "openai/gpt-5.5" }, contextThreshold: 0.1 },
+    ]);
+    expect(
+      resolver.couldAnyRuleMatch({ runtime: { model: "claude", modelRef: "anthropic/claude" } }),
+    ).toBe(false);
+    expect(resolver.couldAnyRuleMatch({ runtime: {} })).toBe(true);
+  });
+});
+
+describe("reconcilePersistedContextThreshold", () => {
+  const liveGlobal = {
+    contextThreshold: 0.75,
+    source: "global" as const,
+    reason: "no_override_matched",
+    specificity: 0,
+  };
+
+  it("uses the live resolution when nothing was persisted", () => {
+    const result = reconcilePersistedContextThreshold({
+      persisted: undefined,
+      live: liveGlobal,
+      anyRuleCouldMatch: false,
+    });
+    expect(result.resolved).toBe(liveGlobal);
+    expect(result.supersededStalePersisted).toBe(false);
+  });
+
+  it("keeps a persisted override while a configured rule could still match", () => {
+    const persisted = {
+      contextThreshold: 0.1,
+      source: "override" as const,
+      reason: "persisted deferred threshold debt",
+      specificity: 0,
+    };
+    const result = reconcilePersistedContextThreshold({
+      persisted,
+      live: liveGlobal,
+      anyRuleCouldMatch: true,
+    });
+    expect(result.resolved).toBe(persisted);
+    expect(result.supersededStalePersisted).toBe(false);
+  });
+
+  it("supersedes a persisted override when no configured rule could match", () => {
+    const persisted = {
+      contextThreshold: 0.02,
+      source: "override" as const,
+      reason: "persisted deferred threshold debt",
+      specificity: 0,
+    };
+    const result = reconcilePersistedContextThreshold({
+      persisted,
+      live: liveGlobal,
+      anyRuleCouldMatch: false,
+    });
+    expect(result.resolved).toBe(liveGlobal);
+    expect(result.supersededStalePersisted).toBe(true);
+  });
+
+  it("supersedes a persisted global that diverges from the configured global", () => {
+    const persisted = {
+      contextThreshold: 0.02,
+      source: "global" as const,
+      reason: "persisted deferred threshold debt",
+      specificity: 0,
+    };
+    const result = reconcilePersistedContextThreshold({
+      persisted,
+      live: liveGlobal,
+      anyRuleCouldMatch: false,
+    });
+    expect(result.resolved).toBe(liveGlobal);
+    expect(result.supersededStalePersisted).toBe(true);
+  });
+
+  it("keeps a persisted global equal to the configured global", () => {
+    const persisted = {
+      contextThreshold: 0.75,
+      source: "global" as const,
+      reason: "persisted deferred threshold debt",
+      specificity: 0,
+      freshTailCount: 4,
+    };
+    const result = reconcilePersistedContextThreshold({
+      persisted,
+      live: liveGlobal,
+      anyRuleCouldMatch: false,
+    });
+    expect(result.resolved).toBe(persisted);
+    expect(result.supersededStalePersisted).toBe(false);
+  });
+
+  it("prefers a live override over a persisted global", () => {
+    const persisted = {
+      contextThreshold: 0.75,
+      source: "global" as const,
+      reason: "persisted deferred threshold debt",
+      specificity: 0,
+    };
+    const liveOverride = {
+      contextThreshold: 0.3,
+      source: "override" as const,
+      reason: "sessionPattern=agent:alpha:**",
+      specificity: 50,
+    };
+    const result = reconcilePersistedContextThreshold({
+      persisted,
+      live: liveOverride,
+      anyRuleCouldMatch: true,
+    });
+    expect(result.resolved).toBe(liveOverride);
+    expect(result.supersededStalePersisted).toBe(true);
   });
 });

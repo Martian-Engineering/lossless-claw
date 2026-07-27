@@ -107,6 +107,54 @@ function ruleMatches(params: {
   return true;
 }
 
+// Like ruleMatches, but a matcher whose runtime metadata is absent counts as
+// potentially satisfiable instead of failed. Backs the staleness check on
+// persisted deferred-maintenance thresholds: a background drain often lacks
+// model metadata, so "no rule could match even as a wildcard" is the only
+// safe proof that a persisted override no longer originates from live config.
+function rulePossiblyMatches(params: {
+  compiled: CompiledOverrideRule;
+  sessionKey?: string;
+  runtime: RuntimeModelContext;
+}): boolean {
+  const { rule, sessionPattern } = params.compiled;
+  const runtime = params.runtime;
+
+  if (rule.match.model) {
+    const normalizedRuleModel = rule.match.model.trim();
+    const candidates = [runtime.modelRef, runtime.model].filter(
+      (candidate): candidate is string => typeof candidate === "string" && candidate.length > 0,
+    );
+    if (candidates.length > 0 && !candidates.includes(normalizedRuleModel)) {
+      return false;
+    }
+  }
+
+  if (sessionPattern) {
+    const sessionKey = params.sessionKey?.trim();
+    if (sessionKey && !sessionPattern.test(sessionKey)) {
+      return false;
+    }
+  }
+
+  if (runtime.modelContextWindow !== undefined) {
+    if (
+      rule.match.modelContextWindowMin !== undefined &&
+      runtime.modelContextWindow < rule.match.modelContextWindowMin
+    ) {
+      return false;
+    }
+    if (
+      rule.match.modelContextWindowMax !== undefined &&
+      runtime.modelContextWindow > rule.match.modelContextWindowMax
+    ) {
+      return false;
+    }
+  }
+
+  return true;
+}
+
 // Summarize which matchers selected the winning rule for log lines.
 function describeRuleMatch(
   rule: ContextThresholdOverride,
@@ -164,6 +212,38 @@ export function persistedContextThresholdOverride(maintenance: {
       ? { leafChunkTokens: Math.floor(maintenance.contextLeafChunkTokens) }
       : {}),
   };
+}
+
+/**
+ * Decide which threshold a deferred-maintenance drain should honour: the one
+ * persisted with the debt row, or a fresh resolution against live config.
+ * The persisted value protects drains that lack the runtime metadata which
+ * originally selected an override; it stays authoritative only while live
+ * config could still plausibly produce it. A persisted override with no
+ * possibly-matching rule left, and a persisted global that diverges from the
+ * configured global, are provably stale (the config changed after the row was
+ * written) and are superseded so a dead experiment value cannot wedge
+ * compaction forever.
+ */
+export function reconcilePersistedContextThreshold(params: {
+  persisted: ResolvedContextThreshold | undefined;
+  live: ResolvedContextThreshold;
+  anyRuleCouldMatch: boolean;
+}): { resolved: ResolvedContextThreshold; supersededStalePersisted: boolean } {
+  const { persisted, live } = params;
+  if (!persisted) {
+    return { resolved: live, supersededStalePersisted: false };
+  }
+  if (persisted.source === "override") {
+    if (params.anyRuleCouldMatch) {
+      return { resolved: persisted, supersededStalePersisted: false };
+    }
+    return { resolved: live, supersededStalePersisted: true };
+  }
+  if (live.source === "override" || live.contextThreshold !== persisted.contextThreshold) {
+    return { resolved: live, supersededStalePersisted: true };
+  }
+  return { resolved: persisted, supersededStalePersisted: false };
 }
 
 /** Format the resolved-threshold fields shared by all selection log lines. */
@@ -249,5 +329,19 @@ export class ContextThresholdResolver {
         ? { leafChunkTokens: best.rule.leafChunkTokens }
         : {}),
     };
+  }
+
+  /**
+   * Whether any configured rule could match this context when matchers whose
+   * runtime metadata is absent are treated as satisfiable. Backs the stale
+   * check in {@link reconcilePersistedContextThreshold}.
+   */
+  couldAnyRuleMatch(params: {
+    sessionKey?: string;
+    runtime: RuntimeModelContext;
+  }): boolean {
+    return this.rules.some((compiled) =>
+      rulePossiblyMatches({ compiled, sessionKey: params.sessionKey, runtime: params.runtime }),
+    );
   }
 }
