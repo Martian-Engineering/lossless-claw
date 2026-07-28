@@ -34,6 +34,7 @@ import {
   extractToolResultIdForPairing,
 } from "./tool-pairing.js";
 import { getTranscriptEntryId } from "./transcript.js";
+import { extractStableEventKey } from "./stable-event-key.js";
 import type { LcmDependencies } from "./types.js";
 
 type RedactSensitiveText = (content: string) => string;
@@ -239,6 +240,45 @@ export class BatchDeduplicator {
     });
   }
 
+  /**
+   * Final-pass filter: drop runtime batch messages whose stable event key is
+   * already present in the database or earlier in the same batch. Guards the
+   * cross-representation duplicate case where transcript reconciliation
+   * persisted the redacted form first and the live afterTurn batch carries
+   * the original unredacted form of the same event.
+   */
+  private async filterRuntimeBatchByStableEventKeys(
+    conversationId: number,
+    batch: AgentMessage[],
+  ): Promise<AgentMessage[]> {
+    if (batch.length === 0) return batch;
+    const keys = batch.map((message) => extractStableEventKey(message, conversationId));
+    const existing = await this.conversationStore.filterExistingStableEventKeys(
+      conversationId,
+      keys.filter((key): key is string => Boolean(key)),
+    );
+    const seenInBatch = new Set<string>();
+    const kept: AgentMessage[] = [];
+    for (let i = 0; i < batch.length; i += 1) {
+      const message = batch[i]!;
+      const key = keys[i] ?? null;
+      if (key) {
+        if (seenInBatch.has(key)) {
+          continue;
+        }
+        if (existing.has(key)) {
+          this.deps.log.debug(
+            `[lcm] batch-dedup: stable-event duplicate skipped role=${(message as { role?: string }).role ?? "?"} key=${key} conversation=${conversationId}`,
+          );
+          continue;
+        }
+        seenInBatch.add(key);
+      }
+      kept.push(message);
+    }
+    return kept;
+  }
+
   async alignRuntimeBatchAgainstCoveredFrontier(
     sessionId: string,
     sessionKey: string | undefined,
@@ -324,7 +364,7 @@ export class BatchDeduplicator {
         matches.some(isStrongReplayAnchor) &&
         redactedMatchesHaveAdjacentAnchor(matches)
       ) {
-        return batch.slice(k);
+        return this.filterRuntimeBatchByStableEventKeys(conversationId, batch.slice(k));
       }
     }
 
@@ -542,7 +582,7 @@ export class BatchDeduplicator {
     // or structurally decorated row before treating it as replay evidence.
     if (!redactedMatchesHaveAdjacentAnchor(matches)) return batch;
 
-    return batch.slice(storedMessageCount);
+    return this.filterRuntimeBatchByStableEventKeys(conversationId, batch.slice(storedMessageCount));
   }
 
   /**
@@ -699,7 +739,7 @@ export class BatchDeduplicator {
             `returning ${newSlice.length} new messages ` +
             `(storedCount=${storedMessageCount} batchLen=${batch.length})`,
         );
-        return newSlice;
+        return this.filterRuntimeBatchByStableEventKeys(conversationId, newSlice);
       }
       if (suffixMatch && (!exactAnchor || !redactionAnchored)) {
         ambiguousWeakOverlap = true;

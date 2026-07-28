@@ -509,3 +509,25 @@ To switch back to OpenClaw's legacy context engine instead:
   }
 }
 ```
+
+## Stable event identity deduplication
+
+Lossless-claw persists a `stable_event_key` on every `messages` row to
+prevent duplicate ingestion when the same semantic event arrives in two
+different content representations (typical case: the JSONL transcript is
+redacted by `logging.redactPatterns` while the live `afterTurn` batch is
+not). The key is derived from the message as follows, in order:
+
+1. assistant messages with `responseId` (or `response_id`):
+   `assistant-response:<responseId>`.
+2. tool / toolResult messages with a tool call id:
+   `tool-result:<toolCallId>`.
+3. Any message with a parseable inner source timestamp (`timestamp` /
+   `createdAt` / `created_at`): `<role>-event:<conversationId>:<role>:<epochMs>`.
+4. Otherwise: no key is persisted, the row falls back to the existing
+   content-based deduplication.
+
+A partial unique index on `(conversation_id, stable_event_key)` ensures
+that two rows in the same conversation can never share a key. The
+mechanism is independent of `logging.redactPatterns` and requires no user
+configuration.

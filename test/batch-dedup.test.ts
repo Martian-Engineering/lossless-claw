@@ -83,6 +83,8 @@ function makeConversationStore(initial: FakeConversationStore): ConversationStor
         }),
       ),
     ),
+    hasMessageByStableEventKey: vi.fn(async () => false),
+    filterExistingStableEventKeys: vi.fn(async () => new Set<string>()),
   } as unknown as ConversationStore;
 }
 
@@ -163,6 +165,33 @@ describe("BatchDeduplicator.deduplicateAfterTurnBatch", () => {
     ];
     const result = await dedup.deduplicateAfterTurnBatch("s1", undefined, batch);
     expect(result).toEqual([batch[2]]);
+  });
+
+  it("skips a runtime batch message whose stable event key is already in the DB", async () => {
+    const conversation = {
+      conversationId: 1,
+      messages: [storedMessage("user", "a")],
+    } as unknown as Parameters<typeof makeDedup>[0];
+    const store = makeConversationStore(conversation);
+    (
+      store as unknown as { hasMessageByStableEventKey: () => Promise<boolean> }
+    ).hasMessageByStableEventKey = vi.fn().mockResolvedValue(true);
+    (
+      store as unknown as { filterExistingStableEventKeys: () => Promise<Set<string>> }
+    ).filterExistingStableEventKeys = vi.fn().mockResolvedValue(new Set(["assistant-response:r-1"]));
+    const dedup = new BatchDeduplicator(
+      store,
+      {} as unknown as SummaryStore,
+      "/tmp/lcm-batch-dedup-test",
+      { log: makeLog() },
+    );
+    const batch = [
+      makeMessage({ role: "user", content: "a" }),
+      makeMessage({ role: "assistant", content: "x", responseId: "r-1" } as never),
+      makeMessage({ role: "assistant", content: "fresh", responseId: "r-2" } as never),
+    ];
+    const result = await dedup.deduplicateAfterTurnBatch("s1", undefined, batch);
+    expect(result.map((m) => m.content)).toEqual(["fresh"]);
   });
 
   it("returns an empty batch when the entire batch is already stored", async () => {

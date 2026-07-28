@@ -68,6 +68,7 @@ import {
   MIN_FALLBACK_MAX_TOKENS,
 } from "./summary-fallback.js";
 import { getTranscriptEntryId, readAppendedLeafPathMessages, readLastJsonlEntryBeforeOffset, readLeafPathMessages, readSessionParentSessionReference, resolveTranscriptMessageCreatedAt } from "./transcript.js";
+import { extractStableEventKey } from "./stable-event-key.js";
 import { type TranscriptReconcileResult } from "./reconcile-plan.js";
 import { checkpointIsPastTranscriptEof, TranscriptReconciler } from "./transcript-reconciler.js";
 import { AMBIGUOUS_SESSION_KEY_RUNTIME_ROLLOVER_REASON, SessionRolloverDetector } from "./session-rollover.js";
@@ -2725,6 +2726,25 @@ export class LcmContextEngine implements ContextEngine {
       return { ingested: false };
     }
 
+    // Stable event identity short-circuit: when the message carries a stable
+    // event key (responseId / toolCallId / role+timestamp) that the
+    // conversation already holds, this is the same event under a different
+    // (likely redacted) content representation. Skip the duplicate insert
+    // before any side effects.
+    const stableEventKey = extractStableEventKey(message, conversationId);
+    if (
+      stableEventKey &&
+      (await this.conversationStore.hasMessageByStableEventKey(
+        conversationId,
+        stableEventKey,
+      ))
+    ) {
+      this.deps.log.debug(
+        `[lcm] ingestSingle: stable-event duplicate skipped role=${stored.role} key=${stableEventKey} conversation=${conversationId}`,
+      );
+      return { ingested: false };
+    }
+
     // Delivery-mirror dedup: OpenClaw writes two entries per assistant turn —
     // the model response (with thinking + text) and a delivery-mirror (text
     // only, model="delivery-mirror"). Both share the same identity_hash
@@ -2842,6 +2862,7 @@ export class LcmContextEngine implements ContextEngine {
       content: stored.content,
       tokenCount: stored.tokenCount,
       transcriptEntryId,
+      stableEventKey,
       createdAt,
       skipReplayTimestampFloodGuard,
     });

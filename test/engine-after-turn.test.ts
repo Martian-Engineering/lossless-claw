@@ -4860,4 +4860,151 @@ describe("LcmContextEngine afterTurn", () => {
       "real assistant",
     ]);
   });
+
+  it("afterTurn dedupes assistant runtime messages against transcript by responseId", async () => {
+    // Stable-event dedup (Task 6): the transcript imports a redacted assistant
+    // message carrying responseId="resp-001"; the runtime batch arrives with
+    // the same responseId but the original (unredacted) content. Only one row
+    // should land in the DB, and its body must match the transcript's redacted
+    // content (the prior row stays canonical).
+    const engine = createEngine();
+    const sessionId = "after-turn-stable-event-response-id";
+    const sessionKey = "agent:main:stable-event-response-id";
+    const sessionFile = createSessionFilePath("stable-event-response-id");
+    writeLeafTranscriptMessages(sessionFile, [
+      makeMessage({
+        role: "assistant",
+        content: [{ type: "text", text: "redacted by logging.redactPatterns" }],
+        responseId: "resp-001",
+      }),
+    ]);
+    await engine.bootstrap({ sessionId, sessionKey, sessionFile });
+    await engine.afterTurn({
+      sessionId,
+      sessionKey,
+      sessionFile,
+      messages: [
+        makeMessage({
+          role: "assistant",
+          content: "original unredacted content",
+          responseId: "resp-001",
+        } as never),
+      ],
+      prePromptMessageCount: 0,
+      tokenBudget: 4_096,
+    });
+    const conversation = await engine.getConversationStore().getConversationBySessionId(sessionId);
+    const rows = await engine.getConversationStore().getMessages(conversation!.conversationId);
+    expect(rows.length).toBe(1);
+    expect(rows[0]!.content).toBe("redacted by logging.redactPatterns");
+  });
+
+  it("afterTurn dedupes user messages by role+timestamp fallback", async () => {
+    // Stable-event dedup (Task 6): user messages without responseId fall back
+    // to a role+timestamp key. Transcript imports a redacted user message at
+    // timestamp=1_700_000_000_000; the runtime batch carries the same
+    // timestamp with the original body. Only one row should land.
+    const engine = createEngine();
+    const sessionId = "after-turn-stable-event-timestamp-fallback";
+    const sessionKey = "agent:main:stable-event-timestamp-fallback";
+    const sessionFile = createSessionFilePath("stable-event-timestamp-fallback");
+    writeLeafTranscriptMessages(sessionFile, [
+      makeMessage({
+        role: "user",
+        content: "redacted body",
+        timestamp: 1_700_000_000_000,
+      }),
+    ]);
+    await engine.bootstrap({ sessionId, sessionKey, sessionFile });
+    await engine.afterTurn({
+      sessionId,
+      sessionKey,
+      sessionFile,
+      messages: [
+        makeMessage({
+          role: "user",
+          content: "original body",
+          timestamp: 1_700_000_000_000,
+        } as never),
+      ],
+      prePromptMessageCount: 0,
+      tokenBudget: 4_096,
+    });
+    const conversation = await engine.getConversationStore().getConversationBySessionId(sessionId);
+    const rows = await engine.getConversationStore().getMessages(conversation!.conversationId);
+    expect(rows.length).toBe(1);
+  });
+
+  it("afterTurn keeps distinct-timestamp user messages (fallback key must not collapse)", async () => {
+    // Regression guard (Task 6): a 1ms timestamp difference must produce two
+    // separate rows. If the fallback key wrongly collapsed near-equal
+    // timestamps, one row would be lost.
+    const engine = createEngine();
+    const sessionId = "after-turn-stable-event-timestamp-mismatch";
+    const sessionKey = "agent:main:stable-event-timestamp-mismatch";
+    const sessionFile = createSessionFilePath("stable-event-timestamp-mismatch");
+    writeLeafTranscriptMessages(sessionFile, [
+      makeMessage({
+        role: "user",
+        content: "transcript turn",
+        timestamp: 1_700_000_000_000,
+      }),
+    ]);
+    await engine.bootstrap({ sessionId, sessionKey, sessionFile });
+    await engine.afterTurn({
+      sessionId,
+      sessionKey,
+      sessionFile,
+      messages: [
+        makeMessage({
+          role: "user",
+          content: "different turn, different timestamp",
+          timestamp: 1_700_000_000_001,
+        } as never),
+      ],
+      prePromptMessageCount: 0,
+      tokenBudget: 4_096,
+    });
+    const conversation = await engine.getConversationStore().getConversationBySessionId(sessionId);
+    const rows = await engine.getConversationStore().getMessages(conversation!.conversationId);
+    expect(rows.length).toBe(2);
+  });
+
+  it("afterTurn dedupes tool/toolResult messages by toolCallId", async () => {
+    // Stable-event dedup (Task 6, spec section 7.3 scenario B): the transcript
+    // imports a redacted toolResult message carrying toolCallId="call-001"; the
+    // runtime batch arrives with the same toolCallId but the original (unredacted)
+    // body. Only one row should land in the DB, and its body must match the
+    // transcript's redacted content (the prior row stays canonical).
+    const engine = createEngine();
+    const sessionId = "after-turn-stable-event-tool-call-id";
+    const sessionKey = "agent:main:stable-event-tool-call-id";
+    const sessionFile = createSessionFilePath("stable-event-tool-call-id");
+    writeLeafTranscriptMessages(sessionFile, [
+      makeMessage({
+        role: "toolResult",
+        content: [{ type: "text", text: "redacted by logging.redactPatterns" }],
+        toolCallId: "call-001",
+      }),
+    ]);
+    await engine.bootstrap({ sessionId, sessionKey, sessionFile });
+    await engine.afterTurn({
+      sessionId,
+      sessionKey,
+      sessionFile,
+      messages: [
+        makeMessage({
+          role: "toolResult",
+          content: "original unredacted tool result body",
+          toolCallId: "call-001",
+        } as never),
+      ],
+      prePromptMessageCount: 0,
+      tokenBudget: 4_096,
+    });
+    const conversation = await engine.getConversationStore().getConversationBySessionId(sessionId);
+    const rows = await engine.getConversationStore().getMessages(conversation!.conversationId);
+    expect(rows.length).toBe(1);
+    expect(rows[0]!.content).toBe("redacted by logging.redactPatterns");
+  });
 });
