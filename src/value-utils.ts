@@ -19,14 +19,17 @@ export function isMissingFileError(error: unknown): boolean {
   return code === "ENOENT" || code === "ENOTDIR";
 }
 
+const SQLITE_SESSION_FILE_PREFIX = "sqlite:";
+
 export function isSqliteSessionFile(sessionFile: string | null | undefined): boolean {
-  return (sessionFile?.startsWith("sqlite:") ?? false);
+  if (!sessionFile) return false;
+  return sessionFile.trim().toLowerCase().startsWith(SQLITE_SESSION_FILE_PREFIX);
 }
 
 export function normalizeSessionFilePathForComparison(filePath: string): string {
   const trimmed = filePath.trim();
   if (!trimmed) return "";
-  if (trimmed.startsWith("sqlite:")) return trimmed;
+  if (trimmed.toLowerCase().startsWith(SQLITE_SESSION_FILE_PREFIX)) return trimmed;
   return resolvePath(trimmed);
 }
 

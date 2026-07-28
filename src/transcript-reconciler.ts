@@ -1892,13 +1892,16 @@ export class TranscriptReconciler {
       // No persisted conversation exists yet. Prefer the transcript over
       // the runtime delta so foreground prompts that are omitted from
       // afterTurn's messages array are not lost.
+      const sqliteSession = isSqliteSessionFile(params.sessionFile);
       let sessionFileState: { size: number } | undefined;
-      try {
-        const sessionFileStats = await stat(params.sessionFile);
-        sessionFileState = { size: sessionFileStats.size };
-      } catch {
-        // Missing files are common for brand-new live sessions; allow the
-        // runtime batch to seed the conversation in that case.
+      if (!sqliteSession) {
+        try {
+          const sessionFileStats = await stat(params.sessionFile);
+          sessionFileState = { size: sessionFileStats.size };
+        } catch {
+          // Missing files are common for brand-new live sessions; allow the
+          // runtime batch to seed the conversation in that case.
+        }
       }
       const historicalMessages = await readLeafPathMessages(params.sessionFile);
       if (historicalMessages.length === 0) {

@@ -6,6 +6,7 @@ import {
   getErrorCode,
   hashSerializedMessages,
   isMissingFileError,
+  isSqliteSessionFile,
   normalizeOptionalCount,
   normalizeSessionFilePathForComparison,
   resolvePositiveInteger,
@@ -89,6 +90,30 @@ describe("isMissingFileError", () => {
   });
 });
 
+describe("isSqliteSessionFile", () => {
+  it.each([
+    ["sqlite:123", true],
+    ["Sqlite:abc", true],
+    ["SQLITE:x", true],
+    ["  sqlite:456  ", true],
+  ])("identifies %s as sqlite session file", (input, expected) => {
+    expect(isSqliteSessionFile(input)).toBe(expected);
+  });
+
+  it.each([
+    ["file.jsonl", false],
+    ["/absolute/path.jsonl", false],
+    ["sqlite", false],
+    ["sqlite2:not", false],
+    ["", false],
+    ["   ", false],
+    [null, false],
+    [undefined, false],
+  ])("returns false for %s", (input, expected) => {
+    expect(isSqliteSessionFile(input as string | null | undefined)).toBe(expected);
+  });
+});
+
 describe("normalizeSessionFilePathForComparison", () => {
   it.each([
     ["absolute path", "/foo/bar/session.jsonl", resolvePath("/foo/bar/session.jsonl")],
@@ -100,6 +125,21 @@ describe("normalizeSessionFilePathForComparison", () => {
 
   it.each(["", "   "])("returns empty string for empty input %j", (input) => {
     expect(normalizeSessionFilePathForComparison(input)).toBe("");
+  });
+
+  it.each([
+    ["sqlite:123", "sqlite:123"],
+    ["SQLITE:abc", "SQLITE:abc"],
+    ["  sqlite:456  ", "sqlite:456"],
+  ])("preserves sqlite: prefix path %j as-is", (input, expected) => {
+    expect(normalizeSessionFilePathForComparison(input)).toBe(expected);
+  });
+
+  it("does not resolve sqlite: paths with path.resolve", () => {
+    const result = normalizeSessionFilePathForComparison("sqlite:conversation/123");
+    expect(result).toBe("sqlite:conversation/123");
+    expect(result).not.toContain(":\\");
+    expect(result).not.toContain("sqlite:\\");
   });
 });
 
