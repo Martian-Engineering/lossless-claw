@@ -91,6 +91,13 @@ export type MessageRecord = {
    * compact `[LCM Tool Output: file_xxx | …]` reference.
    */
   largeContent: string | null;
+  /**
+   * Transcript provenance: non-null only when the row was imported from a
+   * transcript envelope written by the host's own flush — a marker a user
+   * cannot forge. Dedup uses it to decide whether a metadata-body match
+   * against this row may anchor a collapse.
+   */
+  transcriptEntryId: string | null;
 };
 
 export type CreateMessagePartInput = {
@@ -199,6 +206,9 @@ interface MessageRow {
   // v4.2 §B — sidecar fileId column. Optional in row shape because not
   // every SELECT projects it; mappers tolerate undefined → null.
   large_content?: string | null;
+  // Transcript provenance: non-null only for rows imported from a transcript
+  // envelope (the host's own flush). Same optional-projection tolerance.
+  transcript_entry_id?: string | null;
 }
 
 interface MessageSearchRow {
@@ -275,6 +285,7 @@ function formatMessageCreatedAt(value: Date | string | undefined): string | unde
 function toMessageRecord(row: MessageRow): MessageRecord {
   return {
     largeContent: row.large_content ?? null,
+    transcriptEntryId: row.transcript_entry_id ?? null,
     messageId: row.message_id,
     conversationId: row.conversation_id,
     seq: row.seq,
@@ -696,7 +707,7 @@ export class ConversationStore {
 
     const row = this.db
       .prepare(
-        `SELECT message_id, conversation_id, seq, role, content, token_count, created_at, large_content
+        `SELECT message_id, conversation_id, seq, role, content, token_count, created_at, large_content, transcript_entry_id
        FROM messages WHERE message_id = ?`,
       )
       .get(messageId) as unknown as MessageRow;
@@ -719,7 +730,7 @@ export class ConversationStore {
        VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
     );
     const selectStmt = this.db.prepare(
-      `SELECT message_id, conversation_id, seq, role, content, token_count, created_at, large_content
+      `SELECT message_id, conversation_id, seq, role, content, token_count, created_at, large_content, transcript_entry_id
        FROM messages WHERE message_id = ?`,
     );
 
@@ -755,7 +766,7 @@ export class ConversationStore {
     if (limit != null) {
       const rows = this.db
         .prepare(
-          `SELECT message_id, conversation_id, seq, role, content, token_count, created_at, large_content
+          `SELECT message_id, conversation_id, seq, role, content, token_count, created_at, large_content, transcript_entry_id
          FROM messages
          WHERE conversation_id = ? AND seq > ?
          ORDER BY seq
@@ -767,7 +778,7 @@ export class ConversationStore {
 
     const rows = this.db
       .prepare(
-        `SELECT message_id, conversation_id, seq, role, content, token_count, created_at, large_content
+        `SELECT message_id, conversation_id, seq, role, content, token_count, created_at, large_content, transcript_entry_id
        FROM messages
        WHERE conversation_id = ? AND seq > ?
        ORDER BY seq`,
@@ -783,7 +794,7 @@ export class ConversationStore {
     }
     const rows = this.db
       .prepare(
-        `SELECT message_id, conversation_id, seq, role, content, token_count, created_at, large_content
+        `SELECT message_id, conversation_id, seq, role, content, token_count, created_at, large_content, transcript_entry_id
        FROM messages
        WHERE conversation_id = ?
        ORDER BY seq DESC
@@ -796,7 +807,7 @@ export class ConversationStore {
   async getLastMessage(conversationId: ConversationId): Promise<MessageRecord | null> {
     const row = this.db
       .prepare(
-        `SELECT message_id, conversation_id, seq, role, content, token_count, created_at, large_content
+        `SELECT message_id, conversation_id, seq, role, content, token_count, created_at, large_content, transcript_entry_id
        FROM messages
        WHERE conversation_id = ?
        ORDER BY seq DESC
@@ -1221,7 +1232,7 @@ export class ConversationStore {
   async getMessageById(messageId: MessageId): Promise<MessageRecord | null> {
     const row = this.db
       .prepare(
-        `SELECT message_id, conversation_id, seq, role, content, token_count, created_at, large_content
+        `SELECT message_id, conversation_id, seq, role, content, token_count, created_at, large_content, transcript_entry_id
        FROM messages WHERE message_id = ?`,
       )
       .get(messageId) as unknown as MessageRow | undefined;
@@ -1232,7 +1243,7 @@ export class ConversationStore {
   async getMessageByLargeContent(fileId: string): Promise<MessageRecord | null> {
     const row = this.db
       .prepare(
-        `SELECT message_id, conversation_id, seq, role, content, token_count, created_at, large_content
+        `SELECT message_id, conversation_id, seq, role, content, token_count, created_at, large_content, transcript_entry_id
        FROM messages
        WHERE large_content = ?
        ORDER BY seq DESC
@@ -1718,7 +1729,7 @@ export class ConversationStore {
     const whereClause = where.length > 0 ? `WHERE ${where.join(" AND ")}` : "";
     const rows = this.db
       .prepare(
-        `SELECT message_id, conversation_id, seq, role, content, token_count, created_at, large_content
+        `SELECT message_id, conversation_id, seq, role, content, token_count, created_at, large_content, transcript_entry_id
          FROM messages
          ${whereClause}
          ORDER BY created_at DESC
@@ -1780,7 +1791,7 @@ export class ConversationStore {
     const whereClause = where.length > 0 ? `WHERE ${where.join(" AND ")}` : "";
     const rows = this.db
       .prepare(
-        `SELECT message_id, conversation_id, seq, role, content, token_count, created_at, large_content
+        `SELECT message_id, conversation_id, seq, role, content, token_count, created_at, large_content, transcript_entry_id
          FROM messages
          ${whereClause}
          ORDER BY created_at DESC`,

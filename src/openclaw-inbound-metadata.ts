@@ -246,7 +246,13 @@ function extractBodyAfterOpenClawInboundMetadataBlockWithPolicy(
   if (stripInjectedContext) {
     remaining = stripLeadingInjectedContextTagBlocks(remaining);
   }
-  if (hasOpenClawInboundHistory(firstRecord)) {
+  // The recap strip must not require the metadata to announce history:
+  // `history_count` is a host announcement the host demonstrably omits on
+  // some channels (live telegram records carry a recap block with no
+  // history_count field at all). The structural validators inside
+  // matchLeadingOpenClawInboundHistoryRecap are the real gate; the record
+  // field is at most a hint, never a precondition.
+  {
     const contextSplit = splitLeadingOpenClawInboundContextBlocks(remaining);
     const recapCandidate = contextSplit.remaining.trimStart();
     const recapLength = matchLeadingOpenClawInboundHistoryRecap(recapCandidate);
