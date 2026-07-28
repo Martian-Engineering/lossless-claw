@@ -56,26 +56,107 @@ const OPENCLAW_INBOUND_HISTORY_RECAP_BLOCK_RE = new RegExp(
 // "<sender>: <content>". A line carrying NEITHER token is indistinguishable
 // from ordinary prose, so it is deliberately excluded from recognition here
 // (fail-closed: at least one anchor token is required).
-const OPENCLAW_INBOUND_HISTORY_RECAP_LINE_ID_TOKEN = String.raw`#\S+`;
-const OPENCLAW_INBOUND_HISTORY_RECAP_LINE_TIMESTAMP_TOKEN =
-  String.raw`[A-Za-z]{3} \d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2} \S+`;
-const OPENCLAW_INBOUND_HISTORY_RECAP_LINE_ENTRY_SRC = String.raw`(?:${OPENCLAW_INBOUND_HISTORY_RECAP_LINE_ID_TOKEN} ${OPENCLAW_INBOUND_HISTORY_RECAP_LINE_TIMESTAMP_TOKEN} |${OPENCLAW_INBOUND_HISTORY_RECAP_LINE_ID_TOKEN} |${OPENCLAW_INBOUND_HISTORY_RECAP_LINE_TIMESTAMP_TOKEN} ).+: .+`;
+const OPENCLAW_INBOUND_HISTORY_RECAP_LINE_ID_PREFIX_RE = /^#\S+ /;
+const OPENCLAW_INBOUND_HISTORY_RECAP_LINE_TIMESTAMP_PREFIX_RE =
+  /^[A-Za-z]{3} \d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2} \S+ /;
 
 // Unlike the JSON form (self-delimiting via the closing fence), prose lines
 // have no hard terminator: the real emitter just stops emitting lines, and
 // buildInboundUserContextPrefix joins every block (including this one) with
 // blocks.filter(Boolean).join("\n\n"). So the only structurally valid ways
 // for a run of entry lines to end are a blank-line block separator or end of
-// content; the trailing lookahead enforces that. A run that peters out into
-// anything else (a line that is neither a valid entry nor a blank separator)
-// fails the WHOLE match, so it is never partially stripped up to that point.
-const OPENCLAW_INBOUND_HISTORY_RECAP_LINE_BLOCK_RE = new RegExp(
-  `^${OPENCLAW_INBOUND_HISTORY_RECAP_HEADER_SRC}` +
-    String.raw`\r?\n` +
-    `(?:${OPENCLAW_INBOUND_HISTORY_RECAP_LINE_ENTRY_SRC})` +
-    `(?:\r?\n(?:${OPENCLAW_INBOUND_HISTORY_RECAP_LINE_ENTRY_SRC}))*` +
-    String.raw`(?=\r?\n\r?\n|\r?\n?$)`,
-);
+// content. A run that peters out into anything else (a line that is neither a
+// valid entry nor a blank separator) fails the WHOLE match, so it is never
+// partially stripped up to that point.
+//
+// Deliberately implemented as a line walker rather than one composite
+// `(?:ENTRY)(?:\r?\n(?:ENTRY))*(?=terminator)` regex: entry lines are
+// internally ambiguous (three optional-prefix alternates, sender/content
+// split at any ": "), so on a long run whose terminator check fails the
+// backtracking engine explores the cross-product of every per-line ambiguity
+// and goes catastrophic (minutes of blocking on a ~200-entry colon-heavy
+// recap; the shape real group chats produce whenever a recap entry contains
+// its own newlines). A shorter run can never satisfy the terminator that the
+// maximal run failed (the next char after an intermediate entry is always its
+// successor line, never a blank separator or end), so the walk is all-or-
+// nothing greedy and strictly linear.
+function matchLeadingOpenClawInboundHistoryRecapLineBlock(candidate: string): number {
+  const header = OPENCLAW_INBOUND_HISTORY_RECAP_HEADERS.find((headerText) =>
+    candidate.startsWith(headerText),
+  );
+  if (header === undefined) {
+    return 0;
+  }
+  let cursor = header.length;
+  if (candidate.startsWith("\r\n", cursor)) {
+    cursor += 2;
+  } else if (candidate.startsWith("\n", cursor)) {
+    cursor += 1;
+  } else {
+    return 0;
+  }
+
+  let matchedEnd = -1;
+  while (cursor < candidate.length) {
+    const newlineIndex = candidate.indexOf("\n", cursor);
+    let lineTextEnd = newlineIndex === -1 ? candidate.length : newlineIndex;
+    if (lineTextEnd > cursor && candidate.charCodeAt(lineTextEnd - 1) === 13) {
+      lineTextEnd -= 1;
+    }
+    if (!isOpenClawInboundHistoryRecapEntryLine(candidate.slice(cursor, lineTextEnd))) {
+      break;
+    }
+    matchedEnd = lineTextEnd;
+    if (newlineIndex === -1) {
+      break;
+    }
+    cursor = newlineIndex + 1;
+  }
+  if (matchedEnd < 0) {
+    return 0;
+  }
+
+  const rest = candidate.slice(matchedEnd);
+  const terminated =
+    rest.length === 0 ||
+    rest === "\n" ||
+    rest === "\r\n" ||
+    rest.startsWith("\n\n") ||
+    rest.startsWith("\n\r\n") ||
+    rest.startsWith("\r\n\n") ||
+    rest.startsWith("\r\n\r\n");
+  return terminated ? matchedEnd : 0;
+}
+
+// "<sender>: <content>" with both sides non-empty: at least one character
+// before the first eligible ": " and at least one after it. (A CR-only
+// content survives the composite-regex form via `.` matching \r; the walker
+// treats it as empty and rejects -- the conservative direction.)
+function recapEntryLineHasSenderAndContent(remainder: string): boolean {
+  const separatorIndex = remainder.indexOf(": ", 1);
+  return separatorIndex !== -1 && separatorIndex + 2 < remainder.length;
+}
+
+function isOpenClawInboundHistoryRecapEntryLine(line: string): boolean {
+  const idMatch = OPENCLAW_INBOUND_HISTORY_RECAP_LINE_ID_PREFIX_RE.exec(line);
+  if (idMatch) {
+    const afterId = line.slice(idMatch[0].length);
+    const timestampMatch =
+      OPENCLAW_INBOUND_HISTORY_RECAP_LINE_TIMESTAMP_PREFIX_RE.exec(afterId);
+    if (
+      timestampMatch &&
+      recapEntryLineHasSenderAndContent(afterId.slice(timestampMatch[0].length))
+    ) {
+      return true;
+    }
+    return recapEntryLineHasSenderAndContent(afterId);
+  }
+  const timestampMatch = OPENCLAW_INBOUND_HISTORY_RECAP_LINE_TIMESTAMP_PREFIX_RE.exec(line);
+  return (
+    timestampMatch !== null &&
+    recapEntryLineHasSenderAndContent(line.slice(timestampMatch[0].length))
+  );
+}
 
 // OpenClaw-version-coupled inbound decoration string: the header an OpenClaw
 // runtime prepends to a user turn that carries an ambient room event (channel
@@ -127,6 +208,16 @@ export function contentBeginsWithOpenClawInboundMetadataBlock(content: string): 
  * prelude, or null when the content does not begin with one.
  */
 export function extractBodyAfterOpenClawInboundMetadataBlock(content: string): string | null {
+  return extractBodyAfterOpenClawInboundMetadataBlockWithPolicy(content, true);
+}
+
+// Shared metadata/recap reduction. The body matcher first disables injected
+// stripping to preserve an exact user-authored-tag match, then enables it as
+// the plugin-injection fallback.
+function extractBodyAfterOpenClawInboundMetadataBlockWithPolicy(
+  content: string,
+  stripInjectedContext: boolean,
+): string | null {
   const afterTimestamp = stripLeadingOpenClawInboundTimestamp(content.trimStart());
   const { metadataCandidate } = splitOpenClawInboundMetadataPrelude(afterTimestamp);
   const firstCandidate = metadataCandidate.trimStart();
@@ -152,6 +243,9 @@ export function extractBodyAfterOpenClawInboundMetadataBlock(content: string): s
     remaining = secondCandidate.slice(secondMatch[0].length);
   }
 
+  if (stripInjectedContext) {
+    remaining = stripLeadingInjectedContextTagBlocks(remaining);
+  }
   if (hasOpenClawInboundHistory(firstRecord)) {
     const contextSplit = splitLeadingOpenClawInboundContextBlocks(remaining);
     const recapCandidate = contextSplit.remaining.trimStart();
@@ -159,6 +253,9 @@ export function extractBodyAfterOpenClawInboundMetadataBlock(content: string): s
     if (recapLength > 0) {
       remaining = recapCandidate.slice(recapLength);
     }
+  }
+  if (stripInjectedContext) {
+    remaining = stripLeadingInjectedContextTagBlocks(remaining);
   }
 
   return stripMetadataSeparator(remaining);
@@ -176,6 +273,30 @@ export function extractBodyAfterOpenClawInboundMetadataBlock(content: string): s
  * different body is never treated as the same turn (fail-closed).
  */
 export function openClawInboundBodiesMatch(liveContent: string, bareContent: string): boolean {
+  const bareBody = stripLeadingOpenClawInboundTimestamp(bareContent);
+  const exactLiveBodyAfterMetadata = extractBodyAfterOpenClawInboundMetadataBlockWithPolicy(
+    liveContent,
+    false,
+  );
+  if (exactLiveBodyAfterMetadata === null) {
+    return false;
+  }
+  const exactLiveBody = stripLeadingOpenClawInboundTimestamp(exactLiveBodyAfterMetadata);
+  return exactLiveBody.trim().length > 0 && exactLiveBody === bareBody;
+}
+
+/**
+ * Match after stripping known injected-context blocks from the runtime face.
+ * Use only where another strong signal proves the aligned rows are the same
+ * turn, because the tag names themselves are user-typeable.
+ */
+export function openClawInboundBodiesMatchWithInjectedContext(
+  liveContent: string,
+  bareContent: string,
+): boolean {
+  if (openClawInboundBodiesMatch(liveContent, bareContent)) {
+    return true;
+  }
   const liveBodyAfterMetadata = extractBodyAfterOpenClawInboundMetadataBlock(liveContent);
   if (liveBodyAfterMetadata === null) {
     return false;
@@ -183,6 +304,29 @@ export function openClawInboundBodiesMatch(liveContent: string, bareContent: str
   const liveBody = stripLeadingOpenClawInboundTimestamp(liveBodyAfterMetadata);
   const bareBody = stripLeadingOpenClawInboundTimestamp(bareContent);
   return liveBody.trim().length > 0 && liveBody === bareBody;
+}
+
+/**
+ * True when a live metadata-decorated face reduces to the same non-empty body
+ * as an assembled face. Injected tags are stripped only from the live side;
+ * the assembled side stays verbatim because those tags are user-typeable.
+ * Use only after the caller proves both faces belong to the current turn.
+ */
+export function openClawInboundDecoratedBodiesMatch(
+  liveContent: string,
+  assembledContent: string,
+): boolean {
+  const liveBody = extractBodyAfterOpenClawInboundMetadataBlock(liveContent);
+  const assembledBody = extractBodyAfterOpenClawInboundMetadataBlockWithPolicy(
+    assembledContent,
+    false,
+  );
+  return (
+    liveBody !== null &&
+    assembledBody !== null &&
+    liveBody.trim().length > 0 &&
+    liveBody === assembledBody
+  );
 }
 
 const CONVERSATION_INFO_KEYS = new Set([
@@ -467,6 +611,48 @@ function hasOpenClawInboundHistory(record: Record<string, unknown>): boolean {
   return typeof historyCount === "number" && Number.isInteger(historyCount) && historyCount > 0;
 }
 
+// Injected-context tag blocks that memory/context plugins prepend to the
+// model-facing body via before_prompt_build. On decorated channels they sit
+// between the metadata prelude and the user body on the RUNTIME face only;
+// persisted rows never carry them (plugins inject at prompt-build, strictly
+// after the bare row is persisted), so reducing them off the runtime side is
+// what lets the same-turn collapse see through a memory-bearing decorated
+// copy. Only a COMPLETE <tag>...</tag> block for these exact names is
+// stripped; an unclosed or unknown tag stays in the body and blocks the match
+// (fail-closed).
+// Exported as the single source of truth for injected-context TAG names:
+// live-coverage.ts derives its marker-recognition list from this same const,
+// so the reduction here and the recognition gate there can never disagree on
+// which tags count as injected plugin context.
+export const OPENCLAW_INJECTED_CONTEXT_TAG_NAMES = [
+  "relevant-memories",
+  "relevant_memories",
+  "hindsight_memories",
+  "inherited-rules",
+  "derived-focus",
+  "error-detected",
+  "active_memory_plugin",
+] as const;
+
+function stripLeadingInjectedContextTagBlocks(content: string): string {
+  let remaining = content;
+  while (true) {
+    const candidate = remaining.trimStart();
+    const name = OPENCLAW_INJECTED_CONTEXT_TAG_NAMES.find((tag) =>
+      candidate.startsWith(`<${tag}>`),
+    );
+    if (name === undefined) {
+      return remaining;
+    }
+    const closeTag = `</${name}>`;
+    const closeIndex = candidate.indexOf(closeTag);
+    if (closeIndex < 0) {
+      return remaining;
+    }
+    remaining = candidate.slice(closeIndex + closeTag.length);
+  }
+}
+
 function splitLeadingOpenClawInboundContextBlocks(content: string): {
   blocksText: string;
   remaining: string;
@@ -539,8 +725,7 @@ function matchLeadingOpenClawInboundHistoryRecap(candidate: string): number {
   if (jsonMatch) {
     return isValidOpenClawInboundHistoryRecapPayload(jsonMatch[1] ?? "") ? jsonMatch[0].length : 0;
   }
-  const lineMatch = OPENCLAW_INBOUND_HISTORY_RECAP_LINE_BLOCK_RE.exec(candidate);
-  return lineMatch ? lineMatch[0].length : 0;
+  return matchLeadingOpenClawInboundHistoryRecapLineBlock(candidate);
 }
 
 function canonicalizeMetadataJson(

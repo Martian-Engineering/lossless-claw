@@ -7,7 +7,11 @@ import { contentFromParts } from "./assembler.js";
 import { buildMessageParts, toStoredMessage, toSyntheticMessagePartRecord } from "./message-content.js";
 import { createLiveCoverageSignature, hashAgentMessageForAssemblyProtection, messagesHaveSameLiveCoverageSignature } from "./message-signatures.js";
 import type { AgentMessage } from "./openclaw-bridge.js";
-import { stripLeadingOpenClawInboundTimestamp } from "./openclaw-inbound-metadata.js";
+import {
+  OPENCLAW_INJECTED_CONTEXT_TAG_NAMES,
+  openClawInboundDecoratedBodiesMatch,
+  stripLeadingOpenClawInboundTimestamp,
+} from "./openclaw-inbound-metadata.js";
 import { estimateAgentMessageTokens } from "./token-accounting.js";
 import { buildToolPairIndexesByAssembledIndex, expandProtectedToolPairIndexes, expandToolPairLiveSortIndexes } from "./tool-pairing.js";
 import { sanitizeToolUseResultPairing } from "./transcript-repair.js";
@@ -610,13 +614,7 @@ export function liveContentIsRecognizedDecoratedBareBody(params: {
  * assembledRowIsStructuralBareCurrentTurn).
  */
 const INJECTED_CONTEXT_MARKERS = [
-  "<relevant-memories>",
-  "<relevant_memories>",
-  "<hindsight_memories>",
-  "<inherited-rules>",
-  "<derived-focus>",
-  "<error-detected>",
-  "<active_memory_plugin>",
+  ...OPENCLAW_INJECTED_CONTEXT_TAG_NAMES.map((tag) => `<${tag}>` as const),
   INTERNAL_CONTEXT_BEGIN_MARKER,
 ] as const;
 
@@ -626,15 +624,11 @@ function liveContentCarriesRecognizedInjectedContextMarker(liveContent: string):
 
 /**
  * Recognize whether an assembled user row is a BARE copy of the live current
- * turn (its persisted face): it must be a line-aligned trailing segment of the
- * live content, strictly shorter than it, AND the live content must carry
- * recognized decoration evidence -- EITHER a channel timestamp (see
- * liveContentIsRecognizedDecoratedBareBody) OR a recognized injected-context
- * marker (memory-first turns are not always channel-timestamped). The
- * strictly-shorter guard distinguishes a bare/timestamped body row from the
- * decorated live copy itself (equal length, never collapsed); the decoration
- * gate prevents collapsing an unrelated turn that merely ends with the same
- * trailing line.
+ * turn (its persisted face). A marker-bearing current row may either be a
+ * line-aligned trailing body or a metadata-decorated face that reduces to the
+ * exact same body. Timestamp decoration uses the existing structural matcher.
+ * Every recognized row must be strictly shorter than the live copy, which
+ * distinguishes it from that copy itself.
  *
  * Marker presence is not treated as proof of provenance. Some recognized
  * plugin tags are ordinary user-typeable text and are stripped from stored
@@ -662,10 +656,11 @@ function assembledRowIsStructuralBareCurrentTurn(params: {
   if (
     params.assembledIsLastUserRow &&
     liveContentCarriesRecognizedInjectedContextMarker(params.liveContent) &&
-    liveContentContainsBareBody({
+    (liveContentContainsBareBody({
       liveContent: params.liveContent,
       bareContent: params.assembledContent,
-    })
+    }) ||
+      openClawInboundDecoratedBodiesMatch(params.liveContent, params.assembledContent))
   ) {
     return true;
   }

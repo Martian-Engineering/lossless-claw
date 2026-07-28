@@ -3,16 +3,16 @@
 // decorated face of the same turn as its bare persisted row: the runtime side
 // reduces to the same full model-facing body as the bare side once a
 // structurally validated leading block and a leading channel timestamp are
-// stripped. openClawInboundBodiesMatch is the shared directional reduction the
-// after-turn batch matcher uses to collapse that pair; it is byte-equality of
-// the FULL stripped bodies (not containment), so a forged frame concealing a
-// different body, or a distinct turn whose trailing line merely matches, stays
-// fail-closed.
+// stripped. openClawInboundBodiesMatch is the conservative directional
+// reduction; the injected-context relaxation is separate and used only where
+// another frontier anchor proves alignment. Both compare the FULL reduced
+// bodies (not containment).
 import { describe, expect, it } from "vitest";
 import {
   canonicalizeOpenClawInboundMetadataIdentityContent,
   extractBodyAfterOpenClawInboundMetadataBlock,
   openClawInboundBodiesMatch,
+  openClawInboundBodiesMatchWithInjectedContext,
 } from "../src/openclaw-inbound-metadata.js";
 import { buildMessageIdentityHash } from "../src/store/message-identity.js";
 
@@ -583,5 +583,155 @@ describe("canonicalizeOpenClawInboundMetadataIdentityContent / buildMessageIdent
     expect(
       canonicalizeOpenClawInboundMetadataIdentityContent("user", withMalformedRecap),
     ).not.toBe(canonicalizeOpenClawInboundMetadataIdentityContent("user", withoutRecap));
+  });
+});
+
+describe("openClawInboundBodiesMatch with plugin-injected context blocks between metadata and body", () => {
+  // Memory plugins prepend their blocks to the model-facing body via
+  // before_prompt_build, so on decorated channels the runtime face is
+  // metadata prelude + injected tag blocks + body, while the persisted bare
+  // row carries only the body (injection happens at prompt-build, after
+  // persist). The reduction must strip validated, COMPLETE leading blocks
+  // for the known tag names only.
+  const INJECTED_BLOCKS =
+    "<derived-focus>\n[UNTRUSTED DATA]\nfocus text\n[END UNTRUSTED DATA]\n</derived-focus>\n" +
+    "<inherited-rules>\nrule text\n</inherited-rules>\n" +
+    "<relevant-memories>\nmemory text\n</relevant-memories>";
+
+  it("matches when injected blocks sit between the metadata block and the body", () => {
+    expect(
+      openClawInboundBodiesMatchWithInjectedContext(
+        metadataWrapped(INJECTED_BLOCKS + "\n\nmorning check: did the deploy pipeline finish?"),
+        "morning check: did the deploy pipeline finish?",
+      ),
+    ).toBe(true);
+  });
+
+  it("preserves a user-authored known tag when the persisted row carries the same body", () => {
+    const body = "<derived-focus>\nuser-authored note\n</derived-focus>\n\nok";
+    expect(openClawInboundBodiesMatch(metadataWrapped(body), body)).toBe(true);
+  });
+
+  it("does NOT collapse a user-authored known tag onto a shorter bare body", () => {
+    const body = "<derived-focus>\nuser-authored note\n</derived-focus>\n\nok";
+    expect(openClawInboundBodiesMatch(metadataWrapped(body), "ok")).toBe(false);
+  });
+
+  it("matches the full channel shape: timestamp + metadata + injected blocks + multi-line body", () => {
+    expect(
+      openClawInboundBodiesMatchWithInjectedContext(
+        channelTimestamped(metadataWrapped(INJECTED_BLOCKS + "\n\nline one\nline two")),
+        "line one\nline two",
+      ),
+    ).toBe(true);
+  });
+
+  it("matches with injected blocks AFTER the recap on a history-bearing turn", () => {
+    expect(
+      openClawInboundBodiesMatchWithInjectedContext(
+        metadataWrappedWithRecap(TWO_ENTRY_RECAP, INJECTED_BLOCKS + "\n\nok"),
+        "ok",
+      ),
+    ).toBe(true);
+  });
+
+  it("matches with injected blocks BEFORE the recap too", () => {
+    expect(
+      openClawInboundBodiesMatchWithInjectedContext(
+        metadataWrappedWithHistory(INJECTED_BLOCKS + "\n\n" + TWO_ENTRY_RECAP + "\n\nok"),
+        "ok",
+      ),
+    ).toBe(true);
+  });
+
+  it("does NOT strip an unclosed injected-context tag (fail-closed)", () => {
+    expect(
+      openClawInboundBodiesMatchWithInjectedContext(
+        metadataWrapped("<relevant-memories>\nunclosed\n\nok"),
+        "ok",
+      ),
+    ).toBe(false);
+  });
+
+  it("does NOT strip an unknown tag name (fail-closed)", () => {
+    expect(
+      openClawInboundBodiesMatchWithInjectedContext(
+        metadataWrapped("<totally-novel-block>\nx\n</totally-novel-block>\n\nok"),
+        "ok",
+      ),
+    ).toBe(false);
+  });
+
+  it("does NOT match when injected blocks conceal a DIFFERENT body", () => {
+    expect(
+      openClawInboundBodiesMatchWithInjectedContext(
+        metadataWrapped(INJECTED_BLOCKS + "\n\nsomething else entirely"),
+        "ok",
+      ),
+    ).toBe(false);
+  });
+
+  it("keeps injected-tag text embedded MID-body untouched (only leading blocks strip)", () => {
+    expect(
+      openClawInboundBodiesMatchWithInjectedContext(
+        metadataWrapped("I saw <relevant-memories>\nquoted\n</relevant-memories> in a log\nok"),
+        "ok",
+      ),
+    ).toBe(false);
+  });
+
+  it("boundary pin: memory blocks BEFORE the metadata prelude leave extraction null (shape not reduced)", () => {
+    // The reduction requires the metadata block first; a face with injected
+    // blocks ahead of the prelude is not a recognized decorated shape. Not an
+    // observed channel emission; pinned so the boundary is deliberate.
+    const memoryFirst =
+      "<relevant-memories>\nmemory text\n</relevant-memories>\n\n" + metadataWrapped("ok");
+    expect(extractBodyAfterOpenClawInboundMetadataBlock(memoryFirst)).toBeNull();
+    expect(openClawInboundBodiesMatchWithInjectedContext(memoryFirst, "ok")).toBe(false);
+  });
+});
+
+// Injected-block stripping lives only in the anchored body-match relaxation.
+// Identity canonicalization keeps those blocks verbatim, which is prior
+// behavior rather than an oversight. If identity began stripping, two live
+// faces carrying different injected content would collide on one hash. Rows
+// already written at the current identity version have no repair path, so the
+// asymmetry is pinned here rather than "aligned" later by accident.
+describe("injected-context stripping is a body-match relaxation, never an identity change", () => {
+  const bare = "what's the status on the deploy?";
+  const injected = [
+    "<relevant-memories>",
+    "- the deploy queue drains at midnight",
+    "</relevant-memories>",
+  ].join("\n");
+  const decorated = metadataWrapped(`${injected}\n\n${bare}`);
+
+  it("body-match sees through a leading injected block", () => {
+    expect(openClawInboundBodiesMatchWithInjectedContext(decorated, bare)).toBe(true);
+  });
+
+  it("identity canonicalization keeps the injected block verbatim", () => {
+    const canonicalDecorated = canonicalizeOpenClawInboundMetadataIdentityContent("user", decorated);
+    expect(canonicalDecorated).toContain("relevant-memories");
+    expect(canonicalDecorated).not.toBe(
+      canonicalizeOpenClawInboundMetadataIdentityContent("user", metadataWrapped(bare)),
+    );
+  });
+
+  it("so a decorated turn and its bare row hash differently, by design", () => {
+    expect(buildMessageIdentityHash("user", decorated)).not.toBe(
+      buildMessageIdentityHash("user", metadataWrapped(bare)),
+    );
+  });
+
+  it("and two different injected payloads on the same body stay distinct in identity", () => {
+    const otherInjected = [
+      "<relevant-memories>",
+      "- the deploy queue drains at noon",
+      "</relevant-memories>",
+    ].join("\n");
+    expect(buildMessageIdentityHash("user", decorated)).not.toBe(
+      buildMessageIdentityHash("user", metadataWrapped(`${otherInjected}\n\n${bare}`)),
+    );
   });
 });
