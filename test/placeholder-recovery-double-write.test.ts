@@ -253,7 +253,13 @@ describe("placeholder-checkpoint recovery double-write", () => {
     expect(userRows.map((message) => message.content)).toEqual([differentDecoratedBody, "ok"]);
   });
 
-  it("does not adopt when multiple decorated rows reduce to the same bare body", async () => {
+  it("adopts the oldest unstamped row when multiple decorated rows reduce to the same bare body", async () => {
+    // Same-body multiplicity is not ambiguity: every candidate reduces to the
+    // exact bare body, so any of them is a correct provenance carrier for the
+    // entry. The earlier fail-closed refusal made the bare transcript copy
+    // import as an extra persisted row — a duplicate replayed on every later
+    // turn, which is the worse failure for a store whose contract is
+    // no-duplicates. Adoption now anchors the oldest unstamped match.
     const engine = createEngineWithDeps(
       {},
       { log: { info: vi.fn(), warn: vi.fn(), error: vi.fn(), debug: vi.fn() } },
@@ -304,8 +310,91 @@ describe("placeholder-checkpoint recovery double-write", () => {
     expect(userRows.map((message) => message.content)).toEqual([
       decoratedRoomEvent("ok"),
       decoratedRoomEvent("ok"),
-      "ok",
     ]);
+    // The stamp landed on the OLDEST match (deterministic), leaving exactly
+    // the newer row in the unstamped pool.
+    const unstamped = await engine
+      .getConversationStore()
+      .listRecentUnstampedMessagesByRole(conversation!.conversationId, "user", 8);
+    expect(unstamped).toHaveLength(1);
+    expect(unstamped[0].messageId).toBe(userRows[1].messageId);
+  });
+
+  it("adopts every repeated same-body turn without importing bare duplicates on recovery", async () => {
+    // A user sends the same short reply twice; both turns are persisted
+    // decorated+unstamped by the live ingest, then a restart-class recovery
+    // replays the transcript holding BOTH bare entries. Each adoption removes
+    // its row from the next call's unstamped candidate set, so oldest-first
+    // adoption converges one stamp per transcript entry.
+    const engine = createEngineWithDeps(
+      {},
+      { log: { info: vi.fn(), warn: vi.fn(), error: vi.fn(), debug: vi.fn() } },
+    );
+    const sessionId = "repeated-identical-turns";
+    const sessionKey = "agent:agent-one:telegram:repeated-identical-turns";
+
+    await engine.ingest({
+      sessionId,
+      sessionKey,
+      message: makeMessage({ role: "user", content: decoratedRoomEvent("ok") }),
+    });
+    await engine.ingest({
+      sessionId,
+      sessionKey,
+      message: makeMessage({ role: "user", content: decoratedRoomEvent("ok") }),
+    });
+    const conversation = await engine
+      .getConversationStore()
+      .getConversationForSession({ sessionId, sessionKey });
+    expect(conversation).not.toBeNull();
+
+    const sessionFile = createSessionFilePath("repeated-identical-turns");
+    const sessionManager = SessionManager.open(sessionFile);
+    appendSessionMessage(sessionManager, makeMessage({ role: "user", content: "ok" }));
+    appendSessionMessage(sessionManager, makeMessage({ role: "assistant", content: "first reply" }));
+    appendSessionMessage(sessionManager, makeMessage({ role: "user", content: "ok" }));
+    appendSessionMessage(
+      sessionManager,
+      makeMessage({ role: "assistant", content: "second reply" }),
+    );
+    await engine.getSummaryStore().upsertConversationBootstrapState({
+      conversationId: conversation!.conversationId,
+      sessionFilePath: sessionFile,
+      lastSeenSize: 0,
+      lastSeenMtimeMs: 0,
+      lastProcessedOffset: 0,
+      lastProcessedEntryHash: null,
+    });
+
+    await engine.afterTurn({
+      sessionId,
+      sessionKey,
+      sessionFile,
+      messages: [],
+      prePromptMessageCount: 0,
+      tokenBudget: 4_096,
+    });
+
+    const stored = await engine
+      .getConversationStore()
+      .getMessages(conversation!.conversationId);
+    // Both turns keep exactly their decorated rows — no bare "ok" imports.
+    const userRows = stored.filter((message) => message.role === "user");
+    expect(userRows.map((message) => message.content)).toEqual([
+      decoratedRoomEvent("ok"),
+      decoratedRoomEvent("ok"),
+    ]);
+    // Every repeated turn took a stamp: the unstamped pool drained fully.
+    const unstamped = await engine
+      .getConversationStore()
+      .listRecentUnstampedMessagesByRole(conversation!.conversationId, "user", 8);
+    expect(unstamped).toHaveLength(0);
+    // The genuinely-new assistant replies still import (no over-suppression).
+    expect(
+      stored
+        .filter((message) => message.role === "assistant")
+        .map((message) => message.content),
+    ).toEqual(["first reply", "second reply"]);
   });
 
   it("does not apply inbound-decoration adoption to assistant rows", async () => {
