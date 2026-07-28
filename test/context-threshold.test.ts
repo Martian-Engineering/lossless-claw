@@ -406,6 +406,44 @@ describe("reconcilePersistedContextThreshold", () => {
     expect(result.supersededStalePersisted).toBe(true);
   });
 
+  it("supersedes a persisted override when a known live override selects a conflicting payload", () => {
+    const resolver = new ContextThresholdResolver(0.75, [
+      {
+        match: { modelContextWindowMax: 250_000 },
+        contextThreshold: 0.1,
+        freshTailCount: 16,
+      },
+      {
+        match: { model: "openai/gpt-5.5" },
+        contextThreshold: 0.2,
+        freshTailCount: 8,
+      },
+    ]);
+    const runtime = { model: "openai/gpt-5.5" };
+    const persisted = {
+      contextThreshold: 0.1,
+      source: "override" as const,
+      reason: "persisted deferred threshold debt",
+      specificity: 0,
+      freshTailCount: 16,
+    };
+    const liveOverride = resolver.resolve({ runtime });
+
+    expect(resolver.couldAnyRuleProduce({ runtime, persisted })).toBe(true);
+    expect(liveOverride).toMatchObject({
+      contextThreshold: 0.2,
+      source: "override",
+      freshTailCount: 8,
+    });
+    const result = reconcilePersistedContextThreshold({
+      persisted,
+      live: liveOverride,
+      anyRuleCouldProducePersisted: resolver.couldAnyRuleProduce({ runtime, persisted }),
+    });
+    expect(result.resolved).toBe(liveOverride);
+    expect(result.supersededStalePersisted).toBe(true);
+  });
+
   it("supersedes a persisted global that diverges from the configured global", () => {
     const persisted = {
       contextThreshold: 0.02,

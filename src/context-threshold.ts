@@ -186,6 +186,34 @@ function rulePayloadProduces(
   return true;
 }
 
+function resolvedPayloadMatchesPersisted(
+  resolved: Pick<
+    ResolvedContextThreshold,
+    "contextThreshold" | "freshTailCount" | "leafChunkTokens"
+  >,
+  persisted: Pick<
+    ResolvedContextThreshold,
+    "contextThreshold" | "freshTailCount" | "leafChunkTokens"
+  >,
+): boolean {
+  if (resolved.contextThreshold !== persisted.contextThreshold) {
+    return false;
+  }
+  if (
+    persisted.freshTailCount !== undefined &&
+    resolved.freshTailCount !== persisted.freshTailCount
+  ) {
+    return false;
+  }
+  if (
+    persisted.leafChunkTokens !== undefined &&
+    resolved.leafChunkTokens !== persisted.leafChunkTokens
+  ) {
+    return false;
+  }
+  return true;
+}
+
 // Summarize which matchers selected the winning rule for log lines.
 function describeRuleMatch(
   rule: ContextThresholdOverride,
@@ -266,7 +294,10 @@ export function reconcilePersistedContextThreshold(params: {
     return { resolved: live, supersededStalePersisted: false };
   }
   if (persisted.source === "override") {
-    if (params.anyRuleCouldProducePersisted) {
+    if (
+      params.anyRuleCouldProducePersisted &&
+      (live.source !== "override" || resolvedPayloadMatchesPersisted(live, persisted))
+    ) {
       return { resolved: persisted, supersededStalePersisted: false };
     }
     return { resolved: live, supersededStalePersisted: true };
