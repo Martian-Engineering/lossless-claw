@@ -1219,10 +1219,15 @@ export class TranscriptReconciler {
    * Stamp a brand-new transcript entry id onto a recently-persisted,
    * still-unstamped user runtime row that is the DECORATED face of the same
    * turn (its recognized metadata wrapper reduces to the exact bare
-   * model-facing body). When that body matches exactly one candidate, keeps the
-   * decorated row and anchors it instead of importing the bare transcript copy
-   * as a duplicate. Bounded to the flush-lag tail window and fails closed on
-   * ambiguous repeated bodies so legacy or unrelated rows are never mis-adopted.
+   * model-facing body). Keeps the decorated row and anchors it instead of
+   * importing the bare transcript copy as a duplicate. Bounded to the
+   * flush-lag tail window; rows whose reduced body differs are never
+   * mis-adopted. When several candidates reduce to the same body, the oldest
+   * takes the stamp: byte-identical reduced bodies are interchangeable
+   * provenance carriers, and each restamp removes its row from the next
+   * call's unstamped candidate set, so repeated identical turns converge one
+   * adoption per transcript entry instead of importing the bare body as a
+   * persisted duplicate that would replay on every later turn.
    */
   private async adoptDecorationInvariantEntryId(params: {
     conversationId: number;
@@ -1237,7 +1242,7 @@ export class TranscriptReconciler {
     const matches = candidates.filter((candidate) =>
       openClawInboundBodiesMatch(candidate.content, params.bareContent),
     );
-    if (matches.length !== 1) {
+    if (matches.length === 0) {
       return false;
     }
     return this.host.conversationStore.restampTranscriptEntryId(
