@@ -107,6 +107,113 @@ function ruleMatches(params: {
   return true;
 }
 
+// Like ruleMatches, but a matcher whose runtime metadata is absent counts as
+// potentially satisfiable instead of failed. Backs the staleness check on
+// persisted deferred-maintenance thresholds: a background drain often lacks
+// model metadata, so "no rule could match even as a wildcard" is the only
+// safe proof that a persisted override no longer originates from live config.
+function rulePossiblyMatches(params: {
+  compiled: CompiledOverrideRule;
+  sessionKey?: string;
+  runtime: RuntimeModelContext;
+}): boolean {
+  const { rule, sessionPattern } = params.compiled;
+  const runtime = params.runtime;
+
+  if (rule.match.model) {
+    const normalizedRuleModel = rule.match.model.trim();
+    const candidates = [runtime.modelRef, runtime.model].filter(
+      (candidate): candidate is string => typeof candidate === "string" && candidate.length > 0,
+    );
+    if (candidates.length > 0 && !candidates.includes(normalizedRuleModel)) {
+      return false;
+    }
+  }
+
+  if (sessionPattern) {
+    const sessionKey = params.sessionKey?.trim();
+    if (sessionKey && !sessionPattern.test(sessionKey)) {
+      return false;
+    }
+  }
+
+  if (runtime.modelContextWindow !== undefined) {
+    if (
+      rule.match.modelContextWindowMin !== undefined &&
+      runtime.modelContextWindow < rule.match.modelContextWindowMin
+    ) {
+      return false;
+    }
+    if (
+      rule.match.modelContextWindowMax !== undefined &&
+      runtime.modelContextWindow > rule.match.modelContextWindowMax
+    ) {
+      return false;
+    }
+  }
+
+  return true;
+}
+
+// Whether a rule's configured payload could have produced the persisted
+// resolution. The threshold must match exactly; the sizing fields must match
+// wherever the row recorded them. A row without a recorded sizing field
+// predates those columns (legacy schema), so an absent value means
+// "not recorded", never "recorded as absent" — it cannot count against the
+// rule, and the engine's runtime fill-in covers it on the kept path.
+function rulePayloadProduces(
+  rule: ContextThresholdOverride,
+  persisted: Pick<
+    ResolvedContextThreshold,
+    "contextThreshold" | "freshTailCount" | "leafChunkTokens"
+  >,
+): boolean {
+  if (rule.contextThreshold !== persisted.contextThreshold) {
+    return false;
+  }
+  if (
+    persisted.freshTailCount !== undefined &&
+    rule.freshTailCount !== persisted.freshTailCount
+  ) {
+    return false;
+  }
+  if (
+    persisted.leafChunkTokens !== undefined &&
+    rule.leafChunkTokens !== persisted.leafChunkTokens
+  ) {
+    return false;
+  }
+  return true;
+}
+
+function resolvedPayloadMatchesPersisted(
+  resolved: Pick<
+    ResolvedContextThreshold,
+    "contextThreshold" | "freshTailCount" | "leafChunkTokens"
+  >,
+  persisted: Pick<
+    ResolvedContextThreshold,
+    "contextThreshold" | "freshTailCount" | "leafChunkTokens"
+  >,
+): boolean {
+  if (resolved.contextThreshold !== persisted.contextThreshold) {
+    return false;
+  }
+  if (
+    persisted.freshTailCount !== undefined &&
+    resolved.freshTailCount !== persisted.freshTailCount
+  ) {
+    return false;
+  }
+  if (
+    persisted.leafChunkTokens !== undefined &&
+    resolved.leafChunkTokens !== persisted.leafChunkTokens
+  ) {
+    return false;
+  }
+  return true;
+}
+
 // Summarize which matchers selected the winning rule for log lines.
 function describeRuleMatch(
   rule: ContextThresholdOverride,
@@ -164,6 +271,45 @@ export function persistedContextThresholdOverride(maintenance: {
       ? { leafChunkTokens: Math.floor(maintenance.contextLeafChunkTokens) }
       : {}),
   };
+}
+
+/**
+ * Decide which threshold a deferred-maintenance drain should honour: the one
+ * persisted with the debt row, or a fresh resolution against live config.
+ * The persisted value protects drains that lack the runtime metadata which
+ * originally selected an override; it stays authoritative only while live
+ * config could still plausibly produce it. A persisted override with no
+ * plausibly-matching rule that could produce its payload, and a persisted
+ * global that diverges from the configured global, are provably stale (the
+ * config changed after the row was written) and are superseded so a dead
+ * experiment value cannot wedge compaction forever.
+ */
+export function reconcilePersistedContextThreshold(params: {
+  persisted: ResolvedContextThreshold | undefined;
+  live: ResolvedContextThreshold;
+  anyRuleCouldProducePersisted: boolean;
+}): { resolved: ResolvedContextThreshold; supersededStalePersisted: boolean } {
+  const { persisted, live } = params;
+  if (!persisted) {
+    return { resolved: live, supersededStalePersisted: false };
+  }
+  if (persisted.source === "override") {
+    if (
+      params.anyRuleCouldProducePersisted &&
+      (live.source !== "override" || resolvedPayloadMatchesPersisted(live, persisted))
+    ) {
+      return { resolved: persisted, supersededStalePersisted: false };
+    }
+    return { resolved: live, supersededStalePersisted: true };
+  }
+  // Persisted globals are validated by scalar equality only, unlike
+  // overrides, which prove rule-plus-payload producibility above: the
+  // configured global is a single threshold today. If global-level sizing
+  // ever becomes configurable, this check must grow a payload comparison.
+  if (live.source === "override" || live.contextThreshold !== persisted.contextThreshold) {
+    return { resolved: live, supersededStalePersisted: true };
+  }
+  return { resolved: persisted, supersededStalePersisted: false };
 }
 
 /** Format the resolved-threshold fields shared by all selection log lines. */
@@ -249,5 +395,29 @@ export class ContextThresholdResolver {
         ? { leafChunkTokens: best.rule.leafChunkTokens }
         : {}),
     };
+  }
+
+  /**
+   * Whether any configured rule could have produced the persisted resolution:
+   * the rule must both plausibly match this context (matchers whose runtime
+   * metadata is absent count as satisfiable) and carry a payload that yields
+   * the persisted threshold and recorded sizing. A rule that merely might
+   * match is not enough — an unrelated surviving override must not keep a
+   * removed rule's stale value alive. Backs the stale check in
+   * {@link reconcilePersistedContextThreshold}.
+   */
+  couldAnyRuleProduce(params: {
+    sessionKey?: string;
+    runtime: RuntimeModelContext;
+    persisted: Pick<
+      ResolvedContextThreshold,
+      "contextThreshold" | "freshTailCount" | "leafChunkTokens"
+    >;
+  }): boolean {
+    return this.rules.some(
+      (compiled) =>
+        rulePossiblyMatches({ compiled, sessionKey: params.sessionKey, runtime: params.runtime }) &&
+        rulePayloadProduces(compiled.rule, params.persisted),
+    );
   }
 }

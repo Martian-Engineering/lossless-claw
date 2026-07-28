@@ -205,6 +205,248 @@ describe("LcmContextEngine maintain and assemble budget", () => {
     expect(maintenanceResult.changed).toBe(true);
   });
 
+  it("maintain() supersedes a stale persisted override threshold when no live rule could match", async () => {
+    // Debt recorded while a since-removed low-threshold override experiment
+    // was active; live config has no override rules left, so the persisted
+    // 0.02 provably no longer originates from config and must not be honoured.
+    const engine = createEngineWithConfig({
+      contextThreshold: 0.75,
+    });
+    const sessionId = "maintain-deferred-stale-persisted-override";
+    const conversation = await engine.getConversationStore().getOrCreateConversation(sessionId, {
+      sessionKey: undefined,
+    });
+    await engine.getCompactionMaintenanceStore().requestProactiveCompactionDebt({
+      conversationId: conversation.conversationId,
+      reason: "threshold",
+      tokenBudget: 500_000,
+      currentTokenCount: 80_000,
+      contextThreshold: 0.02,
+      contextThresholdSource: "override",
+      contextFreshTailCount: 16,
+      contextLeafChunkTokens: 12000,
+    });
+    const privateEngine = engine as unknown as {
+      executeCompactionCore: (params: unknown) => Promise<unknown>;
+    };
+    const executeCompactionCoreSpy = vi.spyOn(
+      privateEngine,
+      "executeCompactionCore",
+    ).mockResolvedValue({
+      ok: true,
+      compacted: true,
+      reason: "compacted",
+    });
+
+    await engine.maintain({
+      sessionId,
+      sessionFile: createSessionFilePath("maintain-deferred-stale-persisted-override-maintain"),
+      runtimeContext: {
+        allowDeferredCompactionExecution: true,
+        tokenBudget: 500_000,
+        currentTokenCount: 80_000,
+      },
+    });
+
+    expect(executeCompactionCoreSpy).toHaveBeenCalledWith(
+      expect.objectContaining({
+        contextThresholdOverride: expect.objectContaining({
+          contextThreshold: 0.75,
+          source: "global",
+        }),
+      }),
+    );
+  });
+
+  it("maintain() keeps a producible persisted override and fills unrecorded sizing from live config", async () => {
+    // Legacy debt row: only the 0.1 override threshold was recorded (the row
+    // predates the sizing columns). The producing rule is still configured,
+    // so the persisted value is kept and the drain fills the unrecorded
+    // sizing from the live resolution. The persisted reason string proves the
+    // kept object is the persisted one, not a fresh live resolution.
+    const engine = createEngineWithConfig({
+      contextThreshold: 0.75,
+      contextThresholdOverrides: [
+        {
+          match: { modelContextWindowMax: 250_000 },
+          contextThreshold: 0.1,
+          freshTailCount: 16,
+          leafChunkTokens: 12000,
+        },
+      ],
+    });
+    const sessionId = "maintain-deferred-kept-persisted-fills-sizing";
+    const conversation = await engine.getConversationStore().getOrCreateConversation(sessionId, {
+      sessionKey: undefined,
+    });
+    await engine.getCompactionMaintenanceStore().requestProactiveCompactionDebt({
+      conversationId: conversation.conversationId,
+      reason: "threshold",
+      tokenBudget: 500_000,
+      currentTokenCount: 80_000,
+      contextThreshold: 0.1,
+      contextThresholdSource: "override",
+    });
+    const privateEngine = engine as unknown as {
+      executeCompactionCore: (params: unknown) => Promise<unknown>;
+    };
+    const executeCompactionCoreSpy = vi.spyOn(
+      privateEngine,
+      "executeCompactionCore",
+    ).mockResolvedValue({
+      ok: true,
+      compacted: true,
+      reason: "compacted",
+    });
+
+    await engine.maintain({
+      sessionId,
+      sessionFile: createSessionFilePath("maintain-deferred-kept-persisted-fills-sizing-maintain"),
+      runtimeContext: {
+        allowDeferredCompactionExecution: true,
+        tokenBudget: 500_000,
+        currentTokenCount: 80_000,
+        modelContextWindow: 200_000,
+      },
+    });
+
+    expect(executeCompactionCoreSpy).toHaveBeenCalledWith(
+      expect.objectContaining({
+        contextThresholdOverride: expect.objectContaining({
+          contextThreshold: 0.1,
+          source: "override",
+          reason: "persisted deferred threshold debt",
+          freshTailCount: 16,
+          leafChunkTokens: 12000,
+        }),
+      }),
+    );
+  });
+
+  it("maintain() supersedes a persisted override threshold no remaining rule could produce", async () => {
+    // Debt recorded by a since-removed 0.02 override experiment. An unrelated
+    // override rule is still configured and plausibly matches a metadata-less
+    // drain, but it produces a different threshold: rule presence alone must
+    // not keep the stale 0.02 alive when no current rule can produce it.
+    const log = { info: vi.fn(), warn: vi.fn(), error: vi.fn(), debug: vi.fn() };
+    const engine = createEngineWithDeps(
+      {
+        contextThreshold: 0.75,
+        contextThresholdOverrides: [
+          {
+            match: { modelContextWindowMax: 250_000 },
+            contextThreshold: 0.4,
+          },
+        ],
+      },
+      { log },
+    );
+    const sessionId = "maintain-deferred-stale-persisted-unrelated-rule";
+    const conversation = await engine.getConversationStore().getOrCreateConversation(sessionId, {
+      sessionKey: undefined,
+    });
+    await engine.getCompactionMaintenanceStore().requestProactiveCompactionDebt({
+      conversationId: conversation.conversationId,
+      reason: "threshold",
+      tokenBudget: 500_000,
+      currentTokenCount: 80_000,
+      contextThreshold: 0.02,
+      contextThresholdSource: "override",
+      contextFreshTailCount: 16,
+      contextLeafChunkTokens: 12000,
+    });
+    const privateEngine = engine as unknown as {
+      executeCompactionCore: (params: unknown) => Promise<unknown>;
+    };
+    const executeCompactionCoreSpy = vi.spyOn(
+      privateEngine,
+      "executeCompactionCore",
+    ).mockResolvedValue({
+      ok: true,
+      compacted: true,
+      reason: "compacted",
+    });
+
+    await engine.maintain({
+      sessionId,
+      sessionFile: createSessionFilePath(
+        "maintain-deferred-stale-persisted-unrelated-rule-maintain",
+      ),
+      runtimeContext: {
+        allowDeferredCompactionExecution: true,
+        tokenBudget: 500_000,
+        currentTokenCount: 80_000,
+      },
+    });
+
+    expect(executeCompactionCoreSpy).toHaveBeenCalledWith(
+      expect.objectContaining({
+        contextThresholdOverride: expect.objectContaining({
+          contextThreshold: 0.75,
+          source: "global",
+        }),
+      }),
+    );
+    expect(log.info).toHaveBeenCalledWith(
+      expect.stringContaining(
+        "maintain: stale persisted context threshold superseded by live config",
+      ),
+    );
+    expect(log.info).toHaveBeenCalledWith(expect.stringContaining("persistedThreshold=0.02"));
+    expect(log.info).toHaveBeenCalledWith(expect.stringContaining("liveThreshold=0.75"));
+  });
+
+  it("maintain() supersedes a persisted global threshold that diverges from live config", async () => {
+    // The global contextThreshold was lowered for an experiment, debt was
+    // recorded at 0.02, then the config was reverted to 0.75: the drain must
+    // follow the reverted config instead of wedging on the stale row.
+    const engine = createEngineWithConfig({
+      contextThreshold: 0.75,
+    });
+    const sessionId = "maintain-deferred-stale-persisted-global";
+    const conversation = await engine.getConversationStore().getOrCreateConversation(sessionId, {
+      sessionKey: undefined,
+    });
+    await engine.getCompactionMaintenanceStore().requestProactiveCompactionDebt({
+      conversationId: conversation.conversationId,
+      reason: "threshold",
+      tokenBudget: 500_000,
+      currentTokenCount: 80_000,
+      contextThreshold: 0.02,
+      contextThresholdSource: "global",
+    });
+    const privateEngine = engine as unknown as {
+      executeCompactionCore: (params: unknown) => Promise<unknown>;
+    };
+    const executeCompactionCoreSpy = vi.spyOn(
+      privateEngine,
+      "executeCompactionCore",
+    ).mockResolvedValue({
+      ok: true,
+      compacted: true,
+      reason: "compacted",
+    });
+
+    await engine.maintain({
+      sessionId,
+      sessionFile: createSessionFilePath("maintain-deferred-stale-persisted-global-maintain"),
+      runtimeContext: {
+        allowDeferredCompactionExecution: true,
+        tokenBudget: 500_000,
+        currentTokenCount: 80_000,
+      },
+    });
+
+    expect(executeCompactionCoreSpy).toHaveBeenCalledWith(
+      expect.objectContaining({
+        contextThresholdOverride: expect.objectContaining({
+          contextThreshold: 0.75,
+          source: "global",
+        }),
+      }),
+    );
+  });
+
   it("maintain() clears stale legacy non-threshold debt when threshold no longer applies", async () => {
     const engine = createEngine();
     const sessionId = "maintain-legacy-leaf-debt-cleared";
