@@ -2321,7 +2321,9 @@ export class LcmContextEngine implements ContextEngine {
             };
           }
 
-          if (!conversation.bootstrappedAt) {
+          const firstBootstrapHasReadableProgress =
+            reconcile.importedMessages > 0 || reconcile.hasOverlap || historicalMessages.length > 0;
+          if (!conversation.bootstrappedAt && firstBootstrapHasReadableProgress) {
             await this.conversationStore.markConversationBootstrapped(conversationId);
           }
 
@@ -2334,10 +2336,14 @@ export class LcmContextEngine implements ContextEngine {
             };
           }
 
-          // The first bootstrap attempt must establish a checkpoint even when
-          // the DB frontier does not overlap the transcript. Otherwise the next
-          // afterTurn cannot resume from the current transcript offset.
-          if (reconcile.hasOverlap || (!bootstrapState && !conversation.bootstrappedAt)) {
+          // The first bootstrap attempt must establish a checkpoint after a
+          // successful transcript read, even when the DB frontier does not
+          // overlap the transcript. Otherwise the next afterTurn cannot resume
+          // from the current transcript offset.
+          if (
+            reconcile.hasOverlap ||
+            (historicalMessages.length > 0 && !bootstrapState && !conversation.bootstrappedAt)
+          ) {
             await persistBootstrapState(conversationId);
           }
 

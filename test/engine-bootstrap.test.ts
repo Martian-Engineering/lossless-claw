@@ -461,6 +461,16 @@ describe("LcmContextEngine.bootstrap", () => {
       importedMessages: 0,
       reason: "conversation already has messages",
     });
+
+    const checkpoint = await engine
+      .getSummaryStore()
+      .getConversationBootstrapState(conversation!.conversationId);
+    expect(checkpoint).toBeNull();
+
+    const rereadConversation = await engine
+      .getConversationStore()
+      .getConversationBySessionId(sessionId);
+    expect(rereadConversation?.bootstrappedAt).toBeNull();
   });
 
   it("preserves existing conversation data when the session file rotates", async () => {
