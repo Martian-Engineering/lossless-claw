@@ -223,6 +223,10 @@
       "label": "Circuit Breaker Cooldown (ms)",
       "help": "Cooldown before the summarization circuit breaker auto-resets"
     },
+    "compactionLoopMaxConsecutiveFailures": {
+      "label": "Compaction Loop Max Consecutive Failures",
+      "help": "Maximum consecutive backoff-worthy deferred-compaction failures (ENOENT, non-auth errors, etc.) before the compact loop circuit breaker force-exhausts to prevent CPU/I/O runaway. Set to 0 to disable. Uses the durable maintenance-store retryAttempts counter so the breaker survives restarts. After the cooldown period elapses the breaker auto-resets and allows one more attempt. Default: 10."
+    },
     "replayFloodThresholdExternal": {
       "label": "Replay Flood Threshold (External)",
       "help": "Max replay-like messages allowed in a single SQLite-second for third-party roles (role=user) before the anti-replay guard refuses the batch. Defaults to 3 to preserve replay defense for third-partyly-rebroadcastable input."
@@ -559,6 +563,10 @@
       "circuitBreakerCooldownMs": {
         "type": "integer",
         "minimum": 1
+      },
+      "compactionLoopMaxConsecutiveFailures": {
+        "type": "integer",
+        "minimum": 0
       },
       "replayFloodThresholdExternal": {
         "type": "integer",

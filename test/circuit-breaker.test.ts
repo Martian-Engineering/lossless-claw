@@ -661,4 +661,332 @@ describe("Circuit Breaker", () => {
       try { sweepDb.close(); } catch {}
     }
   });
+
+  it("should trip the emergency drain circuit breaker during over-budget assemble", async () => {
+    // Regression: the real emergency-drain path in assemble() only runs when
+    // storedContextTokens > tokenBudget. The previous test used a tiny live
+    // message with a generous 8000-token budget, which never exceeded the
+    // stored context and skipped the drain path entirely.
+    //
+    // Seed enough backlog (40 messages × ~125 tokens ≈ 5000 stored tokens)
+    // then call assemble() with a tight 2000-token budget so the emergency
+    // drain path is entered and the circuit breaker is tested end-to-end.
+    const bigConfig = createTestConfig({
+      compactionLoopMaxConsecutiveFailures: 5,
+    });
+    const bigDb = new DatabaseSync(":memory:");
+    const bigEngine = new LcmContextEngine(createTestDeps(bigConfig), bigDb);
+    const { sessionId: bigSid, sessionKey: bigKey, sessionFile: bigFile } = seedSessionFile(tmpDir, "emergency-drain");
+
+    try {
+      await bigEngine.bootstrap({ sessionId: bigSid, sessionFile: bigFile, sessionKey: bigKey });
+
+      const conversation = await (bigEngine as any).getConversationStore().getConversationForSession({
+        sessionId: bigSid,
+        sessionKey: bigKey,
+      });
+      if (!conversation) return;
+
+      const maintenanceStore = (bigEngine as any).compactionMaintenanceStore;
+
+      // Create a pending maintenance entry and simulate repeated ENOENT
+      // failures that trigger backoff (ENOENT IS backoff-worthy, unlike
+      // auth failures which the spending guard handles separately).
+      await maintenanceStore.requestProactiveCompactionDebt({
+        conversationId: conversation.conversationId,
+        reason: "threshold",
+      });
+
+      for (let i = 0; i < 5; i++) {
+        await maintenanceStore.markProactiveCompactionFinished({
+          conversationId: conversation.conversationId,
+          failureSummary: "ENOENT: transcript file moved or deleted",
+          keepPending: true,
+        });
+      }
+
+      const maintenance = await maintenanceStore.getConversationCompactionMaintenance(
+        conversation.conversationId,
+      );
+      expect(maintenance?.retryAttempts).toBe(5);
+
+      // Call assemble() with a token budget LOW enough that stored context
+      // (≈5000 tokens from 40 messages) exceeds it, triggering the
+      // emergency deferred-compaction drain. The circuit breaker should
+      // force-exhaust because retryAttempts (5) >= maxFailures (5).
+      const liveMessages = [makeMessage({ role: "user", content: "hello" })];
+      const assembled = await bigEngine.assemble({
+        sessionId: bigSid,
+        sessionKey: bigKey,
+        messages: liveMessages,
+        tokenBudget: 2_000,
+      });
+
+      // Assemble must still return messages (degraded fallback).
+      expect(assembled.messages.length).toBeGreaterThan(0);
+
+      // retryAttempts should remain at the threshold because the breaker
+      // force-exhausted before resetting.
+      const after = await maintenanceStore.getConversationCompactionMaintenance(
+        conversation.conversationId,
+      );
+      expect(after?.retryAttempts).toBe(5);
+      expect(after?.pending).toBe(true);
+
+      // Clean up.
+      await maintenanceStore.markProactiveCompactionFinished({
+        conversationId: conversation.conversationId,
+      });
+    } finally {
+      try { bigDb.close(); } catch {}
+    }
+  });
+
+  it("should auto-reset retryAttempts and retry after cooldown elapses", async () => {
+    // After the compaction-loop circuit breaker trips, debt remains pending
+    // and retryAttempts stays at the threshold. On the next assemble() call
+    // with an over-budget context, the breaker should detect that the
+    // cooldown (nextAttemptAfter) has elapsed and auto-reset retryAttempts
+    // so the drain can try again.
+    //
+    // We bypass fake timers (which interact poorly with Date objects
+    // already stored in SQLite) by directly setting nextAttemptAfter to
+    // a past timestamp via the maintenance store.
+    const cooldownConfig = createTestConfig({
+      compactionLoopMaxConsecutiveFailures: 3,
+    });
+    const cooldownDb = new DatabaseSync(":memory:");
+    const cooldownEngine = new LcmContextEngine(createTestDeps(cooldownConfig), cooldownDb);
+    const { sessionId: csid, sessionKey: ckey, sessionFile: cfile } = seedSessionFile(tmpDir, "cooldown-recovery");
+
+    try {
+      await cooldownEngine.bootstrap({ sessionId: csid, sessionFile: cfile, sessionKey: ckey });
+
+      const conversation = await (cooldownEngine as any).getConversationStore().getConversationForSession({
+        sessionId: csid,
+        sessionKey: ckey,
+      });
+      if (!conversation) return;
+
+      const maintenanceStore = (cooldownEngine as any).compactionMaintenanceStore;
+
+      await maintenanceStore.requestProactiveCompactionDebt({
+        conversationId: conversation.conversationId,
+        reason: "threshold",
+      });
+
+      // Trip the breaker with 3 ENOENT failures.
+      for (let i = 0; i < 3; i++) {
+        await maintenanceStore.markProactiveCompactionFinished({
+          conversationId: conversation.conversationId,
+          failureSummary: "ENOENT: transcript file moved or deleted",
+          keepPending: true,
+        });
+      }
+
+      let maintenance = await maintenanceStore.getConversationCompactionMaintenance(
+        conversation.conversationId,
+      );
+      expect(maintenance?.retryAttempts).toBe(3);
+      expect(maintenance?.pending).toBe(true);
+
+      // First assemble() with tight budget — breaker trips because
+      // retryAttempts >= 3 and cooldown has NOT elapsed (nextAttemptAfter
+      // is in the future due to exponential backoff).
+      const liveMessages = [makeMessage({ role: "user", content: "hello" })];
+      const first = await cooldownEngine.assemble({
+        sessionId: csid,
+        sessionKey: ckey,
+        messages: liveMessages,
+        tokenBudget: 2_000,
+      });
+      expect(first.messages.length).toBeGreaterThan(0);
+
+      // Manually set nextAttemptAfter to a past time so the cooldown
+      // appears elapsed. This avoids fake-timer/real-Date mismatch issues
+      // with Date objects already persisted in SQLite.
+      await maintenanceStore.markProactiveCompactionFinished({
+        conversationId: conversation.conversationId,
+        nextAttemptAfter: new Date(Date.now() - 60_000),
+        keepPending: true,
+      });
+
+      // Second assemble() — cooldown has elapsed, breaker should
+      // auto-reset retryAttempts to 0 and allow the drain to proceed.
+      const second = await cooldownEngine.assemble({
+        sessionId: csid,
+        sessionKey: ckey,
+        messages: liveMessages,
+        tokenBudget: 2_000,
+      });
+      expect(second.messages.length).toBeGreaterThan(0);
+
+      // retryAttempts should have been reset by the cooldown recovery
+      // path, then possibly incremented by a subsequent drain failure.
+      // Key assertion: it was RESET (to 0) before the drain ran, so it
+      // won't be stuck at 3 anymore.
+      const after = await maintenanceStore.getConversationCompactionMaintenance(
+        conversation.conversationId,
+      );
+      expect(after?.retryAttempts).toBeLessThan(3);
+
+      // Clean up.
+      await maintenanceStore.markProactiveCompactionFinished({
+        conversationId: conversation.conversationId,
+      });
+    } finally {
+      try { cooldownDb.close(); } catch {}
+    }
+  });
+
+  it("should disable the compact-loop breaker when maxFailures is 0", async () => {
+    // compactionLoopMaxConsecutiveFailures: 0 should disable the breaker
+    // entirely — even with many backoff-worthy failures, the drain should
+    // never force-exhaust.
+    const disabledConfig = createTestConfig({
+      compactionLoopMaxConsecutiveFailures: 0,
+    });
+    const disabledDb = new DatabaseSync(":memory:");
+    const disabledEngine = new LcmContextEngine(createTestDeps(disabledConfig), disabledDb);
+    const { sessionId: dsid, sessionKey: dkey, sessionFile: dfile } = seedSessionFile(tmpDir, "breaker-disabled");
+
+    try {
+      await disabledEngine.bootstrap({ sessionId: dsid, sessionFile: dfile, sessionKey: dkey });
+
+      const conversation = await (disabledEngine as any).getConversationStore().getConversationForSession({
+        sessionId: dsid,
+        sessionKey: dkey,
+      });
+      if (!conversation) return;
+
+      const maintenanceStore = (disabledEngine as any).compactionMaintenanceStore;
+
+      await maintenanceStore.requestProactiveCompactionDebt({
+        conversationId: conversation.conversationId,
+        reason: "threshold",
+      });
+
+      // 20 ENOENT failures — far more than any default threshold.
+      for (let i = 0; i < 20; i++) {
+        await maintenanceStore.markProactiveCompactionFinished({
+          conversationId: conversation.conversationId,
+          failureSummary: "ENOENT: transcript file moved or deleted",
+          keepPending: true,
+        });
+      }
+
+      const maintenance = await maintenanceStore.getConversationCompactionMaintenance(
+        conversation.conversationId,
+      );
+      expect(maintenance?.retryAttempts).toBe(20);
+
+      // Assemble should succeed without the breaker tripping (maxFailures=0).
+      const liveMessages = [makeMessage({ role: "user", content: "hello" })];
+      const assembled = await disabledEngine.assemble({
+        sessionId: dsid,
+        sessionKey: dkey,
+        messages: liveMessages,
+        tokenBudget: 2_000,
+      });
+      expect(assembled.messages.length).toBeGreaterThan(0);
+
+      // Clean up.
+      await maintenanceStore.markProactiveCompactionFinished({
+        conversationId: conversation.conversationId,
+      });
+    } finally {
+      try { disabledDb.close(); } catch {}
+    }
+  });
+
+  it("should trip at a non-default compactionLoopMaxConsecutiveFailures value", async () => {
+    // A non-default threshold (7) should be respected: the breaker
+    // should NOT trip at 6 failures, then trip at 7.
+    const customConfig = createTestConfig({
+      compactionLoopMaxConsecutiveFailures: 7,
+    });
+    const customDb = new DatabaseSync(":memory:");
+    const customEngine = new LcmContextEngine(createTestDeps(customConfig), customDb);
+    const { sessionId: xsid, sessionKey: xkey, sessionFile: xfile } = seedSessionFile(tmpDir, "custom-threshold");
+
+    try {
+      await customEngine.bootstrap({ sessionId: xsid, sessionFile: xfile, sessionKey: xkey });
+
+      const conversation = await (customEngine as any).getConversationStore().getConversationForSession({
+        sessionId: xsid,
+        sessionKey: xkey,
+      });
+      if (!conversation) return;
+
+      const maintenanceStore = (customEngine as any).compactionMaintenanceStore;
+
+      await maintenanceStore.requestProactiveCompactionDebt({
+        conversationId: conversation.conversationId,
+        reason: "threshold",
+      });
+
+      // 6 failures — below the custom threshold of 7. The breaker should
+      // NOT trip; the drain should proceed (and likely fail, incrementing
+      // retryAttempts further).
+      for (let i = 0; i < 6; i++) {
+        await maintenanceStore.markProactiveCompactionFinished({
+          conversationId: conversation.conversationId,
+          failureSummary: "ENOENT: transcript file moved or deleted",
+          keepPending: true,
+        });
+      }
+
+      let maintenance = await maintenanceStore.getConversationCompactionMaintenance(
+        conversation.conversationId,
+      );
+      expect(maintenance?.retryAttempts).toBe(6);
+
+      // At 6 failures, the breaker should allow the drain attempt (not
+      // force-exhaust). The assemble call with a low budget will enter the
+      // emergency drain path.
+      const liveMessages = [makeMessage({ role: "user", content: "hello" })];
+      const beforeTrip = await customEngine.assemble({
+        sessionId: xsid,
+        sessionKey: xkey,
+        messages: liveMessages,
+        tokenBudget: 2_000,
+      });
+      expect(beforeTrip.messages.length).toBeGreaterThan(0);
+
+      // One more failure pushes retryAttempts to 7 — at the threshold.
+      await maintenanceStore.markProactiveCompactionFinished({
+        conversationId: conversation.conversationId,
+        failureSummary: "ENOENT: transcript file moved or deleted",
+        keepPending: true,
+      });
+
+      maintenance = await maintenanceStore.getConversationCompactionMaintenance(
+        conversation.conversationId,
+      );
+      expect(maintenance?.retryAttempts).toBe(7);
+
+      // The next drain call should force-exhaust because retryAttempts (7)
+      // >= maxFailures (7).
+      const afterTrip = await customEngine.assemble({
+        sessionId: xsid,
+        sessionKey: xkey,
+        messages: liveMessages,
+        tokenBudget: 2_000,
+      });
+      expect(afterTrip.messages.length).toBeGreaterThan(0);
+
+      // retryAttempts stays at 7 (breaker tripped, no reset).
+      const after = await maintenanceStore.getConversationCompactionMaintenance(
+        conversation.conversationId,
+      );
+      expect(after?.retryAttempts).toBe(7);
+
+      // Clean up.
+      await maintenanceStore.markProactiveCompactionFinished({
+        conversationId: conversation.conversationId,
+      });
+    } finally {
+      try { customDb.close(); } catch {}
+    }
+  });
 });

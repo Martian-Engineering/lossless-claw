@@ -368,4 +368,22 @@ export class CompactionMaintenanceStore {
       }),
     );
   }
+
+  /**
+   * Reset retryAttempts to 0 without changing any other field.
+   *
+   * Used by the compaction-loop circuit breaker recovery path: after the
+   * breaker trips and the cooldown period elapses, the counter is reset so
+   * the deferred drain can try again on the next assemble() call.
+   */
+  async resetRetryAttempts(conversationId: number): Promise<void> {
+    const existing = await this.getConversationCompactionMaintenance(conversationId);
+    if (!existing) return;
+    await this.saveConversationCompactionMaintenance(
+      mergeMaintenanceRecord(conversationId, existing, {
+        retryAttempts: 0,
+        nextAttemptAfter: null,
+      }),
+    );
+  }
 }

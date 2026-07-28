@@ -1052,19 +1052,40 @@ export class LcmContextEngine implements ContextEngine {
           return;
         }
 
-        // Circuit breaker: if the compact loop has been spinning without
-        // progress, force-exhaust to prevent CPU/I/O runaway. Uses the
-        // durable maintenance-store retryAttempts counter (incremented by
-        // markProactiveCompactionFinished on each failure) instead of a
-        // process-local counter so the breaker survives restarts.
+        // Compaction-loop circuit breaker: when the deferred compaction
+        // drain has recorded enough consecutive backoff-worthy failures
+        // (ENOENT, non-auth provider errors, etc.), force-exhaust the
+        // compact loop to prevent CPU/I/O runaway. Uses the durable
+        // maintenance-store retryAttempts counter (incremented by
+        // markProactiveCompactionFinished on each backoff-worthy failure)
+        // so the breaker survives restarts.
+        //
+        // Recovery: once the cooldown period (nextAttemptAfter) has
+        // elapsed, the breaker auto-resets retryAttempts to 0 and allows
+        // the drain to try again. If the underlying issue persists,
+        // retryAttempts climbs back to the threshold and the breaker
+        // trips again with a fresh backoff.
         const retryAttempts = maintenance?.retryAttempts ?? 0;
         const maxFailures = this.config.compactionLoopMaxConsecutiveFailures ?? 10;
         if (maxFailures > 0 && retryAttempts >= maxFailures) {
-          this.deps.log.warn(
-            `[lcm] circuit-breaker: force-exhausting compact loop conversation=${params.conversationId} ${sessionLabel} retryAttempts=${retryAttempts} maxFailures=${maxFailures}`,
-          );
-          drainResult = { exhausted: true };
-          return;
+          const cooldownElapsed =
+            maintenance?.nextAttemptAfter == null ||
+            maintenance.nextAttemptAfter.getTime() <= Date.now();
+          if (cooldownElapsed) {
+            this.deps.log.info(
+              `[lcm] circuit-breaker: cooldown elapsed, resetting retryAttempts conversation=${params.conversationId} ${sessionLabel} retryAttempts=${retryAttempts} maxFailures=${maxFailures}`,
+            );
+            await this.compactionMaintenanceStore.resetRetryAttempts(
+              params.conversationId,
+            );
+            // Fall through to normal drain logic — retryAttempts is now 0.
+          } else {
+            this.deps.log.warn(
+              `[lcm] circuit-breaker: force-exhausting compact loop conversation=${params.conversationId} ${sessionLabel} retryAttempts=${retryAttempts} maxFailures=${maxFailures} nextAttemptAfter=${maintenance?.nextAttemptAfter?.toISOString() ?? "none"}`,
+            );
+            drainResult = { exhausted: true };
+            return;
+          }
         }
 
         const cappedTokenBudget = this.applyAssemblyBudgetCap(params.tokenBudget);
@@ -1093,9 +1114,12 @@ export class LcmContextEngine implements ContextEngine {
           force: forceAllowed,
         });
         drainResult = { exhausted: result?.exhausted === true };
-        // Maintenance-store retryAttempts handles counter reset: successful
-        // compaction calls markProactiveCompactionFinished without a failure
-        // summary, which resets retryAttempts to 0. No manual reset needed.
+        // Maintenance-store retryAttempts handles counter lifecycle:
+        // - Successful compaction calls markProactiveCompactionFinished
+        //   without a failure summary, which resets retryAttempts to 0.
+        // - Repeated backoff-worthy failures trigger the circuit breaker
+        //   above, which force-exhausts and waits for cooldown before
+        //   calling resetRetryAttempts to allow one more attempt.
       },
       {
         operationName: "assembleDeferredCompaction",

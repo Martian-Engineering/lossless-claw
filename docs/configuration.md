@@ -108,6 +108,7 @@ Most installations only need to override a handful of keys. If you want a comple
   "customInstructions": "",
   "circuitBreakerThreshold": 5,
   "circuitBreakerCooldownMs": 1800000,
+  "compactionLoopMaxConsecutiveFailures": 10,
   "replayFloodThresholdExternal": 3,
   "replayFloodThresholdInternal": 32,
   "fallbackProviders": [],
@@ -298,6 +299,7 @@ Summary calls are executed through OpenClaw's `api.runtime.llm.complete` capabil
 | `fallbackProviders` | `Array<{ provider: string; model: string }>` | `[]` | `LCM_FALLBACK_PROVIDERS` | Explicit provider/model fallback chain for compaction summarization. Format for env vars is `provider/model,provider/model`. |
 | `circuitBreakerThreshold` | `integer` | `5` | `LCM_CIRCUIT_BREAKER_THRESHOLD` | Consecutive auth failures before the summarization circuit breaker trips. |
 | `circuitBreakerCooldownMs` | `integer` | `1800000` | `LCM_CIRCUIT_BREAKER_COOLDOWN_MS` | Cooldown before the summarization circuit breaker resets automatically. |
+| `compactionLoopMaxConsecutiveFailures` | `integer` | `10` | `LCM_COMPACTION_LOOP_MAX_CONSECUTIVE_FAILURES` | Maximum consecutive backoff-worthy deferred-compaction failures before the compact loop circuit breaker force-exhausts. Set to `0` to disable. Uses the durable `retryAttempts` counter so the breaker survives restarts. After cooldown the breaker auto-resets. |
 | `stripInjectedContextTags` | `string[]` | `["active_memory_plugin", "relevant-memories", "relevant_memories", "hindsight_memories"]` | `LCM_STRIP_INJECTED_CONTEXT_TAGS` | XML tag names whose blocks are stripped from message content before compaction summarization. Memory/context plugins inject these via `prependContext`; stripping prevents ephemeral retrieval context from polluting compacted summaries. Env var format is comma-separated tag names. Set to `[]` (or empty env string) to disable. |
 | `replayFloodThresholdExternal` | `integer` | `3` | `LCM_REPLAY_FLOOD_THRESHOLD_EXTERNAL` | Max replay-like messages allowed in a single SQLite-second for `role=user` before `assertNoReplayTimestampFlood` refuses the batch. Defaults to `3` to preserve replay defense for third-partyly-rebroadcastable input. |
 | `replayFloodThresholdInternal` | `integer` | `32` | `LCM_REPLAY_FLOOD_THRESHOLD_INTERNAL` | Max identical messages allowed in a single SQLite-second for `role=tool/assistant/system` before the anti-replay guard refuses the batch. Defaults to `32` to absorb legitimate idempotent sub-agent bursts (same-second tool returns like `{"status":"ok"}`). |

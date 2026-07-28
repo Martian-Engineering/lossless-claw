@@ -796,6 +796,23 @@ Why they matter:
 - keeps provider-auth failures on the separate auth circuit breaker path
 - direct deterministic fallbacks remain available when model-backed large-file summaries are throttled
 
+### `compactionLoopMaxConsecutiveFailures`
+
+| | |
+| --- | --- |
+| Type | `integer` |
+| Default | `10` |
+| Env | `LCM_COMPACTION_LOOP_MAX_CONSECUTIVE_FAILURES` |
+
+Maximum consecutive backoff-worthy deferred-compaction failures before the compact loop circuit breaker force-exhausts. Uses the durable `retryAttempts` counter (not a process-local map) so the breaker survives restarts. Set to `0` to disable.
+
+Why it matters:
+
+- Repeated backoff-worthy failures (ENOENT on moved/deleted transcript files, non-auth provider errors, etc.) can make the deferred compaction loop retry indefinitely, burning CPU and I/O
+- The circuit breaker stops the runaway loop after the configured number of consecutive failures
+- After the backoff cooldown period (`nextAttemptAfter`) elapses, the breaker auto-resets `retryAttempts` to 0 and allows one more drain attempt — if the underlying issue persists, the counter climbs back to the threshold and the breaker trips again
+- Auth failures are handled by the separate `circuitBreakerThreshold`/`circuitBreakerCooldownMs` path and do not count toward this limit
+
 ### `customInstructions`
 
 Natural-language instructions injected into summarization prompts.
