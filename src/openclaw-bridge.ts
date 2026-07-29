@@ -103,7 +103,7 @@ export type ContextEngineInfo = {
 
 export type ContextEngineOperation = "agent-run" | "manual-compact" | "subagent-spawn";
 
-export type ContextEngineControlOperation = "status" | "doctor" | "rotate";
+export type ContextEngineControlOperation = "status" | "doctor";
 
 export type ContextEngineControlCapabilities = {
   status: boolean;
@@ -123,16 +123,9 @@ export type ContextEngineControlDoctorResult = {
   warnings: string[];
 };
 
-export type ContextEngineControlRotateResult = {
-  operation: "rotate";
-  messageCount: number;
-  lastRotatedAt: string;
-};
-
 export type ContextEngineControlResult =
   | ContextEngineControlStatusResult
-  | ContextEngineControlDoctorResult
-  | ContextEngineControlRotateResult;
+  | ContextEngineControlDoctorResult;
 
 export type ContextEngineControlRequest = {
   agentId?: string;

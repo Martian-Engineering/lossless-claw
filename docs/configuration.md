@@ -26,7 +26,7 @@ forks continue to require `thread-bootstrap-projection`.
 If you cannot use a beta or upgrade OpenClaw, use a `lossless-claw` release
 compatible with your installed OpenClaw version.
 
-The optional programmatic `status` / `doctor` / `rotate` control surface requires
+The optional programmatic `status` / `doctor` control surface requires
 a host that separately advertises context-engine capabilities/control dispatch.
 That host contract is not covered by the baseline plugin API version above. As
 of this documentation update, no stable OpenClaw release includes those gateway

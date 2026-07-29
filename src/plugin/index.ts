@@ -1514,10 +1514,10 @@ function wirePluginHandlers(
   // host has no ContextEngine control contract, so control() is never invoked.
   api.session?.controls?.registerSessionAction?.({
     id: "lcm-control",
-    description: "Run an LCM control operation (status | doctor | rotate) for a session.",
+    description: "Run an LCM control operation (status | doctor) for a session.",
     schema: {
       type: "object",
-      properties: { operation: { enum: ["status", "doctor", "rotate"] } },
+      properties: { operation: { enum: ["status", "doctor"] } },
       required: ["operation"],
     },
     handler: async (ctx) => {

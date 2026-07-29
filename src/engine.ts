@@ -1,6 +1,7 @@
 import { createHash } from "node:crypto";
 import { join } from "node:path";
 import type { DatabaseSync } from "node:sqlite";
+import packageJson from "../package.json" with { type: "json" };
 import type {
   ContextEngine,
   ContextEngineControlCapabilities,
@@ -28,6 +29,7 @@ import {
   ContextThresholdResolver,
   describeResolvedContextThreshold,
   persistedContextThresholdOverride,
+  reconcilePersistedContextThreshold,
   type ResolvedContextThreshold,
 } from "./context-threshold.js";
 import { LargeFileInterceptor } from "./large-file-interceptor.js";
@@ -54,7 +56,11 @@ import {
 } from "./plugin/lcm-command.js";
 import { describeLcmConfigSource } from "./db/config.js";
 import { RetrievalEngine } from "./retrieval.js";
-import { compileSessionPatterns, matchesSessionPattern } from "./session-patterns.js";
+import {
+  compileSessionPatterns,
+  isIsolatedCronSessionKey,
+  matchesSessionPattern,
+} from "./session-patterns.js";
 import { logStartupBannerOnce } from "./startup-banner-log.js";
 import { CompactionTelemetryStore } from "./store/compaction-telemetry-store.js";
 import { CompactionMaintenanceStore } from "./store/compaction-maintenance-store.js";
@@ -484,7 +490,8 @@ export class LcmContextEngine implements ContextEngine {
     this.info = {
       id: "lossless-claw",
       name: "Lossless Context Management Engine",
-      version: "0.1.0",
+      version: packageJson.version,
+      acceptedHostParams: ["sessionKey", "prompt", "runtimeContext"],
       ownsCompaction: migrationOk,
       turnMaintenanceMode: "background",
       hostRequirements: {
@@ -735,6 +742,87 @@ export class LcmContextEngine implements ContextEngine {
     const normalizedSessionKey = sessionKey?.trim();
     const normalizedSessionId = sessionId?.trim();
     return normalizedSessionKey || normalizedSessionId || "__lcm__";
+  }
+
+  /** Archive the prior run when a cron scheduler key starts a new runtime session. */
+  private async archiveSupersededIsolatedCronConversation(params: {
+    sessionId: string;
+    sessionKey?: string;
+  }): Promise<void> {
+    const normalizedSessionId = params.sessionId.trim();
+    const normalizedSessionKey = params.sessionKey?.trim();
+    if (
+      !normalizedSessionId ||
+      !normalizedSessionKey ||
+      !isIsolatedCronSessionKey(normalizedSessionKey)
+    ) {
+      return;
+    }
+
+    const activeByKey =
+      await this.conversationStore.getConversationBySessionKey(normalizedSessionKey);
+    if (!activeByKey || activeByKey.sessionId === normalizedSessionId) {
+      return;
+    }
+
+    this.deps.log.info(
+      `[lcm] bootstrap: isolated cron session rollover; archiving conversation=${activeByKey.conversationId} oldSessionId=${activeByKey.sessionId} newSessionId=${normalizedSessionId} sessionKey=${normalizedSessionKey}`,
+    );
+    await this.conversationStore.archiveConversation(
+      activeByKey.conversationId,
+      "cron-rotation",
+    );
+  }
+
+  /**
+   * Resolve afterTurn by cron runtime identity so a late callback cannot
+   * replace the active run that now owns the scheduler key.
+   */
+  private async resolveProjectionConversationForAfterTurn(params: {
+    sessionId: string;
+    sessionKey?: string;
+  }): Promise<{ conversation: ConversationRecord | null; staleIsolatedCron: boolean }> {
+    const normalizedSessionKey = params.sessionKey?.trim();
+    if (!isIsolatedCronSessionKey(normalizedSessionKey)) {
+      return {
+        conversation: await this.conversationStore.getOrCreateConversation(params.sessionId, {
+          sessionKey: params.sessionKey,
+        }),
+        staleIsolatedCron: false,
+      };
+    }
+
+    const cronSessionKey = normalizedSessionKey ?? "";
+    const byRuntimeSession =
+      await this.conversationStore.getConversationBySessionId(params.sessionId);
+    if (byRuntimeSession) {
+      const ownsCronKey = byRuntimeSession.sessionKey?.trim() === cronSessionKey;
+      if (ownsCronKey && byRuntimeSession.active) {
+        return { conversation: byRuntimeSession, staleIsolatedCron: false };
+      }
+      this.deps.log.warn(
+        `[lcm] afterTurn: stale or mismatched isolated cron runtime session; preserving active cron conversation session=${params.sessionId} sessionKey=${cronSessionKey} active=${byRuntimeSession.active} boundSessionKey=${byRuntimeSession.sessionKey ?? ""}`,
+      );
+      return { conversation: null, staleIsolatedCron: true };
+    }
+
+    const activeByKey =
+      await this.conversationStore.getConversationBySessionKey(cronSessionKey);
+    if (activeByKey && activeByKey.sessionId !== params.sessionId) {
+      this.deps.log.warn(
+        `[lcm] afterTurn: isolated cron key is owned by another active runtime; preserving active cron conversation session=${params.sessionId} sessionKey=${cronSessionKey} activeSession=${activeByKey.sessionId}`,
+      );
+      return { conversation: null, staleIsolatedCron: true };
+    }
+
+    return {
+      conversation:
+        activeByKey ??
+        (await this.conversationStore.getOrCreateConversation(params.sessionId, {
+          sessionKey: cronSessionKey,
+        })),
+      staleIsolatedCron: false,
+    };
   }
 
   /** Normalize optional live token estimates supplied by runtime callers. */
@@ -1152,32 +1240,53 @@ export class LcmContextEngine implements ContextEngine {
       const resolvedProjectedTokenCount = this.normalizeObservedTokenCount(
         maintenance.projectedTokenCount ?? undefined,
       );
+      const runtimeModelContext = readRuntimeModelContext(
+        asRecord(params.runtimeContext),
+        asRecord(params.legacyParams),
+      );
       const runtimeResolvedContextThreshold = this.contextThresholdResolver.resolve({
         sessionKey: params.sessionKey,
-        runtime: readRuntimeModelContext(
-          asRecord(params.runtimeContext),
-          asRecord(params.legacyParams),
-        ),
+        runtime: runtimeModelContext,
       });
       // Prefer the threshold persisted with the debt row: a background drain
       // may lack the runtime model metadata that originally selected it, and
-      // re-resolving could silently flip the compaction decision. New debt rows
-      // also persist selected fresh-tail and leaf chunk sizing; the runtime
-      // fallback only helps older rows written before those columns existed.
+      // re-resolving could silently flip the compaction decision. That trust
+      // ends where live config can no longer produce the persisted value.
+      // New debt rows also persist selected fresh-tail and leaf chunk sizing;
+      // the runtime fallback only helps older rows written before those
+      // columns existed.
       const persistedContextThreshold = persistedContextThresholdOverride(maintenance);
-      const resolvedContextThreshold = persistedContextThreshold
-        ? {
-            ...persistedContextThreshold,
-            ...(persistedContextThreshold.freshTailCount === undefined &&
-            runtimeResolvedContextThreshold.freshTailCount !== undefined
-              ? { freshTailCount: runtimeResolvedContextThreshold.freshTailCount }
-              : {}),
-            ...(persistedContextThreshold.leafChunkTokens === undefined &&
-            runtimeResolvedContextThreshold.leafChunkTokens !== undefined
-              ? { leafChunkTokens: runtimeResolvedContextThreshold.leafChunkTokens }
-              : {}),
-          }
-        : runtimeResolvedContextThreshold;
+      const reconciledContextThreshold = reconcilePersistedContextThreshold({
+        persisted: persistedContextThreshold,
+        live: runtimeResolvedContextThreshold,
+        anyRuleCouldProducePersisted:
+          persistedContextThreshold !== undefined &&
+          this.contextThresholdResolver.couldAnyRuleProduce({
+            sessionKey: params.sessionKey,
+            runtime: runtimeModelContext,
+            persisted: persistedContextThreshold,
+          }),
+      });
+      if (reconciledContextThreshold.supersededStalePersisted && persistedContextThreshold) {
+        this.deps.log.info(
+          `[lcm] maintain: stale persisted context threshold superseded by live config conversation=${params.conversationId} ${sessionLabel} persistedThreshold=${persistedContextThreshold.contextThreshold} persistedSource=${persistedContextThreshold.source} liveThreshold=${runtimeResolvedContextThreshold.contextThreshold} liveSource=${runtimeResolvedContextThreshold.source}`,
+        );
+      }
+      const resolvedContextThreshold =
+        persistedContextThreshold &&
+        reconciledContextThreshold.resolved === persistedContextThreshold
+          ? {
+              ...persistedContextThreshold,
+              ...(persistedContextThreshold.freshTailCount === undefined &&
+              runtimeResolvedContextThreshold.freshTailCount !== undefined
+                ? { freshTailCount: runtimeResolvedContextThreshold.freshTailCount }
+                : {}),
+              ...(persistedContextThreshold.leafChunkTokens === undefined &&
+              runtimeResolvedContextThreshold.leafChunkTokens !== undefined
+                ? { leafChunkTokens: runtimeResolvedContextThreshold.leafChunkTokens }
+                : {}),
+            }
+          : reconciledContextThreshold.resolved;
 
       const isThresholdDebt = maintenance.reason?.trim() === "threshold";
       if (!isThresholdDebt) {
@@ -2815,6 +2924,10 @@ export class LcmContextEngine implements ContextEngine {
         this.conversationStore.withTransaction(async () => {
           const entries = await readVisibleSessionTranscriptMessageEntries(params.target);
           const historicalMessages = entries.map(messageFromVisibleTranscriptEntry);
+          await this.archiveSupersededIsolatedCronConversation({
+            sessionId: params.sessionId,
+            sessionKey: params.sessionKey,
+          });
           const conversation = await this.conversationStore.getOrCreateConversation(params.sessionId, {
             sessionKey: params.sessionKey,
           });
@@ -3030,12 +3143,17 @@ export class LcmContextEngine implements ContextEngine {
             };
           }
 
-          const conversation = await this.conversationStore.getOrCreateConversation(
-            params.sessionId,
-            {
-              sessionKey: params.sessionKey,
-            },
-          );
+          const resolvedConversation =
+            await this.resolveProjectionConversationForAfterTurn(params);
+          if (resolvedConversation.staleIsolatedCron || !resolvedConversation.conversation) {
+            return {
+              importedMessages: 0,
+              blockedByImportCap: false,
+              blockedReason: "stale-isolated-cron-afterturn",
+              hasOverlap: false,
+            };
+          }
+          const conversation = resolvedConversation.conversation;
           const conversationId = conversation.conversationId;
           const existingCount = await this.conversationStore.getMessageCount(conversationId);
 
@@ -4140,10 +4258,23 @@ export class LcmContextEngine implements ContextEngine {
       const startedAt = Date.now();
       const sessionLabel = formatSessionLabel(params.sessionId, params.sessionKey);
 
-      const conversation = await this.conversationStore.getConversationForSession({
-        sessionId: params.sessionId,
-        sessionKey: params.sessionKey,
-      });
+      const conversation = isIsolatedCronSessionKey(params.sessionKey)
+        ? await this.conversationStore.getConversationBySessionId(params.sessionId)
+        : await this.conversationStore.getConversationForSession({
+            sessionId: params.sessionId,
+            sessionKey: params.sessionKey,
+          });
+      if (
+        conversation &&
+        isIsolatedCronSessionKey(params.sessionKey) &&
+        (!conversation.active ||
+          conversation.sessionKey?.trim() !== params.sessionKey?.trim())
+      ) {
+        this.deps.log.warn(
+          `[lcm] assemble: stale isolated cron runtime session; preserving active cron conversation ${sessionLabel}`,
+        );
+        return safeFallback();
+      }
       if (!conversation) {
         this.deps.log.debug(
           `[lcm] assemble: conversation lookup missed ${sessionLabel} duration=${formatDurationMs(Date.now() - startedAt)}`,

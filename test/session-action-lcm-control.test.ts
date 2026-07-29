@@ -34,11 +34,9 @@ function buildHarness(control: (input: unknown) => Promise<unknown>) {
   const engine = { control: vi.fn(control) };
   setSharedInit(dbPath, {
     stopped: false,
-    startupMaintenanceStarted: true,
     getCachedEngine: () => engine as never,
     waitForEngine: async () => engine as never,
     waitForDatabase: async () => ({}) as never,
-    runStartupMaintenanceOnce: () => {},
   });
 
   const api = {
@@ -103,35 +101,31 @@ describe("lcm-control session action", () => {
     const { registration } = harness(async () => ({}));
 
     expect(registration.id).toBe("lcm-control");
-    expect(registration.schema?.properties?.operation?.enum).toEqual([
-      "status",
-      "doctor",
-      "rotate",
-    ]);
+    expect(registration.schema?.properties?.operation?.enum).toEqual(["status", "doctor"]);
     expect(registration.schema?.required).toContain("operation");
   });
 
   it("passes the engine result through on success", async () => {
-    const { registration, engine } = harness(async () => ({ rotated: true, bytes: 1259 }));
+    const { registration, engine } = harness(async () => ({ active: true, messageCount: 42 }));
 
     const response = await registration.handler({
       sessionKey: "agent:main:feishu:direct:u1",
-      payload: { operation: "rotate" },
+      payload: { operation: "status" },
     });
 
-    expect(response).toEqual({ ok: true, result: { rotated: true, bytes: 1259 } });
+    expect(response).toEqual({ ok: true, result: { active: true, messageCount: 42 } });
     expect(engine.control).toHaveBeenCalledWith({
-      operation: "rotate",
+      operation: "status",
       sessionKey: "agent:main:feishu:direct:u1",
     });
   });
 
   it("preserves the structured reasonCode when control is unavailable", async () => {
     const { registration } = harness(async () => {
-      throw new LcmProgrammaticControlUnavailableError("rotate", "conversation_unavailable");
+      throw new LcmProgrammaticControlUnavailableError("doctor", "conversation_unavailable");
     });
 
-    const response = await registration.handler({ payload: { operation: "rotate" } });
+    const response = await registration.handler({ payload: { operation: "doctor" } });
 
     // Regression guard: the handler once read `.reason`, collapsing every
     // structured skip reason to the generic "unavailable".
@@ -141,22 +135,22 @@ describe("lcm-control session action", () => {
 
   it("preserves the structured reasonCode when control fails after starting", async () => {
     const { registration } = harness(async () => {
-      throw new LcmProgrammaticControlFailedError("rotate", "rotate_write_failed");
+      throw new LcmProgrammaticControlFailedError("doctor", "doctor_failed");
     });
 
-    const response = await registration.handler({ payload: { operation: "rotate" } });
+    const response = await registration.handler({ payload: { operation: "doctor" } });
 
     expect(response.ok).toBe(false);
-    expect(response.code).toBe("rotate_write_failed");
+    expect(response.code).toBe("doctor_failed");
   });
 
   it("keeps distinct skip reasons distinct", async () => {
     const codes: unknown[] = [];
     for (const reasonCode of ["runtime_unavailable", "session_id_unavailable", "transcript_unavailable"]) {
       const { registration } = harness(async () => {
-        throw new LcmProgrammaticControlUnavailableError("rotate", reasonCode);
+        throw new LcmProgrammaticControlUnavailableError("doctor", reasonCode);
       });
-      const response = await registration.handler({ payload: { operation: "rotate" } });
+      const response = await registration.handler({ payload: { operation: "doctor" } });
       codes.push(response.code);
     }
 

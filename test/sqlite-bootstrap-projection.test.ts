@@ -117,6 +117,174 @@ describe("LcmContextEngine.bootstrap sqlite transcript projection", () => {
     ).resolves.toHaveLength(2);
   });
 
+  it("archives the prior cron run when a scheduler key starts a new runtime session", async () => {
+    const sessionKey = "agent:main:cron:sqlite-projection-isolation";
+    const readVisibleSessionTranscriptMessageEntries = vi.fn(
+      async (target: { sessionId: string }) => [
+        {
+          entryId: `entry-${target.sessionId}`,
+          parentId: null,
+          seq: 1,
+          role: "user",
+          message: {
+            role: "user",
+            content: `cron input for ${target.sessionId}`,
+          } satisfies AgentMessage,
+          createdAt: "2026-07-29T12:00:00.000Z",
+        },
+      ],
+    );
+    const { engine, db } = createEngineWithDepsOverridesAndDb({
+      readVisibleSessionTranscriptMessageEntries,
+    } satisfies Partial<LcmDependencies>);
+    const bootstrapCronRun = (sessionId: string) =>
+      engine.bootstrap({
+        sessionId,
+        sessionKey,
+        runtimeContext: {
+          sessionTarget: {
+            agentId: "main",
+            sessionId,
+            sessionKey,
+            storePath: "/tmp/openclaw-agent.sqlite",
+          },
+        },
+      });
+
+    await expect(bootstrapCronRun("cron-run-old")).resolves.toMatchObject({
+      bootstrapped: true,
+      importedMessages: 1,
+    });
+    await expect(bootstrapCronRun("cron-run-new")).resolves.toMatchObject({
+      bootstrapped: true,
+      importedMessages: 1,
+    });
+
+    const conversations = db
+      .prepare(
+        `SELECT conversation_id, session_id, active, archive_cause
+         FROM conversations
+         WHERE session_key = ?
+         ORDER BY conversation_id`,
+      )
+      .all(sessionKey) as Array<{
+      conversation_id: number;
+      session_id: string;
+      active: number;
+      archive_cause: string | null;
+    }>;
+    expect(conversations).toEqual([
+      expect.objectContaining({
+        session_id: "cron-run-old",
+        active: 0,
+        archive_cause: "cron-rotation",
+      }),
+      expect.objectContaining({
+        session_id: "cron-run-new",
+        active: 1,
+        archive_cause: null,
+      }),
+    ]);
+    await expect(
+      engine.getConversationStore().getMessages(conversations[0]!.conversation_id),
+    ).resolves.toEqual([
+      expect.objectContaining({ content: "cron input for cron-run-old" }),
+    ]);
+    await expect(
+      engine.getConversationStore().getMessages(conversations[1]!.conversation_id),
+    ).resolves.toEqual([
+      expect.objectContaining({ content: "cron input for cron-run-new" }),
+    ]);
+  });
+
+  it("does not let a stale cron afterTurn callback replace the active run", async () => {
+    const sessionKey = "agent:main:cron:sqlite-projection-stale-afterturn";
+    const readVisibleSessionTranscriptMessageEntries = vi.fn(
+      async (target: { sessionId: string }) => [
+        {
+          entryId: `entry-${target.sessionId}`,
+          parentId: null,
+          seq: 1,
+          role: "user",
+          message: {
+            role: "user",
+            content: `cron input for ${target.sessionId}`,
+          } satisfies AgentMessage,
+          createdAt: "2026-07-29T12:05:00.000Z",
+        },
+      ],
+    );
+    const { engine } = createEngineWithDepsOverridesAndDb({
+      readVisibleSessionTranscriptMessageEntries,
+    } satisfies Partial<LcmDependencies>);
+    const bootstrapCronRun = (sessionId: string) =>
+      engine.bootstrap({
+        sessionId,
+        sessionKey,
+        runtimeContext: {
+          sessionTarget: {
+            agentId: "main",
+            sessionId,
+            sessionKey,
+            storePath: "/tmp/openclaw-agent.sqlite",
+          },
+        },
+      });
+
+    await bootstrapCronRun("cron-afterturn-old");
+    await bootstrapCronRun("cron-afterturn-new");
+    const staleAssembly = await engine.assemble({
+      sessionId: "cron-afterturn-old",
+      sessionKey,
+      messages: [{ role: "user", content: "late old-run prompt" }],
+      tokenBudget: 10_000,
+    });
+    expect(staleAssembly.messages).toEqual([
+      expect.objectContaining({ content: "late old-run prompt" }),
+    ]);
+    expect(JSON.stringify(staleAssembly.messages)).not.toContain(
+      "cron input for cron-afterturn-new",
+    );
+
+    await engine.afterTurn({
+      sessionId: "cron-afterturn-old",
+      sessionKey,
+      sessionFile: "/tmp/ignored-cron-afterturn.jsonl",
+      messages: [{ role: "assistant", content: "late old-run output" }],
+      prePromptMessageCount: 0,
+      runtimeContext: {
+        sessionTarget: {
+          agentId: "main",
+          sessionId: "cron-afterturn-old",
+          sessionKey,
+          storePath: "/tmp/openclaw-agent.sqlite",
+        },
+      },
+    });
+
+    const active = await engine.getConversationStore().getConversationBySessionKey(sessionKey);
+    expect(active).toMatchObject({
+      sessionId: "cron-afterturn-new",
+      active: true,
+    });
+    const activeMessages = await engine
+      .getConversationStore()
+      .getMessages(active!.conversationId);
+    expect(activeMessages.map((message) => message.content)).toEqual([
+      "cron input for cron-afterturn-new",
+    ]);
+    const archived = await engine
+      .getConversationStore()
+      .getConversationBySessionId("cron-afterturn-old");
+    expect(archived).toMatchObject({ active: false });
+    const archivedMessages = await engine
+      .getConversationStore()
+      .getMessages(archived!.conversationId);
+    expect(archivedMessages.map((message) => message.content)).toEqual([
+      "cron input for cron-afterturn-old",
+    ]);
+  });
+
   it("stores bootstrap data under the resolved runtimeContext session key", async () => {
     const sessionId = "sqlite-bootstrap-runtime-key";
     const sessionKey = "agent:main:sqlite-bootstrap-runtime-key";
