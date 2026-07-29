@@ -19,6 +19,7 @@ import type {
 import { applyScopedDoctorRepair } from "./lcm-doctor-apply.js";
 import { createLcmDatabaseBackup } from "./lcm-db-backup.js";
 import { describeLogError } from "../lcm-log.js";
+import { getDatabaseSizeBytes, parseDuration, pruneArchivedConversationsToFitSize, pruneConversations } from "../prune.js";
 import { listConfiguredAgentIds } from "./openclaw-agent-ids.js";
 import {
   applyDoctorCleaners,
@@ -108,6 +109,7 @@ type ParsedLcmCommand =
   | { kind: "status" }
   | { kind: "backup" }
   | { kind: "rotate" }
+  | { kind: "prune"; apply: boolean; maxAge?: string; maxBytes?: number; vacuum: boolean }
   | { kind: "focus_status" }
   | { kind: "focus_generate"; prompt: string }
   | { kind: "refocus" }
@@ -629,6 +631,55 @@ function parseLcmCommand(rawArgs: string | undefined): ParsedLcmCommand {
             kind: "help",
             error: `\`${VISIBLE_COMMAND} rotate\` does not accept extra arguments.`,
           };
+    case "prune": {
+      let apply = false;
+      let maxAge: string | undefined;
+      let maxBytes: number | undefined;
+      let vacuum = false;
+      for (const token of rest) {
+        const lower = token.toLowerCase();
+        if (lower === "confirm") {
+          apply = true;
+        } else if (lower === "vacuum") {
+          vacuum = true;
+        } else if (lower.startsWith("age=")) {
+          maxAge = lower.slice(4);
+        } else if (lower.startsWith("size=")) {
+          const raw = lower.slice(5);
+          const mbMatch = raw.match(/^(\d+(?:\.\d+)?)\s*mb$/i);
+          const gbMatch = raw.match(/^(\d+(?:\.\d+)?)\s*gb$/i);
+          if (mbMatch) {
+            const mb = Number(mbMatch[1]);
+            if (Number.isFinite(mb) && mb > 0) {
+              maxBytes = Math.floor(mb * 1024 * 1024);
+            }
+          } else if (gbMatch) {
+            const gb = Number(gbMatch[1]);
+            if (Number.isFinite(gb) && gb > 0) {
+              maxBytes = Math.floor(gb * 1024 * 1024 * 1024);
+            }
+          } else {
+            // No suffix — interpret as MB.
+            const numeric = Number(raw);
+            if (Number.isFinite(numeric) && numeric > 0) {
+              maxBytes = Math.floor(numeric * 1024 * 1024);
+            }
+          }
+          if (maxBytes == null) {
+            return {
+              kind: "help",
+              error: `Invalid size format '${raw}'. Expected: size=500mb or size=1gb.`,
+            };
+          }
+        } else {
+          return {
+            kind: "help",
+            error: `Unknown prune option \`${token}\`. Supported: \`confirm\`, \`vacuum\`, \`age=<duration>\` (e.g. age=90d), \`size=<mb|gb>\` (e.g. size=500mb, size=1gb).`,
+          };
+        }
+      }
+      return { kind: "prune", apply, maxAge, maxBytes, vacuum };
+    }
     case "doctor":
       if (rest.length === 0) {
         return { kind: "doctor", apply: false };
@@ -676,7 +727,7 @@ function parseLcmCommand(rawArgs: string | undefined): ParsedLcmCommand {
     default:
       return {
         kind: "help",
-        error: `Unknown subcommand \`${head}\`. Supported: status, focus, refocus, unfocus, backup, rotate, doctor, doctor clean, doctor apply, help.`,
+        error: `Unknown subcommand \`${head}\`. Supported: status, focus, refocus, unfocus, backup, rotate, prune, doctor, doctor clean, doctor apply, help.`,
       };
   }
 }
@@ -1314,6 +1365,22 @@ function buildHelpText(error?: string): string {
         "Compact the current session transcript while preserving the same LCM conversation and live session identity.",
       ),
       buildStatLine(
+        formatCommand(`${VISIBLE_COMMAND} prune age=<duration>`),
+        "Dry-run: list conversations older than a threshold (e.g. age=90d, age=3m, age=1y).",
+      ),
+      buildStatLine(
+        formatCommand(`${VISIBLE_COMMAND} prune confirm age=90d vacuum`),
+        "Delete conversations older than the threshold and optionally VACUUM.",
+      ),
+      buildStatLine(
+        formatCommand(`${VISIBLE_COMMAND} prune size=<mb|gb>`),
+        "Dry-run: show what would be deleted to fit DB under a size cap (e.g. size=500mb, size=1gb).",
+      ),
+      buildStatLine(
+        formatCommand(`${VISIBLE_COMMAND} prune confirm size=500mb vacuum`),
+        "Delete oldest archived conversations to fit under the size cap (also supports size=1gb).",
+      ),
+      buildStatLine(
         formatCommand(`${VISIBLE_COMMAND} focus <prompt>`),
         "Generate an active focus brief with a delegated recall sub-agent.",
       ),
@@ -1377,6 +1444,109 @@ function buildDoctorCleanerExampleLine(params: {
   const sessionKey = params.sessionKey ? formatCommand(truncateMiddle(params.sessionKey, 44)) : "missing";
   const preview = params.firstMessagePreview ? ` · first: ${JSON.stringify(params.firstMessagePreview)}` : "";
   return `conv ${formatNumber(params.conversationId)} · session key ${sessionKey} · messages ${formatNumber(params.messageCount)}${preview}`;
+}
+
+async function buildPruneText(params: {
+  ctx: PluginCommandContext;
+  db: DatabaseSync;
+  config: LcmConfig;
+  maxAge?: string;
+  maxBytes?: number;
+  vacuum: boolean;
+  confirm: boolean;
+}): Promise<string> {
+  const dbSize = getDatabaseSizeBytes(params.db);
+  const dbSizeMb = (dbSize / (1024 * 1024)).toFixed(1);
+
+  // Age-based pruning (dry run unless confirm)
+  if (params.maxAge) {
+    const days = parseDuration(params.maxAge);
+    if (days == null) {
+      return `Invalid duration \`${params.maxAge}\`. Expected e.g. \`30d\`, \`3m\`, \`1y\`.`;
+    }
+    if (!params.confirm) {
+      const result = pruneConversations(params.db, { before: params.maxAge });
+      if (result.candidates.length === 0) {
+        return [
+          `Dry-run: no conversations found older than \`${params.maxAge}\` (cutoff: ${result.cutoffDate}).`,
+          `Current DB size: ${dbSizeMb} MB.`,
+        ].join("\n");
+      }
+      return [
+        `Dry-run: ${result.candidates.length} conversation(s) match age > \`${params.maxAge}\` (cutoff: ${result.cutoffDate}).`,
+        result.candidates.length <= 20
+          ? result.candidates.map(
+              (c) =>
+                `  conv ${c.conversationId} · ${c.sessionKey ?? "no key"} · ${c.messageCount} msgs · latest ${c.latestMessageAt}`,
+            ).join("\n")
+          : `  (${result.candidates.length} candidates, showing first 20)`,
+        `\nRun \`/lossless prune confirm age=${params.maxAge}${params.vacuum ? " vacuum" : ""}\` to delete.`,
+        `Current DB size: ${dbSizeMb} MB.`,
+      ].join("\n");
+    }
+    const result = pruneConversations(params.db, {
+      before: params.maxAge,
+      confirm: true,
+      vacuum: params.vacuum,
+    });
+    return [
+      `Deleted ${result.deleted} conversation(s) older than \`${params.maxAge}\`.`,
+      result.vacuumed ? "VACUUM completed." : "",
+      `Current DB size: ${dbSizeMb} MB.`,
+    ]
+      .filter(Boolean)
+      .join("\n");
+  }
+
+  // Size-based pruning
+  const targetBytes = params.maxBytes ?? params.config.maxDatabaseBytes;
+  if (targetBytes <= 0) {
+    return [
+      `No size target configured. Set \`maxDatabaseBytes\` in plugin config or use \`size=<mb|gb>\`.`,
+      `Current DB size: ${dbSizeMb} MB.`,
+      `\nAge-based example: \`/lossless prune age=90d\` (dry-run)`,
+      `Age + confirm: \`/lossless prune confirm age=90d vacuum\``,
+      `Size-based example: \`/lossless prune size=500mb\` (dry-run, will prune oldest archived to fit)`,
+      `Size + confirm: \`/lossless prune confirm size=500mb vacuum\``,
+    ].join("\n");
+  }
+
+  const maxBytes = targetBytes;
+  const maxBytesMb = (maxBytes / (1024 * 1024)).toFixed(0);
+
+  if (!params.confirm) {
+    const archivedCount = (
+      params.db.prepare(
+        "SELECT COUNT(*) AS cnt FROM conversations WHERE active = 0 AND archived_at IS NOT NULL",
+      ).get() as { cnt: number }
+    ).cnt;
+    return [
+      `Dry-run: would delete oldest archived conversations to stay under ${maxBytesMb} MB.`,
+      `Current DB size: ${dbSizeMb} MB.`,
+      `Archived conversations available: ${archivedCount}.`,
+      `\nRun \`/lossless prune confirm size=${maxBytesMb}mb${params.vacuum ? " vacuum" : ""}\` to execute.`,
+    ].join("\n");
+  }
+
+  const result = pruneArchivedConversationsToFitSize(params.db, maxBytes, {
+    largeFilesDir: params.config.largeFilesDir,
+  });
+
+  if (params.vacuum && result.deleted > 0) {
+    params.db.exec("VACUUM");
+    params.db.exec("PRAGMA wal_checkpoint(TRUNCATE)");
+  }
+
+  const newSizeMb = (getDatabaseSizeBytes(params.db) / (1024 * 1024)).toFixed(1);
+  return [
+    result.deleted > 0
+      ? `Deleted ${result.deleted} archived conversation(s). Freed ~${((dbSize - getDatabaseSizeBytes(params.db)) / (1024 * 1024)).toFixed(1)} MB.`
+      : "No archived conversations to prune (DB is already under the target size).",
+    params.vacuum ? "VACUUM completed." : "",
+    `Current DB size: ${newSizeMb} MB.`,
+  ]
+    .filter(Boolean)
+    .join("\n");
 }
 
 async function buildStatusText(params: {
@@ -3340,6 +3510,18 @@ export function createLcmCommand(params: {
               config: params.config,
               deps: params.deps,
               getLcm: params.getLcm,
+            }),
+          };
+        case "prune":
+          return {
+            text: await buildPruneText({
+              ctx,
+              db: await getDb(),
+              config: params.config,
+              maxAge: parsed.maxAge,
+              maxBytes: parsed.maxBytes,
+              vacuum: parsed.vacuum,
+              confirm: parsed.apply,
             }),
           };
         case "focus_status":

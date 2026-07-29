@@ -4681,6 +4681,79 @@ describe("lcm command helpers", () => {
     });
   });
 
+  it("parses size= with mb, gb, and bare-numeric suffixes", () => {
+    // mb suffix
+    expect(__testing.parseLcmCommand("prune size=500mb")).toEqual({
+      kind: "prune",
+      apply: false,
+      maxAge: undefined,
+      maxBytes: 500 * 1024 * 1024,
+      vacuum: false,
+    });
+    // gb suffix
+    expect(__testing.parseLcmCommand("prune size=1gb")).toEqual({
+      kind: "prune",
+      apply: false,
+      maxAge: undefined,
+      maxBytes: 1 * 1024 * 1024 * 1024,
+      vacuum: false,
+    });
+    // gb with fractional value
+    expect(__testing.parseLcmCommand("prune size=1.5gb")).toEqual({
+      kind: "prune",
+      apply: false,
+      maxAge: undefined,
+      maxBytes: Math.floor(1.5 * 1024 * 1024 * 1024),
+      vacuum: false,
+    });
+    // No suffix — interpreted as MB
+    expect(__testing.parseLcmCommand("prune size=500")).toEqual({
+      kind: "prune",
+      apply: false,
+      maxAge: undefined,
+      maxBytes: 500 * 1024 * 1024,
+      vacuum: false,
+    });
+    // Case insensitive
+    expect(__testing.parseLcmCommand("prune size=100MB")).toEqual({
+      kind: "prune",
+      apply: false,
+      maxAge: undefined,
+      maxBytes: 100 * 1024 * 1024,
+      vacuum: false,
+    });
+    expect(__testing.parseLcmCommand("prune size=1GB")).toEqual({
+      kind: "prune",
+      apply: false,
+      maxAge: undefined,
+      maxBytes: 1 * 1024 * 1024 * 1024,
+      vacuum: false,
+    });
+  });
+
+  it("returns a specific help error for invalid size= values", () => {
+    // Non-numeric
+    expect(__testing.parseLcmCommand("prune size=abc")).toEqual({
+      kind: "help",
+      error: "Invalid size format 'abc'. Expected: size=500mb or size=1gb.",
+    });
+    // Zero
+    expect(__testing.parseLcmCommand("prune size=0mb")).toEqual({
+      kind: "help",
+      error: "Invalid size format '0mb'. Expected: size=500mb or size=1gb.",
+    });
+    // Negative
+    expect(__testing.parseLcmCommand("prune size=-5mb")).toEqual({
+      kind: "help",
+      error: "Invalid size format '-5mb'. Expected: size=500mb or size=1gb.",
+    });
+    // Unknown suffix
+    expect(__testing.parseLcmCommand("prune size=500tb")).toEqual({
+      kind: "help",
+      error: "Invalid size format '500tb'. Expected: size=500mb or size=1gb.",
+    });
+  });
+
   it("treats only the canonical engine id and empty slot state as selected", () => {
     expect(__testing.resolvePluginSelected({})).toBe(true);
     expect(
