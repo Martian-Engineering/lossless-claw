@@ -2,6 +2,7 @@ import { createHash } from "node:crypto";
 import { open, stat } from "node:fs/promises";
 import { join } from "node:path";
 import type { DatabaseSync } from "node:sqlite";
+import packageJson from "../package.json" with { type: "json" };
 import type {
   ContextEngine,
   ContextEngineControlCapabilities,
@@ -383,7 +384,8 @@ export class LcmContextEngine implements ContextEngine {
     this.info = {
       id: "lossless-claw",
       name: "Lossless Context Management Engine",
-      version: "0.1.0",
+      version: packageJson.version,
+      acceptedHostParams: ["sessionKey", "prompt", "runtimeContext"],
       ownsCompaction: migrationOk,
       turnMaintenanceMode: "background",
       hostRequirements: {
