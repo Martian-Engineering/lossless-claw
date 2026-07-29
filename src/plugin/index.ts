@@ -10,6 +10,7 @@ import type { DatabaseSync } from "node:sqlite";
 import type {
   AssembleResult,
   ContextEngine,
+  ContextEngineControlOperation,
   ContextEngineFactory,
   OpenClawPluginApi,
 } from "../openclaw-bridge.js";
@@ -1697,6 +1698,35 @@ function wirePluginHandlers(
     return engine
       ? new MemorySupplementContextEngine(engine)
       : shared.waitForEngine().then((nextEngine) => new MemorySupplementContextEngine(nextEngine));
+  });
+
+  // Expose the already-implemented ContextEngine.control() through the host's
+  // session-action surface. Without this the control path is unreachable: the
+  // host has no ContextEngine control contract, so control() is never invoked.
+  api.session?.controls?.registerSessionAction?.({
+    id: "lcm-control",
+    description: "Run an LCM control operation (status | doctor | rotate) for a session.",
+    schema: {
+      type: "object",
+      properties: { operation: { enum: ["status", "doctor", "rotate"] } },
+      required: ["operation"],
+    },
+    handler: async (ctx) => {
+      // Operation validation is left to normalizeControlOperation() inside
+      // control(); it already throws LcmProgrammaticControlUnavailableError
+      // with a structured reasonCode. Duplicating it here would shadow that.
+      try {
+        const engine = await shared.waitForEngine();
+        const operation = ctx.payload?.operation as ContextEngineControlOperation;
+        return { ok: true, result: await engine.control({ operation, sessionKey: ctx.sessionKey }) };
+      } catch (err) {
+        return {
+          ok: false,
+          error: err instanceof Error ? err.message : String(err),
+          code: (err as { reasonCode?: string })?.reasonCode ?? "unavailable",
+        };
+      }
+    },
   });
 
   api.registerTool(
