@@ -9,25 +9,12 @@
  * 2. tool / toolResult: tool call id (paired id preferred; fall back to
  *    top-level `toolCallId` / `tool_call_id` / `toolUseId` / `tool_use_id`
  *    / `call_id` / `id`).
- * 3. any role without a stable id: millisecond-truncated inner source
- *    timestamp combined with the conversation id and normalized role.
- * 4. nothing → `null` (existing compatibility path is used).
+ * 3. no stable id available → `null` (falls back to existing
+ *    identity_hash-based dedup and messagesDifferOnlyByHostRedaction).
  */
 import type { AgentMessage } from "./openclaw-bridge.js";
-import { toDbRole } from "./message-content.js";
 import { extractToolResultIdForPairing } from "./tool-pairing.js";
-import { resolveTranscriptMessageInnerTimestamp } from "./transcript.js";
 import { safeString } from "./value-utils.js";
-
-function toEpochMs(value: number | string | null): number | null {
-  if (value === null) return null;
-  if (typeof value === "number") {
-    return Number.isFinite(value) ? Math.trunc(value) : null;
-  }
-  const parsed = Date.parse(value);
-  if (!Number.isFinite(parsed)) return null;
-  return Math.trunc(parsed);
-}
 
 export function extractStableEventKey(
   message: AgentMessage,
@@ -51,13 +38,10 @@ export function extractStableEventKey(
     }
   }
 
-  const inner = resolveTranscriptMessageInnerTimestamp(message);
-  const ms = toEpochMs(inner);
-  if (ms === null) {
-    return null;
-  }
-  const normalizedRole = toDbRole(role);
-  return `${normalizedRole}-event:${conversationId}:${normalizedRole}:${ms}`;
+  // No stable event identity available — fall back to null.
+  // The message will use existing identity_hash-based dedup and
+  // messagesDifferOnlyByHostRedaction for redaction handling.
+  return null;
 }
 
 /** Batch chunk size consumed by the store query helper for batched lookups. */

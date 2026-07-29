@@ -35,40 +35,6 @@ describe("extractStableEventKey", () => {
     ).toBe("tool-result:call-1");
   });
 
-  it("returns a millisecond event key when only timestamp is available", () => {
-    const key = extractStableEventKey(
-      { role: "user", content: "hi", timestamp: 1_700_000_000_123 } as never,
-      conversationId,
-    );
-    expect(key).toBe("user-event:42:user:1700000000123");
-  });
-
-  it("returns null when no stable identity is available", () => {
-    expect(
-      extractStableEventKey({ role: "user", content: "hi" } as never, conversationId),
-    ).toBeNull();
-  });
-
-  it("scopes timestamp keys per conversation", () => {
-    const a = extractStableEventKey(
-      { role: "user", content: "hi", timestamp: 1 } as never,
-      1,
-    );
-    const b = extractStableEventKey(
-      { role: "user", content: "hi", timestamp: 1 } as never,
-      2,
-    );
-    expect(a).not.toBe(b);
-  });
-
-  it("parses ISO string timestamps into the same millisecond key", () => {
-    const key = extractStableEventKey(
-      { role: "user", content: "hi", timestamp: "2023-11-14T22:13:20.123Z" } as never,
-      conversationId,
-    );
-    expect(key).toBe("user-event:42:user:1700000000123");
-  });
-
   it("returns a tool-result key using toolUseId fallback for tool messages", () => {
     const key = extractStableEventKey(
       { role: "tool", content: "ok", toolUseId: "call-x" } as never,
@@ -77,10 +43,19 @@ describe("extractStableEventKey", () => {
     expect(key).toBe("tool-result:call-x");
   });
 
-  it("ignores string timestamps that fail to parse", () => {
+  it("returns null for user message without responseId or toolCallId", () => {
+    // Timestamp-only fallback was removed per PR #1044 review.
+    // Messages without responseId or toolCallId return null.
+    expect(
+      extractStableEventKey({ role: "user", content: "hi" } as never, conversationId),
+    ).toBeNull();
+  });
+
+  it("returns null for user message with timestamp but no responseId/toolCallId", () => {
+    // Timestamp-only fallback was removed per PR #1044 review.
     expect(
       extractStableEventKey(
-        { role: "user", content: "hi", timestamp: "not-a-date" } as never,
+        { role: "user", content: "hi", timestamp: 1_700_000_000_000 } as never,
         conversationId,
       ),
     ).toBeNull();
