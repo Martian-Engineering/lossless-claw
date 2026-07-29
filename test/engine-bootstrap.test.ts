@@ -3719,20 +3719,22 @@ describe("LcmContextEngine.bootstrap", () => {
     expect(conversation).not.toBeNull();
     const stored = await engine.getConversationStore().getMessages(conversation!.conversationId);
     expect(stored.map((message) => message.content)).toEqual(["db only user", "db only assistant"]);
+    expect(conversation!.bootstrappedAt).toBeNull();
+    await expect(
+      engine
+        .getSummaryStore()
+        .getConversationBootstrapState(conversation!.conversationId),
+    ).resolves.toBeNull();
   });
 
-  it("persists a bootstrap checkpoint when reconcile finds no anchor or overlap, so afterTurn does not freeze in checkpoint-missing", async () => {
+  it("recovers a first bootstrap with a non-anchoring DB frontier, so afterTurn does not freeze in checkpoint-missing", async () => {
     // When ingest() runs before bootstrap() (race), the conversation has
-    // messages but no bootstrap_state.  If the transcript content does not
-    // overlap with the DB messages, reconcile finds no anchor.  Without a
-    // checkpoint row, afterTurn classifies the conversation as
-    // "checkpoint-missing" and skips all persistence permanently.
+    // only injected metadata and no bootstrap_state. If the transcript does
+    // not overlap those non-anchoring rows, importing the readable transcript
+    // is safe because there is no real DB history to contaminate.
     //
-    // Before the fix, bootstrap skipped persistBootstrapState when
-    // reconcile had no overlap — leaving the conversation permanently
-    // frozen at checkpoint-missing on every subsequent afterTurn.
-    // This test asserts that bootstrap creates the checkpoint even in the
-    // no-overlap case, so afterTurn can recover on the next turn.
+    // Bootstrap must import that transcript before establishing its checkpoint
+    // so afterTurn can safely resume from the verified frontier.
     const sessionFile = createSessionFilePath("bootstrap-checkpoint-no-overlap");
     const sm = SessionManager.open(sessionFile);
     appendSessionMessage(sm, {
@@ -3747,22 +3749,26 @@ describe("LcmContextEngine.bootstrap", () => {
     const engine = createEngine();
     const sessionId = "bootstrap-checkpoint-no-overlap";
 
-    // Simulate ingest-before-bootstrap: store messages that do NOT overlap
-    // with the transcript content above.
+    // Simulate ingest-before-bootstrap with a proven non-anchoring frontier.
     await engine.ingest({
       sessionId,
-      message: { role: "user", content: "db preamble" } as AgentMessage,
+      message: {
+        role: "user",
+        content: "Conversation info (untrusted metadata): injected preamble one",
+      } as AgentMessage,
     });
     await engine.ingest({
       sessionId,
-      message: { role: "assistant", content: "db preamble response" } as AgentMessage,
+      message: {
+        role: "user",
+        content: "Conversation info (untrusted metadata): injected preamble two",
+      } as AgentMessage,
     });
 
     const result = await engine.bootstrap({ sessionId, sessionFile });
-    expect(result.bootstrapped).toBe(false);
-    expect(result.importedMessages).toBe(0);
-    // The conversation has pre-existing messages with no transcript overlap.
-    expect(result.reason).toBe("conversation already has messages");
+    expect(result.bootstrapped).toBe(true);
+    expect(result.importedMessages).toBe(2);
+    expect(result.reason).toBe("reconciled missing session messages");
 
     const conversation = await engine
       .getConversationStore()
@@ -3770,8 +3776,7 @@ describe("LcmContextEngine.bootstrap", () => {
     expect(conversation).not.toBeNull();
     expect(conversation!.bootstrappedAt).not.toBeNull();
 
-    // The key invariant: bootstrap_state must exist so afterTurn can
-    // find a checkpoint.
+    // The transcript import establishes the checkpoint after verified progress.
     const bootstrapState = await engine
       .getSummaryStore()
       .getConversationBootstrapState(conversation!.conversationId);
@@ -3795,13 +3800,15 @@ describe("LcmContextEngine.bootstrap", () => {
       tokenBudget: 4096,
     });
 
-    // DB messages are preserved and the next turn advances normally.
+    // Metadata is preserved, transcript history imports, and the next turn advances.
     const stored = await engine
       .getConversationStore()
       .getMessages(conversation!.conversationId);
     expect(stored.map((m) => m.content)).toEqual([
-      "db preamble",
-      "db preamble response",
+      "Conversation info (untrusted metadata): injected preamble one",
+      "Conversation info (untrusted metadata): injected preamble two",
+      "transcript only user",
+      "transcript only assistant",
       "next transcript user",
       "next transcript assistant",
     ]);

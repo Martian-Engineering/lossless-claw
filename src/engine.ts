@@ -2284,6 +2284,13 @@ export class LcmContextEngine implements ContextEngine {
 
           // Existing conversation path: reconcile crash gaps by appending JSONL
           // messages that were never persisted to LCM.
+          const isFirstBootstrap = !conversation.bootstrappedAt;
+          const firstBootstrapFrontierIsNonAnchoring =
+            !bootstrapState &&
+            isFirstBootstrap &&
+            (await this.transcriptReconciler.conversationFrontierIsEntirelyNonAnchoring(
+              conversationId,
+            ));
           const reconcile = await this.transcriptReconciler.reconcileSessionTail({
             sessionId: params.sessionId,
             sessionKey: params.sessionKey,
@@ -2298,8 +2305,14 @@ export class LcmContextEngine implements ContextEngine {
                 ? undefined
                 : bootstrapState?.lastProcessedEntryId,
             skipContentAnchorScan: transcriptEpochReason === "same-path-shrink",
-            allowNoAnchorImport: transcriptEpochRotated,
-            noAnchorImportReason: transcriptEpochReason,
+            allowNoAnchorImport:
+              transcriptEpochRotated || firstBootstrapFrontierIsNonAnchoring,
+            allowFullNonAnchoringFrontierImport: firstBootstrapFrontierIsNonAnchoring,
+            noAnchorImportReason:
+              transcriptEpochReason ??
+              (firstBootstrapFrontierIsNonAnchoring
+                ? "checkpoint-missing-recovery"
+                : undefined),
           });
           this.deps.log.debug(
             `[lcm] bootstrap: reconcile finished conversation=${conversationId} ${sessionLabel} importedMessages=${reconcile.importedMessages} overlap=${reconcile.hasOverlap} blockedByImportCap=${reconcile.blockedByImportCap} duration=${formatDurationMs(Date.now() - startedAt)}`,
@@ -2321,14 +2334,9 @@ export class LcmContextEngine implements ContextEngine {
             };
           }
 
-          // Only mark bootstrapped when the transcript was successfully read.
-          // An unreadable or empty transcript intentionally leaves the
-          // conversation unbootstrapped so a later successful read can retry
-          // (the old path set bootstrapped_at regardless, freezing afterTurn
-          // at checkpoint-missing with no recovery path).
           const firstBootstrapHasReadableProgress =
-            reconcile.importedMessages > 0 || reconcile.hasOverlap || historicalMessages.length > 0;
-          if (!conversation.bootstrappedAt && firstBootstrapHasReadableProgress) {
+            reconcile.importedMessages > 0 || reconcile.hasOverlap;
+          if (isFirstBootstrap && firstBootstrapHasReadableProgress) {
             await this.conversationStore.markConversationBootstrapped(conversationId);
           }
 
@@ -2341,19 +2349,7 @@ export class LcmContextEngine implements ContextEngine {
             };
           }
 
-          // The first bootstrap attempt must establish a checkpoint after a
-          // successful transcript read, even when the DB frontier does not
-          // overlap the transcript. Otherwise the next afterTurn cannot resume
-          // from the current transcript offset.
-          //
-          // conversation.bootstrappedAt here reflects the in-memory state
-          // *before* markConversationBootstrapped above — it is intentionally
-          // stale. A refactor that refreshes the local record after the mark
-          // call should also update this gate to prevent a silent regression.
-          if (
-            reconcile.hasOverlap ||
-            (historicalMessages.length > 0 && !bootstrapState && !conversation.bootstrappedAt)
-          ) {
+          if (reconcile.hasOverlap) {
             await persistBootstrapState(conversationId);
           }
 
