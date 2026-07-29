@@ -43,6 +43,31 @@ Configuration precedence is:
 
 Most installations only need to override a handful of keys. If you want a complete starting point, use the full example below and then delete entries you do not need.
 
+## OpenClaw conversation-hook trust
+
+OpenClaw builds that protect `before_prompt_build` as a conversation hook
+require a host-policy grant so Lossless's static recall policy is included in
+the system prompt:
+
+```json
+{
+  "plugins": {
+    "entries": {
+      "lossless-claw": {
+        "hooks": {
+          "allowConversationAccess": true
+        }
+      }
+    }
+  }
+}
+```
+
+This `hooks` object is a sibling of `config`; it is not a Lossless plugin config
+key. Without the grant, the context engine still loads, but OpenClaw blocks the
+prompt hook and logs the missing setting. Restart OpenClaw after changing the
+host policy.
+
 ## Complete `plugins.entries.lossless-claw.config` example
 
 ```json

@@ -157,19 +157,30 @@ The install command records the plugin, enables it, and applies compatible slot 
 
 ### Configure OpenClaw
 
-In most cases, no manual JSON edits are needed after `openclaw plugins install`.
-
-If you need to set it manually, ensure the context engine slot points at lossless-claw:
+Ensure the context engine slot points at lossless-claw and explicitly allow its
+conversation prompt hook:
 
 ```json
 {
   "plugins": {
     "slots": {
       "contextEngine": "lossless-claw"
+    },
+    "entries": {
+      "lossless-claw": {
+        "hooks": {
+          "allowConversationAccess": true
+        }
+      }
     }
   }
 }
 ```
+
+OpenClaw builds that protect `before_prompt_build` as a conversation-access hook
+require this grant. Without it, the context engine still loads, but OpenClaw
+blocks Lossless's static recall-policy prompt hook and logs the missing setting.
+The grant belongs beside `config`, not inside it.
 
 Restart OpenClaw after configuration changes.
 
@@ -187,6 +198,9 @@ Add a `lossless-claw` entry under `plugins.entries` in your OpenClaw config:
     "entries": {
       "lossless-claw": {
         "enabled": true,
+        "hooks": {
+          "allowConversationAccess": true
+        },
         "llm": {
           "allowModelOverride": true,
           "allowedModels": ["openai/gpt-5.4-mini"]

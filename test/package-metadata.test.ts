@@ -30,6 +30,20 @@ describe("package OpenClaw compatibility metadata", () => {
     expect(readProjectFile("docs/tui.md")).toContain("Shows runtime sessions");
   });
 
+  it("documents the OpenClaw conversation-hook trust grant", () => {
+    const readProjectFile = (path: string) =>
+      readFileSync(join(process.cwd(), path), "utf8");
+
+    for (const path of [
+      "README.md",
+      "docs/configuration.md",
+      "skills/lossless-claw/references/config.md",
+    ]) {
+      expect(readProjectFile(path)).toContain('"allowConversationAccess": true');
+    }
+    expect(readProjectFile("README.md")).toContain("before_prompt_build");
+  });
+
   it("publishes the TypeScript lcm executable", () => {
     expect(packageJson.bin).toEqual({
       lcm: "dist/cli.js",

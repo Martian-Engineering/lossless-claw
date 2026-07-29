@@ -8,7 +8,32 @@ This reference covers the current `lossless-claw` config surface on `main`, base
 
 - Ensure the plugin is installed and enabled.
 - Ensure the context-engine slot points at `lossless-claw` when you want it to own compaction.
+- Ensure `plugins.entries.lossless-claw.hooks.allowConversationAccess` is `true`
+  so OpenClaw does not block the `before_prompt_build` recall-policy hook.
 - Run `/lossless` (`/lcm` alias) to confirm the plugin is active and see the live DB path.
+
+## OpenClaw conversation-hook trust
+
+OpenClaw builds that protect conversation hooks require an explicit host grant
+for Lossless's `before_prompt_build` hook:
+
+```json
+{
+  "plugins": {
+    "entries": {
+      "lossless-claw": {
+        "hooks": {
+          "allowConversationAccess": true
+        }
+      }
+    }
+  }
+}
+```
+
+The `hooks` object is host policy beside `config`, not a Lossless config field.
+If it is absent, the context engine can still load while the static recall
+policy is omitted from the system prompt.
 
 ## High-impact settings
 
