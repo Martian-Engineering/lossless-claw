@@ -2727,11 +2727,10 @@ export class LcmContextEngine implements ContextEngine {
     }
 
     // Stable event identity short-circuit: when the message carries a stable
-    // event key (responseId / toolCallId / role+timestamp) that the
-    // conversation already holds, this is the same event under a different
-    // (likely redacted) content representation. Skip the duplicate insert
-    // before any side effects.
-    const stableEventKey = extractStableEventKey(message, conversationId);
+    // event key (responseId / toolCallId) that the conversation already holds,
+    // this is the same event under a different (likely redacted) content
+    // representation. Skip the duplicate insert before any side effects.
+    const stableEventKey = extractStableEventKey(message);
     if (
       stableEventKey &&
       (await this.conversationStore.hasMessageByStableEventKey(

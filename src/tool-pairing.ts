@@ -63,6 +63,48 @@ export function extractToolResultIdForPairing(message: AgentMessage): string | u
   return undefined;
 }
 
+/**
+ * Extracts one unambiguous tool-result id for whole-message identity.
+ *
+ * Aggregate tool-result messages return `undefined` because one shared id
+ * cannot prove that every result block in a later representation is a replay.
+ */
+export function extractSingleToolResultIdForPairing(
+  message: AgentMessage,
+): string | undefined {
+  if (message.role !== "tool" && message.role !== "toolResult") {
+    return undefined;
+  }
+
+  const topLevel = asRecord(message);
+  const directId = topLevel ? extractToolPairingIdFromRecord(topLevel) : undefined;
+  if (!("content" in message) || !Array.isArray(message.content)) {
+    return directId;
+  }
+
+  // Whole-message identity is safe only when the content carries at most one
+  // tool-result block. Multiple blocks can overlap only partially on replay.
+  let resultBlockCount = 0;
+  let contentId: string | undefined;
+  for (const block of message.content) {
+    const record = asRecord(block);
+    if (!record || typeof record.type !== "string" || !TOOL_RESULT_RAW_TYPES.has(record.type)) {
+      continue;
+    }
+    resultBlockCount += 1;
+    if (resultBlockCount > 1) {
+      return undefined;
+    }
+    contentId = extractToolPairingIdFromRecord(record);
+  }
+
+  // Conflicting top-level and block ids are ambiguous, so preserve the row.
+  if (directId && contentId && directId !== contentId) {
+    return undefined;
+  }
+  return directId ?? contentId;
+}
+
 export type ToolCallInputMap = ReadonlyMap<
   string,
   { name?: string; input?: Record<string, unknown> }

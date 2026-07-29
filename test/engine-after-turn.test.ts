@@ -4862,11 +4862,9 @@ describe("LcmContextEngine afterTurn", () => {
   });
 
   it("afterTurn dedupes assistant runtime messages against transcript by responseId", async () => {
-    // Stable-event dedup (Task 6): the transcript imports a redacted assistant
-    // message carrying responseId="resp-001"; the runtime batch arrives with
-    // the same responseId but the original (unredacted) content. Only one row
-    // should land in the DB, and its body must match the transcript's redacted
-    // content (the prior row stays canonical).
+    // The transcript imports a redacted assistant message carrying
+    // responseId="resp-001"; the runtime batch arrives with the same responseId
+    // but original content. The previously persisted redacted row stays canonical.
     const engine = createEngine();
     const sessionId = "after-turn-stable-event-response-id";
     const sessionKey = "agent:main:stable-event-response-id";
@@ -4900,11 +4898,9 @@ describe("LcmContextEngine afterTurn", () => {
   });
 
   it("afterTurn dedupes tool/toolResult messages by toolCallId", async () => {
-    // Stable-event dedup (Task 6, spec section 7.3 scenario B): the transcript
-    // imports a redacted toolResult message carrying toolCallId="call-001"; the
-    // runtime batch arrives with the same toolCallId but the original (unredacted)
-    // body. Only one row should land in the DB, and its body must match the
-    // transcript's redacted content (the prior row stays canonical).
+    // The transcript imports a redacted toolResult message carrying
+    // toolCallId="call-001"; the runtime batch arrives with the same toolCallId
+    // but original content. The previously persisted redacted row stays canonical.
     const engine = createEngine();
     const sessionId = "after-turn-stable-event-tool-call-id";
     const sessionKey = "agent:main:stable-event-tool-call-id";

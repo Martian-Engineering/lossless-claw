@@ -601,6 +601,37 @@ describe("LcmContextEngine fidelity and token budget", () => {
     ).toBe(3);
   });
 
+  it("deduplicates stable event ids within one ingestBatch transaction", async () => {
+    const engine = createEngine();
+    const sessionId = "batch-ingest-stable-event-dedup-session";
+
+    const result = await engine.ingestBatch({
+      sessionId,
+      messages: [
+        makeMessage({
+          role: "assistant",
+          content: "redacted transcript representation",
+          responseId: "resp-shared",
+        }),
+        makeMessage({
+          role: "assistant",
+          content: "original runtime representation",
+          responseId: "resp-shared",
+        }),
+      ],
+    });
+
+    expect(result.ingestedCount).toBe(1);
+    const conversation = await engine.getConversationStore().getConversationBySessionId(sessionId);
+    expect(conversation).not.toBeNull();
+    const messages = await engine
+      .getConversationStore()
+      .getMessages(conversation!.conversationId);
+    expect(messages.map((message) => message.content)).toEqual([
+      "redacted transcript representation",
+    ]);
+  });
+
   it("deduplicates persisted replay rows in ingestBatch", async () => {
     const engine = createEngine();
     const sessionId = "batch-ingest-replay-dedup-session";
@@ -1322,7 +1353,7 @@ describe("LcmContextEngine fidelity and token budget", () => {
       content: [
         {
           type: "tool_result",
-          tool_use_id: "call_duplicate_large_v2",
+          tool_use_id: "call_duplicate_large",
           name: "exec",
           content: [{ type: "text", text: changedFirstOutput }],
         },
@@ -1371,7 +1402,7 @@ describe("LcmContextEngine fidelity and token budget", () => {
         { type: "tool_result", tool_use_id: "raw-part-existing", output: "old output" },
         { type: "tool_result", tool_use_id: "raw-part-new", output: "new output" },
       ],
-      toolCallId: "raw-part-existing-v2",
+      toolCallId: "raw-part-existing",
       timestamp: baseTimestamp + 1,
     });
 

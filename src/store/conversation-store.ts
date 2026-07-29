@@ -5,7 +5,6 @@ import { appendConversationScopeConstraint } from "./conversation-scope.js";
 import { sanitizeFts5Query } from "./fts5-sanitize.js";
 import { buildLikeSearchPlan, containsCjk, createFallbackSnippet } from "./full-text-fallback.js";
 import { buildMessageIdentityHash } from "./message-identity.js";
-import { STABLE_EVENT_KEY_BATCH_CHUNK } from "../stable-event-key.js";
 import { parseUtcTimestamp, parseUtcTimestampOrNull } from "./parse-utc-timestamp.js";
 import { buildFtsOrderBy, type SearchSort } from "./full-text-sort.js";
 import { compileSafeSearchRegex } from "./search-regex.js";
@@ -48,10 +47,10 @@ export type CreateMessageInput = {
    */
   transcriptEntryId?: string | null;
   /**
-   * Cross-representation stable event identity (responseId / toolCallId /
-   * role+timestamp) used to short-circuit duplicate ingestion when the
-   * transcript (often redacted) and the live runtime batch describe the
-   * same semantic event. Null/undefined preserves the existing behavior.
+   * Cross-representation stable event identity (responseId / toolCallId) used
+   * to short-circuit duplicate ingestion when the transcript (often redacted)
+   * and the live runtime batch describe the same semantic event.
+   * Null/undefined preserves the existing behavior.
    */
   stableEventKey?: string | null;
   // Use only when the caller is intentionally importing a fresh transcript epoch.
@@ -364,16 +363,6 @@ export function normalizeMessageContentForFullTextIndex(content: string): string
 
   const normalized = [header, ...summaryLines].filter((line) => line.length > 0).join("\n");
   return normalized || null;
-}
-
-/** Split an array into fixed-size chunks; the final chunk may be shorter. */
-function chunkArray<T>(values: readonly T[], size: number): T[][] {
-  if (size <= 0 || values.length <= size) return [values.slice()];
-  const out: T[][] = [];
-  for (let i = 0; i < values.length; i += size) {
-    out.push(values.slice(i, i + size));
-  }
-  return out;
 }
 
 // ── ConversationStore ─────────────────────────────────────────────────────────
@@ -896,8 +885,8 @@ export class ConversationStore {
 
   /**
    * Whether this conversation already holds a message with the given
-   * stable event key (responseId / toolCallId / role+timestamp). Used
-   * by `ingestSingle` to short-circuit cross-representation duplicates.
+   * stable event key (responseId / toolCallId). Used by `ingestSingle`
+   * to short-circuit cross-representation duplicates.
    */
   async hasMessageByStableEventKey(
     conversationId: ConversationId,
@@ -913,35 +902,6 @@ export class ConversationStore {
       .get(conversationId, stableEventKey) as unknown as CountRow | undefined;
 
     return row?.count === 1;
-  }
-
-  /**
-   * Return the subset of `keys` that already exist as `stable_event_key`
-   * values on messages within this conversation. Uses one prepared
-   * statement reused across chunks so SQLite can cache the plan.
-   */
-  async filterExistingStableEventKeys(
-    conversationId: ConversationId,
-    keys: readonly string[],
-  ): Promise<Set<string>> {
-    const out = new Set<string>();
-    if (keys.length === 0) return out;
-    for (const chunk of chunkArray(keys, STABLE_EVENT_KEY_BATCH_CHUNK)) {
-      const placeholders = chunk.map(() => "?").join(", ");
-      const rows = this.db
-        .prepare(
-          `SELECT stable_event_key
-           FROM messages
-           WHERE conversation_id = ? AND stable_event_key IN (${placeholders})`,
-        )
-        .all(conversationId, ...chunk) as unknown as Array<{ stable_event_key: string }>;
-      for (const row of rows) {
-        if (typeof row.stable_event_key === "string" && row.stable_event_key.length > 0) {
-          out.add(row.stable_event_key);
-        }
-      }
-    }
-    return out;
   }
 
   /**

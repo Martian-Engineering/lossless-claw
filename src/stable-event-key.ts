@@ -1,25 +1,16 @@
-/**
- * Stable event identity for a single message across transcript and runtime
- * representations. Used to short-circuit duplicate ingestion when the
- * transcript (typically redacted) and the live afterTurn batch (typically
- * original) describe the same event.
- *
- * Priority:
- * 1. assistant: `responseId` (or `response_id`).
- * 2. tool / toolResult: tool call id (paired id preferred; fall back to
- *    top-level `toolCallId` / `tool_call_id` / `toolUseId` / `tool_use_id`
- *    / `call_id` / `id`).
- * 3. no stable id available → `null` (falls back to existing
- *    identity_hash-based dedup and messagesDifferOnlyByHostRedaction).
- */
 import type { AgentMessage } from "./openclaw-bridge.js";
-import { extractToolResultIdForPairing } from "./tool-pairing.js";
+import { extractSingleToolResultIdForPairing } from "./tool-pairing.js";
 import { safeString } from "./value-utils.js";
 
-export function extractStableEventKey(
-  message: AgentMessage,
-  conversationId: number,
-): string | null {
+/**
+ * Extracts a message identity that remains stable across transcript and
+ * runtime representations.
+ *
+ * Assistant response ids take priority, followed by tool call ids. Messages
+ * without either identifier return `null` and use the existing content-based
+ * and redaction-aware deduplication paths.
+ */
+export function extractStableEventKey(message: AgentMessage): string | null {
   const role = message.role;
 
   if (role === "assistant") {
@@ -32,7 +23,7 @@ export function extractStableEventKey(
   }
 
   if (role === "tool" || role === "toolResult") {
-    const toolCallId = extractToolResultIdForPairing(message);
+    const toolCallId = extractSingleToolResultIdForPairing(message);
     if (toolCallId) {
       return `tool-result:${toolCallId}`;
     }
@@ -43,6 +34,3 @@ export function extractStableEventKey(
   // messagesDifferOnlyByHostRedaction for redaction handling.
   return null;
 }
-
-/** Batch chunk size consumed by the store query helper for batched lookups. */
-export const STABLE_EVENT_KEY_BATCH_CHUNK = 200;
