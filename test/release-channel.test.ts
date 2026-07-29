@@ -1,7 +1,9 @@
 import { spawnSync } from "node:child_process";
+import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { describe, expect, it } from "vitest";
 
+const repositoryRoot = fileURLToPath(new URL("../", import.meta.url));
 const script = fileURLToPath(
   new URL("../scripts/release-channel.mjs", import.meta.url),
 );
@@ -154,5 +156,31 @@ Stable notes.
     expect(result.stderr).toContain(
       "Expected exactly one valid rollback marker for 0.14.0-beta.0",
     );
+  });
+});
+
+describe("repository release metadata", () => {
+  const packageJson = JSON.parse(
+    readFileSync(`${repositoryRoot}/package.json`, "utf8"),
+  );
+  const packageLock = JSON.parse(
+    readFileSync(`${repositoryRoot}/package-lock.json`, "utf8"),
+  );
+
+  it("keeps one valid rollback marker for the current package version", () => {
+    const changelog = readFileSync(`${repositoryRoot}/CHANGELOG.md`, "utf8");
+    const result = runWithInput(
+      changelog,
+      "--read-rollback",
+      packageJson.version,
+    );
+
+    expect(result.stderr).toBe("");
+    expect(result.status).toBe(0);
+  });
+
+  it("keeps package and lockfile root versions aligned", () => {
+    expect(packageLock.version).toBe(packageJson.version);
+    expect(packageLock.packages[""].version).toBe(packageJson.version);
   });
 });
