@@ -415,7 +415,7 @@ describe("afterTurn covered-frontier alignment", () => {
     expect(messages.map((message) => message.content)).toEqual(["nice! thank you!"]);
   });
 
-  it("collapses a conv-info-only runtime copy onto its transcript-proven bare row without a sibling anchor", async () => {
+  it("keeps a conv-info-only runtime copy without a sibling anchor", async () => {
     const sessionFile = createSessionFilePath("decorated-convinfo-repeat");
     const header = JSON.stringify({
       type: "session",
@@ -453,16 +453,12 @@ describe("afterTurn covered-frontier alignment", () => {
       .getConversationStore()
       .getConversationForSession({ sessionId });
     const messages = await engine.getConversationStore().getMessages(conversation!.conversationId);
-    // Re-derived contract (2026-07-28): the bare row here is transcript-proven
-    // (imported from a real jsonl entry, non-null transcript_entry_id), which
-    // is the non-forgeable marker the metadata-body match anchors on — no
-    // sibling anchor needed. The old expectation (keep both rows) pinned the
-    // live store double-write that filled every Slack conversation with
-    // bare+decorated pairs. The fail-closed descendant of the old premise
-    // lives in test/metadata-face-double-write.test.ts: without transcript
-    // provenance the pair still deliberately duplicates.
+    // The bare row is transcript-proven, but that authenticates only the
+    // stored row. It does not prove this incoming metadata face belongs to the
+    // same entry, so without another exact/timestamp anchor both rows survive.
     expect(messages.map((message) => message.content)).toEqual([
       "Hey there! hows it going?",
+      decorated,
     ]);
   });
 

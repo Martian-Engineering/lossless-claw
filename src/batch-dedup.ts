@@ -43,17 +43,10 @@ type StoredIncomingMatch =
   | "unproven-externalized"
   | "redacted";
 type CoveredStoredIncomingMatch = StoredIncomingMatch | "decorated";
-type AlignmentMatch =
-  | CoveredStoredIncomingMatch
-  | "unanchored-inbound"
-  | "provenanced-inbound";
+type AlignmentMatch = CoveredStoredIncomingMatch | "unanchored-inbound";
 
-// A metadata-body match may anchor a collapse only when the persisted
-// counterpart is transcript-proven (non-null transcript_entry_id): a user can
-// forge a metadata block, but not a row written by the host's own transcript
-// flush. Provenance-less matches stay weak and duplicate instead of trimming.
 function isStrongReplayAnchor(match: AlignmentMatch | undefined): boolean {
-  return match === "exact" || match === "decorated" || match === "provenanced-inbound";
+  return match === "exact" || match === "decorated";
 }
 
 function redactedMatchesHaveAdjacentAnchor(matches: readonly AlignmentMatch[]): boolean {
@@ -308,6 +301,7 @@ export class BatchDeduplicator {
             continue;
           }
           if (
+            tailMessages[i]!.transcriptEntryId != null &&
             this.runtimeRowCoversPersistedFrontierRow(
               tailMessages[i]!.role,
               tailMessages[i]!.content,
@@ -316,11 +310,10 @@ export class BatchDeduplicator {
               { allowUntimestampedInboundBodyMatch: true },
             )
           ) {
-            matches.push(
-              tailMessages[i]!.transcriptEntryId != null
-                ? "provenanced-inbound"
-                : "unanchored-inbound",
-            );
+            // Stored provenance qualifies this as alignment support, but it
+            // authenticates only the persisted row. Another exact/timestamp
+            // anchor must still prove the runtime batch is a replay.
+            matches.push("unanchored-inbound");
             continue;
           }
           aligned = false;
@@ -479,12 +472,6 @@ export class BatchDeduplicator {
           lastDbMessage.content,
           batchAtBoundary.role,
           batchAtBoundary.content,
-          {
-            // Heuristic-route matches may collapse only against a
-            // transcript-proven row (see isStrongReplayAnchor).
-            allowCollapsedSpaceRunMatch: lastDbMessage.transcriptEntryId != null,
-            allowUntimestampedInboundBodyMatch: lastDbMessage.transcriptEntryId != null,
-          },
         ) &&
           !(await this.messagesDifferOnlyByHostRedaction(
             lastDbMessage,
@@ -546,11 +533,6 @@ export class BatchDeduplicator {
             storedMessages[i]!.content,
             storedBatch[i]!.role,
             storedBatch[i]!.content,
-            {
-              allowCollapsedSpaceRunMatch: storedMessages[i]!.transcriptEntryId != null,
-              allowUntimestampedInboundBodyMatch:
-                storedMessages[i]!.transcriptEntryId != null,
-            },
           )
         ) {
           return batch;
@@ -595,7 +577,7 @@ export class BatchDeduplicator {
       );
       if (tailMessages.length === batch.length && tailHashes.length === batch.length) {
         let tailMatch = true;
-        const matches: AlignmentMatch[] = [];
+        const matches: CoveredStoredIncomingMatch[] = [];
         for (let i = 0; i < batch.length; i++) {
           const match = await this.matchStoredMessageToIncomingOrDecoratedCoverage(
             tailMessages[i]!,
@@ -684,7 +666,7 @@ export class BatchDeduplicator {
       const matchLen = Math.min(k + 1, allRecentHashes.length);
       const startDb = allRecentHashes.length - matchLen;
       let suffixMatch = true;
-      const matches: AlignmentMatch[] = [];
+      const matches: CoveredStoredIncomingMatch[] = [];
       for (let j = 0; j < matchLen; j++) {
         const match = await this.matchStoredMessageToIncomingOrDecoratedCoverage(
           allStored[startDb + j]!,
@@ -760,7 +742,7 @@ export class BatchDeduplicator {
     incomingHash: string,
     storedHash: string,
     incomingRawPayloadContent?: string | null,
-  ): Promise<CoveredStoredIncomingMatch | "provenanced-inbound" | null> {
+  ): Promise<CoveredStoredIncomingMatch | null> {
     const match = await this.matchStoredMessageToIncoming(
       storedMessage,
       incoming,
@@ -778,24 +760,9 @@ export class BatchDeduplicator {
         storedMessage.content,
         incoming.role,
         incoming.content,
-        { allowCollapsedSpaceRunMatch: storedMessage.transcriptEntryId != null },
       )
     ) {
       return "decorated";
-    }
-    // Body-equality after metadata stripping: anchoring strength comes from
-    // the persisted row's transcript provenance, never the match alone.
-    if (
-      storedMessage.transcriptEntryId != null &&
-      this.runtimeRowCoversPersistedFrontierRow(
-        storedMessage.role,
-        storedMessage.content,
-        incoming.role,
-        incoming.content,
-        { allowUntimestampedInboundBodyMatch: true },
-      )
-    ) {
-      return "provenanced-inbound";
     }
     return null;
   }

@@ -177,38 +177,10 @@ describe("openClawInboundBodiesMatch with a host chat-history recap block (issue
     ).toBe(true);
   });
 
-  it("strips a structurally valid recap even when metadata omits history_count (host does on some channels)", () => {
-    // Re-derived contract (2026-07-28): live telegram inbound carries a recap
-    // block while its metadata record has NO history_count field at all, so
-    // announcement-gating the strip left the recap glued to the body and every
-    // such turn double-wrote. Structural validation is the gate; the record
-    // field is a hint. Fail-closed is preserved by full-body equality plus the
-    // neighbours below: a recap concealing a DIFFERENT body still never
-    // matches, and a bare row that genuinely contains recap-shaped text keeps
-    // it (the bare side is never stripped).
+  it("does NOT strip a valid recap-shaped user body when metadata reports no history", () => {
     const bare = "what's the status on the deploy?";
     const recapShapedBody = `${TWO_ENTRY_RECAP}\n\n${bare}`;
-    expect(openClawInboundBodiesMatch(metadataWrapped(recapShapedBody), bare)).toBe(true);
-    // The bare row keeping its own recap-shaped prefix stays distinct: equality
-    // runs on the full stripped decorated body vs the full bare body.
-    expect(
-      openClawInboundBodiesMatch(metadataWrapped(recapShapedBody), recapShapedBody),
-    ).toBe(false);
-  });
-
-  it("matches the live telegram face: line-form recap with no history_count in metadata", () => {
-    // Byte-shape of the 2026-07-28 live rows (conversation 168): metadata
-    // record without history_count, line-grammar recap under the
-    // conversation-context header, then the bare body.
-    const bare = "quick status ping, did the overnight jobs finish?";
-    const lineRecap = [
-      "Conversation context (untrusted, chronological, selected for current message):",
-      "#12 Tue 2026-07-22 10:00 GMT+3 sam.rivera: earlier message about the build",
-      "#13 Tue 2026-07-22 10:02 GMT+3 lee.chen: replied with the runbook link",
-    ].join("\n");
-    expect(
-      openClawInboundBodiesMatch(metadataWrapped(`${lineRecap}\n\n${bare}`), bare),
-    ).toBe(true);
+    expect(openClawInboundBodiesMatch(metadataWrapped(recapShapedBody), bare)).toBe(false);
   });
 
   it("does NOT strip a leading host-context-shaped body when no valid recap follows", () => {

@@ -94,8 +94,9 @@ export type MessageRecord = {
   /**
    * Transcript provenance: non-null only when the row was imported from a
    * transcript envelope written by the host's own flush — a marker a user
-   * cannot forge. Dedup uses it to decide whether a metadata-body match
-   * against this row may anchor a collapse.
+   * cannot forge. Covered-frontier dedup requires it before a metadata-body
+   * match may support alignment; an independent replay anchor is still
+   * required before collapse.
    */
   transcriptEntryId: string | null;
 };

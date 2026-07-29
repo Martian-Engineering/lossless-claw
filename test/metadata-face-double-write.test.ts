@@ -1,14 +1,14 @@
-// Metadata-face store double-write across the afterTurn dedup routes.
+// Metadata-face store double-write across the afterTurn dedup boundaries.
 //
 // OpenClaw delivers the same inbound turn in two faces: the transcript
 // persists the BARE body (with a transcript_entry_id), while the runtime
 // AgentMessage carries the DECORATED face ("Conversation info (untrusted
 // metadata)" block + body). Their identity_hashes differ, so identity dedup
 // cannot see the pair; the metadata-body match must collapse it. Anchoring
-// strength comes from the persisted row's transcript provenance: a user can
-// forge a metadata block, but not a row written by the host's own transcript
-// flush. Without provenance the pair deliberately duplicates (duplicates over
-// deletion); with it, exactly one row survives and it is always the bare one.
+// The covered-frontier path requires both persisted transcript provenance and
+// an independent exact/timestamp replay anchor. Heuristic degraded and
+// oversized routes cannot prove that an incoming face belongs to that row, so
+// they preserve both faces (duplicates over deletion).
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { LcmContextEngine } from "../src/engine.js";
 import {
@@ -31,6 +31,17 @@ function decorated(body: string): string {
   );
 }
 
+function decoratedWithAnnouncedRecap(body: string): string {
+  const recap = [
+    "Conversation context (untrusted, chronological, selected for current message):",
+    "#12 Tue 2026-07-22 10:00 GMT+3 sam.rivera: earlier message about the build",
+  ].join("\n");
+  return (
+    'Conversation info (untrusted metadata):\n```json\n{\n  "chat_id": "user:U0EXAMPLE01",\n  "sender": "sam.rivera",\n  "history_count": 1\n}\n```\n\n' +
+    `${recap}\n\n${body}`
+  );
+}
+
 function quietEngine(): LcmContextEngine {
   return createEngineWithDeps(
     {},
@@ -39,7 +50,7 @@ function quietEngine(): LcmContextEngine {
 }
 
 describe("metadata-face covered-path double-write", () => {
-  it("collapses the decorated runtime twin onto the transcript-proven bare row (covered route)", async () => {
+  it("collapses an announced-recap twin when a sibling exact row anchors the covered route", async () => {
     const engine = quietEngine();
     const sessionId = "metadata-face-covered-double-write";
     const sessionKey = "agent:main:metadata-face-covered-double-write";
@@ -53,6 +64,15 @@ describe("metadata-face covered-path double-write", () => {
       {
         conversationId: conversation.conversationId,
         seq: 0,
+        role: "assistant",
+        content: "previous exact reply",
+        tokenCount: 3,
+        transcriptEntryId: "probe-entry-0002",
+        skipReplayTimestampFloodGuard: true,
+      },
+      {
+        conversationId: conversation.conversationId,
+        seq: 1,
         role: "user",
         content: BARE,
         tokenCount: 12,
@@ -65,7 +85,10 @@ describe("metadata-face covered-path double-write", () => {
       .appendContextMessages(conversation.conversationId, bulk.map((m) => m.messageId));
 
     const sessionFile = createSessionFilePath("metadata-face-covered-double-write");
-    writeLeafTranscript(sessionFile, [{ role: "user", content: BARE }]);
+    writeLeafTranscript(sessionFile, [
+      { role: "assistant", content: "previous exact reply" },
+      { role: "user", content: BARE },
+    ]);
     await engine.getSummaryStore().upsertConversationBootstrapState({
       conversationId: conversation.conversationId,
       sessionFilePath: sessionFile,
@@ -80,7 +103,8 @@ describe("metadata-face covered-path double-write", () => {
       sessionKey,
       sessionFile,
       messages: [
-        makeMessage({ role: "user", content: decorated(BARE) }),
+        makeMessage({ role: "assistant", content: "previous exact reply" }),
+        makeMessage({ role: "user", content: decoratedWithAnnouncedRecap(BARE) }),
         makeMessage({ role: "assistant", content: "all overnight jobs finished green" }),
       ],
       prePromptMessageCount: 0,
@@ -97,7 +121,7 @@ describe("metadata-face covered-path double-write", () => {
     ).toBe(true);
   });
 
-  it("collapses the decorated twin on the degraded route when the persisted row is transcript-proven", async () => {
+  it("keeps the decorated turn on the degraded route even when the persisted row is transcript-proven", async () => {
     const engine = quietEngine();
     const sessionId = "metadata-face-degraded-double-write";
     const sessionKey = "agent:main:metadata-face-degraded-double-write";
@@ -143,11 +167,12 @@ describe("metadata-face covered-path double-write", () => {
     const userRows = (
       await engine.getConversationStore().getMessages(conversation.conversationId)
     ).filter((m) => m.role === "user" && m.content.includes(BARE));
-    expect(userRows).toHaveLength(1);
-    expect(userRows[0]!.content).toBe(BARE);
+    expect(userRows).toHaveLength(2);
+    expect(userRows.some((m) => m.content === BARE)).toBe(true);
+    expect(userRows.some((m) => m.content !== BARE)).toBe(true);
   });
 
-  it("collapses the decorated twin on the oversized-suffix route when the persisted row is transcript-proven", async () => {
+  it("keeps the decorated turn on the oversized-suffix route even when the persisted row is transcript-proven", async () => {
     const engine = quietEngine();
     const sessionId = "metadata-face-oversized-double-write";
     const sessionKey = "agent:main:metadata-face-oversized-double-write";
@@ -202,8 +227,9 @@ describe("metadata-face covered-path double-write", () => {
 
     const stored = await engine.getConversationStore().getMessages(conversation.conversationId);
     const userRows = stored.filter((m) => m.role === "user" && m.content.includes(BARE));
-    expect(userRows).toHaveLength(1);
-    expect(userRows[0]!.content).toBe(BARE);
+    expect(userRows).toHaveLength(2);
+    expect(userRows.some((m) => m.content === BARE)).toBe(true);
+    expect(userRows.some((m) => m.content !== BARE)).toBe(true);
     expect(
       stored.some((m) => m.role === "assistant" && m.content.includes("fresh reply")),
     ).toBe(true);
