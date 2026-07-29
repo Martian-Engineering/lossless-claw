@@ -2340,6 +2340,11 @@ export class LcmContextEngine implements ContextEngine {
           // successful transcript read, even when the DB frontier does not
           // overlap the transcript. Otherwise the next afterTurn cannot resume
           // from the current transcript offset.
+          //
+          // conversation.bootstrappedAt here reflects the in-memory state
+          // *before* markConversationBootstrapped above — it is intentionally
+          // stale. A refactor that refreshes the local record after the mark
+          // call should also update this gate to prevent a silent regression.
           if (
             reconcile.hasOverlap ||
             (historicalMessages.length > 0 && !bootstrapState && !conversation.bootstrappedAt)

@@ -3728,6 +3728,9 @@ describe("LcmContextEngine.bootstrap", () => {
     // checkpoint row, afterTurn classifies the conversation as
     // "checkpoint-missing" and skips all persistence permanently.
     //
+    // Before the fix, bootstrap skipped persistBootstrapState when
+    // reconcile had no overlap — leaving the conversation permanently
+    // frozen at checkpoint-missing on every subsequent afterTurn.
     // This test asserts that bootstrap creates the checkpoint even in the
     // no-overlap case, so afterTurn can recover on the next turn.
     const sessionFile = createSessionFilePath("bootstrap-checkpoint-no-overlap");
@@ -3802,6 +3805,12 @@ describe("LcmContextEngine.bootstrap", () => {
       "next transcript user",
       "next transcript assistant",
     ]);
+
+    // Re-bootstrap must be idempotent — a second call returns
+    // "already bootstrapped" without re-persisting.
+    const reResult = await engine.bootstrap({ sessionId, sessionFile });
+    expect(reResult.bootstrapped).toBe(false);
+    expect(reResult.reason).toBe("already bootstrapped");
   });
 
   it("does not advance the bootstrap checkpoint when reconcile aborts at the import cap", async () => {
