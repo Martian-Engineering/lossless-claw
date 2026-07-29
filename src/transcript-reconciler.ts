@@ -610,16 +610,15 @@ export class TranscriptReconciler {
   }
 
   /**
-   * Decide whether a placeholder-checkpoint conversation may recover by importing
-   * its on-disk transcript as a new epoch (#822). Safe ONLY when the persisted
-   * frontier holds no real conversation content that a rotated/unrelated transcript
-   * could overwrite. Generalizes #837's single-injected-metadata-preamble check to
-   * any frontier composed entirely of non-anchoring injected-metadata rows; an
-   * empty frontier is trivially safe, and a larger or non-metadata frontier
-   * conservatively returns false so the conversation freezes (#649) rather than
-   * risk contaminating real history (the failure that closed #824).
+   * Decide whether a conversation may recover without a content anchor.
+   *
+   * Safe ONLY when the persisted frontier holds no real conversation content
+   * that a rotated or unrelated transcript could overwrite. Generalizes #837's
+   * single injected-metadata preamble to any frontier composed entirely of
+   * non-anchoring metadata rows; a larger or real-content frontier remains
+   * fail-closed per #649 and the contamination failure that closed #824.
    */
-  private async conversationFrontierIsEntirelyNonAnchoring(
+  async conversationFrontierIsEntirelyNonAnchoring(
     conversationId: number,
   ): Promise<boolean> {
     const existingMessageCount = await this.host.conversationStore.getMessageCount(conversationId);

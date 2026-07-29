@@ -461,6 +461,16 @@ describe("LcmContextEngine.bootstrap", () => {
       importedMessages: 0,
       reason: "conversation already has messages",
     });
+
+    const checkpoint = await engine
+      .getSummaryStore()
+      .getConversationBootstrapState(conversation!.conversationId);
+    expect(checkpoint).toBeNull();
+
+    const rereadConversation = await engine
+      .getConversationStore()
+      .getConversationBySessionId(sessionId);
+    expect(rereadConversation?.bootstrappedAt).toBeNull();
   });
 
   it("preserves existing conversation data when the session file rotates", async () => {
@@ -3743,6 +3753,105 @@ describe("LcmContextEngine.bootstrap", () => {
     expect(conversation).not.toBeNull();
     const stored = await engine.getConversationStore().getMessages(conversation!.conversationId);
     expect(stored.map((message) => message.content)).toEqual(["db only user", "db only assistant"]);
+    expect(conversation!.bootstrappedAt).toBeNull();
+    await expect(
+      engine
+        .getSummaryStore()
+        .getConversationBootstrapState(conversation!.conversationId),
+    ).resolves.toBeNull();
+  });
+
+  it("recovers a first bootstrap with a non-anchoring DB frontier, so afterTurn does not freeze in checkpoint-missing", async () => {
+    // When ingest() runs before bootstrap() (race), the conversation has
+    // only injected metadata and no bootstrap_state. If the transcript does
+    // not overlap those non-anchoring rows, importing the readable transcript
+    // is safe because there is no real DB history to contaminate.
+    //
+    // Bootstrap must import that transcript before establishing its checkpoint
+    // so afterTurn can safely resume from the verified frontier.
+    const sessionFile = createSessionFilePath("bootstrap-checkpoint-no-overlap");
+    const sm = SessionManager.open(sessionFile);
+    appendSessionMessage(sm, {
+      role: "user",
+      content: [{ type: "text", text: "transcript only user" }],
+    } as AgentMessage);
+    appendSessionMessage(sm, {
+      role: "assistant",
+      content: [{ type: "text", text: "transcript only assistant" }],
+    } as AgentMessage);
+
+    const engine = createEngine();
+    const sessionId = "bootstrap-checkpoint-no-overlap";
+
+    // Simulate ingest-before-bootstrap with a proven non-anchoring frontier.
+    await engine.ingest({
+      sessionId,
+      message: {
+        role: "user",
+        content: "Conversation info (untrusted metadata): injected preamble one",
+      } as AgentMessage,
+    });
+    await engine.ingest({
+      sessionId,
+      message: {
+        role: "user",
+        content: "Conversation info (untrusted metadata): injected preamble two",
+      } as AgentMessage,
+    });
+
+    const result = await engine.bootstrap({ sessionId, sessionFile });
+    expect(result.bootstrapped).toBe(true);
+    expect(result.importedMessages).toBe(2);
+    expect(result.reason).toBe("reconciled missing session messages");
+
+    const conversation = await engine
+      .getConversationStore()
+      .getConversationBySessionId(sessionId);
+    expect(conversation).not.toBeNull();
+    expect(conversation!.bootstrappedAt).not.toBeNull();
+
+    // The transcript import establishes the checkpoint after verified progress.
+    const bootstrapState = await engine
+      .getSummaryStore()
+      .getConversationBootstrapState(conversation!.conversationId);
+    expect(bootstrapState).not.toBeNull();
+    expect(bootstrapState!.sessionFilePath).toBe(sessionFile);
+    expect(bootstrapState!.lastSeenSize).toBe(statSync(sessionFile).size);
+    expect(bootstrapState!.lastProcessedOffset).toBe(statSync(sessionFile).size);
+
+    const nextTurn = [
+      makeMessage({ role: "user", content: "next transcript user" }),
+      makeMessage({ role: "assistant", content: "next transcript assistant" }),
+    ];
+    for (const message of nextTurn) {
+      appendSessionMessage(sm, message as AgentMessage);
+    }
+    await engine.afterTurn({
+      sessionId,
+      sessionFile,
+      messages: nextTurn,
+      prePromptMessageCount: 0,
+      tokenBudget: 4096,
+    });
+
+    // Metadata is preserved, transcript history imports, and the next turn advances.
+    const stored = await engine
+      .getConversationStore()
+      .getMessages(conversation!.conversationId);
+    expect(stored.map((m) => m.content)).toEqual([
+      "Conversation info (untrusted metadata): injected preamble one",
+      "Conversation info (untrusted metadata): injected preamble two",
+      "transcript only user",
+      "transcript only assistant",
+      "next transcript user",
+      "next transcript assistant",
+    ]);
+
+    // Re-bootstrap must be idempotent — a second call returns
+    // "already bootstrapped" without re-persisting.
+    const reResult = await engine.bootstrap({ sessionId, sessionFile });
+    expect(reResult.bootstrapped).toBe(false);
+    expect(reResult.reason).toBe("already bootstrapped");
   });
 
   it("does not advance the bootstrap checkpoint when reconcile aborts at the import cap", async () => {

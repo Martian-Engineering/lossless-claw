@@ -2308,6 +2308,13 @@ export class LcmContextEngine implements ContextEngine {
 
           // Existing conversation path: reconcile crash gaps by appending JSONL
           // messages that were never persisted to LCM.
+          const isFirstBootstrap = !conversation.bootstrappedAt;
+          const firstBootstrapFrontierIsNonAnchoring =
+            !bootstrapState &&
+            isFirstBootstrap &&
+            (await this.transcriptReconciler.conversationFrontierIsEntirelyNonAnchoring(
+              conversationId,
+            ));
           const reconcile = await this.transcriptReconciler.reconcileSessionTail({
             sessionId: params.sessionId,
             sessionKey: params.sessionKey,
@@ -2322,8 +2329,14 @@ export class LcmContextEngine implements ContextEngine {
                 ? undefined
                 : bootstrapState?.lastProcessedEntryId,
             skipContentAnchorScan: transcriptEpochReason === "same-path-shrink",
-            allowNoAnchorImport: transcriptEpochRotated,
-            noAnchorImportReason: transcriptEpochReason,
+            allowNoAnchorImport:
+              transcriptEpochRotated || firstBootstrapFrontierIsNonAnchoring,
+            allowFullNonAnchoringFrontierImport: firstBootstrapFrontierIsNonAnchoring,
+            noAnchorImportReason:
+              transcriptEpochReason ??
+              (firstBootstrapFrontierIsNonAnchoring
+                ? "checkpoint-missing-recovery"
+                : undefined),
           });
           this.deps.log.debug(
             `[lcm] bootstrap: reconcile finished conversation=${conversationId} ${sessionLabel} importedMessages=${reconcile.importedMessages} overlap=${reconcile.hasOverlap} blockedByImportCap=${reconcile.blockedByImportCap} duration=${formatDurationMs(Date.now() - startedAt)}`,
@@ -2345,7 +2358,9 @@ export class LcmContextEngine implements ContextEngine {
             };
           }
 
-          if (!conversation.bootstrappedAt) {
+          const firstBootstrapHasReadableProgress =
+            reconcile.importedMessages > 0 || reconcile.hasOverlap;
+          if (isFirstBootstrap && firstBootstrapHasReadableProgress) {
             await this.conversationStore.markConversationBootstrapped(conversationId);
           }
 
