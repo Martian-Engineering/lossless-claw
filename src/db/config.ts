@@ -173,6 +173,8 @@ export type LcmConfig = {
   timezone: string;
   /** When true, retroactively delete HEARTBEAT_OK turn cycles from LCM storage. */
   pruneHeartbeatOk: boolean;
+  /** When > 0, maintain() auto-prunes the oldest archived conversations to keep the DB under this byte limit. 0 = unlimited. */
+  maxDatabaseBytes: number;
   /** When true, maintain() may rewrite transcript entries for transcript GC. */
   transcriptGcEnabled: boolean;
   /** When true, requests low reasoning from the model for summarization calls. */
@@ -788,6 +790,10 @@ export function resolveLcmConfigWithDiagnostics(
         env.LCM_PRUNE_HEARTBEAT_OK !== undefined
           ? env.LCM_PRUNE_HEARTBEAT_OK === "true"
           : toBool(pc.pruneHeartbeatOk) ?? false,
+      maxDatabaseBytes:
+        toPositiveInteger(parseFiniteInt(env.LCM_MAX_DATABASE_BYTES))
+          ?? toPositiveInteger(toNumber(pc.maxDatabaseBytes))
+          ?? 0,
       transcriptGcEnabled:
         env.LCM_TRANSCRIPT_GC_ENABLED !== undefined
           ? env.LCM_TRANSCRIPT_GC_ENABLED === "true"

@@ -84,6 +84,7 @@ import { describeAssembledPrefixChange, formatOverflowDiagnosticsForLog, shouldL
 import { appendForkBoundedLiveSuffixWithinBudget, buildDegradedLiveAssembleResult, buildForkBoundedLiveFallback, clampMessagesToSerializedBudget, forkBoundedLiveSuffixAppendLogLevel, resolveDeferredAssemblyPressure } from "./assemble-fallback.js";
 import { resolveBootstrapMaxTokens, trimBootstrapMessagesToBudget } from "./bootstrap-budget.js";
 import { batchLooksLikeHeartbeatAckTurn, pruneHeartbeatOkTurns } from "./heartbeat-filter.js";
+import { getDatabaseSizeBytes, pruneArchivedConversationsToFitSize } from "./prune.js";
 import { appendUncoveredVolatileLiveInputsWithinBudget, isVolatileLiveInputMessage, messageContentCoveredBySummary, resolveProtectedFreshTailAssembledIndexes } from "./live-coverage.js";
 import { buildMessageParts, extractMessageContent, filterPersistableMessages, hasPersistableMessageRole, isOpenClawRuntimeContextLeak, toStoredMessage } from "./message-content.js";
 import { createBootstrapEntryHash, readBootstrapMessageFromJsonLine } from "./message-signatures.js";
@@ -305,6 +306,7 @@ export class LcmContextEngine implements ContextEngine {
    * readLeafPathMessages() call can be skipped entirely.
    */
   private lastFullReadFileState = new Map<number, { size: number; mtimeMs: number }>();
+  private lastAutoPruneAt = 0;
 
   // ── Circuit breaker + summary spend guard ───────────────────────────────
   private readonly compactionGuards: CompactionGuards;
@@ -2694,6 +2696,30 @@ export class LcmContextEngine implements ContextEngine {
       { operationName: "maintain", context: sessionLabel },
     );
     await runRuntimeAutoRotate();
+
+    if (this.config.maxDatabaseBytes > 0) {
+      const AUTO_PRUNE_INTERVAL_MS = 5 * 60 * 1000;
+      if (Date.now() - this.lastAutoPruneAt >= AUTO_PRUNE_INTERVAL_MS) {
+        this.lastAutoPruneAt = Date.now();
+        try {
+          const { deleted } = pruneArchivedConversationsToFitSize(
+            this.db,
+            this.config.maxDatabaseBytes,
+            { largeFilesDir: this.config.largeFilesDir },
+          );
+          if (deleted > 0) {
+            this.deps.log.info(
+              `[lcm] auto-prune: deleted ${deleted} archived conversation(s) to stay under maxDatabaseBytes=${this.config.maxDatabaseBytes}`,
+            );
+          }
+        } catch (err) {
+          this.deps.log.warn(
+            `[lcm] auto-prune: failed: ${String(err)}`,
+          );
+        }
+      }
+    }
+
     return result;
   }
   private async ingestSingle(params: {

@@ -54,6 +54,7 @@ function baseConfig(file: string, independentLogFileEnabled = true): LcmConfig {
     summaryTimeoutMs: 60000,
     timezone: "UTC",
     pruneHeartbeatOk: false,
+    maxDatabaseBytes: 0,
     transcriptGcEnabled: false,
     enableSummaryThinking: true,
     proactiveThresholdCompactionMode: "deferred",
