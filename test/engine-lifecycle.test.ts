@@ -6,6 +6,7 @@ import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { SessionManager } from "@earendil-works/pi-coding-agent";
+import packageJson from "../package.json" with { type: "json" };
 import { createLcmDatabaseConnection } from "../src/db/connection.js";
 import { LcmContextEngine } from "../src/engine.js";
 import type { AgentMessage } from "../src/openclaw-bridge.js";
@@ -35,6 +36,16 @@ describe("LcmContextEngine metadata", () => {
   it("reports the registered lossless-claw engine id", () => {
     const engine = createEngine();
     expect(engine.info.id).toBe("lossless-claw");
+  });
+
+  it("reports its package version and accepted OpenClaw host parameters", () => {
+    const engine = createEngine();
+    expect(engine.info.version).toBe(packageJson.version);
+    expect(engine.info.acceptedHostParams).toEqual([
+      "sessionKey",
+      "prompt",
+      "runtimeContext",
+    ]);
   });
 
   it("advertises ownsCompaction capability", () => {

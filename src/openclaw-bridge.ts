@@ -98,6 +98,7 @@ export type ContextEngineInfo = {
   id: string;
   name: string;
   version: string;
+  acceptedHostParams?: string[];
   ownsCompaction?: boolean;
   turnMaintenanceMode?: "background" | "inline" | string;
   hostRequirements?: Partial<Record<ContextEngineOperation, ContextEngineHostRequirements>>;
