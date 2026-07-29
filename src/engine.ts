@@ -2321,6 +2321,11 @@ export class LcmContextEngine implements ContextEngine {
             };
           }
 
+          // Only mark bootstrapped when the transcript was successfully read.
+          // An unreadable or empty transcript intentionally leaves the
+          // conversation unbootstrapped so a later successful read can retry
+          // (the old path set bootstrapped_at regardless, freezing afterTurn
+          // at checkpoint-missing with no recovery path).
           const firstBootstrapHasReadableProgress =
             reconcile.importedMessages > 0 || reconcile.hasOverlap || historicalMessages.length > 0;
           if (!conversation.bootstrappedAt && firstBootstrapHasReadableProgress) {
