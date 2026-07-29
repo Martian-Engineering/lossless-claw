@@ -2,6 +2,8 @@
 
 ## 0.15.1
 
+<!-- release-rollback-version: 0.15.0 -->
+
 ### Patch Changes
 
 - [#1046](https://github.com/Martian-Engineering/lossless-claw/pull/1046) [`e7b69cf`](https://github.com/Martian-Engineering/lossless-claw/commit/e7b69cf0614f3c567503c084ce7ff5edca8907c1) Thanks [@steipete](https://github.com/steipete)! - Declare the OpenClaw host parameters accepted by the context engine and report the package version in engine metadata.

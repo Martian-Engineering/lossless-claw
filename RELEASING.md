@@ -39,11 +39,18 @@ make sure a maintainer gets a `.changeset/*.md` file onto `main`.
 
 1. Merge releasable PRs to `main`
 2. Let the `Version Packages` workflow open or update the release PR
-3. Review the generated version bump and `CHANGELOG.md`
-4. Merge the release PR to `main`
-5. Manually trigger the `Publish Package` workflow on the merged release commit
-6. Approve the workflow if a protected GitHub Environment is configured
-7. Let the workflow:
+3. Add exactly one `<!-- release-rollback-version: X.Y.Z -->` marker to the
+   generated changelog section, where `X.Y.Z` is the current npm `latest`
+   version
+4. Run `npm install --package-lock-only` and verify `package.json`, the root
+   lockfile version, and the lockfile root package version all match
+5. Approve the bot-authored release PR's GitHub Actions runs, then wait for
+   exact-head CI and review gates to pass
+6. Review the generated version bump and `CHANGELOG.md`
+7. Merge the release PR to `main`
+8. Manually trigger the `Publish Package` workflow on the merged release commit
+9. Approve the workflow if a protected GitHub Environment is configured
+10. Let the workflow:
    - install dependencies
    - run tests
    - publish to npm
