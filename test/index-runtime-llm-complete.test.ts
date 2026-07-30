@@ -23,7 +23,7 @@ function buildApi(params?: {
     subagent: {
       run: vi.fn(),
       waitForRun: vi.fn(),
-      getSession: vi.fn(),
+      getSessionMessages: vi.fn(),
       deleteSession: vi.fn(),
     },
     config: {

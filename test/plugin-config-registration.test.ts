@@ -711,63 +711,40 @@ describe("lcm plugin registration", () => {
     });
   });
 
-  it("collects delegated expansion replies through getSessionMessages", async () => {
+  it("reads delegated replies through the OpenClaw 2026.7.2 subagent adapter", async () => {
     const dbPath = join(tmpdir(), `lossless-claw-${Date.now()}-${Math.random().toString(16)}.db`);
     dbPaths.add(dbPath);
 
     const { api, getFactory } = buildApi({ enabled: true, dbPath });
-    const run = api.runtime.subagent.run as ReturnType<typeof vi.fn>;
-    const waitForRun = api.runtime.subagent.waitForRun as ReturnType<typeof vi.fn>;
     const getSessionMessages = api.runtime.subagent.getSessionMessages as ReturnType<typeof vi.fn>;
-    const deleteSession = api.runtime.subagent.deleteSession as ReturnType<typeof vi.fn>;
-    run.mockResolvedValue({ runId: "run-delegated-expansion" });
-    waitForRun.mockResolvedValue({ status: "ok" });
     getSessionMessages.mockResolvedValue({
-      messages: [
-        {
-          role: "assistant",
-          content: [
-            {
-              type: "text",
-              text: JSON.stringify({
-                summary: "Delegated answer collected.",
-                citedIds: ["sum_1059"],
-                followUpSummaryIds: [],
-                totalTokens: 42,
-                truncated: false,
-              }),
-            },
-          ],
-        },
-      ],
+      messages: [{ role: "assistant", content: "completed focus brief" }],
     });
-
     lcmPlugin.register(api);
+
     const engine = getFactory()!() as {
-      deps?: Parameters<typeof runDelegatedExpansionLoop>[0]["deps"];
+      deps?: {
+        callGateway: (params: {
+          method: string;
+          params?: Record<string, unknown>;
+        }) => Promise<unknown>;
+      };
     };
 
-    const result = await runDelegatedExpansionLoop({
-      deps: engine.deps!,
-      requesterSessionKey: "agent:main:main",
-      conversationId: 1059,
-      summaryIds: ["sum_1059"],
-      includeMessages: false,
+    const result = await engine.deps?.callGateway({
+      method: "sessions.get",
+      params: {
+        key: "agent:main:subagent:focus",
+        limit: 80,
+      },
     });
 
-    expect(result).toMatchObject({
-      status: "ok",
-      citedIds: ["sum_1059"],
+    expect(result).toEqual({
+      messages: [{ role: "assistant", content: "completed focus brief" }],
     });
-    expect(result.text).toContain("Delegated answer collected.");
-    expect(result.text).toContain("sum_1059");
     expect(getSessionMessages).toHaveBeenCalledWith({
-      sessionKey: expect.stringMatching(/^agent:main:subagent:/),
+      sessionKey: "agent:main:subagent:focus",
       limit: 80,
-    });
-    expect(deleteSession).toHaveBeenCalledWith({
-      sessionKey: expect.stringMatching(/^agent:main:subagent:/),
-      deleteTranscript: true,
     });
   });
 
