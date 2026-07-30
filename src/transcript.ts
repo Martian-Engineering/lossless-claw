@@ -3,6 +3,7 @@ import { open } from "node:fs/promises";
 import type { FileHandle } from "node:fs/promises";
 import { createInterface } from "node:readline";
 import type { ContextEngine } from "./openclaw-bridge.js";
+import { isSqliteSessionFile } from "./value-utils.js";
 
 type AgentMessage = Parameters<ContextEngine["ingest"]>[0]["message"];
 
@@ -115,6 +116,9 @@ export type TranscriptHeader = {
  */
 export async function readTranscriptHeader(sessionFile: string): Promise<TranscriptHeader> {
   const empty: TranscriptHeader = { sessionHeaderId: null, parentSession: null };
+  if (isSqliteSessionFile(sessionFile)) {
+    return empty;
+  }
   try {
     const stream = createReadStream(sessionFile, { encoding: "utf8" });
     const lines = createInterface({
@@ -292,6 +296,9 @@ function selectLeafPathRecords<T extends TranscriptTreeNode>(records: T[]): T[] 
  * without full id coverage keep the legacy flatten-in-file-order behavior.
  */
 export async function readLeafPathMessages(sessionFile: string): Promise<AgentMessage[]> {
+  if (isSqliteSessionFile(sessionFile)) {
+    return [];
+  }
   try {
     let sawNonWhitespace = false;
     let jsonArrayMode = false;
@@ -405,6 +412,9 @@ export type TranscriptRawLeafPath = {
  */
 export async function readLeafPathRawEntries(sessionFile: string): Promise<TranscriptRawLeafPath> {
   const result: TranscriptRawLeafPath = { header: null, entries: [] };
+  if (isSqliteSessionFile(sessionFile)) {
+    return result;
+  }
   try {
     const stream = createReadStream(sessionFile, { encoding: "utf8" });
     const lines = createInterface({
@@ -443,6 +453,9 @@ export async function readLeafPathRawEntries(sessionFile: string): Promise<Trans
 }
 
 export async function readSessionParentSessionReference(sessionFile: string): Promise<string | null> {
+  if (isSqliteSessionFile(sessionFile)) {
+    return null;
+  }
   try {
     const stream = createReadStream(sessionFile, { encoding: "utf8" });
     const lines = createInterface({
@@ -477,6 +490,9 @@ export async function readSessionParentSessionReference(sessionFile: string): Pr
 }
 
 export async function readFileSegment(sessionFile: string, offset: number): Promise<string | null> {
+  if (isSqliteSessionFile(sessionFile)) {
+    return null;
+  }
   let fh: FileHandle | null = null;
   try {
     fh = await open(sessionFile, "r");
@@ -502,6 +518,9 @@ export async function readLastJsonlEntryBeforeOffset(
   messageOnly = false,
   matcher?: (message: AgentMessage) => boolean,
 ): Promise<string | null> {
+  if (isSqliteSessionFile(sessionFile)) {
+    return null;
+  }
   const chunkSize = 16_384;
   const safeOffset = Math.max(0, Math.floor(offset));
   if (safeOffset <= 0) {

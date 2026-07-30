@@ -20,7 +20,7 @@ import {
   withExclusiveDatabaseLock,
 } from "./transaction-mutex.js";
 import { readLeafPathRawEntries, type TranscriptRawEntry } from "./transcript.js";
-import { asRecord, isMissingFileError, normalizeSessionFilePathForComparison } from "./value-utils.js";
+import { asRecord, isMissingFileError, isSqliteSessionFile, normalizeSessionFilePathForComparison } from "./value-utils.js";
 import type { CompactionEngine } from "./compaction.js";
 import type { CompactionGuards } from "./compaction-guards.js";
 import type { LcmConfig } from "./db/config.js";
@@ -354,6 +354,10 @@ export class SessionRotationService {
       skip("missing-session-file");
       return;
     }
+    if (isSqliteSessionFile(sessionFile)) {
+      skip("sqlite-session");
+      return;
+    }
     if (this.host.shouldIgnoreSession({ sessionId, sessionKey })) {
       skip("session-excluded");
       return;
@@ -598,6 +602,9 @@ export class SessionRotationService {
     }
 
     let sizeBytes: number;
+    if (isSqliteSessionFile(sessionFile)) {
+      return { kind: "skipped" };
+    }
     try {
       sizeBytes = (await stat(sessionFile)).size;
     } catch (error) {
@@ -1007,6 +1014,12 @@ export class SessionRotationService {
     conversationId: number;
     sessionFile: string;
   }): Promise<RotateTranscriptRewriteResult> {
+    // SQLite-backed sessions never reach the rewrite path (auto-rotate
+    // skips them upstream). Block at the top before any I/O.
+    if (isSqliteSessionFile(params.sessionFile)) {
+      throw new Error("sqlite sessions cannot be rotated via file rewrite");
+    }
+
     const { header, entries: branch } = await readLeafPathRawEntries(params.sessionFile);
     if (!header) {
       // SessionManager.open used to synthesize a header (and rewrite the

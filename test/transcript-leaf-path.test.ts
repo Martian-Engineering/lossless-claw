@@ -2,7 +2,7 @@ import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
-import { getTranscriptEntryId, readLeafPathMessages } from "../src/transcript.js";
+import { getTranscriptEntryId, readLeafPathMessages, readTranscriptHeader, readLeafPathRawEntries, readSessionParentSessionReference, readFileSegment, readLastJsonlEntryBeforeOffset } from "../src/transcript.js";
 
 const tempDirs: string[] = [];
 
@@ -176,5 +176,74 @@ describe("readLeafPathMessages leaf-path selection", () => {
     ]);
     const messages = await readLeafPathMessages(sessionFile);
     expect(contents(messages)).toEqual(["one", "two"]);
+  });
+});
+
+describe("sqlite: session file no-op guards", () => {
+  it("readLeafPathMessages returns empty for sqlite: path", async () => {
+    const messages = await readLeafPathMessages("sqlite:conversation/42");
+    expect(messages).toEqual([]);
+  });
+
+  it("readTranscriptHeader returns empty header for sqlite: path", async () => {
+    const result = await readTranscriptHeader("sqlite:conversation/42");
+    expect(result).toEqual({ sessionHeaderId: null, parentSession: null });
+  });
+
+  it("readLeafPathRawEntries returns empty result for sqlite: path", async () => {
+    const result = await readLeafPathRawEntries("sqlite:conversation/42");
+    expect(result).toEqual({ header: null, entries: [] });
+  });
+
+  it("readSessionParentSessionReference returns null for sqlite: path", async () => {
+    const result = await readSessionParentSessionReference("sqlite:conversation/42");
+    expect(result).toBeNull();
+  });
+
+  it("readFileSegment returns null for sqlite: path", async () => {
+    const result = await readFileSegment("sqlite:conversation/42", 0);
+    expect(result).toBeNull();
+  });
+
+  it("readLastJsonlEntryBeforeOffset returns null for sqlite: path", async () => {
+    const result = await readLastJsonlEntryBeforeOffset("sqlite:conversation/42", 100);
+    expect(result).toBeNull();
+  });
+
+  it.each([
+    "Sqlite:conversation/1",
+    "SQLITE:2",
+    "  sqlite:3  ",
+  ])("handles case/whitespace variants of sqlite: path %s", async (path) => {
+    const messages = await readLeafPathMessages(path);
+    expect(messages).toEqual([]);
+  });
+});
+
+describe("isSqliteSessionFile", () => {
+  it.each([
+    ["sqlite:123", true],
+    ["Sqlite:abc", true],
+    ["SQLITE:x", true],
+    ["  sqlite:456  ", true],
+  ])("identifies %s as sqlite session file", async (input, expected) => {
+    const { isSqliteSessionFile } = await import("../src/value-utils.js");
+    expect(isSqliteSessionFile(input)).toBe(expected);
+  });
+
+  it.each([
+    ["file.jsonl", false],
+    ["/absolute/path.jsonl", false],
+    ["sqlite", false],
+    ["sqlite2:not", false],
+  ])("returns false for %s", async (input, expected) => {
+    const { isSqliteSessionFile } = await import("../src/value-utils.js");
+    expect(isSqliteSessionFile(input)).toBe(expected);
+  });
+
+  it("returns false for null and undefined", async () => {
+    const { isSqliteSessionFile } = await import("../src/value-utils.js");
+    expect(isSqliteSessionFile(null)).toBe(false);
+    expect(isSqliteSessionFile(undefined)).toBe(false);
   });
 });
