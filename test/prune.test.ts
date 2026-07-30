@@ -1,4 +1,4 @@
-import { mkdtempSync, rmSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
@@ -7,7 +7,7 @@ import { getLcmDbFeatures } from "../src/db/features.js";
 import { createLcmDatabaseConnection, closeLcmConnection } from "../src/db/connection.js";
 import { ConversationStore } from "../src/store/conversation-store.js";
 import { SummaryStore } from "../src/store/summary-store.js";
-import { parseDuration, pruneConversations } from "../src/prune.js";
+import { parseDuration, pruneConversations, getDatabaseSizeBytes, pruneArchivedConversationsToFitSize } from "../src/prune.js";
 
 function createPruneFixture() {
   const tempDir = mkdtempSync(join(tmpdir(), "lossless-claw-prune-"));
@@ -456,5 +456,102 @@ describe("pruneConversations", () => {
 
     // 90 days before June 1 is March 3
     expect(result.cutoffDate).toContain("2025-03-03");
+  });
+});
+
+describe("getDatabaseSizeBytes", () => {
+  it("returns a positive number for a non-empty database", () => {
+    const { db } = createPruneFixture();
+    const size = getDatabaseSizeBytes(db);
+    expect(typeof size).toBe("number");
+    expect(size).toBeGreaterThan(0);
+  });
+});
+
+describe("pruneArchivedConversationsToFitSize", () => {
+  it("returns zero deleted when DB is under the size limit", () => {
+    const { db } = createPruneFixture();
+    const size = getDatabaseSizeBytes(db);
+    const result = pruneArchivedConversationsToFitSize(db, size * 2);
+    expect(result.deleted).toBe(0);
+  });
+
+  it("deletes archived conversations to fit under target size", () => {
+    const { db } = createPruneFixture();
+
+    db.prepare(
+      `INSERT INTO conversations (session_id, session_key, active, archived_at, archive_cause, created_at, updated_at)
+       VALUES (?, ?, 0, datetime('now'), 'session-end', datetime('now'), datetime('now'))`,
+    ).run("prune-size-test", "agent:main:test-prune-size");
+
+    const result = pruneArchivedConversationsToFitSize(db, 1);
+    expect(result.deleted).toBeGreaterThanOrEqual(1);
+  });
+
+  it("cleans up orphaned large file directories when largeFilesDir is set", () => {
+    const { db, tempDir } = createPruneFixture();
+    const largeFilesDir = join(tempDir, "lcm-files");
+    mkdirSync(largeFilesDir, { recursive: true });
+
+    db.prepare(
+      `INSERT INTO conversations (session_id, session_key, active, archived_at, archive_cause, created_at, updated_at)
+       VALUES (?, ?, 0, datetime('now'), 'session-end', datetime('now'), datetime('now'))`,
+    ).run("prune-largefile-test", "agent:main:test-prune-largefile");
+
+    const convRow = db
+      .prepare(`SELECT conversation_id FROM conversations WHERE session_id = ?`)
+      .get("prune-largefile-test") as { conversation_id: number };
+    const convId = convRow.conversation_id;
+
+    const convDir = join(largeFilesDir, String(convId));
+    mkdirSync(convDir, { recursive: true });
+    writeFileSync(join(convDir, "test.txt"), "hello");
+
+    pruneArchivedConversationsToFitSize(db, 1, { largeFilesDir });
+
+    const stillExists = existsSync(convDir);
+    expect(stillExists).toBe(false);
+  });
+
+  it("rolls back the transaction when the DB delete fails", () => {
+    const { db } = createPruneFixture();
+
+    db.prepare(
+      `INSERT INTO conversations (session_id, session_key, active, archived_at, archive_cause, created_at, updated_at)
+       VALUES (?, ?, 0, datetime('now'), 'session-end', datetime('now'), datetime('now'))`,
+    ).run("rollback-test", "agent:main:test-rollback");
+
+    // Install a trigger that prevents deletion — this causes the DELETE to fail
+    // inside the transaction, triggering the ROLLBACK path.
+    db.exec(
+      `CREATE TEMP TRIGGER test_prevent_prune BEFORE DELETE ON conversations
+       BEGIN
+         SELECT RAISE(ABORT, 'test: forced rollback');
+       END`,
+    );
+
+    const result = pruneArchivedConversationsToFitSize(db, 1);
+
+    // The trigger prevented deletion, so no conversations should be deleted.
+    expect(result.deleted).toBe(0);
+
+    // Clean up the trigger and verify the row still exists.
+    db.exec("DROP TRIGGER IF EXISTS temp.test_prevent_prune");
+    const remaining = db
+      .prepare("SELECT COUNT(*) AS cnt FROM conversations WHERE session_id = ?")
+      .get("rollback-test") as { cnt: number };
+    expect(remaining.cnt).toBe(1);
+  });
+
+  it("returns zero deleted when all conversations are active (no archived)", () => {
+    const { db } = createPruneFixture();
+
+    db.prepare(
+      `INSERT INTO conversations (session_id, session_key, active, created_at, updated_at)
+       VALUES (?, ?, 1, datetime('now'), datetime('now'))`,
+    ).run("active-only", "agent:main:test-active-only");
+
+    const result = pruneArchivedConversationsToFitSize(db, 1);
+    expect(result.deleted).toBe(0);
   });
 });

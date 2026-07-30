@@ -6,6 +6,8 @@
  * to clean up messages, summaries, context_items, and other dependent rows.
  */
 import type { DatabaseSync } from "node:sqlite";
+import { rmSync } from "node:fs";
+import { join } from "node:path";
 
 // ── Duration parsing ────────────────────────────────────────────────────────
 
@@ -389,4 +391,118 @@ export function pruneConversations(
     vacuumed,
     cutoffDate,
   };
+}
+
+// ── Size-based pruning helpers ──────────────────────────────────────────────
+
+export type PruneSizeResult = {
+  deleted: number;
+  deletedBytes: number;
+};
+
+/**
+ * Return the current database file size in bytes using SQLite page stats.
+ */
+export function getDatabaseSizeBytes(db: DatabaseSync): number {
+  const pageCount = (
+    db.prepare("PRAGMA page_count").get() as { page_count: number }
+  ).page_count;
+  const pageSize = (
+    db.prepare("PRAGMA page_size").get() as { page_size: number }
+  ).page_size;
+  return pageCount * pageSize;
+}
+
+/**
+ * Delete the oldest archived conversations (active=0) until the database
+ * size drops below maxBytes (or no archived conversations remain).
+ *
+ * Each conversation is deleted in its own transaction.  The caller should
+ * call VACUUM separately if desired (VACUUM is expensive and may block
+ * concurrent writers).
+ *
+ * @param largeFilesDir  When provided, the on-disk large-file directories
+ *                       for deleted conversations are removed.
+ */
+export function pruneArchivedConversationsToFitSize(
+  db: DatabaseSync,
+  maxBytes: number,
+  options?: {
+    batchSize?: number;
+    largeFilesDir?: string;
+  },
+): PruneSizeResult {
+  let deleted = 0;
+  let deletedBytes = 0;
+  const batchSize = Math.min(
+    options?.batchSize && options.batchSize > 0 ? Math.floor(options.batchSize) : 10,
+    100,
+  );
+
+  const currentSize = getDatabaseSizeBytes(db);
+  if (currentSize <= maxBytes) {
+    return { deleted: 0, deletedBytes: 0 };
+  }
+
+  const beforeSize = currentSize;
+
+  // eslint-disable-next-line no-constant-condition
+  while (true) {
+    const sizeNow = getDatabaseSizeBytes(db);
+    if (sizeNow <= maxBytes) {
+      break;
+    }
+
+    const rows = db
+      .prepare(
+        `SELECT conversation_id FROM conversations
+         WHERE active = 0 AND archived_at IS NOT NULL
+         ORDER BY archived_at ASC
+         LIMIT ?`,
+      )
+      .all(batchSize) as { conversation_id: number }[];
+
+    if (rows.length === 0) {
+      break;
+    }
+
+    const ids = rows.map((r) => r.conversation_id);
+
+    db.exec("BEGIN IMMEDIATE");
+    try {
+      if (options?.largeFilesDir) {
+        for (const id of ids) {
+          try {
+            rmSync(join(options.largeFilesDir, String(id)), { recursive: true, force: true });
+          } catch (err) {
+            // ENOENT: directory never existed or was already cleaned — fine.
+            if ((err as NodeJS.ErrnoException).code !== "ENOENT") {
+              console.warn(
+                `prune: failed to remove large files directory for conversation ${id}:`,
+                (err as Error).message ?? err,
+              );
+            }
+          }
+        }
+      }
+
+      const placeholder = ids.map(() => "?").join(",");
+      const deletedConversations = Number(
+        db
+          .prepare(`DELETE FROM conversations WHERE conversation_id IN (${placeholder})`)
+          .run(...ids).changes ?? 0,
+      );
+
+      db.exec("COMMIT");
+      deleted += deletedConversations;
+    } catch {
+      db.exec("ROLLBACK");
+      break;
+    }
+
+    const newSize = getDatabaseSizeBytes(db);
+    deletedBytes = Math.max(0, beforeSize - newSize);
+  }
+
+  return { deleted, deletedBytes };
 }

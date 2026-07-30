@@ -278,6 +278,10 @@
       "label": "Prune HEARTBEAT_OK",
       "help": "Retroactively delete HEARTBEAT_OK turn cycles from LCM storage"
     },
+    "maxDatabaseBytes": {
+      "label": "Max Database Size (bytes)",
+      "help": "Auto-prune oldest archived conversations when DB exceeds this byte limit. 0 = unlimited."
+    },
     "transcriptGcEnabled": {
       "label": "Transcript GC",
       "help": "Enable transcript rewrite GC during maintain(); disabled by default"
@@ -624,6 +628,10 @@
       },
       "pruneHeartbeatOk": {
         "type": "boolean"
+      },
+      "maxDatabaseBytes": {
+        "type": "number",
+        "minimum": 0
       },
       "transcriptGcEnabled": {
         "type": "boolean"

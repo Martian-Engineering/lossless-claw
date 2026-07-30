@@ -37,6 +37,7 @@ const BASE_CONFIG: LcmConfig = {
   summaryTimeoutMs: 60_000,
   timezone: "UTC",
   pruneHeartbeatOk: false,
+  maxDatabaseBytes: 0,
   transcriptGcEnabled: false,
   enableSummaryThinking: true,
   proactiveThresholdCompactionMode: "deferred",
