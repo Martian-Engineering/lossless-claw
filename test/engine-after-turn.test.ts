@@ -4860,4 +4860,76 @@ describe("LcmContextEngine afterTurn", () => {
       "real assistant",
     ]);
   });
+
+  it("afterTurn dedupes assistant runtime messages against transcript by responseId", async () => {
+    // The transcript imports a redacted assistant message carrying
+    // responseId="resp-001"; the runtime batch arrives with the same responseId
+    // but original content. The previously persisted redacted row stays canonical.
+    const engine = createEngine();
+    const sessionId = "after-turn-stable-event-response-id";
+    const sessionKey = "agent:main:stable-event-response-id";
+    const sessionFile = createSessionFilePath("stable-event-response-id");
+    writeLeafTranscriptMessages(sessionFile, [
+      makeMessage({
+        role: "assistant",
+        content: [{ type: "text", text: "redacted by logging.redactPatterns" }],
+        responseId: "resp-001",
+      }),
+    ]);
+    await engine.bootstrap({ sessionId, sessionKey, sessionFile });
+    await engine.afterTurn({
+      sessionId,
+      sessionKey,
+      sessionFile,
+      messages: [
+        makeMessage({
+          role: "assistant",
+          content: "original unredacted content",
+          responseId: "resp-001",
+        } as never),
+      ],
+      prePromptMessageCount: 0,
+      tokenBudget: 4_096,
+    });
+    const conversation = await engine.getConversationStore().getConversationBySessionId(sessionId);
+    const rows = await engine.getConversationStore().getMessages(conversation!.conversationId);
+    expect(rows.length).toBe(1);
+    expect(rows[0]!.content).toBe("redacted by logging.redactPatterns");
+  });
+
+  it("afterTurn dedupes tool/toolResult messages by toolCallId", async () => {
+    // The transcript imports a redacted toolResult message carrying
+    // toolCallId="call-001"; the runtime batch arrives with the same toolCallId
+    // but original content. The previously persisted redacted row stays canonical.
+    const engine = createEngine();
+    const sessionId = "after-turn-stable-event-tool-call-id";
+    const sessionKey = "agent:main:stable-event-tool-call-id";
+    const sessionFile = createSessionFilePath("stable-event-tool-call-id");
+    writeLeafTranscriptMessages(sessionFile, [
+      makeMessage({
+        role: "toolResult",
+        content: [{ type: "text", text: "redacted by logging.redactPatterns" }],
+        toolCallId: "call-001",
+      }),
+    ]);
+    await engine.bootstrap({ sessionId, sessionKey, sessionFile });
+    await engine.afterTurn({
+      sessionId,
+      sessionKey,
+      sessionFile,
+      messages: [
+        makeMessage({
+          role: "toolResult",
+          content: "original unredacted tool result body",
+          toolCallId: "call-001",
+        } as never),
+      ],
+      prePromptMessageCount: 0,
+      tokenBudget: 4_096,
+    });
+    const conversation = await engine.getConversationStore().getConversationBySessionId(sessionId);
+    const rows = await engine.getConversationStore().getMessages(conversation!.conversationId);
+    expect(rows.length).toBe(1);
+    expect(rows[0]!.content).toBe("redacted by logging.redactPatterns");
+  });
 });

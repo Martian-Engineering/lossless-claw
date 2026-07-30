@@ -401,6 +401,21 @@ function ensureMessageTranscriptEntryIdColumn(db: DatabaseSync): void {
   }
 }
 
+/**
+ * Stable event-key deduplication: a stable identity for a message that survives
+ * across representations (e.g., transcript redacted vs. runtime unredacted).
+ * NULL for legacy rows; populated by `extractStableEventKey` at ingest time.
+ * The partial unique index `(conversation_id, stable_event_key) WHERE
+ * stable_event_key IS NOT NULL` enforces idempotency only for non-NULL keys.
+ */
+function ensureMessageStableEventKeyColumn(db: DatabaseSync): void {
+  const messageColumns = db.prepare(`PRAGMA table_info(messages)`).all() as SummaryColumnInfo[];
+  const hasStableEventKey = messageColumns.some((col) => col.name === "stable_event_key");
+  if (!hasStableEventKey) {
+    db.exec(`ALTER TABLE messages ADD COLUMN stable_event_key TEXT`);
+  }
+}
+
 function ensureConversationBootstrapStateForkColumns(db: DatabaseSync): void {
   const columns = db
     .prepare(`PRAGMA table_info(conversation_bootstrap_state)`)
@@ -1436,6 +1451,19 @@ export function runLcmMigrations(
         `CREATE UNIQUE INDEX IF NOT EXISTS messages_conv_entry_unique_idx
          ON messages (conversation_id, transcript_entry_id)
          WHERE transcript_entry_id IS NOT NULL`,
+      ),
+    );
+    runMigrationStep("ensureMessageStableEventKeyColumn", log, () =>
+      ensureMessageStableEventKeyColumn(db),
+    );
+    // Partial unique index: NULL stable event keys (legacy rows, messages
+    // without a stable identity) are exempt, so this only enforces idempotency
+    // for messages that carry a computed key.
+    runMigrationStep("createMessagesStableEventKeyIndex", log, () =>
+      db.exec(
+        `CREATE UNIQUE INDEX IF NOT EXISTS messages_stable_event_key_unique
+         ON messages (conversation_id, stable_event_key)
+         WHERE stable_event_key IS NOT NULL`,
       ),
     );
     runMigrationStep("ensureCompactionTelemetryColumns", log, () =>

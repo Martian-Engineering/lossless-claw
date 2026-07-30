@@ -1558,11 +1558,17 @@ describe("LcmContextEngine.ingest content extraction", () => {
   it("serializes recycled session writes by stable sessionKey", async () => {
     const engine = createEngine();
     const sessionKey = "agent:main:main";
+    const baseTimestamp = Date.now();
 
     await engine.ingest({
       sessionId: "runtime-seed",
       sessionKey,
-      message: makeMessage({ role: "assistant", content: "seed" }),
+      message: makeMessage({
+        role: "assistant",
+        content: "seed",
+        responseId: "resp-recycled-seed",
+        timestamp: baseTimestamp,
+      }),
     });
 
     const store = engine.getConversationStore();
@@ -1590,14 +1596,24 @@ describe("LcmContextEngine.ingest content extraction", () => {
     const firstIngest = engine.ingest({
       sessionId: "runtime-a",
       sessionKey,
-      message: makeMessage({ role: "assistant", content: "first recycled reply" }),
+      message: makeMessage({
+        role: "assistant",
+        content: "first recycled reply",
+        responseId: "resp-recycled-first",
+        timestamp: baseTimestamp + 1,
+      }),
     });
     await firstCreateBlocked;
 
     const secondIngest = engine.ingest({
       sessionId: "runtime-b",
       sessionKey,
-      message: makeMessage({ role: "assistant", content: "second recycled reply" }),
+      message: makeMessage({
+        role: "assistant",
+        content: "second recycled reply",
+        responseId: "resp-recycled-second",
+        timestamp: baseTimestamp + 2,
+      }),
     });
 
     await new Promise((resolve) => setTimeout(resolve, 0));

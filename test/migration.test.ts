@@ -1588,6 +1588,21 @@ describe("runLcmMigrations summary depth backfill", () => {
     expect(execCalls.at(-1)).toBe("COMMIT");
   });
 
+  it("adds messages.stable_event_key column and partial unique index", () => {
+    const db = createTestDb("stable-event-key.db");
+    runLcmMigrations(db, { fts5Available: false });
+
+    const cols = db.prepare(`PRAGMA table_info(messages)`).all() as Array<{ name: string }>;
+    expect(cols.some((c) => c.name === "stable_event_key")).toBe(true);
+
+    const idx = db
+      .prepare(
+        `SELECT 1 FROM sqlite_master WHERE type='index' AND name='messages_stable_event_key_unique'`,
+      )
+      .get();
+    expect(idx).toBeDefined();
+  });
+
   it("retries a versioned backfill cleanly after the state write fails", () => {
     const db = createTestDb("retry-state-write.db");
     seedLegacySummaryGraph(db);

@@ -280,12 +280,25 @@ export async function withTempHome<T>(run: (homeDir: string) => Promise<T>): Pro
   }
 }
 
-export function makeMessage(params: { role?: string; content: unknown }): AgentMessage {
-  return {
+export function makeMessage(params: {
+  role?: string;
+  content: unknown;
+  timestamp?: number;
+  responseId?: string;
+  toolCallId?: string;
+}): AgentMessage {
+  const message: Record<string, unknown> = {
     role: (params.role ?? "assistant") as AgentMessage["role"],
     content: params.content,
-    timestamp: Date.now(),
-  } as AgentMessage;
+    timestamp: params.timestamp ?? Date.now(),
+  };
+  if (params.responseId !== undefined) {
+    message.responseId = params.responseId;
+  }
+  if (params.toolCallId !== undefined) {
+    message.toolCallId = params.toolCallId;
+  }
+  return message as AgentMessage;
 }
 
 export async function seedBacklogContext(

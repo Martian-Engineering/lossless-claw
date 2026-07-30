@@ -46,6 +46,13 @@ export type CreateMessageInput = {
    * ingests and envelope-less transcripts.
    */
   transcriptEntryId?: string | null;
+  /**
+   * Cross-representation stable event identity (responseId / toolCallId) used
+   * to short-circuit duplicate ingestion when the transcript (often redacted)
+   * and the live runtime batch describe the same semantic event.
+   * Null/undefined preserves the existing behavior.
+   */
+  stableEventKey?: string | null;
   // Use only when the caller is intentionally importing a fresh transcript epoch.
   skipReplayTimestampFloodGuard?: boolean;
 };
@@ -53,6 +60,7 @@ export type CreateMessageInput = {
 type PreparedMessageInsert = CreateMessageInput & {
   createdAt: string;
   identityHash: string;
+  stableEventKey: string | null;
 };
 
 type ExternalReplayFloodGroup = {
@@ -688,8 +696,8 @@ export class ConversationStore {
 
     const result = this.db
       .prepare(
-        `INSERT INTO messages (conversation_id, seq, role, content, token_count, identity_hash, transcript_entry_id, created_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+        `INSERT INTO messages (conversation_id, seq, role, content, token_count, identity_hash, transcript_entry_id, stable_event_key, created_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       )
       .run(
         prepared.conversationId,
@@ -699,6 +707,7 @@ export class ConversationStore {
         prepared.tokenCount,
         prepared.identityHash,
         prepared.transcriptEntryId ?? null,
+        prepared.stableEventKey,
         prepared.createdAt,
       );
 
@@ -727,8 +736,8 @@ export class ConversationStore {
     );
 
     const insertStmt = this.db.prepare(
-      `INSERT INTO messages (conversation_id, seq, role, content, token_count, identity_hash, transcript_entry_id, created_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+      `INSERT INTO messages (conversation_id, seq, role, content, token_count, identity_hash, transcript_entry_id, stable_event_key, created_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
     );
     const selectStmt = this.db.prepare(
       `SELECT message_id, conversation_id, seq, role, content, token_count, created_at, large_content, transcript_entry_id
@@ -745,6 +754,7 @@ export class ConversationStore {
         input.tokenCount,
         input.identityHash,
         input.transcriptEntryId ?? null,
+        input.stableEventKey,
         input.createdAt,
       );
 
@@ -881,6 +891,27 @@ export class ConversationStore {
        LIMIT 1`,
       )
       .get(conversationId, transcriptEntryId) as unknown as CountRow | undefined;
+
+    return row?.count === 1;
+  }
+
+  /**
+   * Whether this conversation already holds a message with the given
+   * stable event key (responseId / toolCallId). Used by `ingestSingle`
+   * to short-circuit cross-representation duplicates.
+   */
+  async hasMessageByStableEventKey(
+    conversationId: ConversationId,
+    stableEventKey: string,
+  ): Promise<boolean> {
+    const row = this.db
+      .prepare(
+        `SELECT 1 AS count
+       FROM messages
+       WHERE conversation_id = ? AND stable_event_key = ?
+       LIMIT 1`,
+      )
+      .get(conversationId, stableEventKey) as unknown as CountRow | undefined;
 
     return row?.count === 1;
   }
@@ -1463,6 +1494,7 @@ export class ConversationStore {
       ...input,
       createdAt: formatMessageCreatedAt(input.createdAt) ?? createdAt,
       identityHash: input.identityHash ?? buildMessageIdentityHash(input.role, input.content),
+      stableEventKey: input.stableEventKey ?? null,
     };
   }
 

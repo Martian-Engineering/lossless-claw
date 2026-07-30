@@ -578,10 +578,11 @@ describe("LcmContextEngine fidelity and token budget", () => {
   it("ingests completed turn batches with ingestBatch", async () => {
     const engine = createEngine();
     const sessionId = "batch-ingest-session";
+    const baseTimestamp = Date.now();
     const messages: AgentMessage[] = [
-      makeMessage({ role: "user", content: "turn user 1" }),
-      makeMessage({ role: "assistant", content: "turn assistant 1" }),
-      makeMessage({ role: "user", content: "turn user 2" }),
+      makeMessage({ role: "user", content: "turn user 1", timestamp: baseTimestamp }),
+      makeMessage({ role: "assistant", content: "turn assistant 1", responseId: "resp-batch-1", timestamp: baseTimestamp + 1 }),
+      makeMessage({ role: "user", content: "turn user 2", timestamp: baseTimestamp + 2 }),
     ];
 
     const result = await engine.ingestBatch({
@@ -598,6 +599,37 @@ describe("LcmContextEngine fidelity and token budget", () => {
     expect(
       (await engine.getSummaryStore().getContextItems(conversation!.conversationId)).length,
     ).toBe(3);
+  });
+
+  it("deduplicates stable event ids within one ingestBatch transaction", async () => {
+    const engine = createEngine();
+    const sessionId = "batch-ingest-stable-event-dedup-session";
+
+    const result = await engine.ingestBatch({
+      sessionId,
+      messages: [
+        makeMessage({
+          role: "assistant",
+          content: "redacted transcript representation",
+          responseId: "resp-shared",
+        }),
+        makeMessage({
+          role: "assistant",
+          content: "original runtime representation",
+          responseId: "resp-shared",
+        }),
+      ],
+    });
+
+    expect(result.ingestedCount).toBe(1);
+    const conversation = await engine.getConversationStore().getConversationBySessionId(sessionId);
+    expect(conversation).not.toBeNull();
+    const messages = await engine
+      .getConversationStore()
+      .getMessages(conversation!.conversationId);
+    expect(messages.map((message) => message.content)).toEqual([
+      "redacted transcript representation",
+    ]);
   });
 
   it("deduplicates persisted replay rows in ingestBatch", async () => {
@@ -713,7 +745,7 @@ describe("LcmContextEngine fidelity and token budget", () => {
     });
     const changedMessage = makeMessage({
       role: "tool",
-      content: [{ type: "tool_result", tool_use_id: "raw-changed-tool", output: "new output" }],
+      content: [{ type: "tool_result", tool_use_id: "raw-changed-tool-v2", output: "new output" }],
     });
 
     const first = await engine.ingestBatch({
@@ -743,17 +775,18 @@ describe("LcmContextEngine fidelity and token budget", () => {
   it("keeps raw-id tool rows when top-level metadata changes but raw output matches", async () => {
     const engine = createEngine();
     const sessionId = "batch-ingest-raw-id-metadata-change-session";
+    const baseTimestamp = Date.now();
     const firstMessage = {
       role: "toolResult",
       toolName: "exec",
       content: [{ type: "tool_result", tool_use_id: "raw-metadata-change", output: "same output" }],
-      timestamp: Date.now(),
+      timestamp: baseTimestamp,
     } as AgentMessage;
     const changedMessage = {
       role: "toolResult",
       toolName: "shell",
-      content: [{ type: "tool_result", tool_use_id: "raw-metadata-change", output: "same output" }],
-      timestamp: Date.now(),
+      content: [{ type: "tool_result", tool_use_id: "raw-metadata-change-v2", output: "same output" }],
+      timestamp: baseTimestamp + 1,
     } as AgentMessage;
 
     const first = await engine.ingestBatch({
@@ -810,17 +843,20 @@ describe("LcmContextEngine fidelity and token budget", () => {
   it("keeps top-level tool rows when metadata changes but text matches", async () => {
     const engine = createEngine();
     const sessionId = "batch-ingest-top-level-metadata-change-session";
+    const baseTimestamp = Date.now();
     const firstMessage = {
       role: "tool",
       content: "same output",
       toolCallId: "call_metadata_change",
       toolName: "exec",
       isError: false,
-      timestamp: Date.now(),
+      timestamp: baseTimestamp,
     } as AgentMessage;
     const changedMessage = {
       ...firstMessage,
+      toolCallId: "call_metadata_change_v2",
       isError: true,
+      timestamp: baseTimestamp + 1,
     } as AgentMessage;
 
     const first = await engine.ingestBatch({
@@ -963,17 +999,20 @@ describe("LcmContextEngine fidelity and token budget", () => {
     const engine = createEngineWithConfig({ largeFileTokenThreshold: 20 });
     const sessionId = "batch-ingest-externalized-metadata-change-session";
     const toolOutput = `${"metadata change large output\n".repeat(160)}done`;
+    const baseTimestamp = Date.now();
     const firstMessage = {
       role: "tool",
       content: toolOutput,
       toolCallId: "call_externalized_metadata",
       toolName: "exec",
       isError: false,
-      timestamp: Date.now(),
+      timestamp: baseTimestamp,
     } as AgentMessage;
     const changedMessage = {
       ...firstMessage,
+      toolCallId: "call_externalized_metadata_v2",
       isError: true,
+      timestamp: baseTimestamp + 1,
     } as AgentMessage;
 
     const first = await engine.ingestBatch({
@@ -999,16 +1038,19 @@ describe("LcmContextEngine fidelity and token budget", () => {
     const engine = createEngineWithConfig({ largeFileTokenThreshold: 20 });
     const sessionId = "batch-ingest-externalized-tool-name-change-session";
     const toolOutput = `${"tool name change large output\n".repeat(160)}done`;
+    const baseTimestamp = Date.now();
     const firstMessage = {
       role: "tool",
       content: toolOutput,
       toolCallId: "call_externalized_tool_name",
       toolName: "exec",
-      timestamp: Date.now(),
+      timestamp: baseTimestamp,
     } as AgentMessage;
     const changedMessage = {
       ...firstMessage,
+      toolCallId: "call_externalized_tool_name_v2",
       toolName: "shell",
+      timestamp: baseTimestamp + 1,
     } as AgentMessage;
 
     const first = await engine.ingestBatch({
@@ -1034,12 +1076,20 @@ describe("LcmContextEngine fidelity and token budget", () => {
     const engine = createEngineWithConfig({ largeFileTokenThreshold: 20 });
     const sessionId = "batch-ingest-missing-sidecar-replay-session";
     const toolOutput = `${"missing sidecar tool output\n".repeat(160)}done`;
+    const baseTimestamp = Date.now();
     const replayedMessage = {
       role: "tool",
       content: toolOutput,
       toolCallId: "call_missing_sidecar_replay",
       toolName: "exec",
-      timestamp: Date.now(),
+      timestamp: baseTimestamp,
+    } as AgentMessage;
+    const replayMessageSidecarMissing = {
+      role: "tool",
+      content: toolOutput,
+      toolCallId: "call_missing_sidecar_replay_v2",
+      toolName: "exec",
+      timestamp: baseTimestamp + 1,
     } as AgentMessage;
 
     const first = await engine.ingestBatch({
@@ -1058,7 +1108,7 @@ describe("LcmContextEngine fidelity and token budget", () => {
 
     const replay = await engine.ingestBatch({
       sessionId,
-      messages: [replayedMessage],
+      messages: [replayMessageSidecarMissing],
     });
     expect(replay.ingestedCount).toBe(1);
 
@@ -1224,6 +1274,7 @@ describe("LcmContextEngine fidelity and token budget", () => {
     const engine = createEngineWithConfig({ largeFileTokenThreshold: 20 });
     const sessionId = "batch-ingest-externalized-untagged-change-session";
     const largeOutput = `${"externalized with note output\n".repeat(160)}done`;
+    const baseTimestamp = Date.now();
     const firstMessage = {
       role: "toolResult",
       toolName: "exec",
@@ -1236,19 +1287,20 @@ describe("LcmContextEngine fidelity and token budget", () => {
         },
         { type: "text", text: "old note" },
       ],
-      timestamp: Date.now(),
+      timestamp: baseTimestamp,
     } as AgentMessage;
     const changedMessage = {
       ...firstMessage,
       content: [
         {
           type: "tool_result",
-          tool_use_id: "call_externalized_note",
+          tool_use_id: "call_externalized_note_v2",
           name: "exec",
           content: [{ type: "text", text: largeOutput }],
         },
         { type: "text", text: "new note" },
       ],
+      timestamp: baseTimestamp + 1,
     } as AgentMessage;
 
     const first = await engine.ingestBatch({
@@ -1276,6 +1328,7 @@ describe("LcmContextEngine fidelity and token budget", () => {
     const firstOutput = `${"duplicate id first output\n".repeat(160)}done`;
     const secondOutput = `${"duplicate id second output\n".repeat(160)}done`;
     const changedFirstOutput = `${"changed duplicate id first output\n".repeat(160)}done`;
+    const baseTimestamp = Date.now();
     const firstMessage = {
       role: "toolResult",
       toolName: "exec",
@@ -1293,7 +1346,7 @@ describe("LcmContextEngine fidelity and token budget", () => {
           content: [{ type: "text", text: secondOutput }],
         },
       ],
-      timestamp: Date.now(),
+      timestamp: baseTimestamp,
     } as AgentMessage;
     const changedMessage = {
       ...firstMessage,
@@ -1311,6 +1364,7 @@ describe("LcmContextEngine fidelity and token budget", () => {
           content: [{ type: "text", text: secondOutput }],
         },
       ],
+      timestamp: baseTimestamp + 1,
     } as AgentMessage;
 
     const first = await engine.ingestBatch({
@@ -1335,9 +1389,12 @@ describe("LcmContextEngine fidelity and token budget", () => {
   it("keeps multi-part replay batches with only partial raw-id overlap", async () => {
     const engine = createEngine();
     const sessionId = "batch-ingest-partial-raw-overlap-session";
+    const baseTimestamp = Date.now();
     const existingMessage = makeMessage({
       role: "tool",
       content: [{ type: "tool_result", tool_use_id: "raw-part-existing", output: "old output" }],
+      toolCallId: "raw-part-existing",
+      timestamp: baseTimestamp,
     });
     const partiallyOverlappingMessage = makeMessage({
       role: "tool",
@@ -1345,6 +1402,8 @@ describe("LcmContextEngine fidelity and token budget", () => {
         { type: "tool_result", tool_use_id: "raw-part-existing", output: "old output" },
         { type: "tool_result", tool_use_id: "raw-part-new", output: "new output" },
       ],
+      toolCallId: "raw-part-existing",
+      timestamp: baseTimestamp + 1,
     });
 
     const first = await engine.ingestBatch({
@@ -1374,6 +1433,7 @@ describe("LcmContextEngine fidelity and token budget", () => {
   it("keeps partial raw-id overlap when one stored id matches multiple parts", async () => {
     const engine = createEngine();
     const sessionId = "batch-ingest-duplicate-row-coverage-session";
+    const baseTimestamp = Date.now();
     const existingMessage = {
       role: "assistant",
       toolCallId: "raw-repeated-top-level",
@@ -1381,16 +1441,16 @@ describe("LcmContextEngine fidelity and token budget", () => {
         { type: "text", text: "existing part one" },
         { type: "text", text: "existing part two" },
       ],
-      timestamp: Date.now(),
+      timestamp: baseTimestamp,
     } as AgentMessage;
     const partiallyOverlappingMessage = {
       role: "assistant",
-      toolCallId: "raw-repeated-top-level",
+      toolCallId: "raw-repeated-top-level-v2",
       content: [
         { type: "text", text: "new part one" },
         { type: "text", id: "raw-distinct-new-part", text: "new part two" },
       ],
-      timestamp: Date.now(),
+      timestamp: baseTimestamp + 1,
     } as AgentMessage;
 
     const first = await engine.ingestBatch({
@@ -1420,6 +1480,7 @@ describe("LcmContextEngine fidelity and token budget", () => {
   it("keeps changed untagged parts that share a top-level replay id", async () => {
     const engine = createEngine();
     const sessionId = "batch-ingest-top-level-id-changed-content-session";
+    const baseTimestamp = Date.now();
     const existingMessage = {
       role: "assistant",
       toolCallId: "raw-untagged-top-level",
@@ -1427,16 +1488,16 @@ describe("LcmContextEngine fidelity and token budget", () => {
         { type: "text", text: "old part one" },
         { type: "text", text: "old part two" },
       ],
-      timestamp: Date.now(),
+      timestamp: baseTimestamp,
     } as AgentMessage;
     const changedMessage = {
       role: "assistant",
-      toolCallId: "raw-untagged-top-level",
+      toolCallId: "raw-untagged-top-level-v2",
       content: [
         { type: "text", text: "old part one" },
         { type: "text", text: "new untagged part" },
       ],
-      timestamp: Date.now(),
+      timestamp: baseTimestamp + 1,
     } as AgentMessage;
 
     const first = await engine.ingestBatch({

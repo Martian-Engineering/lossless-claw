@@ -198,13 +198,14 @@ describe("LcmContextEngine afterTurn dedup guard", () => {
   it("does not trim on stale identity_hash without matching content", async () => {
     const engine = createEngine();
     const sessionId = "dedup-stale-identity-hash";
+    const baseTimestamp = Date.now();
 
     await engine.afterTurn({
       sessionId,
       sessionFile: createSessionFilePath("dedup-stale-identity-hash"),
       messages: [
-        makeMessage({ role: "user", content: "old A" }),
-        makeMessage({ role: "assistant", content: "old B" }),
+        makeMessage({ role: "user", content: "old A", timestamp: baseTimestamp }),
+        makeMessage({ role: "assistant", content: "old B", timestamp: baseTimestamp + 1 }),
       ],
       prePromptMessageCount: 0,
       tokenBudget: 4096,
@@ -224,9 +225,9 @@ describe("LcmContextEngine afterTurn dedup guard", () => {
       sessionId,
       sessionFile: createSessionFilePath("dedup-stale-identity-hash-2"),
       messages: [
-        makeMessage({ role: "user", content: "old A" }),
-        makeMessage({ role: "assistant", content: "new B" }),
-        makeMessage({ role: "assistant", content: "new C" }),
+        makeMessage({ role: "user", content: "old A", timestamp: baseTimestamp + 2 }),
+        makeMessage({ role: "assistant", content: "new B", responseId: "resp-new-b", timestamp: baseTimestamp + 3 }),
+        makeMessage({ role: "assistant", content: "new C", responseId: "resp-new-c", timestamp: baseTimestamp + 4 }),
       ],
       prePromptMessageCount: 0,
       tokenBudget: 4096,
@@ -314,16 +315,17 @@ describe("LcmContextEngine afterTurn dedup guard", () => {
   it("handles repeated identical content (e.g. empty tool results) with occurrence counting", async () => {
     const engine = createEngine();
     const sessionId = "dedup-repeated";
+    const baseTimestamp = Date.now();
 
     // Seed with repeated content
     await engine.afterTurn({
       sessionId,
       sessionFile: createSessionFilePath("dedup-repeated"),
       messages: [
-        makeMessage({ role: "user", content: "request" }),
-        makeMessage({ role: "tool", content: "" }),
-        makeMessage({ role: "tool", content: "" }),
-        makeMessage({ role: "assistant", content: "done" }),
+        makeMessage({ role: "user", content: "request", timestamp: baseTimestamp }),
+        makeMessage({ role: "tool", content: "", toolCallId: "call-empty-1", timestamp: baseTimestamp + 1 }),
+        makeMessage({ role: "tool", content: "", toolCallId: "call-empty-2", timestamp: baseTimestamp + 2 }),
+        makeMessage({ role: "assistant", content: "done", responseId: "resp-done-1", timestamp: baseTimestamp + 3 }),
       ],
       prePromptMessageCount: 0,
       tokenBudget: 4096,
@@ -334,13 +336,13 @@ describe("LcmContextEngine afterTurn dedup guard", () => {
       sessionId,
       sessionFile: createSessionFilePath("dedup-repeated-2"),
       messages: [
-        makeMessage({ role: "user", content: "request" }),
-        makeMessage({ role: "tool", content: "" }),
-        makeMessage({ role: "tool", content: "" }),
-        makeMessage({ role: "assistant", content: "done" }),
-        makeMessage({ role: "user", content: "more work" }),
-        makeMessage({ role: "tool", content: "" }),
-        makeMessage({ role: "assistant", content: "done again" }),
+        makeMessage({ role: "user", content: "request", timestamp: baseTimestamp + 4 }),
+        makeMessage({ role: "tool", content: "", toolCallId: "call-empty-1", timestamp: baseTimestamp + 5 }),
+        makeMessage({ role: "tool", content: "", toolCallId: "call-empty-2", timestamp: baseTimestamp + 6 }),
+        makeMessage({ role: "assistant", content: "done", responseId: "resp-done-1", timestamp: baseTimestamp + 7 }),
+        makeMessage({ role: "user", content: "more work", timestamp: baseTimestamp + 8 }),
+        makeMessage({ role: "tool", content: "", toolCallId: "call-empty-3", timestamp: baseTimestamp + 9 }),
+        makeMessage({ role: "assistant", content: "done again", responseId: "resp-done-again", timestamp: baseTimestamp + 10 }),
       ],
       prePromptMessageCount: 0,
       tokenBudget: 4096,
@@ -823,9 +825,9 @@ describe("LcmContextEngine afterTurn dedup guard", () => {
       sessionId,
       sessionFile: createSessionFilePath("dedup-oversized-no-overlap-repeated-same-second"),
       messages: [
-        { role: "user", content: "deploy?", timestamp: sharedTimestamp } as AgentMessage,
-        { role: "assistant", content: "done", timestamp: sharedTimestamp } as AgentMessage,
-        { role: "assistant", content: "later tail", timestamp: sharedTimestamp + 1000 } as AgentMessage,
+        makeMessage({ role: "user", content: "deploy?", timestamp: sharedTimestamp }),
+        makeMessage({ role: "assistant", content: "done", responseId: "resp-done-seed", timestamp: sharedTimestamp }),
+        makeMessage({ role: "assistant", content: "later tail", responseId: "resp-tail-seed", timestamp: sharedTimestamp + 1000 }),
       ],
       prePromptMessageCount: 0,
       tokenBudget: 4096,
@@ -835,8 +837,8 @@ describe("LcmContextEngine afterTurn dedup guard", () => {
       sessionId,
       sessionFile: createSessionFilePath("dedup-oversized-no-overlap-repeated-same-second-2"),
       messages: [
-        { role: "user", content: "deploy?", timestamp: sharedTimestamp } as AgentMessage,
-        { role: "assistant", content: "done", timestamp: sharedTimestamp } as AgentMessage,
+        makeMessage({ role: "user", content: "deploy?", timestamp: sharedTimestamp + 2000 }),
+        makeMessage({ role: "assistant", content: "done", responseId: "resp-done-replay", timestamp: sharedTimestamp + 2000 }),
       ],
       prePromptMessageCount: 0,
       tokenBudget: 4096,
@@ -892,14 +894,15 @@ describe("LcmContextEngine afterTurn dedup guard", () => {
     const sessionId = "dedup-large-file-rewrite-anchored-replay";
     const fileText = `${"anchored rewritten file line\n".repeat(160)}done`;
     const originalContent = `<file name="anchored.md" mime="text/markdown">${fileText}</file>`;
+    const baseTimestamp = Date.now();
 
     await engine.afterTurn({
       sessionId,
       sessionFile: createSessionFilePath("dedup-large-file-rewrite-anchored-replay"),
       messages: [
-        makeMessage({ role: "user", content: "old A" }),
-        makeMessage({ role: "user", content: originalContent }),
-        makeMessage({ role: "assistant", content: "old C" }),
+        makeMessage({ role: "user", content: "old A", timestamp: baseTimestamp }),
+        makeMessage({ role: "user", content: originalContent, timestamp: baseTimestamp + 1 }),
+        makeMessage({ role: "assistant", content: "old C", responseId: "resp-anchored-c", timestamp: baseTimestamp + 2 }),
       ],
       prePromptMessageCount: 0,
       tokenBudget: 4096,
@@ -909,10 +912,10 @@ describe("LcmContextEngine afterTurn dedup guard", () => {
       sessionId,
       sessionFile: createSessionFilePath("dedup-large-file-rewrite-anchored-replay-2"),
       messages: [
-        makeMessage({ role: "user", content: "old A" }),
-        makeMessage({ role: "user", content: originalContent }),
-        makeMessage({ role: "assistant", content: "old C" }),
-        makeMessage({ role: "assistant", content: "new D" }),
+        makeMessage({ role: "user", content: "old A", timestamp: baseTimestamp + 3 }),
+        makeMessage({ role: "user", content: originalContent, timestamp: baseTimestamp + 4 }),
+        makeMessage({ role: "assistant", content: "old C", responseId: "resp-anchored-c", timestamp: baseTimestamp + 5 }),
+        makeMessage({ role: "assistant", content: "new D", responseId: "resp-anchored-d", timestamp: baseTimestamp + 6 }),
       ],
       prePromptMessageCount: 0,
       tokenBudget: 4096,
@@ -946,14 +949,15 @@ describe("LcmContextEngine afterTurn dedup guard", () => {
       `<file name="large.md" mime="text/markdown">${largeText}</file>`,
       "after files",
     ].join("\n");
+    const baseTimestamp = Date.now();
 
     await engine.afterTurn({
       sessionId,
       sessionFile: createSessionFilePath("dedup-large-file-mixed-inline-replay"),
       messages: [
-        makeMessage({ role: "user", content: "old A" }),
-        makeMessage({ role: "user", content: mixedContent }),
-        makeMessage({ role: "assistant", content: "old C" }),
+        makeMessage({ role: "user", content: "old A", timestamp: baseTimestamp }),
+        makeMessage({ role: "user", content: mixedContent, timestamp: baseTimestamp + 1 }),
+        makeMessage({ role: "assistant", content: "old C", responseId: "resp-mixed-c", timestamp: baseTimestamp + 2 }),
       ],
       prePromptMessageCount: 0,
       tokenBudget: 4096,
@@ -963,10 +967,10 @@ describe("LcmContextEngine afterTurn dedup guard", () => {
       sessionId,
       sessionFile: createSessionFilePath("dedup-large-file-mixed-inline-replay-2"),
       messages: [
-        makeMessage({ role: "user", content: "old A" }),
-        makeMessage({ role: "user", content: mixedContent }),
-        makeMessage({ role: "assistant", content: "old C" }),
-        makeMessage({ role: "assistant", content: "new D" }),
+        makeMessage({ role: "user", content: "old A", timestamp: baseTimestamp + 3 }),
+        makeMessage({ role: "user", content: mixedContent, timestamp: baseTimestamp + 4 }),
+        makeMessage({ role: "assistant", content: "old C", responseId: "resp-mixed-c", timestamp: baseTimestamp + 5 }),
+        makeMessage({ role: "assistant", content: "new D", responseId: "resp-mixed-d", timestamp: baseTimestamp + 6 }),
       ],
       prePromptMessageCount: 0,
       tokenBudget: 4096,
@@ -987,14 +991,15 @@ describe("LcmContextEngine afterTurn dedup guard", () => {
     const fileText = `${"inline externalized file line\n".repeat(1200)}done`;
     const inlineContent =
       `prefix <file name="inline.md" mime="text/markdown">${fileText}</file> suffix`;
+    const baseTimestamp = Date.now();
 
     await engine.afterTurn({
       sessionId,
       sessionFile: createSessionFilePath("dedup-large-file-inline-replay"),
       messages: [
-        makeMessage({ role: "user", content: "old A" }),
-        makeMessage({ role: "user", content: inlineContent }),
-        makeMessage({ role: "assistant", content: "old C" }),
+        makeMessage({ role: "user", content: "old A", timestamp: baseTimestamp }),
+        makeMessage({ role: "user", content: inlineContent, timestamp: baseTimestamp + 1 }),
+        makeMessage({ role: "assistant", content: "old C", responseId: "resp-inline-c", timestamp: baseTimestamp + 2 }),
       ],
       prePromptMessageCount: 0,
       tokenBudget: 4096,
@@ -1004,10 +1009,10 @@ describe("LcmContextEngine afterTurn dedup guard", () => {
       sessionId,
       sessionFile: createSessionFilePath("dedup-large-file-inline-replay-2"),
       messages: [
-        makeMessage({ role: "user", content: "old A" }),
-        makeMessage({ role: "user", content: inlineContent }),
-        makeMessage({ role: "assistant", content: "old C" }),
-        makeMessage({ role: "assistant", content: "new D" }),
+        makeMessage({ role: "user", content: "old A", timestamp: baseTimestamp + 3 }),
+        makeMessage({ role: "user", content: inlineContent, timestamp: baseTimestamp + 4 }),
+        makeMessage({ role: "assistant", content: "old C", responseId: "resp-inline-c", timestamp: baseTimestamp + 5 }),
+        makeMessage({ role: "assistant", content: "new D", responseId: "resp-inline-d", timestamp: baseTimestamp + 6 }),
       ],
       prePromptMessageCount: 0,
       tokenBudget: 4096,
@@ -1032,14 +1037,15 @@ describe("LcmContextEngine afterTurn dedup guard", () => {
       "middle text",
       `<file name="second.md" mime="text/markdown">${secondText}</file>`,
     ].join("\n");
+    const baseTimestamp = Date.now();
 
     await engine.afterTurn({
       sessionId,
       sessionFile: createSessionFilePath("dedup-large-file-multi-file-block-message"),
       messages: [
-        makeMessage({ role: "user", content: "old A" }),
-        makeMessage({ role: "user", content: multiFileContent }),
-        makeMessage({ role: "assistant", content: "old C" }),
+        makeMessage({ role: "user", content: "old A", timestamp: baseTimestamp }),
+        makeMessage({ role: "user", content: multiFileContent, timestamp: baseTimestamp + 1 }),
+        makeMessage({ role: "assistant", content: "old C", responseId: "resp-multi-c", timestamp: baseTimestamp + 2 }),
       ],
       prePromptMessageCount: 0,
       tokenBudget: 4096,
@@ -1049,10 +1055,10 @@ describe("LcmContextEngine afterTurn dedup guard", () => {
       sessionId,
       sessionFile: createSessionFilePath("dedup-large-file-multi-file-block-message-2"),
       messages: [
-        makeMessage({ role: "user", content: "old A" }),
-        makeMessage({ role: "user", content: multiFileContent }),
-        makeMessage({ role: "assistant", content: "old C" }),
-        makeMessage({ role: "assistant", content: "new D" }),
+        makeMessage({ role: "user", content: "old A", timestamp: baseTimestamp + 3 }),
+        makeMessage({ role: "user", content: multiFileContent, timestamp: baseTimestamp + 4 }),
+        makeMessage({ role: "assistant", content: "old C", responseId: "resp-multi-c", timestamp: baseTimestamp + 5 }),
+        makeMessage({ role: "assistant", content: "new D", responseId: "resp-multi-d", timestamp: baseTimestamp + 6 }),
       ],
       prePromptMessageCount: 0,
       tokenBudget: 4096,
@@ -1072,14 +1078,15 @@ describe("LcmContextEngine afterTurn dedup guard", () => {
     const sessionId = "dedup-large-file-bracket-filename";
     const fileText = `${"bracket filename file line\n".repeat(160)}done`;
     const originalContent = `<file name="report]v2.md" mime="text/markdown">${fileText}</file>`;
+    const baseTimestamp = Date.now();
 
     await engine.afterTurn({
       sessionId,
       sessionFile: createSessionFilePath("dedup-large-file-bracket-filename"),
       messages: [
-        makeMessage({ role: "user", content: "old A" }),
-        makeMessage({ role: "user", content: originalContent }),
-        makeMessage({ role: "assistant", content: "old C" }),
+        makeMessage({ role: "user", content: "old A", timestamp: baseTimestamp }),
+        makeMessage({ role: "user", content: originalContent, timestamp: baseTimestamp + 1 }),
+        makeMessage({ role: "assistant", content: "old C", responseId: "resp-bracket-c", timestamp: baseTimestamp + 2 }),
       ],
       prePromptMessageCount: 0,
       tokenBudget: 4096,
@@ -1089,10 +1096,10 @@ describe("LcmContextEngine afterTurn dedup guard", () => {
       sessionId,
       sessionFile: createSessionFilePath("dedup-large-file-bracket-filename-2"),
       messages: [
-        makeMessage({ role: "user", content: "old A" }),
-        makeMessage({ role: "user", content: originalContent }),
-        makeMessage({ role: "assistant", content: "old C" }),
-        makeMessage({ role: "assistant", content: "new D" }),
+        makeMessage({ role: "user", content: "old A", timestamp: baseTimestamp + 3 }),
+        makeMessage({ role: "user", content: originalContent, timestamp: baseTimestamp + 4 }),
+        makeMessage({ role: "assistant", content: "old C", responseId: "resp-bracket-c", timestamp: baseTimestamp + 5 }),
+        makeMessage({ role: "assistant", content: "new D", responseId: "resp-bracket-d", timestamp: baseTimestamp + 6 }),
       ],
       prePromptMessageCount: 0,
       tokenBudget: 4096,
@@ -1113,14 +1120,15 @@ describe("LcmContextEngine afterTurn dedup guard", () => {
     const fileText = `${"lcm substring filename file line\n".repeat(160)}done`;
     const originalContent =
       `<file name="notes [LCM File: file_deadbeefdeadbeef.md" mime="text/markdown">${fileText}</file>`;
+    const baseTimestamp = Date.now();
 
     await engine.afterTurn({
       sessionId,
       sessionFile: createSessionFilePath("dedup-large-file-lcm-substring-filename"),
       messages: [
-        makeMessage({ role: "user", content: "old A" }),
-        makeMessage({ role: "user", content: originalContent }),
-        makeMessage({ role: "assistant", content: "old C" }),
+        makeMessage({ role: "user", content: "old A", timestamp: baseTimestamp }),
+        makeMessage({ role: "user", content: originalContent, timestamp: baseTimestamp + 1 }),
+        makeMessage({ role: "assistant", content: "old C", responseId: "resp-lcm-sub-c", timestamp: baseTimestamp + 2 }),
       ],
       prePromptMessageCount: 0,
       tokenBudget: 4096,
@@ -1130,10 +1138,10 @@ describe("LcmContextEngine afterTurn dedup guard", () => {
       sessionId,
       sessionFile: createSessionFilePath("dedup-large-file-lcm-substring-filename-2"),
       messages: [
-        makeMessage({ role: "user", content: "old A" }),
-        makeMessage({ role: "user", content: originalContent }),
-        makeMessage({ role: "assistant", content: "old C" }),
-        makeMessage({ role: "assistant", content: "new D" }),
+        makeMessage({ role: "user", content: "old A", timestamp: baseTimestamp + 3 }),
+        makeMessage({ role: "user", content: originalContent, timestamp: baseTimestamp + 4 }),
+        makeMessage({ role: "assistant", content: "old C", responseId: "resp-lcm-sub-c", timestamp: baseTimestamp + 5 }),
+        makeMessage({ role: "assistant", content: "new D", responseId: "resp-lcm-sub-d", timestamp: baseTimestamp + 6 }),
       ],
       prePromptMessageCount: 0,
       tokenBudget: 4096,
@@ -1157,14 +1165,15 @@ describe("LcmContextEngine afterTurn dedup guard", () => {
       `compare ${incidentalReference} with`,
       `<file name="real.md" mime="text/markdown">${fileText}</file>`,
     ].join("\n");
+    const baseTimestamp = Date.now();
 
     await engine.afterTurn({
       sessionId,
       sessionFile: createSessionFilePath("dedup-large-file-incidental-before-real"),
       messages: [
-        makeMessage({ role: "user", content: "old A" }),
-        makeMessage({ role: "user", content: originalContent }),
-        makeMessage({ role: "assistant", content: "old C" }),
+        makeMessage({ role: "user", content: "old A", timestamp: baseTimestamp }),
+        makeMessage({ role: "user", content: originalContent, timestamp: baseTimestamp + 1 }),
+        makeMessage({ role: "assistant", content: "old C", responseId: "resp-incidental-c", timestamp: baseTimestamp + 2 }),
       ],
       prePromptMessageCount: 0,
       tokenBudget: 4096,
@@ -1174,10 +1183,10 @@ describe("LcmContextEngine afterTurn dedup guard", () => {
       sessionId,
       sessionFile: createSessionFilePath("dedup-large-file-incidental-before-real-2"),
       messages: [
-        makeMessage({ role: "user", content: "old A" }),
-        makeMessage({ role: "user", content: originalContent }),
-        makeMessage({ role: "assistant", content: "old C" }),
-        makeMessage({ role: "assistant", content: "new D" }),
+        makeMessage({ role: "user", content: "old A", timestamp: baseTimestamp + 3 }),
+        makeMessage({ role: "user", content: originalContent, timestamp: baseTimestamp + 4 }),
+        makeMessage({ role: "assistant", content: "old C", responseId: "resp-incidental-c", timestamp: baseTimestamp + 5 }),
+        makeMessage({ role: "assistant", content: "new D", responseId: "resp-incidental-d", timestamp: baseTimestamp + 6 }),
       ],
       prePromptMessageCount: 0,
       tokenBudget: 4096,
@@ -1196,14 +1205,15 @@ describe("LcmContextEngine afterTurn dedup guard", () => {
     const engine = createEngineWithConfig({ largeFileTokenThreshold: 20 });
     const sessionId = "dedup-large-file-raw-payload-replay";
     const rawText = `${"raw payload replay line\n".repeat(160)}done`;
+    const baseTimestamp = Date.now();
 
     await engine.afterTurn({
       sessionId,
       sessionFile: createSessionFilePath("dedup-large-file-raw-payload-replay"),
       messages: [
-        makeMessage({ role: "user", content: "old A" }),
-        makeMessage({ role: "user", content: rawText }),
-        makeMessage({ role: "assistant", content: "old C" }),
+        makeMessage({ role: "user", content: "old A", timestamp: baseTimestamp }),
+        makeMessage({ role: "user", content: rawText, timestamp: baseTimestamp + 1 }),
+        makeMessage({ role: "assistant", content: "old C", responseId: "resp-raw-payload-c", timestamp: baseTimestamp + 2 }),
       ],
       prePromptMessageCount: 0,
       tokenBudget: 4096,
@@ -1213,10 +1223,10 @@ describe("LcmContextEngine afterTurn dedup guard", () => {
       sessionId,
       sessionFile: createSessionFilePath("dedup-large-file-raw-payload-replay-2"),
       messages: [
-        makeMessage({ role: "user", content: "old A" }),
-        makeMessage({ role: "user", content: rawText }),
-        makeMessage({ role: "assistant", content: "old C" }),
-        makeMessage({ role: "assistant", content: "new D" }),
+        makeMessage({ role: "user", content: "old A", timestamp: baseTimestamp + 3 }),
+        makeMessage({ role: "user", content: rawText, timestamp: baseTimestamp + 4 }),
+        makeMessage({ role: "assistant", content: "old C", responseId: "resp-raw-payload-c", timestamp: baseTimestamp + 5 }),
+        makeMessage({ role: "assistant", content: "new D", responseId: "resp-raw-payload-d", timestamp: baseTimestamp + 6 }),
       ],
       prePromptMessageCount: 0,
       tokenBudget: 4096,
@@ -1235,14 +1245,15 @@ describe("LcmContextEngine afterTurn dedup guard", () => {
     const sessionId = "dedup-large-file-serialized-raw-payload-replay";
     const rawText = `${"serialized raw payload replay line\n".repeat(160)}done`;
     const rawPayload = [{ type: "text", text: rawText, metadata: { source: "vendor" } }];
+    const baseTimestamp = Date.now();
 
     await engine.afterTurn({
       sessionId,
       sessionFile: createSessionFilePath("dedup-large-file-serialized-raw-payload-replay"),
       messages: [
-        makeMessage({ role: "user", content: "old A" }),
-        makeMessage({ role: "user", content: rawPayload }),
-        makeMessage({ role: "assistant", content: "old C" }),
+        makeMessage({ role: "user", content: "old A", timestamp: baseTimestamp }),
+        makeMessage({ role: "user", content: rawPayload, timestamp: baseTimestamp + 1 }),
+        makeMessage({ role: "assistant", content: "old C", responseId: "resp-serialized-c", timestamp: baseTimestamp + 2 }),
       ],
       prePromptMessageCount: 0,
       tokenBudget: 4096,
@@ -1252,10 +1263,10 @@ describe("LcmContextEngine afterTurn dedup guard", () => {
       sessionId,
       sessionFile: createSessionFilePath("dedup-large-file-serialized-raw-payload-replay-2"),
       messages: [
-        makeMessage({ role: "user", content: "old A" }),
-        makeMessage({ role: "user", content: rawPayload }),
-        makeMessage({ role: "assistant", content: "old C" }),
-        makeMessage({ role: "assistant", content: "new D" }),
+        makeMessage({ role: "user", content: "old A", timestamp: baseTimestamp + 3 }),
+        makeMessage({ role: "user", content: rawPayload, timestamp: baseTimestamp + 4 }),
+        makeMessage({ role: "assistant", content: "old C", responseId: "resp-serialized-c", timestamp: baseTimestamp + 5 }),
+        makeMessage({ role: "assistant", content: "new D", responseId: "resp-serialized-d", timestamp: baseTimestamp + 6 }),
       ],
       prePromptMessageCount: 0,
       tokenBudget: 4096,
@@ -1279,14 +1290,15 @@ describe("LcmContextEngine afterTurn dedup guard", () => {
       `<file name="raw-file.md" mime="text/markdown">${fileText}</file>`,
       surroundingText,
     ].join("\n");
+    const baseTimestamp = Date.now();
 
     await engine.afterTurn({
       sessionId,
       sessionFile: createSessionFilePath("dedup-large-file-raw-payload-file-block-replay"),
       messages: [
-        makeMessage({ role: "user", content: "old A" }),
-        makeMessage({ role: "user", content: rawContent }),
-        makeMessage({ role: "assistant", content: "old C" }),
+        makeMessage({ role: "user", content: "old A", timestamp: baseTimestamp }),
+        makeMessage({ role: "user", content: rawContent, timestamp: baseTimestamp + 1 }),
+        makeMessage({ role: "assistant", content: "old C", responseId: "resp-raw-file-block-c", timestamp: baseTimestamp + 2 }),
       ],
       prePromptMessageCount: 0,
       tokenBudget: 4096,
@@ -1297,10 +1309,10 @@ describe("LcmContextEngine afterTurn dedup guard", () => {
       sessionId,
       sessionFile: createSessionFilePath("dedup-large-file-raw-payload-file-block-replay-2"),
       messages: [
-        makeMessage({ role: "user", content: "old A" }),
-        makeMessage({ role: "user", content: rawContent }),
-        makeMessage({ role: "assistant", content: "old C" }),
-        makeMessage({ role: "assistant", content: "new D" }),
+        makeMessage({ role: "user", content: "old A", timestamp: baseTimestamp + 3 }),
+        makeMessage({ role: "user", content: rawContent, timestamp: baseTimestamp + 4 }),
+        makeMessage({ role: "assistant", content: "old C", responseId: "resp-raw-file-block-c", timestamp: baseTimestamp + 5 }),
+        makeMessage({ role: "assistant", content: "new D", responseId: "resp-raw-file-block-d", timestamp: baseTimestamp + 6 }),
       ],
       prePromptMessageCount: 0,
       tokenBudget: 4096,
@@ -1360,14 +1372,15 @@ describe("LcmContextEngine afterTurn dedup guard", () => {
     const engine = createEngineWithConfig({ largeFileTokenThreshold: 20 });
     const sessionId = "dedup-large-file-tool-output-replay";
     const toolOutput = `${"tool output replay line\n".repeat(160)}done`;
+    const baseTimestamp = Date.now();
 
     await engine.afterTurn({
       sessionId,
       sessionFile: createSessionFilePath("dedup-large-file-tool-output-replay"),
       messages: [
-        makeMessage({ role: "assistant", content: "old A" }),
-        makeMessage({ role: "tool", content: toolOutput }),
-        makeMessage({ role: "assistant", content: "old C" }),
+        makeMessage({ role: "assistant", content: "old A", responseId: "resp-tool-a", timestamp: baseTimestamp }),
+        makeMessage({ role: "tool", content: toolOutput, toolCallId: "call-tool-output-replay", timestamp: baseTimestamp + 1 }),
+        makeMessage({ role: "assistant", content: "old C", responseId: "resp-tool-c", timestamp: baseTimestamp + 2 }),
       ],
       prePromptMessageCount: 0,
       tokenBudget: 4096,
@@ -1377,10 +1390,10 @@ describe("LcmContextEngine afterTurn dedup guard", () => {
       sessionId,
       sessionFile: createSessionFilePath("dedup-large-file-tool-output-replay-2"),
       messages: [
-        makeMessage({ role: "assistant", content: "old A" }),
-        makeMessage({ role: "tool", content: toolOutput }),
-        makeMessage({ role: "assistant", content: "old C" }),
-        makeMessage({ role: "assistant", content: "new D" }),
+        makeMessage({ role: "assistant", content: "old A", responseId: "resp-tool-a", timestamp: baseTimestamp + 3 }),
+        makeMessage({ role: "tool", content: toolOutput, toolCallId: "call-tool-output-replay", timestamp: baseTimestamp + 4 }),
+        makeMessage({ role: "assistant", content: "old C", responseId: "resp-tool-c", timestamp: baseTimestamp + 5 }),
+        makeMessage({ role: "assistant", content: "new D", responseId: "resp-tool-d", timestamp: baseTimestamp + 6 }),
       ],
       prePromptMessageCount: 0,
       tokenBudget: 4096,
@@ -1398,17 +1411,19 @@ describe("LcmContextEngine afterTurn dedup guard", () => {
     const engine = createEngineWithConfig({ largeFileTokenThreshold: 20 });
     const sessionId = "dedup-native-image-replay";
     const base64Image = `iVBOR${"A".repeat(600)}`;
+    const baseTimestamp = Date.now();
 
     await engine.afterTurn({
       sessionId,
       sessionFile: createSessionFilePath("dedup-native-image-replay"),
       messages: [
-        makeMessage({ role: "assistant", content: "old A" }),
+        makeMessage({ role: "assistant", content: "old A", responseId: "resp-img-a", timestamp: baseTimestamp }),
         makeMessage({
           role: "user",
           content: [{ type: "image", data: base64Image, mimeType: "image/png" }],
+          timestamp: baseTimestamp + 1,
         }),
-        makeMessage({ role: "assistant", content: "old C" }),
+        makeMessage({ role: "assistant", content: "old C", responseId: "resp-img-c", timestamp: baseTimestamp + 2 }),
       ],
       prePromptMessageCount: 0,
       tokenBudget: 4096,
@@ -1418,13 +1433,14 @@ describe("LcmContextEngine afterTurn dedup guard", () => {
       sessionId,
       sessionFile: createSessionFilePath("dedup-native-image-replay-2"),
       messages: [
-        makeMessage({ role: "assistant", content: "old A" }),
+        makeMessage({ role: "assistant", content: "old A", responseId: "resp-img-a", timestamp: baseTimestamp + 3 }),
         makeMessage({
           role: "user",
           content: [{ type: "image", data: base64Image, mimeType: "image/png" }],
+          timestamp: baseTimestamp + 4,
         }),
-        makeMessage({ role: "assistant", content: "old C" }),
-        makeMessage({ role: "assistant", content: "new D" }),
+        makeMessage({ role: "assistant", content: "old C", responseId: "resp-img-c", timestamp: baseTimestamp + 5 }),
+        makeMessage({ role: "assistant", content: "new D", responseId: "resp-img-d", timestamp: baseTimestamp + 6 }),
       ],
       prePromptMessageCount: 0,
       tokenBudget: 4096,
@@ -1450,14 +1466,15 @@ describe("LcmContextEngine afterTurn dedup guard", () => {
       { type: "image", data: secondImage, mimeType: "image/png" },
       { type: "text", text: "after image" },
     ];
+    const baseTimestamp = Date.now();
 
     await engine.afterTurn({
       sessionId,
       sessionFile: createSessionFilePath("dedup-native-image-mixed-multi-replay"),
       messages: [
-        makeMessage({ role: "assistant", content: "old A" }),
-        makeMessage({ role: "user", content: mixedContent }),
-        makeMessage({ role: "assistant", content: "old C" }),
+        makeMessage({ role: "assistant", content: "old A", responseId: "resp-mixed-img-a", timestamp: baseTimestamp }),
+        makeMessage({ role: "user", content: mixedContent, timestamp: baseTimestamp + 1 }),
+        makeMessage({ role: "assistant", content: "old C", responseId: "resp-mixed-img-c", timestamp: baseTimestamp + 2 }),
       ],
       prePromptMessageCount: 0,
       tokenBudget: 4096,
@@ -1467,10 +1484,10 @@ describe("LcmContextEngine afterTurn dedup guard", () => {
       sessionId,
       sessionFile: createSessionFilePath("dedup-native-image-mixed-multi-replay-2"),
       messages: [
-        makeMessage({ role: "assistant", content: "old A" }),
-        makeMessage({ role: "user", content: mixedContent }),
-        makeMessage({ role: "assistant", content: "old C" }),
-        makeMessage({ role: "assistant", content: "new D" }),
+        makeMessage({ role: "assistant", content: "old A", responseId: "resp-mixed-img-a", timestamp: baseTimestamp + 3 }),
+        makeMessage({ role: "user", content: mixedContent, timestamp: baseTimestamp + 4 }),
+        makeMessage({ role: "assistant", content: "old C", responseId: "resp-mixed-img-c", timestamp: baseTimestamp + 5 }),
+        makeMessage({ role: "assistant", content: "new D", responseId: "resp-mixed-img-d", timestamp: baseTimestamp + 6 }),
       ],
       prePromptMessageCount: 0,
       tokenBudget: 4096,
@@ -1497,14 +1514,15 @@ describe("LcmContextEngine afterTurn dedup guard", () => {
       { type: "image", data: base64Image, mimeType: "image/png" },
       { type: "text", text: "raw payload image suffix" },
     ];
+    const baseTimestamp = Date.now();
 
     await engine.afterTurn({
       sessionId,
       sessionFile: createSessionFilePath("dedup-native-image-raw-payload-replay"),
       messages: [
-        makeMessage({ role: "assistant", content: "old A" }),
-        makeMessage({ role: "user", content: mixedContent }),
-        makeMessage({ role: "assistant", content: "old C" }),
+        makeMessage({ role: "assistant", content: "old A", responseId: "resp-img-rp-a", timestamp: baseTimestamp }),
+        makeMessage({ role: "user", content: mixedContent, timestamp: baseTimestamp + 1 }),
+        makeMessage({ role: "assistant", content: "old C", responseId: "resp-img-rp-c", timestamp: baseTimestamp + 2 }),
       ],
       prePromptMessageCount: 0,
       tokenBudget: 4096,
@@ -1514,10 +1532,10 @@ describe("LcmContextEngine afterTurn dedup guard", () => {
       sessionId,
       sessionFile: createSessionFilePath("dedup-native-image-raw-payload-replay-2"),
       messages: [
-        makeMessage({ role: "assistant", content: "old A" }),
-        makeMessage({ role: "user", content: mixedContent }),
-        makeMessage({ role: "assistant", content: "old C" }),
-        makeMessage({ role: "assistant", content: "new D" }),
+        makeMessage({ role: "assistant", content: "old A", responseId: "resp-img-rp-a", timestamp: baseTimestamp + 3 }),
+        makeMessage({ role: "user", content: mixedContent, timestamp: baseTimestamp + 4 }),
+        makeMessage({ role: "assistant", content: "old C", responseId: "resp-img-rp-c", timestamp: baseTimestamp + 5 }),
+        makeMessage({ role: "assistant", content: "new D", responseId: "resp-img-rp-d", timestamp: baseTimestamp + 6 }),
       ],
       prePromptMessageCount: 0,
       tokenBudget: 4096,
@@ -1571,14 +1589,15 @@ describe("LcmContextEngine afterTurn dedup guard", () => {
     const secondText = `${"second prefix replay file line\n".repeat(160)}done`;
     const firstContent = `<file name="first-prefix.md" mime="text/markdown">${firstText}</file>`;
     const secondContent = `<file name="second-prefix.md" mime="text/markdown">${secondText}</file>`;
+    const baseTimestamp = Date.now();
 
     await engine.afterTurn({
       sessionId,
       sessionFile: createSessionFilePath("dedup-large-file-multi-prefix-replay"),
       messages: [
-        makeMessage({ role: "user", content: "old A" }),
-        makeMessage({ role: "user", content: firstContent }),
-        makeMessage({ role: "user", content: secondContent }),
+        makeMessage({ role: "user", content: "old A", timestamp: baseTimestamp }),
+        makeMessage({ role: "user", content: firstContent, timestamp: baseTimestamp + 1 }),
+        makeMessage({ role: "user", content: secondContent, timestamp: baseTimestamp + 2 }),
       ],
       prePromptMessageCount: 0,
       tokenBudget: 4096,
@@ -1588,9 +1607,9 @@ describe("LcmContextEngine afterTurn dedup guard", () => {
       sessionId,
       sessionFile: createSessionFilePath("dedup-large-file-multi-prefix-replay-2"),
       messages: [
-        makeMessage({ role: "user", content: firstContent }),
-        makeMessage({ role: "user", content: secondContent }),
-        makeMessage({ role: "assistant", content: "new assistant suffix" }),
+        makeMessage({ role: "user", content: firstContent, timestamp: baseTimestamp + 3 }),
+        makeMessage({ role: "user", content: secondContent, timestamp: baseTimestamp + 4 }),
+        makeMessage({ role: "assistant", content: "new assistant suffix", responseId: "resp-multi-prefix-suffix", timestamp: baseTimestamp + 5 }),
       ],
       prePromptMessageCount: 0,
       tokenBudget: 4096,
@@ -1615,14 +1634,15 @@ describe("LcmContextEngine afterTurn dedup guard", () => {
     const sessionId = "dedup-large-file-oversized-externalized-only";
     const fileText = `${"oversized externalized-only file line\n".repeat(160)}done`;
     const originalContent = `<file name="oversized-only.md" mime="text/markdown">${fileText}</file>`;
+    const baseTimestamp = Date.now();
 
     await engine.afterTurn({
       sessionId,
       sessionFile: createSessionFilePath("dedup-large-file-oversized-externalized-only"),
       messages: [
-        makeMessage({ role: "user", content: "old A" }),
-        makeMessage({ role: "assistant", content: "old B" }),
-        makeMessage({ role: "user", content: originalContent }),
+        makeMessage({ role: "user", content: "old A", timestamp: baseTimestamp }),
+        makeMessage({ role: "assistant", content: "old B", responseId: "resp-oversized-b", timestamp: baseTimestamp + 1 }),
+        makeMessage({ role: "user", content: originalContent, timestamp: baseTimestamp + 2 }),
       ],
       prePromptMessageCount: 0,
       tokenBudget: 4096,
@@ -1632,8 +1652,8 @@ describe("LcmContextEngine afterTurn dedup guard", () => {
       sessionId,
       sessionFile: createSessionFilePath("dedup-large-file-oversized-externalized-only-2"),
       messages: [
-        makeMessage({ role: "user", content: originalContent }),
-        makeMessage({ role: "assistant", content: "new assistant suffix" }),
+        makeMessage({ role: "user", content: originalContent, timestamp: baseTimestamp + 3 }),
+        makeMessage({ role: "assistant", content: "new assistant suffix", responseId: "resp-oversized-suffix", timestamp: baseTimestamp + 4 }),
       ],
       prePromptMessageCount: 0,
       tokenBudget: 4096,
@@ -1723,14 +1743,15 @@ describe("LcmContextEngine afterTurn dedup guard", () => {
     const sessionId = "dedup-large-file-plain-text-not-file";
     const fileText = `${"plain text is not file metadata line\n".repeat(160)}done`;
     const fileContent = `<file name="plain.md" mime="text/markdown">${fileText}</file>`;
+    const baseTimestamp = Date.now();
 
     await engine.afterTurn({
       sessionId,
       sessionFile: createSessionFilePath("dedup-large-file-plain-text-not-file"),
       messages: [
-        makeMessage({ role: "user", content: "old A" }),
-        makeMessage({ role: "user", content: fileContent }),
-        makeMessage({ role: "assistant", content: "old C" }),
+        makeMessage({ role: "user", content: "old A", timestamp: baseTimestamp }),
+        makeMessage({ role: "user", content: fileContent, timestamp: baseTimestamp + 1 }),
+        makeMessage({ role: "assistant", content: "old C", responseId: "resp-plain-c-seed", timestamp: baseTimestamp + 2 }),
       ],
       prePromptMessageCount: 0,
       tokenBudget: 4096,
@@ -1740,10 +1761,10 @@ describe("LcmContextEngine afterTurn dedup guard", () => {
       sessionId,
       sessionFile: createSessionFilePath("dedup-large-file-plain-text-not-file-2"),
       messages: [
-        makeMessage({ role: "user", content: "old A" }),
-        makeMessage({ role: "user", content: fileText }),
-        makeMessage({ role: "assistant", content: "old C" }),
-        makeMessage({ role: "assistant", content: "new D" }),
+        makeMessage({ role: "user", content: "old A", timestamp: baseTimestamp + 3 }),
+        makeMessage({ role: "user", content: fileText, timestamp: baseTimestamp + 4 }),
+        makeMessage({ role: "assistant", content: "old C", responseId: "resp-plain-c-replay", timestamp: baseTimestamp + 5 }),
+        makeMessage({ role: "assistant", content: "new D", responseId: "resp-plain-d", timestamp: baseTimestamp + 6 }),
       ],
       prePromptMessageCount: 0,
       tokenBudget: 4096,
@@ -1810,13 +1831,14 @@ describe("LcmContextEngine afterTurn dedup guard", () => {
     ]);
 
     const replayedUpload = `prefix ${fileContent} suffix`;
+    const baseTimestamp = Date.now();
     await engine.afterTurn({
       sessionId,
       sessionFile: createSessionFilePath("dedup-large-file-pasted-reference-2"),
       messages: [
-        makeMessage({ role: "assistant", content: anchor }),
-        makeMessage({ role: "user", content: replayedUpload }),
-        makeMessage({ role: "assistant", content: "new pasted-reference suffix" }),
+        makeMessage({ role: "assistant", content: anchor, responseId: "resp-anchor", timestamp: baseTimestamp }),
+        makeMessage({ role: "user", content: replayedUpload, timestamp: baseTimestamp + 1 }),
+        makeMessage({ role: "assistant", content: "new pasted-reference suffix", responseId: "resp-new-pasted-suffix", timestamp: baseTimestamp + 2 }),
       ],
       prePromptMessageCount: 0,
       tokenBudget: 4096,
@@ -1835,14 +1857,15 @@ describe("LcmContextEngine afterTurn dedup guard", () => {
     const sessionId = "dedup-large-file-legacy-reference";
     const fileText = `${"legacy reference file line\n".repeat(160)}done`;
     const originalContent = `<file name="legacy.md" mime="text/markdown">${fileText}</file>`;
+    const baseTimestamp = Date.now();
 
     await engine.afterTurn({
       sessionId,
       sessionFile: createSessionFilePath("dedup-large-file-legacy-reference"),
       messages: [
-        makeMessage({ role: "user", content: "old A" }),
-        makeMessage({ role: "user", content: originalContent }),
-        makeMessage({ role: "assistant", content: "old C" }),
+        makeMessage({ role: "user", content: "old A", timestamp: baseTimestamp }),
+        makeMessage({ role: "user", content: originalContent, timestamp: baseTimestamp + 1 }),
+        makeMessage({ role: "assistant", content: "old C", responseId: "resp-legacy-c-seed", timestamp: baseTimestamp + 2 }),
       ],
       prePromptMessageCount: 0,
       tokenBudget: 4096,
@@ -1860,10 +1883,10 @@ describe("LcmContextEngine afterTurn dedup guard", () => {
       sessionId,
       sessionFile: createSessionFilePath("dedup-large-file-legacy-reference-2"),
       messages: [
-        makeMessage({ role: "user", content: "old A" }),
-        makeMessage({ role: "user", content: originalContent }),
-        makeMessage({ role: "assistant", content: "old C" }),
-        makeMessage({ role: "assistant", content: "new D" }),
+        makeMessage({ role: "user", content: "old A", timestamp: baseTimestamp + 3 }),
+        makeMessage({ role: "user", content: originalContent, timestamp: baseTimestamp + 4 }),
+        makeMessage({ role: "assistant", content: "old C", responseId: "resp-legacy-c-replay", timestamp: baseTimestamp + 5 }),
+        makeMessage({ role: "assistant", content: "new D", responseId: "resp-legacy-d", timestamp: baseTimestamp + 6 }),
       ],
       prePromptMessageCount: 0,
       tokenBudget: 4096,
@@ -1884,14 +1907,15 @@ describe("LcmContextEngine afterTurn dedup guard", () => {
     const incidentalId = "[LCM File: file_deadbeefdeadbeef | incidental.md | text/markdown | 1 bytes]";
     const fileText = `${incidentalId}\n${"incidental summary file id line\n".repeat(160)}done`;
     const originalContent = `<file name="incidental.md" mime="text/markdown">${fileText}</file>`;
+    const baseTimestamp = Date.now();
 
     await engine.afterTurn({
       sessionId,
       sessionFile: createSessionFilePath("dedup-large-file-incidental-file-id-summary"),
       messages: [
-        makeMessage({ role: "user", content: "old A" }),
-        makeMessage({ role: "user", content: originalContent }),
-        makeMessage({ role: "assistant", content: "old C" }),
+        makeMessage({ role: "user", content: "old A", timestamp: baseTimestamp }),
+        makeMessage({ role: "user", content: originalContent, timestamp: baseTimestamp + 1 }),
+        makeMessage({ role: "assistant", content: "old C", responseId: "resp-incidental-id-c", timestamp: baseTimestamp + 2 }),
       ],
       prePromptMessageCount: 0,
       tokenBudget: 4096,
@@ -1901,10 +1925,10 @@ describe("LcmContextEngine afterTurn dedup guard", () => {
       sessionId,
       sessionFile: createSessionFilePath("dedup-large-file-incidental-file-id-summary-2"),
       messages: [
-        makeMessage({ role: "user", content: "old A" }),
-        makeMessage({ role: "user", content: originalContent }),
-        makeMessage({ role: "assistant", content: "old C" }),
-        makeMessage({ role: "assistant", content: "new D" }),
+        makeMessage({ role: "user", content: "old A", timestamp: baseTimestamp + 3 }),
+        makeMessage({ role: "user", content: originalContent, timestamp: baseTimestamp + 4 }),
+        makeMessage({ role: "assistant", content: "old C", responseId: "resp-incidental-id-c", timestamp: baseTimestamp + 5 }),
+        makeMessage({ role: "assistant", content: "new D", responseId: "resp-incidental-id-d", timestamp: baseTimestamp + 6 }),
       ],
       prePromptMessageCount: 0,
       tokenBudget: 4096,
@@ -1929,14 +1953,15 @@ describe("LcmContextEngine afterTurn dedup guard", () => {
       "Exploration Summary:",
       "incidental summary block",
     ].join("\n");
+    const baseTimestamp = Date.now();
 
     await engine.afterTurn({
       sessionId,
       sessionFile: createSessionFilePath("dedup-large-file-summary-incidental-reference-block"),
       messages: [
-        makeMessage({ role: "user", content: "old A" }),
-        makeMessage({ role: "user", content: originalContent }),
-        makeMessage({ role: "assistant", content: "old C" }),
+        makeMessage({ role: "user", content: "old A", timestamp: baseTimestamp }),
+        makeMessage({ role: "user", content: originalContent, timestamp: baseTimestamp + 1 }),
+        makeMessage({ role: "assistant", content: "old C", responseId: "resp-incidental-block-c", timestamp: baseTimestamp + 2 }),
       ],
       prePromptMessageCount: 0,
       tokenBudget: 4096,
@@ -1973,10 +1998,10 @@ describe("LcmContextEngine afterTurn dedup guard", () => {
       sessionId,
       sessionFile: createSessionFilePath("dedup-large-file-summary-incidental-reference-block-2"),
       messages: [
-        makeMessage({ role: "user", content: "old A" }),
-        makeMessage({ role: "user", content: originalContent }),
-        makeMessage({ role: "assistant", content: "old C" }),
-        makeMessage({ role: "assistant", content: "new D" }),
+        makeMessage({ role: "user", content: "old A", timestamp: baseTimestamp + 3 }),
+        makeMessage({ role: "user", content: originalContent, timestamp: baseTimestamp + 4 }),
+        makeMessage({ role: "assistant", content: "old C", responseId: "resp-incidental-block-c", timestamp: baseTimestamp + 5 }),
+        makeMessage({ role: "assistant", content: "new D", responseId: "resp-incidental-block-d", timestamp: baseTimestamp + 6 }),
       ],
       prePromptMessageCount: 0,
       tokenBudget: 4096,
@@ -2087,13 +2112,14 @@ describe("LcmContextEngine afterTurn dedup guard", () => {
       `<file name="new.md" mime="text/markdown">${newText}</file>`,
     ].join("\n");
 
+    const baseTimestamp = Date.now();
     await engine.afterTurn({
       sessionId,
       sessionFile: createSessionFilePath("dedup-large-file-partial-match"),
       messages: [
-        makeMessage({ role: "user", content: "old A" }),
-        makeMessage({ role: "user", content: oldContent }),
-        makeMessage({ role: "assistant", content: "old C" }),
+        makeMessage({ role: "user", content: "old A", timestamp: baseTimestamp }),
+        makeMessage({ role: "user", content: oldContent, timestamp: baseTimestamp + 1 }),
+        makeMessage({ role: "assistant", content: "old C", responseId: "resp-partial-c-seed", timestamp: baseTimestamp + 2 }),
       ],
       prePromptMessageCount: 0,
       tokenBudget: 4096,
@@ -2103,10 +2129,10 @@ describe("LcmContextEngine afterTurn dedup guard", () => {
       sessionId,
       sessionFile: createSessionFilePath("dedup-large-file-partial-match-2"),
       messages: [
-        makeMessage({ role: "user", content: "old A" }),
-        makeMessage({ role: "user", content: changedContent }),
-        makeMessage({ role: "assistant", content: "old C" }),
-        makeMessage({ role: "assistant", content: "new D" }),
+        makeMessage({ role: "user", content: "old A", timestamp: baseTimestamp + 3 }),
+        makeMessage({ role: "user", content: changedContent, timestamp: baseTimestamp + 4 }),
+        makeMessage({ role: "assistant", content: "old C", responseId: "resp-partial-c-replay", timestamp: baseTimestamp + 5 }),
+        makeMessage({ role: "assistant", content: "new D", responseId: "resp-partial-d", timestamp: baseTimestamp + 6 }),
       ],
       prePromptMessageCount: 0,
       tokenBudget: 4096,
@@ -2355,10 +2381,10 @@ describe("LcmContextEngine compaction telemetry", () => {
     await engine.ingestBatch({
       sessionId,
       messages: [
-        makeMessage({ role: "user", content: "Question one that should compact." }),
-        makeMessage({ role: "assistant", content: "Answer one that should compact." }),
-        makeMessage({ role: "user", content: "Question two stays in the fresh tail." }),
-        makeMessage({ role: "assistant", content: "Answer two stays in the fresh tail." }),
+        makeMessage({ role: "user", content: "Question one that should compact.", timestamp: Date.now() }),
+        makeMessage({ role: "assistant", content: "Answer one that should compact.", responseId: "resp-compact-1", timestamp: Date.now() + 1 }),
+        makeMessage({ role: "user", content: "Question two stays in the fresh tail.", timestamp: Date.now() + 2 }),
+        makeMessage({ role: "assistant", content: "Answer two stays in the fresh tail.", responseId: "resp-compact-2", timestamp: Date.now() + 3 }),
       ],
     });
 
@@ -2537,10 +2563,11 @@ describe("LcmContextEngine compaction telemetry", () => {
             "",
             "Actual user request that should compact.",
           ].join("\n"),
+          timestamp: Date.now(),
         }),
-        makeMessage({ role: "assistant", content: "Actual assistant answer." }),
-        makeMessage({ role: "user", content: "Fresh tail question." }),
-        makeMessage({ role: "assistant", content: "Fresh tail answer." }),
+        makeMessage({ role: "assistant", content: "Actual assistant answer.", responseId: "resp-strip-actual", timestamp: Date.now() + 1 }),
+        makeMessage({ role: "user", content: "Fresh tail question.", timestamp: Date.now() + 2 }),
+        makeMessage({ role: "assistant", content: "Fresh tail answer.", responseId: "resp-strip-fresh", timestamp: Date.now() + 3 }),
       ],
     });
 

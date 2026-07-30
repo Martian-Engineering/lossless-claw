@@ -232,3 +232,17 @@ All mutating operations (ingest, compact) are serialized per-session using a pro
 LCM needs model inference for summarization, but it does not resolve provider credentials, base URLs, or provider transport settings directly. Summarization calls go through OpenClaw's `runtime.llm.complete` capability, which owns model preparation, credential resolution, OAuth refresh, provider dispatch, and usage attribution.
 
 Configured Lossless summary model overrides (`summaryModel`, `largeFileSummaryModel`, and `fallbackProviders`) are sent as runtime LLM model override requests. OpenClaw enforces those requests with `plugins.entries.lossless-claw.llm.allowModelOverride` and `plugins.entries.lossless-claw.llm.allowedModels`; denied overrides fail closed instead of silently falling back to a different model.
+
+## Stable event identity
+
+The `messages` table carries a `stable_event_key` column (TEXT, nullable)
+indexed by a partial unique index `(conversation_id, stable_event_key)
+WHERE stable_event_key IS NOT NULL`. The key is computed at
+`ingestSingle` time from a message's `responseId` or a single
+`toolCallId` and acts as a third identity axis alongside
+`transcript_entry_id` and `identity_hash`. Aggregate tool-result messages
+and messages without either stable identifier continue to use the
+existing identity-hash and redaction-aware deduplication. When a message
+with a key that is already present for the conversation is ingested, the
+duplicate is rejected before any side effects (large-file interception,
+parts, context items) so the originally-persisted row stays canonical.
