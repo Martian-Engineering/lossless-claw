@@ -4,7 +4,8 @@
 
 Fix duplicate ingestion of the same message when the transcript is
 redacted by `logging.redactPatterns` and the live `afterTurn` batch is
-not. A new `messages.stable_event_key` column + partial unique index
-plus an event-key short-circuit in `ingestSingle` (and a final-pass
-filter in `BatchDeduplicator`) prevent the two representations from
-being stored as separate rows.
+not. Stable assistant response and unambiguous tool-call identities are
+persisted in a new `messages.stable_event_key` column, checked before
+ingest side effects, and protected by a partial unique index. Messages
+without an unambiguous stable identity retain the existing
+content-based and redaction-aware deduplication behavior.
