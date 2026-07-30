@@ -112,6 +112,7 @@ function storedMessage(role: string, content: string, messageId = 0): MessageRec
     tokenCount: 1,
     createdAt: new Date(),
     largeContent: null,
+  transcriptEntryId: null,
   };
 }
 

@@ -99,6 +99,7 @@ export function createMockConversationStore() {
           tokenCount: input.tokenCount,
           createdAt: new Date(),
           largeContent: null,
+  transcriptEntryId: null,
         };
         messages.push(msg);
         return msg;

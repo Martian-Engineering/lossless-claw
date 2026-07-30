@@ -415,7 +415,7 @@ describe("afterTurn covered-frontier alignment", () => {
     expect(messages.map((message) => message.content)).toEqual(["nice! thank you!"]);
   });
 
-  it("keeps a single conv-info-only runtime copy without a sibling anchor", async () => {
+  it("keeps a conv-info-only runtime copy without a sibling anchor", async () => {
     const sessionFile = createSessionFilePath("decorated-convinfo-repeat");
     const header = JSON.stringify({
       type: "session",
@@ -453,6 +453,9 @@ describe("afterTurn covered-frontier alignment", () => {
       .getConversationStore()
       .getConversationForSession({ sessionId });
     const messages = await engine.getConversationStore().getMessages(conversation!.conversationId);
+    // The bare row is transcript-proven, but that authenticates only the
+    // stored row. It does not prove this incoming metadata face belongs to the
+    // same entry, so without another exact/timestamp anchor both rows survive.
     expect(messages.map((message) => message.content)).toEqual([
       "Hey there! hows it going?",
       decorated,

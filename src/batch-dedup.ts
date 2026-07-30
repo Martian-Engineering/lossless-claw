@@ -301,6 +301,7 @@ export class BatchDeduplicator {
             continue;
           }
           if (
+            tailMessages[i]!.transcriptEntryId != null &&
             this.runtimeRowCoversPersistedFrontierRow(
               tailMessages[i]!.role,
               tailMessages[i]!.content,
@@ -309,6 +310,9 @@ export class BatchDeduplicator {
               { allowUntimestampedInboundBodyMatch: true },
             )
           ) {
+            // Stored provenance qualifies this as alignment support, but it
+            // authenticates only the persisted row. Another exact/timestamp
+            // anchor must still prove the runtime batch is a replay.
             matches.push("unanchored-inbound");
             continue;
           }
@@ -750,14 +754,17 @@ export class BatchDeduplicator {
     if (match) {
       return match;
     }
-    return this.runtimeRowCoversPersistedFrontierRow(
-      storedMessage.role,
-      storedMessage.content,
-      incoming.role,
-      incoming.content,
-    )
-      ? "decorated"
-      : null;
+    if (
+      this.runtimeRowCoversPersistedFrontierRow(
+        storedMessage.role,
+        storedMessage.content,
+        incoming.role,
+        incoming.content,
+      )
+    ) {
+      return "decorated";
+    }
+    return null;
   }
 
   private async matchStoredMessageToIncoming(

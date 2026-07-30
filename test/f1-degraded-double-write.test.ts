@@ -380,7 +380,7 @@ describe("F1 degraded-path double-write", () => {
     expect(userRows.length).toBe(2);
   });
 
-  it("oversized degraded path KEEPS a metadata-block same-body turn without timestamp evidence", async () => {
+  it("oversized degraded path KEEPS a metadata-block same-body turn even with stored transcript provenance", async () => {
     const engine: LcmContextEngine = createEngine();
     const sessionId = "f1-oversized-degraded-metadata-same-body";
     const sessionKey = "agent:main:f1-oversized-degraded-metadata-same-body";
@@ -405,6 +405,7 @@ describe("F1 degraded-path double-write", () => {
         role: "user",
         content: priorBody,
         tokenCount: 2,
+        transcriptEntryId: "oversized-safety-entry",
         skipReplayTimestampFloodGuard: true,
       },
     ]);
@@ -440,7 +441,7 @@ describe("F1 degraded-path double-write", () => {
     expect(userRows.length).toBe(2);
   });
 
-  it("degraded path KEEPS a recap-bearing metadata-block same-body turn without timestamp evidence", async () => {
+  it("degraded path KEEPS a recap-bearing metadata-block same-body turn even with stored transcript provenance", async () => {
     const engine: LcmContextEngine = createEngine();
     const sessionId = "f1-degraded-recap-metadata-same-body";
     const sessionKey = "agent:main:f1-degraded-recap-metadata-same-body";
@@ -457,6 +458,7 @@ describe("F1 degraded-path double-write", () => {
         role: "user",
         content: priorBody,
         tokenCount: 2,
+        transcriptEntryId: "recap-safety-entry",
         skipReplayTimestampFloodGuard: true,
       },
     ]);
