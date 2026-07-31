@@ -627,6 +627,50 @@ export function buildMessageParts(params: {
     });
   }
 
+  // Empty-content tool-result fallback (issue #992): a tool result message
+  // whose content is an empty array (e.g. OpenClaw `update_plan` shape
+  // `{content: [], details: {...}}`) produces zero parts above, which loses
+  // the top-level pairing identity (toolCallId/toolName/isError live only in
+  // part metadata). Downstream, a zero-part role=tool row can no longer be
+  // rehydrated as a toolResult — it is demoted to assistant, filtered as
+  // empty, and `sanitizeToolUseResultPairing` then injects a synthetic
+  // "missing tool result" error on every assemble while the call is in the
+  // context window. Persist one fallback part that carries the pairing
+  // identity so assembly can reconstruct the toolResult. Role-gated (not
+  // id-gated): pre-existing routing in blockFromPart treats a metadata-less
+  // "tool" part as a toolCall, so only tool/toolResult roles may land here —
+  // an id-bearing assistant/user message would otherwise be misassembled as
+  // a phantom call. User and assistant empty content intentionally stays
+  // part-less (the empty-content filter and the empty-assistant skip are
+  // desired behavior). Callid-less tool rows keep today's demote-to-assistant
+  // assembly path.
+  if (
+    message.content.length === 0 &&
+    (role === "tool" || role === "toolResult") &&
+    !rawPayloadExternalized
+  ) {
+    parts.push({
+      sessionId,
+      partType: "tool",
+      ordinal: 0,
+      textContent: " ",
+      toolCallId: topLevelToolCallId ?? null,
+      toolName: topLevelToolName ?? null,
+      metadata: toJson({
+        // Always identify as "toolResult" so blockFromPart routes through
+        // toolResultBlockFromPart (not toolCallBlockFromPart which would
+        // emit a phantom toolCall block). The raw role may be "tool" but
+        // the logical shape is a tool RESULT.
+        originalRole: "toolResult",
+        rawType: "tool_result",
+        toolCallId: topLevelToolCallId,
+        toolName: topLevelToolName,
+        isError: topLevelIsError,
+        emptyContentFallback: true,
+      }),
+    });
+  }
+
   return parts;
 }
 
