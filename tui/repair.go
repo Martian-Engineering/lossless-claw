@@ -115,7 +115,7 @@ type anthropicClient struct {
 type anthropicRequest struct {
 	Model       string                    `json:"model"`
 	MaxTokens   int                       `json:"max_tokens"`
-	Temperature float64                   `json:"temperature,omitempty"`
+	Temperature *float64                  `json:"temperature,omitempty"`
 	Messages    []anthropicRequestMessage `json:"messages"`
 }
 
@@ -990,7 +990,7 @@ func (c *anthropicClient) summarizeAnthropic(ctx context.Context, model, prompt 
 	reqBody := anthropicRequest{
 		Model:       model,
 		MaxTokens:   targetTokens,
-		Temperature: 0,
+		Temperature: zeroTemperature(),
 		Messages: []anthropicRequestMessage{
 			{Role: "user", Content: prompt},
 		},
@@ -1060,8 +1060,9 @@ func (c *anthropicClient) summarizeAnthropic(ctx context.Context, model, prompt 
 
 func (c *anthropicClient) summarizeMiniMax(ctx context.Context, model, prompt string, targetTokens int) (string, error) {
 	reqBody := anthropicRequest{
-		Model:     model,
-		MaxTokens: targetTokens,
+		Model:       model,
+		MaxTokens:   targetTokens,
+		Temperature: zeroTemperature(),
 		Messages: []anthropicRequestMessage{
 			{Role: "user", Content: prompt},
 		},
@@ -1120,6 +1121,11 @@ func (c *anthropicClient) summarizeMiniMax(ctx context.Context, model, prompt st
 		)
 	}
 	return result, nil
+}
+
+func zeroTemperature() *float64 {
+	value := 0.0
+	return &value
 }
 
 // summarizeViaCLI delegates to the `claude` CLI binary when an OAuth/setup-token

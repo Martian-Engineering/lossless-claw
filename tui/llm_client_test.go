@@ -105,6 +105,9 @@ func TestSummarizeMiniMaxRegionalEndpoints(t *testing.T) {
 					if payload.Model != miniMaxModel || payload.MaxTokens != 200 {
 						t.Fatalf("unexpected request model/token budget: %#v", payload)
 					}
+					if payload.Temperature == nil || *payload.Temperature != 0 {
+						t.Fatalf("expected deterministic temperature 0, got %#v", payload.Temperature)
+					}
 					if len(payload.Messages) != 1 || payload.Messages[0].Role != "user" || payload.Messages[0].Content != "prompt" {
 						t.Fatalf("unexpected request messages: %#v", payload.Messages)
 					}
@@ -598,6 +601,13 @@ func TestSummarizeAnthropicRegularKeyHitsDirectAPI(t *testing.T) {
 			capturedURL = req.URL.String()
 			if got := req.Header.Get("x-api-key"); got != "sk-ant-api03-regular-key" {
 				t.Fatalf("expected x-api-key header, got %q", got)
+			}
+			var payload anthropicRequest
+			if err := json.NewDecoder(req.Body).Decode(&payload); err != nil {
+				t.Fatalf("decode request: %v", err)
+			}
+			if payload.Temperature == nil || *payload.Temperature != 0 {
+				t.Fatalf("expected deterministic temperature 0, got %#v", payload.Temperature)
 			}
 			return jsonResponse(200, `{
 				"content":[{"type":"text","text":"Direct API response."}]
