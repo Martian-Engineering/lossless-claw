@@ -289,6 +289,17 @@ lcm-tui doctor --all
 
 Use `--provider openai-codex` when you want ChatGPT Plus/Pro OAuth from the Codex CLI. Keep `--provider openai` for direct OpenAI-compatible HTTP calls with a raw `OPENAI_API_KEY`, including custom `--base-url` proxies.
 
+#### MiniMax regional endpoints
+
+Set `MINIMAX_API_KEY`, then select `--provider minimax` for the global endpoint or `--provider minimax-cn` for the China endpoint. Both provider IDs default to `MiniMax-M3` and use the Anthropic-compatible Messages API:
+
+| Provider ID | Default base URL |
+|-------------|------------------|
+| `minimax` | `https://api.minimax.io/anthropic` |
+| `minimax-cn` | `https://api.minimaxi.com/anthropic` |
+
+`--base-url`, `LCM_TUI_SUMMARY_BASE_URL`, and configured provider `baseUrl` values continue to override these defaults.
+
 ### `lcm-tui repair`
 
 Finds and fixes corrupted summaries (those containing the `[LCM fallback summary]` marker from failed summarization attempts).

@@ -28,11 +28,16 @@ const (
 	defaultLLMProvider     = "anthropic"
 	anthropicModel         = "claude-sonnet-4-20250514"
 	anthropicVersion       = "2023-06-01"
+	miniMaxProviderID      = "minimax"
+	miniMaxCNProviderID    = "minimax-cn"
+	miniMaxModel           = "MiniMax-M3"
 	openAIResponsesModel   = "gpt-5.3-codex"
 	condensedTargetTokens  = 2000
 	defaultHTTPTimeout     = 180 * time.Second
 
 	defaultAnthropicBaseURL = "https://api.anthropic.com"
+	defaultMiniMaxBaseURL   = "https://api.minimax.io/anthropic"
+	defaultMiniMaxCNBaseURL = "https://api.minimaxi.com/anthropic"
 	defaultOpenAIBaseURL    = "https://api.openai.com"
 )
 
@@ -972,6 +977,8 @@ func (c *anthropicClient) summarize(ctx context.Context, prompt string, targetTo
 	switch provider {
 	case "anthropic":
 		return c.summarizeAnthropic(ctx, model, prompt, targetTokens)
+	case miniMaxProviderID, miniMaxCNProviderID:
+		return c.summarizeMiniMax(ctx, model, prompt, targetTokens)
 	case "openai", "openai-codex", "github-copilot":
 		return c.summarizeOpenAI(ctx, model, prompt, targetTokens)
 	default:
@@ -1044,6 +1051,70 @@ func (c *anthropicClient) summarizeAnthropic(ctx context.Context, model, prompt 
 	if result == "" {
 		return "", fmt.Errorf(
 			"empty summary after normalization (provider=anthropic model=%s block_types=%s)",
+			model,
+			formatBlockTypes(blockTypes),
+		)
+	}
+	return result, nil
+}
+
+func (c *anthropicClient) summarizeMiniMax(ctx context.Context, model, prompt string, targetTokens int) (string, error) {
+	reqBody := anthropicRequest{
+		Model:     model,
+		MaxTokens: targetTokens,
+		Messages: []anthropicRequestMessage{
+			{Role: "user", Content: prompt},
+		},
+	}
+	payload, err := json.Marshal(reqBody)
+	if err != nil {
+		return "", fmt.Errorf("marshal MiniMax request: %w", err)
+	}
+
+	baseURL := c.baseURL
+	if baseURL == "" {
+		baseURL = defaultMiniMaxBaseURLForProvider(c.provider)
+	}
+	req, err := http.NewRequestWithContext(
+		ctx,
+		http.MethodPost,
+		resolveProviderEndpointURL(baseURL, "/v1/messages"),
+		bytes.NewReader(payload),
+	)
+	if err != nil {
+		return "", fmt.Errorf("build MiniMax request: %w", err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer "+c.apiKey)
+	req.Header.Set("anthropic-version", anthropicVersion)
+
+	resp, err := c.http.Do(req)
+	if err != nil {
+		return "", fmt.Errorf("call MiniMax API: %w", err)
+	}
+	defer resp.Body.Close()
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return "", fmt.Errorf("read MiniMax response: %w", err)
+	}
+
+	if resp.StatusCode >= 300 {
+		var apiErr anthropicErrorEnvelope
+		if json.Unmarshal(body, &apiErr) == nil && strings.TrimSpace(apiErr.Error.Message) != "" {
+			return "", fmt.Errorf("MiniMax API %d %s: %s", resp.StatusCode, apiErr.Error.Type, apiErr.Error.Message)
+		}
+		return "", fmt.Errorf("MiniMax API %d: %s", resp.StatusCode, strings.TrimSpace(string(body)))
+	}
+
+	result, blockTypes, err := extractMiniMaxSummary(body)
+	if err != nil {
+		return "", err
+	}
+	if result == "" {
+		return "", fmt.Errorf(
+			"empty summary after normalization (provider=%s model=%s block_types=%s)",
+			normalizeProviderID(c.provider),
 			model,
 			formatBlockTypes(blockTypes),
 		)
@@ -1320,9 +1391,17 @@ func (c *anthropicClient) summarizeOpenAI(ctx context.Context, model, prompt str
 }
 
 func extractAnthropicSummary(body []byte) (string, []string, error) {
+	return extractMessagesSummary("Anthropic", body)
+}
+
+func extractMiniMaxSummary(body []byte) (string, []string, error) {
+	return extractMessagesSummary("MiniMax", body)
+}
+
+func extractMessagesSummary(apiName string, body []byte) (string, []string, error) {
 	var parsed anthropicResponse
 	if err := json.Unmarshal(body, &parsed); err != nil {
-		return "", nil, fmt.Errorf("decode Anthropic response: %w", err)
+		return "", nil, fmt.Errorf("decode %s response: %w", apiName, err)
 	}
 
 	chunks := make([]string, 0, len(parsed.Content))
@@ -1479,9 +1558,12 @@ func resolveSummaryProviderModel(providerHint, modelHint string) (string, string
 	model := strings.TrimSpace(modelHint)
 
 	if model == "" {
-		if provider == "openai" || provider == "openai-codex" || provider == "github-copilot" {
+		switch provider {
+		case miniMaxProviderID, miniMaxCNProviderID:
+			model = miniMaxModel
+		case "openai", "openai-codex", "github-copilot":
 			model = openAIResponsesModel
-		} else {
+		default:
 			model = anthropicModel
 		}
 	}
@@ -1510,6 +1592,8 @@ func normalizeProviderID(provider string) string {
 func inferProviderFromModel(model string) string {
 	lower := strings.ToLower(strings.TrimSpace(model))
 	switch {
+	case strings.HasPrefix(lower, miniMaxProviderID+"-"):
+		return miniMaxProviderID
 	case strings.HasPrefix(lower, "claude"):
 		return "anthropic"
 	case strings.HasPrefix(lower, "gpt-"),
@@ -1672,6 +1756,8 @@ func providerAPIEnvCandidates(provider string) []string {
 	switch normalizeProviderID(provider) {
 	case "anthropic":
 		return []string{"ANTHROPIC_API_KEY"}
+	case miniMaxProviderID, miniMaxCNProviderID:
+		return []string{"MINIMAX_API_KEY"}
 	case "openai", "openai-codex":
 		return []string{"OPENAI_API_KEY"}
 	case "github-copilot":
@@ -1747,11 +1833,20 @@ func resolveProviderBaseURL(paths appDataPaths, provider, flagOverride string) s
 	}
 
 	switch normalizedProvider {
+	case miniMaxProviderID, miniMaxCNProviderID:
+		return defaultMiniMaxBaseURLForProvider(normalizedProvider)
 	case "openai", "openai-codex", "github-copilot":
 		return defaultOpenAIBaseURL
 	default:
 		return defaultAnthropicBaseURL
 	}
+}
+
+func defaultMiniMaxBaseURLForProvider(provider string) string {
+	if normalizeProviderID(provider) == miniMaxCNProviderID {
+		return defaultMiniMaxCNBaseURL
+	}
+	return defaultMiniMaxBaseURL
 }
 
 // resolveProviderEndpointURL accepts either API-root base URLs or versioned /v1 URLs.
