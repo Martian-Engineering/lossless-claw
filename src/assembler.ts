@@ -583,8 +583,23 @@ function toRuntimeRole(
   return "user"; // user | system
 }
 
-/** @internal Exported for testing only. */
-export function blockFromPart(part: MessagePartRecord): unknown {
+/**
+ * Reconstruct a runtime content block from a stored message part.
+ *
+ * `messageHasStoredModelIdentity` is the message-level gate for preserving
+ * provider-issued thinking signatures (the host's transformMessages then
+ * applies its own same-model replay policy). Identity is persisted on
+ * ordinal-0 metadata only, so callers that reconstruct a whole message pass
+ * the message-level decision in; callers default to the per-part check so a
+ * standalone part still behaves correctly.
+ *
+ * @internal Exported for testing only.
+ */
+export function blockFromPart(
+  part: MessagePartRecord,
+  messageHasStoredModelIdentity?: boolean,
+): unknown {
+  const hasModelIdentity = messageHasStoredModelIdentity ?? hasStoredModelIdentity(part);
   const metadata = getPartMetadata(part);
   if (metadata.raw && typeof metadata.raw === "object") {
     // If this is an OpenClaw-normalised OpenAI reasoning block, restore the original
@@ -607,18 +622,29 @@ export function blockFromPart(part: MessagePartRecord): unknown {
       // "reasoning_content" is OpenClaw's cross-provider sentinel signature
       // (provider-stream stamps it for reasoning_content-native endpoints and
       // the Anthropic client recognizes it), not a provider-issued signature.
-      // Preserving it keeps reasoning-native replay working; stripping it
-      // downgrades the block to plain text on replay, which corrupts
-      // reasoning-native models (e.g. Kimi K3 response-channel contamination).
+      // Preserving it keeps reasoning-native replay working when the assembled
+      // message also carries model identity (the host's transformMessages then
+      // treats the block as same-model and keeps the sentinel, which the
+      // Anthropic client drops from outgoing requests).
+      //
+      // Legacy rows without stored identity: drop the block entirely. The
+      // host's transformMessages would treat it as cross-model (missing
+      // identity → downgrade to text), which lands reasoning in the response
+      // channel of the chat template — exactly the contamination this patch
+      // fixes. Dropping mirrors what the host does to sentinel blocks without
+      // identity and avoids polluting the response channel for existing
+      // sessions that still have pre-upgrade rows.
       if (rawRecord.thinkingSignature === "reasoning_content") {
-        return rawRecord;
+        return hasModelIdentity ? rawRecord : null;
       }
       // Provider-issued signatures are kept only when the stored model
       // identity survives to the assembled message (the host's
       // transformMessages then applies its own same-model replay policy).
-      // Legacy rows without identity keep the historical strip so foreign
-      // signatures cannot leak across a provider switch (#365).
-      if (hasStoredModelIdentity(part)) {
+      // Identity lives on ordinal-0 metadata, so the gate is decided at
+      // message level and passed in; per-part check is the single-block
+      // fallback. Legacy rows without identity keep the historical strip so
+      // foreign signatures cannot leak across a provider switch (#365).
+      if (hasModelIdentity) {
         return rawRecord;
       }
       const { thinkingSignature: _thinkingSignature, ...cleaned } = rawRecord;
@@ -743,7 +769,26 @@ export function contentFromParts(
     return fallbackContent;
   }
 
-  const blocks = contentParts.map(blockFromPart);
+  // Message-level signature-preservation gate: a signature-bearing thinking
+  // block may sit at any ordinal, but identity is persisted on ordinal-0
+  // metadata, so the decision must see the whole part set.
+  const messageHasStoredModelIdentity =
+    role === "assistant" && pickModelIdentity(parts) !== undefined;
+  const blocks = contentParts
+    .map((part) => blockFromPart(part, messageHasStoredModelIdentity))
+    .filter((block): block is NonNullable<typeof block> => block != null);
+  if (blocks.length === 0) {
+    // All content blocks were dropped (e.g. legacy sentinel-only thinking
+    // blocks without stored identity). Fall back to stored content like the
+    // no-parts branch above.
+    if (role === "assistant") {
+      return fallbackContent ? [{ type: "text", text: fallbackContent }] : [];
+    }
+    if (role === "toolResult") {
+      return [{ type: "text", text: fallbackContent }];
+    }
+    return fallbackContent;
+  }
   if (
     role === "user" &&
     blocks.length === 1 &&

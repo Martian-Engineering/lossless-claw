@@ -3,6 +3,7 @@ import {
   toolCallBlockFromPart,
   toolResultBlockFromPart,
   blockFromPart,
+  contentFromParts,
   tokenizeText,
   scoreRelevance,
 } from "../src/assembler.js";
@@ -433,11 +434,15 @@ describe("blockFromPart", () => {
     expect(block).not.toHaveProperty("thinkingSignature");
   });
 
-  it("preserves the reasoning_content sentinel thinkingSignature", () => {
+  it("preserves the reasoning_content sentinel when model identity exists", () => {
     const part = makePart({
       partType: "reasoning",
       textContent: "native reasoning replay text",
       metadata: JSON.stringify({
+        originalRole: "assistant",
+        modelProvider: "moonshot",
+        modelApi: "openai-completions",
+        modelId: "kimi-k3",
         raw: {
           type: "thinking",
           thinking: "native reasoning replay text",
@@ -452,6 +457,25 @@ describe("blockFromPart", () => {
       thinking: "native reasoning replay text",
       thinkingSignature: "reasoning_content",
     });
+  });
+
+  it("drops reasoning_content sentinel when no stored model identity (legacy rows)", () => {
+    const part = makePart({
+      partType: "reasoning",
+      textContent: "legacy native reasoning text",
+      metadata: JSON.stringify({
+        raw: {
+          type: "thinking",
+          thinking: "legacy native reasoning text",
+          thinkingSignature: "reasoning_content",
+        },
+      }),
+    });
+    const block = blockFromPart(part);
+
+    // Legacy rows without identity: sentinel is dropped (null) so the host's
+    // transformMessages doesn't downgrade it to response-channel text.
+    expect(block).toBeNull();
   });
 
   it("preserves provider thinkingSignature when stored model identity exists", () => {
@@ -476,6 +500,32 @@ describe("blockFromPart", () => {
       type: "thinking",
       thinking: "same-model thinking text",
       thinkingSignature: "anthropic-signature-payload",
+    });
+  });
+
+  it("preserves provider sig on non-ordinal-0 thinking block when message-level identity exists", () => {
+    // Regression: identity is stored on ordinal-0 metadata only, but a
+    // signature-bearing thinking block may sit at any ordinal. The
+    // message-level gate must pass the identity decision to all blocks.
+    const part = makePart({
+      partType: "reasoning",
+      textContent: "thinking at ordinal 1",
+      metadata: JSON.stringify({
+        originalRole: "assistant",
+        raw: {
+          type: "thinking",
+          thinking: "thinking at ordinal 1",
+          thinkingSignature: "anthropic-sig-for-ordinal-1",
+        },
+      }),
+    });
+    // No identity on THIS part, but the message-level gate says identity exists.
+    const block = blockFromPart(part, true) as Record<string, unknown>;
+
+    expect(block).toEqual({
+      type: "thinking",
+      thinking: "thinking at ordinal 1",
+      thinkingSignature: "anthropic-sig-for-ordinal-1",
     });
   });
 
@@ -660,6 +710,90 @@ describe("blockFromPart", () => {
     const block = blockFromPart(part) as Record<string, unknown>;
 
     expect(block.id).toBe("toolu_lcm_test-part-1");
+  });
+});
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// contentFromParts (message-level identity gating)
+// ═══════════════════════════════════════════════════════════════════════════════
+
+describe("contentFromParts", () => {
+  it("preserves provider thinkingSignature on ordinal-1 block via message-level identity", () => {
+    // Identity is on ordinal-0 (text), thinking block is ordinal-1.
+    const parts: MessagePartRecord[] = [
+      {
+        partId: "p0",
+        messageId: 1,
+        sessionId: "s1",
+        partType: "text",
+        ordinal: 0,
+        textContent: "visible answer",
+        toolCallId: null,
+        toolName: null,
+        toolInput: null,
+        toolOutput: null,
+        metadata: JSON.stringify({
+          originalRole: "assistant",
+          modelProvider: "anthropic",
+          modelApi: "anthropic-messages",
+          modelId: "claude-opus-4-6",
+        }),
+      },
+      {
+        partId: "p1",
+        messageId: 1,
+        sessionId: "s1",
+        partType: "reasoning",
+        ordinal: 1,
+        textContent: "thinking at ordinal 1",
+        toolCallId: null,
+        toolName: null,
+        toolInput: null,
+        toolOutput: null,
+        metadata: JSON.stringify({
+          originalRole: "assistant",
+          raw: {
+            type: "thinking",
+            thinking: "thinking at ordinal 1",
+            thinkingSignature: "anthropic-sig-ordinal-1",
+          },
+        }),
+      },
+    ];
+    const content = contentFromParts(parts, "assistant", "fallback") as Array<Record<string, unknown>>;
+    expect(content.length).toBe(2);
+    expect(content[1]).toEqual({
+      type: "thinking",
+      thinking: "thinking at ordinal 1",
+      thinkingSignature: "anthropic-sig-ordinal-1",
+    });
+  });
+
+  it("drops legacy sentinel-only thinking block without identity", () => {
+    const parts: MessagePartRecord[] = [
+      {
+        partId: "p0",
+        messageId: 1,
+        sessionId: "s1",
+        partType: "reasoning",
+        ordinal: 0,
+        textContent: "legacy reasoning",
+        toolCallId: null,
+        toolName: null,
+        toolInput: null,
+        toolOutput: null,
+        metadata: JSON.stringify({
+          raw: {
+            type: "thinking",
+            thinking: "legacy reasoning",
+            thinkingSignature: "reasoning_content",
+          },
+        }),
+      },
+    ];
+    const content = contentFromParts(parts, "assistant", "fallback");
+    // Block dropped (no identity), falls back to stored content.
+    expect(content).toEqual([{ type: "text", text: "fallback" }]);
   });
 });
 

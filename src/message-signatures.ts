@@ -3,7 +3,12 @@
  *
  * Extracted from engine.ts (Phase 1 of the engine decomposition).
  */
-import { buildMessageParts, toStoredMessage, type StoredMessage } from "./message-content.js";
+import {
+  buildMessageParts,
+  stripModelIdentityFromSerializedPartsSignature,
+  toStoredMessage,
+  type StoredMessage,
+} from "./message-content.js";
 import type { AgentMessage } from "./openclaw-bridge.js";
 import { canonicalizeOpenClawInboundMetadataIdentityContent } from "./openclaw-inbound-metadata.js";
 import type { CreateMessagePartInput } from "./store/conversation-store.js";
@@ -52,20 +57,27 @@ export function createLosslessMessageSignature(message: AgentMessage): string {
     fallbackContent: stored.content,
   });
 
-  return JSON.stringify({
-    role: stored.role,
-    content: stored.content,
-    parts: parts.map((part) => ({
-      partType: part.partType,
-      ordinal: part.ordinal,
-      textContent: part.textContent ?? null,
-      toolCallId: part.toolCallId ?? null,
-      toolName: part.toolName ?? null,
-      toolInput: part.toolInput ?? null,
-      toolOutput: part.toolOutput ?? null,
-      metadata: part.metadata ?? null,
-    })),
-  });
+  // Strip model-identity metadata from the serialized payload: identity is
+  // replay affinity, not message identity. Rows persisted before identity
+  // stamping and live/assembled representations produced after the upgrade
+  // must keep comparing equal for replay-prefix detection across the
+  // pre/post-upgrade boundary.
+  return stripModelIdentityFromSerializedPartsSignature(
+    JSON.stringify({
+      role: stored.role,
+      content: stored.content,
+      parts: parts.map((part) => ({
+        partType: part.partType,
+        ordinal: part.ordinal,
+        textContent: part.textContent ?? null,
+        toolCallId: part.toolCallId ?? null,
+        toolName: part.toolName ?? null,
+        toolInput: part.toolInput ?? null,
+        toolOutput: part.toolOutput ?? null,
+        metadata: part.metadata ?? null,
+      })),
+    }),
+  );
 }
 
 export function hashAgentMessageForAssemblyProtection(message: AgentMessage): string {

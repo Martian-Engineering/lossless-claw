@@ -2,7 +2,7 @@ import { describe, expect, it } from "vitest";
 import { buildMessageParts } from "../src/message-content.js";
 import type { AgentMessage } from "../src/openclaw-bridge.js";
 
-function partMetadata(part: { metadata: string | null }): Record<string, unknown> {
+function partMetadata(part: { metadata?: string | null }): Record<string, unknown> {
   return JSON.parse(part.metadata ?? "{}") as Record<string, unknown>;
 }
 
