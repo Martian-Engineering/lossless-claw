@@ -11,13 +11,14 @@
  *   error=ENOENT...
  * once per turn, forever, while the rotation guard silently did nothing.
  *
- * Policy under test: only the known opaque locator forms are skipped
- * (reason=session-file-not-rotatable) — the sqlite: marker prefix, and a
- * sessionFile equal to the session key or session id. Every other value,
- * absolute or relative, keeps the pre-existing behavior: stat,
+ * Policy under test: known opaque locator forms are skipped
+ * (reason=session-file-not-rotatable) -- valid sqlite markers, and missing
+ * sessionFile values equal to the session key or session id. Every other
+ * value, absolute or relative, keeps the pre-existing behavior: stat,
  * below-threshold skip, and a warn when the stat genuinely fails.
  */
-import { writeFileSync } from "node:fs";
+import { mkdtempSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import {
@@ -25,6 +26,7 @@ import {
   createEngineWithDeps,
   createEngineWithDepsOverrides,
   createSessionFilePath,
+  tempDirs,
 } from "./helpers.js";
 
 afterEach(cleanupEngineTestState);
@@ -43,7 +45,7 @@ function loggedLines(mock: ReturnType<typeof vi.fn>): string[] {
 }
 
 describe("runtime auto-rotate with opaque sessionFile locators", () => {
-  it("skips a bare session key without stat or warn", async () => {
+  it("skips a missing bare session key without warn", async () => {
     const log = createLogSpies();
     const engine = createEngineWithDepsOverrides({ log });
 
@@ -65,7 +67,7 @@ describe("runtime auto-rotate with opaque sessionFile locators", () => {
     expect(skips.length).toBe(1);
   });
 
-  it("skips a bare session id without stat or warn", async () => {
+  it("skips a missing bare session id without warn", async () => {
     const log = createLogSpies();
     const engine = createEngineWithDepsOverrides({ log });
 
@@ -107,6 +109,70 @@ describe("runtime auto-rotate with opaque sessionFile locators", () => {
         line.includes("reason=session-file-not-rotatable"),
     );
     expect(skips.length).toBe(1);
+  });
+
+  it("still stats real relative paths with a sqlite prefix when they are not markers", async () => {
+    const previousCwd = process.cwd();
+    const tempDir = mkdtempSync(join(tmpdir(), "lossless-claw-relative-session-"));
+    tempDirs.push(tempDir);
+    process.chdir(tempDir);
+    try {
+      const log = createLogSpies();
+      const engine = createEngineWithDepsOverrides({ log });
+      const sessionFile = "sqlite:large-session.jsonl";
+      writeFileSync(sessionFile, `${JSON.stringify({ type: "session_info" })}\n`);
+
+      await engine.maintain({
+        sessionId: "99999999-9999-4999-8999-999999999999",
+        sessionKey: "agent:main:telegram:direct:sqlite-prefix",
+        sessionFile,
+      });
+
+      expect(
+        loggedLines(log.info).filter((line) => line.includes("reason=session-file-not-rotatable")),
+      ).toEqual([]);
+      const skips = loggedLines(log.info).filter(
+        (line) =>
+          line.includes("auto-rotate:") &&
+          line.includes("action=skip") &&
+          line.includes("reason=below-threshold"),
+      );
+      expect(skips.length).toBe(1);
+    } finally {
+      process.chdir(previousCwd);
+    }
+  });
+
+  it("still stats real relative paths equal to the session id", async () => {
+    const previousCwd = process.cwd();
+    const tempDir = mkdtempSync(join(tmpdir(), "lossless-claw-relative-session-"));
+    tempDirs.push(tempDir);
+    process.chdir(tempDir);
+    try {
+      const log = createLogSpies();
+      const engine = createEngineWithDepsOverrides({ log });
+      const sessionId = "relative-session-id-transcript";
+      writeFileSync(sessionId, `${JSON.stringify({ type: "session_info" })}\n`);
+
+      await engine.maintain({
+        sessionId,
+        sessionKey: "agent:main:telegram:direct:session-id-path",
+        sessionFile: sessionId,
+      });
+
+      expect(
+        loggedLines(log.info).filter((line) => line.includes("reason=session-file-not-rotatable")),
+      ).toEqual([]);
+      const skips = loggedLines(log.info).filter(
+        (line) =>
+          line.includes("auto-rotate:") &&
+          line.includes("action=skip") &&
+          line.includes("reason=below-threshold"),
+      );
+      expect(skips.length).toBe(1);
+    } finally {
+      process.chdir(previousCwd);
+    }
   });
 
   it("still stats real absolute paths (below-threshold skip)", async () => {

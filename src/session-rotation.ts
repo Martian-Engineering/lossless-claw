@@ -121,27 +121,26 @@ type StartupAutoRotateBatchResult = {
 
 const AUTO_ROTATE_DATABASE_LOCK_TIMEOUT_MS = 30_000;
 
-const SQLITE_SESSION_FILE_MARKER_PREFIX = "sqlite:";
+const SQLITE_SESSION_FILE_MARKER_RE = /^sqlite:([^:]+):([^:]+):(.+)$/;
 
 /**
  * Hosts with SQLite-backed session stores pass opaque locators through
  * sessionFile instead of a transcript path: a
- * "sqlite:<agentId>:<sessionId>:<storePath>" marker, or — in some
- * maintenance paths — the bare session key or session id (e.g.
- * "agent:main:main"). JSONL auto-rotation only applies to real transcript
- * files on disk, so these are skipped before any filesystem work instead of
- * warn-logging a stat failure on every turn. Only these known opaque forms
- * are rejected; every other value (absolute or relative paths alike) keeps
- * the pre-existing stat behavior.
+ * "sqlite:<agentId>:<sessionId>:<storePath>" marker. JSONL auto-rotation only
+ * applies to real transcript files on disk, so valid SQLite markers are
+ * skipped before any filesystem work instead of warn-logging a stat failure on
+ * every turn.
  */
-function isOpaqueSessionFileLocator(params: {
+function isSqliteSessionFileMarker(sessionFile: string): boolean {
+  const match = SQLITE_SESSION_FILE_MARKER_RE.exec(sessionFile);
+  return Boolean(match?.[1] && match[2] && match[3]);
+}
+
+function isBareSessionIdentityLocator(params: {
   sessionFile: string;
   sessionId?: string;
   sessionKey?: string;
 }): boolean {
-  if (params.sessionFile.startsWith(SQLITE_SESSION_FILE_MARKER_PREFIX)) {
-    return true;
-  }
   return params.sessionFile === params.sessionKey || params.sessionFile === params.sessionId;
 }
 
@@ -386,7 +385,7 @@ export class SessionRotationService {
       skip("stateless-session");
       return;
     }
-    if (isOpaqueSessionFileLocator({ sessionFile, sessionId, sessionKey })) {
+    if (isSqliteSessionFileMarker(sessionFile)) {
       skip("session-file-not-rotatable");
       return;
     }
@@ -397,6 +396,10 @@ export class SessionRotationService {
     try {
       sizeBytes = (await stat(sessionFile)).size;
     } catch (error) {
+      if (isMissingFileError(error) && isBareSessionIdentityLocator({ sessionFile, sessionId, sessionKey })) {
+        skip("session-file-not-rotatable");
+        return;
+      }
       this.logAutoRotateSessionFileDecision({
         ...baseLog,
         action: "warn",
@@ -590,7 +593,7 @@ export class SessionRotationService {
     if (this.host.shouldIgnoreSession({ sessionId, sessionKey }) || this.host.isStatelessSession(sessionKey)) {
       return { kind: "skipped" };
     }
-    if (isOpaqueSessionFileLocator({ sessionFile, sessionId, sessionKey })) {
+    if (isSqliteSessionFileMarker(sessionFile)) {
       return { kind: "skipped" };
     }
 
