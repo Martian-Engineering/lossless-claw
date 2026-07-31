@@ -433,6 +433,52 @@ describe("blockFromPart", () => {
     expect(block).not.toHaveProperty("thinkingSignature");
   });
 
+  it("preserves the reasoning_content sentinel thinkingSignature", () => {
+    const part = makePart({
+      partType: "reasoning",
+      textContent: "native reasoning replay text",
+      metadata: JSON.stringify({
+        raw: {
+          type: "thinking",
+          thinking: "native reasoning replay text",
+          thinkingSignature: "reasoning_content",
+        },
+      }),
+    });
+    const block = blockFromPart(part) as Record<string, unknown>;
+
+    expect(block).toEqual({
+      type: "thinking",
+      thinking: "native reasoning replay text",
+      thinkingSignature: "reasoning_content",
+    });
+  });
+
+  it("preserves provider thinkingSignature when stored model identity exists", () => {
+    const part = makePart({
+      partType: "reasoning",
+      textContent: "same-model thinking text",
+      metadata: JSON.stringify({
+        originalRole: "assistant",
+        modelProvider: "anthropic",
+        modelApi: "anthropic-messages",
+        modelId: "claude-opus-4-6",
+        raw: {
+          type: "thinking",
+          thinking: "same-model thinking text",
+          thinkingSignature: "anthropic-signature-payload",
+        },
+      }),
+    });
+    const block = blockFromPart(part) as Record<string, unknown>;
+
+    expect(block).toEqual({
+      type: "thinking",
+      thinking: "same-model thinking text",
+      thinkingSignature: "anthropic-signature-payload",
+    });
+  });
+
   it("routes tool result parts correctly", () => {
     const part = makePart({
       partType: "tool",

@@ -306,6 +306,56 @@ function getOriginalRole(parts: MessagePartRecord[]): string | null {
   return null;
 }
 
+type StoredModelIdentity = {
+  provider?: string;
+  api?: string;
+  model?: string;
+  responseModel?: string;
+};
+
+/** Read the assistant model identity persisted by buildMessageParts (if any). */
+function pickModelIdentity(parts: MessagePartRecord[]): StoredModelIdentity | undefined {
+  for (const part of parts) {
+    const decoded = parseJson(part.metadata);
+    if (!decoded || typeof decoded !== "object") {
+      continue;
+    }
+    const record = decoded as {
+      modelProvider?: unknown;
+      modelApi?: unknown;
+      modelId?: unknown;
+      responseModelId?: unknown;
+    };
+    const identity: StoredModelIdentity = {};
+    if (typeof record.modelProvider === "string" && record.modelProvider.length > 0) {
+      identity.provider = record.modelProvider;
+    }
+    if (typeof record.modelApi === "string" && record.modelApi.length > 0) {
+      identity.api = record.modelApi;
+    }
+    if (typeof record.modelId === "string" && record.modelId.length > 0) {
+      identity.model = record.modelId;
+    }
+    if (typeof record.responseModelId === "string" && record.responseModelId.length > 0) {
+      identity.responseModel = record.responseModelId;
+    }
+    if (
+      identity.provider !== undefined ||
+      identity.api !== undefined ||
+      identity.model !== undefined ||
+      identity.responseModel !== undefined
+    ) {
+      return identity;
+    }
+  }
+  return undefined;
+}
+
+/** True when the part's message-level metadata carries a stored model identity. */
+function hasStoredModelIdentity(part: MessagePartRecord): boolean {
+  return pickModelIdentity([part]) !== undefined;
+}
+
 function getPartMetadata(part: MessagePartRecord): {
   originalRole?: string;
   rawType?: string;
@@ -554,6 +604,23 @@ export function blockFromPart(part: MessagePartRecord): unknown {
       rawType === "thinking" &&
       typeof rawRecord.thinkingSignature === "string"
     ) {
+      // "reasoning_content" is OpenClaw's cross-provider sentinel signature
+      // (provider-stream stamps it for reasoning_content-native endpoints and
+      // the Anthropic client recognizes it), not a provider-issued signature.
+      // Preserving it keeps reasoning-native replay working; stripping it
+      // downgrades the block to plain text on replay, which corrupts
+      // reasoning-native models (e.g. Kimi K3 response-channel contamination).
+      if (rawRecord.thinkingSignature === "reasoning_content") {
+        return rawRecord;
+      }
+      // Provider-issued signatures are kept only when the stored model
+      // identity survives to the assembled message (the host's
+      // transformMessages then applies its own same-model replay policy).
+      // Legacy rows without identity keep the historical strip so foreign
+      // signatures cannot leak across a provider switch (#365).
+      if (hasStoredModelIdentity(part)) {
+        return rawRecord;
+      }
       const { thinkingSignature: _thinkingSignature, ...cleaned } = rawRecord;
       return cleaned;
     }
@@ -1768,6 +1835,7 @@ export class ContextAssembler {
     const content = contentFromParts(parts, role, msg.content);
     const topLevelAssistantReasoning =
       role === "assistant" ? pickTopLevelAssistantReasoning(parts) : {};
+    const modelIdentity = role === "assistant" ? pickModelIdentity(parts) : undefined;
     const contentText =
       typeof content === "string" ? content : (JSON.stringify(content) ?? msg.content);
     const topLevelReasoningText = Object.values(topLevelAssistantReasoning).join("\n");
@@ -1804,6 +1872,7 @@ export class ContextAssembler {
           ? ({
               role,
               content,
+              ...(modelIdentity ?? {}),
               ...topLevelAssistantReasoning,
               usage: {
                 input: 0,

@@ -463,6 +463,28 @@ export function buildMessageParts(params: {
   const topLevelReasoning = extractTopLevelReasoningContent(role, topLevel);
   const rawPayloadExternalized = safeBoolean(topLevel.rawPayloadExternalized);
   const externalizedFileId = safeString(topLevel.externalizedFileId);
+  // Assistant model identity (provider/api/model/responseModel). Persisted in
+  // part metadata so assembly can reconstruct messages that survive the host's
+  // model-bound thinking-replay checks (OpenClaw transformMessages treats a
+  // missing identity as a cross-model switch and downgrades thinking blocks to
+  // plain text, which corrupts reasoning-native models like Kimi K3).
+  const modelIdentityMetadata = (() => {
+    if (role !== "assistant") {
+      return undefined;
+    }
+    const identity = {
+      modelProvider: safeString(topLevel.provider),
+      modelApi: safeString(topLevel.api),
+      modelId: safeString(topLevel.model),
+      responseModelId: safeString(topLevel.responseModel),
+    };
+    return identity.modelProvider !== undefined ||
+      identity.modelApi !== undefined ||
+      identity.modelId !== undefined ||
+      identity.responseModelId !== undefined
+      ? identity
+      : undefined;
+  })();
   const externalizedFileIds = Array.isArray(topLevel.externalizedFileIds)
     ? topLevel.externalizedFileIds.filter((fileId): fileId is string => typeof fileId === "string")
     : undefined;
@@ -515,6 +537,7 @@ export function buildMessageParts(params: {
         textContent: message.content,
         metadata: toJson({
           originalRole: role,
+          ...(modelIdentityMetadata ?? {}),
           toolCallId: topLevelToolCallId,
           toolName: topLevelToolName,
           isError: topLevelIsError,
@@ -556,6 +579,7 @@ export function buildMessageParts(params: {
       textContent: null,
       metadata: toJson({
         originalRole: role,
+        ...(modelIdentityMetadata ?? {}),
         rawType: topLevelReasoning.field,
         ...topLevelReasoningMetadata(topLevelReasoning, true),
       }),
@@ -609,6 +633,7 @@ export function buildMessageParts(params: {
             : (safeString(metadataRecord?.tool_output) ?? null),
       metadata: toJson({
         originalRole: role,
+        ...(ordinal === 0 ? (modelIdentityMetadata ?? {}) : {}),
         toolCallId: topLevelToolCallId,
         toolName: topLevelToolName,
         isError: topLevelIsError,
