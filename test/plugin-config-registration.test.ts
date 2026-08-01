@@ -9,6 +9,7 @@ import { closeLcmConnection } from "../src/db/connection.js";
 import { LcmContextEngine } from "../src/engine.js";
 import { clearAllSharedInit } from "../src/plugin/shared-init.js";
 import { resetStartupBannerLogsForTests } from "../src/startup-banner-log.js";
+import { runDelegatedExpansionLoop } from "../src/tools/lcm-expand-tool.delegation.js";
 
 const buildMemorySystemPromptAdditionMock = vi.hoisted(() => vi.fn());
 
@@ -72,7 +73,7 @@ function buildApi(
       subagent: {
         run: vi.fn(),
         waitForRun: vi.fn(),
-        getSession: vi.fn(),
+        getSessionMessages: vi.fn(),
         deleteSession: vi.fn(),
       },
       ...(options?.includeRuntimeLlm === false
@@ -815,6 +816,66 @@ describe("lcm plugin registration", () => {
 
     expect(deleteSession).toHaveBeenCalledWith({
       sessionKey: "agent:main:subagent:delegated-expansion",
+      deleteTranscript: true,
+    });
+  });
+
+  it("collects delegated expansion replies through getSessionMessages", async () => {
+    const dbPath = join(tmpdir(), `lossless-claw-${Date.now()}-${Math.random().toString(16)}.db`);
+    dbPaths.add(dbPath);
+
+    const { api, getFactory } = buildApi({ enabled: true, dbPath });
+    const run = api.runtime.subagent.run as ReturnType<typeof vi.fn>;
+    const waitForRun = api.runtime.subagent.waitForRun as ReturnType<typeof vi.fn>;
+    const getSessionMessages = api.runtime.subagent.getSessionMessages as ReturnType<typeof vi.fn>;
+    const deleteSession = api.runtime.subagent.deleteSession as ReturnType<typeof vi.fn>;
+    run.mockResolvedValue({ runId: "run-delegated-expansion" });
+    waitForRun.mockResolvedValue({ status: "ok" });
+    getSessionMessages.mockResolvedValue({
+      messages: [
+        {
+          role: "assistant",
+          content: [
+            {
+              type: "text",
+              text: JSON.stringify({
+                summary: "Delegated answer collected.",
+                citedIds: ["sum_1059"],
+                followUpSummaryIds: [],
+                totalTokens: 42,
+                truncated: false,
+              }),
+            },
+          ],
+        },
+      ],
+    });
+
+    lcmPlugin.register(api);
+    const engine = getFactory()!() as {
+      deps?: Parameters<typeof runDelegatedExpansionLoop>[0]["deps"];
+    };
+
+    const result = await runDelegatedExpansionLoop({
+      deps: engine.deps!,
+      requesterSessionKey: "agent:main:main",
+      conversationId: 1059,
+      summaryIds: ["sum_1059"],
+      includeMessages: false,
+    });
+
+    expect(result).toMatchObject({
+      status: "ok",
+      citedIds: ["sum_1059"],
+    });
+    expect(result.text).toContain("Delegated answer collected.");
+    expect(result.text).toContain("sum_1059");
+    expect(getSessionMessages).toHaveBeenCalledWith({
+      sessionKey: expect.stringMatching(/^agent:main:subagent:/),
+      limit: 80,
+    });
+    expect(deleteSession).toHaveBeenCalledWith({
+      sessionKey: expect.stringMatching(/^agent:main:subagent:/),
       deleteTranscript: true,
     });
   });
