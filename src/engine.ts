@@ -87,7 +87,7 @@ import { appendForkBoundedLiveSuffixWithinBudget, buildDegradedLiveAssembleResul
 import { resolveBootstrapMaxTokens, trimBootstrapMessagesToBudget } from "./bootstrap-budget.js";
 import { batchLooksLikeHeartbeatAckTurn, pruneHeartbeatOkTurns } from "./heartbeat-filter.js";
 import { appendUncoveredVolatileLiveInputsWithinBudget, isVolatileLiveInputMessage, messageContentCoveredBySummary, resolveProtectedFreshTailAssembledIndexes } from "./live-coverage.js";
-import { buildMessageParts, extractMessageContent, filterPersistableMessages, hasPersistableMessageRole, isOpenClawRuntimeContextLeak, toStoredMessage } from "./message-content.js";
+import { buildMessageParts, extractMessageContent, filterPersistableMessages, hasPersistableMessageRole, isOpenClawRuntimeContextLeak, TOOL_CALL_RAW_TYPES, toStoredMessage } from "./message-content.js";
 import { createBootstrapEntryHash, readBootstrapMessageFromJsonLine } from "./message-signatures.js";
 import { canonicalizeOpenClawInboundMetadataIdentityContent } from "./openclaw-inbound-metadata.js";
 import { PROMPT_RECALL_MAX_MESSAGES, PROMPT_RECALL_SEARCH_CANDIDATE_LIMIT, buildPromptRecallProjectionFingerprint, extractPromptRecallIdentifiers, extractPromptRecallSnippet, findPromptRecallIdentifierIndex, isPromptRecallEligibleRole, normalizePromptRecallCoverageText, normalizePromptRecallText, renderPromptRecallMessage } from "./prompt-recall.js";
@@ -3553,7 +3553,11 @@ export class LcmContextEngine implements ContextEngine {
   }): Promise<AssembleResult> {
     let liveMessages = params.messages;
     const hasRenderableMessageContent = (message: AgentMessage): boolean => {
-      const content = (message as unknown as { content?: unknown }).content;
+      const record = message as unknown as { content?: unknown; tool_calls?: unknown };
+      if (Array.isArray(record.tool_calls) && record.tool_calls.length > 0) {
+        return true;
+      }
+      const content = record.content;
       if (typeof content === "string") {
         return content.trim().length > 0;
       }
@@ -3563,6 +3567,10 @@ export class LcmContextEngine implements ContextEngine {
             return part.trim().length > 0;
           }
           if (part && typeof part === "object") {
+            const type = (part as { type?: unknown }).type;
+            if (typeof type === "string" && TOOL_CALL_RAW_TYPES.has(type)) {
+              return true;
+            }
             const text = (part as { text?: unknown }).text;
             return typeof text === "string" && text.trim().length > 0;
           }
