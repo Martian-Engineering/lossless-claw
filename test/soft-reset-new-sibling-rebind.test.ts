@@ -567,6 +567,122 @@ describe("host-minted reset replacement (timestamp-correlated /new)", () => {
     const active = await engine.getConversationStore().getConversationBySessionKey(SESSION_KEY);
     expect(active?.conversationId).toBe(lane.conversationId);
     expect(active?.sessionId).toBe(NEW_SESSION_ID);
+
+    // The rebind is the carry-forward path: the retained depth-2 summary
+    // survives, same as the plain sibling-rebind case above.
+    const carried = await engine.getSummaryStore().getContextItems(lane.conversationId);
+    expect(carried.map((item) => item.summaryId)).toContain("sum_d2");
+  });
+
+  it("accepts a header instant 29s past the reset instant (inside the correlation tolerance)", async () => {
+    const { engine, log, db } = createEngine({ newSessionRetainDepth: 2 });
+    const lane = await seedSummaryBearingLane(engine, db);
+    await engine.handleBeforeReset({
+      reason: "new",
+      sessionId: OLD_SESSION_ID,
+      sessionKey: SESSION_KEY,
+    });
+
+    const resetInstant = Date.now();
+    archiveTrackedFileAtInstant(lane.trackedFile, resetInstant);
+    const newSessionFile = writeRolledTranscript({
+      name: `${NEW_SESSION_ID}-tolerance-inside`,
+      sessionHeaderTimestampMs: resetInstant + 29_000,
+      entries: [
+        {
+          role: "user",
+          text: "lane turn 10 about the deployment plan",
+          timestamp: Date.now() + 60_000,
+        },
+      ],
+    });
+
+    await engine.bootstrap({
+      sessionId: NEW_SESSION_ID,
+      sessionKey: SESSION_KEY,
+      sessionFile: newSessionFile,
+    });
+
+    expect(log.info).toHaveBeenCalledWith(
+      expect.stringContaining("resolved by fresh-transcript rebind"),
+    );
+    const active = await engine.getConversationStore().getConversationBySessionKey(SESSION_KEY);
+    expect(active?.sessionId).toBe(NEW_SESSION_ID);
+  });
+
+  it("fails closed at 31s past the reset instant (outside the correlation tolerance)", async () => {
+    const { engine, log, db } = createEngine({ newSessionRetainDepth: 2 });
+    const lane = await seedSummaryBearingLane(engine, db);
+    await engine.handleBeforeReset({
+      reason: "new",
+      sessionId: OLD_SESSION_ID,
+      sessionKey: SESSION_KEY,
+    });
+
+    const resetInstant = Date.now();
+    archiveTrackedFileAtInstant(lane.trackedFile, resetInstant);
+    const newSessionFile = writeRolledTranscript({
+      name: `${NEW_SESSION_ID}-tolerance-outside`,
+      sessionHeaderTimestampMs: resetInstant + 31_000,
+      entries: [
+        {
+          role: "user",
+          text: "lane turn 10 about the deployment plan",
+          timestamp: Date.now() + 60_000,
+        },
+      ],
+    });
+
+    await engine.bootstrap({
+      sessionId: NEW_SESSION_ID,
+      sessionKey: SESSION_KEY,
+      sessionFile: newSessionFile,
+    });
+
+    expect(log.warn).toHaveBeenCalledWith(
+      expect.stringContaining("freshness=identity-overlap-with-persisted-history"),
+    );
+    const conversation = await engine.getConversationStore().getConversationBySessionKey(SESSION_KEY);
+    expect(conversation?.sessionId).toBe(OLD_SESSION_ID);
+  });
+
+  it("fails closed when the sibling archive suffix is date-only (no time component)", async () => {
+    const { engine, log, db } = createEngine({ newSessionRetainDepth: 2 });
+    const lane = await seedSummaryBearingLane(engine, db);
+    await engine.handleBeforeReset({
+      reason: "new",
+      sessionId: OLD_SESSION_ID,
+      sessionKey: SESSION_KEY,
+    });
+
+    // A bare date would Date.parse as midnight; a header minted near that
+    // midnight must still not correlate, because a date-only tail cannot pin
+    // the archive to an instant.
+    const dateOnlyMidnight = Date.parse("2026-06-29");
+    renameSync(lane.trackedFile, `${lane.trackedFile}.reset.2026-06-29`);
+    const newSessionFile = writeRolledTranscript({
+      name: `${NEW_SESSION_ID}-date-only-sibling`,
+      sessionHeaderTimestampMs: dateOnlyMidnight + 5,
+      entries: [
+        {
+          role: "user",
+          text: "lane turn 10 about the deployment plan",
+          timestamp: Date.now() + 60_000,
+        },
+      ],
+    });
+
+    await engine.bootstrap({
+      sessionId: NEW_SESSION_ID,
+      sessionKey: SESSION_KEY,
+      sessionFile: newSessionFile,
+    });
+
+    expect(log.warn).toHaveBeenCalledWith(
+      expect.stringContaining("freshness=identity-overlap-with-persisted-history"),
+    );
+    const conversation = await engine.getConversationStore().getConversationBySessionKey(SESSION_KEY);
+    expect(conversation?.sessionId).toBe(OLD_SESSION_ID);
   });
 
   it("still fails closed when the header instant is outside the correlation tolerance", async () => {

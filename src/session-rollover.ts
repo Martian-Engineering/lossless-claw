@@ -68,9 +68,14 @@ function isTrivialRolloverOverlapContent(content: string): boolean {
  * Max distance between an archive sibling's `.reset.<ts>` instant and the new
  * transcript's session-header `timestamp` for the pair to count as one
  * host-minted /new operation. Both artifacts are minted by the same host
- * handler (measured 0-1 ms apart on a live rotation); the allowance absorbs
- * slow disks and busy hosts while staying far below any plausible
- * foreign-transcript coincidence.
+ * handler within one /new (measured 0-1 ms apart on a live rotation); the
+ * allowance absorbs slow disks, busy hosts, and stalls between the archive
+ * rename and the header write while staying far below any plausible
+ * foreign-transcript coincidence. The window is also not the only defense: a
+ * transcript inside it must still carry Lossless's own /new marker
+ * (`softResetPrunedAt`) plus the `.reset.` sibling, and the per-entry
+ * timestamp gates (`candidate-missing-timestamp`,
+ * `candidate-entries-predate-last-persisted`) run ahead of the bypass.
  */
 const HOST_MINTED_RESET_REPLACEMENT_TOLERANCE_MS = 30_000;
 
@@ -84,12 +89,15 @@ const AMBIGUOUS_ROLLOVER_FROZEN_RESTATEMENT_INFO_EVERY = 25;
 /**
  * Parse the `<ts>` tail of a host archive name (`${file}.reset.<ts>`). The
  * host mints ISO-8601 with the time separators replaced by dashes
- * (`2026-08-01T08-25-10.924Z`); a plain ISO tail is accepted too. Returns
- * epoch ms, or null when the tail does not parse (callers fail closed).
+ * (`2026-08-01T08-25-10.924Z`); a plain ISO tail is accepted too. A tail
+ * without a time component (e.g. a bare date, which `Date.parse` would
+ * happily read as midnight) is rejected: it cannot pin the archive to an
+ * instant precisely enough to correlate. Returns epoch ms, or null when the
+ * tail does not parse (callers fail closed).
  */
 function parseResetArchiveSuffixInstant(suffix: string): number | null {
   const trimmed = suffix.trim();
-  if (!trimmed) {
+  if (!/T\d{2}/.test(trimmed)) {
     return null;
   }
   const candidates = [trimmed, trimmed.replace(/T(\d{2})-(\d{2})-(\d{2})/, "T$1:$2:$3")];
