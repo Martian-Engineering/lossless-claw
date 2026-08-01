@@ -3552,11 +3552,40 @@ export class LcmContextEngine implements ContextEngine {
     runtimeContext?: Record<string, unknown>;
   }): Promise<AssembleResult> {
     let liveMessages = params.messages;
+    const hasRenderableMessageContent = (message: AgentMessage): boolean => {
+      const content = (message as unknown as { content?: unknown }).content;
+      if (typeof content === "string") {
+        return content.trim().length > 0;
+      }
+      if (Array.isArray(content)) {
+        return content.some((part) => {
+          if (typeof part === "string") {
+            return part.trim().length > 0;
+          }
+          if (part && typeof part === "object") {
+            const text = (part as { text?: unknown }).text;
+            return typeof text === "string" && text.trim().length > 0;
+          }
+          return false;
+        });
+      }
+      return false;
+    };
     // Return a new fallback array so the runtime hook treats this as assembled
-    // context, and remove assistant prefill tails from fallback-only paths.
+    // context, and strip assistant prefill tails from fallback-only paths.
+    // When the host delivers the current turn separately via `prompt`, the
+    // framework appends the current user turn after this array, so a trailing
+    // assistant with real content is the completed previous reply, not a
+    // prefill seed — popping it would make every degraded call answer one turn
+    // behind. Blank tails are stripped on every host.
+    const hostDeliversCurrentTurnSeparately = params.prompt !== undefined;
     const safeFallback = (): AssembleResult => {
       const msgs = liveMessages.slice();
       while (msgs.length > 0 && msgs[msgs.length - 1]?.role === "assistant") {
+        const tail = msgs[msgs.length - 1];
+        if (hostDeliversCurrentTurnSeparately && tail && hasRenderableMessageContent(tail)) {
+          break;
+        }
         msgs.pop();
       }
       return { messages: msgs, estimatedTokens: 0 };

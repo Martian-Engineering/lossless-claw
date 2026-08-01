@@ -36,6 +36,49 @@ describe("LcmContextEngine.assemble canonical path", () => {
     expect(result.contextProjection).toBeUndefined();
   });
 
+  it("preserves a completed trailing assistant reply when the host passes the current turn separately", async () => {
+    // Embedded hosts pass the full prior history in `messages` and deliver the
+    // current user turn via `prompt`; the framework appends the current turn
+    // after the returned array. A trailing assistant here is the completed
+    // previous reply, not a prefill seed — stripping it makes every degraded
+    // call answer one turn behind.
+    const engine = createEngine();
+    const liveMessages: AgentMessage[] = [
+      { role: "user", content: "first turn" },
+      { role: "assistant", content: "first reply" },
+    ] as AgentMessage[];
+
+    const result = await engine.assemble({
+      sessionId: "session-missing-prompt-separate",
+      messages: liveMessages,
+      tokenBudget: 100,
+      prompt: "second turn",
+    });
+
+    expect(result.messages).not.toBe(liveMessages);
+    expect(result.messages).toStrictEqual(liveMessages);
+    expect(result.estimatedTokens).toBe(0);
+  });
+
+  it("still strips blank assistant prefill seeds when the host passes the current turn separately", async () => {
+    const engine = createEngine();
+    const liveMessages: AgentMessage[] = [
+      { role: "user", content: "first turn" },
+      { role: "assistant", content: "   " },
+    ] as AgentMessage[];
+
+    const result = await engine.assemble({
+      sessionId: "session-missing-blank-prefill",
+      messages: liveMessages,
+      tokenBudget: 100,
+      prompt: "second turn",
+    });
+
+    expect(result.messages).not.toBe(liveMessages);
+    expect(result.messages).toStrictEqual([{ role: "user", content: "first turn" }]);
+    expect(result.estimatedTokens).toBe(0);
+  });
+
   it("falls back when DB context clearly trails live context", async () => {
     const engine = createEngine();
     const sessionId = "session-incomplete";
