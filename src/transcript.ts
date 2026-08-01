@@ -105,6 +105,8 @@ export type TranscriptHeader = {
   /** Stable id from the leading `{type:"session", id}` line; null when absent. */
   sessionHeaderId: string | null;
   parentSession: string | null;
+  /** ISO creation instant from the header's `timestamp` field; null when absent. */
+  sessionHeaderCreatedAt: string | null;
 };
 
 /**
@@ -114,7 +116,11 @@ export type TranscriptHeader = {
  * of inferring them from path/size heuristics.
  */
 export async function readTranscriptHeader(sessionFile: string): Promise<TranscriptHeader> {
-  const empty: TranscriptHeader = { sessionHeaderId: null, parentSession: null };
+  const empty: TranscriptHeader = {
+    sessionHeaderId: null,
+    parentSession: null,
+    sessionHeaderCreatedAt: null,
+  };
   try {
     const stream = createReadStream(sessionFile, { encoding: "utf8" });
     const lines = createInterface({
@@ -132,6 +138,7 @@ export async function readTranscriptHeader(sessionFile: string): Promise<Transcr
             type?: unknown;
             id?: unknown;
             parentSession?: unknown;
+            timestamp?: unknown;
           };
           if (parsed.type !== "session") {
             return empty;
@@ -139,6 +146,7 @@ export async function readTranscriptHeader(sessionFile: string): Promise<Transcr
           return {
             sessionHeaderId: normalizeEnvelopeString(parsed.id),
             parentSession: normalizeEnvelopeString(parsed.parentSession),
+            sessionHeaderCreatedAt: normalizeEnvelopeString(parsed.timestamp),
           };
         } catch {
           return empty;

@@ -18,6 +18,7 @@ const ROLLOVER: AmbiguousSessionKeyRuntimeRollover = {
   sessionKey: "agent:main:main",
   trackedSessionFile: "/tmp/old-transcript.jsonl",
   hasDeliberateRolloverEvidence: false,
+  hostMintedResetReplacement: false,
 };
 
 const NEW_SESSION_ID = "new-session";

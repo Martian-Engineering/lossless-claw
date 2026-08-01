@@ -90,6 +90,8 @@ function makeMessage(role: string, content: string, timestamp: number): AgentMes
 function writeRolledTranscript(params: {
   name: string;
   entries: Array<{ role: string; text: string; timestamp: number }>;
+  /** When set, prepend a host-shaped `{type:"session"}` header line with this creation instant. */
+  sessionHeaderTimestampMs?: number;
 }): string {
   const tempDir = mkdtempSync(join(tmpdir(), "lossless-claw-sibling-roll-"));
   tempDirs.push(tempDir);
@@ -111,7 +113,18 @@ function writeRolledTranscript(params: {
     parentId = id;
     return line;
   });
-  writeFileSync(file, `${lines.join("\n")}\n`);
+  const headerLines =
+    params.sessionHeaderTimestampMs === undefined
+      ? []
+      : [
+          JSON.stringify({
+            type: "session",
+            version: 3,
+            id: params.name,
+            timestamp: new Date(params.sessionHeaderTimestampMs).toISOString(),
+          }),
+        ];
+  writeFileSync(file, `${[...headerLines, ...lines].join("\n")}\n`);
   return file;
 }
 
@@ -233,6 +246,18 @@ async function seedSummaryBearingLane(
  */
 function archiveTrackedFile(trackedFile: string, kind: "reset" | "deleted"): void {
   renameSync(trackedFile, `${trackedFile}.${kind}.2026-06-29T120000-000Z`);
+}
+
+/**
+ * Host-shaped archive rename carrying a REAL parseable instant, exactly as the
+ * live host mints it: ISO-8601 with the time separators dashed
+ * (`2026-08-01T08-25-10.924Z`).
+ */
+function archiveTrackedFileAtInstant(trackedFile: string, instantMs: number): void {
+  renameSync(
+    trackedFile,
+    `${trackedFile}.reset.${new Date(instantMs).toISOString().replace(/:/g, "-")}`,
+  );
 }
 
 describe("/new soft-reset carry-forward via archive-sibling probe", () => {
@@ -495,5 +520,162 @@ describe("/new soft-reset carry-forward via archive-sibling probe", () => {
     const rebound = await engine.getConversationStore().getConversationBySessionKey(SESSION_KEY);
     expect(rebound?.conversationId).toBe(lane.conversationId);
     expect(rebound?.sessionId).toBe(NEW_SESSION_ID);
+  });
+});
+
+describe("host-minted reset replacement (timestamp-correlated /new)", () => {
+  it("rebinds despite substantial same-text overlap when the sibling and header instants correlate", async () => {
+    const { engine, log, db } = createEngine({ newSessionRetainDepth: 2 });
+    const lane = await seedSummaryBearingLane(engine, db);
+    await engine.handleBeforeReset({
+      reason: "new",
+      sessionId: OLD_SESSION_ID,
+      sessionKey: SESSION_KEY,
+    });
+
+    // The host archives the old transcript and mints the new session file in
+    // one /new operation: sibling instant and header instant 1 ms apart.
+    const resetInstant = Date.now();
+    archiveTrackedFileAtInstant(lane.trackedFile, resetInstant);
+    const newSessionFile = writeRolledTranscript({
+      name: NEW_SESSION_ID,
+      sessionHeaderTimestampMs: resetInstant + 1,
+      entries: [
+        // Byte-identical, substantial re-send of a persisted line: exactly the
+        // shape that fails closed without the host-minted correlation (see the
+        // foreign reused-key test above).
+        {
+          role: "user",
+          text: "lane turn 10 about the deployment plan",
+          timestamp: Date.now() + 60_000,
+        },
+      ],
+    });
+
+    await engine.bootstrap({
+      sessionId: NEW_SESSION_ID,
+      sessionKey: SESSION_KEY,
+      sessionFile: newSessionFile,
+    });
+
+    expect(log.info).toHaveBeenCalledWith(
+      expect.stringContaining("resolved by fresh-transcript rebind"),
+    );
+    expect(log.warn).not.toHaveBeenCalledWith(
+      expect.stringContaining("ambiguous rollover not provably fresh"),
+    );
+    const active = await engine.getConversationStore().getConversationBySessionKey(SESSION_KEY);
+    expect(active?.conversationId).toBe(lane.conversationId);
+    expect(active?.sessionId).toBe(NEW_SESSION_ID);
+  });
+
+  it("still fails closed when the header instant is outside the correlation tolerance", async () => {
+    const { engine, log, db } = createEngine({ newSessionRetainDepth: 2 });
+    const lane = await seedSummaryBearingLane(engine, db);
+    await engine.handleBeforeReset({
+      reason: "new",
+      sessionId: OLD_SESSION_ID,
+      sessionKey: SESSION_KEY,
+    });
+
+    const resetInstant = Date.now();
+    archiveTrackedFileAtInstant(lane.trackedFile, resetInstant);
+    const overlapText = "lane turn 10 about the deployment plan";
+    const foreignFile = writeRolledTranscript({
+      name: `${NEW_SESSION_ID}-late-header`,
+      // Ten minutes past the reset instant: not the host-minted replacement.
+      sessionHeaderTimestampMs: resetInstant + 10 * 60_000,
+      entries: [{ role: "user", text: overlapText, timestamp: Date.now() + 60_000 }],
+    });
+
+    await engine.bootstrap({
+      sessionId: NEW_SESSION_ID,
+      sessionKey: SESSION_KEY,
+      sessionFile: foreignFile,
+    });
+
+    expect(log.warn).toHaveBeenCalledWith(
+      expect.stringContaining("freshness=identity-overlap-with-persisted-history"),
+    );
+    expect(log.warn).toHaveBeenCalledWith(
+      expect.stringContaining(`overlapContentLength=${overlapText.length}`),
+    );
+    expect(log.info).not.toHaveBeenCalledWith(
+      expect.stringContaining("resolved by fresh-transcript rebind"),
+    );
+    const conversation = await engine.getConversationStore().getConversationBySessionKey(SESSION_KEY);
+    expect(conversation?.conversationId).toBe(lane.conversationId);
+    expect(conversation?.sessionId).toBe(OLD_SESSION_ID);
+  });
+
+  it("fails closed when the new transcript has no session header even with a parseable sibling instant", async () => {
+    const { engine, log, db } = createEngine({ newSessionRetainDepth: 2 });
+    const lane = await seedSummaryBearingLane(engine, db);
+    await engine.handleBeforeReset({
+      reason: "new",
+      sessionId: OLD_SESSION_ID,
+      sessionKey: SESSION_KEY,
+    });
+
+    archiveTrackedFileAtInstant(lane.trackedFile, Date.now());
+    const headerlessFile = writeRolledTranscript({
+      name: `${NEW_SESSION_ID}-headerless`,
+      entries: [
+        {
+          role: "user",
+          text: "lane turn 10 about the deployment plan",
+          timestamp: Date.now() + 60_000,
+        },
+      ],
+    });
+
+    await engine.bootstrap({
+      sessionId: NEW_SESSION_ID,
+      sessionKey: SESSION_KEY,
+      sessionFile: headerlessFile,
+    });
+
+    expect(log.warn).toHaveBeenCalledWith(
+      expect.stringContaining("freshness=identity-overlap-with-persisted-history"),
+    );
+    const conversation = await engine.getConversationStore().getConversationBySessionKey(SESSION_KEY);
+    expect(conversation?.sessionId).toBe(OLD_SESSION_ID);
+  });
+
+  it("fails closed when the sibling archive suffix does not parse", async () => {
+    const { engine, log, db } = createEngine({ newSessionRetainDepth: 2 });
+    const lane = await seedSummaryBearingLane(engine, db);
+    await engine.handleBeforeReset({
+      reason: "new",
+      sessionId: OLD_SESSION_ID,
+      sessionKey: SESSION_KEY,
+    });
+
+    // Sibling present (deliberate-rollover evidence holds) but its suffix is
+    // not a parseable instant, so no correlation is possible.
+    archiveTrackedFile(lane.trackedFile, "reset");
+    const newSessionFile = writeRolledTranscript({
+      name: `${NEW_SESSION_ID}-unparseable-sibling`,
+      sessionHeaderTimestampMs: Date.now(),
+      entries: [
+        {
+          role: "user",
+          text: "lane turn 10 about the deployment plan",
+          timestamp: Date.now() + 60_000,
+        },
+      ],
+    });
+
+    await engine.bootstrap({
+      sessionId: NEW_SESSION_ID,
+      sessionKey: SESSION_KEY,
+      sessionFile: newSessionFile,
+    });
+
+    expect(log.warn).toHaveBeenCalledWith(
+      expect.stringContaining("freshness=identity-overlap-with-persisted-history"),
+    );
+    const conversation = await engine.getConversationStore().getConversationBySessionKey(SESSION_KEY);
+    expect(conversation?.sessionId).toBe(OLD_SESSION_ID);
   });
 });
