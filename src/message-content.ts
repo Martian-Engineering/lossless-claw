@@ -183,10 +183,16 @@ export function extractModelIdentityMetadata(
     modelId: safeString(topLevel.model),
     responseModelId: safeString(topLevel.responseModel),
   };
-  return identity.modelProvider !== undefined ||
-    identity.modelApi !== undefined ||
-    identity.modelId !== undefined ||
-    identity.responseModelId !== undefined
+  // The host's same-model replay check (transformMessages) requires
+  // `provider`, `api`, and `model` to ALL match; `responseModel` is
+  // supplemental and never consulted by that predicate. Treat an identity as
+  // stored only when the three host-required fields are present — a partial
+  // identity (e.g. responseModel alone) would preserve a sentinel signature
+  // that the host later classifies as cross-model and downgrades to response
+  // text, reintroducing the contamination this gate exists to prevent.
+  return identity.modelProvider !== undefined &&
+    identity.modelApi !== undefined &&
+    identity.modelId !== undefined
     ? identity
     : undefined;
 }

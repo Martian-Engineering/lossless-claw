@@ -103,3 +103,69 @@ describe("buildMessageParts model identity persistence", () => {
     expect(metadata).not.toHaveProperty("responseModelId");
   });
 });
+
+describe("partial identity gating (host requires provider+api+model)", () => {
+  it("does not store identity when only responseModel is present", () => {
+    const message = {
+      role: "assistant",
+      content: [
+        { type: "thinking", thinking: "reasoning", thinkingSignature: "reasoning_content" },
+        { type: "text", text: "answer" },
+      ],
+      responseModel: "kimi-k3",
+    } as unknown as AgentMessage;
+
+    const parts = buildMessageParts({
+      sessionId: "session-1",
+      message,
+      fallbackContent: "answer",
+    });
+
+    const metadata = partMetadata(parts[0]!);
+    expect(metadata).not.toHaveProperty("modelProvider");
+    expect(metadata).not.toHaveProperty("modelApi");
+    expect(metadata).not.toHaveProperty("modelId");
+    expect(metadata).not.toHaveProperty("responseModelId");
+  });
+
+  it("does not store identity when api is missing (host same-model check would fail)", () => {
+    const message = {
+      role: "assistant",
+      content: "text",
+      provider: "xiaomi",
+      model: "kimi-k3",
+    } as unknown as AgentMessage;
+
+    const parts = buildMessageParts({
+      sessionId: "session-1",
+      message,
+      fallbackContent: "text",
+    });
+
+    const metadata = partMetadata(parts[0]!);
+    expect(metadata).not.toHaveProperty("modelProvider");
+    expect(metadata).not.toHaveProperty("modelId");
+  });
+
+  it("stores identity when provider+api+model are all present without responseModel", () => {
+    const message = {
+      role: "assistant",
+      content: "text",
+      provider: "xiaomi",
+      api: "anthropic-messages",
+      model: "kimi-k3",
+    } as unknown as AgentMessage;
+
+    const parts = buildMessageParts({
+      sessionId: "session-1",
+      message,
+      fallbackContent: "text",
+    });
+
+    expect(partMetadata(parts[0]!)).toMatchObject({
+      modelProvider: "xiaomi",
+      modelApi: "anthropic-messages",
+      modelId: "kimi-k3",
+    });
+  });
+});

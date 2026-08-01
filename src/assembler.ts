@@ -339,11 +339,15 @@ function pickModelIdentity(parts: MessagePartRecord[]): StoredModelIdentity | un
     if (typeof record.responseModelId === "string" && record.responseModelId.length > 0) {
       identity.responseModel = record.responseModelId;
     }
+    // Mirror the ingest-side gate (extractModelIdentityMetadata): the host's
+    // same-model check needs provider+api+model all present. A partial
+    // identity must not qualify — it would preserve signatures the host then
+    // treats as cross-model (downgrade to text → response-channel
+    // contamination). responseModel remains supplemental.
     if (
-      identity.provider !== undefined ||
-      identity.api !== undefined ||
-      identity.model !== undefined ||
-      identity.responseModel !== undefined
+      identity.provider !== undefined &&
+      identity.api !== undefined &&
+      identity.model !== undefined
     ) {
       return identity;
     }

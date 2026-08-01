@@ -795,6 +795,70 @@ describe("contentFromParts", () => {
     // Block dropped (no identity), falls back to stored content.
     expect(content).toEqual([{ type: "text", text: "fallback" }]);
   });
+
+  it("treats partial stored identity (responseModel only) as no identity: sentinel dropped", () => {
+    // Host same-model check needs provider+api+model; responseModel alone
+    // must not qualify, otherwise the sentinel survives assembly but the host
+    // later downgrades it to response-channel text.
+    const parts: MessagePartRecord[] = [
+      {
+        partId: "p0",
+        messageId: 1,
+        sessionId: "s1",
+        partType: "reasoning",
+        ordinal: 0,
+        textContent: "partial identity reasoning",
+        toolCallId: null,
+        toolName: null,
+        toolInput: null,
+        toolOutput: null,
+        metadata: JSON.stringify({
+          originalRole: "assistant",
+          responseModelId: "kimi-k3",
+          raw: {
+            type: "thinking",
+            thinking: "partial identity reasoning",
+            thinkingSignature: "reasoning_content",
+          },
+        }),
+      },
+    ];
+    const content = contentFromParts(parts, "assistant", "fallback");
+    expect(content).toEqual([{ type: "text", text: "fallback" }]);
+  });
+
+  it("strips provider signature when stored identity is partial (api missing)", () => {
+    const parts: MessagePartRecord[] = [
+      {
+        partId: "p0",
+        messageId: 1,
+        sessionId: "s1",
+        partType: "reasoning",
+        ordinal: 0,
+        textContent: "reasoning",
+        toolCallId: null,
+        toolName: null,
+        toolInput: null,
+        toolOutput: null,
+        metadata: JSON.stringify({
+          originalRole: "assistant",
+          modelProvider: "anthropic",
+          modelId: "claude-opus-4-6",
+          raw: {
+            type: "thinking",
+            thinking: "reasoning",
+            thinkingSignature: "real-provider-sig",
+          },
+        }),
+      },
+    ];
+    const content = contentFromParts(parts, "assistant", "fallback") as Array<
+      Record<string, unknown>
+    >;
+    expect(content.length).toBe(1);
+    expect(content[0]).toMatchObject({ type: "thinking", thinking: "reasoning" });
+    expect(content[0]).not.toHaveProperty("thinkingSignature");
+  });
 });
 
 // ═══════════════════════════════════════════════════════════════════════════════
