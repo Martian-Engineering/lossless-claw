@@ -72,6 +72,11 @@ When configuring npm trusted publishing, register the GitHub workflow using the 
 
 The publish workflow is intentionally manual. Release issuance should stay deliberate even after trusted publishing is enabled.
 
+## ClawHub releases
+
+The `Publish to ClawHub` workflow defaults to a dry run. Set `dry_run` to
+`false` to publish the version in `package.json`.
+
 ## Beta releases
 
 Use a Changesets prerelease when `main` needs broader testing before a stable release:

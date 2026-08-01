@@ -1,0 +1,32 @@
+name: Publish to ClawHub
+
+on:
+  pull_request:
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: Validate the ClawHub package without publishing
+        required: true
+        default: true
+        type: boolean
+
+jobs:
+  dry-run:
+    if: (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository) || inputs.dry_run
+    permissions:
+      actions: read
+      contents: read
+      id-token: write
+    uses: openclaw/clawhub/.github/workflows/package-publish.yml@v0.23.1
+    with:
+      dry_run: true
+
+  publish:
+    if: github.event_name == 'workflow_dispatch' && inputs.dry_run == false
+    permissions:
+      actions: read
+      contents: read
+      id-token: write
+    uses: openclaw/clawhub/.github/workflows/package-publish.yml@v0.23.1
+    with:
+      dry_run: false
