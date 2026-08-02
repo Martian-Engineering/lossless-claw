@@ -434,6 +434,11 @@ export class LcmContextEngine implements ContextEngine {
       fts5Available: this.fts5Available,
       replayFloodThresholdExternal: this.config.replayFloodThresholdExternal,
       replayFloodThresholdInternal: this.config.replayFloodThresholdInternal,
+      onStableEventKeyConflict: ({ conversationId, stableEventKey }) => {
+        this.deps.log.warn(
+          `[lcm] stable-event-key unique conflict conversation=${conversationId} key=${stableEventKey} — provider/mode id uniqueness violated; row persisted without stable key`,
+        );
+      },
     });
     this.summaryStore = new SummaryStore(this.db, { fts5Available: this.fts5Available });
     this.largeFileInterceptor = new LargeFileInterceptor(
@@ -2768,9 +2773,20 @@ export class LcmContextEngine implements ContextEngine {
     }
 
     // Stable event identity short-circuit: when the message carries a stable
-    // event key (responseId / toolCallId) that the conversation already holds,
-    // this is the same event under a different (likely redacted) content
-    // representation. Skip the duplicate insert before any side effects.
+    // event key (assistant responseId, or a PROVABLY PROVIDER-UNIQUE
+    // toolCallId — see stable-event-key.ts) that the conversation already
+    // holds, this is the same event under a different (likely redacted)
+    // content representation. Skip the duplicate insert before any side
+    // effects.
+    //
+    // Ordering matters (P1 rawId anchoring): the unique transcript-entry-id
+    // check above runs first because an entry id is per-line unique and is
+    // the authoritative replay anchor. The stable key below is only ever
+    // derived from event-unique identifiers, so an existing key is same-event
+    // proof even for fresh transcript entry ids. Model-authored recurrent
+    // toolCallIds (e.g. Kimi `exec:101`) never produce a key — they fall
+    // through to the content/adjacency-bound dedup paths, which prefer
+    // duplicate emission over dropped ingestion.
     const stableEventKey = extractStableEventKey(message);
     if (
       stableEventKey &&
