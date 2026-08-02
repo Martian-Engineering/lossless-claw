@@ -6,10 +6,11 @@
 import { buildMessageParts, toStoredMessage, type StoredMessage } from "./message-content.js";
 import type { AgentMessage } from "./openclaw-bridge.js";
 import { canonicalizeOpenClawInboundMetadataIdentityContent } from "./openclaw-inbound-metadata.js";
+import { isProviderUniqueToolCallId } from "./stable-event-key.js";
 import type { CreateMessagePartInput } from "./store/conversation-store.js";
 import { extractToolResultIdForPairing } from "./tool-pairing.js";
 import { extractBootstrapMessageCandidate } from "./transcript.js";
-import { createHash } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 
 export function createBootstrapEntryHash(message: StoredMessage | null): string | null {
   if (!message) {
@@ -103,6 +104,23 @@ export function createLiveCoverageSignature(message: AgentMessage): string {
   if (canonicalEmptyToolResultSignature) {
     return canonicalEmptyToolResultSignature;
   }
+  if (stored.role === "tool") {
+    const pairingId = extractToolResultIdForPairing(message);
+    if (pairingId && !isProviderUniqueToolCallId(pairingId)) {
+      // Recurrent model-authored ids: the lossless signature contains no
+      // occurrence identity, so two distinct events with identical content
+      // ("(no output)") sign equal and a coverage consumer can elide a REAL
+      // newer occurrence against an older assembled one. Without provenance
+      // there is no in-message occurrence discriminator, so refuse to let
+      // these events anchor coverage at all: double-emit is recoverable by
+      // repair-time dedup; a sliced-away live event is not (P3).
+      return JSON.stringify({
+        kind: "recurrent-tool-event",
+        toolCallId: pairingId,
+        nonce: randomUUID(),
+      });
+    }
+  }
   return createLosslessMessageSignature(message);
 }
 
@@ -141,11 +159,19 @@ export function createCanonicalToolTextCoverageSignature(
   ) {
     return undefined;
   }
+  const toolCallId = part.toolCallId ?? extractToolResultIdForPairing(message) ?? null;
+  if (toolCallId && !isProviderUniqueToolCallId(toolCallId)) {
+    // Model-authored recurrent ids (Kimi K3 `name:N`) are not event-unique:
+    // equal content + equal id across DISTINCT events would collapse their
+    // coverage signatures and let an older occurrence prove coverage of a
+    // newer one. Fall back to the full lossless signature instead.
+    return undefined;
+  }
   return JSON.stringify({
     kind: "canonical-tool-text",
     role: stored.role,
     content: fallbackContent,
-    toolCallId: part.toolCallId ?? extractToolResultIdForPairing(message) ?? null,
+    toolCallId,
     toolName: normalizeToolNameForCoverage(part.toolName),
   });
 }
@@ -180,28 +206,62 @@ export function createCanonicalEmptyToolResultCoverageSignature(
     return undefined;
   }
   const part = parts[0] as CreateMessagePartInput;
-  if (part.partType !== "tool" || part.toolInput != null) {
-    return undefined;
-  }
-  // Effective text must be empty: the fallback sentinel " " or an output
-  // column holding only whitespace — never a real payload.
-  if (!isEffectivelyEmptyToolResultPart(part, fallbackContent)) {
-    return undefined;
-  }
-  if (!isToolResultShapedPart(part)) {
+  // Two rehydrations of the same logical empty result are valid: the legacy
+  // "tool" part (pre-#1054-round-2 DB rows, plus single-tool_result-block
+  // live shapes) and the provider-facing plain text part the empty-content
+  // fallback now assembles into. Reject anything else.
+  if (part.toolInput != null) {
     return undefined;
   }
   const toolCallId = part.toolCallId ?? extractToolResultIdForPairing(message) ?? null;
+  if (part.partType === "text") {
+    // Whitespace-only text on a tool-result message: the text-block
+    // rehydration of the empty-content fallback (#992). After a DB round-trip
+    // the reconstructed part may carry metadata.originalRole:"toolResult"
+    // with rawType:"text" (no longer tool-shaped), so gate on the message
+    // role + whitespace content instead of tool-part shape.
+    if ((part.textContent ?? "").trim() !== "") {
+      return undefined;
+    }
+    if (stored.role !== "tool" && stored.role !== "toolResult") {
+      return undefined;
+    }
+    if (!toolCallId) {
+      return undefined;
+    }
+  } else if (part.partType === "tool") {
+    // Effective text must be empty: the fallback sentinel " " or an output
+    // column holding only whitespace — never a real payload.
+    if (!isEffectivelyEmptyToolResultPart(part, fallbackContent)) {
+      return undefined;
+    }
+    if (!isToolResultShapedPart(part)) {
+      return undefined;
+    }
+  } else {
+    return undefined;
+  }
   if (!toolCallId) {
     // Identity-less results cannot be canonicalized without collision risk:
     // two distinct id-less results would otherwise map to the same key and
     // one side could be silently swallowed by coverage dedup.
     return undefined;
   }
+  if (!isProviderUniqueToolCallId(toolCallId)) {
+    // Model-authored ids (Kimi K3 `name:N` counters) recur across turns, so
+    // (role, toolCallId) does NOT identify an event: an id-less content match
+    // here would let coverage consumers (e.g. resolveForkBoundedLiveSuffix)
+    // treat an OLDER occurrence as proof a NEWER occurrence is covered and
+    // slice real events out of the request. Restrict the canonical shortcut
+    // to provider-unique ids; everything else keeps the full lossless
+    // signature, preferring a possible double-emit over a silent suppression.
+    return undefined;
+  }
   // toolName is intentionally omitted from the key: the same logical result
   // may appear with a top-level toolName (DB round-trip) or without one
-  // (live transcript block only), and toolCallId is the unique pairing
-  // identity — two results with the same toolCallId ARE the same result.
+  // (live transcript block only), and a provider-unique toolCallId is then
+  // an event-unique pairing identity — two results with the same provider-
+  // unique toolCallId ARE the same event.
   return JSON.stringify({
     kind: "canonical-empty-tool-result",
     role: stored.role,

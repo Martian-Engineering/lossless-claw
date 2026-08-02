@@ -74,6 +74,10 @@ describe("empty-content toolResult ingest fallback (issue #992)", () => {
     expect(parts[0]!.partType).toBe("tool");
     expect(parts[0]!.toolCallId).toBe("call_plan_1");
     expect(parts[0]!.toolName).toBe("update_plan");
+    // The structured `details` payload is persisted in part metadata — the
+    // lossless layer must not discard it even though text content is empty.
+    const metadata = JSON.parse(parts[0]!.metadata!) as { details?: unknown };
+    expect(metadata.details).toEqual({ plan: [{ step: "reproduce", status: "in_progress" }] });
 
     const assembler = new ContextAssembler(engine.getConversationStore(), engine.getSummaryStore());
     const assembled = await assembler.assemble({
@@ -97,6 +101,9 @@ describe("empty-content toolResult ingest fallback (issue #992)", () => {
     expect(resultMessage.isError).not.toBe(true);
     // Effective tool output is an empty string — never a missing-result error.
     expect(JSON.stringify(resultMessage.content)).not.toContain(MISSING_RESULT_MARKER);
+    // Provider-facing content must be a valid text block: adapters only
+    // accept text/image blocks inside toolResult message content.
+    expect(resultMessage.content).toEqual([{ type: "text", text: " " }]);
   });
 
   it("never inserts the synthetic error while the call is inside the context window", async () => {
@@ -154,6 +161,16 @@ describe("empty-content toolResult ingest fallback (issue #992)", () => {
       .getConversationStore()
       .getMessages(conversation!.conversationId);
     expect(stored).toHaveLength(2);
+    // Fabricate the legacy shape: the string-content ingest above persisted a
+    // normal text part, so delete the parts row to reconstruct the pre-fix
+    // "role=tool, empty content, zero parts" shape exactly.
+    const db = (engine as unknown as {
+      db: { prepare: (sql: string) => { run: (...args: unknown[]) => void } };
+    }).db;
+    db.prepare(`DELETE FROM message_parts WHERE message_id = ?`).run(stored[1]!.messageId);
+    expect(
+      await engine.getConversationStore().getMessageParts(stored[1]!.messageId),
+    ).toHaveLength(0);
 
     const assembler = new ContextAssembler(engine.getConversationStore(), engine.getSummaryStore());
     const assembled = await assembler.assemble({

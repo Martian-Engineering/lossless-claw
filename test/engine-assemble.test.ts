@@ -2411,7 +2411,7 @@ describe("LcmContextEngine.assemble maxAssemblyTokenBudget cap", () => {
 
     // Ingest a tool result that will be stored with toolName="unknown"
     // by the assembler (assembler fills missing tool names with "unknown").
-    const toolCallId = "call_nameless_tool";
+    const toolCallId = "call_AbCdEf012345";
     const toolOutput = "tool output without a real tool name must anchor correctly";
     await engine.ingest({
       sessionId,

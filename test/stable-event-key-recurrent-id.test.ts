@@ -173,14 +173,15 @@ describe("recurrent model-authored toolCallIds (K3 pattern)", () => {
     expect(rows[0]!.content).toBe("redacted by logging.redactPatterns");
   });
 
-  it("assembly after recurrent-id ingestion inserts no synthetic missing-tool-result errors", async () => {
+  it("assembly preserves every recurrent-id call/result occurrence (occurrence-scoped pairing)", async () => {
     const engine = createEngine();
     const sessionId = "k3-recurrent-id-assembly";
     const sessionFile = createSessionFilePath("k3-recurrent-id-assembly");
     writeLeafTranscriptMessages(sessionFile, []);
     await engine.bootstrap({ sessionId, sessionFile });
 
-    for (const command of ["ls /tmp/a", "ls /tmp/b", "ls /tmp/c"]) {
+    const commands = ["ls /tmp/a", "ls /tmp/b", "ls /tmp/c"];
+    for (const command of commands) {
       await engine.ingest({ sessionId, message: makeMessage({ role: "user", content: `run ${command}` }) });
       await engine.ingest({ sessionId, message: assistantToolCall("exec:101", command) });
       await engine.ingest({ sessionId, message: toolResult("exec:101") });
@@ -197,5 +198,21 @@ describe("recurrent model-authored toolCallIds (K3 pattern)", () => {
     });
     const payload = JSON.stringify(assembled.messages);
     expect(payload).not.toContain("missing tool result");
+
+    // All three occurrences must survive: three tool_use blocks with distinct
+    // arguments and three results, not just the first pair.
+    const toolUseBlocks = assembled.messages.flatMap((message) =>
+      Array.isArray(message.content)
+        ? (message.content as Array<Record<string, unknown>>).filter(
+            (block) => block && block.type === "tool_use",
+          )
+        : [],
+    );
+    const resultMessages = assembled.messages.filter(
+      (message) => message.role === "toolResult",
+    );
+    expect(toolUseBlocks.length).toBe(commands.length);
+    expect(toolUseBlocks.map((block) => (block.input as { command: string }).command)).toEqual(commands);
+    expect(resultMessages.length).toBe(commands.length);
   });
 });

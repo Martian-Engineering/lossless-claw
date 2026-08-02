@@ -30,3 +30,20 @@ is now derived only from provably provider-unique tool-call id formats
 content/adjacency-bound dedup paths (preferring possible duplicates over data
 loss). A colliding stable-key INSERT is degraded to a NULL-key persist with
 a warning instead of being rejected by the partial unique index.
+
+The same recurrent-id root cause had three more edges, fixed together:
+transcript repair pairing now dedups assistant tool_use blocks by
+(id, payload-fingerprint) of a PENDING call instead of by conversation-global
+id — byte-identical repeats while a result is outstanding are store
+double-writes (keep-first), while legitimate recurrent-id reuses, including
+identical-argument repeats with their own later results ("pwd" twice), are
+distinct occurrences that survive. Deferred-result lookup no longer crosses
+the next surviving same-id occurrence, so results pair with the newest
+pending occurrence instead of being stolen by the first call. The
+canonical empty/tool-text coverage signatures are now restricted to
+provider-unique ids (recurrent ids fall back to the full lossless signature,
+so an older occurrence can never prove coverage of a newer one), and the
+empty-content fallback rehydrates as a provider-valid whitespace text block
+while persisting the structured `details` payload in part metadata.
+
+Co-Authored-By: Cha <cha@jetd.one> via OpenClaw

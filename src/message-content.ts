@@ -636,19 +636,66 @@ export function buildMessageParts(params: {
   // empty, and `sanitizeToolUseResultPairing` then injects a synthetic
   // "missing tool result" error on every assemble while the call is in the
   // context window. Persist one fallback part that carries the pairing
-  // identity so assembly can reconstruct the toolResult. Role-gated (not
-  // id-gated): pre-existing routing in blockFromPart treats a metadata-less
-  // "tool" part as a toolCall, so only tool/toolResult roles may land here —
-  // an id-bearing assistant/user message would otherwise be misassembled as
-  // a phantom call. User and assistant empty content intentionally stays
-  // part-less (the empty-content filter and the empty-assistant skip are
-  // desired behavior). Callid-less tool rows keep today's demote-to-assistant
-  // assembly path.
+  // identity so assembly can reconstruct the toolResult.
+  //
+  // The OpenClaw `details` payload (the motivating `update_plan` case is
+  // `{content: [], details: {...}}`) is persisted in part metadata — the
+  // lossless layer must not discard structured payload data just because the
+  // text content is empty. Oversized payloads are summarized instead of
+  // dropped silently.
+  //
+  // Gated on BOTH role and a non-empty pairing id: pre-existing routing in
+  // blockFromPart treats a metadata-less "tool" part as a toolCall, so only
+  // tool/toolResult roles may land here — an id-bearing assistant/user message
+  // would otherwise be misassembled as a phantom call. And without a
+  // toolCallId the rehydrated row demotes to assistant but now carries a
+  // tool_result block with no tool_use_id — malformed provider input — so
+  // ID-less rows keep the legacy zero-part path (demote to assistant with
+  // empty content, dropped by the empty-content filter). User and assistant
+  // empty content intentionally stays part-less (the empty-content filter and
+  // the empty-assistant skip are desired behavior).
   if (
     message.content.length === 0 &&
     (role === "tool" || role === "toolResult") &&
+    typeof topLevelToolCallId === "string" &&
+    topLevelToolCallId.length > 0 &&
     !rawPayloadExternalized
   ) {
+    // Structured payload capture (P3: lossless layer must not discard data).
+    // `details` rides the top-level message — e.g. update_plan's
+    // `{content: [], details: {...}}` — so persist it in part metadata even
+    // though the rehydrated provider-facing block stays a whitespace text
+    // block (adapters only accept text/image in toolResult content).
+    const details = (message as { details?: unknown }).details;
+    let detailsEntry: Record<string, unknown> = {};
+    if (details !== undefined) {
+      // Persist intact up to a bound: empty content gives
+      // interceptLargeToolResults nothing to externalize and raw-payload
+      // externalization skips tool roles, so an unbounded details blob both
+      // violates the lossless invariant in the other direction (if trimmed
+      // without evidence elsewhere) and bypasses payload-size controls (if
+      // kept whole) — plus it is reparsed at EVERY assemble. Normal empty
+      // results (update_plan-scale payloads are KBs) stay intact; an
+      // oversized blob keeps byteSize + head preview + a LOUD ingest warning
+      // (P3's "disappear without audible complaint" rationale: the invariant
+      // breach is at least evidence-bearing and audible, unlike silent loss).
+      const EMPTY_FALLBACK_DETAILS_MAX_BYTES = 65536;
+      const serialized = toJson(details);
+      const serializedBytes = Buffer.byteLength(serialized ?? "", "utf8");
+      if (serializedBytes <= EMPTY_FALLBACK_DETAILS_MAX_BYTES) {
+        detailsEntry = { details };
+      } else {
+        console.warn(
+          `[lcm] empty-content tool result details payload ${serializedBytes}B exceeds ${EMPTY_FALLBACK_DETAILS_MAX_BYTES}B cap (toolCallId=${topLevelToolCallId}); byteSize + preview preserved in part metadata`,
+        );
+        detailsEntry = {
+          detailsOversize: {
+            byteSize: serializedBytes,
+            preview: (serialized ?? "").slice(0, 2048),
+          },
+        };
+      }
+    }
     parts.push({
       sessionId,
       partType: "tool",
@@ -657,16 +704,16 @@ export function buildMessageParts(params: {
       toolCallId: topLevelToolCallId ?? null,
       toolName: topLevelToolName ?? null,
       metadata: toJson({
-        // Always identify as "toolResult" so blockFromPart routes through
-        // toolResultBlockFromPart (not toolCallBlockFromPart which would
-        // emit a phantom toolCall block). The raw role may be "tool" but
-        // the logical shape is a tool RESULT.
+        // Always identify as "toolResult" (the raw role may be "tool" but
+        // the logical shape is a tool RESULT); the emptyContentFallback flag
+        // routes rehydration to a provider-valid text block.
         originalRole: "toolResult",
         rawType: "tool_result",
         toolCallId: topLevelToolCallId,
         toolName: topLevelToolName,
         isError: topLevelIsError,
         emptyContentFallback: true,
+        ...detailsEntry,
       }),
     });
   }

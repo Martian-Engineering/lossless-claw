@@ -2787,18 +2787,46 @@ export class LcmContextEngine implements ContextEngine {
     // toolCallIds (e.g. Kimi `exec:101`) never produce a key — they fall
     // through to the content/adjacency-bound dedup paths, which prefer
     // duplicate emission over dropped ingestion.
+    //
+    // A fresh-transcript-entry TOOL RESULT colliding with an existing stable
+    // key is a NEW event recycled into a provider-unique FORMAT by a
+    // model/provider-compat layer — the entry-id check above already proved
+    // freshness, and no documented same-event tool-result import regenerates
+    // entry ids (the #1040 aborted/redacted-twin fault chain was
+    // assistant-responseId only). Persist it WITHOUT the stable key (conflict
+    // path) instead of silently skipping the result — ingested=false would
+    // repeat the #194379 disaster for id-recycling providers.
     const stableEventKey = extractStableEventKey(message);
-    if (
-      stableEventKey &&
-      (await this.conversationStore.hasMessageByStableEventKey(
-        conversationId,
-        stableEventKey,
-      ))
-    ) {
+    const stableEventKeyConflict = stableEventKey
+      ? await this.conversationStore.hasMessageByStableEventKey(
+          conversationId,
+          stableEventKey,
+        )
+      : false;
+    // A fresh-transcript-entry TOOL RESULT colliding with an existing stable
+    // key is a NEW event recycled into a provider-unique FORMAT by a
+    // model/provider-compat layer — the entry-id check above already proved
+    // freshness, and no documented same-event tool-result import regenerates
+    // entry ids (the #1040 aborted/redacted-twin fault chain was
+    // assistant-responseId only). Persist it WITHOUT the stable key (conflict
+    // path) instead of silently skipping the result — ingested=false would
+    // repeat the #194379 disaster for id-recycling providers.
+    const stableEventKeyToolResultOverride = Boolean(
+      stableEventKeyConflict &&
+        transcriptEntryId &&
+        stableEventKey?.startsWith("tool-result:"),
+    );
+    if (stableEventKeyConflict && !stableEventKeyToolResultOverride) {
       this.deps.log.debug(
         `[lcm] ingestSingle: stable-event duplicate skipped role=${stored.role} key=${stableEventKey} conversation=${conversationId}`,
       );
       return { ingested: false };
+    }
+    const stableEventKeyForInsert = stableEventKeyToolResultOverride ? null : stableEventKey;
+    if (stableEventKeyToolResultOverride) {
+      this.deps.log.warn(
+        `[lcm] ingestSingle: tool-result stable-event key recycled for a fresh transcript entry — persisted WITHOUT stable key role=${stored.role} key=${stableEventKey} entry=${transcriptEntryId} conversation=${conversationId}`,
+      );
     }
 
     // Delivery-mirror dedup: OpenClaw writes two entries per assistant turn —
@@ -2918,7 +2946,7 @@ export class LcmContextEngine implements ContextEngine {
       content: stored.content,
       tokenCount: stored.tokenCount,
       transcriptEntryId,
-      stableEventKey,
+      stableEventKey: stableEventKeyForInsert,
       createdAt,
       skipReplayTimestampFloodGuard,
     });
