@@ -25,6 +25,7 @@ function baseRollover(sessionKey: string): AmbiguousSessionKeyRuntimeRollover {
     sessionKey,
     trackedSessionFile: "/tmp/old-transcript.jsonl",
     hasDeliberateRolloverEvidence: false,
+    hostMintedResetReplacement: false,
   };
 }
 

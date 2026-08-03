@@ -15,7 +15,7 @@ import { createBootstrapEntryHash, messageIdentity } from "./message-signatures.
 import type { AgentMessage } from "./openclaw-bridge.js";
 import { isIsolatedCronSessionKey } from "./session-patterns.js";
 import type { ArchiveCause, ConversationStore } from "./store/conversation-store.js";
-import { getTranscriptEntryMeta } from "./transcript.js";
+import { getTranscriptEntryMeta, readTranscriptHeader } from "./transcript.js";
 import { isMissingFileError } from "./value-utils.js";
 import type { SummaryStore } from "./store/summary-store.js";
 import type { LcmDependencies } from "./types.js";
@@ -64,6 +64,52 @@ function isTrivialRolloverOverlapContent(content: string): boolean {
   return content.trim().length <= TRIVIAL_ROLLOVER_OVERLAP_CONTENT_MAX_LENGTH;
 }
 
+/**
+ * Max delay from an archive sibling's `.reset.<ts>` instant to the new
+ * transcript's session-header `timestamp` for the pair to count as one
+ * host-minted /new operation. Both artifacts are minted in that order by the
+ * same host handler within one /new (measured 0-1 ms apart on a live
+ * rotation); the allowance absorbs slow disks, busy hosts, and stalls between
+ * the archive rename and the header write while staying far below any
+ * plausible foreign-transcript coincidence. The window is also not the only
+ * defense: a transcript inside it must still carry Lossless's own /new marker
+ * (`softResetPrunedAt`) plus the `.reset.` sibling, and the per-entry
+ * timestamp gates (`candidate-missing-timestamp`,
+ * `candidate-entries-predate-last-persisted`) run ahead of the bypass.
+ */
+const HOST_MINTED_RESET_REPLACEMENT_TOLERANCE_MS = 30_000;
+
+/**
+ * A still-frozen lane restates its once-only WARN at debug on every turn;
+ * every Nth restatement is re-emitted at info so a long-lived freeze stays
+ * visible in default log levels instead of going silent after one WARN.
+ */
+const AMBIGUOUS_ROLLOVER_FROZEN_RESTATEMENT_INFO_EVERY = 25;
+
+/**
+ * Parse the `<ts>` tail of a host archive name (`${file}.reset.<ts>`). The
+ * host mints ISO-8601 with the time separators replaced by dashes
+ * (`2026-08-01T08-25-10.924Z`); a plain ISO tail is accepted too. A tail
+ * without a time component (e.g. a bare date, which `Date.parse` would
+ * happily read as midnight) is rejected: it cannot pin the archive to an
+ * instant precisely enough to correlate. Returns epoch ms, or null when the
+ * tail does not parse (callers fail closed).
+ */
+function parseResetArchiveSuffixInstant(suffix: string): number | null {
+  const trimmed = suffix.trim();
+  if (!/T\d{2}/.test(trimmed)) {
+    return null;
+  }
+  const candidates = [trimmed, trimmed.replace(/T(\d{2})-(\d{2})-(\d{2})/, "T$1:$2:$3")];
+  for (const candidate of candidates) {
+    const parsed = Date.parse(candidate);
+    if (Number.isFinite(parsed) && parsed > 0) {
+      return parsed;
+    }
+  }
+  return null;
+}
+
 export type AmbiguousSessionKeyRuntimeRollover = {
   conversationId: number;
   activeSessionId: string;
@@ -78,6 +124,17 @@ export type AmbiguousSessionKeyRuntimeRollover = {
    * `TRIVIAL_ROLLOVER_OVERLAP_CONTENT_MAX_LENGTH` above.
    */
   hasDeliberateRolloverEvidence: boolean;
+  /**
+   * True when the new transcript's header id matches the current runtime
+   * session and its creation instant follows the newest `.reset.` sibling
+   * archive instant within
+   * `HOST_MINTED_RESET_REPLACEMENT_TOLERANCE_MS` (on top of the
+   * deliberate-rollover evidence above): the new transcript is bound to the
+   * host's current session for this /new, so the freshness gate may bypass the
+   * identity-overlap scan. Missing or mismatched evidence leaves this false
+   * and behavior unchanged (fail closed).
+   */
+  hostMintedResetReplacement: boolean;
 };
 
 /**
@@ -141,7 +198,10 @@ export class SessionRolloverDetector {
    * gets evicted just re-warns once more on its next call, which is harmless
    * noise, so plain size-capped FIFO is enough; no LRU needed.
    */
-  private readonly warnedAmbiguousRolloverGenerations = new Map<string, string>();
+  private readonly warnedAmbiguousRolloverGenerations = new Map<
+    string,
+    { reason: string; restatements: number }
+  >();
   private static readonly WARNED_AMBIGUOUS_ROLLOVER_GENERATIONS_CAP = 500;
 
   constructor(
@@ -201,6 +261,80 @@ export class SessionRolloverDetector {
       params.softResetPrunedAt !== undefined &&
       (await this.hasResetArchivedTranscriptSibling(params.trackedSessionFile))
     );
+  }
+
+  /**
+   * Archive instant of the NEWEST `.reset.<ts>` sibling beside a tracked
+   * transcript, parsed from the suffix the host mints. Null when no sibling
+   * exists or no suffix parses; callers must fail closed on null.
+   */
+  private async latestResetArchivedTranscriptSiblingInstant(
+    trackedFile: string,
+  ): Promise<number | null> {
+    const prefix = basename(trackedFile);
+    if (!prefix) {
+      return null;
+    }
+    const resetPrefix = `${prefix}.reset.`;
+    let latest: number | null = null;
+    try {
+      const entries = await readdir(dirname(trackedFile));
+      for (const entry of entries) {
+        if (!entry.startsWith(resetPrefix)) {
+          continue;
+        }
+        const instant = parseResetArchiveSuffixInstant(entry.slice(resetPrefix.length));
+        if (instant !== null && (latest === null || instant > latest)) {
+          latest = instant;
+        }
+      }
+    } catch (err) {
+      if (!isMissingFileError(err)) {
+        this.deps.log.warn(
+          `[lcm] could not scan archived transcript sibling instants dir=${dirname(trackedFile)} file=${prefix} error=${describeLogError(err)}`,
+        );
+      }
+      return null;
+    }
+    return latest;
+  }
+
+  /**
+   * True when the new transcript's header id matches the current runtime
+   * session and its creation instant follows the newest `.reset.` sibling's
+   * archive instant within `HOST_MINTED_RESET_REPLACEMENT_TOLERANCE_MS`.
+   * OpenClaw mints the header id from that runtime session id, so the identity
+   * match binds the candidate file to the current host session while the
+   * ordered timestamps bind it to the reset window. Requires the deliberate
+   * rollover evidence pair, matching identity, and both instants; anything
+   * missing yields false (fail closed).
+   */
+  private async isHostMintedResetReplacementTranscript(params: {
+    hasDeliberateRolloverEvidence: boolean;
+    sessionId: string;
+    trackedSessionFile: string;
+    sessionFile?: string;
+  }): Promise<boolean> {
+    const sessionId = params.sessionId.trim();
+    if (!params.hasDeliberateRolloverEvidence || !sessionId || !params.sessionFile) {
+      return false;
+    }
+    const resetArchivedAt = await this.latestResetArchivedTranscriptSiblingInstant(
+      params.trackedSessionFile,
+    );
+    if (resetArchivedAt === null) {
+      return false;
+    }
+    const header = await readTranscriptHeader(params.sessionFile);
+    if (header.sessionHeaderId !== sessionId || !header.sessionHeaderCreatedAt) {
+      return false;
+    }
+    const headerCreatedAt = Date.parse(header.sessionHeaderCreatedAt);
+    if (!Number.isFinite(headerCreatedAt) || headerCreatedAt <= 0) {
+      return false;
+    }
+    const headerDelayMs = headerCreatedAt - resetArchivedAt;
+    return headerDelayMs >= 0 && headerDelayMs <= HOST_MINTED_RESET_REPLACEMENT_TOLERANCE_MS;
   }
 
   /**
@@ -391,12 +525,20 @@ export class SessionRolloverDetector {
       }
     }
 
+    const hostMintedResetReplacement = await this.isHostMintedResetReplacementTranscript({
+      hasDeliberateRolloverEvidence,
+      sessionId: params.sessionId,
+      trackedSessionFile,
+      sessionFile: params.sessionFile,
+    });
+
     return {
       conversationId: activeByKey.conversationId,
       activeSessionId: activeByKey.sessionId,
       sessionKey: normalizedSessionKey,
       trackedSessionFile,
       hasDeliberateRolloverEvidence,
+      hostMintedResetReplacement,
     };
   }
 
@@ -445,11 +587,23 @@ export class SessionRolloverDetector {
      * isolated-cron rollover) keep the unmodified, fully fail-closed check.
      */
     hasDeliberateRolloverEvidence?: boolean;
+    /**
+     * True when sibling + header instants prove the transcript is the
+     * host-minted replacement for exactly this /new (see
+     * `isHostMintedResetReplacementTranscript`): the identity-overlap scan is
+     * bypassed, because a same-text re-send across the user's own reset is
+     * the same user's traffic, not a foreign transcript reusing the key. The
+     * per-entry timestamp gates still apply. Defaults to false so every
+     * caller without the proof keeps the unmodified fail-closed check.
+     */
+    hasHostMintedResetReplacementEvidence?: boolean;
   }): Promise<{
     fresh: boolean;
     reason: string;
     lastPersistedAt: Date | null;
     firstCandidateAt: number | null;
+    /** Trimmed length of the overlapping content on an identity-overlap verdict. */
+    overlapContentLength?: number;
   }> {
     if (isLikelyInjectedDeliveryOnlyTranscript(params.candidateMessages)) {
       return {
@@ -506,6 +660,22 @@ export class SessionRolloverDetector {
       return {
         fresh: false,
         reason: "candidate-entries-predate-last-persisted",
+        lastPersistedAt: lastPersisted.createdAt,
+        firstCandidateAt,
+      };
+    }
+
+    if (params.hasHostMintedResetReplacementEvidence) {
+      // The archive sibling's reset instant and the new transcript's session
+      // header instant were minted by the same host-side /new and agree
+      // within tolerance: this transcript IS the host's replacement for
+      // exactly that reset. Overlapping content across the boundary is the
+      // same user's traffic (the natural "reset, then re-send" pattern), so
+      // the content-overlap scan below is bypassed; the timestamp gates
+      // above still hold.
+      return {
+        fresh: true,
+        reason: "fresh-host-minted-reset-replacement-transcript",
         lastPersistedAt: lastPersisted.createdAt,
         firstCandidateAt,
       };
@@ -591,6 +761,7 @@ export class SessionRolloverDetector {
           reason: "identity-overlap-with-persisted-history",
           lastPersistedAt: lastPersisted.createdAt,
           firstCandidateAt,
+          overlapContentLength: stored.content.trim().length,
         };
       }
     }
@@ -636,6 +807,7 @@ export class SessionRolloverDetector {
         conversationId: params.rollover.conversationId,
         candidateMessages: params.candidateMessages,
         hasDeliberateRolloverEvidence: params.rollover.hasDeliberateRolloverEvidence,
+        hasHostMintedResetReplacementEvidence: params.rollover.hostMintedResetReplacement,
       });
     } catch (err) {
       this.deps.log.warn(
@@ -645,7 +817,7 @@ export class SessionRolloverDetector {
     }
     if (!verdict.fresh) {
       const preserveExpected = isTransientAmbiguousRolloverFreshness(verdict.reason);
-      const message = `[lcm] ${params.phase}: ambiguous rollover not provably fresh conversation=${params.rollover.conversationId} sessionKey=${params.rollover.sessionKey} freshness=${verdict.reason} lastPersistedAt=${verdict.lastPersistedAt?.toISOString() ?? "none"} firstCandidateAt=${verdict.firstCandidateAt !== null ? new Date(verdict.firstCandidateAt).toISOString() : "none"}`;
+      const message = `[lcm] ${params.phase}: ambiguous rollover not provably fresh conversation=${params.rollover.conversationId} sessionKey=${params.rollover.sessionKey} freshness=${verdict.reason} lastPersistedAt=${verdict.lastPersistedAt?.toISOString() ?? "none"} firstCandidateAt=${verdict.firstCandidateAt !== null ? new Date(verdict.firstCandidateAt).toISOString() : "none"} candidateMessages=${params.candidateMessages.length} overlapContentLength=${verdict.overlapContentLength ?? "none"}`;
       if (preserveExpected) {
         this.deps.log.info(message);
         return { rebound: false, preserveExpected, alreadyWarned: false };
@@ -653,12 +825,22 @@ export class SessionRolloverDetector {
       // Once-only WARN: a genuine freeze re-derives identically on every
       // subsequent call (nothing about a failed attempt mutates state), so
       // only the first occurrence of a given (generation, reason) pair
-      // warns; repeats log at debug. A reason change for the same
-      // generation is a materially different situation and warns again.
+      // warns; repeats log at debug, with every Nth restatement re-emitted
+      // at info so a long-frozen lane stays visible at default log levels.
+      // A reason change for the same generation is a materially different
+      // situation and warns again.
       const generationKey = this.ambiguousRolloverGenerationKey(params.rollover, params.sessionId);
-      const alreadyWarned = this.warnedAmbiguousRolloverGenerations.get(generationKey) === verdict.reason;
-      if (alreadyWarned) {
-        this.deps.log.debug(message);
+      const warnedEntry = this.warnedAmbiguousRolloverGenerations.get(generationKey);
+      const alreadyWarned = warnedEntry?.reason === verdict.reason;
+      if (alreadyWarned && warnedEntry) {
+        warnedEntry.restatements += 1;
+        if (warnedEntry.restatements % AMBIGUOUS_ROLLOVER_FROZEN_RESTATEMENT_INFO_EVERY === 0) {
+          this.deps.log.info(
+            `${message} restatements=${warnedEntry.restatements} (lane still frozen; ingest suspended until the next /new)`,
+          );
+        } else {
+          this.deps.log.debug(message);
+        }
       } else {
         this.deps.log.warn(message);
         if (
@@ -671,7 +853,10 @@ export class SessionRolloverDetector {
             this.warnedAmbiguousRolloverGenerations.delete(oldest);
           }
         }
-        this.warnedAmbiguousRolloverGenerations.set(generationKey, verdict.reason);
+        this.warnedAmbiguousRolloverGenerations.set(generationKey, {
+          reason: verdict.reason,
+          restatements: 0,
+        });
       }
       return { rebound: false, preserveExpected, alreadyWarned };
     }
