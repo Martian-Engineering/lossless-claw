@@ -173,6 +173,16 @@ export function extractModelIdentityMetadata(
     : undefined;
 }
 
+/** Return whether an assistant message contains completed text or replay-critical structure. */
+export function hasSubstantiveAssistantContent(message: AgentMessage): boolean {
+  const record = message as unknown as { content?: unknown; tool_calls?: unknown };
+  if (Array.isArray(record.tool_calls) && record.tool_calls.length > 0) {
+    return true;
+  }
+  const text = extractStructuredText(record.content);
+  return Boolean(text?.trim()) || hasReplayCriticalRawBlock(record.content);
+}
+
 export function looksLikeJsonPayload(value: string): boolean {
   if (typeof value !== "string") return false;
   const trimmed = value.trim();

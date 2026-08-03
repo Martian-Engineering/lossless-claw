@@ -86,8 +86,8 @@ import { describeAssembledPrefixChange, formatOverflowDiagnosticsForLog, shouldL
 import { appendForkBoundedLiveSuffixWithinBudget, buildDegradedLiveAssembleResult, buildForkBoundedLiveFallback, clampMessagesToSerializedBudget, forkBoundedLiveSuffixAppendLogLevel, resolveDeferredAssemblyPressure } from "./assemble-fallback.js";
 import { resolveBootstrapMaxTokens, trimBootstrapMessagesToBudget } from "./bootstrap-budget.js";
 import { batchLooksLikeHeartbeatAckTurn, pruneHeartbeatOkTurns } from "./heartbeat-filter.js";
-import { appendUncoveredVolatileLiveInputsWithinBudget, isVolatileLiveInputMessage, messageContentCoveredBySummary, resolveProtectedFreshTailAssembledIndexes } from "./live-coverage.js";
-import { buildMessageParts, extractMessageContent, extractStructuredText, filterPersistableMessages, hasPersistableMessageRole, hasReplayCriticalRawBlock, isOpenClawRuntimeContextLeak, toStoredMessage } from "./message-content.js";
+import { appendUncoveredVolatileLiveInputsWithinBudget, isVolatileLiveInputMessage, messageContentCoveredBySummary, resolveProtectedFreshTailAssembledIndexes, stripTrailingAssistantPrefill } from "./live-coverage.js";
+import { buildMessageParts, extractMessageContent, filterPersistableMessages, hasPersistableMessageRole, isOpenClawRuntimeContextLeak, toStoredMessage } from "./message-content.js";
 import { createBootstrapEntryHash, readBootstrapMessageFromJsonLine } from "./message-signatures.js";
 import { canonicalizeOpenClawInboundMetadataIdentityContent } from "./openclaw-inbound-metadata.js";
 import { PROMPT_RECALL_MAX_MESSAGES, PROMPT_RECALL_SEARCH_CANDIDATE_LIMIT, buildPromptRecallProjectionFingerprint, extractPromptRecallIdentifiers, extractPromptRecallSnippet, findPromptRecallIdentifierIndex, isPromptRecallEligibleRole, normalizePromptRecallCoverageText, normalizePromptRecallText, renderPromptRecallMessage } from "./prompt-recall.js";
@@ -247,16 +247,6 @@ function buildLiveToolOutputFileId(params: {
   hash.update("\0");
   hash.update(params.content);
   return `file_${hash.digest("hex").slice(0, 16)}`;
-}
-
-/** Return whether an assistant message contains completed text or replay-critical structure. */
-function hasSubstantiveAssistantContent(message: AgentMessage): boolean {
-  const record = message as unknown as { content?: unknown; tool_calls?: unknown };
-  if (Array.isArray(record.tool_calls) && record.tool_calls.length > 0) {
-    return true;
-  }
-  const text = extractStructuredText(record.content);
-  return Boolean(text?.trim()) || hasReplayCriticalRawBlock(record.content);
 }
 
 
@@ -3576,14 +3566,9 @@ export class LcmContextEngine implements ContextEngine {
     // behind. Blank tails are stripped on every host.
     const hostDeliversCurrentTurnSeparately = params.prompt !== undefined;
     const safeFallback = (): AssembleResult => {
-      const msgs = liveMessages.slice();
-      while (msgs.length > 0 && msgs[msgs.length - 1]?.role === "assistant") {
-        const tail = msgs[msgs.length - 1];
-        if (hostDeliversCurrentTurnSeparately && tail && hasSubstantiveAssistantContent(tail)) {
-          break;
-        }
-        msgs.pop();
-      }
+      const msgs = stripTrailingAssistantPrefill(liveMessages, {
+        preserveSubstantiveAssistantTail: hostDeliversCurrentTurnSeparately,
+      });
       return { messages: msgs, estimatedTokens: 0 };
     };
 
@@ -3716,6 +3701,7 @@ export class LcmContextEngine implements ContextEngine {
         const clamp = clampMessagesToSerializedBudget({
           messages: fallback.messages,
           tokenBudget,
+          preserveSubstantiveAssistantTail: hostDeliversCurrentTurnSeparately,
         });
         if (clamp.clamped || clamp.overBudget) {
           this.deps.log.warn(
@@ -3807,6 +3793,7 @@ export class LcmContextEngine implements ContextEngine {
         const degraded = buildDegradedLiveAssembleResult({
           liveMessages,
           tokenBudget,
+          preserveSubstantiveAssistantTail: hostDeliversCurrentTurnSeparately,
         });
         this.deps.log.warn(
           `[lcm] assemble: degraded live fallback conversation=${conversation.conversationId} ${sessionLabel} reason=${deferredAssemblyDegradation.reason} storedContextTokens=${deferredAssemblyDegradation.pressure.storedContextTokens} projectedTokenCount=${deferredAssemblyDegradation.pressure.projectedTokenCount ?? "null"} tokenBudget=${tokenBudget} pressureThreshold=${Math.floor(tokenBudget * DEFERRED_ASSEMBLY_DEGRADED_PRESSURE_RATIO)} outputMessages=${degraded.messages.length} estimatedTokens=${degraded.estimatedTokens}`,
@@ -3827,6 +3814,7 @@ export class LcmContextEngine implements ContextEngine {
             forkSourceMessageCount,
             tokenBudget,
             bootstrapMaxTokens: resolveBootstrapMaxTokens(this.config),
+            preserveSubstantiveAssistantTail: hostDeliversCurrentTurnSeparately,
           });
           this.deps.log.debug(
             `[lcm] assemble: no context items for fork-bounded bootstrap; using bounded live suffix conversation=${conversation.conversationId} ${sessionLabel} outputMessages=${boundedFallback.messages.length} duration=${formatDurationMs(Date.now() - startedAt)}`,
@@ -3883,6 +3871,7 @@ export class LcmContextEngine implements ContextEngine {
             liveMessages,
             forkSourceMessageCount,
             tokenBudget,
+            preserveSubstantiveAssistantTail: hostDeliversCurrentTurnSeparately,
           })
         : null;
       const preRecallMessages = forkLiveSuffixAppend?.messages ?? assembled.messages;
@@ -3906,6 +3895,7 @@ export class LcmContextEngine implements ContextEngine {
             forkSourceMessageCount,
             tokenBudget,
             bootstrapMaxTokens: resolveBootstrapMaxTokens(this.config),
+            preserveSubstantiveAssistantTail: hostDeliversCurrentTurnSeparately,
           });
           this.deps.log.debug(
             `[lcm] assemble: empty assembled output for fork-bounded bootstrap; using bounded live suffix conversation=${conversation.conversationId} ${sessionLabel} outputMessages=${boundedFallback.messages.length} tokenBudget=${tokenBudget} duration=${formatDurationMs(Date.now() - startedAt)}`,
@@ -3931,6 +3921,7 @@ export class LcmContextEngine implements ContextEngine {
             forkSourceMessageCount,
             tokenBudget,
             bootstrapMaxTokens: resolveBootstrapMaxTokens(this.config),
+            preserveSubstantiveAssistantTail: hostDeliversCurrentTurnSeparately,
           });
           this.deps.log.debug(
             `[lcm] assemble: fork-bounded context has no user turns; using bounded live suffix conversation=${conversation.conversationId} ${sessionLabel} outputMessages=${boundedFallback.messages.length} duration=${formatDurationMs(Date.now() - startedAt)}`,
@@ -4041,6 +4032,7 @@ export class LcmContextEngine implements ContextEngine {
       let serializedClamp = clampMessagesToSerializedBudget({
         messages: volatileLiveInputAppend.messages,
         tokenBudget,
+        preserveSubstantiveAssistantTail: hostDeliversCurrentTurnSeparately,
       });
       if (serializedClamp.clamped && budgetedPromptRecallCue) {
         // The recall cue is optional enrichment: drop it before evicting any
@@ -4053,6 +4045,7 @@ export class LcmContextEngine implements ContextEngine {
           serializedClamp = clampMessagesToSerializedBudget({
             messages: withoutCue,
             tokenBudget,
+            preserveSubstantiveAssistantTail: hostDeliversCurrentTurnSeparately,
           });
           budgetedPromptRecallCue = null;
         }
@@ -4154,6 +4147,7 @@ export class LcmContextEngine implements ContextEngine {
       const clamp = clampMessagesToSerializedBudget({
         messages: fallback.messages,
         tokenBudget: fallbackBudget,
+        preserveSubstantiveAssistantTail: hostDeliversCurrentTurnSeparately,
       });
       if (clamp.clamped || clamp.overBudget) {
         this.deps.log.warn(

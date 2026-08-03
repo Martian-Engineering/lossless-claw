@@ -4,7 +4,7 @@
  * Extracted from engine.ts (Phase 1 of the engine decomposition).
  */
 import { contentFromParts } from "./assembler.js";
-import { buildMessageParts, toStoredMessage, toSyntheticMessagePartRecord } from "./message-content.js";
+import { buildMessageParts, hasSubstantiveAssistantContent, toStoredMessage, toSyntheticMessagePartRecord } from "./message-content.js";
 import { createLiveCoverageSignature, hashAgentMessageForAssemblyProtection, messagesHaveSameLiveCoverageSignature } from "./message-signatures.js";
 import type { AgentMessage } from "./openclaw-bridge.js";
 import {
@@ -124,9 +124,21 @@ export function isVolatileLiveInputContent(content: string): boolean {
   );
 }
 
-export function stripTrailingAssistantPrefill(messages: AgentMessage[]): AgentMessage[] {
+/** Strip trailing assistant prefill while optionally preserving completed assistant content. */
+export function stripTrailingAssistantPrefill(
+  messages: AgentMessage[],
+  options: { preserveSubstantiveAssistantTail?: boolean } = {},
+): AgentMessage[] {
   const trimmed = messages.slice();
   while (trimmed.length > 0 && trimmed[trimmed.length - 1]?.role === "assistant") {
+    const tail = trimmed[trimmed.length - 1];
+    if (
+      options.preserveSubstantiveAssistantTail === true &&
+      tail &&
+      hasSubstantiveAssistantContent(tail)
+    ) {
+      break;
+    }
     trimmed.pop();
   }
   return trimmed;

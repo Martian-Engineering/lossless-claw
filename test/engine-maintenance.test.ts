@@ -1278,6 +1278,53 @@ describe("LcmContextEngine maintain and assemble budget", () => {
     expect(log.warn).toHaveBeenCalledWith(expect.stringContaining("reason=near-budget"));
   });
 
+  it("assemble() preserves a completed assistant tail in degraded prompt-separate fallback", async () => {
+    const log = {
+      info: vi.fn(),
+      warn: vi.fn(),
+      error: vi.fn(),
+      debug: vi.fn(),
+    };
+    const engine = createEngineWithDepsOverrides({ log });
+    const sessionId = "assemble-threshold-debt-prompt-separate-assistant-tail";
+    const conversation = await engine.getConversationStore().getOrCreateConversation(sessionId, {
+      sessionKey: undefined,
+    });
+    const [storedMessage] = await engine.getConversationStore().createMessagesBulk([
+      {
+        conversationId: conversation.conversationId,
+        seq: 0,
+        role: "user",
+        content: "stored context should be skipped while maintenance is pending",
+        tokenCount: 80,
+      },
+    ]);
+    await engine
+      .getSummaryStore()
+      .appendContextMessages(conversation.conversationId, [storedMessage.messageId]);
+    await engine.getCompactionMaintenanceStore().requestProactiveCompactionDebt({
+      conversationId: conversation.conversationId,
+      reason: "threshold",
+      tokenBudget: 100,
+      currentTokenCount: 90,
+    });
+
+    const liveMessages = [
+      makeMessage({ role: "user", content: "previous delivery turn" }),
+      makeMessage({ role: "assistant", content: "completed previous reply" }),
+    ];
+    const assembleResult = await engine.assemble({
+      sessionId,
+      messages: liveMessages,
+      prompt: "current delivery turn",
+      tokenBudget: 100,
+    });
+
+    expect(assembleResult.messages).toStrictEqual(liveMessages);
+    expect(assembleResult).toHaveProperty("promptAuthority", "preassembly_may_overflow");
+    expect(log.warn).toHaveBeenCalledWith(expect.stringContaining("reason=near-budget"));
+  });
+
   it("assemble() intercepts large tool results in live messages before degraded fallback", async () => {
     const largeFilesDir = mkdtempSync(join(tmpdir(), "lossless-claw-large-files-"));
     tempDirs.push(largeFilesDir);
