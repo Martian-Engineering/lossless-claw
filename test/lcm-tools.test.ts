@@ -208,6 +208,34 @@ describe("LCM tools session scoping", () => {
     expect((result.details as { error?: string }).error).toContain('mode: "regex"');
   });
 
+  it("lcm_grep reports a missing pattern instead of throwing", async () => {
+    const retrieval = {
+      grep: vi.fn(async () => ({
+        messages: [],
+        summaries: [],
+        totalMatches: 0,
+      })),
+      expand: vi.fn(),
+      describe: vi.fn(),
+    };
+
+    const tool = createLcmGrepTool({
+      deps: makeDeps(),
+      lcm: buildLcmEngine({ retrieval, conversationId: 42 }) as never,
+      sessionId: "session-1",
+    });
+    // Hosts forward model-supplied arguments unvalidated, so the omitted
+    // required parameter has to surface as a tool error, not a TypeError.
+    const result = await tool.execute("call-missing-pattern", {
+      mode: "full_text",
+      allConversations: true,
+      sort: "recency",
+    });
+
+    expect(retrieval.grep).not.toHaveBeenCalled();
+    expect((result.details as { error?: string }).error).toContain("Missing required `pattern`");
+  });
+
   it("lcm_grep still forwards regex alternation in regex mode", async () => {
     const retrieval = {
       grep: vi.fn(async () => ({
