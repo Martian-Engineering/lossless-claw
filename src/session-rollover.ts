@@ -125,13 +125,14 @@ export type AmbiguousSessionKeyRuntimeRollover = {
    */
   hasDeliberateRolloverEvidence: boolean;
   /**
-   * True when the new transcript's session-header creation instant follows
-   * the newest `.reset.` sibling's archive instant within
+   * True when the new transcript's header id matches the current runtime
+   * session and its creation instant follows the newest `.reset.` sibling
+   * archive instant within
    * `HOST_MINTED_RESET_REPLACEMENT_TOLERANCE_MS` (on top of the
-   * deliberate-rollover evidence above): the new transcript is the
-   * host-minted replacement for exactly this /new, so the freshness gate may
-   * bypass the identity-overlap scan. Missing either artifact leaves this
-   * false and behavior unchanged (fail closed).
+   * deliberate-rollover evidence above): the new transcript is bound to the
+   * host's current session for this /new, so the freshness gate may bypass the
+   * identity-overlap scan. Missing or mismatched evidence leaves this false
+   * and behavior unchanged (fail closed).
    */
   hostMintedResetReplacement: boolean;
 };
@@ -299,22 +300,23 @@ export class SessionRolloverDetector {
   }
 
   /**
-   * True when the new transcript's session-header creation instant follows
-   * the newest `.reset.` sibling's archive instant within
-   * `HOST_MINTED_RESET_REPLACEMENT_TOLERANCE_MS`. Both artifacts are minted
-   * by the same host-side /new operation, so their ordered proximity proves
-   * the new transcript is the host's replacement for exactly that reset; a
-   * foreign transcript reusing a stale sessionKey carries a header instant
-   * unrelated to the reset instant and cannot satisfy the correlation. Requires the
-   * deliberate-rollover evidence pair and both instants; anything missing
-   * yields false (fail closed).
+   * True when the new transcript's header id matches the current runtime
+   * session and its creation instant follows the newest `.reset.` sibling's
+   * archive instant within `HOST_MINTED_RESET_REPLACEMENT_TOLERANCE_MS`.
+   * OpenClaw mints the header id from that runtime session id, so the identity
+   * match binds the candidate file to the current host session while the
+   * ordered timestamps bind it to the reset window. Requires the deliberate
+   * rollover evidence pair, matching identity, and both instants; anything
+   * missing yields false (fail closed).
    */
   private async isHostMintedResetReplacementTranscript(params: {
     hasDeliberateRolloverEvidence: boolean;
+    sessionId: string;
     trackedSessionFile: string;
     sessionFile?: string;
   }): Promise<boolean> {
-    if (!params.hasDeliberateRolloverEvidence || !params.sessionFile) {
+    const sessionId = params.sessionId.trim();
+    if (!params.hasDeliberateRolloverEvidence || !sessionId || !params.sessionFile) {
       return false;
     }
     const resetArchivedAt = await this.latestResetArchivedTranscriptSiblingInstant(
@@ -324,7 +326,7 @@ export class SessionRolloverDetector {
       return false;
     }
     const header = await readTranscriptHeader(params.sessionFile);
-    if (!header.sessionHeaderCreatedAt) {
+    if (header.sessionHeaderId !== sessionId || !header.sessionHeaderCreatedAt) {
       return false;
     }
     const headerCreatedAt = Date.parse(header.sessionHeaderCreatedAt);
@@ -525,6 +527,7 @@ export class SessionRolloverDetector {
 
     const hostMintedResetReplacement = await this.isHostMintedResetReplacementTranscript({
       hasDeliberateRolloverEvidence,
+      sessionId: params.sessionId,
       trackedSessionFile,
       sessionFile: params.sessionFile,
     });

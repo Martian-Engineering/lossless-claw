@@ -574,6 +574,45 @@ describe("host-minted reset replacement (timestamp-correlated /new)", () => {
     expect(carried.map((item) => item.summaryId)).toContain("sum_d2");
   });
 
+  it("fails closed for an in-window transcript whose header id is not the current session", async () => {
+    const { engine, log, db } = createEngine({ newSessionRetainDepth: 2 });
+    const lane = await seedSummaryBearingLane(engine, db);
+    await engine.handleBeforeReset({
+      reason: "new",
+      sessionId: OLD_SESSION_ID,
+      sessionKey: SESSION_KEY,
+    });
+
+    const resetInstant = Date.now();
+    archiveTrackedFileAtInstant(lane.trackedFile, resetInstant);
+    const foreignSessionFile = writeRolledTranscript({
+      name: "foreign-session-created-in-window",
+      sessionHeaderTimestampMs: resetInstant + 1,
+      entries: [
+        {
+          role: "user",
+          text: "lane turn 10 about the deployment plan",
+          timestamp: Date.now() + 60_000,
+        },
+      ],
+    });
+
+    await engine.bootstrap({
+      sessionId: NEW_SESSION_ID,
+      sessionKey: SESSION_KEY,
+      sessionFile: foreignSessionFile,
+    });
+
+    expect(log.warn).toHaveBeenCalledWith(
+      expect.stringContaining("freshness=identity-overlap-with-persisted-history"),
+    );
+    expect(log.info).not.toHaveBeenCalledWith(
+      expect.stringContaining("resolved by fresh-transcript rebind"),
+    );
+    const conversation = await engine.getConversationStore().getConversationBySessionKey(SESSION_KEY);
+    expect(conversation?.sessionId).toBe(OLD_SESSION_ID);
+  });
+
   it("accepts a header instant 29s past the reset instant (inside the correlation tolerance)", async () => {
     const { engine, log, db } = createEngine({ newSessionRetainDepth: 2 });
     const lane = await seedSummaryBearingLane(engine, db);
@@ -586,7 +625,7 @@ describe("host-minted reset replacement (timestamp-correlated /new)", () => {
     const resetInstant = Date.now();
     archiveTrackedFileAtInstant(lane.trackedFile, resetInstant);
     const newSessionFile = writeRolledTranscript({
-      name: `${NEW_SESSION_ID}-tolerance-inside`,
+      name: NEW_SESSION_ID,
       sessionHeaderTimestampMs: resetInstant + 29_000,
       entries: [
         {
@@ -622,7 +661,7 @@ describe("host-minted reset replacement (timestamp-correlated /new)", () => {
     const resetInstant = Date.now();
     archiveTrackedFileAtInstant(lane.trackedFile, resetInstant);
     const newSessionFile = writeRolledTranscript({
-      name: `${NEW_SESSION_ID}-tolerance-outside`,
+      name: NEW_SESSION_ID,
       sessionHeaderTimestampMs: resetInstant + 31_000,
       entries: [
         {
@@ -658,7 +697,7 @@ describe("host-minted reset replacement (timestamp-correlated /new)", () => {
     const resetInstant = Date.now();
     archiveTrackedFileAtInstant(lane.trackedFile, resetInstant);
     const newSessionFile = writeRolledTranscript({
-      name: `${NEW_SESSION_ID}-header-before-reset`,
+      name: NEW_SESSION_ID,
       // The host archives first and then writes the replacement header. Even
       // a nearby pre-reset header cannot identify this /new replacement.
       sessionHeaderTimestampMs: resetInstant - 1,
@@ -702,7 +741,7 @@ describe("host-minted reset replacement (timestamp-correlated /new)", () => {
     const dateOnlyMidnight = Date.parse("2026-06-29");
     renameSync(lane.trackedFile, `${lane.trackedFile}.reset.2026-06-29`);
     const newSessionFile = writeRolledTranscript({
-      name: `${NEW_SESSION_ID}-date-only-sibling`,
+      name: NEW_SESSION_ID,
       sessionHeaderTimestampMs: dateOnlyMidnight + 5,
       entries: [
         {
@@ -739,7 +778,7 @@ describe("host-minted reset replacement (timestamp-correlated /new)", () => {
     archiveTrackedFileAtInstant(lane.trackedFile, resetInstant);
     const overlapText = "lane turn 10 about the deployment plan";
     const foreignFile = writeRolledTranscript({
-      name: `${NEW_SESSION_ID}-late-header`,
+      name: NEW_SESSION_ID,
       // Ten minutes past the reset instant: not the host-minted replacement.
       sessionHeaderTimestampMs: resetInstant + 10 * 60_000,
       entries: [{ role: "user", text: overlapText, timestamp: Date.now() + 60_000 }],
@@ -812,7 +851,7 @@ describe("host-minted reset replacement (timestamp-correlated /new)", () => {
     // not a parseable instant, so no correlation is possible.
     archiveTrackedFile(lane.trackedFile, "reset");
     const newSessionFile = writeRolledTranscript({
-      name: `${NEW_SESSION_ID}-unparseable-sibling`,
+      name: NEW_SESSION_ID,
       sessionHeaderTimestampMs: Date.now(),
       entries: [
         {
