@@ -646,6 +646,47 @@ describe("host-minted reset replacement (timestamp-correlated /new)", () => {
     expect(conversation?.sessionId).toBe(OLD_SESSION_ID);
   });
 
+  it("fails closed when the header instant predates the reset archive", async () => {
+    const { engine, log, db } = createEngine({ newSessionRetainDepth: 2 });
+    const lane = await seedSummaryBearingLane(engine, db);
+    await engine.handleBeforeReset({
+      reason: "new",
+      sessionId: OLD_SESSION_ID,
+      sessionKey: SESSION_KEY,
+    });
+
+    const resetInstant = Date.now();
+    archiveTrackedFileAtInstant(lane.trackedFile, resetInstant);
+    const newSessionFile = writeRolledTranscript({
+      name: `${NEW_SESSION_ID}-header-before-reset`,
+      // The host archives first and then writes the replacement header. Even
+      // a nearby pre-reset header cannot identify this /new replacement.
+      sessionHeaderTimestampMs: resetInstant - 1,
+      entries: [
+        {
+          role: "user",
+          text: "lane turn 10 about the deployment plan",
+          timestamp: Date.now() + 60_000,
+        },
+      ],
+    });
+
+    await engine.bootstrap({
+      sessionId: NEW_SESSION_ID,
+      sessionKey: SESSION_KEY,
+      sessionFile: newSessionFile,
+    });
+
+    expect(log.warn).toHaveBeenCalledWith(
+      expect.stringContaining("freshness=identity-overlap-with-persisted-history"),
+    );
+    expect(log.info).not.toHaveBeenCalledWith(
+      expect.stringContaining("resolved by fresh-transcript rebind"),
+    );
+    const conversation = await engine.getConversationStore().getConversationBySessionKey(SESSION_KEY);
+    expect(conversation?.sessionId).toBe(OLD_SESSION_ID);
+  });
+
   it("fails closed when the sibling archive suffix is date-only (no time component)", async () => {
     const { engine, log, db } = createEngine({ newSessionRetainDepth: 2 });
     const lane = await seedSummaryBearingLane(engine, db);

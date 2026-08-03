@@ -65,14 +65,14 @@ function isTrivialRolloverOverlapContent(content: string): boolean {
 }
 
 /**
- * Max distance between an archive sibling's `.reset.<ts>` instant and the new
+ * Max delay from an archive sibling's `.reset.<ts>` instant to the new
  * transcript's session-header `timestamp` for the pair to count as one
- * host-minted /new operation. Both artifacts are minted by the same host
- * handler within one /new (measured 0-1 ms apart on a live rotation); the
- * allowance absorbs slow disks, busy hosts, and stalls between the archive
- * rename and the header write while staying far below any plausible
- * foreign-transcript coincidence. The window is also not the only defense: a
- * transcript inside it must still carry Lossless's own /new marker
+ * host-minted /new operation. Both artifacts are minted in that order by the
+ * same host handler within one /new (measured 0-1 ms apart on a live
+ * rotation); the allowance absorbs slow disks, busy hosts, and stalls between
+ * the archive rename and the header write while staying far below any
+ * plausible foreign-transcript coincidence. The window is also not the only
+ * defense: a transcript inside it must still carry Lossless's own /new marker
  * (`softResetPrunedAt`) plus the `.reset.` sibling, and the per-entry
  * timestamp gates (`candidate-missing-timestamp`,
  * `candidate-entries-predate-last-persisted`) run ahead of the bypass.
@@ -125,8 +125,8 @@ export type AmbiguousSessionKeyRuntimeRollover = {
    */
   hasDeliberateRolloverEvidence: boolean;
   /**
-   * True when the newest `.reset.` sibling's archive instant and the new
-   * transcript's session-header creation instant agree within
+   * True when the new transcript's session-header creation instant follows
+   * the newest `.reset.` sibling's archive instant within
    * `HOST_MINTED_RESET_REPLACEMENT_TOLERANCE_MS` (on top of the
    * deliberate-rollover evidence above): the new transcript is the
    * host-minted replacement for exactly this /new, so the freshness gate may
@@ -299,13 +299,13 @@ export class SessionRolloverDetector {
   }
 
   /**
-   * True when the new transcript's session-header creation instant and the
-   * newest `.reset.` sibling's archive instant agree within
+   * True when the new transcript's session-header creation instant follows
+   * the newest `.reset.` sibling's archive instant within
    * `HOST_MINTED_RESET_REPLACEMENT_TOLERANCE_MS`. Both artifacts are minted
-   * by the same host-side /new operation, so their agreement proves the new
-   * transcript is the host's replacement for exactly that reset; a foreign
-   * transcript reusing a stale sessionKey carries a header instant unrelated
-   * to the reset instant and cannot satisfy the correlation. Requires the
+   * by the same host-side /new operation, so their ordered proximity proves
+   * the new transcript is the host's replacement for exactly that reset; a
+   * foreign transcript reusing a stale sessionKey carries a header instant
+   * unrelated to the reset instant and cannot satisfy the correlation. Requires the
    * deliberate-rollover evidence pair and both instants; anything missing
    * yields false (fail closed).
    */
@@ -331,9 +331,8 @@ export class SessionRolloverDetector {
     if (!Number.isFinite(headerCreatedAt) || headerCreatedAt <= 0) {
       return false;
     }
-    return (
-      Math.abs(headerCreatedAt - resetArchivedAt) <= HOST_MINTED_RESET_REPLACEMENT_TOLERANCE_MS
-    );
+    const headerDelayMs = headerCreatedAt - resetArchivedAt;
+    return headerDelayMs >= 0 && headerDelayMs <= HOST_MINTED_RESET_REPLACEMENT_TOLERANCE_MS;
   }
 
   /**
