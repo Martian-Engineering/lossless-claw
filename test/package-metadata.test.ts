@@ -1,4 +1,5 @@
 import { describe, expect, it } from "vitest";
+import { readFileSync } from "node:fs";
 import packageJson from "../package.json" with { type: "json" };
 
 describe("package OpenClaw compatibility metadata", () => {
@@ -17,5 +18,11 @@ describe("package OpenClaw compatibility metadata", () => {
     });
     expect(packageJson.scripts.build).toContain("build:cli");
     expect(packageJson.scripts.build).toContain("build:migrate-sessions");
+  });
+
+  it("documents the same OpenClaw baseline as package.json", () => {
+    const docsConfig = readFileSync(new URL("../docs/configuration.md", import.meta.url), "utf8");
+    expect(docsConfig).toContain("2026.5.28");
+    expect(docsConfig).not.toContain("2026.5.22");
   });
 });
