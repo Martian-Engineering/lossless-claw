@@ -1,5 +1,9 @@
 import { describe, expect, it } from "vitest";
-import { createBootstrapEntryHash, createLosslessMessageSignature } from "../src/message-signatures.js";
+import {
+  createBootstrapEntryHash,
+  createLiveCoverageSignature,
+  createLosslessMessageSignature,
+} from "../src/message-signatures.js";
 import { stripModelIdentityFromMetadataJson } from "../src/message-content.js";
 import type { AgentMessage } from "../src/openclaw-bridge.js";
 
@@ -36,6 +40,83 @@ describe("createLosslessMessageSignature upgrade parity", () => {
     } as unknown as AgentMessage;
     expect(createLosslessMessageSignature(preUpgrade)).toBe(
       createLosslessMessageSignature(postUpgrade),
+    );
+  });
+
+  it("strips provider replay signatures so legacy assembled thinking still matches", () => {
+    const legacyAssembled = {
+      role: "assistant",
+      content: [
+        { type: "thinking", thinking: "reasoning" },
+        { type: "text", text: "answer" },
+      ],
+    } as unknown as AgentMessage;
+    const postUpgrade = {
+      role: "assistant",
+      content: [
+        { type: "thinking", thinking: "reasoning", thinkingSignature: "provider-signature" },
+        { type: "text", text: "answer" },
+      ],
+      provider: "anthropic",
+      api: "anthropic-messages",
+      model: "claude-opus-4-6",
+    } as unknown as AgentMessage;
+
+    expect(createLosslessMessageSignature(legacyAssembled)).toBe(
+      createLosslessMessageSignature(postUpgrade),
+    );
+  });
+
+  it("keeps OpenAI encrypted reasoning payloads in message identity", () => {
+    const messageWithSignature = (id: string) =>
+      ({
+        role: "assistant",
+        content: [
+          {
+            type: "thinking",
+            thinking: "",
+            thinkingSignature: JSON.stringify({ type: "reasoning", id }),
+          },
+        ],
+      }) as unknown as AgentMessage;
+
+    expect(createLosslessMessageSignature(messageWithSignature("rs_1"))).not.toBe(
+      createLosslessMessageSignature(messageWithSignature("rs_2")),
+    );
+  });
+
+  it("keeps opaque signatures when no thinking text can identify the block", () => {
+    const messageWithSignature = (thinkingSignature: string) =>
+      ({
+        role: "assistant",
+        content: [{ type: "thinking", thinking: "", thinkingSignature }],
+      }) as unknown as AgentMessage;
+
+    expect(createLosslessMessageSignature(messageWithSignature("opaque-1"))).not.toBe(
+      createLosslessMessageSignature(messageWithSignature("opaque-2")),
+    );
+  });
+});
+
+describe("createLiveCoverageSignature upgrade parity", () => {
+  it("matches legacy text-only assembly to live text plus reasoning_content", () => {
+    const legacyAssembled = {
+      role: "assistant",
+      content: [{ type: "text", text: "answer" }],
+    } as unknown as AgentMessage;
+    const postUpgrade = {
+      role: "assistant",
+      content: [
+        { type: "thinking", thinking: "reasoning", thinkingSignature: "reasoning_content" },
+        { type: "text", text: "answer" },
+      ],
+      provider: "moonshot",
+      api: "openai-completions",
+      model: "kimi-k3",
+    } as unknown as AgentMessage;
+
+    expect(createLiveCoverageSignature(legacyAssembled)).toBe(
+      createLiveCoverageSignature(postUpgrade),
     );
   });
 });

@@ -73,9 +73,53 @@ export function createLosslessMessageSignature(message: AgentMessage): string {
       toolName: part.toolName ?? null,
       toolInput: part.toolInput ?? null,
       toolOutput: part.toolOutput ?? null,
-      metadata: stripModelIdentityFromMetadataJson(part.metadata ?? null),
+      metadata: canonicalizePartMetadataForMessageSignature(part.metadata ?? null),
     })),
   });
+}
+
+/** Keep OpenAI encrypted-reasoning payloads as message identity. */
+function isOpenAiReasoningSignature(signature: string): boolean {
+  if (!signature.startsWith("{")) {
+    return false;
+  }
+  try {
+    const parsed = JSON.parse(signature) as { type?: unknown; id?: unknown };
+    return parsed.type === "reasoning" && typeof parsed.id === "string";
+  } catch {
+    return false;
+  }
+}
+
+/** Remove replay affinity while retaining content-bearing metadata. */
+function canonicalizePartMetadataForMessageSignature(metadata: string | null): string | null {
+  const identityStripped = stripModelIdentityFromMetadataJson(metadata);
+  if (!identityStripped) {
+    return identityStripped;
+  }
+  try {
+    const parsed = JSON.parse(identityStripped) as { raw?: unknown };
+    if (!parsed.raw || typeof parsed.raw !== "object" || Array.isArray(parsed.raw)) {
+      return identityStripped;
+    }
+    const raw = parsed.raw as Record<string, unknown>;
+    const signature = raw.thinkingSignature;
+    // Empty opaque signatures can carry the only replayable payload. Keep
+    // those exact; non-empty thinking text supplies the comparison identity.
+    if (
+      raw.type !== "thinking" ||
+      typeof signature !== "string" ||
+      isOpenAiReasoningSignature(signature) ||
+      (signature !== "reasoning_content" &&
+        (typeof raw.thinking !== "string" || raw.thinking.length === 0))
+    ) {
+      return identityStripped;
+    }
+    const { thinkingSignature: _thinkingSignature, ...canonicalRaw } = raw;
+    return JSON.stringify({ ...parsed, raw: canonicalRaw });
+  } catch {
+    return identityStripped;
+  }
 }
 
 export function hashAgentMessageForAssemblyProtection(message: AgentMessage): string {
@@ -91,7 +135,9 @@ export function createLiveCoverageSignature(message: AgentMessage): string {
   if (
     (stored.role === "user" || stored.role === "system" || stored.role === "assistant") &&
     stored.content.length > 0 &&
-    isCanonicalTextOnlyMessage(message, stored.content)
+    (isCanonicalTextOnlyMessage(message, stored.content) ||
+      (stored.role === "assistant" &&
+        isCanonicalTextWithReasoningContent(message, stored.content)))
   ) {
     return JSON.stringify({
       kind: "canonical-text",
@@ -107,6 +153,51 @@ export function createLiveCoverageSignature(message: AgentMessage): string {
     return canonicalToolTextSignature;
   }
   return createLosslessMessageSignature(message);
+}
+
+/** Match post-upgrade sentinel replay to legacy assembly, which drops that block. */
+function isCanonicalTextWithReasoningContent(
+  message: AgentMessage,
+  fallbackContent: string,
+): boolean {
+  const parts = buildMessageParts({
+    sessionId: "live-coverage-signature",
+    message,
+    fallbackContent,
+  });
+  let removedSentinel = false;
+  const visibleParts = parts.filter((part) => {
+    if (part.partType !== "reasoning") {
+      return true;
+    }
+    if (!part.metadata) {
+      return true;
+    }
+    try {
+      const parsed = JSON.parse(part.metadata) as { raw?: unknown };
+      const raw = parsed.raw as Record<string, unknown> | undefined;
+      const isSentinel =
+        raw?.type === "thinking" && raw.thinkingSignature === "reasoning_content";
+      removedSentinel ||= isSentinel;
+      return !isSentinel;
+    } catch {
+      return true;
+    }
+  });
+  return removedSentinel && hasCanonicalTextPart(visibleParts, fallbackContent);
+}
+
+/** True when the parts contain exactly one plain text representation. */
+function hasCanonicalTextPart(parts: CreateMessagePartInput[], fallbackContent: string): boolean {
+  const part = parts[0];
+  return parts.length === 1 && part !== undefined && (
+    part.partType === "text" &&
+    (part.textContent ?? "") === fallbackContent &&
+    part.toolCallId == null &&
+    part.toolName == null &&
+    part.toolInput == null &&
+    part.toolOutput == null
+  );
 }
 
 export function normalizeToolNameForCoverage(toolName: string | null | undefined): string | null {
@@ -159,18 +250,7 @@ export function isCanonicalTextOnlyMessage(message: AgentMessage, fallbackConten
     message,
     fallbackContent,
   });
-  if (parts.length !== 1) {
-    return false;
-  }
-  const part = parts[0] as CreateMessagePartInput;
-  return (
-    part.partType === "text" &&
-    (part.textContent ?? "") === fallbackContent &&
-    part.toolCallId == null &&
-    part.toolName == null &&
-    part.toolInput == null &&
-    part.toolOutput == null
-  );
+  return hasCanonicalTextPart(parts, fallbackContent);
 }
 
 export function messagesHaveSameLiveCoverageSignature(left: AgentMessage, right: AgentMessage): boolean {
