@@ -5,7 +5,7 @@
  */
 import {
   buildMessageParts,
-  stripModelIdentityFromSerializedPartsSignature,
+  stripModelIdentityFromMetadataJson,
   toStoredMessage,
   type StoredMessage,
 } from "./message-content.js";
@@ -62,22 +62,20 @@ export function createLosslessMessageSignature(message: AgentMessage): string {
   // stamping and live/assembled representations produced after the upgrade
   // must keep comparing equal for replay-prefix detection across the
   // pre/post-upgrade boundary.
-  return stripModelIdentityFromSerializedPartsSignature(
-    JSON.stringify({
-      role: stored.role,
-      content: stored.content,
-      parts: parts.map((part) => ({
-        partType: part.partType,
-        ordinal: part.ordinal,
-        textContent: part.textContent ?? null,
-        toolCallId: part.toolCallId ?? null,
-        toolName: part.toolName ?? null,
-        toolInput: part.toolInput ?? null,
-        toolOutput: part.toolOutput ?? null,
-        metadata: part.metadata ?? null,
-      })),
-    }),
-  );
+  return JSON.stringify({
+    role: stored.role,
+    content: stored.content,
+    parts: parts.map((part) => ({
+      partType: part.partType,
+      ordinal: part.ordinal,
+      textContent: part.textContent ?? null,
+      toolCallId: part.toolCallId ?? null,
+      toolName: part.toolName ?? null,
+      toolInput: part.toolInput ?? null,
+      toolOutput: part.toolOutput ?? null,
+      metadata: stripModelIdentityFromMetadataJson(part.metadata ?? null),
+    })),
+  });
 }
 
 export function hashAgentMessageForAssemblyProtection(message: AgentMessage): string {

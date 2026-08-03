@@ -133,30 +133,6 @@ export function stripModelIdentityFromMetadataJson(
 }
 
 /**
- * Strip model-identity keys from every `"metadata":"..."` value embedded in an
- * already-serialized parts-signature payload, without re-serializing the
- * surrounding content. This preserves byte-exact metadata equality across the
- * pre/post-upgrade boundary inside comparison blobs like
- * createLosslessMessageSignature output.
- */
-export function stripModelIdentityFromSerializedPartsSignature(serialized: string): string {
-  const metadataPattern = /"metadata":"((?:[^"\\]|\\.)*)"/g;
-  return serialized.replace(metadataPattern, (whole, escaped: string) => {
-    let metadata: string;
-    try {
-      metadata = JSON.parse(`"${escaped}"`) as string;
-    } catch {
-      return whole;
-    }
-    const stripped = stripModelIdentityFromMetadataJson(metadata);
-    if (stripped == null || stripped === metadata) {
-      return whole;
-    }
-    return `"metadata":${JSON.stringify(stripped)}`;
-  });
-}
-
-/**
  * Read the assistant model identity carried at message (top) level on an
  * incoming AgentMessage (`provider`/`api`/`model`/`responseModel`). Shared by
  * buildMessageParts (persistence) and normalizeMessageContentForStorage
