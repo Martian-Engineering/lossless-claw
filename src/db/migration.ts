@@ -415,6 +415,21 @@ function ensureMessageTranscriptEntryIdColumn(db: DatabaseSync): void {
   }
 }
 
+/**
+ * Stable event-key deduplication: a stable identity for a message that survives
+ * across representations (e.g., transcript redacted vs. runtime unredacted).
+ * NULL for legacy rows; populated by `extractStableEventKey` at ingest time.
+ * The partial unique index `(conversation_id, stable_event_key) WHERE
+ * stable_event_key IS NOT NULL` enforces idempotency only for non-NULL keys.
+ */
+function ensureMessageStableEventKeyColumn(db: DatabaseSync): void {
+  const messageColumns = db.prepare(`PRAGMA table_info(messages)`).all() as SummaryColumnInfo[];
+  const hasStableEventKey = messageColumns.some((col) => col.name === "stable_event_key");
+  if (!hasStableEventKey) {
+    db.exec(`ALTER TABLE messages ADD COLUMN stable_event_key TEXT`);
+  }
+}
+
 
 // Creates the durable trust boundary used by SQLite transcript migration.
 // Existing message transcript ids remain data, not trusted anchors, until a

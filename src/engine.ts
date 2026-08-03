@@ -91,6 +91,7 @@ import {
   MIN_FALLBACK_MAX_TOKENS,
 } from "./summary-fallback.js";
 import { attachTranscriptEntryMeta, getTranscriptEntryId, resolveTranscriptMessageCreatedAt } from "./transcript.js";
+import { extractStableEventKey } from "./stable-event-key.js";
 import { transcriptImportCap, type TranscriptReconcileResult } from "./reconcile-plan.js";
 import { describeAssembledPrefixChange, formatOverflowDiagnosticsForLog, shouldLogOverflowDiagnostics, type AssemblePrefixSnapshot, type BootstrapImportObservation } from "./assemble-debug.js";
 
