@@ -87,7 +87,7 @@ import { appendForkBoundedLiveSuffixWithinBudget, buildDegradedLiveAssembleResul
 import { resolveBootstrapMaxTokens, trimBootstrapMessagesToBudget } from "./bootstrap-budget.js";
 import { batchLooksLikeHeartbeatAckTurn, pruneHeartbeatOkTurns } from "./heartbeat-filter.js";
 import { appendUncoveredVolatileLiveInputsWithinBudget, isVolatileLiveInputMessage, messageContentCoveredBySummary, resolveProtectedFreshTailAssembledIndexes } from "./live-coverage.js";
-import { buildMessageParts, extractMessageContent, filterPersistableMessages, hasPersistableMessageRole, isOpenClawRuntimeContextLeak, TOOL_CALL_RAW_TYPES, toStoredMessage } from "./message-content.js";
+import { buildMessageParts, extractMessageContent, extractStructuredText, filterPersistableMessages, hasPersistableMessageRole, hasReplayCriticalRawBlock, isOpenClawRuntimeContextLeak, toStoredMessage } from "./message-content.js";
 import { createBootstrapEntryHash, readBootstrapMessageFromJsonLine } from "./message-signatures.js";
 import { canonicalizeOpenClawInboundMetadataIdentityContent } from "./openclaw-inbound-metadata.js";
 import { PROMPT_RECALL_MAX_MESSAGES, PROMPT_RECALL_SEARCH_CANDIDATE_LIMIT, buildPromptRecallProjectionFingerprint, extractPromptRecallIdentifiers, extractPromptRecallSnippet, findPromptRecallIdentifierIndex, isPromptRecallEligibleRole, normalizePromptRecallCoverageText, normalizePromptRecallText, renderPromptRecallMessage } from "./prompt-recall.js";
@@ -247,6 +247,16 @@ function buildLiveToolOutputFileId(params: {
   hash.update("\0");
   hash.update(params.content);
   return `file_${hash.digest("hex").slice(0, 16)}`;
+}
+
+/** Return whether an assistant message contains completed text or replay-critical structure. */
+function hasSubstantiveAssistantContent(message: AgentMessage): boolean {
+  const record = message as unknown as { content?: unknown; tool_calls?: unknown };
+  if (Array.isArray(record.tool_calls) && record.tool_calls.length > 0) {
+    return true;
+  }
+  const text = extractStructuredText(record.content);
+  return Boolean(text?.trim()) || hasReplayCriticalRawBlock(record.content);
 }
 
 
@@ -3546,39 +3556,17 @@ export class LcmContextEngine implements ContextEngine {
     tokenBudget?: number;
     /** Current model identifier from OpenClaw hosts that predate assemble runtimeContext. */
     model?: string;
-    /** Optional user query for relevance-based eviction (BM25-lite). When absent or unsearchable, falls back to chronological eviction. */
+    /**
+     * Incoming user prompt for this turn. Embedded OpenClaw hosts call assemble()
+     * with the pre-prompt history, adopt the returned messages, and submit this
+     * prompt afterward. Lossless also uses searchable prompt text for relevance-
+     * based eviction; absent or unsearchable text falls back to chronology.
+     */
     prompt?: string;
     /** Optional runtime context for override resolution (model, provider, etc.). */
     runtimeContext?: Record<string, unknown>;
   }): Promise<AssembleResult> {
     let liveMessages = params.messages;
-    const hasRenderableMessageContent = (message: AgentMessage): boolean => {
-      const record = message as unknown as { content?: unknown; tool_calls?: unknown };
-      if (Array.isArray(record.tool_calls) && record.tool_calls.length > 0) {
-        return true;
-      }
-      const content = record.content;
-      if (typeof content === "string") {
-        return content.trim().length > 0;
-      }
-      if (Array.isArray(content)) {
-        return content.some((part) => {
-          if (typeof part === "string") {
-            return part.trim().length > 0;
-          }
-          if (part && typeof part === "object") {
-            const type = (part as { type?: unknown }).type;
-            if (typeof type === "string" && TOOL_CALL_RAW_TYPES.has(type)) {
-              return true;
-            }
-            const text = (part as { text?: unknown }).text;
-            return typeof text === "string" && text.trim().length > 0;
-          }
-          return false;
-        });
-      }
-      return false;
-    };
     // Return a new fallback array so the runtime hook treats this as assembled
     // context, and strip assistant prefill tails from fallback-only paths.
     // When the host delivers the current turn separately via `prompt`, the
@@ -3591,7 +3579,7 @@ export class LcmContextEngine implements ContextEngine {
       const msgs = liveMessages.slice();
       while (msgs.length > 0 && msgs[msgs.length - 1]?.role === "assistant") {
         const tail = msgs[msgs.length - 1];
-        if (hostDeliversCurrentTurnSeparately && tail && hasRenderableMessageContent(tail)) {
+        if (hostDeliversCurrentTurnSeparately && tail && hasSubstantiveAssistantContent(tail)) {
           break;
         }
         msgs.pop();

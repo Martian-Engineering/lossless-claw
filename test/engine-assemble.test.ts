@@ -130,6 +130,28 @@ describe("LcmContextEngine.assemble canonical path", () => {
     expect(result.estimatedTokens).toBe(0);
   });
 
+  it("preserves a reasoning-only trailing assistant when the host passes the current turn separately", async () => {
+    const engine = createEngine();
+    const liveMessages: AgentMessage[] = [
+      { role: "user", content: "first turn" },
+      {
+        role: "assistant",
+        content: [{ type: "reasoning", summary: [{ type: "summary_text", text: "checked" }] }],
+      },
+    ] as AgentMessage[];
+
+    const result = await engine.assemble({
+      sessionId: "session-missing-reasoning-tail",
+      messages: liveMessages,
+      tokenBudget: 100,
+      prompt: "second turn",
+    });
+
+    expect(result.messages).not.toBe(liveMessages);
+    expect(result.messages).toStrictEqual(liveMessages);
+    expect(result.estimatedTokens).toBe(0);
+  });
+
   it("still strips an empty-array-content assistant tail when the host passes the current turn separately", async () => {
     const engine = createEngine();
     const liveMessages: AgentMessage[] = [

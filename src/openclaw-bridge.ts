@@ -266,6 +266,10 @@ export type ContextEngine = {
     sessionKey?: string;
     messages: AgentMessage[];
     tokenBudget?: number;
+    /**
+     * Incoming user prompt for this turn. Embedded hosts provide pre-prompt
+     * history in messages, adopt the assembled result, then submit this prompt.
+     */
     prompt?: string;
     /** Current model identifier from OpenClaw hosts that predate assemble runtimeContext. */
     model?: string;
