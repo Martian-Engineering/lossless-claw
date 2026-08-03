@@ -25,6 +25,7 @@ import {
   buildMessageParts,
   isLikelyInjectedDeliveryOnlyTranscript,
   isLikelyInjectedMetadataPreambleRecord,
+  stripModelIdentityFromMetadataJson,
   toStoredMessage,
   type StoredMessage,
 } from "./message-content.js";
@@ -1573,7 +1574,15 @@ export class TranscriptReconciler {
           const rows = rawBlockSignatureStmt.all(messageId) as Array<{ metadata: string | null }>;
           if (
             rows.length === parts.length &&
-            rows.every((row, index) => row.metadata === (parts[index]?.metadata ?? null))
+            rows.every(
+              (row, index) =>
+                // Strip model-identity keys before comparing: pre-upgrade rows
+                // lack them while replayed parts now carry them on ordinal-0.
+                // Raw byte-equality would treat the same turn as new and
+                // ingest it again across the upgrade boundary.
+                stripModelIdentityFromMetadataJson(row.metadata) ===
+                stripModelIdentityFromMetadataJson(parts[index]?.metadata ?? null),
+            )
           ) {
             alreadyPersisted = true;
             break;

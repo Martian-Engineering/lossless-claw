@@ -3,7 +3,10 @@
  *
  * Extracted from engine.ts (Phase 1 of the engine decomposition).
  */
-import { extractStructuredText } from "./message-content.js";
+import {
+  extractStructuredText,
+  stripModelIdentityFromMetadataJson,
+} from "./message-content.js";
 import type { AgentMessage } from "./openclaw-bridge.js";
 import { getTranscriptEntryId, readLeafPathMessages } from "./transcript.js";
 import { asRecord, safeString, toJson } from "./value-utils.js";
@@ -228,8 +231,15 @@ export function externalizedReplayMetadataMatches(
   let persistedParsed: unknown;
   let incomingParsed: unknown;
   try {
-    persistedParsed = persistedMetadata ? JSON.parse(persistedMetadata) : undefined;
-    incomingParsed = incomingMetadata ? JSON.parse(incomingMetadata) : undefined;
+    // Model identity is replay affinity, not message identity: strip it so a
+    // row persisted before identity stamping still matches the post-upgrade
+    // representation of the same logical message (PR #1053).
+    persistedParsed = persistedMetadata
+      ? JSON.parse(stripModelIdentityFromMetadataJson(persistedMetadata) ?? "null")
+      : undefined;
+    incomingParsed = incomingMetadata
+      ? JSON.parse(stripModelIdentityFromMetadataJson(incomingMetadata) ?? "null")
+      : undefined;
   } catch {
     return false;
   }

@@ -82,6 +82,97 @@ export const REPLAY_CRITICAL_RAW_TYPES: ReadonlySet<string> = new Set([
 
 export const RAW_PAYLOAD_EXTERNALIZATION_REASON = "large_raw_message";
 
+/**
+ * Part-metadata keys that persist the assistant message's model identity
+ * (written by buildMessageParts on ordinal-0 parts). Identity is replay-
+ * affinity data, not message identity: any comparison path that treats
+ * metadata as identity (replay detection, live-coverage signatures, dedup)
+ * must strip these keys so rows persisted before identity stamping still
+ * match the post-upgrade representation of the same logical message.
+ */
+export const MODEL_IDENTITY_METADATA_KEYS = [
+  "modelProvider",
+  "modelApi",
+  "modelId",
+  "responseModelId",
+] as const;
+
+/**
+ * Remove model-identity keys from a serialized part-metadata JSON object.
+ *
+ * Returns the input byte-identical when no identity keys are present, so
+ * pre-upgrade rows keep their exact stored serialization. When keys are
+ * present, deleting them restores the pre-identity key order (buildMessageParts
+ * splices identity keys immediately after `originalRole`), so the stripped
+ * form of a post-upgrade serialization is byte-identical to the pre-upgrade
+ * serialization of the same message.
+ */
+export function stripModelIdentityFromMetadataJson(
+  metadata: string | null | undefined,
+): string | null {
+  if (typeof metadata !== "string" || metadata.length === 0) {
+    return metadata == null ? null : metadata;
+  }
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(metadata);
+  } catch {
+    return metadata;
+  }
+  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+    return metadata;
+  }
+  const record = parsed as Record<string, unknown>;
+  if (!MODEL_IDENTITY_METADATA_KEYS.some((key) => key in record)) {
+    return metadata;
+  }
+  for (const key of MODEL_IDENTITY_METADATA_KEYS) {
+    delete record[key];
+  }
+  return JSON.stringify(record);
+}
+
+/**
+ * Read the assistant model identity carried at message (top) level on an
+ * incoming AgentMessage (`provider`/`api`/`model`/`responseModel`). Shared by
+ * buildMessageParts (persistence) and normalizeMessageContentForStorage
+ * (message-level signature-preservation gate).
+ */
+export function extractModelIdentityMetadata(
+  message: AgentMessage,
+):
+  | {
+      modelProvider?: string;
+      modelApi?: string;
+      modelId?: string;
+      responseModelId?: string;
+    }
+  | undefined {
+  const role = typeof message.role === "string" ? message.role : "unknown";
+  if (role !== "assistant") {
+    return undefined;
+  }
+  const topLevel = message as unknown as Record<string, unknown>;
+  const identity = {
+    modelProvider: safeString(topLevel.provider),
+    modelApi: safeString(topLevel.api),
+    modelId: safeString(topLevel.model),
+    responseModelId: safeString(topLevel.responseModel),
+  };
+  // The host's same-model replay check (transformMessages) requires
+  // `provider`, `api`, and `model` to ALL match; `responseModel` is
+  // supplemental and never consulted by that predicate. Treat an identity as
+  // stored only when the three host-required fields are present — a partial
+  // identity (e.g. responseModel alone) would preserve a sentinel signature
+  // that the host later classifies as cross-model and downgrades to response
+  // text, reintroducing the contamination this gate exists to prevent.
+  return identity.modelProvider !== undefined &&
+    identity.modelApi !== undefined &&
+    identity.modelId !== undefined
+    ? identity
+    : undefined;
+}
+
 export function looksLikeJsonPayload(value: string): boolean {
   if (typeof value !== "string") return false;
   const trimmed = value.trim();
@@ -432,7 +523,24 @@ export function normalizeMessageContentForStorage(params: {
     return fallbackContent;
   }
 
-  const blocks = parts.map(blockFromPart);
+  // Resolve the signature-preservation gate at message level: identity is
+  // persisted on ordinal-0 metadata only, but a signature-bearing thinking
+  // block may sit at any ordinal. Using the incoming message's top-level
+  // identity mirrors contentFromParts' message-level decision so blocks at
+  // any ordinal see the same verdict.
+  const messageHasStoredModelIdentity = extractModelIdentityMetadata(message) !== undefined;
+  const blocks = parts
+    .map((part) => blockFromPart(part, messageHasStoredModelIdentity))
+    .filter((block): block is NonNullable<typeof block> => block != null);
+  if (blocks.length === 0) {
+    if (role === "assistant") {
+      return fallbackContent ? [{ type: "text", text: fallbackContent }] : [];
+    }
+    if (role === "toolResult") {
+      return [{ type: "text", text: fallbackContent }];
+    }
+    return fallbackContent;
+  }
   if (role === "user" && blocks.length === 1 && isTextBlock(blocks[0])) {
     return blocks[0].text;
   }
@@ -463,6 +571,12 @@ export function buildMessageParts(params: {
   const topLevelReasoning = extractTopLevelReasoningContent(role, topLevel);
   const rawPayloadExternalized = safeBoolean(topLevel.rawPayloadExternalized);
   const externalizedFileId = safeString(topLevel.externalizedFileId);
+  // Assistant model identity (provider/api/model/responseModel). Persisted in
+  // part metadata so assembly can reconstruct messages that survive the host's
+  // model-bound thinking-replay checks (OpenClaw transformMessages treats a
+  // missing identity as a cross-model switch and downgrades thinking blocks to
+  // plain text, which corrupts reasoning-native models like Kimi K3).
+  const modelIdentityMetadata = extractModelIdentityMetadata(message);
   const externalizedFileIds = Array.isArray(topLevel.externalizedFileIds)
     ? topLevel.externalizedFileIds.filter((fileId): fileId is string => typeof fileId === "string")
     : undefined;
@@ -515,6 +629,7 @@ export function buildMessageParts(params: {
         textContent: message.content,
         metadata: toJson({
           originalRole: role,
+          ...(modelIdentityMetadata ?? {}),
           toolCallId: topLevelToolCallId,
           toolName: topLevelToolName,
           isError: topLevelIsError,
@@ -556,6 +671,7 @@ export function buildMessageParts(params: {
       textContent: null,
       metadata: toJson({
         originalRole: role,
+        ...(modelIdentityMetadata ?? {}),
         rawType: topLevelReasoning.field,
         ...topLevelReasoningMetadata(topLevelReasoning, true),
       }),
@@ -609,6 +725,7 @@ export function buildMessageParts(params: {
             : (safeString(metadataRecord?.tool_output) ?? null),
       metadata: toJson({
         originalRole: role,
+        ...(ordinal === 0 ? (modelIdentityMetadata ?? {}) : {}),
         toolCallId: topLevelToolCallId,
         toolName: topLevelToolName,
         isError: topLevelIsError,
