@@ -130,7 +130,7 @@ describe("LcmContextEngine.assemble canonical path", () => {
     expect(result.estimatedTokens).toBe(0);
   });
 
-  it("preserves a reasoning-only trailing assistant when the host passes the current turn separately", async () => {
+  it("strips a reasoning-only trailing assistant when the host passes the current turn separately", async () => {
     const engine = createEngine();
     const liveMessages: AgentMessage[] = [
       { role: "user", content: "first turn" },
@@ -148,7 +148,30 @@ describe("LcmContextEngine.assemble canonical path", () => {
     });
 
     expect(result.messages).not.toBe(liveMessages);
-    expect(result.messages).toStrictEqual(liveMessages);
+    expect(result.messages).toStrictEqual([{ role: "user", content: "first turn" }]);
+    expect(result.estimatedTokens).toBe(0);
+  });
+
+  it("strips a top-level reasoning-only trailing assistant when the host passes the current turn separately", async () => {
+    const engine = createEngine();
+    const liveMessages: AgentMessage[] = [
+      { role: "user", content: "first turn" },
+      {
+        role: "assistant",
+        content: [],
+        reasoning_content: "private completed reasoning",
+      },
+    ] as AgentMessage[];
+
+    const result = await engine.assemble({
+      sessionId: "session-missing-top-level-reasoning-tail",
+      messages: liveMessages,
+      tokenBudget: 100,
+      prompt: "second turn",
+    });
+
+    expect(result.messages).not.toBe(liveMessages);
+    expect(result.messages).toStrictEqual([{ role: "user", content: "first turn" }]);
     expect(result.estimatedTokens).toBe(0);
   });
 
