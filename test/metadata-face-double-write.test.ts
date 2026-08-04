@@ -5,11 +5,13 @@
 // AgentMessage carries the DECORATED face ("Conversation info (untrusted
 // metadata)" block + body). Their identity_hashes differ, so identity dedup
 // cannot see the pair; the metadata-body match must collapse it. Collapse
-// strength requires BOTH persisted transcript provenance (host-written row)
-// AND that the row was ingested by the CURRENT turn's own reconcile (its
-// message_id above the pre-reconcile floor the engine captures). Any older
-// row, however recent, and any provenance-less row stays weak and duplicates
-// instead of trimming, so an echo of an earlier turn is never eaten.
+// strength exists only on the transcript-covered route and requires the
+// persisted row to be host-proven (transcript provenance), ingested by the
+// CURRENT turn's own reconcile (message_id above the pre-reconcile floor the
+// engine captures), AND the conversation's newest user row — a backfilled
+// historical row imported by the same reconcile never anchors. Any other
+// row, and any provenance-less row, stays weak and duplicates instead of
+// trimming; the degraded and oversized routes never strong-collapse at all.
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { LcmContextEngine } from "../src/engine.js";
 import {
@@ -166,8 +168,8 @@ describe("metadata-face covered-path double-write", () => {
     });
 
     // The persisted row was seeded moments ago, yet the transcript is
-    // unavailable this turn: nothing was ingested by THIS turn's reconcile,
-    // so the row sits below the same-turn floor and the match stays weak. A
+    // unavailable this turn: the degraded route runs without same-turn
+    // ingest proof and never strong-collapses, so the match stays weak. A
     // rapid repeated body (same text within seconds) takes exactly this
     // shape, and the pair duplicates instead of eating the new turn.
     const userRows = (
@@ -343,4 +345,128 @@ describe("metadata-face covered-path double-write", () => {
     expect(userRows.some((m) => m.content === BARE)).toBe(true);
   });
 
+});
+
+describe("covered-frontier same-turn anchor", () => {
+  it("never anchors on a backfilled above-floor row: an older user row imported by the same reconcile stays weak and the batch is kept", async () => {
+    // Catch-up reconcile shape: floor 0 (first reconcile of the
+    // conversation), several host-proven rows imported by the same
+    // reconcile, among them an OLD user row whose body a decorated runtime
+    // face repeats. The insertion watermark alone would call that row
+    // same-turn; the newest-user-row condition refuses it, and its
+    // provenanced sibling never extends strength to the refused neighbor.
+    const engine = quietEngine();
+    const sessionId = "metadata-face-backfill";
+    const sessionKey = "agent:main:metadata-face-backfill";
+    const conversation = await engine
+      .getConversationStore()
+      .getOrCreateConversation(sessionId, { sessionKey });
+
+    const bulk = await engine.getConversationStore().createMessagesBulk([
+      {
+        conversationId: conversation.conversationId,
+        seq: 0,
+        role: "user",
+        content: BARE,
+        tokenCount: 12,
+        transcriptEntryId: "backfill-entry-0001",
+        skipReplayTimestampFloodGuard: true,
+      },
+      {
+        conversationId: conversation.conversationId,
+        seq: 1,
+        role: "user",
+        content: DIFFERENT,
+        tokenCount: 8,
+        transcriptEntryId: "backfill-entry-0002",
+        skipReplayTimestampFloodGuard: true,
+      },
+    ]);
+    await engine
+      .getSummaryStore()
+      .appendContextMessages(conversation.conversationId, bulk.map((m) => m.messageId));
+
+    const result = await engine
+      .getBatchDeduplicator()
+      .alignRuntimeBatchAgainstCoveredFrontier(
+        sessionId,
+        sessionKey,
+        [
+          makeMessage({ role: "user", content: decorated(BARE) }),
+          makeMessage({ role: "user", content: decorated(DIFFERENT) }),
+        ],
+        0,
+      );
+
+    // The BARE-bodied face matched a row that is above the floor but not the
+    // newest user row (a backfill), so nothing in the suffix may trim.
+    expect(result).toHaveLength(2);
+  });
+
+  it("collapses a lone decorated face onto exactly its own same-turn ingest (above floor and the newest user row)", async () => {
+    const engine = quietEngine();
+    const sessionId = "metadata-face-own-ingest";
+    const sessionKey = "agent:main:metadata-face-own-ingest";
+    const conversation = await engine
+      .getConversationStore()
+      .getOrCreateConversation(sessionId, { sessionKey });
+
+    const bulk = await engine.getConversationStore().createMessagesBulk([
+      {
+        conversationId: conversation.conversationId,
+        seq: 0,
+        role: "user",
+        content: BARE,
+        tokenCount: 12,
+        transcriptEntryId: "own-ingest-entry-0001",
+        skipReplayTimestampFloodGuard: true,
+      },
+    ]);
+    await engine
+      .getSummaryStore()
+      .appendContextMessages(conversation.conversationId, bulk.map((m) => m.messageId));
+
+    const result = await engine
+      .getBatchDeduplicator()
+      .alignRuntimeBatchAgainstCoveredFrontier(
+        sessionId,
+        sessionKey,
+        [makeMessage({ role: "user", content: decorated(BARE) })],
+        0,
+      );
+
+    expect(result).toHaveLength(0);
+  });
+
+  it("keeps the pair when no floor is available (lookup failure disables the strong collapse)", async () => {
+    const engine = quietEngine();
+    const sessionId = "metadata-face-no-floor";
+    const sessionKey = "agent:main:metadata-face-no-floor";
+    const conversation = await engine
+      .getConversationStore()
+      .getOrCreateConversation(sessionId, { sessionKey });
+
+    const bulk = await engine.getConversationStore().createMessagesBulk([
+      {
+        conversationId: conversation.conversationId,
+        seq: 0,
+        role: "user",
+        content: BARE,
+        tokenCount: 12,
+        transcriptEntryId: "no-floor-entry-0001",
+        skipReplayTimestampFloodGuard: true,
+      },
+    ]);
+    await engine
+      .getSummaryStore()
+      .appendContextMessages(conversation.conversationId, bulk.map((m) => m.messageId));
+
+    const result = await engine
+      .getBatchDeduplicator()
+      .alignRuntimeBatchAgainstCoveredFrontier(sessionId, sessionKey, [
+        makeMessage({ role: "user", content: decorated(BARE) }),
+      ]);
+
+    expect(result).toHaveLength(1);
+  });
 });
