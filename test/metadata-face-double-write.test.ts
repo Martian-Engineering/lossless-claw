@@ -438,6 +438,97 @@ describe("covered-frontier same-turn anchor", () => {
     expect(result).toHaveLength(0);
   });
 
+  it("captures a true insertion watermark: an out-of-order backfilled row above the logical tail's id never anchors", async () => {
+    // Insertion order deliberately diverges from seq order: the assistant
+    // tail row (seq 1) is inserted FIRST, the user row (seq 0) SECOND, so
+    // the user row carries the higher message_id while the logical tail's
+    // id sits below it. A floor read from the tail row's id would report
+    // this pre-existing user row as above-floor; MAX(message_id) reports it
+    // below, which is the semantics the collapse predicate documents. The
+    // end-to-end shape stays a keep either way (the tail window never pairs
+    // a lone face with a row below the logical tail), so this pins the
+    // watermark contract and the keep direction against future window
+    // changes rather than a live reproduction.
+    const engine = quietEngine();
+    const sessionId = "metadata-face-out-of-order";
+    const sessionKey = "agent:main:metadata-face-out-of-order";
+    const conversation = await engine
+      .getConversationStore()
+      .getOrCreateConversation(sessionId, { sessionKey });
+
+    const assistantRows = await engine.getConversationStore().createMessagesBulk([
+      {
+        conversationId: conversation.conversationId,
+        seq: 1,
+        role: "assistant",
+        content: "previous exact reply",
+        tokenCount: 3,
+        transcriptEntryId: "ooo-entry-0002",
+        skipReplayTimestampFloodGuard: true,
+      },
+    ]);
+    const userRows = await engine.getConversationStore().createMessagesBulk([
+      {
+        conversationId: conversation.conversationId,
+        seq: 0,
+        role: "user",
+        content: BARE,
+        tokenCount: 12,
+        transcriptEntryId: "ooo-entry-0001",
+        skipReplayTimestampFloodGuard: true,
+      },
+    ]);
+    // The divergence this test exists for: the seq-0 user row was inserted
+    // after the seq-1 tail row and carries the higher message_id, so the
+    // logical tail's id under-reports the insertion frontier while
+    // MAX(message_id) captures it.
+    expect(userRows[0]!.messageId).toBeGreaterThan(assistantRows[0]!.messageId);
+    const tailRow = await engine
+      .getConversationStore()
+      .getLastMessage(conversation.conversationId);
+    const watermark = await engine
+      .getConversationStore()
+      .getMaxMessageId(conversation.conversationId);
+    expect(tailRow!.messageId).toBe(assistantRows[0]!.messageId);
+    expect(watermark).toBe(userRows[0]!.messageId);
+    expect(watermark!).toBeGreaterThan(tailRow!.messageId);
+    await engine
+      .getSummaryStore()
+      .appendContextMessages(conversation.conversationId, [
+        userRows[0]!.messageId,
+        assistantRows[0]!.messageId,
+      ]);
+
+    const sessionFile = createSessionFilePath("metadata-face-out-of-order");
+    writeLeafTranscript(sessionFile, [
+      { role: "user", content: BARE },
+      { role: "assistant", content: "previous exact reply" },
+    ]);
+    await engine.getSummaryStore().upsertConversationBootstrapState({
+      conversationId: conversation.conversationId,
+      sessionFilePath: sessionFile,
+      lastSeenSize: 0,
+      lastSeenMtimeMs: 0,
+      lastProcessedOffset: 0,
+      lastProcessedEntryHash: null,
+    });
+
+    await engine.afterTurn({
+      sessionId,
+      sessionKey,
+      sessionFile,
+      messages: [makeMessage({ role: "user", content: decorated(BARE) })],
+      prePromptMessageCount: 0,
+      tokenBudget: 4_096,
+    });
+
+    const stored = await engine.getConversationStore().getMessages(conversation.conversationId);
+    const bareRows = stored.filter((m) => m.role === "user" && m.content.includes(BARE));
+    expect(bareRows).toHaveLength(2);
+    expect(bareRows.some((m) => m.content === BARE)).toBe(true);
+    expect(bareRows.some((m) => m.content !== BARE)).toBe(true);
+  });
+
   it("keeps the pair when no floor is available (lookup failure disables the strong collapse)", async () => {
     const engine = quietEngine();
     const sessionId = "metadata-face-no-floor";
