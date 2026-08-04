@@ -43,10 +43,30 @@ type StoredIncomingMatch =
   | "unproven-externalized"
   | "redacted";
 type CoveredStoredIncomingMatch = StoredIncomingMatch | "decorated";
-type AlignmentMatch = CoveredStoredIncomingMatch | "unanchored-inbound";
+type AlignmentMatch = CoveredStoredIncomingMatch | "unanchored-inbound" | "provenanced-inbound";
+
+/**
+ * True when a persisted row is host-proven (transcript provenance) AND was
+ * inserted during the current afterTurn's own transcript reconcile: its
+ * message_id lies above the conversation's newest message id captured just
+ * before that reconcile ran. Session writes are queue-serialized and
+ * message_id is insertion-ordered, so rows above the floor are exactly this
+ * turn's transcript ingests. Provenance authenticates the persisted row; the
+ * floor ties the incoming decorated face to that very ingest rather than to
+ * any older row, however recent. Either condition missing (including callers
+ * that pass no floor) keeps the match weak: it may support alignment but
+ * never anchors a collapse.
+ */
+function persistedRowIsCurrentTurnIngest(
+  record: Pick<MessageRecord, "transcriptEntryId" | "messageId">,
+  sameTurnIngestFloor: number | undefined,
+): boolean {
+  if (record.transcriptEntryId == null) return false;
+  return sameTurnIngestFloor !== undefined && record.messageId > sameTurnIngestFloor;
+}
 
 function isStrongReplayAnchor(match: AlignmentMatch | undefined): boolean {
-  return match === "exact" || match === "decorated";
+  return match === "exact" || match === "decorated" || match === "provenanced-inbound";
 }
 
 function redactedMatchesHaveAdjacentAnchor(matches: readonly AlignmentMatch[]): boolean {
@@ -244,6 +264,7 @@ export class BatchDeduplicator {
     sessionId: string,
     sessionKey: string | undefined,
     batch: AgentMessage[],
+    sameTurnIngestFloor?: number,
   ): Promise<AgentMessage[]> {
     if (batch.length === 0) return batch;
 
@@ -310,10 +331,19 @@ export class BatchDeduplicator {
               { allowUntimestampedInboundBodyMatch: true },
             )
           ) {
-            // Stored provenance qualifies this as alignment support, but it
-            // authenticates only the persisted row. Another exact/timestamp
-            // anchor must still prove the runtime batch is a replay.
-            matches.push("unanchored-inbound");
+            // Stored provenance authenticates only the persisted row. When
+            // that row was ingested by THIS turn's own reconcile (above the
+            // pre-reconcile floor), the incoming decorated face is the
+            // end-of-turn copy of that very ingest (the store double-write)
+            // and anchors the collapse. Any older row, however recent, stays
+            // weak and needs an independent exact/timestamp anchor, so an
+            // echo or replay of an earlier turn duplicates instead of
+            // trimming.
+            matches.push(
+              persistedRowIsCurrentTurnIngest(tailMessages[i]!, sameTurnIngestFloor)
+                ? "provenanced-inbound"
+                : "unanchored-inbound",
+            );
             continue;
           }
           aligned = false;
@@ -369,6 +399,7 @@ export class BatchDeduplicator {
     sessionId: string,
     sessionKey: string | undefined,
     batch: AgentMessage[],
+    sameTurnIngestFloor?: number,
   ): Promise<AgentMessage[]> {
     if (batch.length === 0) return batch;
 
@@ -391,6 +422,7 @@ export class BatchDeduplicator {
     }
     return this.deduplicateAfterTurnBatch(sessionId, sessionKey, batch, {
       oversizedNoOverlap: "ingest",
+      sameTurnIngestFloor,
     });
   }
 
@@ -418,7 +450,7 @@ export class BatchDeduplicator {
     sessionId: string,
     sessionKey: string | undefined,
     batch: AgentMessage[],
-    options?: { oversizedNoOverlap?: "ingest" | "skip" },
+    options?: { oversizedNoOverlap?: "ingest" | "skip"; sameTurnIngestFloor?: number },
   ): Promise<AgentMessage[]> {
     if (batch.length === 0) return batch;
 
@@ -472,6 +504,18 @@ export class BatchDeduplicator {
           lastDbMessage.content,
           batchAtBoundary.role,
           batchAtBoundary.content,
+          {
+            // Heuristic routes may collapse only against a row this turn's
+            // own reconcile ingested (see persistedRowIsCurrentTurnIngest).
+            allowCollapsedSpaceRunMatch: persistedRowIsCurrentTurnIngest(
+              lastDbMessage,
+              options?.sameTurnIngestFloor,
+            ),
+            allowUntimestampedInboundBodyMatch: persistedRowIsCurrentTurnIngest(
+              lastDbMessage,
+              options?.sameTurnIngestFloor,
+            ),
+          },
         ) &&
           !(await this.messagesDifferOnlyByHostRedaction(
             lastDbMessage,
@@ -488,7 +532,7 @@ export class BatchDeduplicator {
           rawPayloadContents,
           storedMessageCount,
           "prefix-mismatch",
-          { onNoOverlap: "ingest" },
+          { onNoOverlap: "ingest", sameTurnIngestFloor: options?.sameTurnIngestFloor },
         );
       }
     }
@@ -533,6 +577,16 @@ export class BatchDeduplicator {
             storedMessages[i]!.content,
             storedBatch[i]!.role,
             storedBatch[i]!.content,
+            {
+              allowCollapsedSpaceRunMatch: persistedRowIsCurrentTurnIngest(
+                storedMessages[i]!,
+                options?.sameTurnIngestFloor,
+              ),
+              allowUntimestampedInboundBodyMatch: persistedRowIsCurrentTurnIngest(
+                storedMessages[i]!,
+                options?.sameTurnIngestFloor,
+              ),
+            },
           )
         ) {
           return batch;
@@ -563,7 +617,7 @@ export class BatchDeduplicator {
     rawPayloadContents: Array<string | null>,
     storedMessageCount: number,
     lastDbIdentityHash: string,
-    options?: { oversizedNoOverlap?: "ingest" | "skip" },
+    options?: { oversizedNoOverlap?: "ingest" | "skip"; sameTurnIngestFloor?: number },
   ): Promise<AgentMessage[]> {
     const lastBatchHash = batchHashes[batchHashes.length - 1]!;
 
@@ -577,7 +631,7 @@ export class BatchDeduplicator {
       );
       if (tailMessages.length === batch.length && tailHashes.length === batch.length) {
         let tailMatch = true;
-        const matches: CoveredStoredIncomingMatch[] = [];
+        const matches: AlignmentMatch[] = [];
         for (let i = 0; i < batch.length; i++) {
           const match = await this.matchStoredMessageToIncomingOrDecoratedCoverage(
             tailMessages[i]!,
@@ -586,6 +640,7 @@ export class BatchDeduplicator {
             batchHashes[i]!,
             tailHashes[i]!,
             rawPayloadContents[i],
+            options?.sameTurnIngestFloor,
           );
           if (!match || match === "unproven-externalized") {
             tailMatch = false;
@@ -615,7 +670,10 @@ export class BatchDeduplicator {
       rawPayloadContents,
       storedMessageCount,
       "oversized",
-      { onNoOverlap: options?.oversizedNoOverlap ?? "ingest" },
+      {
+        onNoOverlap: options?.oversizedNoOverlap ?? "ingest",
+        sameTurnIngestFloor: options?.sameTurnIngestFloor,
+      },
     );
   }
 
@@ -632,7 +690,7 @@ export class BatchDeduplicator {
     rawPayloadContents: Array<string | null>,
     storedMessageCount: number,
     context: string,
-    options?: { onNoOverlap?: "ingest" | "skip" },
+    options?: { onNoOverlap?: "ingest" | "skip"; sameTurnIngestFloor?: number },
   ): Promise<AgentMessage[]> {
     const allRecentHashes = await this.conversationStore.getRecentMessageIdentityHashes(
       conversationId,
@@ -656,6 +714,7 @@ export class BatchDeduplicator {
         batchHashes[k]!,
         lastStoredHash,
         rawPayloadContents[k],
+        options?.sameTurnIngestFloor,
       );
       if (lastMatch === "unproven-externalized") {
         ambiguousWeakOverlap = true;
@@ -666,7 +725,7 @@ export class BatchDeduplicator {
       const matchLen = Math.min(k + 1, allRecentHashes.length);
       const startDb = allRecentHashes.length - matchLen;
       let suffixMatch = true;
-      const matches: CoveredStoredIncomingMatch[] = [];
+      const matches: AlignmentMatch[] = [];
       for (let j = 0; j < matchLen; j++) {
         const match = await this.matchStoredMessageToIncomingOrDecoratedCoverage(
           allStored[startDb + j]!,
@@ -675,6 +734,7 @@ export class BatchDeduplicator {
           batchHashes[k - matchLen + 1 + j]!,
           allRecentHashes[startDb + j]!,
           rawPayloadContents[k - matchLen + 1 + j],
+          options?.sameTurnIngestFloor,
         );
         if (match === "unproven-externalized") {
           ambiguousWeakOverlap = true;
@@ -742,7 +802,8 @@ export class BatchDeduplicator {
     incomingHash: string,
     storedHash: string,
     incomingRawPayloadContent?: string | null,
-  ): Promise<CoveredStoredIncomingMatch | null> {
+    sameTurnIngestFloor?: number,
+  ): Promise<CoveredStoredIncomingMatch | "provenanced-inbound" | null> {
     const match = await this.matchStoredMessageToIncoming(
       storedMessage,
       incoming,
@@ -760,9 +821,32 @@ export class BatchDeduplicator {
         storedMessage.content,
         incoming.role,
         incoming.content,
+        {
+          allowCollapsedSpaceRunMatch: persistedRowIsCurrentTurnIngest(
+            storedMessage,
+            sameTurnIngestFloor,
+          ),
+        },
       )
     ) {
       return "decorated";
+    }
+    // Body equality after metadata stripping: collapse strength requires the
+    // persisted row's transcript provenance AND that this turn's own
+    // reconcile inserted it (above the pre-reconcile floor). The match alone
+    // never anchors: metadata blocks are user-forgeable, and any older proven
+    // row may face an echo of an earlier turn.
+    if (
+      persistedRowIsCurrentTurnIngest(storedMessage, sameTurnIngestFloor) &&
+      this.runtimeRowCoversPersistedFrontierRow(
+        storedMessage.role,
+        storedMessage.content,
+        incoming.role,
+        incoming.content,
+        { allowUntimestampedInboundBodyMatch: true },
+      )
+    ) {
+      return "provenanced-inbound";
     }
     return null;
   }

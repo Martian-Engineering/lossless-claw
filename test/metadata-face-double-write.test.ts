@@ -4,11 +4,12 @@
 // persists the BARE body (with a transcript_entry_id), while the runtime
 // AgentMessage carries the DECORATED face ("Conversation info (untrusted
 // metadata)" block + body). Their identity_hashes differ, so identity dedup
-// cannot see the pair; the metadata-body match must collapse it. Anchoring
-// The covered-frontier path requires both persisted transcript provenance and
-// an independent exact/timestamp replay anchor. Heuristic degraded and
-// oversized routes cannot prove that an incoming face belongs to that row, so
-// they preserve both faces (duplicates over deletion).
+// cannot see the pair; the metadata-body match must collapse it. Collapse
+// strength requires BOTH persisted transcript provenance (host-written row)
+// AND that the row was ingested by the CURRENT turn's own reconcile (its
+// message_id above the pre-reconcile floor the engine captures). Any older
+// row, however recent, and any provenance-less row stays weak and duplicates
+// instead of trimming, so an echo of an earlier turn is never eaten.
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { LcmContextEngine } from "../src/engine.js";
 import {
@@ -121,7 +122,7 @@ describe("metadata-face covered-path double-write", () => {
     ).toBe(true);
   });
 
-  it("keeps the decorated turn on the degraded route even when the persisted row is transcript-proven", async () => {
+  it("keeps the pair on the degraded route even for a transcript-proven row created moments ago (not this turn's ingest; covers the rapid repeated-body case)", async () => {
     const engine = quietEngine();
     const sessionId = "metadata-face-degraded-double-write";
     const sessionKey = "agent:main:metadata-face-degraded-double-write";
@@ -164,6 +165,11 @@ describe("metadata-face covered-path double-write", () => {
       tokenBudget: 4_096,
     });
 
+    // The persisted row was seeded moments ago, yet the transcript is
+    // unavailable this turn: nothing was ingested by THIS turn's reconcile,
+    // so the row sits below the same-turn floor and the match stays weak. A
+    // rapid repeated body (same text within seconds) takes exactly this
+    // shape, and the pair duplicates instead of eating the new turn.
     const userRows = (
       await engine.getConversationStore().getMessages(conversation.conversationId)
     ).filter((m) => m.role === "user" && m.content.includes(BARE));
@@ -172,7 +178,7 @@ describe("metadata-face covered-path double-write", () => {
     expect(userRows.some((m) => m.content !== BARE)).toBe(true);
   });
 
-  it("keeps the decorated turn on the oversized-suffix route even when the persisted row is transcript-proven", async () => {
+  it("keeps the pair on the oversized-suffix route even for a transcript-proven row created moments ago (not this turn's ingest)", async () => {
     const engine = quietEngine();
     const sessionId = "metadata-face-oversized-double-write";
     const sessionKey = "agent:main:metadata-face-oversized-double-write";
@@ -336,4 +342,5 @@ describe("metadata-face covered-path double-write", () => {
     expect(userRows).toHaveLength(2);
     expect(userRows.some((m) => m.content === BARE)).toBe(true);
   });
+
 });
