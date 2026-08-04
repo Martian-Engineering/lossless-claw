@@ -86,7 +86,7 @@ import { describeAssembledPrefixChange, formatOverflowDiagnosticsForLog, shouldL
 import { appendForkBoundedLiveSuffixWithinBudget, buildDegradedLiveAssembleResult, buildForkBoundedLiveFallback, clampMessagesToSerializedBudget, forkBoundedLiveSuffixAppendLogLevel, resolveDeferredAssemblyPressure } from "./assemble-fallback.js";
 import { resolveBootstrapMaxTokens, trimBootstrapMessagesToBudget } from "./bootstrap-budget.js";
 import { batchLooksLikeHeartbeatAckTurn, pruneHeartbeatOkTurns } from "./heartbeat-filter.js";
-import { appendUncoveredVolatileLiveInputsWithinBudget, isVolatileLiveInputMessage, messageContentCoveredBySummary, resolveProtectedFreshTailAssembledIndexes } from "./live-coverage.js";
+import { appendUncoveredVolatileLiveInputsWithinBudget, isVolatileLiveInputMessage, messageContentCoveredBySummary, resolveProtectedFreshTailAssembledIndexes, stripTrailingAssistantPrefill } from "./live-coverage.js";
 import { buildMessageParts, extractMessageContent, filterPersistableMessages, hasPersistableMessageRole, isOpenClawRuntimeContextLeak, toStoredMessage } from "./message-content.js";
 import { createBootstrapEntryHash, readBootstrapMessageFromJsonLine } from "./message-signatures.js";
 import { canonicalizeOpenClawInboundMetadataIdentityContent } from "./openclaw-inbound-metadata.js";
@@ -3544,21 +3544,36 @@ export class LcmContextEngine implements ContextEngine {
     sessionKey?: string;
     messages: AgentMessage[];
     tokenBudget?: number;
+    /** Tool names supplied by embedded OpenClaw hosts for the current run. */
+    availableTools?: Set<string>;
     /** Current model identifier from OpenClaw hosts that predate assemble runtimeContext. */
     model?: string;
-    /** Optional user query for relevance-based eviction (BM25-lite). When absent or unsearchable, falls back to chronological eviction. */
+    /**
+     * Incoming user prompt for this turn. Embedded OpenClaw hosts call assemble()
+     * with the pre-prompt history, adopt the returned messages, and submit this
+     * prompt afterward. Lossless also uses searchable prompt text for relevance-
+     * based eviction; absent or unsearchable text falls back to chronology.
+     */
     prompt?: string;
     /** Optional runtime context for override resolution (model, provider, etc.). */
     runtimeContext?: Record<string, unknown>;
   }): Promise<AssembleResult> {
     let liveMessages = params.messages;
     // Return a new fallback array so the runtime hook treats this as assembled
-    // context, and remove assistant prefill tails from fallback-only paths.
+    // context, and strip assistant prefill tails from fallback-only paths.
+    // When the host delivers the current turn separately via `prompt`, the
+    // framework appends the current user turn after this array, so a trailing
+    // assistant with real content is the completed previous reply, not a
+    // prefill seed. OpenClaw 2026.5.28+ also supplies `availableTools` on this
+    // embedded-host path (including an empty Set); require that host signal so
+    // legacy callers using `prompt` only as a retrieval query keep historical
+    // assistant-prefill stripping. Blank tails are stripped on every host.
+    const hostDeliversCurrentTurnSeparately =
+      params.prompt !== undefined && params.availableTools instanceof Set;
     const safeFallback = (): AssembleResult => {
-      const msgs = liveMessages.slice();
-      while (msgs.length > 0 && msgs[msgs.length - 1]?.role === "assistant") {
-        msgs.pop();
-      }
+      const msgs = stripTrailingAssistantPrefill(liveMessages, {
+        preserveSubstantiveAssistantTail: hostDeliversCurrentTurnSeparately,
+      });
       return { messages: msgs, estimatedTokens: 0 };
     };
 
@@ -3691,6 +3706,7 @@ export class LcmContextEngine implements ContextEngine {
         const clamp = clampMessagesToSerializedBudget({
           messages: fallback.messages,
           tokenBudget,
+          preserveSubstantiveAssistantTail: hostDeliversCurrentTurnSeparately,
         });
         if (clamp.clamped || clamp.overBudget) {
           this.deps.log.warn(
@@ -3782,6 +3798,7 @@ export class LcmContextEngine implements ContextEngine {
         const degraded = buildDegradedLiveAssembleResult({
           liveMessages,
           tokenBudget,
+          preserveSubstantiveAssistantTail: hostDeliversCurrentTurnSeparately,
         });
         this.deps.log.warn(
           `[lcm] assemble: degraded live fallback conversation=${conversation.conversationId} ${sessionLabel} reason=${deferredAssemblyDegradation.reason} storedContextTokens=${deferredAssemblyDegradation.pressure.storedContextTokens} projectedTokenCount=${deferredAssemblyDegradation.pressure.projectedTokenCount ?? "null"} tokenBudget=${tokenBudget} pressureThreshold=${Math.floor(tokenBudget * DEFERRED_ASSEMBLY_DEGRADED_PRESSURE_RATIO)} outputMessages=${degraded.messages.length} estimatedTokens=${degraded.estimatedTokens}`,
@@ -3802,6 +3819,7 @@ export class LcmContextEngine implements ContextEngine {
             forkSourceMessageCount,
             tokenBudget,
             bootstrapMaxTokens: resolveBootstrapMaxTokens(this.config),
+            preserveSubstantiveAssistantTail: hostDeliversCurrentTurnSeparately,
           });
           this.deps.log.debug(
             `[lcm] assemble: no context items for fork-bounded bootstrap; using bounded live suffix conversation=${conversation.conversationId} ${sessionLabel} outputMessages=${boundedFallback.messages.length} duration=${formatDurationMs(Date.now() - startedAt)}`,
@@ -3858,6 +3876,7 @@ export class LcmContextEngine implements ContextEngine {
             liveMessages,
             forkSourceMessageCount,
             tokenBudget,
+            preserveSubstantiveAssistantTail: hostDeliversCurrentTurnSeparately,
           })
         : null;
       const preRecallMessages = forkLiveSuffixAppend?.messages ?? assembled.messages;
@@ -3881,6 +3900,7 @@ export class LcmContextEngine implements ContextEngine {
             forkSourceMessageCount,
             tokenBudget,
             bootstrapMaxTokens: resolveBootstrapMaxTokens(this.config),
+            preserveSubstantiveAssistantTail: hostDeliversCurrentTurnSeparately,
           });
           this.deps.log.debug(
             `[lcm] assemble: empty assembled output for fork-bounded bootstrap; using bounded live suffix conversation=${conversation.conversationId} ${sessionLabel} outputMessages=${boundedFallback.messages.length} tokenBudget=${tokenBudget} duration=${formatDurationMs(Date.now() - startedAt)}`,
@@ -3906,6 +3926,7 @@ export class LcmContextEngine implements ContextEngine {
             forkSourceMessageCount,
             tokenBudget,
             bootstrapMaxTokens: resolveBootstrapMaxTokens(this.config),
+            preserveSubstantiveAssistantTail: hostDeliversCurrentTurnSeparately,
           });
           this.deps.log.debug(
             `[lcm] assemble: fork-bounded context has no user turns; using bounded live suffix conversation=${conversation.conversationId} ${sessionLabel} outputMessages=${boundedFallback.messages.length} duration=${formatDurationMs(Date.now() - startedAt)}`,
@@ -4016,6 +4037,7 @@ export class LcmContextEngine implements ContextEngine {
       let serializedClamp = clampMessagesToSerializedBudget({
         messages: volatileLiveInputAppend.messages,
         tokenBudget,
+        preserveSubstantiveAssistantTail: hostDeliversCurrentTurnSeparately,
       });
       if (serializedClamp.clamped && budgetedPromptRecallCue) {
         // The recall cue is optional enrichment: drop it before evicting any
@@ -4028,6 +4050,7 @@ export class LcmContextEngine implements ContextEngine {
           serializedClamp = clampMessagesToSerializedBudget({
             messages: withoutCue,
             tokenBudget,
+            preserveSubstantiveAssistantTail: hostDeliversCurrentTurnSeparately,
           });
           budgetedPromptRecallCue = null;
         }
@@ -4129,6 +4152,7 @@ export class LcmContextEngine implements ContextEngine {
       const clamp = clampMessagesToSerializedBudget({
         messages: fallback.messages,
         tokenBudget: fallbackBudget,
+        preserveSubstantiveAssistantTail: hostDeliversCurrentTurnSeparately,
       });
       if (clamp.clamped || clamp.overBudget) {
         this.deps.log.warn(

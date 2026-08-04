@@ -36,6 +36,210 @@ describe("LcmContextEngine.assemble canonical path", () => {
     expect(result.contextProjection).toBeUndefined();
   });
 
+  it("preserves a completed trailing assistant reply when the host passes the current turn separately", async () => {
+    // Embedded hosts pass the full prior history in `messages` and deliver the
+    // current user turn via `prompt`; the framework appends the current turn
+    // after the returned array. A trailing assistant here is the completed
+    // previous reply, not a prefill seed — stripping it makes every degraded
+    // call answer one turn behind.
+    const engine = createEngine();
+    const liveMessages: AgentMessage[] = [
+      { role: "user", content: "first turn" },
+      { role: "assistant", content: "first reply" },
+    ] as AgentMessage[];
+
+    const result = await engine.assemble({
+      sessionId: "session-missing-prompt-separate",
+      messages: liveMessages,
+      tokenBudget: 100,
+      availableTools: new Set(),
+      prompt: "second turn",
+    });
+
+    expect(result.messages).not.toBe(liveMessages);
+    expect(result.messages).toStrictEqual(liveMessages);
+    expect(result.estimatedTokens).toBe(0);
+  });
+
+  it("preserves a completed trailing reply when a separate prompt repeats the previous user turn", async () => {
+    const engine = createEngine();
+    const liveMessages: AgentMessage[] = [
+      { role: "user", content: "repeat this request" },
+      { role: "assistant", content: "completed previous reply" },
+    ] as AgentMessage[];
+
+    const result = await engine.assemble({
+      sessionId: "session-missing-repeated-separate-prompt",
+      messages: liveMessages,
+      tokenBudget: 100,
+      availableTools: new Set(),
+      prompt: "repeat this request",
+    });
+
+    expect(result.messages).not.toBe(liveMessages);
+    expect(result.messages).toStrictEqual(liveMessages);
+    expect(result.estimatedTokens).toBe(0);
+  });
+
+  it("strips a nonblank assistant prefill for legacy prompt callers without the host signal", async () => {
+    const engine = createEngine();
+    const liveMessages: AgentMessage[] = [
+      { role: "user", content: "current turn" },
+      { role: "assistant", content: "prefill seed" },
+    ] as AgentMessage[];
+
+    const result = await engine.assemble({
+      sessionId: "session-missing-embedded-prompt-prefill",
+      messages: liveMessages,
+      tokenBudget: 100,
+      prompt: "current turn",
+    });
+
+    expect(result.messages).not.toBe(liveMessages);
+    expect(result.messages).toStrictEqual([{ role: "user", content: "current turn" }]);
+    expect(result.estimatedTokens).toBe(0);
+  });
+
+  it("still strips blank assistant prefill seeds when the host passes the current turn separately", async () => {
+    const engine = createEngine();
+    const liveMessages: AgentMessage[] = [
+      { role: "user", content: "first turn" },
+      { role: "assistant", content: "   " },
+    ] as AgentMessage[];
+
+    const result = await engine.assemble({
+      sessionId: "session-missing-blank-prefill",
+      messages: liveMessages,
+      tokenBudget: 100,
+      availableTools: new Set(),
+      prompt: "second turn",
+    });
+
+    expect(result.messages).not.toBe(liveMessages);
+    expect(result.messages).toStrictEqual([{ role: "user", content: "first turn" }]);
+    expect(result.estimatedTokens).toBe(0);
+  });
+
+  it("preserves a tool-call-only trailing assistant when the host passes the current turn separately", async () => {
+    // An assistant turn that ended in tool calls carries no renderable text,
+    // but it is still substantive completed content — the host repairs
+    // tool-use/result pairing on the adopted array, so popping it here loses
+    // the call record for nothing.
+    const engine = createEngine();
+    const liveMessages: AgentMessage[] = [
+      { role: "user", content: "first turn" },
+      {
+        role: "assistant",
+        content: [{ type: "toolCall", id: "call_123", name: "read", input: { path: "notes.txt" } }],
+      },
+    ] as AgentMessage[];
+
+    const result = await engine.assemble({
+      sessionId: "session-missing-toolcall-tail",
+      messages: liveMessages,
+      tokenBudget: 100,
+      availableTools: new Set(),
+      prompt: "second turn",
+    });
+
+    expect(result.messages).not.toBe(liveMessages);
+    expect(result.messages).toStrictEqual(liveMessages);
+    expect(result.estimatedTokens).toBe(0);
+  });
+
+  it("preserves a mixed text-and-tool-call trailing assistant when the host passes the current turn separately", async () => {
+    const engine = createEngine();
+    const liveMessages: AgentMessage[] = [
+      { role: "user", content: "first turn" },
+      {
+        role: "assistant",
+        content: [
+          { type: "text", text: "checking the file" },
+          { type: "toolCall", id: "call_456", name: "bash", input: { command: "ls" } },
+        ],
+      },
+    ] as AgentMessage[];
+
+    const result = await engine.assemble({
+      sessionId: "session-missing-mixed-tail",
+      messages: liveMessages,
+      tokenBudget: 100,
+      availableTools: new Set(),
+      prompt: "second turn",
+    });
+
+    expect(result.messages).not.toBe(liveMessages);
+    expect(result.messages).toStrictEqual(liveMessages);
+    expect(result.estimatedTokens).toBe(0);
+  });
+
+  it("strips a reasoning-only trailing assistant when the host passes the current turn separately", async () => {
+    const engine = createEngine();
+    const liveMessages: AgentMessage[] = [
+      { role: "user", content: "first turn" },
+      {
+        role: "assistant",
+        content: [{ type: "reasoning", summary: [{ type: "summary_text", text: "checked" }] }],
+      },
+    ] as AgentMessage[];
+
+    const result = await engine.assemble({
+      sessionId: "session-missing-reasoning-tail",
+      messages: liveMessages,
+      tokenBudget: 100,
+      availableTools: new Set(),
+      prompt: "second turn",
+    });
+
+    expect(result.messages).not.toBe(liveMessages);
+    expect(result.messages).toStrictEqual([{ role: "user", content: "first turn" }]);
+    expect(result.estimatedTokens).toBe(0);
+  });
+
+  it("strips a top-level reasoning-only trailing assistant when the host passes the current turn separately", async () => {
+    const engine = createEngine();
+    const liveMessages: AgentMessage[] = [
+      { role: "user", content: "first turn" },
+      {
+        role: "assistant",
+        content: [],
+        reasoning_content: "private completed reasoning",
+      },
+    ] as AgentMessage[];
+
+    const result = await engine.assemble({
+      sessionId: "session-missing-top-level-reasoning-tail",
+      messages: liveMessages,
+      tokenBudget: 100,
+      availableTools: new Set(),
+      prompt: "second turn",
+    });
+
+    expect(result.messages).not.toBe(liveMessages);
+    expect(result.messages).toStrictEqual([{ role: "user", content: "first turn" }]);
+    expect(result.estimatedTokens).toBe(0);
+  });
+
+  it("still strips an empty-array-content assistant tail when the host passes the current turn separately", async () => {
+    const engine = createEngine();
+    const liveMessages: AgentMessage[] = [
+      { role: "user", content: "first turn" },
+      { role: "assistant", content: [] },
+    ] as AgentMessage[];
+
+    const result = await engine.assemble({
+      sessionId: "session-missing-empty-array-tail",
+      messages: liveMessages,
+      tokenBudget: 100,
+      availableTools: new Set(),
+      prompt: "second turn",
+    });
+
+    expect(result.messages).not.toBe(liveMessages);
+    expect(result.messages).toStrictEqual([{ role: "user", content: "first turn" }]);
+    expect(result.estimatedTokens).toBe(0);
+  });
+
   it("falls back when DB context clearly trails live context", async () => {
     const engine = createEngine();
     const sessionId = "session-incomplete";

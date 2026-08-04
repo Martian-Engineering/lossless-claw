@@ -266,6 +266,13 @@ export type ContextEngine = {
     sessionKey?: string;
     messages: AgentMessage[];
     tokenBudget?: number;
+    /** Tool names supplied by embedded OpenClaw hosts for the current run. */
+    availableTools?: Set<string>;
+    /**
+     * Incoming user prompt for this turn. Embedded hosts provide pre-prompt
+     * history in messages plus availableTools, adopt the assembled result, then
+     * submit this prompt. Legacy direct callers may use prompt only for retrieval.
+     */
     prompt?: string;
     /** Current model identifier from OpenClaw hosts that predate assemble runtimeContext. */
     model?: string;

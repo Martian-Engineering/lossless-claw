@@ -6,6 +6,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { SessionManager } from "@earendil-works/pi-coding-agent";
 import { ContextAssembler } from "../src/assembler.js";
+import { clampMessagesToSerializedBudget } from "../src/assemble-fallback.js";
 import type { LcmConfig } from "../src/db/config.js";
 import { closeLcmConnection, createLcmDatabaseConnection } from "../src/db/connection.js";
 import { getLcmDbFeatures } from "../src/db/features.js";
@@ -38,6 +39,28 @@ import {
 
 afterEach(cleanupEngineTestState);
 describe("LcmContextEngine maintain and assemble budget", () => {
+  it("serialized clamp does not restore rejected prompt-separate assistant tails", () => {
+    const rejectedTails = [
+      { role: "assistant", content: "   " },
+      {
+        role: "assistant",
+        content: [{ type: "reasoning", summary: [{ type: "summary_text", text: "checked" }] }],
+      },
+    ] as AgentMessage[];
+
+    for (const tail of rejectedTails) {
+      const clamped = clampMessagesToSerializedBudget({
+        messages: [tail],
+        tokenBudget: 1,
+        preserveSubstantiveAssistantTail: true,
+      });
+
+      expect(clamped.clamped).toBe(true);
+      expect(clamped.messages).toStrictEqual([]);
+      expect(clamped.serializedTokens).toBe(0);
+    }
+  });
+
   it("assemble falls back to live messages on ambiguous runtime rollover while the old transcript still exists", async () => {
     const warnLog = vi.fn();
     const debugLog = vi.fn();
@@ -1275,6 +1298,54 @@ describe("LcmContextEngine maintain and assemble budget", () => {
     expect(log.warn).toHaveBeenCalledWith(
       expect.stringContaining("[lcm] assemble: degraded live fallback"),
     );
+    expect(log.warn).toHaveBeenCalledWith(expect.stringContaining("reason=near-budget"));
+  });
+
+  it("assemble() preserves a completed assistant tail in degraded prompt-separate fallback", async () => {
+    const log = {
+      info: vi.fn(),
+      warn: vi.fn(),
+      error: vi.fn(),
+      debug: vi.fn(),
+    };
+    const engine = createEngineWithDepsOverrides({ log });
+    const sessionId = "assemble-threshold-debt-prompt-separate-assistant-tail";
+    const conversation = await engine.getConversationStore().getOrCreateConversation(sessionId, {
+      sessionKey: undefined,
+    });
+    const [storedMessage] = await engine.getConversationStore().createMessagesBulk([
+      {
+        conversationId: conversation.conversationId,
+        seq: 0,
+        role: "user",
+        content: "stored context should be skipped while maintenance is pending",
+        tokenCount: 80,
+      },
+    ]);
+    await engine
+      .getSummaryStore()
+      .appendContextMessages(conversation.conversationId, [storedMessage.messageId]);
+    await engine.getCompactionMaintenanceStore().requestProactiveCompactionDebt({
+      conversationId: conversation.conversationId,
+      reason: "threshold",
+      tokenBudget: 100,
+      currentTokenCount: 90,
+    });
+
+    const liveMessages = [
+      makeMessage({ role: "user", content: "previous delivery turn" }),
+      makeMessage({ role: "assistant", content: "completed previous reply" }),
+    ];
+    const assembleResult = await engine.assemble({
+      sessionId,
+      messages: liveMessages,
+      availableTools: new Set(),
+      prompt: "current delivery turn",
+      tokenBudget: 100,
+    });
+
+    expect(assembleResult.messages).toStrictEqual(liveMessages);
+    expect(assembleResult).toHaveProperty("promptAuthority", "preassembly_may_overflow");
     expect(log.warn).toHaveBeenCalledWith(expect.stringContaining("reason=near-budget"));
   });
 

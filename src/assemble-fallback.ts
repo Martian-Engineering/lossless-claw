@@ -20,13 +20,17 @@ import { estimateAgentMessageTokens, normalizeNonNegativeInteger, toRuntimeRoleF
  * *sent to the model*, so it must count structured tool payloads that the
  * stored-content estimate omits.
  */
-export function trimMessagesToBudget(messages: AgentMessage[], tokenBudget: number): AgentMessage[] {
+export function trimMessagesToBudget(
+  messages: AgentMessage[],
+  tokenBudget: number,
+  options: { preserveSubstantiveAssistantTail?: boolean } = {},
+): AgentMessage[] {
   const safeMaxTokens = Number.isFinite(tokenBudget) ? Math.max(0, Math.floor(tokenBudget)) : 0;
   if (messages.length === 0) {
     return [];
   }
   if (safeMaxTokens <= 0) {
-    return stripTrailingAssistantPrefill([messages[messages.length - 1]!]);
+    return stripTrailingAssistantPrefill([messages[messages.length - 1]!], options);
   }
   const kept: AgentMessage[] = [];
   let totalTokens = 0;
@@ -45,7 +49,7 @@ export function trimMessagesToBudget(messages: AgentMessage[], tokenBudget: numb
     return [];
   }
   kept.reverse();
-  return stripTrailingAssistantPrefill(kept);
+  return stripTrailingAssistantPrefill(kept, options);
 }
 
 /**
@@ -69,6 +73,7 @@ export const SERIALIZED_OUTPUT_CLAMP_SAFETY_RATIO = 0.9;
 export function clampMessagesToSerializedBudget(params: {
   messages: AgentMessage[];
   tokenBudget: number;
+  preserveSubstantiveAssistantTail?: boolean;
 }): {
   messages: AgentMessage[];
   serializedTokens: number;
@@ -131,11 +136,17 @@ export function clampMessagesToSerializedBudget(params: {
     }
   }
 
-  // If stripping the assistant tail would empty the result (a transcript
-  // with no user turns at all), keep the unstripped suffix instead; the
-  // estimate must describe whichever set is actually returned.
-  const stripped = stripTrailingAssistantPrefill(kept);
-  const finalMessages = stripped.length > 0 ? stripped : kept;
+  // Historically an assistant-only suffix was retained when stripping would
+  // empty the result. Prompt-separate hosts must still return an empty array
+  // for blank or reasoning-only tails: restoring those tails would reintroduce
+  // invalid assistant prefill content after the preservation policy rejected it.
+  const stripped = stripTrailingAssistantPrefill(kept, {
+    preserveSubstantiveAssistantTail: params.preserveSubstantiveAssistantTail,
+  });
+  const finalMessages =
+    stripped.length > 0 || params.preserveSubstantiveAssistantTail === true
+      ? stripped
+      : kept;
   const serializedTokens =
     finalMessages.length === kept.length
       ? keptTokens
@@ -158,8 +169,15 @@ export function isProtectedLeadingLiveContextMessage(message: AgentMessage): boo
 export function buildDegradedLiveAssembleResult(params: {
   liveMessages: AgentMessage[];
   tokenBudget: number;
+  preserveSubstantiveAssistantTail?: boolean;
 }): AssembleResult {
-  const withoutAssistantPrefill = stripTrailingAssistantPrefill(params.liveMessages.slice());
+  const prefillOptions = {
+    preserveSubstantiveAssistantTail: params.preserveSubstantiveAssistantTail,
+  };
+  const withoutAssistantPrefill = stripTrailingAssistantPrefill(
+    params.liveMessages,
+    prefillOptions,
+  );
   const protectedPrefix: AgentMessage[] = [];
   while (
     protectedPrefix.length < withoutAssistantPrefill.length &&
@@ -172,7 +190,7 @@ export function buildDegradedLiveAssembleResult(params: {
     0,
     Math.floor(params.tokenBudget) - estimateAgentMessageTokens(protectedPrefix),
   );
-  let liveTailMessages = trimMessagesToBudget(liveTail, remainingBudget);
+  let liveTailMessages = trimMessagesToBudget(liveTail, remainingBudget, prefillOptions);
   if (liveTailMessages.length === 0 && liveTail.length > 0) {
     liveTailMessages = [liveTail[liveTail.length - 1]!];
   }
@@ -214,6 +232,7 @@ export function buildForkBoundedLiveFallback(params: {
   forkSourceMessageCount: number;
   tokenBudget: number;
   bootstrapMaxTokens: number;
+  preserveSubstantiveAssistantTail?: boolean;
 }): AssembleResult {
   const suffix = resolveForkBoundedLiveSuffix({
     assembledMessages: [],
@@ -224,6 +243,7 @@ export function buildForkBoundedLiveFallback(params: {
   const boundedMessages = trimMessagesToBudget(
     candidateMessages,
     Math.min(params.tokenBudget, params.bootstrapMaxTokens),
+    { preserveSubstantiveAssistantTail: params.preserveSubstantiveAssistantTail },
   );
   return {
     messages: boundedMessages,
@@ -245,6 +265,7 @@ export function appendForkBoundedLiveSuffixWithinBudget(params: {
   liveMessages: AgentMessage[];
   forkSourceMessageCount: number;
   tokenBudget: number;
+  preserveSubstantiveAssistantTail?: boolean;
 }): {
   messages: AgentMessage[];
   estimatedTokens: number;
@@ -261,6 +282,7 @@ export function appendForkBoundedLiveSuffixWithinBudget(params: {
       liveMessages: params.liveMessages,
       forkSourceMessageCount: params.forkSourceMessageCount,
     }),
+    { preserveSubstantiveAssistantTail: params.preserveSubstantiveAssistantTail },
   );
   if (suffix.length === 0) {
     return {

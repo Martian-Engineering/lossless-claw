@@ -173,6 +173,16 @@ export function extractModelIdentityMetadata(
     : undefined;
 }
 
+/** Return whether an assistant message contains visible text or replayable tool-call structure. */
+export function hasSubstantiveAssistantContent(message: AgentMessage): boolean {
+  const record = message as unknown as Record<string, unknown>;
+  if (Array.isArray(record.tool_calls) && record.tool_calls.length > 0) {
+    return true;
+  }
+  const text = extractStructuredText(record.content);
+  return Boolean(text?.trim()) || hasToolCallRawBlock(record.content);
+}
+
 export function looksLikeJsonPayload(value: string): boolean {
   if (typeof value !== "string") return false;
   const trimmed = value.trim();
@@ -284,33 +294,42 @@ export function extractReasoningText(record: Record<string, unknown>): string | 
   return normalized.length > 0 ? normalized.join("\n") : undefined;
 }
 
-/** Return true when a raw block should remain structurally replayable. */
-export function hasReplayCriticalRawBlock(value: unknown): boolean {
+function hasRawBlockOfType(value: unknown, rawTypes: ReadonlySet<string>): boolean {
   if (!value || typeof value !== "object") {
     return false;
   }
   if (Array.isArray(value)) {
-    return value.some((entry) => hasReplayCriticalRawBlock(entry));
+    return value.some((entry) => hasRawBlockOfType(entry, rawTypes));
   }
 
   const record = value as Record<string, unknown>;
   const rawType = safeString(record.type) ?? safeString(record.rawType);
-  if (rawType && REPLAY_CRITICAL_RAW_TYPES.has(rawType)) {
+  if (rawType && rawTypes.has(rawType)) {
     return true;
   }
 
   for (const key of STRUCTURED_NESTED_FIELD_KEYS) {
-    if (hasReplayCriticalRawBlock(record[key])) {
+    if (hasRawBlockOfType(record[key], rawTypes)) {
       return true;
     }
   }
   for (const key of STRUCTURED_ARRAY_FIELD_KEYS) {
-    if (hasReplayCriticalRawBlock(record[key])) {
+    if (hasRawBlockOfType(record[key], rawTypes)) {
       return true;
     }
   }
 
   return false;
+}
+
+/** Return true when content contains a structurally replayable tool-call block. */
+export function hasToolCallRawBlock(value: unknown): boolean {
+  return hasRawBlockOfType(value, TOOL_CALL_RAW_TYPES);
+}
+
+/** Return true when a raw block should remain structurally replayable. */
+export function hasReplayCriticalRawBlock(value: unknown): boolean {
+  return hasRawBlockOfType(value, REPLAY_CRITICAL_RAW_TYPES);
 }
 
 /** Serialize the original message content that backs a generic raw-payload reference. */
