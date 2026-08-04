@@ -52,11 +52,51 @@ describe("LcmContextEngine.assemble canonical path", () => {
       sessionId: "session-missing-prompt-separate",
       messages: liveMessages,
       tokenBudget: 100,
+      availableTools: new Set(),
       prompt: "second turn",
     });
 
     expect(result.messages).not.toBe(liveMessages);
     expect(result.messages).toStrictEqual(liveMessages);
+    expect(result.estimatedTokens).toBe(0);
+  });
+
+  it("preserves a completed trailing reply when a separate prompt repeats the previous user turn", async () => {
+    const engine = createEngine();
+    const liveMessages: AgentMessage[] = [
+      { role: "user", content: "repeat this request" },
+      { role: "assistant", content: "completed previous reply" },
+    ] as AgentMessage[];
+
+    const result = await engine.assemble({
+      sessionId: "session-missing-repeated-separate-prompt",
+      messages: liveMessages,
+      tokenBudget: 100,
+      availableTools: new Set(),
+      prompt: "repeat this request",
+    });
+
+    expect(result.messages).not.toBe(liveMessages);
+    expect(result.messages).toStrictEqual(liveMessages);
+    expect(result.estimatedTokens).toBe(0);
+  });
+
+  it("strips a nonblank assistant prefill for legacy prompt callers without the host signal", async () => {
+    const engine = createEngine();
+    const liveMessages: AgentMessage[] = [
+      { role: "user", content: "current turn" },
+      { role: "assistant", content: "prefill seed" },
+    ] as AgentMessage[];
+
+    const result = await engine.assemble({
+      sessionId: "session-missing-embedded-prompt-prefill",
+      messages: liveMessages,
+      tokenBudget: 100,
+      prompt: "current turn",
+    });
+
+    expect(result.messages).not.toBe(liveMessages);
+    expect(result.messages).toStrictEqual([{ role: "user", content: "current turn" }]);
     expect(result.estimatedTokens).toBe(0);
   });
 
@@ -71,6 +111,7 @@ describe("LcmContextEngine.assemble canonical path", () => {
       sessionId: "session-missing-blank-prefill",
       messages: liveMessages,
       tokenBudget: 100,
+      availableTools: new Set(),
       prompt: "second turn",
     });
 
@@ -97,6 +138,7 @@ describe("LcmContextEngine.assemble canonical path", () => {
       sessionId: "session-missing-toolcall-tail",
       messages: liveMessages,
       tokenBudget: 100,
+      availableTools: new Set(),
       prompt: "second turn",
     });
 
@@ -122,6 +164,7 @@ describe("LcmContextEngine.assemble canonical path", () => {
       sessionId: "session-missing-mixed-tail",
       messages: liveMessages,
       tokenBudget: 100,
+      availableTools: new Set(),
       prompt: "second turn",
     });
 
@@ -144,6 +187,7 @@ describe("LcmContextEngine.assemble canonical path", () => {
       sessionId: "session-missing-reasoning-tail",
       messages: liveMessages,
       tokenBudget: 100,
+      availableTools: new Set(),
       prompt: "second turn",
     });
 
@@ -167,6 +211,7 @@ describe("LcmContextEngine.assemble canonical path", () => {
       sessionId: "session-missing-top-level-reasoning-tail",
       messages: liveMessages,
       tokenBudget: 100,
+      availableTools: new Set(),
       prompt: "second turn",
     });
 
@@ -186,6 +231,7 @@ describe("LcmContextEngine.assemble canonical path", () => {
       sessionId: "session-missing-empty-array-tail",
       messages: liveMessages,
       tokenBudget: 100,
+      availableTools: new Set(),
       prompt: "second turn",
     });
 

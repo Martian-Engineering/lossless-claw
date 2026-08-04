@@ -3544,6 +3544,8 @@ export class LcmContextEngine implements ContextEngine {
     sessionKey?: string;
     messages: AgentMessage[];
     tokenBudget?: number;
+    /** Tool names supplied by embedded OpenClaw hosts for the current run. */
+    availableTools?: Set<string>;
     /** Current model identifier from OpenClaw hosts that predate assemble runtimeContext. */
     model?: string;
     /**
@@ -3562,9 +3564,12 @@ export class LcmContextEngine implements ContextEngine {
     // When the host delivers the current turn separately via `prompt`, the
     // framework appends the current user turn after this array, so a trailing
     // assistant with real content is the completed previous reply, not a
-    // prefill seed — popping it would make every degraded call answer one turn
-    // behind. Blank tails are stripped on every host.
-    const hostDeliversCurrentTurnSeparately = params.prompt !== undefined;
+    // prefill seed. OpenClaw 2026.5.28+ also supplies `availableTools` on this
+    // embedded-host path (including an empty Set); require that host signal so
+    // legacy callers using `prompt` only as a retrieval query keep historical
+    // assistant-prefill stripping. Blank tails are stripped on every host.
+    const hostDeliversCurrentTurnSeparately =
+      params.prompt !== undefined && params.availableTools instanceof Set;
     const safeFallback = (): AssembleResult => {
       const msgs = stripTrailingAssistantPrefill(liveMessages, {
         preserveSubstantiveAssistantTail: hostDeliversCurrentTurnSeparately,

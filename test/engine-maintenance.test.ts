@@ -6,6 +6,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { SessionManager } from "@earendil-works/pi-coding-agent";
 import { ContextAssembler } from "../src/assembler.js";
+import { clampMessagesToSerializedBudget } from "../src/assemble-fallback.js";
 import type { LcmConfig } from "../src/db/config.js";
 import { closeLcmConnection, createLcmDatabaseConnection } from "../src/db/connection.js";
 import { getLcmDbFeatures } from "../src/db/features.js";
@@ -38,6 +39,28 @@ import {
 
 afterEach(cleanupEngineTestState);
 describe("LcmContextEngine maintain and assemble budget", () => {
+  it("serialized clamp does not restore rejected prompt-separate assistant tails", () => {
+    const rejectedTails = [
+      { role: "assistant", content: "   " },
+      {
+        role: "assistant",
+        content: [{ type: "reasoning", summary: [{ type: "summary_text", text: "checked" }] }],
+      },
+    ] as AgentMessage[];
+
+    for (const tail of rejectedTails) {
+      const clamped = clampMessagesToSerializedBudget({
+        messages: [tail],
+        tokenBudget: 1,
+        preserveSubstantiveAssistantTail: true,
+      });
+
+      expect(clamped.clamped).toBe(true);
+      expect(clamped.messages).toStrictEqual([]);
+      expect(clamped.serializedTokens).toBe(0);
+    }
+  });
+
   it("assemble falls back to live messages on ambiguous runtime rollover while the old transcript still exists", async () => {
     const warnLog = vi.fn();
     const debugLog = vi.fn();
@@ -1316,6 +1339,7 @@ describe("LcmContextEngine maintain and assemble budget", () => {
     const assembleResult = await engine.assemble({
       sessionId,
       messages: liveMessages,
+      availableTools: new Set(),
       prompt: "current delivery turn",
       tokenBudget: 100,
     });

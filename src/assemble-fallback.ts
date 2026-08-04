@@ -136,13 +136,17 @@ export function clampMessagesToSerializedBudget(params: {
     }
   }
 
-  // If stripping the assistant tail would empty the result (a transcript
-  // with no user turns at all), keep the unstripped suffix instead; the
-  // estimate must describe whichever set is actually returned.
+  // Historically an assistant-only suffix was retained when stripping would
+  // empty the result. Prompt-separate hosts must still return an empty array
+  // for blank or reasoning-only tails: restoring those tails would reintroduce
+  // invalid assistant prefill content after the preservation policy rejected it.
   const stripped = stripTrailingAssistantPrefill(kept, {
     preserveSubstantiveAssistantTail: params.preserveSubstantiveAssistantTail,
   });
-  const finalMessages = stripped.length > 0 ? stripped : kept;
+  const finalMessages =
+    stripped.length > 0 || params.preserveSubstantiveAssistantTail === true
+      ? stripped
+      : kept;
   const serializedTokens =
     finalMessages.length === kept.length
       ? keptTokens
