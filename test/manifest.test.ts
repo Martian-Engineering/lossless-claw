@@ -7,6 +7,7 @@ import manifest from "../openclaw.plugin.json" with { type: "json" };
 const HERE = dirname(fileURLToPath(import.meta.url));
 const SRC_TOOLS_DIR = resolve(HERE, "..", "src", "tools");
 const PLUGIN_INDEX = resolve(HERE, "..", "src", "plugin", "index.ts");
+const PLUGIN_MANIFEST = resolve(HERE, "..", "openclaw.plugin.json");
 
 /**
  * These tests guard against drift between the names registered at runtime via
@@ -144,6 +145,10 @@ describe("openclaw.plugin.json manifest drift guard (#570)", () => {
   });
 
   it("describes largeFilesDir relative to OPENCLAW_STATE_DIR without duplicate keys", () => {
+    const manifestSource = readFileSync(PLUGIN_MANIFEST, "utf8");
+    const largeFilesDirKeys = manifestSource.match(/^\s*"largeFilesDir"\s*:/gm) ?? [];
+
+    expect(largeFilesDirKeys).toHaveLength(2);
     expect(manifest.uiHints.largeFilesDir?.help).toContain("OPENCLAW_STATE_DIR");
     expect(manifest.configSchema.properties.largeFilesDir?.description).toContain("OPENCLAW_STATE_DIR");
   });
