@@ -44,6 +44,7 @@ canonical empty/tool-text coverage signatures are now restricted to
 provider-unique ids (recurrent ids fall back to the full lossless signature,
 so an older occurrence can never prove coverage of a newer one), and the
 empty-content fallback rehydrates as a provider-valid whitespace text block
-while persisting the structured `details` payload in part metadata.
+while preserving structured `details` in part metadata. Oversized `details`
+payloads are externalized with a durable file reference instead of truncated.
 
 Co-Authored-By: Cha <cha@jetd.one> via OpenClaw

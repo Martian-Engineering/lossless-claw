@@ -15,9 +15,14 @@
 //      plan calls as FAILED and retried in a loop.
 import { afterEach, describe, expect, it } from "vitest";
 import { randomUUID } from "node:crypto";
+import { readFileSync } from "node:fs";
 import { ContextAssembler } from "../src/assembler.js";
 import type { AgentMessage } from "../src/openclaw-bridge.js";
-import { cleanupEngineTestState, createEngine } from "./helpers.js";
+import {
+  cleanupEngineTestState,
+  createEngine,
+  createEngineWithConfig,
+} from "./helpers.js";
 
 afterEach(cleanupEngineTestState);
 
@@ -133,6 +138,83 @@ describe("empty-content toolResult ingest fallback (issue #992)", () => {
       );
       expect(results).toHaveLength(1);
     }
+  });
+
+  it("externalizes oversized structured details without truncation", async () => {
+    const engine = createEngineWithConfig({ largeFileTokenThreshold: 100_000 });
+    const details = { payload: "oversized plan details\n".repeat(4_000) };
+    const result = {
+      ...makeEmptyPlanResult(),
+      details,
+    } as AgentMessage;
+    const sessionId = randomUUID();
+    await engine.ingest({ sessionId, message: result });
+
+    const conversation = await engine
+      .getConversationStore()
+      .getConversationBySessionId(sessionId);
+    expect(conversation).not.toBeNull();
+    const stored = await engine
+      .getConversationStore()
+      .getMessages(conversation!.conversationId);
+    expect(stored).toHaveLength(1);
+    const parts = await engine
+      .getConversationStore()
+      .getMessageParts(stored[0]!.messageId);
+    expect(parts).toHaveLength(1);
+
+    const metadata = JSON.parse(parts[0]!.metadata!) as {
+      details?: { externalizedFileId?: string; reference?: string };
+      externalizedFileId?: string;
+      originalByteSize?: number;
+      externalizationReason?: string;
+    };
+    const fileId = metadata.externalizedFileId;
+    expect(fileId).toMatch(/^file_[a-f0-9]{16}$/);
+    expect(metadata).toMatchObject({
+      details: { externalizedFileId: fileId },
+      externalizedFileId: fileId,
+      originalByteSize: Buffer.byteLength(JSON.stringify(details), "utf8"),
+      externalizationReason: "large_tool_result_details",
+    });
+    expect(metadata.details?.reference).toContain(fileId);
+    expect(parts[0]!.metadata).not.toContain("oversized plan details");
+
+    const storedFile = await engine.getSummaryStore().getLargeFile(fileId!);
+    expect(storedFile).not.toBeNull();
+    expect(storedFile!.mimeType).toBe("application/json");
+    expect(readFileSync(storedFile!.storageUri, "utf8")).toBe(JSON.stringify(details));
+  });
+
+  it("reuses one externalized details file across repeated live assembly", async () => {
+    const engine = createEngineWithConfig({
+      largeFileTokenThreshold: 20,
+      stubLargeToolPayloads: true,
+    });
+    const sessionId = randomUUID();
+    await engine.ingest({
+      sessionId,
+      message: { role: "user", content: "seed" } as AgentMessage,
+    });
+    const liveMessages = [
+      makeUpdatePlanCall(),
+      {
+        ...makeEmptyPlanResult(),
+        details: { payload: "repeated live plan details\n".repeat(200) },
+      } as AgentMessage,
+    ];
+
+    await engine.assemble({ sessionId, messages: liveMessages, tokenBudget: 100_000 });
+    await engine.assemble({ sessionId, messages: liveMessages, tokenBudget: 100_000 });
+
+    const conversation = await engine
+      .getConversationStore()
+      .getConversationBySessionId(sessionId);
+    expect(conversation).not.toBeNull();
+    const files = await engine
+      .getSummaryStore()
+      .getLargeFilesByConversation(conversation!.conversationId);
+    expect(files).toHaveLength(1);
   });
 
   it("keeps legacy zero-part rows no worse than today (demote + drop, no crash)", async () => {

@@ -5,6 +5,8 @@ import { homedir } from "node:os";
 import { DatabaseSync } from "node:sqlite";
 import { closeLcmConnection, createLcmDatabaseConnection } from "./db/connection.js";
 import { runLcmMigrations } from "./db/migration.js";
+import { resolveLcmConfig } from "./db/config.js";
+import { LargeFileInterceptor } from "./large-file-interceptor.js";
 import { buildMessageParts, filterPersistableMessages, toStoredMessage, type StoredMessage } from "./message-content.js";
 import { createBootstrapEntryHash } from "./message-signatures.js";
 import type { AgentMessage } from "./openclaw-bridge.js";
@@ -305,6 +307,7 @@ async function importPreparedFile(
   db: DatabaseSync,
   conversationStore: ConversationStore,
   summaryStore: SummaryStore,
+  largeFileInterceptor: LargeFileInterceptor,
   prepared: PreparedSessionFile,
 ): Promise<MigrationFileResult> {
   const importable = toImportableMessages(prepared.messages);
@@ -375,12 +378,30 @@ async function importPreparedFile(
     const createdMessages: MessageRecord[] = [];
     let nextSeq = (await conversationStore.getMaxSeq(conversation.conversationId)) + 1;
     for (const entry of toImport) {
+      let messageForParts = entry.message;
+      let storedForPersistence = entry.stored;
+      const rawContent = "content" in entry.message ? entry.message.content : undefined;
+      if (
+        entry.stored.role === "tool" &&
+        Array.isArray(rawContent) &&
+        rawContent.length === 0 &&
+        (entry.message as { details?: unknown }).details !== undefined
+      ) {
+        const intercepted = await largeFileInterceptor.interceptLargeToolResults({
+          conversationId: conversation.conversationId,
+          message: entry.message,
+        });
+        if (intercepted) {
+          messageForParts = intercepted.rewrittenMessage;
+          storedForPersistence = toStoredMessage(messageForParts);
+        }
+      }
       const message = await conversationStore.createMessage({
         conversationId: conversation.conversationId,
         seq: nextSeq,
-        role: entry.stored.role,
-        content: entry.stored.content,
-        tokenCount: entry.stored.tokenCount,
+        role: storedForPersistence.role,
+        content: storedForPersistence.content,
+        tokenCount: storedForPersistence.tokenCount,
         transcriptEntryId: entry.transcriptEntryId,
         createdAt: resolveTranscriptMessageCreatedAt(entry.message),
         skipReplayTimestampFloodGuard: true,
@@ -390,8 +411,8 @@ async function importPreparedFile(
         message.messageId,
         buildMessageParts({
           sessionId: prepared.sessionId,
-          message: entry.message,
-          fallbackContent: entry.stored.content,
+          message: messageForParts,
+          fallbackContent: storedForPersistence.content,
         }),
       );
       createdMessages.push(message);
@@ -488,6 +509,17 @@ export async function runSessionMigration(
     runLcmMigrations(db);
     const conversationStore = new ConversationStore(db);
     const summaryStore = new SummaryStore(db);
+    const migrationConfig = resolveLcmConfig({
+      ...process.env,
+      OPENCLAW_STATE_DIR: stateDir,
+      LCM_DATABASE_PATH: dbPath,
+      LCM_LARGE_FILES_DIR: join(stateDir, "lcm-files"),
+    });
+    const largeFileInterceptor = new LargeFileInterceptor(
+      migrationConfig,
+      summaryStore,
+      async () => undefined,
+    );
     const results: MigrationFileResult[] = [];
     for (const file of prepared) {
       if (!isPreparedSessionFile(file)) {
@@ -495,7 +527,15 @@ export async function runSessionMigration(
         continue;
       }
       try {
-        results.push(await importPreparedFile(db, conversationStore, summaryStore, file));
+        results.push(
+          await importPreparedFile(
+            db,
+            conversationStore,
+            summaryStore,
+            largeFileInterceptor,
+            file,
+          ),
+        );
       } catch (error) {
         results.push({
           file: file.file,

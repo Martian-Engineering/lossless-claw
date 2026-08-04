@@ -1269,6 +1269,7 @@ export class TranscriptReconciler {
         sessionId: params.sessionId,
         message,
         fallbackContent: stored.content,
+        allowOversizedInlineDetailsForAnalysis: true,
       });
       for (const part of parts) {
         for (const rawId of extractRawIdsFromPartMetadata(part.metadata)) {
@@ -1425,6 +1426,7 @@ export class TranscriptReconciler {
         sessionId: params.sessionId,
         message,
         fallbackContent: stored.content,
+        allowOversizedInlineDetailsForAnalysis: true,
       });
       for (const part of parts) {
         const partRawBlockIds = extractRawBlockIdsFromPartMetadata(part.metadata);

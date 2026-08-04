@@ -51,6 +51,7 @@ export function createLosslessMessageSignature(message: AgentMessage): string {
     sessionId: "lossless-message-signature",
     message,
     fallbackContent: stored.content,
+    allowOversizedInlineDetailsForAnalysis: true,
   });
 
   return JSON.stringify({
@@ -146,6 +147,7 @@ export function createCanonicalToolTextCoverageSignature(
     sessionId: "live-tool-coverage-signature",
     message,
     fallbackContent,
+    allowOversizedInlineDetailsForAnalysis: true,
   });
   if (parts.length !== 1) {
     return undefined;
@@ -201,6 +203,7 @@ export function createCanonicalEmptyToolResultCoverageSignature(
     sessionId: "live-empty-tool-coverage-signature",
     message,
     fallbackContent,
+    allowOversizedInlineDetailsForAnalysis: true,
   });
   if (parts.length !== 1) {
     return undefined;
@@ -319,8 +322,14 @@ function isEffectivelyEmptyToolResultPart(
     return true;
   }
   const rawRecord = raw as Record<string, unknown>;
-  // Check raw.content and raw.output for any payload.
-  if (rawRecord.content != null) {
+  // Empty string/array content is another provider representation of an
+  // empty result. Preserve every other non-null shape conservatively so real
+  // structured payloads cannot be canonicalized away by call id alone.
+  const rawContent = rawRecord.content;
+  const rawContentIsEmpty =
+    (typeof rawContent === "string" && rawContent.trim() === "") ||
+    (Array.isArray(rawContent) && rawContent.length === 0);
+  if (rawContent != null && !rawContentIsEmpty) {
     return false;
   }
   if (rawRecord.output != null && String(rawRecord.output).trim() !== "") {
@@ -373,6 +382,7 @@ export function isCanonicalTextOnlyMessage(message: AgentMessage, fallbackConten
     sessionId: "live-coverage-signature",
     message,
     fallbackContent,
+    allowOversizedInlineDetailsForAnalysis: true,
   });
   if (parts.length !== 1) {
     return false;

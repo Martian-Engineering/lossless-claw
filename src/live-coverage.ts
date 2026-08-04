@@ -155,6 +155,7 @@ export function normalizeLiveMessageForAssemblyReconciliation(message: AgentMess
           sessionId: "live-reconciliation",
           message,
           fallbackContent: stored.content,
+          allowOversizedInlineDetailsForAnalysis: true,
         }).map((part) => toSyntheticMessagePartRecord(part, 0))
       : [];
   const content = contentFromParts(parts, runtimeRole, stored.content);

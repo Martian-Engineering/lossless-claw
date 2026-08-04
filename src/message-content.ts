@@ -11,6 +11,8 @@ import { estimateContentTokensForRole, toRuntimeRoleForTokenEstimate } from "./t
 import { safeBoolean, safeString, toJson } from "./value-utils.js";
 import { join } from "node:path";
 
+export const MAX_INLINE_TOOL_RESULT_DETAILS_BYTES = 65_536;
+
 export function appendTextValue(value: unknown, out: string[]): void {
   if (typeof value === "string") {
     out.push(value);
@@ -420,6 +422,7 @@ export function normalizeMessageContentForStorage(params: {
     sessionId: "storage-estimate",
     message,
     fallbackContent,
+    allowOversizedInlineDetailsForAnalysis: true,
   }).map((part) => toSyntheticMessagePartRecord(part, 0));
 
   if (parts.length === 0) {
@@ -443,6 +446,7 @@ export function buildMessageParts(params: {
   sessionId: string;
   message: AgentMessage;
   fallbackContent: string;
+  allowOversizedInlineDetailsForAnalysis?: boolean;
 }): import("./store/conversation-store.js").CreateMessagePartInput[] {
   const { sessionId, message, fallbackContent } = params;
   const role = typeof message.role === "string" ? message.role : "unknown";
@@ -639,10 +643,8 @@ export function buildMessageParts(params: {
   // identity so assembly can reconstruct the toolResult.
   //
   // The OpenClaw `details` payload (the motivating `update_plan` case is
-  // `{content: [], details: {...}}`) is persisted in part metadata — the
-  // lossless layer must not discard structured payload data just because the
-  // text content is empty. Oversized payloads are summarized instead of
-  // dropped silently.
+  // `{content: [], details: {...}}`) is preserved in part metadata, either
+  // inline or as the externalized reference prepared by LargeFileInterceptor.
   //
   // Gated on BOTH role and a non-empty pairing id: pre-existing routing in
   // blockFromPart treats a metadata-less "tool" part as a toolCall, so only
@@ -663,38 +665,23 @@ export function buildMessageParts(params: {
   ) {
     // Structured payload capture (P3: lossless layer must not discard data).
     // `details` rides the top-level message — e.g. update_plan's
-    // `{content: [], details: {...}}` — so persist it in part metadata even
-    // though the rehydrated provider-facing block stays a whitespace text
-    // block (adapters only accept text/image in toolResult content).
+    // `{content: [], details: {...}}` — so preserve it (or its externalized
+    // reference) even though the rehydrated provider-facing block stays a
+    // whitespace text block (adapters only accept text/image there).
     const details = (message as { details?: unknown }).details;
     let detailsEntry: Record<string, unknown> = {};
     if (details !== undefined) {
-      // Persist intact up to a bound: empty content gives
-      // interceptLargeToolResults nothing to externalize and raw-payload
-      // externalization skips tool roles, so an unbounded details blob both
-      // violates the lossless invariant in the other direction (if trimmed
-      // without evidence elsewhere) and bypasses payload-size controls (if
-      // kept whole) — plus it is reparsed at EVERY assemble. Normal empty
-      // results (update_plan-scale payloads are KBs) stay intact; an
-      // oversized blob keeps byteSize + head preview + a LOUD ingest warning
-      // (P3's "disappear without audible complaint" rationale: the invariant
-      // breach is at least evidence-bearing and audible, unlike silent loss).
-      const EMPTY_FALLBACK_DETAILS_MAX_BYTES = 65536;
-      const serialized = toJson(details);
-      const serializedBytes = Buffer.byteLength(serialized ?? "", "utf8");
-      if (serializedBytes <= EMPTY_FALLBACK_DETAILS_MAX_BYTES) {
-        detailsEntry = { details };
-      } else {
-        console.warn(
-          `[lcm] empty-content tool result details payload ${serializedBytes}B exceeds ${EMPTY_FALLBACK_DETAILS_MAX_BYTES}B cap (toolCallId=${topLevelToolCallId}); byteSize + preview preserved in part metadata`,
+      const serializedDetails = toJson(details);
+      const detailsBytes = Buffer.byteLength(serializedDetails, "utf8");
+      if (
+        detailsBytes > MAX_INLINE_TOOL_RESULT_DETAILS_BYTES &&
+        !params.allowOversizedInlineDetailsForAnalysis
+      ) {
+        throw new Error(
+          `Oversized empty tool-result details must be externalized before persistence (toolCallId=${topLevelToolCallId}, bytes=${detailsBytes})`,
         );
-        detailsEntry = {
-          detailsOversize: {
-            byteSize: serializedBytes,
-            preview: (serialized ?? "").slice(0, 2048),
-          },
-        };
       }
+      detailsEntry = { details };
     }
     parts.push({
       sessionId,
@@ -713,6 +700,9 @@ export function buildMessageParts(params: {
         toolName: topLevelToolName,
         isError: topLevelIsError,
         emptyContentFallback: true,
+        externalizedFileId,
+        originalByteSize,
+        externalizationReason,
         ...detailsEntry,
       }),
     });

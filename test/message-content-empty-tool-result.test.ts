@@ -39,6 +39,16 @@ function partsOf(message: AgentMessage, fallbackContent = "") {
 }
 
 describe("buildMessageParts empty-content tool-result fallback", () => {
+  it("rejects oversized details that were not externalized before persistence", () => {
+    const message = makeEmptyResult({
+      details: { payload: "x".repeat(65_537) },
+    });
+
+    expect(() => partsOf(message)).toThrow(
+      "Oversized empty tool-result details must be externalized before persistence",
+    );
+  });
+
   it("emits one fallback part carrying pairing identity", () => {
     const parts = partsOf(makeEmptyResult());
     expect(parts).toHaveLength(1);
@@ -249,6 +259,27 @@ describe("live-coverage signature stability across DB round-trip", () => {
       ],
     } as unknown as AgentMessage;
     expect(createLiveCoverageSignature(liveIded)).toBe(
+      createLiveCoverageSignature(assembled),
+    );
+  });
+
+  it.each([
+    ["empty string", ""],
+    ["empty array", []],
+  ])("live tool_result block with %s content matches assembly", (_label, content) => {
+    const toolCallId = "call_0123456789abcdef";
+    const live = {
+      role: "toolResult",
+      toolCallId,
+      content: [{ type: "tool_result", tool_use_id: toolCallId, content }],
+    } as unknown as AgentMessage;
+    const assembled = {
+      role: "toolResult",
+      toolCallId,
+      content: [{ type: "text", text: " " }],
+    } as unknown as AgentMessage;
+
+    expect(createLiveCoverageSignature(live)).toBe(
       createLiveCoverageSignature(assembled),
     );
   });
