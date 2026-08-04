@@ -75,6 +75,8 @@ The TUI reads directly from the LCM SQLite database (`~/.openclaw/lcm.db`) and s
 
 Doctor, repair, rewrite, and backfill compaction operations all accept `--provider`, `--model`, and `--base-url`, and they also honor `LCM_TUI_SUMMARY_PROVIDER`, `LCM_TUI_SUMMARY_MODEL`, and `LCM_TUI_SUMMARY_BASE_URL` before falling back to the legacy `LCM_SUMMARY_*` settings. By default, repair/rewrite/backfill use Anthropic (`claude-sonnet-4-20250514`), while doctor keeps its lighter default (`claude-haiku-4-5`).
 
+MiniMax API-key calls use `--provider minimax` for the global endpoint or `--provider minimax-cn` for the China endpoint. Both read `MINIMAX_API_KEY` and default to `MiniMax-M3`.
+
 ## License
 
 Part of the [Lossless Claw](https://github.com/Martian-Engineering/lossless-claw) monorepo.
