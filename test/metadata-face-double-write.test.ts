@@ -6,12 +6,12 @@
 // metadata)" block + body). Their identity_hashes differ, so identity dedup
 // cannot see the pair; the metadata-body match must collapse it. Collapse
 // strength exists only on the transcript-covered route and requires the
-// persisted row to be host-proven (transcript provenance), ingested by the
-// CURRENT turn's own reconcile (message_id above the pre-reconcile floor the
-// engine captures), AND the conversation's newest user row — a backfilled
-// historical row imported by the same reconcile never anchors. Any other
-// row, and any provenance-less row, stays weak and duplicates instead of
-// trimming; the degraded and oversized routes never strong-collapse at all.
+// persisted row to be host-proven (transcript provenance), among the exact
+// message ids the CURRENT turn's own reconcile reported as inserted, AND
+// the conversation's newest user row — a backfilled historical row imported
+// by the same reconcile never anchors while a newer user row exists. Any
+// other row, and any provenance-less row, stays weak and duplicates instead
+// of trimming; the degraded and oversized routes never strong-collapse.
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { LcmContextEngine } from "../src/engine.js";
 import {
@@ -348,13 +348,13 @@ describe("metadata-face covered-path double-write", () => {
 });
 
 describe("covered-frontier same-turn anchor", () => {
-  it("never anchors on a backfilled above-floor row: an older user row imported by the same reconcile stays weak and the batch is kept", async () => {
-    // Catch-up reconcile shape: floor 0 (first reconcile of the
-    // conversation), several host-proven rows imported by the same
-    // reconcile, among them an OLD user row whose body a decorated runtime
-    // face repeats. The insertion watermark alone would call that row
-    // same-turn; the newest-user-row condition refuses it, and its
-    // provenanced sibling never extends strength to the refused neighbor.
+  it("never anchors on a backfilled row: an older user row imported by the same reconcile stays weak and the batch is kept", async () => {
+    // Catch-up reconcile shape: several host-proven rows imported by the
+    // same reconcile (both ids in this turn's inserted set), among them an
+    // OLD user row whose body a decorated runtime face repeats. Set
+    // membership alone would call that row same-turn; the newest-user-row
+    // condition refuses it, and its provenanced sibling never extends
+    // strength to the refused neighbor.
     const engine = quietEngine();
     const sessionId = "metadata-face-backfill";
     const sessionKey = "agent:main:metadata-face-backfill";
@@ -395,7 +395,7 @@ describe("covered-frontier same-turn anchor", () => {
           makeMessage({ role: "user", content: decorated(BARE) }),
           makeMessage({ role: "user", content: decorated(DIFFERENT) }),
         ],
-        0,
+        new Set(bulk.map((m) => m.messageId)),
       );
 
     // The BARE-bodied face matched a row that is above the floor but not the
@@ -403,7 +403,7 @@ describe("covered-frontier same-turn anchor", () => {
     expect(result).toHaveLength(2);
   });
 
-  it("collapses a lone decorated face onto exactly its own same-turn ingest (above floor and the newest user row)", async () => {
+  it("collapses a lone decorated face onto exactly its own same-turn ingest (in the inserted set and the newest user row)", async () => {
     const engine = quietEngine();
     const sessionId = "metadata-face-own-ingest";
     const sessionKey = "agent:main:metadata-face-own-ingest";
@@ -432,23 +432,19 @@ describe("covered-frontier same-turn anchor", () => {
         sessionId,
         sessionKey,
         [makeMessage({ role: "user", content: decorated(BARE) })],
-        0,
+        new Set([bulk[0]!.messageId]),
       );
 
     expect(result).toHaveLength(0);
   });
 
-  it("captures a true insertion watermark: an out-of-order backfilled row above the logical tail's id never anchors", async () => {
+  it("keeps the pair when rows were inserted out of seq order before this turn (pre-existing rows are never in the inserted set)", async () => {
     // Insertion order deliberately diverges from seq order: the assistant
     // tail row (seq 1) is inserted FIRST, the user row (seq 0) SECOND, so
     // the user row carries the higher message_id while the logical tail's
-    // id sits below it. A floor read from the tail row's id would report
-    // this pre-existing user row as above-floor; MAX(message_id) reports it
-    // below, which is the semantics the collapse predicate documents. The
-    // end-to-end shape stays a keep either way (the tail window never pairs
-    // a lone face with a row below the logical tail), so this pins the
-    // watermark contract and the keep direction against future window
-    // changes rather than a live reproduction.
+    // id sits below it. Both rows predate this turn, so neither appears in
+    // the reconcile's inserted-id set and no watermark inference can
+    // misclassify them; the pair is kept.
     const engine = quietEngine();
     const sessionId = "metadata-face-out-of-order";
     const sessionKey = "agent:main:metadata-face-out-of-order";
@@ -479,19 +475,8 @@ describe("covered-frontier same-turn anchor", () => {
       },
     ]);
     // The divergence this test exists for: the seq-0 user row was inserted
-    // after the seq-1 tail row and carries the higher message_id, so the
-    // logical tail's id under-reports the insertion frontier while
-    // MAX(message_id) captures it.
+    // after the seq-1 tail row and carries the higher message_id.
     expect(userRows[0]!.messageId).toBeGreaterThan(assistantRows[0]!.messageId);
-    const tailRow = await engine
-      .getConversationStore()
-      .getLastMessage(conversation.conversationId);
-    const watermark = await engine
-      .getConversationStore()
-      .getMaxMessageId(conversation.conversationId);
-    expect(tailRow!.messageId).toBe(assistantRows[0]!.messageId);
-    expect(watermark).toBe(userRows[0]!.messageId);
-    expect(watermark!).toBeGreaterThan(tailRow!.messageId);
     await engine
       .getSummaryStore()
       .appendContextMessages(conversation.conversationId, [

@@ -2921,7 +2921,7 @@ export class LcmContextEngine implements ContextEngine {
     // Append to context items so assembler can see it
     await this.summaryStore.appendContextMessage(conversationId, msgRecord.messageId);
 
-    return { ingested: true };
+    return { ingested: true, messageId: msgRecord.messageId };
   }
 
   async ingest(params: {
@@ -3056,33 +3056,6 @@ export class LcmContextEngine implements ContextEngine {
     const newMessages = filterPersistableMessages(
       params.messages.slice(params.prePromptMessageCount),
     );
-    // Capture the conversation's maximum message id BEFORE the transcript
-    // reconcile below runs: rows above this floor were inserted by THIS
-    // turn's reconcile (session writes are queue-serialized and message_id
-    // is insertion-ordered). MAX(message_id) rather than the logical tail's
-    // id: a writer that backfills rows out of seq order leaves the tail's id
-    // below newer insertions, and a watermark that misses them would let a
-    // pre-existing row pose as this turn's ingest. Only the
-    // transcript-covered alignment consumes the floor — covered means the
-    // reconcile read the transcript to its frontier, so the newest user row
-    // is this turn's own inbound and the decorated end-of-turn face may
-    // collapse onto exactly that ingest. Routes without that proof (degraded
-    // checkpoint, heuristic, oversized) never strong-collapse and keep the
-    // pair. Undefined on lookup failure = the strong collapse stays off.
-    let sameTurnIngestFloor: number | undefined;
-    try {
-      const preReconcileConversation = await this.conversationStore.getConversationForSession({
-        sessionId: params.sessionId,
-        sessionKey: params.sessionKey,
-      });
-      sameTurnIngestFloor = preReconcileConversation
-        ? ((await this.conversationStore.getMaxMessageId(
-            preReconcileConversation.conversationId,
-          )) ?? 0)
-        : 0;
-    } catch {
-      sameTurnIngestFloor = undefined;
-    }
     let transcriptReconcileResult: TranscriptReconcileResult = {
       importedMessages: 0,
       blockedByImportCap: false,
@@ -3158,12 +3131,17 @@ export class LcmContextEngine implements ContextEngine {
       // The transcript reconcile read the file to its frontier, so the DB
       // tail is exact — use precise alignment instead of the heuristic
       // dedup stack, and persist only what the transcript flush has not
-      // delivered yet.
+      // delivered yet. The reconcile reports the exact message ids it
+      // inserted this turn; only those rows may anchor the metadata-face
+      // collapse (ground truth, not an insertion-order inference). An empty
+      // or absent set keeps the strong collapse off.
       dedupedNewMessages = await this.batchDeduplicator.alignRuntimeBatchAgainstCoveredFrontier(
         params.sessionId,
         params.sessionKey,
         newMessages,
-        sameTurnIngestFloor,
+        transcriptReconcileResult.insertedMessageIds?.length
+          ? new Set(transcriptReconcileResult.insertedMessageIds)
+          : undefined,
       );
       if (newMessages.length > 0 && dedupedNewMessages.length < newMessages.length) {
         this.deps.log.debug(

@@ -110,10 +110,10 @@ export type MessageRecord = {
    * Transcript provenance: non-null only when the row was imported from a
    * transcript envelope written by the host's own flush — a marker a user
    * cannot forge. Dedup uses it, together with proof that the row is the
-   * current turn's own transcript ingest (above the pre-reconcile message-id
-   * floor and the conversation's newest user row), to decide whether a
-   * metadata-body match against this row may anchor a collapse; provenance
-   * alone only supports alignment.
+   * current turn's own transcript ingest (its id in the set the reconcile
+   * reported as inserted, and the conversation's newest user row), to decide
+   * whether a metadata-body match against this row may anchor a collapse;
+   * provenance alone only supports alignment.
    */
   transcriptEntryId: string | null;
   /** Allowlisted OpenClaw sender identity, or null for legacy/direct messages. */
@@ -843,19 +843,6 @@ export class ConversationStore {
       .get(conversationId) as unknown as MessageRow | undefined;
 
     return row ? toMessageRecord(row) : null;
-  }
-
-  /**
-   * True insertion watermark for a conversation: the maximum message_id ever
-   * inserted, independent of seq ordering. getLastMessage follows the
-   * logical tail (seq), which can sit below the newest insertion when a
-   * writer backfills rows out of sequence; watermark semantics must not.
-   */
-  async getMaxMessageId(conversationId: ConversationId): Promise<number | null> {
-    const row = this.db
-      .prepare(`SELECT MAX(message_id) AS max_id FROM messages WHERE conversation_id = ?`)
-      .get(conversationId) as { max_id: number | null } | undefined;
-    return row?.max_id ?? null;
   }
 
   async getLastMessageWithRole(

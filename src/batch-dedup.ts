@@ -48,25 +48,23 @@ type AlignmentMatch = CoveredStoredIncomingMatch | "unanchored-inbound" | "prove
 /**
  * True when a persisted row may anchor the same-turn metadata-face collapse.
  * Three conditions, all required: the row is host-proven (transcript
- * provenance), it was inserted during the current afterTurn's own transcript
- * reconcile (message_id above the pre-reconcile floor; session writes are
- * queue-serialized and message_id is insertion-ordered), and it is the
- * conversation's newest user row after that reconcile. The last condition is
- * what turns the floor from an insertion watermark into same-turn
- * provenance: a reconcile that backfills older transcript history (catch-up
- * import, first reconcile with floor 0) puts historical rows above the floor
- * too, but on the transcript-covered route the turn's own inbound is always
- * the newest user row, so a backfilled row can never anchor. Any condition
- * missing (including callers that pass no floor) keeps the match weak: it
- * may support alignment but never anchors a collapse.
+ * provenance), its message id is in the set the current afterTurn's own
+ * transcript reconcile reported as inserted (ground truth from the insert
+ * sites, not an insertion-order inference), and it is the conversation's
+ * newest user row after that reconcile. Membership ties the anchor to this
+ * very reconcile's writes; the newest-user condition ties it to the turn's
+ * own inbound, so a historical row a catch-up reconcile backfilled in the
+ * same pass can never anchor while a newer user row exists. Any condition
+ * missing (including callers that pass no set) keeps the match weak: it may
+ * support alignment but never anchors a collapse.
  */
 function persistedRowAnchorsSameTurnCollapse(
   record: Pick<MessageRecord, "transcriptEntryId" | "messageId">,
-  sameTurnIngestFloor: number | undefined,
+  sameTurnInsertedIds: ReadonlySet<number> | undefined,
   newestUserMessageId: number | undefined,
 ): boolean {
   if (record.transcriptEntryId == null) return false;
-  if (sameTurnIngestFloor === undefined || record.messageId <= sameTurnIngestFloor) return false;
+  if (!sameTurnInsertedIds || !sameTurnInsertedIds.has(record.messageId)) return false;
   return newestUserMessageId !== undefined && record.messageId === newestUserMessageId;
 }
 
@@ -298,7 +296,7 @@ export class BatchDeduplicator {
     sessionId: string,
     sessionKey: string | undefined,
     batch: AgentMessage[],
-    sameTurnIngestFloor?: number,
+    sameTurnInsertedIds?: ReadonlySet<number>,
   ): Promise<AgentMessage[]> {
     if (batch.length === 0) return batch;
 
@@ -317,7 +315,7 @@ export class BatchDeduplicator {
     // newest user row IS this turn's inbound. Only that row may anchor the
     // metadata-face collapse (see persistedRowAnchorsSameTurnCollapse).
     const newestUserMessageId =
-      sameTurnIngestFloor === undefined
+      sameTurnInsertedIds === undefined || sameTurnInsertedIds.size === 0
         ? undefined
         : (await this.conversationStore.getLastMessageWithRole(conversationId, "user"))
             ?.messageId;
@@ -375,19 +373,18 @@ export class BatchDeduplicator {
             )
           ) {
             // Stored provenance authenticates only the persisted row. When
-            // that row was ingested by THIS turn's own reconcile (above the
-            // pre-reconcile floor) AND is the conversation's newest user row,
-            // the incoming decorated face is the end-of-turn copy of that
-            // very ingest (the store double-write) and anchors the collapse
-            // of its own row. Any other row — older, backfilled by a
-            // catch-up reconcile, or shadowed by a newer user row — stays
-            // weak and needs an independent exact/timestamp anchor, so an
-            // echo or replay of an earlier turn duplicates instead of
-            // trimming.
+            // that row is among the ids THIS turn's own reconcile inserted
+            // AND is the conversation's newest user row, the incoming
+            // decorated face is the end-of-turn copy of that very ingest
+            // (the store double-write) and anchors the collapse of its own
+            // row. Any other row — older, backfilled by a catch-up reconcile
+            // in the same pass, or shadowed by a newer user row — stays weak
+            // and needs an independent exact/timestamp anchor, so an echo or
+            // replay of an earlier turn duplicates instead of trimming.
             matches.push(
               persistedRowAnchorsSameTurnCollapse(
                 tailMessages[i]!,
-                sameTurnIngestFloor,
+                sameTurnInsertedIds,
                 newestUserMessageId,
               )
                 ? "provenanced-inbound"
