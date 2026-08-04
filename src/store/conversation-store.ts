@@ -102,9 +102,11 @@ export type MessageRecord = {
   /**
    * Transcript provenance: non-null only when the row was imported from a
    * transcript envelope written by the host's own flush — a marker a user
-   * cannot forge. Dedup uses it, together with same-turn freshness of the
-   * row, to decide whether a metadata-body match against this row may anchor
-   * a collapse; provenance alone only supports alignment.
+   * cannot forge. Dedup uses it, together with proof that the row is the
+   * current turn's own transcript ingest (above the pre-reconcile message-id
+   * floor and the conversation's newest user row), to decide whether a
+   * metadata-body match against this row may anchor a collapse; provenance
+   * alone only supports alignment.
    */
   transcriptEntryId: string | null;
 };
@@ -825,6 +827,23 @@ export class ConversationStore {
        LIMIT 1`,
       )
       .get(conversationId) as unknown as MessageRow | undefined;
+
+    return row ? toMessageRecord(row) : null;
+  }
+
+  async getLastMessageWithRole(
+    conversationId: ConversationId,
+    role: string,
+  ): Promise<MessageRecord | null> {
+    const row = this.db
+      .prepare(
+        `SELECT message_id, conversation_id, seq, role, content, token_count, created_at, large_content, transcript_entry_id
+       FROM messages
+       WHERE conversation_id = ? AND role = ?
+       ORDER BY seq DESC
+       LIMIT 1`,
+      )
+      .get(conversationId, role) as unknown as MessageRow | undefined;
 
     return row ? toMessageRecord(row) : null;
   }
