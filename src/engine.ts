@@ -3056,6 +3056,28 @@ export class LcmContextEngine implements ContextEngine {
     const newMessages = filterPersistableMessages(
       params.messages.slice(params.prePromptMessageCount),
     );
+    // Capture the conversation's newest message id BEFORE the transcript
+    // reconcile below runs: rows above this floor are exactly the ingests of
+    // THIS turn's reconcile (session writes are queue-serialized), which is
+    // what lets the deduplicator collapse the decorated end-of-turn face onto
+    // the same turn's bare transcript row while never trimming against any
+    // older row. Undefined on lookup failure = the strong collapse stays off.
+    let sameTurnIngestFloor: number | undefined;
+    try {
+      const preReconcileConversation = await this.conversationStore.getConversationForSession({
+        sessionId: params.sessionId,
+        sessionKey: params.sessionKey,
+      });
+      sameTurnIngestFloor = preReconcileConversation
+        ? ((
+            await this.conversationStore.getLastMessage(
+              preReconcileConversation.conversationId,
+            )
+          )?.messageId ?? 0)
+        : 0;
+    } catch {
+      sameTurnIngestFloor = undefined;
+    }
     let transcriptReconcileResult: TranscriptReconcileResult = {
       importedMessages: 0,
       blockedByImportCap: false,
@@ -3121,6 +3143,7 @@ export class LcmContextEngine implements ContextEngine {
           params.sessionId,
           params.sessionKey,
           newMessages,
+          sameTurnIngestFloor,
         );
       if (newMessages.length > 0 && dedupedNewMessages.length < newMessages.length) {
         this.deps.log.debug(
@@ -3136,6 +3159,7 @@ export class LcmContextEngine implements ContextEngine {
         params.sessionId,
         params.sessionKey,
         newMessages,
+        sameTurnIngestFloor,
       );
       if (newMessages.length > 0 && dedupedNewMessages.length < newMessages.length) {
         this.deps.log.debug(
@@ -3149,6 +3173,7 @@ export class LcmContextEngine implements ContextEngine {
         newMessages,
         {
           oversizedNoOverlap: "ingest",
+          sameTurnIngestFloor,
         },
       );
     }

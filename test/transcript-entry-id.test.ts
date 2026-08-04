@@ -415,7 +415,7 @@ describe("afterTurn covered-frontier alignment", () => {
     expect(messages.map((message) => message.content)).toEqual(["nice! thank you!"]);
   });
 
-  it("keeps a conv-info-only runtime copy without a sibling anchor", async () => {
+  it("collapses a conv-info-only runtime copy onto the same turn's own transcript ingest without a sibling anchor", async () => {
     const sessionFile = createSessionFilePath("decorated-convinfo-repeat");
     const header = JSON.stringify({
       type: "session",
@@ -453,12 +453,12 @@ describe("afterTurn covered-frontier alignment", () => {
       .getConversationStore()
       .getConversationForSession({ sessionId });
     const messages = await engine.getConversationStore().getMessages(conversation!.conversationId);
-    // The bare row is transcript-proven, but that authenticates only the
-    // stored row. It does not prove this incoming metadata face belongs to the
-    // same entry, so without another exact/timestamp anchor both rows survive.
+    // The bare row is transcript-proven AND same-turn fresh: the host ingested
+    // it from its own transcript moments ago, so the incoming metadata face is
+    // this turn's end-of-turn copy (the store double-write), not an echo of an
+    // older turn. Fresh provenance anchors the collapse; the bare face wins.
     expect(messages.map((message) => message.content)).toEqual([
       "Hey there! hows it going?",
-      decorated,
     ]);
   });
 
