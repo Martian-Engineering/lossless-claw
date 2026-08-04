@@ -845,6 +845,19 @@ export class ConversationStore {
     return row ? toMessageRecord(row) : null;
   }
 
+  /**
+   * True insertion watermark for a conversation: the maximum message_id ever
+   * inserted, independent of seq ordering. getLastMessage follows the
+   * logical tail (seq), which can sit below the newest insertion when a
+   * writer backfills rows out of sequence; watermark semantics must not.
+   */
+  async getMaxMessageId(conversationId: ConversationId): Promise<number | null> {
+    const row = this.db
+      .prepare(`SELECT MAX(message_id) AS max_id FROM messages WHERE conversation_id = ?`)
+      .get(conversationId) as { max_id: number | null } | undefined;
+    return row?.max_id ?? null;
+  }
+
   async getLastMessageWithRole(
     conversationId: ConversationId,
     role: string,
