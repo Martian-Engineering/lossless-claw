@@ -189,7 +189,7 @@ describe("LcmContextEngine ignored sessions", () => {
     });
 
     expect(ignored).toEqual({ ingested: false });
-    expect(included).toEqual({ ingested: true });
+    expect(included).toEqual({ ingested: true, messageId: expect.any(Number) });
     expect(
       await engine.getConversationStore().getConversationBySessionId(ignoredSessionId),
     ).toBeNull();
@@ -732,7 +732,7 @@ describe("LcmContextEngine stateless sessions", () => {
 
     expect(ingested).toEqual({ ingested: false });
     expect(batched).toEqual({ ingestedCount: 0 });
-    expect(included).toEqual({ ingested: true });
+    expect(included).toEqual({ ingested: true, messageId: expect.any(Number) });
 
     const conversation = await engine
       .getConversationStore()
@@ -754,7 +754,7 @@ describe("LcmContextEngine stateless sessions", () => {
       sessionKey,
       message: makeMessage({ role: "user", content: "ping" }),
     });
-    expect(userResult).toEqual({ ingested: true });
+    expect(userResult).toEqual({ ingested: true, messageId: expect.any(Number) });
 
     // Ingest an error assistant message with empty content array
     const errorResult = await engine.ingest({
@@ -814,7 +814,7 @@ describe("LcmContextEngine stateless sessions", () => {
       sessionKey,
       message: makeMessage({ role: "assistant", content: "pong" }),
     });
-    expect(normalResult).toEqual({ ingested: true });
+    expect(normalResult).toEqual({ ingested: true, messageId: expect.any(Number) });
 
     // An error assistant with actual content should still be ingested
     const errorWithContentResult = await engine.ingest({
@@ -827,7 +827,7 @@ describe("LcmContextEngine stateless sessions", () => {
         timestamp: Date.now(),
       } as AgentMessage,
     });
-    expect(errorWithContentResult).toEqual({ ingested: true });
+    expect(errorWithContentResult).toEqual({ ingested: true, messageId: expect.any(Number) });
 
     // Verify only the 3 valid messages were stored despite rejected empty error turns.
     const conversation = await engine
@@ -1436,7 +1436,7 @@ describe("LcmContextEngine connection lifecycle", () => {
         sessionId,
         message: makeMessage({ role: "assistant", content: "second" }),
       }),
-    ).resolves.toEqual({ ingested: true });
+    ).resolves.toEqual({ ingested: true, messageId: expect.any(Number) });
   });
 });
 
