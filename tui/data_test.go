@@ -3,7 +3,6 @@ package main
 import (
 	"os"
 	"path/filepath"
-	"strings"
 	"testing"
 )
 
@@ -51,8 +50,13 @@ func TestResolveOpenclawStateDirFallsBackOnWhitespaceOnly(t *testing.T) {
 	if err != nil {
 		t.Fatalf("resolveOpenclawStateDir: %v", err)
 	}
-	if strings.HasPrefix(dir, "/") {
-		t.Fatalf("expected fallback path starting with home, got absolute %q", dir)
+	home, err := os.UserHomeDir()
+	if err != nil {
+		t.Fatalf("UserHomeDir: %v", err)
+	}
+	expected := filepath.Join(home, ".openclaw")
+	if dir != expected {
+		t.Fatalf("expected %q, got %q", expected, dir)
 	}
 }
 

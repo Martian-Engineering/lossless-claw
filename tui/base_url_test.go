@@ -125,6 +125,13 @@ func TestResolveTUISummaryRuntimeSettingsUsesTUIEnvBeforeLegacyEnv(t *testing.T)
 }
 
 func TestResolveTUISummaryRuntimeSettingsUsesDoctorDefaults(t *testing.T) {
+	t.Setenv("LCM_TUI_SUMMARY_PROVIDER", "")
+	t.Setenv("LCM_TUI_SUMMARY_MODEL", "")
+	t.Setenv("LCM_TUI_SUMMARY_BASE_URL", "")
+	t.Setenv("LCM_SUMMARY_PROVIDER", "")
+	t.Setenv("LCM_SUMMARY_MODEL", "")
+	t.Setenv("LCM_SUMMARY_BASE_URL", "")
+
 	settings := resolveTUISummaryRuntimeSettings(appDataPaths{}, "", "", "", doctorDefaultProvider, doctorDefaultModel)
 	if settings.provider != doctorDefaultProvider {
 		t.Fatalf("expected doctor default provider %q, got %q", doctorDefaultProvider, settings.provider)
