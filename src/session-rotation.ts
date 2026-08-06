@@ -121,6 +121,29 @@ type StartupAutoRotateBatchResult = {
 
 const AUTO_ROTATE_DATABASE_LOCK_TIMEOUT_MS = 30_000;
 
+const SQLITE_SESSION_FILE_MARKER_RE = /^sqlite:([^:]+):([^:]+):(.+)$/;
+
+/**
+ * Hosts with SQLite-backed session stores pass opaque locators through
+ * sessionFile instead of a transcript path: a
+ * "sqlite:<agentId>:<sessionId>:<storePath>" marker. JSONL auto-rotation only
+ * applies to real transcript files on disk, so valid SQLite markers are
+ * skipped before any filesystem work instead of warn-logging a stat failure on
+ * every turn.
+ */
+function isSqliteSessionFileMarker(sessionFile: string): boolean {
+  const match = SQLITE_SESSION_FILE_MARKER_RE.exec(sessionFile);
+  return Boolean(match?.[1] && match[2] && match[3]);
+}
+
+function isBareSessionIdentityLocator(params: {
+  sessionFile: string;
+  sessionId?: string;
+  sessionKey?: string;
+}): boolean {
+  return params.sessionFile === params.sessionKey || params.sessionFile === params.sessionId;
+}
+
 function isRotatePreservedEntryType(type: string): boolean {
   return (
     type === "message" ||
@@ -362,6 +385,10 @@ export class SessionRotationService {
       skip("stateless-session");
       return;
     }
+    if (isSqliteSessionFileMarker(sessionFile)) {
+      skip("session-file-not-rotatable");
+      return;
+    }
 
     // The file stat is the only runtime hot-path filesystem work before we
     // know a rotation is needed.
@@ -369,6 +396,10 @@ export class SessionRotationService {
     try {
       sizeBytes = (await stat(sessionFile)).size;
     } catch (error) {
+      if (isMissingFileError(error) && isBareSessionIdentityLocator({ sessionFile, sessionId, sessionKey })) {
+        skip("session-file-not-rotatable");
+        return;
+      }
       this.logAutoRotateSessionFileDecision({
         ...baseLog,
         action: "warn",
@@ -560,6 +591,9 @@ export class SessionRotationService {
       return { kind: "skipped" };
     }
     if (this.host.shouldIgnoreSession({ sessionId, sessionKey }) || this.host.isStatelessSession(sessionKey)) {
+      return { kind: "skipped" };
+    }
+    if (isSqliteSessionFileMarker(sessionFile)) {
       return { kind: "skipped" };
     }
 
