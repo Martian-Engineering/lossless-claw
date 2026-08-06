@@ -132,11 +132,7 @@
     },
     "largeFilesDir": {
       "label": "Large Files Directory",
-      "help": "Directory for persisting large-file text payloads (default: <stateDir>/lcm-files). Uses OPENCLAW_STATE_DIR when set."
-    },
-    "largeFilesDir": {
-      "label": "Large Files Directory",
-      "help": "Directory for externalized large files and inline-image payloads (default: ~/.openclaw/lcm-files)"
+      "help": "Directory for persisting externalized large-file text and inline-image payloads (default: <OPENCLAW_STATE_DIR>/lcm-files)"
     },
     "ignoreSessionPatterns": {
       "label": "Ignored Sessions",
@@ -476,9 +472,6 @@
       "dbPath": {
         "type": "string"
       },
-      "largeFilesDir": {
-        "type": "string"
-      },
       "ignoreSessionPatterns": {
         "type": "array",
         "items": {
@@ -691,7 +684,7 @@
         "type": "string"
       },
       "largeFilesDir": {
-        "description": "Directory for persisting large-file text payloads (default: <OPENCLAW_STATE_DIR>/lcm-files)",
+        "description": "Directory for persisting externalized large-file text and inline-image payloads (default: <OPENCLAW_STATE_DIR>/lcm-files)",
         "type": "string"
       },
       "fallbackProviders": {
