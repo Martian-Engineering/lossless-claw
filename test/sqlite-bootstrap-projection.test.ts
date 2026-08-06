@@ -578,6 +578,96 @@ describe("LcmContextEngine.bootstrap sqlite transcript projection", () => {
     ]);
   });
 
+  it("does not re-import a trimmed prefix before an untrusted stamped suffix", async () => {
+    const sessionId = "sqlite-bootstrap-untrusted-suffix-session";
+    const sessionKey = "agent:main:sqlite-bootstrap-untrusted-suffix-session";
+    const readVisibleSessionTranscriptMessageEntries = vi.fn(async () => [
+      {
+        entryId: "entry-trimmed-prefix",
+        parentId: null,
+        seq: 1,
+        role: "user",
+        message: { role: "user", content: "trimmed older prefix" } satisfies AgentMessage,
+        createdAt: "2026-06-29T12:22:00.000Z",
+      },
+      {
+        entryId: "entry-untrusted-suffix",
+        parentId: "entry-trimmed-prefix",
+        seq: 2,
+        role: "assistant",
+        message: { role: "assistant", content: "retained suffix" } satisfies AgentMessage,
+        createdAt: "2026-06-29T12:22:01.000Z",
+      },
+      {
+        entryId: "entry-fresh-tail",
+        parentId: "entry-untrusted-suffix",
+        seq: 3,
+        role: "user",
+        message: { role: "user", content: "new tail" } satisfies AgentMessage,
+        createdAt: "2026-06-29T12:22:02.000Z",
+      },
+    ] satisfies VisibleSessionTranscriptMessageEntry[]);
+    const { engine, db } = createEngineWithDepsOverridesAndDb({
+      readVisibleSessionTranscriptMessageEntries,
+    } satisfies Partial<LcmDependencies>);
+
+    await expect(
+      engine.ingestBatch({
+        sessionId,
+        sessionKey,
+        messages: [
+          attachTranscriptEntryMeta(
+            { role: "assistant", content: "retained suffix" } satisfies AgentMessage,
+            {
+              entryId: "entry-untrusted-suffix",
+              parentId: "entry-trimmed-prefix",
+              timestamp: "2026-06-29T12:22:01.000Z",
+            },
+          ),
+        ],
+      }),
+    ).resolves.toMatchObject({ ingestedCount: 1 });
+
+    const conversation = await engine.getConversationStore().getConversationForSession({
+      sessionId,
+      sessionKey,
+    });
+    expect(conversation).not.toBeNull();
+    // A database migrated from before explicit anchor trust can retain stamped rows
+    // without corresponding trust records.
+    db.prepare(
+      "DELETE FROM message_transcript_anchor_trust WHERE conversation_id = ?",
+    ).run(conversation!.conversationId);
+
+    await expect(
+      engine.bootstrap({
+        sessionId,
+        sessionKey,
+        runtimeContext: {
+          transcriptStorage: { kind: "sqlite" },
+          sessionTarget: {
+            agentId: "main",
+            sessionId,
+            sessionKey,
+            storePath: "/tmp/openclaw-agent.sqlite",
+          },
+        },
+      }),
+    ).resolves.toMatchObject({
+      bootstrapped: true,
+      importedMessages: 1,
+      reason: "reconciled missing session messages",
+    });
+
+    const messages = await engine.getConversationStore().getMessages(
+      conversation!.conversationId,
+    );
+    expect(messages.map((message) => message.content)).toEqual([
+      "retained suffix",
+      "new tail",
+    ]);
+  });
+
   it("does not treat duplicate content without entry-id overlap as a projection anchor", async () => {
     const sessionId = "sqlite-bootstrap-duplicate-content-session";
     const sessionKey = "agent:main:sqlite-bootstrap-duplicate-content-session";

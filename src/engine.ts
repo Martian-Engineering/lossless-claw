@@ -2534,6 +2534,7 @@ export class LcmContextEngine implements ContextEngine {
     let importedMessages = 0;
     let hasOverlap = false;
     let establishedEpochBoundary = false;
+    let epochBoundaryIndex = -1;
     let suspectEpochEntryId: string | null = null;
     let overlapAnchorIndex = -1;
     const importableMessages: Array<{ index: number; message: AgentMessage }> = [];
@@ -2615,6 +2616,7 @@ export class LcmContextEngine implements ContextEngine {
             existingEntryIds.delete(entryId);
           }
           establishedEpochBoundary = true;
+          epochBoundaryIndex = index;
           suspectEpochEntryId ??= entryId;
         }
       }
@@ -2776,10 +2778,10 @@ export class LcmContextEngine implements ContextEngine {
       };
     }
 
-    const anchoredImportableMessages =
-      hasOverlap
-        ? importableMessages.filter((candidate) => candidate.index > overlapAnchorIndex)
-        : importableMessages;
+    const importBoundaryIndex = Math.max(overlapAnchorIndex, epochBoundaryIndex);
+    const anchoredImportableMessages = importableMessages.filter(
+      (candidate) => candidate.index > importBoundaryIndex,
+    );
     const importCap = transcriptImportCap(
       await this.conversationStore.getMessageCount(params.conversationId),
     );
