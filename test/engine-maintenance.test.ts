@@ -904,6 +904,86 @@ describe("LcmContextEngine maintain and assemble budget", () => {
     }
   });
 
+  it.each([
+    {
+      name: "fresh-tail count",
+      override: { freshTailCount: 3, leafChunkTokens: 100 },
+      expectedReason: "no compactable context outside fresh tail",
+    },
+    {
+      name: "leaf chunk size",
+      override: { freshTailCount: 0, leafChunkTokens: 500 },
+      expectedReason: "no pending summary nodes planned",
+    },
+  ])("pending preparation honors the resolved $name override", async ({
+    override,
+    expectedReason,
+  }) => {
+    const complete = vi.fn(async () => ({
+      content: [{ type: "text", text: "unexpected summary" }],
+    }));
+    const engine = createEngineWithDeps(
+      {
+        summaryProvider: "anthropic",
+        summaryModel: "claude-opus-4-5",
+        freshTailCount: 0,
+        leafChunkTokens: 100,
+        maxSweepIterations: 1,
+      },
+      { complete },
+    );
+    const sessionId = `pending-threshold-override-${override.freshTailCount}-${override.leafChunkTokens}`;
+    const conversation = await engine.getConversationStore().getOrCreateConversation(sessionId, {
+      sessionKey: undefined,
+    });
+    const messages = await engine.getConversationStore().createMessagesBulk(
+      Array.from({ length: 3 }, (_, index) => ({
+        conversationId: conversation.conversationId,
+        seq: index + 1,
+        role: index % 2 === 0 ? "user" as const : "assistant" as const,
+        content: `override source ${index}`,
+        tokenCount: 100,
+        skipReplayTimestampFloodGuard: true,
+      })),
+    );
+    await engine.getSummaryStore().appendContextMessages(
+      conversation.conversationId,
+      messages.map((message) => message.messageId),
+    );
+
+    const privateEngine = engine as unknown as {
+      executePendingCompactionCore: (params: unknown) => Promise<{
+        compacted: boolean;
+        reason?: string;
+      }>;
+    };
+    const result = await privateEngine.executePendingCompactionCore({
+      conversationId: conversation.conversationId,
+      sessionId,
+      tokenBudget: 4_096,
+      currentTokenCount: 9_000,
+      sessionQueueHeld: true,
+      publishPolicy: "prepare-only",
+      maxPendingSteps: 1,
+      contextThresholdOverride: {
+        contextThreshold: 0.8,
+        source: "override",
+        reason: "test override",
+        specificity: 50,
+        ...override,
+      },
+    });
+
+    expect(result.compacted).toBe(false);
+    expect(result.reason).toBe(expectedReason);
+    expect(complete).not.toHaveBeenCalled();
+    await expect(
+      engine.getPendingSummaryStore().getActiveBatchForConversation(
+        conversation.conversationId,
+      ),
+    ).resolves.toBeNull();
+  });
+
   it("manual compact keeps threshold debt pending after a partial pending publish", async () => {
     const complete = vi.fn(async () => ({
       content: [{ type: "text", text: "prepared summary" }],

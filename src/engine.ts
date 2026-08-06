@@ -1494,6 +1494,10 @@ export class LcmContextEngine implements ContextEngine {
                 context: formatSessionLabel(params.sessionId, params.sessionKey),
               },
             );
+    const pendingFreshTailCount =
+      params.contextThresholdOverride?.freshTailCount ?? this.config.freshTailCount;
+    const pendingLeafChunkTokens =
+      params.contextThresholdOverride?.leafChunkTokens ?? this.config.leafChunkTokens;
     const coordinator = new PendingCompactionCoordinator({
       conversationStore: this.conversationStore,
       summaryStore: this.summaryStore,
@@ -1503,12 +1507,12 @@ export class LcmContextEngine implements ContextEngine {
       leaseOwner: `engine:${params.sessionId}`,
       ...(withPublishLock ? { withPublishLock } : {}),
       config: {
-        freshTailCount: this.config.freshTailCount,
+        freshTailCount: pendingFreshTailCount,
         freshTailMaxTokens: this.config.freshTailMaxTokens,
-        leafChunkTokens: this.config.leafChunkTokens,
+        leafChunkTokens: pendingLeafChunkTokens,
         condensedMinFanout: this.config.condensedMinFanout,
         condensedMinSourceTokens: this.resolvePendingCondensedMinSourceTokens(),
-        condensedChunkTokens: this.config.leafChunkTokens,
+        condensedChunkTokens: pendingLeafChunkTokens,
         leaseMs: this.config.summaryTimeoutMs,
         stripInjectedContextTags: this.config.stripInjectedContextTags,
       },
