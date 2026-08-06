@@ -26,6 +26,15 @@ jobs:
       - name: Run typecheck
         run: npm run typecheck
 
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: tui/go.mod
+          cache-dependency-path: tui/go.sum
+
+      - name: Run TUI tests
+        run: npm run test:tui
+
       - name: Run tests
         run: |
           set +e

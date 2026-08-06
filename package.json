@@ -26,8 +26,9 @@
     "build:cli": "esbuild cli.ts --bundle --platform=node --target=node22 --format=esm --outfile=dist/cli.js --minify-whitespace",
     "changeset": "changeset",
     "plugin-inspector:ci": "npm exec --yes --package @openclaw/plugin-inspector@0.3.11 -- plugin-inspector ci --plugin-root . --out plugin-inspector-reports",
-    "release:verify": "npm run typecheck && npm run build && npm test && npm pack --dry-run",
+    "release:verify": "npm run typecheck && npm run build && npm test && npm run test:tui && npm pack --dry-run",
     "test": "vitest run --dir test",
+    "test:tui": "cd tui && go test ./...",
     "typecheck": "tsc --noEmit --pretty false",
     "version-packages": "changeset version"
   },
