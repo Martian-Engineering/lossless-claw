@@ -512,12 +512,28 @@ function getBootstrap(db: DatabaseSync, conversationId: number): ConversationDia
   if (!bootstrapTable) {
     return null;
   }
+  const bootstrapColumns = new Set(
+    (db.prepare("PRAGMA table_info(conversation_bootstrap_state)").all() as Array<{ name: string }>)
+      .map((column) => column.name),
+  );
+  // Pre-epoch databases retain the core file checkpoint without these later
+  // reconciliation and fork fields. Diagnostics must remain read-only.
+  const sessionHeaderId = bootstrapColumns.has("session_header_id")
+    ? "session_header_id"
+    : "NULL";
+  const lastProcessedEntryId = bootstrapColumns.has("last_processed_entry_id")
+    ? "last_processed_entry_id"
+    : "NULL";
+  const forkBounded = bootstrapColumns.has("fork_bounded") ? "fork_bounded" : "0";
+  const forkSourceMessageCount = bootstrapColumns.has("fork_source_message_count")
+    ? "fork_source_message_count"
+    : "0";
   const row = db.prepare(`SELECT
       session_file_path AS sessionFilePath, last_seen_size AS lastSeenSize,
       last_seen_mtime_ms AS lastSeenMtimeMs, last_processed_offset AS lastProcessedOffset,
-      last_processed_entry_hash AS lastProcessedEntryHash, session_header_id AS sessionHeaderId,
-      last_processed_entry_id AS lastProcessedEntryId, fork_bounded AS forkBounded,
-      fork_source_message_count AS forkSourceMessageCount, updated_at AS updatedAt
+      last_processed_entry_hash AS lastProcessedEntryHash, ${sessionHeaderId} AS sessionHeaderId,
+      ${lastProcessedEntryId} AS lastProcessedEntryId, ${forkBounded} AS forkBounded,
+      ${forkSourceMessageCount} AS forkSourceMessageCount, updated_at AS updatedAt
     FROM conversation_bootstrap_state WHERE conversation_id = ?`
   ).get(conversationId) as BootstrapRow | undefined;
   return row ? { ...row, forkBounded: row.forkBounded === 1 } : null;

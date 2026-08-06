@@ -211,4 +211,48 @@ describe("getConversationDiagnostics", () => {
       latestAt: "2026-07-02T08:00:00.000Z",
     });
   });
+
+  it("reads a legacy bootstrap table without newer reconciliation columns", () => {
+    const writable = new DatabaseSync(databasePath);
+    writable.exec(`
+      CREATE TABLE conversation_bootstrap_state (
+        conversation_id INTEGER PRIMARY KEY,
+        session_file_path TEXT NOT NULL,
+        last_seen_size INTEGER NOT NULL,
+        last_seen_mtime_ms INTEGER NOT NULL,
+        last_processed_offset INTEGER NOT NULL,
+        last_processed_entry_hash TEXT,
+        updated_at TEXT NOT NULL
+      );
+      INSERT INTO conversation_bootstrap_state (
+        conversation_id, session_file_path, last_seen_size, last_seen_mtime_ms,
+        last_processed_offset, last_processed_entry_hash, updated_at
+      ) VALUES (
+        2, '/legacy/session.jsonl', 4096, 1720000000000,
+        2048, 'legacy-entry-hash', '2026-07-02T09:00:00.000Z'
+      );
+    `);
+    writable.close();
+
+    const db = openReadOnlyDatabase(databasePath);
+    const diagnostics = getConversationDiagnostics(
+      db,
+      { kind: "conversationId", value: 2 },
+      { freshTailCount: 1 },
+    );
+    db.close();
+
+    expect(diagnostics.bootstrap).toEqual({
+      sessionFilePath: "/legacy/session.jsonl",
+      lastSeenSize: 4096,
+      lastSeenMtimeMs: 1720000000000,
+      lastProcessedOffset: 2048,
+      lastProcessedEntryHash: "legacy-entry-hash",
+      sessionHeaderId: null,
+      lastProcessedEntryId: null,
+      forkBounded: false,
+      forkSourceMessageCount: 0,
+      updatedAt: "2026-07-02T09:00:00.000Z",
+    });
+  });
 });
