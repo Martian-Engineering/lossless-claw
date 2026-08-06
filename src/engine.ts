@@ -353,12 +353,6 @@ function selectLegacyPrefixFrontier(params: {
     };
   }
   if (freshSuffixIndex === 0) {
-    if (params.entries.length < 2) {
-      return {
-        frontier: params.entries.at(-1) ?? null,
-        allowsUnanchoredImport: false,
-      };
-    }
     return {
       frontier: null,
       allowsUnanchoredImport: true,

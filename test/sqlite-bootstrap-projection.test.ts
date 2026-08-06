@@ -1656,6 +1656,74 @@ describe("LcmContextEngine.bootstrap sqlite transcript projection", () => {
     });
   });
 
+  it("imports one fresh post-tail message when establishing a legacy-prefix epoch", async () => {
+    const sessionId = "sqlite-bootstrap-legacy-prefix-one-fresh-session";
+    const sessionKey = "agent:main:sqlite-bootstrap-legacy-prefix-one-fresh-session";
+    const readVisibleSessionTranscriptMessageEntries = vi.fn(async () => [
+      {
+        entryId: "entry-one-fresh-user",
+        parentId: "entry-model-snapshot",
+        seq: 4,
+        role: "user",
+        message: { role: "user", content: "one fresh turn" } satisfies AgentMessage,
+        createdAt: "2026-07-08T16:45:51.306Z",
+      },
+    ] satisfies VisibleSessionTranscriptMessageEntry[]);
+    const { engine } = createEngineWithDepsOverridesAndDb({
+      readVisibleSessionTranscriptMessageEntries,
+    } satisfies Partial<LcmDependencies>);
+
+    await expect(
+      engine.ingestBatch({
+        sessionId,
+        sessionKey,
+        messages: [
+          attachTranscriptEntryMeta(
+            { role: "assistant", content: "" } satisfies AgentMessage,
+            {
+              entryId: "entry-stale-blank",
+              parentId: null,
+              timestamp: "2026-05-20T12:00:00.000Z",
+            },
+          ),
+        ],
+      }),
+    ).resolves.toMatchObject({ ingestedCount: 1 });
+
+    await expect(
+      engine.bootstrap({
+        sessionId,
+        sessionKey,
+        runtimeContext: {
+          transcriptStorage: { kind: "sqlite" },
+          sessionTarget: {
+            agentId: "main",
+            sessionId,
+            sessionKey,
+            storePath: "/tmp/openclaw-agent.sqlite",
+          },
+        },
+      }),
+    ).resolves.toMatchObject({
+      bootstrapped: true,
+      importedMessages: 1,
+      reason: "reconciled missing session messages",
+    });
+
+    const conversation = await engine.getConversationStore().getConversationForSession({
+      sessionId,
+      sessionKey,
+    });
+    expect(conversation).not.toBeNull();
+    const messages = await engine.getConversationStore().getMessages(
+      conversation!.conversationId,
+    );
+    expect(messages.map((message) => message.content)).toEqual([
+      "",
+      "one fresh turn",
+    ]);
+  });
+
   it("does not advance a legacy-prefix frontier across entries without timestamp evidence", async () => {
     const sessionId = "sqlite-legacy-prefix-missing-timestamps-session";
     const sessionKey = "agent:main:sqlite-legacy-prefix-missing-timestamps-session";
