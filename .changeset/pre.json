@@ -1,0 +1,25 @@
+{
+  "mode": "pre",
+  "tag": "beta",
+  "initialVersions": {
+    "@martian-engineering/lossless-claw": "0.15.1"
+  },
+  "changesets": [
+    "legacy-bootstrap-diagnostics",
+    "minimax-tui-provider",
+    "pending-summary-projection-pressure",
+    "plugin-json-duplicate-largefilesdir",
+    "preserve-completed-assistant-fallback",
+    "preserve-thinking-identity",
+    "remove-transcript-maintenance",
+    "runtime-subagent-session-messages",
+    "schedule-threshold-summary-publication",
+    "serialized-output-headroom",
+    "sqlite-transcript-runtime",
+    "stable-event-dedup",
+    "strict-metadata-decoration-gate",
+    "transcript-provenance-dedup",
+    "trust-conversation-prompt-hook",
+    "verified-transcript-anchors"
+  ]
+}
