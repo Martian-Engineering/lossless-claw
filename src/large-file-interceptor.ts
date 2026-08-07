@@ -24,13 +24,16 @@ import {
 import {
   extractStructuredText,
   hasReplayCriticalRawBlock,
+  MAX_INLINE_TOOL_RESULT_DETAILS_BYTES,
   RAW_PAYLOAD_EXTERNALIZATION_REASON,
   serializeRawPayloadContent,
   type StoredMessage,
 } from "./message-content.js";
 import { resolveLiveToolResultExternalization } from "./read-tool-recovery.js";
 import { buildExternalizedToolResultBlock } from "./tool-result-blocks.js";
-import { asRecord, safeBoolean, safeString } from "./value-utils.js";
+import { asRecord, safeBoolean, safeString, toJson } from "./value-utils.js";
+
+const LARGE_TOOL_RESULT_DETAILS_EXTERNALIZATION_REASON = "large_tool_result_details";
 
 /** Resolves the optional model-backed summarizer used for large-file exploration summaries. */
 export type LargeFileTextSummarizerResolver = (params?: {
@@ -800,6 +803,56 @@ export class LargeFileInterceptor {
     const topLevelIsError =
       safeBoolean(topLevel.isError) ??
       safeBoolean(topLevel.is_error);
+
+    // Empty tool results can carry their entire structured payload in the
+    // top-level `details` field. Externalize oversized details here because
+    // the content-block loop below has nothing to inspect and the generic raw
+    // payload interceptor intentionally skips tool roles.
+    if (params.message.content.length === 0 && topLevel.details !== undefined) {
+      const serializedDetails = toJson(topLevel.details);
+      const serializedDetailsBytes = Buffer.byteLength(serializedDetails, "utf8");
+      if (
+        serializedDetails.length > 0 &&
+        (estimateTokens(serializedDetails) >= threshold ||
+          serializedDetailsBytes > MAX_INLINE_TOOL_RESULT_DETAILS_BYTES)
+      ) {
+        const toolName = topLevelToolName ?? "tool-result";
+        const detailsToolName = `${toolName}-details`;
+        const externalized = await this.externalizeLargeTextPayload({
+          conversationId: params.conversationId,
+          content: serializedDetails,
+          fileId: params.getFileId?.({
+            content: serializedDetails,
+            toolName: detailsToolName,
+            callId: topLevelToolCallId,
+          }),
+          fileName: `${detailsToolName}.json`,
+          mimeType: "application/json",
+          formatReference: ({ fileId, byteSize, summary }) =>
+            formatToolOutputReference({
+              fileId,
+              toolName: detailsToolName,
+              byteSize,
+              summary,
+            }),
+        });
+        return {
+          rewrittenMessage: {
+            ...params.message,
+            details: {
+              externalizedFileId: externalized.fileId,
+              originalByteSize: externalized.byteSize,
+              externalizationReason: LARGE_TOOL_RESULT_DETAILS_EXTERNALIZATION_REASON,
+              reference: externalized.reference,
+            },
+            externalizedFileId: externalized.fileId,
+            originalByteSize: externalized.byteSize,
+            externalizationReason: LARGE_TOOL_RESULT_DETAILS_EXTERNALIZATION_REASON,
+          } as AgentMessage,
+          fileIds: [externalized.fileId],
+        };
+      }
+    }
 
     for (const item of params.message.content) {
       if (!item || typeof item !== "object" || Array.isArray(item)) {

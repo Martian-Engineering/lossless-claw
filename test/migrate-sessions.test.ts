@@ -1,4 +1,4 @@
-import { mkdtempSync, rmSync, writeFileSync, existsSync, mkdirSync, appendFileSync } from "node:fs";
+import { mkdtempSync, rmSync, writeFileSync, existsSync, mkdirSync, appendFileSync, readFileSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
@@ -168,6 +168,56 @@ describe("runSessionMigration", () => {
       });
     } finally {
       closeLcmConnection(db);
+    }
+  });
+
+  it("externalizes oversized empty tool-result details during migration", async () => {
+    const root = tempRoot();
+    const details = { payload: "migrated details\n".repeat(5_000) };
+    writeAgentSession(root, "session-details.jsonl", [
+      sessionHeader("session-details"),
+      {
+        type: "message",
+        id: "m1",
+        parentId: null,
+        timestamp: "2026-06-10T00:00:00.000Z",
+        message: {
+          role: "toolResult",
+          toolCallId: "call_migration_details",
+          toolName: "update_plan",
+          content: [],
+          details,
+        },
+      },
+    ]);
+    const dbPath = migratedDb(root);
+
+    const result = await runSessionMigration({ dbPath, stateDir: root, apply: true });
+
+    expect(result.files[0]).toMatchObject({ status: "imported", importedMessages: 1 });
+    const migrated = openMigratedDb(dbPath);
+    try {
+      const conversation = await migrated.conversationStore.getConversationForSession({
+        sessionId: "session-details",
+      });
+      expect(conversation).not.toBeNull();
+      const files = await migrated.summaryStore.getLargeFilesByConversation(
+        conversation!.conversationId,
+      );
+      expect(files).toHaveLength(1);
+      expect(files[0]!.mimeType).toBe("application/json");
+      expect(readFileSync(files[0]!.storageUri, "utf8")).toBe(JSON.stringify(details));
+
+      const messages = await migrated.conversationStore.getMessages(conversation!.conversationId);
+      const parts = await migrated.conversationStore.getMessageParts(messages[0]!.messageId);
+      const metadata = JSON.parse(parts[0]!.metadata!) as Record<string, unknown>;
+      expect(metadata).toMatchObject({
+        externalizedFileId: files[0]!.fileId,
+        externalizationReason: "large_tool_result_details",
+      });
+      expect(parts[0]!.metadata).not.toContain("migrated details");
+    } finally {
+      closeLcmConnection(migrated.db);
     }
   });
 

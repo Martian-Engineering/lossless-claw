@@ -11,6 +11,8 @@ import { estimateContentTokensForRole, toRuntimeRoleForTokenEstimate } from "./t
 import { safeBoolean, safeString, toJson } from "./value-utils.js";
 import { join } from "node:path";
 
+export const MAX_INLINE_TOOL_RESULT_DETAILS_BYTES = 65_536;
+
 export function appendTextValue(value: unknown, out: string[]): void {
   if (typeof value === "string") {
     out.push(value);
@@ -530,6 +532,7 @@ export function normalizeMessageContentForStorage(params: {
     sessionId: "storage-estimate",
     message,
     fallbackContent,
+    allowOversizedInlineDetailsForAnalysis: true,
   }).map((part) => toSyntheticMessagePartRecord(part, 0));
 
   if (parts.length === 0) {
@@ -570,6 +573,7 @@ export function buildMessageParts(params: {
   sessionId: string;
   message: AgentMessage;
   fallbackContent: string;
+  allowOversizedInlineDetailsForAnalysis?: boolean;
 }): import("./store/conversation-store.js").CreateMessagePartInput[] {
   const { sessionId, message, fallbackContent } = params;
   const role = typeof message.role === "string" ? message.role : "unknown";
@@ -759,6 +763,83 @@ export function buildMessageParts(params: {
         externalizationReason: safeString(metadataRecord?.externalizationReason),
         rawType: rawBlockType,
         raw: rawBlock,
+      }),
+    });
+  }
+
+  // Empty-content tool-result fallback (issue #992): a tool result message
+  // whose content is an empty array (e.g. OpenClaw `update_plan` shape
+  // `{content: [], details: {...}}`) produces zero parts above, which loses
+  // the top-level pairing identity (toolCallId/toolName/isError live only in
+  // part metadata). Downstream, a zero-part role=tool row can no longer be
+  // rehydrated as a toolResult — it is demoted to assistant, filtered as
+  // empty, and `sanitizeToolUseResultPairing` then injects a synthetic
+  // "missing tool result" error on every assemble while the call is in the
+  // context window. Persist one fallback part that carries the pairing
+  // identity so assembly can reconstruct the toolResult.
+  //
+  // The OpenClaw `details` payload (the motivating `update_plan` case is
+  // `{content: [], details: {...}}`) is preserved in part metadata, either
+  // inline or as the externalized reference prepared by LargeFileInterceptor.
+  //
+  // Gated on BOTH role and a non-empty pairing id: pre-existing routing in
+  // blockFromPart treats a metadata-less "tool" part as a toolCall, so only
+  // tool/toolResult roles may land here — an id-bearing assistant/user message
+  // would otherwise be misassembled as a phantom call. And without a
+  // toolCallId the rehydrated row demotes to assistant but now carries a
+  // tool_result block with no tool_use_id — malformed provider input — so
+  // ID-less rows keep the legacy zero-part path (demote to assistant with
+  // empty content, dropped by the empty-content filter). User and assistant
+  // empty content intentionally stays part-less (the empty-content filter and
+  // the empty-assistant skip are desired behavior).
+  if (
+    message.content.length === 0 &&
+    (role === "tool" || role === "toolResult") &&
+    typeof topLevelToolCallId === "string" &&
+    topLevelToolCallId.length > 0 &&
+    !rawPayloadExternalized
+  ) {
+    // Structured payload capture (P3: lossless layer must not discard data).
+    // `details` rides the top-level message — e.g. update_plan's
+    // `{content: [], details: {...}}` — so preserve it (or its externalized
+    // reference) even though the rehydrated provider-facing block stays a
+    // whitespace text block (adapters only accept text/image there).
+    const details = (message as { details?: unknown }).details;
+    let detailsEntry: Record<string, unknown> = {};
+    if (details !== undefined) {
+      const serializedDetails = toJson(details);
+      const detailsBytes = Buffer.byteLength(serializedDetails, "utf8");
+      if (
+        detailsBytes > MAX_INLINE_TOOL_RESULT_DETAILS_BYTES &&
+        !params.allowOversizedInlineDetailsForAnalysis
+      ) {
+        throw new Error(
+          `Oversized empty tool-result details must be externalized before persistence (toolCallId=${topLevelToolCallId}, bytes=${detailsBytes})`,
+        );
+      }
+      detailsEntry = { details };
+    }
+    parts.push({
+      sessionId,
+      partType: "tool",
+      ordinal: 0,
+      textContent: " ",
+      toolCallId: topLevelToolCallId ?? null,
+      toolName: topLevelToolName ?? null,
+      metadata: toJson({
+        // Always identify as "toolResult" (the raw role may be "tool" but
+        // the logical shape is a tool RESULT); the emptyContentFallback flag
+        // routes rehydration to a provider-valid text block.
+        originalRole: "toolResult",
+        rawType: "tool_result",
+        toolCallId: topLevelToolCallId,
+        toolName: topLevelToolName,
+        isError: topLevelIsError,
+        emptyContentFallback: true,
+        externalizedFileId,
+        originalByteSize,
+        externalizationReason,
+        ...detailsEntry,
       }),
     });
   }

@@ -367,6 +367,7 @@ function getPartMetadata(part: MessagePartRecord): {
   topLevelReasoningField?: string;
   topLevelReasoningContent?: string;
   topLevelReasoningOnly?: boolean;
+  emptyContentFallback?: boolean;
 } {
   const decoded = parseJson(part.metadata);
   if (!decoded || typeof decoded !== "object") {
@@ -380,6 +381,7 @@ function getPartMetadata(part: MessagePartRecord): {
     topLevelReasoningField?: unknown;
     topLevelReasoningContent?: unknown;
     topLevelReasoningOnly?: unknown;
+    emptyContentFallback?: unknown;
   };
   return {
     originalRole:
@@ -405,6 +407,7 @@ function getPartMetadata(part: MessagePartRecord): {
       typeof record.topLevelReasoningOnly === "boolean"
         ? record.topLevelReasoningOnly
         : undefined,
+    emptyContentFallback: record.emptyContentFallback === true,
   };
 }
 
@@ -704,6 +707,16 @@ export function blockFromPart(
     return reasoningBlockFromPart(part, metadata.rawType);
   }
   if (part.partType === "tool") {
+    if (metadata.emptyContentFallback === true) {
+      // #992 identity carrier: pair via the surrounding message's top-level
+      // toolCallId (set from the part), but emit a plain text block —
+      // provider adapters only accept text/image blocks inside toolResult
+      // message content; a nested tool_result block without a valid id would
+      // be dropped or rejected downstream. Whitespace text keeps the block
+      // effectively-empty for coverage canonicalization while surviving the
+      // empty-content filter (toolResult role is not blank-filtered).
+      return { type: "text", text: part.textContent ?? " " };
+    }
     if (metadata.originalRole === "toolResult" || metadata.rawType === "function_call_output") {
       return toolResultBlockFromPart(
         part,

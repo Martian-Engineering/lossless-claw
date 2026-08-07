@@ -282,19 +282,27 @@ describe("sanitizeToolUseResultPairing", () => {
   const toolResultIds = (messages: Msg[]): string[] =>
     messages.filter((m) => m.role === "toolResult" && m.toolCallId).map((m) => m.toolCallId as string);
 
-  it("drops a duplicate assistant tool_use id repeated across two messages", () => {
+  it("drops a byte-identical assistant tool_use repeat while the first call is still pending", () => {
+    // A pending (not-yet-paired) call repeated byte-identically is a store
+    // double-write; the later identical block drops keep-first. Repeats that
+    // arrive with their own later result are distinct occurrences — see the
+    // recurrent-id occurrence semantics suite below.
     const out = sanitizeToolUseResultPairing<Msg>([
       { role: "assistant", content: [{ type: "toolCall", id: "X", name: "bash" }] },
-      { role: "toolResult", toolCallId: "X", content: [{ type: "text", text: "out-1" }] },
       { role: "assistant", content: [{ type: "toolCall", id: "X", name: "bash" }] },
-      { role: "toolResult", toolCallId: "X", content: [{ type: "text", text: "out-2" }] },
+      { role: "toolResult", toolCallId: "X", content: [{ type: "text", text: "out-1" }] },
     ]);
 
     expect(assistantToolUseIds(out)).toEqual(["X"]);
     expect(toolResultIds(out)).toEqual(["X"]);
   });
 
-  it("keeps a distinct tool_use in a later message while dropping the duplicate block", () => {
+  it("keeps a repeated id as a fresh occurrence when a pairable later result exists", () => {
+    // Occurrence-scoped pairing: the second X call reuses an id whose first
+    // occurrence already paired, and a second X result exists for it — the
+    // same shape as `pwd` run twice or a store double-write. Prefer emitting
+    // both occurrences (recoverable by repair-time dedup) over dropping a
+    // possibly-genuine event.
     const out = sanitizeToolUseResultPairing<Msg>([
       { role: "assistant", content: [{ type: "toolCall", id: "X", name: "bash" }] },
       { role: "toolResult", toolCallId: "X", content: [{ type: "text", text: "x" }] },
@@ -309,8 +317,8 @@ describe("sanitizeToolUseResultPairing", () => {
       { role: "toolResult", toolCallId: "Y", content: [{ type: "text", text: "y" }] },
     ]);
 
-    expect(assistantToolUseIds(out).sort()).toEqual(["X", "Y"]);
-    expect(toolResultIds(out).sort()).toEqual(["X", "Y"]);
+    expect(assistantToolUseIds(out).sort()).toEqual(["X", "X", "Y"]);
+    expect(toolResultIds(out).sort()).toEqual(["X", "X", "Y"]);
   });
 
   it("moves a delayed real result before a mixed duplicate and new tool_use turn", () => {
@@ -466,9 +474,8 @@ describe("sanitizeToolUseResultPairing", () => {
     sanitizeToolUseResultPairing<Msg>(
       [
         { role: "assistant", content: [{ type: "toolCall", id: "X", name: "bash" }] },
-        { role: "toolResult", toolCallId: "X", content: [{ type: "text", text: "a" }] },
         { role: "assistant", content: [{ type: "toolCall", id: "X", name: "bash" }] },
-        { role: "toolResult", toolCallId: "X", content: [{ type: "text", text: "b" }] },
+        { role: "toolResult", toolCallId: "X", content: [{ type: "text", text: "a" }] },
       ],
       { warn: (m) => warnings.push(m) }
     );
@@ -490,4 +497,96 @@ describe("sanitizeToolUseResultPairing", () => {
     expect(warnings[0]).not.toContain("duplicate");
   });
 
+});
+
+describe("sanitizeToolUseResultPairing recurrent-id occurrence semantics", () => {
+  type Msg = {
+    role: string;
+    content?: unknown;
+    toolCallId?: string;
+    toolUseId?: string;
+    toolName?: string;
+    stopReason?: string;
+    stop_reason?: string;
+    isError?: boolean;
+  };
+
+  it("keeps identical-args repeats with their own results (`pwd` twice)", () => {
+    const out = sanitizeToolUseResultPairing<Msg>([
+      { role: "assistant", content: [{ type: "toolCall", id: "exec:7", name: "exec", arguments: { command: "pwd" } }] },
+      { role: "toolResult", toolCallId: "exec:7", content: [{ type: "text", text: "/home/jet" }] },
+      { role: "assistant", content: [{ type: "toolCall", id: "exec:7", name: "exec", arguments: { command: "pwd" } }] },
+      { role: "toolResult", toolCallId: "exec:7", content: [{ type: "text", text: "/home/jet" }] },
+    ]);
+    expect(out.filter((m) => m.role === "assistant").length).toBe(2);
+    expect(out.filter((m) => m.role === "toolResult").length).toBe(2);
+    expect(JSON.stringify(out)).not.toContain("missing tool result");
+  });
+
+  it("does not let an earlier call steal a result past the next same-id occurrence", () => {
+    // [call X(a), call X(b), result X]: the result belongs to the newest
+    // pending occurrence; the first call gets a synthetic placeholder instead
+    // of stealing the second call's result.
+    const out = sanitizeToolUseResultPairing<Msg>([
+      { role: "assistant", content: [{ type: "toolCall", id: "exec:9", name: "exec", arguments: { command: "ls /tmp/a" } }] },
+      { role: "assistant", content: [{ type: "toolCall", id: "exec:9", name: "exec", arguments: { command: "ls /tmp/b" } }] },
+      { role: "toolResult", toolCallId: "exec:9", content: [{ type: "text", text: "real-for-b" }] },
+    ]);
+    const resultContents = out
+      .filter((m) => m.role === "toolResult")
+      .map((m) => JSON.stringify(m.content));
+    const realIndex = out.findIndex(
+      (m) => m.role === "toolResult" && JSON.stringify(m.content).includes("real-for-b"),
+    );
+    const callBIndex = out.findIndex(
+      (m) => m.role === "assistant" && JSON.stringify(m.content).includes("ls /tmp/b"),
+    );
+    expect(resultContents.length).toBe(2);
+    expect(callBIndex).toBeGreaterThanOrEqual(0);
+    expect(realIndex).toBe(callBIndex + 1);
+    // The first call gets the synthetic placeholder, never the second call's
+    // real result.
+    expect(resultContents[0]).toContain("missing tool result");
+    expect(resultContents[1]).toContain("real-for-b");
+  });
+
+  it("reprocesses text-bearing identical recurrent calls instead of swallowing them", () => {
+    const out = sanitizeToolUseResultPairing<Msg>([
+      { role: "assistant", content: [{ type: "toolCall", id: "exec:11", name: "exec", arguments: { command: "pwd" } }] },
+      { role: "toolResult", toolCallId: "exec:11", content: [{ type: "text", text: "/home/jet" }] },
+      {
+        role: "assistant",
+        content: [
+          { type: "text", text: "again:" },
+          { type: "toolCall", id: "exec:11", name: "exec", arguments: { command: "pwd" } },
+        ],
+      },
+      { role: "toolResult", toolCallId: "exec:11", content: [{ type: "text", text: "/home/jet" }] },
+    ]);
+    const texts = JSON.stringify(out);
+    expect(out.filter((m) => m.role === "assistant").length).toBe(2);
+    expect(out.filter((m) => m.role === "toolResult").length).toBe(2);
+    expect(texts).toContain("again:");
+    expect(texts).not.toContain("missing tool result");
+  });
+
+  it("collapses same-id tool calls within a single assistant turn (keep-first)", () => {
+    const out = sanitizeToolUseResultPairing<Msg>([
+      {
+        role: "assistant",
+        content: [
+          { type: "toolCall", id: "exec:13", name: "exec", arguments: { command: "ls a" } },
+          { type: "toolCall", id: "exec:13", name: "exec", arguments: { command: "ls b" } },
+        ],
+      },
+      { role: "toolResult", toolCallId: "exec:13", content: [{ type: "text", text: "ok" }] },
+    ]);
+    const calls = out
+      .filter((m) => m.role === "assistant")
+      .flatMap((m) => (Array.isArray(m.content) ? (m.content as Array<{ type?: string }>) : []))
+      .filter((b) => b && typeof b.type === "string" && b.type === "toolCall");
+    expect(calls.length).toBe(1);
+    expect(out.filter((m) => m.role === "toolResult").length).toBe(1);
+    expect(JSON.stringify(out)).not.toContain("missing tool result");
+  });
 });

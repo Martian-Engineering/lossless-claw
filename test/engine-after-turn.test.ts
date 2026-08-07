@@ -4897,10 +4897,13 @@ describe("LcmContextEngine afterTurn", () => {
     expect(rows[0]!.content).toBe("redacted by logging.redactPatterns");
   });
 
-  it("afterTurn dedupes tool/toolResult messages by toolCallId", async () => {
-    // The transcript imports a redacted toolResult message carrying
-    // toolCallId="call-001"; the runtime batch arrives with the same toolCallId
-    // but original content. The previously persisted redacted row stays canonical.
+  it("afterTurn dedupes tool/toolResult messages by provider-unique toolCallId", async () => {
+    // The transcript imports a redacted toolResult message carrying a
+    // provider-unique (Anthropic toolu_) toolCallId; the runtime batch
+    // arrives with the same toolCallId but original content. The previously
+    // persisted redacted row stays canonical. Model-authored recurrent ids
+    // (e.g. Kimi `exec:101`) are intentionally NOT deduped this way — see
+    // stable-event-key-recurrent-id.test.ts.
     const engine = createEngine();
     const sessionId = "after-turn-stable-event-tool-call-id";
     const sessionKey = "agent:main:stable-event-tool-call-id";
@@ -4909,7 +4912,7 @@ describe("LcmContextEngine afterTurn", () => {
       makeMessage({
         role: "toolResult",
         content: [{ type: "text", text: "redacted by logging.redactPatterns" }],
-        toolCallId: "call-001",
+        toolCallId: "toolu_01StableEventDedupeCase",
       }),
     ]);
     await engine.bootstrap({ sessionId, sessionKey, sessionFile });
@@ -4921,7 +4924,7 @@ describe("LcmContextEngine afterTurn", () => {
         makeMessage({
           role: "toolResult",
           content: "original unredacted tool result body",
-          toolCallId: "call-001",
+          toolCallId: "toolu_01StableEventDedupeCase",
         } as never),
       ],
       prePromptMessageCount: 0,
