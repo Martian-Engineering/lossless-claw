@@ -1,5 +1,5 @@
 import { createHash } from "node:crypto";
-import type { ContextEngine } from "./openclaw-bridge.js";
+import type { ContextEngine, OpenClawCompactionMessage } from "./openclaw-bridge.js";
 import { sanitizeToolUseResultPairing } from "./transcript-repair.js";
 import type {
   ConversationStore,
@@ -1990,9 +1990,14 @@ export class ContextAssembler {
     // sanitizeToolUseResultPairing, and "assistant" risks provider
     // first-message/alternation constraints handled only by OpenClaw upstream.
     // Downgrading the role requires upstream support; tracked in issue #71.
+    const message: OpenClawCompactionMessage = {
+      role: "user",
+      content,
+      __openclaw: { kind: "compaction" },
+    };
     return {
       ordinal: item.ordinal,
-      message: { role: "user" as const, content } as AgentMessage,
+      message,
       tokens,
       isMessage: false,
       text: summary.content,
