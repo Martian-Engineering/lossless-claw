@@ -72,6 +72,7 @@ import {
 import { FocusBriefStore, type FocusBriefRecord } from "./store/focus-brief-store.js";
 import { buildToolCallInputMap } from "./tool-pairing.js";
 import { PendingSummaryStore } from "./store/pending-summary-store.js";
+import { parseUtcTimestampOrNull } from "./store/parse-utc-timestamp.js";
 import { SummaryStore, type ContextItemRecord } from "./store/summary-store.js";
 import { createLcmSummarizeFromLegacyParams, FALLBACK_SUMMARY_MARKER, LcmProviderAuthError, LcmSummarySpendLimitError, type LcmSummarizeFn } from "./summarize.js";
 import type {
@@ -317,7 +318,7 @@ function transcriptAuditTimestampMs(value: Date | string | undefined): number | 
   if (typeof value !== "string" || value.trim().length === 0) {
     return null;
   }
-  const ms = Date.parse(value);
+  const ms = parseUtcTimestampOrNull(value)?.getTime() ?? Number.NaN;
   return Number.isFinite(ms) ? ms : null;
 }
 
@@ -331,6 +332,10 @@ function selectLegacyPrefixFrontier(params: {
   const persistedTimes = params.messages
     .map((message) => transcriptAuditTimestampMs(message.createdAt))
     .filter((ms): ms is number => ms !== null);
+  const hasNonBlankStampedMessage = params.messages.some(
+    (message) => message.transcriptEntryId && message.content.trim().length > 0,
+  );
+  const startsAfterOmittedParent = Boolean(params.entries[0]?.parentId);
   const maxPersistedTime = persistedTimes.length > 0 ? Math.max(...persistedTimes) : null;
   if (maxPersistedTime === null) {
     return {
@@ -353,6 +358,14 @@ function selectLegacyPrefixFrontier(params: {
     };
   }
   if (freshSuffixIndex === 0) {
+    // A conflicting nonblank id can indicate a rewritten projection. Record a
+    // one-entry baseline instead of treating timestamp order as overlap proof.
+    if (hasNonBlankStampedMessage && !startsAfterOmittedParent) {
+      return {
+        frontier: params.entries.length === 1 ? params.entries[0]! : null,
+        allowsUnanchoredImport: false,
+      };
+    }
     return {
       frontier: null,
       allowsUnanchoredImport: true,
