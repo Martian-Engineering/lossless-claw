@@ -74,9 +74,6 @@ export type ContextEngineMaintenanceResult = {
 
 export type ContextEngineMaintenanceRuntimeContext = Record<string, unknown> & {
   allowDeferredCompactionExecution?: boolean;
-  rewriteTranscriptEntries?: (
-    request: Record<string, unknown>,
-  ) => Promise<ContextEngineMaintenanceResult>;
 };
 
 export type IngestResult = {
@@ -106,7 +103,7 @@ export type ContextEngineInfo = {
 
 export type ContextEngineOperation = "agent-run" | "manual-compact" | "subagent-spawn";
 
-export type ContextEngineControlOperation = "status" | "doctor" | "rotate";
+export type ContextEngineControlOperation = "status" | "doctor";
 
 export type ContextEngineControlCapabilities = {
   status: boolean;
@@ -126,16 +123,9 @@ export type ContextEngineControlDoctorResult = {
   warnings: string[];
 };
 
-export type ContextEngineControlRotateResult = {
-  operation: "rotate";
-  messageCount: number;
-  lastRotatedAt: string;
-};
-
 export type ContextEngineControlResult =
   | ContextEngineControlStatusResult
-  | ContextEngineControlDoctorResult
-  | ContextEngineControlRotateResult;
+  | ContextEngineControlDoctorResult;
 
 export type ContextEngineControlRequest = {
   agentId?: string;
@@ -229,6 +219,23 @@ export type AgentMessage = {
   output?: unknown;
 };
 
+export type ContextEngineSessionTarget = {
+  agentId?: string;
+  sessionId?: string;
+  sessionKey?: string;
+  storePath?: string;
+  threadId?: string | number;
+};
+
+export type ContextEngineRuntimeContext = {
+  sessionTarget?: ContextEngineSessionTarget;
+  transcriptStorage?: {
+    kind?: string;
+    [key: string]: unknown;
+  };
+  [key: string]: unknown;
+};
+
 export type ContextEngine = {
   info: ContextEngineInfo;
   bootstrap(params: {
@@ -236,6 +243,8 @@ export type ContextEngine = {
     sessionKey?: string;
     sessionFile?: string;
     messages?: AgentMessage[];
+    sessionTarget?: ContextEngineSessionTarget;
+    runtimeContext?: ContextEngineRuntimeContext;
   }): Promise<BootstrapResult>;
   ingest(params: {
     sessionId: string;
@@ -251,6 +260,7 @@ export type ContextEngine = {
   afterTurn?(params: {
     sessionId: string;
     sessionKey?: string;
+    sessionTarget?: ContextEngineSessionTarget;
     sessionFile: string;
     messages: AgentMessage[];
     prePromptMessageCount: number;

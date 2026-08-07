@@ -128,6 +128,16 @@ describe("estimateSerializedMessageTokens", () => {
     expect(estimateSerializedMessageTokens(message)).toBeGreaterThan(15_000);
   });
 
+  it("uses provider-boundary pressure for large plain-text tool results", () => {
+    const payload = "x".repeat(20_000);
+    const message = {
+      role: "toolResult",
+      toolName: "exec",
+      content: payload,
+    };
+    expect(estimateSerializedMessageTokens(message)).toBeGreaterThan(11_000);
+  });
+
   it("counts repeated shared block references in full", () => {
     const block = { type: "text", text: "shared block ".repeat(100) };
     const shared = { role: "user", content: [block, block] };

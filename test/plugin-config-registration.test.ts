@@ -1,4 +1,4 @@
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
@@ -24,10 +24,6 @@ vi.mock("openclaw/plugin-sdk/logging-core", () => ({
 type RegisteredEngineFactory = (() => unknown) | undefined;
 type HookHandler = (event: unknown, context: unknown) => unknown;
 type RegisteredContextEngine = { id: string; factory: () => unknown };
-type SessionStoreSnapshot = Record<string, {
-  totalTokens?: unknown;
-  totalTokensFresh?: unknown;
-}>;
 
 function buildApi(
   pluginConfig: unknown,
@@ -157,41 +153,6 @@ function buildApi(
     sessionInfoLog,
     sessionWarnLog,
   };
-}
-
-/** Attach a file-backed session-store runtime API to a mock plugin API. */
-function attachSessionStoreApi(api: OpenClawPluginApi, sessionStorePath: string): void {
-  (api.runtime as unknown as {
-    channel: {
-      session: {
-        resolveStorePath: (store?: string) => string;
-        loadSessionStore: (storePath: string) => Record<string, unknown>;
-        resolveSessionFilePath: (
-          sessionId: string,
-          entry?: { sessionFile?: unknown },
-        ) => string;
-      };
-    };
-  }).channel.session = {
-    resolveStorePath: (store?: string) => (typeof store === "string" ? store : sessionStorePath),
-    loadSessionStore: (storePath: string) => JSON.parse(readFileSync(storePath, "utf8")) as Record<string, unknown>,
-    resolveSessionFilePath: (runtimeSessionId: string, entry?: { sessionFile?: unknown }) =>
-      typeof entry?.sessionFile === "string" && entry.sessionFile.trim()
-        ? entry.sessionFile
-        : join(tmpdir(), `${runtimeSessionId}.jsonl`),
-  };
-}
-
-/** Read a session-store snapshot, tolerating transient partial writes during async recovery. */
-function readSessionStoreSnapshot(sessionStorePath: string): SessionStoreSnapshot | undefined {
-  try {
-    return JSON.parse(readFileSync(sessionStorePath, "utf8")) as SessionStoreSnapshot;
-  } catch (error) {
-    if (error instanceof SyntaxError) {
-      return undefined;
-    }
-    throw error;
-  }
 }
 
 function defaultModelConfig(model: string): Record<string, unknown> {
@@ -327,14 +288,11 @@ describe("lcm plugin registration", () => {
   );
 
   it.each(["discovery", "tool-discovery"])(
-    "does not schedule startup maintenance during %s registration",
+    "does not initialize the runtime database during %s registration",
     async (registrationMode) => {
       const dbPath = join(tmpdir(), `lossless-claw-${Date.now()}-${Math.random().toString(16)}.db`);
       dbPaths.add(dbPath);
       const createSpy = vi.spyOn(connectionModule, "createLcmDatabaseConnection");
-      const autoRotateSpy = vi
-        .spyOn(LcmContextEngine.prototype, "autoRotateManagedSessionFilesAtStartup")
-        .mockResolvedValue();
       const { api, getFactory } = buildApi(
         { enabled: true, dbPath },
         { registrationMode },
@@ -348,76 +306,13 @@ describe("lcm plugin registration", () => {
         "Engine initialization is disabled during read-only plugin registration",
       );
       expect(createSpy).not.toHaveBeenCalled();
-      expect(autoRotateSpy).not.toHaveBeenCalled();
     },
   );
 
-  it("schedules startup maintenance when live registration follows read-only registration", () => {
-    const dbPath = join(tmpdir(), `lossless-claw-${Date.now()}-${Math.random().toString(16)}.db`);
-    dbPaths.add(dbPath);
-    const autoRotateSpy = vi
-      .spyOn(LcmContextEngine.prototype, "autoRotateManagedSessionFilesAtStartup")
-      .mockResolvedValue();
-    const first = buildApi(
-      { enabled: true, dbPath },
-      { registrationMode: "discovery" },
-    );
-
-    lcmPlugin.register(first.api);
-    expect(autoRotateSpy).not.toHaveBeenCalled();
-
-    const second = buildApi({ enabled: true, dbPath });
-    lcmPlugin.register(second.api);
-
-    expect(autoRotateSpy).toHaveBeenCalledTimes(1);
-  });
-
-  it("uses live runtime startup APIs after read-only registration", () => {
-    const dbPath = join(tmpdir(), `lossless-claw-${Date.now()}-${Math.random().toString(16)}.db`);
-    dbPaths.add(dbPath);
-    const sessionStorePath = join(
-      tmpdir(),
-      `lossless-claw-session-store-${Date.now()}-${Math.random().toString(16)}.json`,
-    );
-    const autoRotateSpy = vi
-      .spyOn(LcmContextEngine.prototype, "autoRotateManagedSessionFilesAtStartup")
-      .mockResolvedValue();
-    writeFileSync(sessionStorePath, "{}\n", "utf8");
-
-    const first = buildApi(
-      { enabled: true, dbPath },
-      { registrationMode: "discovery" },
-    );
-    lcmPlugin.register(first.api);
-    expect(autoRotateSpy).not.toHaveBeenCalled();
-
-    const second = buildApi(
-      { enabled: true, dbPath },
-      {
-        runtimeConfig: {
-          session: {
-            store: sessionStorePath,
-          },
-        },
-      },
-    );
-    attachSessionStoreApi(second.api, sessionStorePath);
-    lcmPlugin.register(second.api);
-
-    expect(autoRotateSpy).toHaveBeenCalledTimes(1);
-    expect(autoRotateSpy).toHaveBeenCalledWith({
-      listStartupSessionFileCandidates: expect.any(Function),
-    });
-    rmSync(sessionStorePath, { force: true });
-  });
-
-  it("does not schedule startup maintenance during CLI runtime inspection", async () => {
+  it("does not initialize the runtime database during CLI runtime inspection", async () => {
     const dbPath = join(tmpdir(), `lossless-claw-${Date.now()}-${Math.random().toString(16)}.db`);
     const originalArgv = process.argv;
     dbPaths.add(dbPath);
-    const autoRotateSpy = vi
-      .spyOn(LcmContextEngine.prototype, "autoRotateManagedSessionFilesAtStartup")
-      .mockResolvedValue();
     const { api, getFactory } = buildApi({ enabled: true, dbPath });
 
     process.argv = ["node", "openclaw", "plugins", "inspect", "lossless-claw", "--runtime"];
@@ -429,7 +324,6 @@ describe("lcm plugin registration", () => {
       await expect(Promise.resolve(factory!())).rejects.toThrow(
         "Engine initialization is disabled during read-only plugin registration",
       );
-      expect(autoRotateSpy).not.toHaveBeenCalled();
     } finally {
       process.argv = originalArgv;
     }
@@ -462,7 +356,7 @@ describe("lcm plugin registration", () => {
     delete (api as unknown as { registerContextEngine?: unknown }).registerContextEngine;
 
     expect(() => lcmPlugin.register(api)).toThrow(
-      /requires OpenClaw >=2026\.5\.28 with api\.registerContextEngine/,
+      /requires OpenClaw >=2026\.7\.2-beta\.2 with api\.registerContextEngine/,
     );
     expect(createSpy).not.toHaveBeenCalled();
     expect(api.registerCommand).not.toHaveBeenCalled();
@@ -537,7 +431,6 @@ describe("lcm plugin registration", () => {
         ignoreSessionPatterns: ["agent:*:cron:**", "agent:main:subagent:**"],
         statelessSessionPatterns: ["agent:*:subagent:**"],
         skipStatelessSessions: true,
-        transcriptGcEnabled: true,
         proactiveThresholdCompactionMode: "inline",
         largeFileThresholdTokens: 12345,
         independentLogFile: {
@@ -578,7 +471,6 @@ describe("lcm plugin registration", () => {
       ignoreSessionPatterns: ["agent:*:cron:**", "agent:main:subagent:**"],
       statelessSessionPatterns: ["agent:*:subagent:**"],
       skipStatelessSessions: true,
-      transcriptGcEnabled: true,
       proactiveThresholdCompactionMode: "inline",
       largeFileTokenThreshold: 12345,
     });
@@ -589,7 +481,6 @@ describe("lcm plugin registration", () => {
     expect(infoLog).toHaveBeenCalledWith(
       `[lcm] Plugin loaded (enabled=true, db=${dbPath}, threshold=0.33, proactiveThresholdCompactionMode=inline)`,
     );
-    expect(infoLog).toHaveBeenCalledWith("[lcm] Transcript GC enabled (default false)");
     expect(infoLog).toHaveBeenCalledWith(
       "[lcm] Proactive threshold compaction mode: inline (default deferred)",
     );
@@ -820,63 +711,40 @@ describe("lcm plugin registration", () => {
     });
   });
 
-  it("collects delegated expansion replies through getSessionMessages", async () => {
+  it("reads delegated replies through the OpenClaw 2026.7.2 subagent adapter", async () => {
     const dbPath = join(tmpdir(), `lossless-claw-${Date.now()}-${Math.random().toString(16)}.db`);
     dbPaths.add(dbPath);
 
     const { api, getFactory } = buildApi({ enabled: true, dbPath });
-    const run = api.runtime.subagent.run as ReturnType<typeof vi.fn>;
-    const waitForRun = api.runtime.subagent.waitForRun as ReturnType<typeof vi.fn>;
     const getSessionMessages = api.runtime.subagent.getSessionMessages as ReturnType<typeof vi.fn>;
-    const deleteSession = api.runtime.subagent.deleteSession as ReturnType<typeof vi.fn>;
-    run.mockResolvedValue({ runId: "run-delegated-expansion" });
-    waitForRun.mockResolvedValue({ status: "ok" });
     getSessionMessages.mockResolvedValue({
-      messages: [
-        {
-          role: "assistant",
-          content: [
-            {
-              type: "text",
-              text: JSON.stringify({
-                summary: "Delegated answer collected.",
-                citedIds: ["sum_1059"],
-                followUpSummaryIds: [],
-                totalTokens: 42,
-                truncated: false,
-              }),
-            },
-          ],
-        },
-      ],
+      messages: [{ role: "assistant", content: "completed focus brief" }],
     });
-
     lcmPlugin.register(api);
+
     const engine = getFactory()!() as {
-      deps?: Parameters<typeof runDelegatedExpansionLoop>[0]["deps"];
+      deps?: {
+        callGateway: (params: {
+          method: string;
+          params?: Record<string, unknown>;
+        }) => Promise<unknown>;
+      };
     };
 
-    const result = await runDelegatedExpansionLoop({
-      deps: engine.deps!,
-      requesterSessionKey: "agent:main:main",
-      conversationId: 1059,
-      summaryIds: ["sum_1059"],
-      includeMessages: false,
+    const result = await engine.deps?.callGateway({
+      method: "sessions.get",
+      params: {
+        key: "agent:main:subagent:focus",
+        limit: 80,
+      },
     });
 
-    expect(result).toMatchObject({
-      status: "ok",
-      citedIds: ["sum_1059"],
+    expect(result).toEqual({
+      messages: [{ role: "assistant", content: "completed focus brief" }],
     });
-    expect(result.text).toContain("Delegated answer collected.");
-    expect(result.text).toContain("sum_1059");
     expect(getSessionMessages).toHaveBeenCalledWith({
-      sessionKey: expect.stringMatching(/^agent:main:subagent:/),
+      sessionKey: "agent:main:subagent:focus",
       limit: 80,
-    });
-    expect(deleteSession).toHaveBeenCalledWith({
-      sessionKey: expect.stringMatching(/^agent:main:subagent:/),
-      deleteTranscript: true,
     });
   });
 
@@ -1155,155 +1023,6 @@ describe("lcm plugin registration", () => {
     );
   });
 
-  it("preserves registration config fallback when live runtime config is unavailable for startup scans", async () => {
-    const dbPath = join(tmpdir(), `lossless-claw-${Date.now()}-${Math.random().toString(16)}.db`);
-    dbPaths.add(dbPath);
-    const sessionStorePath = join(
-      tmpdir(),
-      `lossless-claw-session-store-${Date.now()}-${Math.random().toString(16)}.json`,
-    );
-    const sessionId = `alpha-session-${Date.now()}-${Math.random().toString(16).slice(2)}`;
-    const sessionKey = `agent:alpha:chat:${Math.random().toString(16).slice(2)}`;
-    const sessionFile = join(tmpdir(), `${sessionId}.jsonl`);
-
-    writeFileSync(
-      sessionStorePath,
-      `${JSON.stringify({
-        [sessionKey]: {
-          sessionId,
-          sessionFile,
-        },
-      }, null, 2)}\n`,
-      "utf8",
-    );
-
-    const { api, getFactory } = buildApi({ enabled: true, dbPath });
-    api.config = {
-      session: {
-        store: sessionStorePath,
-      },
-      agents: {
-        list: [{ id: "alpha", enabled: true }],
-      },
-    } as OpenClawPluginApi["config"];
-    attachSessionStoreApi(api, sessionStorePath);
-    delete (api.runtime as unknown as { config?: unknown }).config;
-
-    lcmPlugin.register(api);
-
-    const factory = getFactory();
-    expect(factory).toBeTypeOf("function");
-    const engine = factory!() as {
-      deps?: {
-        listStartupSessionFileCandidates: () => Promise<Array<{
-          sessionId: string;
-          sessionKey: string;
-          sessionFile: string;
-          agentId: string;
-          storePath: string;
-        }>>;
-      };
-    };
-
-    await expect(engine.deps?.listStartupSessionFileCandidates()).resolves.toEqual([
-      {
-        sessionId,
-        sessionKey,
-        sessionFile,
-        agentId: "alpha",
-        storePath: sessionStorePath,
-      },
-    ]);
-    rmSync(sessionStorePath, { force: true });
-  });
-
-  it("uses the agent encoded in sessionKey when resolving a transcript file", async () => {
-    const dbPath = join(tmpdir(), `lossless-claw-${Date.now()}-${Math.random().toString(16)}.db`);
-    dbPaths.add(dbPath);
-    const alphaStorePath = join(
-      tmpdir(),
-      `lossless-claw-alpha-store-${Date.now()}-${Math.random().toString(16)}.json`,
-    );
-    const betaStorePath = join(
-      tmpdir(),
-      `lossless-claw-beta-store-${Date.now()}-${Math.random().toString(16)}.json`,
-    );
-    const sessionId = `shared-session-${Date.now()}-${Math.random().toString(16).slice(2)}`;
-    const sessionKey = `agent:alpha:chat:${Math.random().toString(16).slice(2)}`;
-    const alphaSessionFile = join(tmpdir(), `${sessionId}-alpha.jsonl`);
-    const betaSessionFile = join(tmpdir(), `${sessionId}-beta.jsonl`);
-
-    writeFileSync(
-      alphaStorePath,
-      `${JSON.stringify({
-        [sessionKey]: {
-          sessionId,
-          sessionFile: alphaSessionFile,
-        },
-      }, null, 2)}\n`,
-      "utf8",
-    );
-    writeFileSync(
-      betaStorePath,
-      `${JSON.stringify({
-        [`agent:beta:chat:${Math.random().toString(16).slice(2)}`]: {
-          sessionId,
-          sessionFile: betaSessionFile,
-        },
-      }, null, 2)}\n`,
-      "utf8",
-    );
-
-    const { api, getFactory } = buildApi({ enabled: true, dbPath });
-    const resolveStorePath = vi.fn((_store: string | undefined, options?: { agentId?: string }) =>
-      options?.agentId === "alpha" ? alphaStorePath : betaStorePath,
-    );
-    (api.runtime as unknown as {
-      channel: {
-        session: {
-          resolveStorePath: typeof resolveStorePath;
-          loadSessionStore: (storePath: string) => Record<string, unknown>;
-          resolveSessionFilePath: (
-            runtimeSessionId: string,
-            entry?: { sessionFile?: unknown },
-          ) => string;
-        };
-      };
-    }).channel.session = {
-      resolveStorePath,
-      loadSessionStore: (storePath: string) => JSON.parse(readFileSync(storePath, "utf8")) as Record<string, unknown>,
-      resolveSessionFilePath: (runtimeSessionId: string, entry?: { sessionFile?: unknown }) =>
-        typeof entry?.sessionFile === "string" && entry.sessionFile.trim()
-          ? entry.sessionFile
-          : join(tmpdir(), `${runtimeSessionId}.jsonl`),
-    };
-
-    lcmPlugin.register(api);
-
-    const factory = getFactory();
-    expect(factory).toBeTypeOf("function");
-    const engine = factory!() as {
-      deps?: {
-        resolveSessionTranscriptFile: (params: {
-          agentId?: string;
-          sessionId: string;
-          sessionKey?: string;
-        }) => Promise<string | undefined>;
-      };
-    };
-
-    await expect(
-      engine.deps?.resolveSessionTranscriptFile({
-        agentId: "beta",
-        sessionId,
-        sessionKey,
-      }),
-    ).resolves.toBe(alphaSessionFile);
-    expect(resolveStorePath).toHaveBeenCalledWith(undefined, { agentId: "alpha" });
-    rmSync(alphaStorePath, { force: true });
-    rmSync(betaStorePath, { force: true });
-  });
-
   it("uses runtime OpenClaw defaults when api.pluginConfig is ready before api.config", () => {
     const { api, getFactory, infoLog } = buildApi(
       {
@@ -1410,7 +1129,6 @@ describe("lcm plugin registration", () => {
     const startupBannerMessages = [...firstMessages, ...secondMessages].filter((message) =>
       [
         "[lcm] Plugin loaded (enabled=true, db=",
-        "[lcm] Transcript GC ",
         "[lcm] Proactive threshold compaction mode:",
         "[lcm] Compaction summarization model:",
         "[lcm] Ignoring sessions matching ",
@@ -1420,7 +1138,6 @@ describe("lcm plugin registration", () => {
 
     expect(startupBannerMessages.sort()).toEqual([
       `[lcm] Plugin loaded (enabled=true, db=${dbPath}, threshold=0.33, proactiveThresholdCompactionMode=deferred)`,
-      "[lcm] Transcript GC disabled (default false)",
       "[lcm] Proactive threshold compaction mode: deferred (default deferred)",
       "[lcm] Compaction summarization model: (unconfigured)",
       "[lcm] Ignoring sessions matching 2 pattern(s) from plugin config: agent:*:cron:**, agent:main:subagent:**",
@@ -1510,419 +1227,6 @@ describe("lcm plugin registration", () => {
         databasePath: dbPath,
       },
     });
-  });
-
-  it("recovers stale session totalTokens from persisted context on startup", async () => {
-    const dbPath = join(tmpdir(), `lossless-claw-${Date.now()}-${Math.random().toString(16)}.db`);
-    dbPaths.add(dbPath);
-    const sessionStorePath = join(
-      tmpdir(),
-      `lossless-claw-session-store-${Date.now()}-${Math.random().toString(16)}.json`,
-    );
-    const sessionId = `test-session-${Date.now()}-${Math.random().toString(16).slice(2)}`;
-    const sessionKey = `agent:main:chat:${Math.random().toString(16).slice(2)}`;
-    const sessionFilePath = join(tmpdir(), `${sessionId}.jsonl`);
-
-    writeFileSync(
-      sessionStorePath,
-      `${JSON.stringify({
-        [sessionKey]: {
-          sessionId,
-          sessionFile: sessionFilePath,
-          totalTokens: null,
-          totalTokensFresh: false,
-          inputTokens: 1_200,
-          cacheRead: 300,
-          contextTokens: 200_000,
-        },
-      }, null, 2)}\n`,
-      "utf8",
-    );
-
-    const first = buildApi(
-      { enabled: true, dbPath },
-      {
-        runtimeConfig: {
-          session: {
-            store: sessionStorePath,
-          },
-        },
-      },
-    );
-    (first.api.runtime as unknown as {
-      channel: {
-        session: {
-          resolveStorePath: (store?: string) => string;
-          loadSessionStore: (storePath: string) => Record<string, unknown>;
-          resolveSessionFilePath: (
-            sessionId: string,
-            entry?: { sessionFile?: unknown },
-          ) => string;
-        };
-      };
-    }).channel.session = {
-      resolveStorePath: (store?: string) => (typeof store === "string" ? store : sessionStorePath),
-      loadSessionStore: (storePath: string) => JSON.parse(readFileSync(storePath, "utf8")) as Record<string, unknown>,
-      resolveSessionFilePath: (runtimeSessionId: string, entry?: { sessionFile?: unknown }) =>
-        typeof entry?.sessionFile === "string" && entry.sessionFile.trim()
-          ? entry.sessionFile
-          : join(tmpdir(), `${runtimeSessionId}.jsonl`),
-    };
-    lcmPlugin.register(first.api);
-    const firstFactory = first.getFactory();
-    expect(firstFactory).toBeTypeOf("function");
-    const firstEngine = await Promise.resolve(firstFactory!()) as {
-      getConversationStore: () => {
-        createConversation: (input: { sessionId: string; sessionKey: string }) => Promise<{
-          conversationId: number;
-        }>;
-      };
-      getSummaryStore: () => {
-        insertSummary: (input: {
-          summaryId: string;
-          conversationId: number;
-          kind: "leaf";
-          content: string;
-          tokenCount: number;
-        }) => Promise<void>;
-        appendContextSummary: (conversationId: number, summaryId: string) => Promise<void>;
-      };
-    };
-    const conversation = await firstEngine.getConversationStore().createConversation({
-      sessionId,
-      sessionKey,
-    });
-    const summaryId = `summary-${Math.random().toString(16).slice(2)}`;
-    await firstEngine.getSummaryStore().insertSummary({
-      summaryId,
-      conversationId: conversation.conversationId,
-      kind: "leaf",
-      content: "Persisted summary content",
-      tokenCount: 7_000,
-    });
-    await firstEngine.getSummaryStore().appendContextSummary(conversation.conversationId, summaryId);
-    await first.getHook("gateway_stop")?.({}, {});
-
-    const second = buildApi(
-      { enabled: true, dbPath },
-      {
-        runtimeConfig: {
-          session: {
-            store: sessionStorePath,
-          },
-        },
-      },
-    );
-    (second.api.runtime as unknown as {
-      channel: {
-        session: {
-          resolveStorePath: (store?: string) => string;
-          loadSessionStore: (storePath: string) => Record<string, unknown>;
-          resolveSessionFilePath: (
-            sessionId: string,
-            entry?: { sessionFile?: unknown },
-          ) => string;
-        };
-      };
-    }).channel.session = {
-      resolveStorePath: (store?: string) => (typeof store === "string" ? store : sessionStorePath),
-      loadSessionStore: (storePath: string) => JSON.parse(readFileSync(storePath, "utf8")) as Record<string, unknown>,
-      resolveSessionFilePath: (runtimeSessionId: string, entry?: { sessionFile?: unknown }) =>
-        typeof entry?.sessionFile === "string" && entry.sessionFile.trim()
-          ? entry.sessionFile
-          : join(tmpdir(), `${runtimeSessionId}.jsonl`),
-    };
-    lcmPlugin.register(second.api);
-    const secondFactory = second.getFactory();
-    expect(secondFactory).toBeTypeOf("function");
-    await Promise.resolve(secondFactory!());
-
-    let recoveredEntry:
-      | {
-          totalTokens?: unknown;
-          totalTokensFresh?: unknown;
-        }
-      | undefined;
-    for (let attempt = 0; attempt < 30; attempt += 1) {
-      const store = readSessionStoreSnapshot(sessionStorePath);
-      recoveredEntry = store?.[sessionKey];
-      if (
-        recoveredEntry
-        && typeof recoveredEntry.totalTokens === "number"
-        && recoveredEntry.totalTokens > 0
-        && recoveredEntry.totalTokensFresh === true
-      ) {
-        break;
-      }
-      await new Promise((resolve) => setTimeout(resolve, 10));
-    }
-
-    expect(recoveredEntry).toMatchObject({
-      totalTokensFresh: true,
-    });
-    expect(typeof recoveredEntry?.totalTokens).toBe("number");
-    expect((recoveredEntry?.totalTokens as number)).toBeGreaterThanOrEqual(8_500);
-    rmSync(sessionStorePath, { force: true });
-  });
-
-  it("does not overwrite fresh session totalTokens during startup recovery", async () => {
-    const dbPath = join(tmpdir(), `lossless-claw-${Date.now()}-${Math.random().toString(16)}.db`);
-    dbPaths.add(dbPath);
-    const sessionStorePath = join(
-      tmpdir(),
-      `lossless-claw-session-store-${Date.now()}-${Math.random().toString(16)}.json`,
-    );
-    const sessionId = `fresh-session-${Date.now()}-${Math.random().toString(16).slice(2)}`;
-    const sessionKey = `agent:main:chat:${Math.random().toString(16).slice(2)}`;
-    const sessionFilePath = join(tmpdir(), `${sessionId}.jsonl`);
-
-    writeFileSync(
-      sessionStorePath,
-      `${JSON.stringify({
-        [sessionKey]: {
-          sessionId,
-          sessionFile: sessionFilePath,
-          totalTokens: 50_000,
-          totalTokensFresh: true,
-          inputTokens: 1_200,
-          cacheRead: 300,
-        },
-      }, null, 2)}\n`,
-      "utf8",
-    );
-
-    const first = buildApi(
-      { enabled: true, dbPath },
-      {
-        runtimeConfig: {
-          session: {
-            store: sessionStorePath,
-          },
-        },
-      },
-    );
-    attachSessionStoreApi(first.api, sessionStorePath);
-    lcmPlugin.register(first.api);
-    const firstFactory = first.getFactory();
-    expect(firstFactory).toBeTypeOf("function");
-    const firstEngine = await Promise.resolve(firstFactory!()) as {
-      getConversationStore: () => {
-        createConversation: (input: { sessionId: string; sessionKey: string }) => Promise<{
-          conversationId: number;
-        }>;
-      };
-      getSummaryStore: () => {
-        insertSummary: (input: {
-          summaryId: string;
-          conversationId: number;
-          kind: "leaf";
-          content: string;
-          tokenCount: number;
-        }) => Promise<void>;
-        appendContextSummary: (conversationId: number, summaryId: string) => Promise<void>;
-      };
-    };
-    const conversation = await firstEngine.getConversationStore().createConversation({
-      sessionId,
-      sessionKey,
-    });
-    const summaryId = `summary-${Math.random().toString(16).slice(2)}`;
-    await firstEngine.getSummaryStore().insertSummary({
-      summaryId,
-      conversationId: conversation.conversationId,
-      kind: "leaf",
-      content: "Persisted summary content",
-      tokenCount: 7_000,
-    });
-    await firstEngine.getSummaryStore().appendContextSummary(conversation.conversationId, summaryId);
-    await first.getHook("gateway_stop")?.({}, {});
-
-    const second = buildApi(
-      { enabled: true, dbPath },
-      {
-        runtimeConfig: {
-          session: {
-            store: sessionStorePath,
-          },
-        },
-      },
-    );
-    attachSessionStoreApi(second.api, sessionStorePath);
-    lcmPlugin.register(second.api);
-    const secondFactory = second.getFactory();
-    expect(secondFactory).toBeTypeOf("function");
-    await Promise.resolve(secondFactory!());
-
-    let store: SessionStoreSnapshot | undefined;
-    for (let attempt = 0; attempt < 30; attempt += 1) {
-      store = readSessionStoreSnapshot(sessionStorePath);
-      if (store?.[sessionKey]?.totalTokens === 50_000) {
-        break;
-      }
-      await new Promise((resolve) => setTimeout(resolve, 10));
-    }
-    expect(store?.[sessionKey]).toMatchObject({
-      totalTokens: 50_000,
-      totalTokensFresh: true,
-    });
-    rmSync(sessionStorePath, { force: true });
-  });
-
-  it("preserves session store writes made while startup recovery is pending", async () => {
-    const dbPath = join(tmpdir(), `lossless-claw-${Date.now()}-${Math.random().toString(16)}.db`);
-    dbPaths.add(dbPath);
-    const sessionStorePath = join(
-      tmpdir(),
-      `lossless-claw-session-store-${Date.now()}-${Math.random().toString(16)}.json`,
-    );
-    const sessionId = `stale-session-${Date.now()}-${Math.random().toString(16).slice(2)}`;
-    const sessionKey = `agent:main:chat:${Math.random().toString(16).slice(2)}`;
-    const concurrentSessionKey = `agent:main:chat:${Math.random().toString(16).slice(2)}`;
-    const sessionFilePath = join(tmpdir(), `${sessionId}.jsonl`);
-
-    writeFileSync(
-      sessionStorePath,
-      `${JSON.stringify({
-        [sessionKey]: {
-          sessionId,
-          sessionFile: sessionFilePath,
-          totalTokens: null,
-          totalTokensFresh: false,
-          inputTokens: 1_200,
-          cacheRead: 300,
-        },
-      }, null, 2)}\n`,
-      "utf8",
-    );
-
-    const first = buildApi(
-      { enabled: true, dbPath },
-      {
-        runtimeConfig: {
-          session: {
-            store: sessionStorePath,
-          },
-        },
-      },
-    );
-    attachSessionStoreApi(first.api, sessionStorePath);
-    lcmPlugin.register(first.api);
-    const firstFactory = first.getFactory();
-    expect(firstFactory).toBeTypeOf("function");
-    const firstEngine = await Promise.resolve(firstFactory!()) as {
-      getConversationStore: () => {
-        createConversation: (input: { sessionId: string; sessionKey: string }) => Promise<{
-          conversationId: number;
-        }>;
-      };
-      getSummaryStore: () => {
-        insertSummary: (input: {
-          summaryId: string;
-          conversationId: number;
-          kind: "leaf";
-          content: string;
-          tokenCount: number;
-        }) => Promise<void>;
-        appendContextSummary: (conversationId: number, summaryId: string) => Promise<void>;
-      };
-    };
-    const conversation = await firstEngine.getConversationStore().createConversation({
-      sessionId,
-      sessionKey,
-    });
-    const summaryId = `summary-${Math.random().toString(16).slice(2)}`;
-    await firstEngine.getSummaryStore().insertSummary({
-      summaryId,
-      conversationId: conversation.conversationId,
-      kind: "leaf",
-      content: "Persisted summary content",
-      tokenCount: 7_000,
-    });
-    await firstEngine.getSummaryStore().appendContextSummary(conversation.conversationId, summaryId);
-    await first.getHook("gateway_stop")?.({}, {});
-
-    const second = buildApi(
-      { enabled: true, dbPath },
-      {
-        runtimeConfig: {
-          session: {
-            store: sessionStorePath,
-          },
-        },
-      },
-    );
-    let injectedConcurrentWrite = false;
-    (second.api.runtime as unknown as {
-      channel: {
-        session: {
-          resolveStorePath: (store?: string) => string;
-          loadSessionStore: (storePath: string) => Record<string, unknown>;
-          resolveSessionFilePath: (
-            sessionId: string,
-            entry?: { sessionFile?: unknown },
-          ) => string;
-        };
-      };
-    }).channel.session = {
-      resolveStorePath: (store?: string) => (typeof store === "string" ? store : sessionStorePath),
-      loadSessionStore: (storePath: string) => {
-        const loaded = JSON.parse(readFileSync(storePath, "utf8")) as Record<string, unknown>;
-        if (!injectedConcurrentWrite) {
-          injectedConcurrentWrite = true;
-          writeFileSync(
-            storePath,
-            `${JSON.stringify({
-              ...loaded,
-              [concurrentSessionKey]: {
-                sessionId: "concurrent-session",
-                sessionFile: join(tmpdir(), "concurrent-session.jsonl"),
-                totalTokens: 12_345,
-                totalTokensFresh: true,
-              },
-            }, null, 2)}\n`,
-            "utf8",
-          );
-        }
-        return loaded;
-      },
-      resolveSessionFilePath: (runtimeSessionId: string, entry?: { sessionFile?: unknown }) =>
-        typeof entry?.sessionFile === "string" && entry.sessionFile.trim()
-          ? entry.sessionFile
-          : join(tmpdir(), `${runtimeSessionId}.jsonl`),
-    };
-    lcmPlugin.register(second.api);
-    const secondFactory = second.getFactory();
-    expect(secondFactory).toBeTypeOf("function");
-    await Promise.resolve(secondFactory!());
-
-    let recoveredStore:
-      | Record<string, {
-          totalTokens?: unknown;
-          totalTokensFresh?: unknown;
-        }>
-      | undefined;
-    for (let attempt = 0; attempt < 30; attempt += 1) {
-      recoveredStore = readSessionStoreSnapshot(sessionStorePath);
-      const recoveredEntry = recoveredStore?.[sessionKey];
-      if (
-        recoveredEntry
-        && typeof recoveredEntry.totalTokens === "number"
-        && recoveredEntry.totalTokens > 0
-        && recoveredEntry.totalTokensFresh === true
-      ) {
-        break;
-      }
-      await new Promise((resolve) => setTimeout(resolve, 10));
-    }
-
-    expect(recoveredStore?.[sessionKey]).toMatchObject({
-      totalTokensFresh: true,
-    });
-    expect(recoveredStore?.[concurrentSessionKey]).toMatchObject({
-      totalTokens: 12_345,
-      totalTokensFresh: true,
-    });
-    rmSync(sessionStorePath, { force: true });
   });
 
   it("surfaces deferred init failures after gateway_start runs", async () => {
