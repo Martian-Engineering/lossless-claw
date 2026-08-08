@@ -43,9 +43,39 @@ type StoredIncomingMatch =
   | "unproven-externalized"
   | "redacted";
 type CoveredStoredIncomingMatch = StoredIncomingMatch | "decorated";
-type AlignmentMatch = CoveredStoredIncomingMatch | "unanchored-inbound";
+type AlignmentMatch = CoveredStoredIncomingMatch | "unanchored-inbound" | "provenanced-inbound";
 
-function isStrongReplayAnchor(match: AlignmentMatch | undefined): boolean {
+/**
+ * True when a persisted row may anchor the same-turn metadata-face collapse.
+ * Three conditions, all required: the row is host-proven (transcript
+ * provenance), its message id is in the set the current afterTurn's own
+ * transcript reconcile reported as inserted (ground truth from the insert
+ * sites, not an insertion-order inference), and it is the conversation's
+ * newest user row after that reconcile. Membership ties the anchor to this
+ * very reconcile's writes; the newest-user condition ties it to the turn's
+ * own inbound, so a historical row a catch-up reconcile backfilled in the
+ * same pass can never anchor while a newer user row exists. Any condition
+ * missing (including callers that pass no set) keeps the match weak: it may
+ * support alignment but never anchors a collapse.
+ */
+function persistedRowAnchorsSameTurnCollapse(
+  record: Pick<MessageRecord, "transcriptEntryId" | "messageId">,
+  sameTurnInsertedIds: ReadonlySet<number> | undefined,
+  newestUserMessageId: number | undefined,
+): boolean {
+  if (record.transcriptEntryId == null) return false;
+  if (!sameTurnInsertedIds || !sameTurnInsertedIds.has(record.messageId)) return false;
+  return newestUserMessageId !== undefined && record.messageId === newestUserMessageId;
+}
+
+/**
+ * Anchors that may vouch for rows beyond their own: exact identity or the
+ * strict structural decoration gate. "provenanced-inbound" is deliberately
+ * absent — its proof (body equality under the same-turn floor) authenticates
+ * only its own row, so it never carries a neighboring redacted or otherwise
+ * weak match into a trim.
+ */
+function isIndependentReplayAnchor(match: AlignmentMatch | undefined): boolean {
   return match === "exact" || match === "decorated";
 }
 
@@ -53,8 +83,30 @@ function redactedMatchesHaveAdjacentAnchor(matches: readonly AlignmentMatch[]): 
   return matches.every(
     (match, index) =>
       match !== "redacted" ||
-      isStrongReplayAnchor(matches[index - 1]) ||
-      isStrongReplayAnchor(matches[index + 1]),
+      isIndependentReplayAnchor(matches[index - 1]) ||
+      isIndependentReplayAnchor(matches[index + 1]),
+  );
+}
+
+/**
+ * Trim decision for the covered-frontier alignment. Either an independent
+ * anchor (exact/decorated) proves the suffix under the pre-existing contract
+ * (with redacted rows needing an independent neighbor), or every row is
+ * self-proven — exact, decorated, or a provenanced-inbound row whose own
+ * same-turn ingest authenticates it. A provenanced-inbound match never
+ * extends its authority to any other row: a suffix that still contains an
+ * unanchored or redacted row alongside only provenanced-inbound strength is
+ * left untrimmed.
+ */
+function alignedSuffixIsAnchored(matches: readonly AlignmentMatch[]): boolean {
+  if (matches.some(isIndependentReplayAnchor)) {
+    return redactedMatchesHaveAdjacentAnchor(matches);
+  }
+  return (
+    matches.length > 0 &&
+    matches.every(
+      (match) => match === "provenanced-inbound" || isIndependentReplayAnchor(match),
+    )
   );
 }
 
@@ -244,6 +296,7 @@ export class BatchDeduplicator {
     sessionId: string,
     sessionKey: string | undefined,
     batch: AgentMessage[],
+    sameTurnInsertedIds?: ReadonlySet<number>,
   ): Promise<AgentMessage[]> {
     if (batch.length === 0) return batch;
 
@@ -257,6 +310,15 @@ export class BatchDeduplicator {
     const storedBatch = batch.map((message) => toStoredMessage(message));
     const batchHashes = computeBatchIdentityHashes(storedBatch);
     const rawPayloadContents = computeBatchRawPayloadContents(batch, storedBatch);
+    // Resolved once, after this turn's reconcile has already run: on the
+    // covered route the reconcile read the transcript to its frontier, so the
+    // newest user row IS this turn's inbound. Only that row may anchor the
+    // metadata-face collapse (see persistedRowAnchorsSameTurnCollapse).
+    const newestUserMessageId =
+      sameTurnInsertedIds === undefined || sameTurnInsertedIds.size === 0
+        ? undefined
+        : (await this.conversationStore.getLastMessageWithRole(conversationId, "user"))
+            ?.messageId;
     const tail = await this.conversationStore.getLastMessages(conversationId, batch.length);
     const tailHashes = await this.conversationStore.getRecentMessageIdentityHashes(
       conversationId,
@@ -310,10 +372,24 @@ export class BatchDeduplicator {
               { allowUntimestampedInboundBodyMatch: true },
             )
           ) {
-            // Stored provenance qualifies this as alignment support, but it
-            // authenticates only the persisted row. Another exact/timestamp
-            // anchor must still prove the runtime batch is a replay.
-            matches.push("unanchored-inbound");
+            // Stored provenance authenticates only the persisted row. When
+            // that row is among the ids THIS turn's own reconcile inserted
+            // AND is the conversation's newest user row, the incoming
+            // decorated face is the end-of-turn copy of that very ingest
+            // (the store double-write) and anchors the collapse of its own
+            // row. Any other row — older, backfilled by a catch-up reconcile
+            // in the same pass, or shadowed by a newer user row — stays weak
+            // and needs an independent exact/timestamp anchor, so an echo or
+            // replay of an earlier turn duplicates instead of trimming.
+            matches.push(
+              persistedRowAnchorsSameTurnCollapse(
+                tailMessages[i]!,
+                sameTurnInsertedIds,
+                newestUserMessageId,
+              )
+                ? "provenanced-inbound"
+                : "unanchored-inbound",
+            );
             continue;
           }
           aligned = false;
@@ -322,13 +398,10 @@ export class BatchDeduplicator {
         matches.push(match);
       }
       // Externalized-only matches are ambiguous in the same way as suffix
-      // fallback anchors: they may be a replay or a legitimate repeated upload.
-      // Trim only when at least one matched message still has exact identity.
-      if (
-        aligned &&
-        matches.some(isStrongReplayAnchor) &&
-        redactedMatchesHaveAdjacentAnchor(matches)
-      ) {
+      // fallback anchors: they may be a replay or a legitimate repeated
+      // upload. Trim only under an independent anchor, or when every row in
+      // the suffix proves itself (see alignedSuffixIsAnchored).
+      if (aligned && alignedSuffixIsAnchored(matches)) {
         return batch.slice(k);
       }
     }
@@ -687,7 +760,7 @@ export class BatchDeduplicator {
         }
         matches.push(match);
       }
-      const exactAnchor = matches.some(isStrongReplayAnchor);
+      const exactAnchor = matches.some(isIndependentReplayAnchor);
       const redactionAnchored = redactedMatchesHaveAdjacentAnchor(matches);
       const newSlice = batch.slice(k + 1);
       // Outside the transcript-covered path, an externalized-only anchor is

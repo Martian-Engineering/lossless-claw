@@ -2918,7 +2918,7 @@ export class LcmContextEngine implements ContextEngine {
     // Append to context items so assembler can see it
     await this.summaryStore.appendContextMessage(conversationId, msgRecord.messageId);
 
-    return { ingested: true };
+    return { ingested: true, messageId: msgRecord.messageId };
   }
 
   async ingest(params: {
@@ -3128,11 +3128,17 @@ export class LcmContextEngine implements ContextEngine {
       // The transcript reconcile read the file to its frontier, so the DB
       // tail is exact — use precise alignment instead of the heuristic
       // dedup stack, and persist only what the transcript flush has not
-      // delivered yet.
+      // delivered yet. The reconcile reports the exact message ids it
+      // inserted this turn; only those rows may anchor the metadata-face
+      // collapse (ground truth, not an insertion-order inference). An empty
+      // or absent set keeps the strong collapse off.
       dedupedNewMessages = await this.batchDeduplicator.alignRuntimeBatchAgainstCoveredFrontier(
         params.sessionId,
         params.sessionKey,
         newMessages,
+        transcriptReconcileResult.insertedMessageIds?.length
+          ? new Set(transcriptReconcileResult.insertedMessageIds)
+          : undefined,
       );
       if (newMessages.length > 0 && dedupedNewMessages.length < newMessages.length) {
         this.deps.log.debug(

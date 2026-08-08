@@ -423,6 +423,7 @@ export class TranscriptReconciler {
 
     const replayTwinIndex = this.buildReplayTwinIndex(historicalMessages);
     let importedMessages = 0;
+    const insertedMessageIds: number[] = [];
     let adoptedMessages = 0;
     let restampedMessages = 0;
     let replayTwinsSkipped = 0;
@@ -480,6 +481,7 @@ export class TranscriptReconciler {
       if (result.ingested) {
         importedMessages += 1;
         cappedImportProgress += 1;
+        if (result.messageId !== undefined) insertedMessageIds.push(result.messageId);
       }
     }
 
@@ -491,10 +493,11 @@ export class TranscriptReconciler {
         blockedByImportCap: true,
         blockedReason: "import-cap",
         importedMessages,
+        insertedMessageIds,
         hasOverlap: true,
       };
     }
-    return { blockedByImportCap: false, importedMessages, hasOverlap: true };
+    return { blockedByImportCap: false, importedMessages, insertedMessageIds, hasOverlap: true };
   }
 
   /**
@@ -865,7 +868,7 @@ export class TranscriptReconciler {
       );
     }
 
-    const importedMessages = await this.ingestBatch({
+    const { importedMessages, insertedMessageIds } = await this.ingestBatch({
       sessionId,
       sessionKey: params.sessionKey,
       messages: importableTail,
@@ -880,6 +883,7 @@ export class TranscriptReconciler {
         blockedByImportCap: true,
         blockedReason: "import-cap",
         importedMessages,
+        insertedMessageIds,
         hasOverlap: true,
       };
     }
@@ -887,7 +891,7 @@ export class TranscriptReconciler {
     this.host.deps.log.debug(
       `[lcm] reconcileSessionTail: slow path for ${sessionContext} duration=${formatDurationMs(Date.now() - startedAt)} historicalMessages=${historicalMessages.length} anchorIndex=${anchorIndex} missingTail=${missingTail.length} importedMessages=${importedMessages}`,
     );
-    return { blockedByImportCap: false, importedMessages, hasOverlap: true };
+    return { blockedByImportCap: false, importedMessages, insertedMessageIds, hasOverlap: true };
   }
 
   /**
@@ -906,6 +910,7 @@ export class TranscriptReconciler {
     const existingCount = await this.host.conversationStore.getMessageCount(params.conversationId);
     if (existingCount === 0) {
       let importedMessages = 0;
+      const insertedMessageIds: number[] = [];
       for (const message of params.historicalMessages) {
         const result = await this.host.ingestSingle({
           sessionId: params.sessionId,
@@ -916,6 +921,7 @@ export class TranscriptReconciler {
         });
         if (result.ingested) {
           importedMessages += 1;
+          if (result.messageId !== undefined) insertedMessageIds.push(result.messageId);
         }
       }
       await this.host.conversationStore.markConversationBootstrapped(params.conversationId);
@@ -926,6 +932,7 @@ export class TranscriptReconciler {
       });
       return {
         importedMessages,
+        insertedMessageIds,
         blockedByImportCap: false,
         hasOverlap: true,
         transcriptCovered: importedMessages > 0,
@@ -1124,6 +1131,7 @@ export class TranscriptReconciler {
         .filter((id): id is string => id !== null),
     );
     let importedMessages = 0;
+    const insertedMessageIds: number[] = [];
     let adoptedMessages = 0;
     for (const message of noAnchorImportMessages) {
       const entryId = getTranscriptEntryId(message);
@@ -1186,6 +1194,7 @@ export class TranscriptReconciler {
       });
       if (result.ingested) {
         importedMessages += 1;
+        if (result.messageId !== undefined) insertedMessageIds.push(result.messageId);
       }
     }
     // A fresh-ambiguous-rollover rebind imports the rolled transcript as a new
@@ -1205,6 +1214,7 @@ export class TranscriptReconciler {
         blockedByImportCap: true,
         blockedReason: "import-cap",
         importedMessages,
+        insertedMessageIds,
         hasOverlap: adoptedMessages > 0,
       };
     }
@@ -1212,7 +1222,12 @@ export class TranscriptReconciler {
     // host re-issued ids for messages we already hold), so report the
     // overlap — the caller then refreshes the checkpoint instead of
     // re-entering this path every turn.
-    return { blockedByImportCap: false, importedMessages, hasOverlap: adoptedMessages > 0 };
+    return {
+      blockedByImportCap: false,
+      importedMessages,
+      insertedMessageIds,
+      hasOverlap: adoptedMessages > 0,
+    };
   }
 
   /**
@@ -1770,9 +1785,10 @@ export class TranscriptReconciler {
   }
 
   /**
-   * Ingest a reconciled batch in order, returning how many rows persisted.
-   * Indexes below `replayGuardExemptPrefixLength` skip the replay-timestamp
-   * flood guard (transcript-proven history); pass Infinity to exempt all.
+   * Ingest a reconciled batch in order, returning how many rows persisted
+   * and their message ids. Indexes below `replayGuardExemptPrefixLength`
+   * skip the replay-timestamp flood guard (transcript-proven history); pass
+   * Infinity to exempt all.
    */
   private async ingestBatch(params: {
     sessionId: string;
@@ -1785,8 +1801,9 @@ export class TranscriptReconciler {
     replayTwinConversationId?: number;
     replayTwinSessionFile?: string;
     onReplayTwinSkipped?: () => void;
-  }): Promise<number> {
+  }): Promise<{ importedMessages: number; insertedMessageIds: number[] }> {
     let importedMessages = 0;
+    const insertedMessageIds: number[] = [];
     // Tier 2 full-tail index, built lazily at most once per batch: only a Tier-1
     // store hit (a persisted same-identity, same-second row) justifies the full
     // leaf-path re-read.
@@ -1833,9 +1850,10 @@ export class TranscriptReconciler {
       });
       if (result.ingested) {
         importedMessages += 1;
+        if (result.messageId !== undefined) insertedMessageIds.push(result.messageId);
       }
     }
-    return importedMessages;
+    return { importedMessages, insertedMessageIds };
   }
 
   /**
@@ -1938,7 +1956,7 @@ export class TranscriptReconciler {
         );
         return { importedMessages: 0, blockedByImportCap: true, hasOverlap: false };
       }
-      const importedMessages = await this.ingestBatch({
+      const { importedMessages, insertedMessageIds } = await this.ingestBatch({
         sessionId: params.sessionId,
         sessionKey: params.sessionKey,
         messages: bootstrapMessages,
@@ -1963,6 +1981,7 @@ export class TranscriptReconciler {
       }
       return {
         importedMessages,
+        insertedMessageIds,
         blockedByImportCap: bootstrapMessages.length < historicalMessages.length,
         hasOverlap: true,
         transcriptCovered: true,
@@ -2076,7 +2095,7 @@ export class TranscriptReconciler {
         });
         if (!appendOnlyOverlapsPersisted) {
           let replayTwinsSkipped = 0;
-          const importedMessages = await this.ingestBatch({
+          const { importedMessages, insertedMessageIds } = await this.ingestBatch({
             sessionId: params.sessionId,
             sessionKey: params.sessionKey,
             messages: replayFilteredMessages,
@@ -2101,6 +2120,7 @@ export class TranscriptReconciler {
           }
           return {
             importedMessages,
+            insertedMessageIds,
             blockedByImportCap: false,
             hasOverlap: true,
             transcriptCovered: true,
