@@ -72,6 +72,21 @@ When configuring npm trusted publishing, register the GitHub workflow using the 
 
 The publish workflow is intentionally manual. Release issuance should stay deliberate even after trusted publishing is enabled.
 
+## ClawHub releases
+
+Publish to npm first. After the npm workflow creates the matching `vX.Y.Z` tag,
+manually run `Publish to ClawHub` from that exact tag with `dry_run` set to
+`false`.
+
+The workflow refuses to publish unless the selected tag, `package.json`
+version, npm version, npm `gitHead`, and selected commit all identify the same
+release. Real ClawHub publishes are serialized.
+
+ClawHub trusted publishing is configured for
+`.github/workflows/clawhub-publish.yml`; no long-lived repository token is
+required. Deleting that trusted-publisher configuration disables future
+publishes.
+
 ## Beta releases
 
 Use a Changesets prerelease when `main` needs broader testing before a stable release:
