@@ -20,18 +20,38 @@ describe("ClawHub publish workflow", () => {
       (match) => match[1],
     );
 
-    expect(refs).toEqual([clawhubWorkflowCommit, clawhubWorkflowCommit]);
+    expect(refs).toEqual([
+      clawhubWorkflowCommit,
+      clawhubWorkflowCommit,
+      clawhubWorkflowCommit,
+    ]);
   });
 
-  it("requires the selected release tag to match the npm commit", () => {
+  it("resolves the requested release tag to the npm commit", () => {
+    expect(workflow).toContain("release_tag:");
     expect(workflow).toContain("release-preflight:");
-    expect(workflow).toContain('GITHUB_REF_TYPE" != "tag"');
-    expect(workflow).toContain('GITHUB_REF_NAME" != "$expected_tag"');
+    expect(workflow).toContain("ref: ${{ inputs.release_tag }}");
+    expect(workflow).toContain(
+      'git fetch --no-tags origin "refs/tags/$RELEASE_TAG:refs/tags/$RELEASE_TAG"',
+    );
+    expect(workflow).toContain(
+      'tag_sha="$(git rev-list -n 1 "refs/tags/$RELEASE_TAG")"',
+    );
+    expect(workflow).toContain('source_sha" != "$tag_sha"');
     expect(workflow).toContain(
       'npm view "$package_name@$version" version gitHead --json',
     );
-    expect(workflow).toContain('published_sha" != "$GITHUB_SHA"');
-    expect(workflow).toMatch(/publish:\n\s+needs: release-preflight/);
+    expect(workflow).toContain('published_sha" != "$source_sha"');
+    expect(workflow).toContain('echo "source_sha=$source_sha" >> "$GITHUB_OUTPUT"');
+  });
+
+  it("binds manual validation and publication to the verified commit", () => {
+    expect(workflow).toMatch(
+      /release-dry-run:\n\s+needs: release-preflight(?:.|\n)*?source: \$\{\{ github\.repository \}\}(?:.|\n)*?ref: \$\{\{ needs\.release-preflight\.outputs\.source_sha \}\}(?:.|\n)*?source_ref: refs\/tags\/\$\{\{ inputs\.release_tag \}\}/,
+    );
+    expect(workflow).toMatch(
+      /publish:\n\s+needs: release-preflight(?:.|\n)*?source: \$\{\{ github\.repository \}\}(?:.|\n)*?ref: \$\{\{ needs\.release-preflight\.outputs\.source_sha \}\}(?:.|\n)*?source_ref: refs\/tags\/\$\{\{ inputs\.release_tag \}\}/,
+    );
   });
 
   it("serializes real publishes without cancelling an active release", () => {
