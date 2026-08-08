@@ -4,6 +4,10 @@ on:
   pull_request:
   workflow_dispatch:
     inputs:
+      release_tag:
+        description: Existing npm and GitHub release tag to publish
+        required: true
+        type: string
       dry_run:
         description: Validate the ClawHub package without publishing
         required: true
@@ -12,7 +16,7 @@ on:
 
 jobs:
   dry-run:
-    if: (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository) || inputs.dry_run
+    if: github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository
     permissions:
       actions: read
       contents: read
@@ -23,17 +27,22 @@ jobs:
       dry_run: true
 
   release-preflight:
-    if: github.event_name == 'workflow_dispatch' && inputs.dry_run == false
+    if: github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
     permissions:
       contents: read
+    outputs:
+      source_sha: ${{ steps.identity.outputs.source_sha }}
     steps:
       - name: Checkout selected release
         uses: actions/checkout@v4
         with:
-          ref: ${{ github.sha }}
+          ref: ${{ inputs.release_tag }}
 
       - name: Verify npm release identity
+        id: identity
+        env:
+          RELEASE_TAG: ${{ inputs.release_tag }}
         run: |
           set -euo pipefail
 
@@ -41,14 +50,16 @@ jobs:
           version="$(node -p "require('./package.json').version")"
           expected_tag="v$version"
 
-          if [ "$GITHUB_REF_TYPE" != "tag" ] || [ "$GITHUB_REF_NAME" != "$expected_tag" ]; then
-            echo "Select release tag $expected_tag, not $GITHUB_REF"
+          if [ "$RELEASE_TAG" != "$expected_tag" ]; then
+            echo "Select release tag $expected_tag, not $RELEASE_TAG"
             exit 1
           fi
 
           source_sha="$(git rev-parse HEAD)"
-          if [ "$source_sha" != "$GITHUB_SHA" ]; then
-            echo "Checked out $source_sha, expected selected commit $GITHUB_SHA"
+          git fetch --no-tags origin "refs/tags/$RELEASE_TAG:refs/tags/$RELEASE_TAG"
+          tag_sha="$(git rev-list -n 1 "refs/tags/$RELEASE_TAG")"
+          if [ "$source_sha" != "$tag_sha" ]; then
+            echo "Checked out $source_sha, expected $RELEASE_TAG at $tag_sha"
             exit 1
           fi
 
@@ -56,13 +67,31 @@ jobs:
           published_version="$(node -e 'const data=JSON.parse(process.argv[1]); process.stdout.write(data.version || "")' "$npm_state")"
           published_sha="$(node -e 'const data=JSON.parse(process.argv[1]); process.stdout.write(data.gitHead || "")' "$npm_state")"
 
-          if [ "$published_version" != "$version" ] || [ "$published_sha" != "$GITHUB_SHA" ]; then
-            echo "npm identity does not match $expected_tag at $GITHUB_SHA"
+          if [ "$published_version" != "$version" ] || [ "$published_sha" != "$source_sha" ]; then
+            echo "npm identity does not match $expected_tag at $source_sha"
             exit 1
           fi
 
+          echo "source_sha=$source_sha" >> "$GITHUB_OUTPUT"
+
+  release-dry-run:
+    needs: release-preflight
+    if: github.event_name == 'workflow_dispatch' && inputs.dry_run
+    permissions:
+      actions: read
+      contents: read
+      id-token: write
+    # openclaw/clawhub package-publish.yml v0.23.1
+    uses: openclaw/clawhub/.github/workflows/package-publish.yml@a230d962db64019462c2c8ee400755eb92169908
+    with:
+      source: ${{ github.repository }}
+      ref: ${{ needs.release-preflight.outputs.source_sha }}
+      source_ref: refs/tags/${{ inputs.release_tag }}
+      dry_run: true
+
   publish:
     needs: release-preflight
+    if: github.event_name == 'workflow_dispatch' && inputs.dry_run == false
     concurrency:
       group: clawhub-publish
       cancel-in-progress: false
@@ -73,4 +102,7 @@ jobs:
     # openclaw/clawhub package-publish.yml v0.23.1
     uses: openclaw/clawhub/.github/workflows/package-publish.yml@a230d962db64019462c2c8ee400755eb92169908
     with:
+      source: ${{ github.repository }}
+      ref: ${{ needs.release-preflight.outputs.source_sha }}
+      source_ref: refs/tags/${{ inputs.release_tag }}
       dry_run: false

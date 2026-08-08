@@ -75,12 +75,15 @@ The publish workflow is intentionally manual. Release issuance should stay delib
 ## ClawHub releases
 
 Publish to npm first. After the npm workflow creates the matching `vX.Y.Z` tag,
-manually run `Publish to ClawHub` from that exact tag with `dry_run` set to
-`false`.
+manually run `Publish to ClawHub` from the default branch with `release_tag`
+set to that tag. Run once with `dry_run` set to `true`, review the validation,
+then run again with `dry_run` set to `false`.
 
 The workflow refuses to publish unless the selected tag, `package.json`
-version, npm version, npm `gitHead`, and selected commit all identify the same
-release. Real ClawHub publishes are serialized.
+version, npm version, npm `gitHead`, and the tag's immutable commit all identify
+the same release. Real ClawHub publishes are serialized. Selecting the default
+branch allows releases whose tags predate this workflow to be published without
+moving those tags or weakening the npm commit check.
 
 ClawHub trusted publishing is configured for
 `.github/workflows/clawhub-publish.yml`; no long-lived repository token is
