@@ -215,6 +215,10 @@ export type PluginSessionActionResult =
   | { ok?: true; result?: unknown }
   | { ok: false; error: string; code?: string; details?: unknown };
 
+/** Host-owned metadata preserved on messages exchanged with OpenClaw. */
+export type OpenClawMessageMetadata = Record<string, unknown>;
+
+/** Message shape exchanged across the local OpenClaw context-engine bridge. */
 export type AgentMessage = {
   role: string;
   content?: any;
@@ -227,6 +231,12 @@ export type AgentMessage = {
   stopReason?: string;
   command?: string;
   output?: unknown;
+  __openclaw?: OpenClawMessageMetadata;
+};
+
+/** Synthetic summary message that OpenClaw renders as a compaction boundary. */
+export type OpenClawCompactionMessage = AgentMessage & {
+  __openclaw: { kind: "compaction" };
 };
 
 export type ContextEngine = {
