@@ -1412,6 +1412,17 @@ export function runLcmMigrations(
       PRIMARY KEY (step_name, algorithm_version)
     );
 
+    CREATE TABLE IF NOT EXISTS turn_advancements (
+      advancement_key TEXT PRIMARY KEY,
+      payload_hash TEXT NOT NULL,
+      session_id TEXT NOT NULL,
+      session_key TEXT,
+      admission_entry_id TEXT NOT NULL,
+      terminal_entry_id TEXT NOT NULL,
+      message_count INTEGER NOT NULL,
+      committed_at TEXT NOT NULL DEFAULT (datetime('now'))
+    );
+
     -- Indexes
     CREATE INDEX IF NOT EXISTS messages_conv_seq_idx ON messages (conversation_id, seq);
     CREATE INDEX IF NOT EXISTS message_anchor_trust_conv_state_idx
@@ -1446,6 +1457,8 @@ export function runLcmMigrations(
       ON focus_briefs (conversation_id, status, created_at);
     CREATE INDEX IF NOT EXISTS focus_brief_sources_summary_idx
       ON focus_brief_sources (summary_id);
+    CREATE INDEX IF NOT EXISTS turn_advancements_session_idx
+      ON turn_advancements (session_id, committed_at);
 
     -- Speed up summary_messages lookups by message_id (PK is summary_id,message_id)
     CREATE INDEX IF NOT EXISTS summary_messages_message_idx ON summary_messages (message_id);

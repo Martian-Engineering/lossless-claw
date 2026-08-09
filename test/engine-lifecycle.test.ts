@@ -46,6 +46,10 @@ describe("LcmContextEngine metadata", () => {
       "prompt",
       "runtimeContext",
     ]);
+    expect(engine.info.transcriptSemantics).toEqual({
+      currentTurnFence: "before-current-turn-entry-v1",
+      turnAdvancementIdempotency: "atomic-idempotent-v1",
+    });
   });
 
   it("advertises ownsCompaction capability", () => {

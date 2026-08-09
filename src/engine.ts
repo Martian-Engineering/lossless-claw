@@ -19,6 +19,8 @@ import type {
   IngestResult,
   SubagentEndReason,
   SubagentSpawnPreparation,
+  TranscriptEntryAnchor,
+  TranscriptTurnAdmission,
 } from "./openclaw-bridge.js";
 import { ContextAssembler } from "./assembler.js";
 import { CompactionEngine, type CompactionConfig } from "./compaction.js";
@@ -132,6 +134,84 @@ const LOSSLESS_AGENT_RUN_CAPTURE_ONLY_HOST_CAPABILITIES: ContextEngineHostCapabi
   "maintain",
 ];
 const MAX_PREVIOUS_ASSEMBLED_SNAPSHOTS = 100;
+
+type CommitTurnParams = {
+  advancementKey: string;
+  admission: TranscriptTurnAdmission;
+  terminal: TranscriptEntryAnchor;
+  messages: AgentMessage[];
+  prePromptMessageCount: number;
+  sessionId: string;
+  sessionKey?: string;
+  sessionTarget?: ContextEngineSessionTarget;
+  runtimeSettings?: Record<string, unknown>;
+  runtimeContext?: ContextEngineRuntimeContext;
+  isHeartbeat?: boolean;
+};
+
+/** JSON.stringify semantics with stable object-key ordering for retry identity. */
+function canonicalizeTurnPayload(value: unknown): unknown {
+  if (Array.isArray(value)) {
+    return value.map((entry) => canonicalizeTurnPayload(entry));
+  }
+  if (value && typeof value === "object") {
+    return Object.fromEntries(
+      Object.entries(value as Record<string, unknown>)
+        .filter(([, entry]) => entry !== undefined)
+        .sort(([left], [right]) => left.localeCompare(right))
+        .map(([key, entry]) => [key, canonicalizeTurnPayload(entry)]),
+    );
+  }
+  return value;
+}
+
+function buildTurnAdvancementPayloadHash(params: CommitTurnParams): string {
+  const canonicalPayload = canonicalizeTurnPayload({
+    admission: params.admission,
+    isHeartbeat: params.isHeartbeat === true,
+    messages: params.messages,
+    prePromptMessageCount: params.prePromptMessageCount,
+    sessionId: params.sessionId,
+    sessionKey: params.sessionKey,
+    terminal: params.terminal,
+  });
+  return createHash("sha256").update(JSON.stringify(canonicalPayload)).digest("hex");
+}
+
+function assertValidTurnAdvancement(params: CommitTurnParams): void {
+  const { admission, terminal } = params;
+  if (!params.advancementKey || params.advancementKey !== admission.logicalTurnId) {
+    throw new Error("turn advancement key does not match transcript admission");
+  }
+  if (
+    params.sessionId !== admission.sessionId ||
+    (params.sessionKey !== undefined && params.sessionKey !== admission.sessionKey) ||
+    terminal.agentId !== admission.agentId ||
+    terminal.sessionId !== admission.sessionId ||
+    terminal.sessionKey !== admission.sessionKey ||
+    terminal.storePath !== admission.storePath ||
+    terminal.generation !== admission.generation ||
+    params.sessionTarget?.agentId !== undefined &&
+      params.sessionTarget.agentId !== admission.agentId ||
+    params.sessionTarget?.sessionId !== undefined &&
+      params.sessionTarget.sessionId !== admission.sessionId ||
+    params.sessionTarget?.sessionKey !== undefined &&
+      params.sessionTarget.sessionKey !== admission.sessionKey ||
+    params.sessionTarget?.storePath !== undefined &&
+      params.sessionTarget.storePath !== admission.storePath
+  ) {
+    throw new Error("turn advancement transcript target changed after admission");
+  }
+  if (
+    !Number.isSafeInteger(params.prePromptMessageCount) ||
+    params.prePromptMessageCount < 0 ||
+    params.prePromptMessageCount > params.messages.length ||
+    params.prePromptMessageCount !== admission.activeMessagePosition ||
+    terminal.activeMessagePosition < admission.activeMessagePosition
+  ) {
+    throw new Error("turn advancement transcript range is invalid");
+  }
+}
 
 // Host-contract dependency: the deliberate-vs-incidental archive distinction
 // relies on OpenClaw emitting these exact reason strings only for genuine
@@ -500,6 +580,10 @@ export class LcmContextEngine implements ContextEngine {
       name: "Lossless Context Management Engine",
       version: packageJson.version,
       acceptedHostParams: ["sessionKey", "prompt", "runtimeContext"],
+      transcriptSemantics: {
+        currentTurnFence: "before-current-turn-entry-v1",
+        turnAdvancementIdempotency: "atomic-idempotent-v1",
+      },
       ownsCompaction: migrationOk,
       turnMaintenanceMode: "background",
       hostRequirements: {
@@ -3714,6 +3798,83 @@ export class LcmContextEngine implements ContextEngine {
           ...(params.sessionKey?.trim() ? [`sessionKey=${params.sessionKey.trim()}`] : []),
           `messages=${params.messages.length}`,
         ].join(" "),
+      },
+    );
+  }
+
+  /**
+   * Persist one host-accepted transcript turn and its advancement receipt in
+   * the same SQLite transaction. The host may safely retry after losing the
+   * response; a reused key with a different payload fails closed.
+   */
+  async commitTurn(params: CommitTurnParams): Promise<{ status: "committed" | "duplicate" }> {
+    assertValidTurnAdvancement(params);
+    this.ensureMigrated();
+    const payloadHash = buildTurnAdvancementPayloadHash(params);
+    const sessionId = params.admission.sessionId;
+    const sessionKey = params.admission.sessionKey;
+
+    return this.withSessionQueue(
+      this.resolveSessionQueueKey(sessionId, sessionKey),
+      async () =>
+        this.conversationStore.withTransaction(async () => {
+          const existing = this.db
+            .prepare(
+              `SELECT payload_hash
+               FROM turn_advancements
+               WHERE advancement_key = ?`,
+            )
+            .get(params.advancementKey) as { payload_hash: string } | undefined;
+          if (existing) {
+            if (existing.payload_hash !== payloadHash) {
+              throw new Error(
+                `context-engine advancement key collision: ${params.advancementKey}`,
+              );
+            }
+            return { status: "duplicate" as const };
+          }
+
+          let ingestedCount = 0;
+          const turnMessages = params.messages.slice(params.prePromptMessageCount);
+          for (const message of turnMessages) {
+            const result = await this.ingestSingle({
+              sessionId,
+              sessionKey,
+              message,
+              isHeartbeat: params.isHeartbeat === true,
+              createdAt: resolveTranscriptMessageCreatedAt(message),
+            });
+            if (result.ingested) {
+              ingestedCount += 1;
+            }
+          }
+
+          this.db
+            .prepare(
+              `INSERT INTO turn_advancements (
+                 advancement_key,
+                 payload_hash,
+                 session_id,
+                 session_key,
+                 admission_entry_id,
+                 terminal_entry_id,
+                 message_count
+               ) VALUES (?, ?, ?, ?, ?, ?, ?)`,
+            )
+            .run(
+              params.advancementKey,
+              payloadHash,
+              sessionId,
+              sessionKey,
+              params.admission.entryId,
+              params.terminal.entryId,
+              ingestedCount,
+            );
+          return { status: "committed" as const };
+        }),
+      {
+        operationName: "commitTurn",
+        context: `session=${sessionId} sessionKey=${sessionKey} advancementKey=${params.advancementKey}`,
       },
     );
   }

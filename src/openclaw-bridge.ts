@@ -96,6 +96,10 @@ export type ContextEngineInfo = {
   name: string;
   version: string;
   acceptedHostParams?: string[];
+  transcriptSemantics?: {
+    currentTurnFence?: "before-current-turn-entry-v1";
+    turnAdvancementIdempotency?: "atomic-idempotent-v1";
+  };
   ownsCompaction?: boolean;
   turnMaintenanceMode?: "background" | "inline" | string;
   hostRequirements?: Partial<Record<ContextEngineOperation, ContextEngineHostRequirements>>;
@@ -236,6 +240,27 @@ export type ContextEngineRuntimeContext = {
   [key: string]: unknown;
 };
 
+/** Immutable SQLite transcript identity supplied by OpenClaw. */
+export type TranscriptEntryAnchor = Readonly<{
+  agentId: string;
+  sessionId: string;
+  sessionKey: string;
+  storePath: string;
+  generation: string;
+  entryId: string;
+  rawSeq: number;
+  effectiveParentId: string | null;
+  activeMessagePosition: number;
+  idempotencyKey?: string;
+}>;
+
+/** Current user row that owns one host-issued logical turn. */
+export type TranscriptTurnAdmission = TranscriptEntryAnchor &
+  Readonly<{
+    logicalTurnId: string;
+    role: "user";
+  }>;
+
 export type ContextEngine = {
   info: ContextEngineInfo;
   bootstrap(params: {
@@ -271,6 +296,19 @@ export type ContextEngine = {
     runtimeContext?: Record<string, unknown>;
     legacyCompactionParams?: Record<string, unknown>;
   }): Promise<void>;
+  commitTurn?(params: {
+    advancementKey: string;
+    admission: TranscriptTurnAdmission;
+    terminal: TranscriptEntryAnchor;
+    messages: AgentMessage[];
+    prePromptMessageCount: number;
+    sessionId: string;
+    sessionKey?: string;
+    sessionTarget?: ContextEngineSessionTarget;
+    runtimeSettings?: Record<string, unknown>;
+    runtimeContext?: ContextEngineRuntimeContext;
+    isHeartbeat?: boolean;
+  }): Promise<{ status: "committed" | "duplicate" }>;
   assemble(params: {
     sessionId: string;
     sessionKey?: string;

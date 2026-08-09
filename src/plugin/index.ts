@@ -180,6 +180,7 @@ class MemorySupplementContextEngine implements ContextEngine {
   readonly info: ContextEngine["info"];
   readonly ingestBatch: ContextEngine["ingestBatch"];
   readonly afterTurn: ContextEngine["afterTurn"];
+  readonly commitTurn: ContextEngine["commitTurn"];
   readonly prepareSubagentSpawn: ContextEngine["prepareSubagentSpawn"];
   readonly onSubagentEnded: ContextEngine["onSubagentEnded"];
   readonly maintain: ContextEngine["maintain"];
@@ -190,6 +191,7 @@ class MemorySupplementContextEngine implements ContextEngine {
   constructor(private readonly inner: ContextEngine) {
     const ingestBatch = inner.ingestBatch?.bind(inner);
     const afterTurn = inner.afterTurn?.bind(inner);
+    const commitTurn = inner.commitTurn?.bind(inner);
     const prepareSubagentSpawn = inner.prepareSubagentSpawn?.bind(inner);
     const onSubagentEnded = inner.onSubagentEnded?.bind(inner);
     const maintain = inner.maintain?.bind(inner);
@@ -199,6 +201,7 @@ class MemorySupplementContextEngine implements ContextEngine {
     this.info = inner.info;
     this.ingestBatch = ingestBatch ? (params) => ingestBatch(params) : undefined;
     this.afterTurn = afterTurn ? (params) => afterTurn(params) : undefined;
+    this.commitTurn = commitTurn ? (params) => commitTurn(params) : undefined;
     this.prepareSubagentSpawn = prepareSubagentSpawn
       ? (params) => prepareSubagentSpawn(params)
       : undefined;

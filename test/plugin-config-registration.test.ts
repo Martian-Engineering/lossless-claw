@@ -383,6 +383,7 @@ describe("lcm plugin registration", () => {
 
     const engine = factory!() as {
       afterTurn?: unknown;
+      commitTurn?: unknown;
       maintain?: unknown;
       dispose?: unknown;
       assemble: (params: {
@@ -393,6 +394,7 @@ describe("lcm plugin registration", () => {
       }) => Promise<{ systemPromptAddition?: string }>;
     };
     expect(engine.afterTurn).toBeTypeOf("function");
+    expect(engine.commitTurn).toBeTypeOf("function");
     expect(engine.maintain).toBeTypeOf("function");
     expect(engine.dispose).toBeTypeOf("function");
     const result = await engine.assemble({
