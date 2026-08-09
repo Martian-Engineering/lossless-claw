@@ -513,21 +513,29 @@ To switch back to OpenClaw's legacy context engine instead:
 ## Stable event identity deduplication
 
 Lossless-claw persists a `stable_event_key` on messages that carry a
-`responseId` or tool call id. This prevents duplicate ingestion when the
-same semantic event arrives in two different content representations
-(typical case: the JSONL transcript is redacted by
+`responseId` or a provider-unique tool call id. This prevents duplicate
+ingestion when the same semantic event arrives in two different content
+representations (typical case: the JSONL transcript is redacted by
 `logging.redactPatterns` while the live `afterTurn` batch is not). The key
 is derived from the message as follows, in order:
 
 1. assistant messages with `responseId` (or `response_id`):
    `assistant-response:<responseId>`.
-2. tool / toolResult messages that represent exactly one tool call id:
+2. tool / toolResult messages that represent exactly one tool call id
+   whose format is provider-issued and therefore conversation-globally
+   unique (Anthropic `toolu_…`, OpenAI `call_…`):
    `tool-result:<toolCallId>`.
-3. Otherwise, including aggregate tool-result messages: no key is
-   persisted, and the row falls back to the existing content-based
-   deduplication.
+3. Otherwise, including aggregate tool-result messages and ALL
+   model-authored counter-pattern ids (Kimi K3 `name:N` such as
+   `exec:101`, `read:92`, `web_search:45`): no key is persisted, and the
+   row falls back to the existing content-based deduplication.
+   Model-authored ids recur across turns and are only adjacency-unique —
+   treating them as global event identities silently drops distinct
+   events sharing the id, so the fallback deliberately prefers possible
+   duplicates over data loss.
 
-A partial unique index on `(conversation_id, stable_event_key)` ensures
-that two rows in the same conversation can never share a key. The
+A partial unique index on `(conversation_id, stable_event_key)` enforces
+one row per key per conversation; a collision at insert time persists the
+row with a NULL key (and logs a warning) rather than rejecting it. The
 mechanism is independent of `logging.redactPatterns` and requires no user
 configuration.

@@ -434,6 +434,11 @@ export class LcmContextEngine implements ContextEngine {
       fts5Available: this.fts5Available,
       replayFloodThresholdExternal: this.config.replayFloodThresholdExternal,
       replayFloodThresholdInternal: this.config.replayFloodThresholdInternal,
+      onStableEventKeyConflict: ({ conversationId, stableEventKey }) => {
+        this.deps.log.warn(
+          `[lcm] stable-event-key unique conflict conversation=${conversationId} key=${stableEventKey} — provider/mode id uniqueness violated; row persisted without stable key`,
+        );
+      },
     });
     this.summaryStore = new SummaryStore(this.db, { fts5Available: this.fts5Available });
     this.largeFileInterceptor = new LargeFileInterceptor(
@@ -2768,21 +2773,60 @@ export class LcmContextEngine implements ContextEngine {
     }
 
     // Stable event identity short-circuit: when the message carries a stable
-    // event key (responseId / toolCallId) that the conversation already holds,
-    // this is the same event under a different (likely redacted) content
-    // representation. Skip the duplicate insert before any side effects.
+    // event key (assistant responseId, or a PROVABLY PROVIDER-UNIQUE
+    // toolCallId — see stable-event-key.ts) that the conversation already
+    // holds, this is the same event under a different (likely redacted)
+    // content representation. Skip the duplicate insert before any side
+    // effects.
+    //
+    // Ordering matters (P1 rawId anchoring): the unique transcript-entry-id
+    // check above runs first because an entry id is per-line unique and is
+    // the authoritative replay anchor. The stable key below is only ever
+    // derived from event-unique identifiers, so an existing key is same-event
+    // proof even for fresh transcript entry ids. Model-authored recurrent
+    // toolCallIds (e.g. Kimi `exec:101`) never produce a key — they fall
+    // through to the content/adjacency-bound dedup paths, which prefer
+    // duplicate emission over dropped ingestion.
+    //
+    // A fresh-transcript-entry TOOL RESULT colliding with an existing stable
+    // key is a NEW event recycled into a provider-unique FORMAT by a
+    // model/provider-compat layer — the entry-id check above already proved
+    // freshness, and no documented same-event tool-result import regenerates
+    // entry ids (the #1040 aborted/redacted-twin fault chain was
+    // assistant-responseId only). Persist it WITHOUT the stable key (conflict
+    // path) instead of silently skipping the result — ingested=false would
+    // repeat the #194379 disaster for id-recycling providers.
     const stableEventKey = extractStableEventKey(message);
-    if (
-      stableEventKey &&
-      (await this.conversationStore.hasMessageByStableEventKey(
-        conversationId,
-        stableEventKey,
-      ))
-    ) {
+    const stableEventKeyConflict = stableEventKey
+      ? await this.conversationStore.hasMessageByStableEventKey(
+          conversationId,
+          stableEventKey,
+        )
+      : false;
+    // A fresh-transcript-entry TOOL RESULT colliding with an existing stable
+    // key is a NEW event recycled into a provider-unique FORMAT by a
+    // model/provider-compat layer — the entry-id check above already proved
+    // freshness, and no documented same-event tool-result import regenerates
+    // entry ids (the #1040 aborted/redacted-twin fault chain was
+    // assistant-responseId only). Persist it WITHOUT the stable key (conflict
+    // path) instead of silently skipping the result — ingested=false would
+    // repeat the #194379 disaster for id-recycling providers.
+    const stableEventKeyToolResultOverride = Boolean(
+      stableEventKeyConflict &&
+        transcriptEntryId &&
+        stableEventKey?.startsWith("tool-result:"),
+    );
+    if (stableEventKeyConflict && !stableEventKeyToolResultOverride) {
       this.deps.log.debug(
         `[lcm] ingestSingle: stable-event duplicate skipped role=${stored.role} key=${stableEventKey} conversation=${conversationId}`,
       );
       return { ingested: false };
+    }
+    const stableEventKeyForInsert = stableEventKeyToolResultOverride ? null : stableEventKey;
+    if (stableEventKeyToolResultOverride) {
+      this.deps.log.warn(
+        `[lcm] ingestSingle: tool-result stable-event key recycled for a fresh transcript entry — persisted WITHOUT stable key role=${stored.role} key=${stableEventKey} entry=${transcriptEntryId} conversation=${conversationId}`,
+      );
     }
 
     // Delivery-mirror dedup: OpenClaw writes two entries per assistant turn —
@@ -2902,7 +2946,7 @@ export class LcmContextEngine implements ContextEngine {
       content: stored.content,
       tokenCount: stored.tokenCount,
       transcriptEntryId,
-      stableEventKey,
+      stableEventKey: stableEventKeyForInsert,
       createdAt,
       skipReplayTimestampFloodGuard,
     });

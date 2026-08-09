@@ -383,6 +383,10 @@ export class ConversationStore {
   private readonly fts5Available: boolean;
   private readonly replayFloodThresholdExternal: number;
   private readonly replayFloodThresholdInternal: number;
+  private readonly onStableEventKeyConflict?: (info: {
+    conversationId: ConversationId;
+    stableEventKey: string;
+  }) => void;
 
   constructor(
     private db: DatabaseSync,
@@ -400,11 +404,22 @@ export class ConversationStore {
        * calls returning identical results within the same SQLite-second).
        */
       replayFloodThresholdInternal?: number;
+      /**
+       * Invoked when a stable-event-key insert collides with the partial
+       * unique index and the row is re-inserted without its stable key. The
+       * hook exists so operators see the invariant violation; the row is
+       * always persisted (lossless over idempotency).
+       */
+      onStableEventKeyConflict?: (info: {
+        conversationId: ConversationId;
+        stableEventKey: string;
+      }) => void;
     },
   ) {
     this.fts5Available = options?.fts5Available ?? true;
     this.replayFloodThresholdExternal = options?.replayFloodThresholdExternal ?? 3;
     this.replayFloodThresholdInternal = options?.replayFloodThresholdInternal ?? 32;
+    this.onStableEventKeyConflict = options?.onStableEventKeyConflict;
   }
 
   // ── Transaction helpers ──────────────────────────────────────────────────
@@ -688,30 +703,64 @@ export class ConversationStore {
 
   // ── Message operations ────────────────────────────────────────────────────
 
+  /**
+   * Insert a message row, degrading the stable event key to NULL on a unique
+   * index conflict instead of losing the row. A conflict means the
+   * "provider-unique" toolCallId/responseId assumption was violated (a
+   * provider reused an id, or a model-augmented id slipped past the format
+   * gate); persisting without the key keeps the data and only weakens later
+   * dedup, the safe failure direction for a lossless store.
+   */
+  private runMessageInsert(prepared: PreparedMessageInsert): number {
+    const runWith = (stableEventKey: string | null): number => {
+      const result = this.db
+        .prepare(
+          `INSERT INTO messages (conversation_id, seq, role, content, token_count, identity_hash, transcript_entry_id, stable_event_key, created_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        )
+        .run(
+          prepared.conversationId,
+          prepared.seq,
+          prepared.role,
+          prepared.content,
+          prepared.tokenCount,
+          prepared.identityHash,
+          prepared.transcriptEntryId ?? null,
+          stableEventKey,
+          prepared.createdAt,
+        );
+      return Number(result.lastInsertRowid);
+    };
+    if (prepared.stableEventKey == null) {
+      return runWith(null);
+    }
+    try {
+      return runWith(prepared.stableEventKey);
+    } catch (err: unknown) {
+      if (
+        err instanceof Error &&
+        /UNIQUE constraint failed|SQLITE_CONSTRAINT_UNIQUE/i.test(err.message) &&
+        err.message.includes("stable_event_key")
+      ) {
+        const stableEventKey = prepared.stableEventKey;
+        const messageId = runWith(null);
+        this.onStableEventKeyConflict?.({
+          conversationId: prepared.conversationId,
+          stableEventKey,
+        });
+        return messageId;
+      }
+      throw err;
+    }
+  }
+
   async createMessage(input: CreateMessageInput): Promise<MessageRecord> {
     const prepared = this.prepareMessageInsert(input);
     if (!prepared.skipReplayTimestampFloodGuard) {
       this.assertNoReplayTimestampFlood([prepared]);
     }
 
-    const result = this.db
-      .prepare(
-        `INSERT INTO messages (conversation_id, seq, role, content, token_count, identity_hash, transcript_entry_id, stable_event_key, created_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-      )
-      .run(
-        prepared.conversationId,
-        prepared.seq,
-        prepared.role,
-        prepared.content,
-        prepared.tokenCount,
-        prepared.identityHash,
-        prepared.transcriptEntryId ?? null,
-        prepared.stableEventKey,
-        prepared.createdAt,
-      );
-
-    const messageId = Number(result.lastInsertRowid);
+    const messageId = this.runMessageInsert(prepared);
 
     this.indexMessageForFullText(messageId, input.content);
 
@@ -735,10 +784,6 @@ export class ConversationStore {
       preparedInputs.filter((input) => !input.skipReplayTimestampFloodGuard),
     );
 
-    const insertStmt = this.db.prepare(
-      `INSERT INTO messages (conversation_id, seq, role, content, token_count, identity_hash, transcript_entry_id, stable_event_key, created_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-    );
     const selectStmt = this.db.prepare(
       `SELECT message_id, conversation_id, seq, role, content, token_count, created_at, large_content, transcript_entry_id
        FROM messages WHERE message_id = ?`,
@@ -746,19 +791,7 @@ export class ConversationStore {
 
     const records: MessageRecord[] = [];
     for (const input of preparedInputs) {
-      const result = insertStmt.run(
-        input.conversationId,
-        input.seq,
-        input.role,
-        input.content,
-        input.tokenCount,
-        input.identityHash,
-        input.transcriptEntryId ?? null,
-        input.stableEventKey,
-        input.createdAt,
-      );
-
-      const messageId = Number(result.lastInsertRowid);
+      const messageId = this.runMessageInsert(input);
       this.indexMessageForFullText(messageId, input.content);
       const row = selectStmt.get(messageId) as unknown as MessageRow;
       records.push(toMessageRecord(row));

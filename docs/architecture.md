@@ -239,10 +239,21 @@ The `messages` table carries a `stable_event_key` column (TEXT, nullable)
 indexed by a partial unique index `(conversation_id, stable_event_key)
 WHERE stable_event_key IS NOT NULL`. The key is computed at
 `ingestSingle` time from a message's `responseId` or a single
-`toolCallId` and acts as a third identity axis alongside
-`transcript_entry_id` and `identity_hash`. Aggregate tool-result messages
-and messages without either stable identifier continue to use the
-existing identity-hash and redaction-aware deduplication. When a message
-with a key that is already present for the conversation is ingested, the
-duplicate is rejected before any side effects (large-file interception,
-parts, context items) so the originally-persisted row stays canonical.
+PROVIDER-UNIQUE `toolCallId` (Anthropic `toolu_…`, OpenAI `call_…`; see
+`isProviderUniqueToolCallId`) and acts as a third identity axis alongside
+`transcript_entry_id` and `identity_hash`.
+
+Model-authored tool-call ids (Kimi K3 style `name:N` counters such as
+`exec:101`) recur across turns and are only adjacency-unique; they NEVER
+produce a stable key. Such messages fall back to the existing
+identity-hash and redaction-aware deduplication, which may duplicate a
+redacted twin but never loses an event — preferring duplicate emission
+(recoverable by repair-time dedup) over dropped ingestion. Aggregate
+tool-result messages and messages without either stable identifier use
+the same fallback. When a message with a key that is already present for
+the conversation is ingested, the duplicate is rejected before any side
+effects (large-file interception, parts, context items) so the
+originally-persisted row stays canonical. Should a key conflict ever
+slip past that pre-check at INSERT time (provider id reuse), the store
+persists the row with a NULL stable key and reports the conflict instead
+of losing data.
