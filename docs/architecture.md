@@ -54,7 +54,7 @@ When compaction creates a summary from a range of messages (or summaries), the s
 
 When OpenClaw processes a turn, it calls the context engine's lifecycle hooks:
 
-1. **bootstrap** — On session start, reconciles the JSONL session file with the LCM database. Imports any messages that exist in the file but not in LCM (crash recovery).
+1. **bootstrap** — On session start, reconciles the host-owned visible transcript with the LCM database. SQLite hosts provide a storage-neutral message projection; file-backed hosts use the JSONL session file. Messages present in the host transcript but missing from LCM are imported for crash recovery.
 2. **ingest** / **ingestBatch** — Persists new messages to the database and appends them to context_items.
 3. **afterTurn** — After the model responds, ingests new messages, then evaluates whether `contextThreshold` requires compaction.
 
@@ -203,14 +203,14 @@ This prevents a single large file paste from consuming the entire context window
 
 LCM handles crash recovery through **bootstrap reconciliation**:
 
-1. On session start, read the JSONL session file (OpenClaw's ground truth).
+1. On session start, read OpenClaw's visible transcript. SQLite hosts supply a branch-safe projection keyed by the runtime session target; file-backed hosts supply the JSONL session file.
 2. Compare against the LCM database.
 3. Find the most recent message that exists in both (the "anchor").
-4. Import any messages after the anchor that are in JSONL but not in LCM.
+4. Import any messages after the anchor that are in the host transcript but not in LCM. Stable transcript entry ids provide exact identity when the host supplies them.
 5. If an existing session key moves to a different transcript file and no anchor exists, treat the new file as a bounded transcript epoch and import its recoverable messages. The same flood cap used for tail reconciliation prevents large unrelated transcripts from being appended automatically.
 6. Advance the bootstrap checkpoint only after an overlap is found or a bounded epoch import succeeds. No-anchor reads that import nothing leave the old checkpoint in place so a later turn can retry.
 
-This handles the case where OpenClaw wrote messages to the session file but crashed before LCM could persist them.
+This handles the case where OpenClaw persisted transcript messages but crashed before LCM could persist them.
 
 For forked child sessions, LCM treats a host-copied parent JSONL branch as a
 first-time bootstrap source and imports only the newest messages that fit within

@@ -29,20 +29,33 @@ import { createLcmGrepTool } from "../tools/lcm-grep-tool.js";
 import { createLcmCommand } from "./lcm-command.js";
 import type {
   LcmDependencies,
+  SessionTranscriptReadTarget,
   RuntimeLlmCompleteFn,
   RuntimeLlmModelOverride,
   RuntimeCompactionDelegateFn,
   StartupSessionFileCandidate,
+  VisibleSessionTranscriptMessageEntry,
 } from "../types.js";
 import { listConfiguredAgentIds, normalizeAgentId } from "./openclaw-agent-ids.js";
 
 const MIN_CONTEXT_ENGINE_OPENCLAW_VERSION = "2026.5.28";
+const MIN_SQLITE_TRANSCRIPT_OPENCLAW_VERSION = "2026.7.2-beta.2";
 
 type PluginSdkCoreModule = {
   delegateCompactionToRuntime?: RuntimeCompactionDelegateFn;
 };
 
 let pluginSdkCoreImport: Promise<PluginSdkCoreModule | null> | undefined;
+
+type ReadVisibleSessionTranscriptMessageEntries = (
+  target: SessionTranscriptReadTarget,
+) => Promise<VisibleSessionTranscriptMessageEntry[]>;
+
+type SessionTranscriptRuntimeModule = {
+  readVisibleSessionTranscriptMessageEntries?: unknown;
+};
+
+let sessionTranscriptRuntimeImport: Promise<SessionTranscriptRuntimeModule | null> | undefined;
 
 type ContextEngineCapableOpenClawPluginApi = OpenClawPluginApi & {
   registerContextEngine: (id: string, factory: ContextEngineFactory) => void;
@@ -76,6 +89,37 @@ function loadPluginSdkCore(log: LcmDependencies["log"]): Promise<PluginSdkCoreMo
     return null;
   });
   return pluginSdkCoreImport;
+}
+
+/** Lazily load the optional SQLite transcript projection without raising the stable peer floor. */
+function loadSessionTranscriptRuntime(
+  log: LcmDependencies["log"],
+): Promise<SessionTranscriptRuntimeModule | null> {
+  sessionTranscriptRuntimeImport ??= (Function("specifier", "return import(specifier)") as (
+    specifier: string,
+  ) => Promise<SessionTranscriptRuntimeModule>)(
+    "openclaw/plugin-sdk/session-transcript-runtime",
+  ).catch((error: unknown) => {
+    log.debug(`[lcm] SQLite transcript projection unavailable: ${describeLogError(error)}`);
+    return null;
+  });
+  return sessionTranscriptRuntimeImport;
+}
+
+/** Create a late-bound reader for OpenClaw-owned visible SQLite transcript entries. */
+function createVisibleTranscriptReader(
+  log: LcmDependencies["log"],
+): ReadVisibleSessionTranscriptMessageEntries {
+  return async (target) => {
+    const runtime = await loadSessionTranscriptRuntime(log);
+    const reader = runtime?.readVisibleSessionTranscriptMessageEntries;
+    if (typeof reader !== "function") {
+      throw new Error(
+        `[lcm] SQLite transcript bootstrap requires OpenClaw >=${MIN_SQLITE_TRANSCRIPT_OPENCLAW_VERSION}.`,
+      );
+    }
+    return (reader as ReadVisibleSessionTranscriptMessageEntries)(target);
+  };
 }
 
 /** Create a late-bound delegate to OpenClaw's stock runtime compaction path. */
@@ -1657,6 +1701,7 @@ function createLcmDependencies(
 
       return candidates;
     },
+    readVisibleSessionTranscriptMessageEntries: createVisibleTranscriptReader(log),
     agentLaneSubagent: "subagent",
     log,
   };

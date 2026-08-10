@@ -19,6 +19,13 @@ runtime LLM completion. Fully capable native hosts still advertise and execute
 the full lifecycle, and Lossless retains compaction ownership for those runs.
 Subagent forks continue to require `thread-bootstrap-projection`.
 
+SQLite-backed session bootstrap uses OpenClaw's host-owned visible transcript
+projection, first published in OpenClaw `2026.7.2-beta.2`. The plugin selects
+that path only when the runtime reports SQLite transcript storage. File-backed
+hosts continue to use JSONL bootstrap, so the package-wide minimum remains
+OpenClaw `2026.5.28`. If a SQLite host does not expose the projection helper,
+upgrade OpenClaw or select the `legacy` context engine.
+
 The optional programmatic `status` / `doctor` / `rotate` control surface requires
 a host that separately advertises context-engine capabilities/control dispatch.
 That host contract is not covered by the baseline plugin API version above. As

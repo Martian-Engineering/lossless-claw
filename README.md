@@ -119,6 +119,14 @@ The command defaults to `${OPENCLAW_STATE_DIR:-~/.openclaw}` and `${OPENCLAW_STA
 
 > **Compatibility:** `lossless-claw@0.10.0` and newer require OpenClaw `2026.5.12` or newer for OpenClaw's `api.runtime.llm.complete` summarization capability. Releases that include context-engine memory supplement support require OpenClaw `2026.5.28` or newer for `buildMemorySystemPromptAddition`. If you cannot upgrade OpenClaw yet, stay on `lossless-claw@0.9.4` and remove `0.10.x`-only config such as `sweepMaxDepth`.
 
+SQLite-backed OpenClaw sessions require the branch-safe visible transcript
+projection first published in OpenClaw `2026.7.2-beta.2`. Lossless detects that
+storage mode from the context-engine runtime context and reads the host-owned
+projection without treating session markers as file paths. File-backed stable
+hosts retain the JSONL bootstrap path and the `2026.5.28` package minimum. If
+your OpenClaw build does not expose the projection helper, remain on a
+file-backed OpenClaw release or select the `legacy` context engine.
+
 ### Install the plugin
 
 Use OpenClaw's plugin installer (recommended):

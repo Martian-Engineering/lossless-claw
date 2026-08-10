@@ -10,6 +10,8 @@ import type {
   ContextEngineControlResult,
   ContextEngineInfo,
   ContextEngineHostCapability,
+  ContextEngineRuntimeContext,
+  ContextEngineSessionTarget,
   AssembleResult,
   BootstrapResult,
   CompactResult,
@@ -62,14 +64,18 @@ import { FocusBriefStore, type FocusBriefRecord } from "./store/focus-brief-stor
 import { buildToolCallInputMap } from "./tool-pairing.js";
 import { SummaryStore, type ContextItemRecord } from "./store/summary-store.js";
 import { createLcmSummarizeFromLegacyParams, FALLBACK_SUMMARY_MARKER, LcmProviderAuthError, LcmSummarySpendLimitError, type LcmSummarizeFn } from "./summarize.js";
-import type { LcmDependencies } from "./types.js";
+import type {
+  LcmDependencies,
+  SessionTranscriptReadTarget,
+  VisibleSessionTranscriptMessageEntry,
+} from "./types.js";
 import { estimateTokens } from "./estimate-tokens.js";
 import {
   buildDeterministicFallbackSummary,
   FALLBACK_DIRECTIVE_SUMMARY_MARKER,
   MIN_FALLBACK_MAX_TOKENS,
 } from "./summary-fallback.js";
-import { getTranscriptEntryId, readAppendedLeafPathMessages, readLastJsonlEntryBeforeOffset, readLeafPathMessages, readSessionParentSessionReference, resolveTranscriptMessageCreatedAt } from "./transcript.js";
+import { attachTranscriptEntryMeta, getTranscriptEntryId, readAppendedLeafPathMessages, readLastJsonlEntryBeforeOffset, readLeafPathMessages, readSessionParentSessionReference, resolveTranscriptMessageCreatedAt } from "./transcript.js";
 import { extractStableEventKey } from "./stable-event-key.js";
 import { type TranscriptReconcileResult } from "./reconcile-plan.js";
 import { checkpointIsPastTranscriptEof, TranscriptReconciler } from "./transcript-reconciler.js";
@@ -118,6 +124,64 @@ const LOSSLESS_AGENT_RUN_CAPTURE_ONLY_HOST_CAPABILITIES: ContextEngineHostCapabi
 ];
 const MAX_PREVIOUS_ASSEMBLED_SNAPSHOTS = 100;
 const FORK_BOUNDED_BOOTSTRAP_REASON = "fork-bounded bootstrap import";
+
+/** Normalize one optional runtime-supplied session identity field. */
+function normalizedTargetString(value: unknown): string | undefined {
+  return typeof value === "string" && value.trim().length > 0 ? value.trim() : undefined;
+}
+
+/** Return whether this lifecycle invocation uses OpenClaw-owned SQLite transcripts. */
+function usesSqliteTranscriptStorage(params: {
+  sessionTarget?: ContextEngineSessionTarget;
+  runtimeContext?: ContextEngineRuntimeContext;
+}): boolean {
+  const kind = normalizedTargetString(params.runtimeContext?.transcriptStorage?.kind);
+  if (kind) {
+    return kind.toLowerCase() === "sqlite";
+  }
+  const target = params.sessionTarget ?? params.runtimeContext?.sessionTarget;
+  return normalizedTargetString(target?.storePath)?.toLowerCase().endsWith(".sqlite") === true;
+}
+
+/** Resolve the storage-neutral identity expected by OpenClaw's transcript projection API. */
+function resolveSessionTranscriptReadTarget(params: {
+  sessionId: string;
+  sessionKey?: string;
+  sessionTarget?: ContextEngineSessionTarget;
+  runtimeContext?: ContextEngineRuntimeContext;
+}): SessionTranscriptReadTarget | undefined {
+  const target = params.sessionTarget ?? params.runtimeContext?.sessionTarget;
+  const sessionId = normalizedTargetString(target?.sessionId) ?? params.sessionId.trim();
+  const sessionKey =
+    normalizedTargetString(target?.sessionKey) ?? normalizedTargetString(params.sessionKey);
+  if (!sessionId || !sessionKey) {
+    return undefined;
+  }
+  const agentId = normalizedTargetString(target?.agentId);
+  const storePath = normalizedTargetString(target?.storePath);
+  const threadId =
+    typeof target?.threadId === "string" || typeof target?.threadId === "number"
+      ? target.threadId
+      : undefined;
+  return {
+    sessionId,
+    sessionKey,
+    ...(agentId ? { agentId } : {}),
+    ...(storePath ? { storePath } : {}),
+    ...(threadId !== undefined ? { threadId } : {}),
+  };
+}
+
+/** Attach the host-owned transcript identity to one projected message. */
+function messageFromVisibleTranscriptEntry(
+  entry: VisibleSessionTranscriptMessageEntry,
+): AgentMessage {
+  return attachTranscriptEntryMeta(entry.message, {
+    entryId: entry.entryId,
+    parentId: entry.parentId,
+    timestamp: entry.createdAt ?? null,
+  });
+}
 
 // Host-contract dependency: the deliberate-vs-incidental archive distinction
 // relies on OpenClaw emitting these exact reason strings only for genuine
@@ -1859,6 +1923,210 @@ export class LcmContextEngine implements ContextEngine {
     }
   }
 
+  /** Import a bounded projection into a conversation that has no persisted messages. */
+  private async importInitialVisibleTranscriptProjection(params: {
+    sessionId: string;
+    sessionKey?: string;
+    conversationId: number;
+    historicalMessages: AgentMessage[];
+    startedAt: number;
+    sessionLabel: string;
+  }): Promise<BootstrapResult> {
+    const bootstrapMessages = trimBootstrapMessagesToBudget(
+      params.historicalMessages,
+      resolveBootstrapMaxTokens(this.config),
+    );
+    if (bootstrapMessages.length === 0) {
+      await this.conversationStore.markConversationBootstrapped(params.conversationId);
+      return {
+        bootstrapped: false,
+        importedMessages: 0,
+        reason: "no visible transcript messages in session",
+      };
+    }
+
+    let importedMessages = 0;
+    for (const message of bootstrapMessages) {
+      const ingestResult = await this.ingestSingle({
+        sessionId: params.sessionId,
+        sessionKey: params.sessionKey,
+        message,
+        createdAt: resolveTranscriptMessageCreatedAt(message),
+        skipReplayTimestampFloodGuard: true,
+      });
+      if (ingestResult.ingested) {
+        importedMessages += 1;
+      }
+    }
+    await this.conversationStore.markConversationBootstrapped(params.conversationId);
+
+    if (this.config.pruneHeartbeatOk) {
+      const pruned = await pruneHeartbeatOkTurns(
+        this.conversationStore,
+        params.conversationId,
+      );
+      if (pruned > 0) {
+        this.deps.log.info(
+          `[lcm] bootstrap: pruned ${pruned} HEARTBEAT_OK messages from conversation ${params.conversationId}`,
+        );
+      }
+    }
+
+    this.deps.log.debug(
+      `[lcm] bootstrap: sqlite projection initial import conversation=${params.conversationId} ${params.sessionLabel} importedMessages=${importedMessages} sourceMessages=${params.historicalMessages.length} duration=${formatDurationMs(Date.now() - params.startedAt)}`,
+    );
+    return {
+      bootstrapped: importedMessages > 0,
+      importedMessages,
+    };
+  }
+
+  /** Reconcile one visible projection with an existing 0.15.x conversation. */
+  private async reconcileVisibleTranscriptProjection(params: {
+    sessionId: string;
+    sessionKey?: string;
+    conversation: ConversationRecord;
+    historicalMessages: AgentMessage[];
+    startedAt: number;
+    sessionLabel: string;
+  }): Promise<BootstrapResult> {
+    const conversationId = params.conversation.conversationId;
+    const bootstrapState = await this.summaryStore.getConversationBootstrapState(conversationId);
+    const isFirstBootstrap = !params.conversation.bootstrappedAt;
+    const firstBootstrapFrontierIsNonAnchoring =
+      !bootstrapState &&
+      isFirstBootstrap &&
+      (await this.transcriptReconciler.conversationFrontierIsEntirelyNonAnchoring(
+        conversationId,
+      ));
+    const reconcile = await this.transcriptReconciler.reconcileSessionTail({
+      sessionId: params.sessionId,
+      sessionKey: params.sessionKey,
+      conversationId,
+      historicalMessages: params.historicalMessages,
+      checkpointEntryHash: bootstrapState?.lastProcessedEntryHash,
+      lastProcessedEntryId: bootstrapState?.lastProcessedEntryId,
+      allowNoAnchorImport: firstBootstrapFrontierIsNonAnchoring,
+      allowFullNonAnchoringFrontierImport: firstBootstrapFrontierIsNonAnchoring,
+      noAnchorImportReason: firstBootstrapFrontierIsNonAnchoring
+        ? "checkpoint-missing-recovery"
+        : undefined,
+    });
+    this.deps.log.debug(
+      `[lcm] bootstrap: sqlite projection reconcile finished conversation=${conversationId} ${params.sessionLabel} importedMessages=${reconcile.importedMessages} overlap=${reconcile.hasOverlap} blockedByImportCap=${reconcile.blockedByImportCap} duration=${formatDurationMs(Date.now() - params.startedAt)}`,
+    );
+
+    if (reconcile.blockedByImportCap) {
+      return {
+        bootstrapped: false,
+        importedMessages: reconcile.importedMessages,
+        reason:
+          reconcile.blockedReason === "cross-conversation-raw-id"
+            ? "reconcile duplicate raw ids"
+            : reconcile.blockedReason === "duplicate-transcript-replay"
+              ? "reconcile duplicate transcript replay"
+              : "reconcile import capped",
+      };
+    }
+    if (isFirstBootstrap && (reconcile.importedMessages > 0 || reconcile.hasOverlap)) {
+      await this.conversationStore.markConversationBootstrapped(conversationId);
+    }
+    if (reconcile.importedMessages > 0) {
+      return {
+        bootstrapped: true,
+        importedMessages: reconcile.importedMessages,
+        reason: "reconciled missing session messages",
+      };
+    }
+    if (params.conversation.bootstrappedAt) {
+      return {
+        bootstrapped: false,
+        importedMessages: 0,
+        reason: "already bootstrapped",
+      };
+    }
+    return {
+      bootstrapped: false,
+      importedMessages: 0,
+      reason: reconcile.hasOverlap
+        ? "conversation already up to date"
+        : "conversation already has messages",
+    };
+  }
+
+  /** Bootstrap from OpenClaw's storage-neutral visible SQLite transcript projection. */
+  private async bootstrapFromVisibleTranscriptProjection(params: {
+    sessionId: string;
+    sessionKey?: string;
+    target: SessionTranscriptReadTarget;
+    startedAt: number;
+    sessionLabel: string;
+  }): Promise<BootstrapResult> {
+    const readVisibleSessionTranscriptMessageEntries =
+      this.deps.readVisibleSessionTranscriptMessageEntries;
+    if (!readVisibleSessionTranscriptMessageEntries) {
+      return {
+        bootstrapped: false,
+        importedMessages: 0,
+        reason: "visible transcript projection unavailable",
+      };
+    }
+
+    const result = await this.withSessionQueue(
+      this.resolveSessionQueueKey(params.sessionId, params.sessionKey),
+      async () =>
+        this.conversationStore.withTransaction(async () => {
+          const entries = await readVisibleSessionTranscriptMessageEntries(params.target);
+          const historicalMessages = entries.map(messageFromVisibleTranscriptEntry);
+          await this.sessionRolloverDetector.rotateIsolatedCronConversationIfRuntimeChanged({
+            phase: "bootstrap",
+            sessionId: params.sessionId,
+            sessionKey: params.sessionKey,
+            createReplacement: true,
+          });
+          const conversation = await this.conversationStore.getOrCreateConversation(params.sessionId, {
+            sessionKey: params.sessionKey,
+          });
+          const existingCount = await this.conversationStore.getMessageCount(
+            conversation.conversationId,
+          );
+          const bootstrapParams = {
+            sessionId: params.sessionId,
+            sessionKey: params.sessionKey,
+            historicalMessages,
+            startedAt: params.startedAt,
+            sessionLabel: params.sessionLabel,
+          };
+          return existingCount === 0
+            ? this.importInitialVisibleTranscriptProjection({
+                ...bootstrapParams,
+                conversationId: conversation.conversationId,
+              })
+            : this.reconcileVisibleTranscriptProjection({
+                ...bootstrapParams,
+                conversation,
+              });
+        }),
+      { operationName: "bootstrap", context: params.sessionLabel },
+    );
+
+    const conversation = await this.conversationStore.getConversationForSession({
+      sessionId: params.sessionId,
+      sessionKey: params.sessionKey,
+    });
+    if (conversation) {
+      this.recordRecentBootstrapImport(
+        conversation.conversationId,
+        result.importedMessages,
+        result.reason ?? null,
+      );
+    }
+    this.deps.log.debug(
+      `[lcm] bootstrap: done ${params.sessionLabel} bootstrapped=${result.bootstrapped} importedMessages=${result.importedMessages} reason=${result.reason ?? "none"} duration=${formatDurationMs(Date.now() - params.startedAt)}`,
+    );
+    return result;
+  }
+
 
   // ── ContextEngine interface ─────────────────────────────────────────────
 
@@ -1866,17 +2134,25 @@ export class LcmContextEngine implements ContextEngine {
 
   async bootstrap(params: {
     sessionId: string;
-    sessionFile: string;
+    sessionFile?: string;
     sessionKey?: string;
+    sessionTarget?: ContextEngineSessionTarget;
+    runtimeContext?: ContextEngineRuntimeContext;
   }): Promise<BootstrapResult> {
-    if (this.shouldIgnoreSession({ sessionId: params.sessionId, sessionKey: params.sessionKey })) {
+    const sqliteTranscriptStorage = usesSqliteTranscriptStorage(params);
+    const transcriptReadTarget = sqliteTranscriptStorage
+      ? resolveSessionTranscriptReadTarget(params)
+      : undefined;
+    const sessionId = transcriptReadTarget?.sessionId ?? params.sessionId;
+    const sessionKey = transcriptReadTarget?.sessionKey ?? params.sessionKey;
+    if (this.shouldIgnoreSession({ sessionId, sessionKey })) {
       return {
         bootstrapped: false,
         importedMessages: 0,
         reason: "session excluded by pattern",
       };
     }
-    if (this.isStatelessSession(params.sessionKey)) {
+    if (this.isStatelessSession(sessionKey)) {
       return {
         bootstrapped: false,
         importedMessages: 0,
@@ -1885,11 +2161,35 @@ export class LcmContextEngine implements ContextEngine {
     }
     this.ensureMigrated();
     const startedAt = Date.now();
-    const sessionLabel = formatSessionLabel(params.sessionId, params.sessionKey);
-    const sessionFileStats = await stat(params.sessionFile);
+    const sessionLabel = formatSessionLabel(sessionId, sessionKey);
+    if (sqliteTranscriptStorage) {
+      if (!transcriptReadTarget) {
+        return {
+          bootstrapped: false,
+          importedMessages: 0,
+          reason: "visible transcript projection unavailable",
+        };
+      }
+      return this.bootstrapFromVisibleTranscriptProjection({
+        sessionId,
+        sessionKey,
+        target: transcriptReadTarget,
+        startedAt,
+        sessionLabel,
+      });
+    }
+    if (!params.sessionFile) {
+      return {
+        bootstrapped: false,
+        importedMessages: 0,
+        reason: "session file unavailable",
+      };
+    }
+    const sessionFile = params.sessionFile;
+    const sessionFileStats = await stat(sessionFile);
     const sessionFileSize = sessionFileStats.size;
     const sessionFileMtimeMs = Math.trunc(sessionFileStats.mtimeMs);
-    const parentSessionReference = await readSessionParentSessionReference(params.sessionFile);
+    const parentSessionReference = await readSessionParentSessionReference(sessionFile);
 
     const result = await this.withSessionQueue(
       this.resolveSessionQueueKey(params.sessionId, params.sessionKey),
@@ -1905,7 +2205,7 @@ export class LcmContextEngine implements ContextEngine {
           ): Promise<void> => {
             await this.transcriptReconciler.refreshBootstrapState({
               conversationId,
-              sessionFile: params.sessionFile,
+              sessionFile,
               fileStats: {
                 size: sessionFileSize,
                 mtimeMs: sessionFileMtimeMs,
@@ -1943,7 +2243,7 @@ export class LcmContextEngine implements ContextEngine {
               sessionFile: params.sessionFile,
             });
           if (ambiguousRollover) {
-            preloadedHistoricalMessages = await readLeafPathMessages(params.sessionFile);
+            preloadedHistoricalMessages = await readLeafPathMessages(sessionFile);
             const activeBootstrapState =
               await this.summaryStore.getConversationBootstrapState(
                 ambiguousRollover.conversationId,
@@ -1972,7 +2272,7 @@ export class LcmContextEngine implements ContextEngine {
                   phase: "bootstrap",
                   rollover: ambiguousRollover,
                   sessionId: params.sessionId,
-                  sessionFile: params.sessionFile,
+                  sessionFile,
                   expected: rolloverResolution.preserveExpected,
                   alreadyWarned: rolloverResolution.alreadyWarned,
                 });
@@ -1986,7 +2286,7 @@ export class LcmContextEngine implements ContextEngine {
                 await this.transcriptReconciler.importFreshAmbiguousRolloverTranscript({
                   sessionId: params.sessionId,
                   sessionKey: params.sessionKey,
-                  sessionFile: params.sessionFile,
+                  sessionFile,
                   conversationId: ambiguousRollover.conversationId,
                   historicalMessages: preloadedHistoricalMessages,
                 });
@@ -2231,7 +2531,7 @@ export class LcmContextEngine implements ContextEngine {
           }
 
           const historicalMessages =
-            preloadedHistoricalMessages ?? (await readLeafPathMessages(params.sessionFile));
+            preloadedHistoricalMessages ?? (await readLeafPathMessages(sessionFile));
           this.deps.log.debug(
             `[lcm] bootstrap: full transcript read conversation=${conversationId} ${sessionLabel} existingCount=${existingCount} historicalMessages=${historicalMessages.length} duration=${formatDurationMs(Date.now() - startedAt)}`,
           );

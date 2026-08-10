@@ -229,6 +229,25 @@ export type AgentMessage = {
   output?: unknown;
 };
 
+/** Storage-neutral session identity supplied by newer OpenClaw runtimes. */
+export type ContextEngineSessionTarget = {
+  agentId?: string;
+  sessionId?: string;
+  sessionKey?: string;
+  storePath?: string;
+  threadId?: string | number;
+};
+
+/** Runtime-owned storage details supplied to context-engine lifecycle hooks. */
+export type ContextEngineRuntimeContext = {
+  sessionTarget?: ContextEngineSessionTarget;
+  transcriptStorage?: {
+    kind?: string;
+    [key: string]: unknown;
+  };
+  [key: string]: unknown;
+};
+
 export type ContextEngine = {
   info: ContextEngineInfo;
   bootstrap(params: {
@@ -236,6 +255,8 @@ export type ContextEngine = {
     sessionKey?: string;
     sessionFile?: string;
     messages?: AgentMessage[];
+    sessionTarget?: ContextEngineSessionTarget;
+    runtimeContext?: ContextEngineRuntimeContext;
   }): Promise<BootstrapResult>;
   ingest(params: {
     sessionId: string;

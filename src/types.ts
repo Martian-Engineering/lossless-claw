@@ -7,7 +7,7 @@
 
 import type { LcmConfig } from "./db/config.js";
 import type { LcmConfigDiagnostics } from "./db/config.js";
-import type { CompactResult } from "./openclaw-bridge.js";
+import type { AgentMessage, CompactResult } from "./openclaw-bridge.js";
 
 /**
  * Minimal LLM completion interface needed by LCM for summarization.
@@ -126,6 +126,26 @@ export type StartupSessionFileCandidate = {
   storePath?: string;
 };
 
+/** Storage-neutral OpenClaw session identity for transcript reads. */
+export type SessionTranscriptReadTarget = {
+  sessionId: string;
+  sessionKey: string;
+  agentId?: string;
+  storePath?: string;
+  threadId?: string | number;
+};
+
+/** Branch-safe visible message projection returned by OpenClaw's transcript runtime. */
+export type VisibleSessionTranscriptMessageEntry = {
+  entryId: string;
+  parentId: string | null;
+  seq: number;
+  message: AgentMessage;
+  role: AgentMessage["role"];
+  createdAt?: string;
+  idempotencyKey?: string;
+};
+
 /**
  * Dependencies injected into the LCM engine at registration time.
  * These replace all direct imports from OpenClaw core.
@@ -186,6 +206,11 @@ export interface LcmDependencies {
 
   /** List OpenClaw-indexed session files that startup recovery may enumerate. */
   listStartupSessionFileCandidates?: () => Promise<StartupSessionFileCandidate[]>;
+
+  /** Read OpenClaw-owned visible transcript entries for SQLite-backed sessions. */
+  readVisibleSessionTranscriptMessageEntries?: (
+    target: SessionTranscriptReadTarget,
+  ) => Promise<VisibleSessionTranscriptMessageEntry[]>;
 
   /** Agent lane constant for subagents */
   agentLaneSubagent: string;
