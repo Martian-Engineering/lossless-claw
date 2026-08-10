@@ -1990,4 +1990,62 @@ describe("lcm plugin registration", () => {
     lcmPlugin.register(api2);
     expect(createSpy).toHaveBeenCalledTimes(2);
   });
+
+  it("reopens the retained context-engine factory on the next gateway lifecycle", async () => {
+    const dbPath = join(tmpdir(), `lossless-claw-${Date.now()}-${Math.random().toString(16)}.db`);
+    dbPaths.add(dbPath);
+
+    const createSpy = vi.spyOn(connectionModule, "createLcmDatabaseConnection");
+    const { api, getFactory, getHook } = buildApi({ enabled: true, dbPath });
+    lcmPlugin.register(api);
+
+    const retainedFactory = getFactory();
+    const gatewayStop = getHook("gateway_stop");
+    expect(retainedFactory).toBeTypeOf("function");
+    expect(gatewayStop).toBeTypeOf("function");
+    await expect(Promise.resolve(retainedFactory!())).resolves.toBeDefined();
+
+    await gatewayStop?.({}, {});
+
+    const gatewayStart = getHook("gateway_start");
+    expect(gatewayStart).toBeTypeOf("function");
+    await gatewayStart?.({ port: 3000 }, { port: 3000 });
+
+    await expect(Promise.resolve(retainedFactory!())).resolves.toBeDefined();
+    expect(api.registerContextEngine).toHaveBeenCalledTimes(1);
+    expect(createSpy).toHaveBeenCalledTimes(2);
+  });
+
+  it("retries retained-factory initialization after a failed gateway lifecycle", async () => {
+    const dbPath = join(tmpdir(), `lossless-claw-${Date.now()}-${Math.random().toString(16)}.db`);
+    dbPaths.add(dbPath);
+
+    const originalCreate = connectionModule.createLcmDatabaseConnection;
+    const createSpy = vi.spyOn(connectionModule, "createLcmDatabaseConnection");
+    createSpy.mockImplementation((path: string) => {
+      if (createSpy.mock.calls.length === 2) {
+        throw new Error("database is locked");
+      }
+      return originalCreate(path);
+    });
+
+    const { api, getFactory, getHook } = buildApi({ enabled: true, dbPath });
+    lcmPlugin.register(api);
+    const retainedFactory = getFactory();
+    const gatewayStop = getHook("gateway_stop");
+    const gatewayStart = getHook("gateway_start");
+
+    await gatewayStop?.({}, {});
+    await gatewayStart?.({ port: 3000 }, { port: 3000 });
+    await expect(Promise.resolve(retainedFactory!())).rejects.toThrow(
+      "Database connection closed after gateway_stop",
+    );
+
+    await gatewayStop?.({}, {});
+    await gatewayStart?.({ port: 3000 }, { port: 3000 });
+
+    await expect(Promise.resolve(retainedFactory!())).resolves.toBeDefined();
+    expect(api.registerContextEngine).toHaveBeenCalledTimes(1);
+    expect(createSpy).toHaveBeenCalledTimes(3);
+  });
 });
