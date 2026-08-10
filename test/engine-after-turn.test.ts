@@ -305,12 +305,12 @@ describe("LcmContextEngine afterTurn", () => {
     );
   });
 
-  it("afterTurn runs inline threshold compaction when projected raw backlog crosses threshold", async () => {
+  it("afterTurn does not run inline threshold compaction for double-counted raw backlog", async () => {
     const engine = createEngineWithConfig({
       proactiveThresholdCompactionMode: "inline",
       freshTailCount: 1,
     });
-    const sessionId = "after-turn-inline-projected-raw-backlog-threshold";
+    const sessionId = "after-turn-inline-double-counted-raw-backlog";
     await seedBacklogContext(engine, sessionId, [100, 100, 100]);
     const compactSpy = vi.spyOn(engine, "compact").mockResolvedValue({
       ok: true,
@@ -320,21 +320,14 @@ describe("LcmContextEngine afterTurn", () => {
 
     await engine.afterTurn({
       sessionId,
-      sessionFile: createSessionFilePath("after-turn-inline-projected-raw-backlog-threshold"),
+      sessionFile: createSessionFilePath("after-turn-inline-double-counted-raw-backlog"),
       messages: [makeMessage({ role: "assistant", content: "fresh projected turn" })],
       prePromptMessageCount: 0,
       tokenBudget: 600,
       runtimeContext: { currentTokenCount: 300 },
     });
 
-    expect(compactSpy).toHaveBeenCalledWith(
-      expect.objectContaining({
-        sessionId,
-        tokenBudget: 600,
-        currentTokenCount: 300,
-        compactionTarget: "threshold",
-      }),
-    );
+    expect(compactSpy).not.toHaveBeenCalled();
     const conversation = await engine.getConversationStore().getConversationBySessionId(sessionId);
     expect(conversation).not.toBeNull();
     await expect(
@@ -342,7 +335,7 @@ describe("LcmContextEngine afterTurn", () => {
     ).resolves.toBeLessThan(450);
   });
 
-  it("afterTurn records deferred threshold debt when projected raw backlog crosses threshold", async () => {
+  it("afterTurn does not record deferred threshold debt for double-counted raw backlog", async () => {
     const debugLog = vi.fn();
     const engine = createEngineWithDeps(
       { freshTailCount: 1 },
@@ -350,7 +343,7 @@ describe("LcmContextEngine afterTurn", () => {
         log: { info: vi.fn(), warn: vi.fn(), error: vi.fn(), debug: debugLog },
       },
     );
-    const sessionId = "after-turn-deferred-projected-raw-backlog-threshold";
+    const sessionId = "after-turn-deferred-double-counted-raw-backlog";
     const privateEngine = engine as unknown as {
       scheduleDeferredCompactionDebtDrain: (params: unknown) => void;
     };
@@ -362,7 +355,7 @@ describe("LcmContextEngine afterTurn", () => {
 
     await engine.afterTurn({
       sessionId,
-      sessionFile: createSessionFilePath("after-turn-deferred-projected-raw-backlog-threshold"),
+      sessionFile: createSessionFilePath("after-turn-deferred-double-counted-raw-backlog"),
       messages: [makeMessage({ role: "assistant", content: "fresh projected turn" })],
       prePromptMessageCount: 0,
       tokenBudget: 600,
@@ -375,33 +368,15 @@ describe("LcmContextEngine afterTurn", () => {
       .getCompactionMaintenanceStore()
       .getConversationCompactionMaintenance(conversation!.conversationId);
     expect(compactSpy).not.toHaveBeenCalled();
-    expect(scheduleSpy).toHaveBeenCalledWith(
-      expect.objectContaining({
-        sessionId,
-        tokenBudget: 600,
-        currentTokenCount: 300,
-        reason: "threshold",
-      }),
-    );
-    expect(maintenance).toMatchObject({
-      pending: true,
-      running: false,
-      reason: "threshold",
-      tokenBudget: 600,
-      currentTokenCount: 300,
-      projectedTokenCount: expect.any(Number),
-      rawTokensOutsideTail: expect.any(Number),
-    });
+    expect(scheduleSpy).not.toHaveBeenCalled();
+    expect(maintenance).toBeNull();
     await expect(
       engine.getSummaryStore().getContextTokenCount(conversation!.conversationId),
     ).resolves.toBeLessThan(450);
     const deferredDebtLog = debugLog.mock.calls
       .map((call) => String(call[0]))
       .find((message) => message.includes("deferred compaction debt recorded"));
-    expect(deferredDebtLog).toContain("projectedTokenCount=");
-    expect(deferredDebtLog).not.toContain("projectedTokenCount=null");
-    expect(deferredDebtLog).toContain("rawTokensOutsideTail=");
-    expect(deferredDebtLog).not.toContain("rawTokensOutsideTail=null");
+    expect(deferredDebtLog).toBeUndefined();
   });
 
   it("afterTurn ignores raw leaf pressure below the context threshold", async () => {
@@ -4439,7 +4414,7 @@ describe("LcmContextEngine afterTurn", () => {
     expect(maintenance?.running).toBe(false);
   });
 
-  it("afterTurn refreshes threshold debt while retry backoff is active without compacting", async () => {
+  it("afterTurn leaves threshold debt backoff unchanged when pressure is below threshold", async () => {
     vi.useFakeTimers({ toFake: ["Date"] });
     vi.setSystemTime(new Date("2026-05-31T12:30:00.000Z"));
     try {
@@ -4486,7 +4461,7 @@ describe("LcmContextEngine afterTurn", () => {
         .getCompactionMaintenanceStore()
         .getConversationCompactionMaintenance(conversation!.conversationId);
       expect(compactSpy).not.toHaveBeenCalled();
-      expect(scheduleSpy).toHaveBeenCalled();
+      expect(scheduleSpy).not.toHaveBeenCalled();
       expect(after?.pending).toBe(true);
       expect(after?.running).toBe(false);
       expect(after?.nextAttemptAfter?.toISOString()).toBe(
