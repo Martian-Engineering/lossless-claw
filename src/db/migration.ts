@@ -362,6 +362,22 @@ function ensureMessageIdentityHashColumn(db: DatabaseSync): void {
 }
 
 /**
+ * OpenClaw sender identity used for lossless group-message replay. The JSON
+ * object contains only the allowlisted senderId, senderName, and
+ * senderUsername envelope fields. NULL preserves legacy and direct-message
+ * behavior without rewriting existing rows.
+ */
+function ensureMessageOpenClawSenderMetadataColumn(db: DatabaseSync): void {
+  const messageColumns = db.prepare(`PRAGMA table_info(messages)`).all() as SummaryColumnInfo[];
+  const hasSenderMetadata = messageColumns.some(
+    (column) => column.name === "openclaw_sender_metadata",
+  );
+  if (!hasSenderMetadata) {
+    db.exec(`ALTER TABLE messages ADD COLUMN openclaw_sender_metadata TEXT`);
+  }
+}
+
+/**
  * v4.2 §B — stub-tier stratification: the `large_content` sidecar column.
  *
  * Stratifies the messages row into a thread-metadata tier (always emitted)
@@ -1143,6 +1159,7 @@ export function runLcmMigrations(
       content TEXT NOT NULL,
       token_count INTEGER NOT NULL,
       identity_hash TEXT,
+      openclaw_sender_metadata TEXT,
       transcript_entry_id TEXT,
       created_at TEXT NOT NULL DEFAULT (datetime('now')),
       UNIQUE (conversation_id, seq)
@@ -1412,6 +1429,9 @@ export function runLcmMigrations(
     runMigrationStep("ensureSummaryModelColumn", log, () => ensureSummaryModelColumn(db));
     runMigrationStep("ensureMessageIdentityHashColumn", log, () =>
       ensureMessageIdentityHashColumn(db),
+    );
+    runMigrationStep("ensureMessageOpenClawSenderMetadataColumn", log, () =>
+      ensureMessageOpenClawSenderMetadataColumn(db),
     );
     // v4.2 §B — messages.large_content sidecar column for stub-tier
     // stratification. Idempotent additive ALTER; safe across versions.

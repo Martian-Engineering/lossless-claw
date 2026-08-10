@@ -166,6 +166,21 @@ function seedLegacySummaryGraph(db: ReturnType<typeof getLcmConnection>): void {
 }
 
 describe("runLcmMigrations summary depth backfill", () => {
+  it("adds nullable OpenClaw sender metadata without rewriting legacy messages", () => {
+    const db = createTestDb("legacy-sender-metadata.db");
+    seedLegacySummaryGraph(db);
+
+    runLcmMigrations(db);
+    runLcmMigrations(db);
+
+    const columns = db.prepare(`PRAGMA table_info(messages)`).all() as Array<{ name: string }>;
+    expect(columns.map((column) => column.name)).toContain("openclaw_sender_metadata");
+    const row = db
+      .prepare(`SELECT openclaw_sender_metadata FROM messages WHERE message_id = 1`)
+      .get() as { openclaw_sender_metadata: string | null };
+    expect(row.openclaw_sender_metadata).toBeNull();
+  });
+
   it("adds deferred compaction retry columns to legacy maintenance rows", () => {
     const db = createTestDb("legacy-maintenance.db");
     db.exec(`

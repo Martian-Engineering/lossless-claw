@@ -11,6 +11,10 @@ import type { SummaryStore, SummaryRecord, ContextItemRecord } from "./store/sum
 import { estimateTokens, truncateTextToEstimatedTokens } from "./estimate-tokens.js";
 import { extractFileIdsFromContent } from "./large-files.js";
 import { NOOP_LCM_LOGGER, type LcmLogger } from "./lcm-log.js";
+import {
+  formatOpenClawSenderForSummary,
+  type OpenClawSenderMetadata,
+} from "./openclaw-sender-metadata.js";
 import { LcmProviderAuthError } from "./summarize.js";
 import {
   buildDeterministicFallbackSummary,
@@ -2259,6 +2263,7 @@ export class CompactionEngine {
       content: string;
       createdAt: Date;
       tokenCount: number;
+      openClawSenderMetadata: OpenClawSenderMetadata | null;
     }[] = [];
     for (const item of messageItems) {
       if (item.messageId == null) {
@@ -2272,6 +2277,7 @@ export class CompactionEngine {
           content: await this.resolveLeafSummaryMessageContent(msg),
           createdAt: msg.createdAt,
           tokenCount: this.resolveMessageTokenCount(msg),
+          openClawSenderMetadata: msg.openClawSenderMetadata,
         });
       }
     }
@@ -2293,7 +2299,12 @@ export class CompactionEngine {
         if (!text) return null;
         // Role stays in the header line so the summarizer can tell an operator
         // instruction from material a tool fetched out of another conversation.
-        return `[${formatTimestamp(message.createdAt, this.config.timezone)} | ${message.role}]\n${text}`;
+        const sender =
+          message.role === "user"
+            ? formatOpenClawSenderForSummary(message.openClawSenderMetadata)
+            : null;
+        const senderSuffix = sender ? ` | ${sender}` : "";
+        return `[${formatTimestamp(message.createdAt, this.config.timezone)} | ${message.role}${senderSuffix}]\n${text}`;
       })
       .filter((s): s is string => s !== null)
       .join("\n\n");

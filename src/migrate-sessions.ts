@@ -8,6 +8,10 @@ import { runLcmMigrations } from "./db/migration.js";
 import { buildMessageParts, filterPersistableMessages, toStoredMessage, type StoredMessage } from "./message-content.js";
 import { createBootstrapEntryHash } from "./message-signatures.js";
 import type { AgentMessage } from "./openclaw-bridge.js";
+import {
+  extractOpenClawSenderMetadata,
+  type OpenClawSenderMetadata,
+} from "./openclaw-sender-metadata.js";
 import { ConversationStore, type MessageRecord } from "./store/conversation-store.js";
 import { SummaryStore } from "./store/summary-store.js";
 import { withDatabaseTransaction } from "./transaction-mutex.js";
@@ -71,6 +75,7 @@ type ImportableMessage = {
   message: AgentMessage;
   stored: StoredMessage;
   transcriptEntryId: string | null;
+  openClawSenderMetadata: OpenClawSenderMetadata | null;
 };
 
 export function defaultStateDir(): string {
@@ -283,6 +288,7 @@ function toImportableMessages(messages: AgentMessage[]): ImportableMessage[] {
     message,
     stored: toStoredMessage(message),
     transcriptEntryId: getTranscriptEntryId(message),
+    openClawSenderMetadata: extractOpenClawSenderMetadata(message),
   }));
 }
 
@@ -361,6 +367,7 @@ async function importPreparedFile(
             entry.stored.role,
             entry.stored.content,
             entry.transcriptEntryId,
+            entry.openClawSenderMetadata,
           );
           if (adopted) {
             existingEntryIds.add(entry.transcriptEntryId);
@@ -381,6 +388,7 @@ async function importPreparedFile(
         role: entry.stored.role,
         content: entry.stored.content,
         tokenCount: entry.stored.tokenCount,
+        openClawSenderMetadata: entry.openClawSenderMetadata,
         transcriptEntryId: entry.transcriptEntryId,
         createdAt: resolveTranscriptMessageCreatedAt(entry.message),
         skipReplayTimestampFloodGuard: true,

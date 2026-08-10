@@ -34,6 +34,10 @@ import {
   openClawInboundBodiesMatch,
 } from "./openclaw-inbound-metadata.js";
 import {
+  extractOpenClawSenderMetadata,
+  type OpenClawSenderMetadata,
+} from "./openclaw-sender-metadata.js";
+import {
   createBootstrapEntryHash,
   createLosslessMessageSignature,
   isBootstrapReplayCandidateMessage,
@@ -436,6 +440,7 @@ export class TranscriptReconciler {
         stored.role,
         stored.content,
         entryId,
+        extractOpenClawSenderMetadata(message),
       );
       if (adopted) {
         adoptedMessages += 1;
@@ -448,6 +453,7 @@ export class TranscriptReconciler {
         role: stored.role,
         content: stored.content,
         entryId,
+        openClawSenderMetadata: extractOpenClawSenderMetadata(message),
       });
       if (restamped) {
         restampedMessages += 1;
@@ -512,6 +518,7 @@ export class TranscriptReconciler {
     role: StoredMessage["role"];
     content: string;
     entryId: string;
+    openClawSenderMetadata: OpenClawSenderMetadata | null;
   }): Promise<boolean> {
     const candidates = await this.host.conversationStore.listTranscriptEntryIdsByIdentity(
       params.conversationId,
@@ -525,6 +532,7 @@ export class TranscriptReconciler {
       const restamped = await this.host.conversationStore.restampTranscriptEntryId(
         candidate.messageId,
         params.entryId,
+        params.openClawSenderMetadata,
       );
       if (restamped) {
         return true;
@@ -1143,6 +1151,7 @@ export class TranscriptReconciler {
               stored.role,
               stored.content,
               entryId,
+              extractOpenClawSenderMetadata(message),
             )) ||
             (await this.adoptStaleTranscriptEntryId({
               conversationId,
@@ -1150,6 +1159,7 @@ export class TranscriptReconciler {
               role: stored.role,
               content: stored.content,
               entryId,
+              openClawSenderMetadata: extractOpenClawSenderMetadata(message),
             }));
           if (adopted) {
             adoptedMessages += 1;
@@ -1170,6 +1180,7 @@ export class TranscriptReconciler {
               conversationId,
               bareContent: stored.content,
               entryId,
+              openClawSenderMetadata: extractOpenClawSenderMetadata(message),
             }))
           ) {
             adoptedMessages += 1;
@@ -1233,6 +1244,7 @@ export class TranscriptReconciler {
     conversationId: number;
     bareContent: string;
     entryId: string;
+    openClawSenderMetadata: OpenClawSenderMetadata | null;
   }): Promise<boolean> {
     const candidates = await this.host.conversationStore.listRecentUnstampedMessagesByRole(
       params.conversationId,
@@ -1248,6 +1260,7 @@ export class TranscriptReconciler {
     return this.host.conversationStore.restampTranscriptEntryId(
       matches[0].messageId,
       params.entryId,
+      params.openClawSenderMetadata,
     );
   }
 

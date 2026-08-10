@@ -171,6 +171,44 @@ describe("runSessionMigration", () => {
     }
   });
 
+  it("imports only allowlisted OpenClaw sender identity from JSONL messages", async () => {
+    const root = tempRoot();
+    writeAgentSession(root, "session-sender.jsonl", [
+      sessionHeader("session-sender"),
+      {
+        ...messageEntry("m1", null, "user", "group history"),
+        message: {
+          role: "user",
+          content: "group history",
+          __openclaw: {
+            senderId: "user-42",
+            senderName: "Ada Lovelace",
+            senderUsername: "ada",
+            senderIsOwner: true,
+          },
+        },
+      },
+    ]);
+    const dbPath = migratedDb(root);
+
+    await runSessionMigration({ dbPath, stateDir: root, apply: true });
+
+    const { db, conversationStore } = openMigratedDb(dbPath);
+    try {
+      const conversation = await conversationStore.getConversationForSession({
+        sessionId: "session-sender",
+      });
+      const messages = await conversationStore.getMessages(conversation!.conversationId);
+      expect(messages[0]?.openClawSenderMetadata).toEqual({
+        senderId: "user-42",
+        senderName: "Ada Lovelace",
+        senderUsername: "ada",
+      });
+    } finally {
+      closeLcmConnection(db);
+    }
+  });
+
   it("is idempotent on rerun and imports no duplicate rows", async () => {
     const root = tempRoot();
     writeAgentSession(root, "session-a.jsonl", [
@@ -234,7 +272,17 @@ describe("runSessionMigration", () => {
     const root = tempRoot();
     writeAgentSession(root, "session-a.jsonl", [
       sessionHeader("session-a"),
-      messageEntry("m1", null, "user", "already persisted"),
+      {
+        ...messageEntry("m1", null, "user", "already persisted"),
+        message: {
+          role: "user",
+          content: "already persisted",
+          __openclaw: {
+            senderId: "adopted-user",
+            senderName: "Adopted Sender",
+          },
+        },
+      },
       messageEntry("m2", "m1", "assistant", "existing reply"),
     ]);
     const dbPath = migratedDb(root);
@@ -283,6 +331,13 @@ describe("runSessionMigration", () => {
         { content: "already persisted", transcript_entry_id: "m1" },
         { content: "existing reply", transcript_entry_id: "m2" },
       ]);
+      const messages = await reopened.conversationStore.getMessages(
+        conversation!.conversationId,
+      );
+      expect(messages[0]?.openClawSenderMetadata).toEqual({
+        senderId: "adopted-user",
+        senderName: "Adopted Sender",
+      });
     } finally {
       closeLcmConnection(reopened.db);
     }

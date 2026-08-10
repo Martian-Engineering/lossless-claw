@@ -89,6 +89,7 @@ export function createMockConversationStore() {
         role: MessageRole;
         content: string;
         tokenCount: number;
+        openClawSenderMetadata?: MessageRecord["openClawSenderMetadata"];
       }) => {
         const msg: MessageRecord = {
           messageId: nextMsgId++,
@@ -97,9 +98,10 @@ export function createMockConversationStore() {
           role: input.role,
           content: input.content,
           tokenCount: input.tokenCount,
+          openClawSenderMetadata: input.openClawSenderMetadata ?? null,
           createdAt: new Date(),
           largeContent: null,
-  transcriptEntryId: null,
+          transcriptEntryId: null,
         };
         messages.push(msg);
         return msg;
@@ -769,4 +771,3 @@ export function makeSummarizeDeps(overrides?: Partial<LcmDependencies>): LcmDepe
 // ═════════════════════════════════════════════════════════════════════════════
 // Test Suite: Ingest -> Assemble
 // ═════════════════════════════════════════════════════════════════════════════
-
