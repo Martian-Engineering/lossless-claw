@@ -1563,7 +1563,7 @@ export class CompactionEngine {
     return messageCache.get(messageId) ?? null;
   }
 
-  /** Resolve message token count with a content-length fallback. */
+  /** Resolve leaf-source token count, including rendered sender identity. */
   private async getMessageTokenCount(
     messageId: number,
     messageCache?: Map<number, MessageRecord | null>,
@@ -1574,14 +1574,7 @@ export class CompactionEngine {
     if (!message) {
       return 0;
     }
-    if (
-      typeof message.tokenCount === "number" &&
-      Number.isFinite(message.tokenCount) &&
-      message.tokenCount > 0
-    ) {
-      return message.tokenCount;
-    }
-    return estimateTokens(message.content);
+    return this.resolveMessageTokenCount(message);
   }
 
   /** Sum raw message tokens outside the protected fresh tail. */
@@ -1770,16 +1763,24 @@ export class CompactionEngine {
     return extractMeaningfulSummaryText(summary.content).trim().length > 0;
   }
 
-  /** Resolve message token count with content-length fallback. */
-  private resolveMessageTokenCount(message: { tokenCount: number; content: string }): number {
-    if (
+  /** Resolve leaf-source tokens with content and rendered sender metadata. */
+  private resolveMessageTokenCount(
+    message: Pick<
+      MessageRecord,
+      "role" | "tokenCount" | "content" | "openClawSenderMetadata"
+    >,
+  ): number {
+    const contentTokens =
       typeof message.tokenCount === "number" &&
       Number.isFinite(message.tokenCount) &&
       message.tokenCount > 0
-    ) {
-      return message.tokenCount;
-    }
-    return estimateTokens(message.content);
+        ? message.tokenCount
+        : estimateTokens(message.content);
+    const sender =
+      message.role === "user"
+        ? formatOpenClawSenderForSummary(message.openClawSenderMetadata)
+        : null;
+    return contentTokens + (sender ? estimateTokens(sender) : 0);
   }
 
   private resolveLeafMinFanout(): number {
@@ -2337,11 +2338,10 @@ export class CompactionEngine {
     // Persist the leaf summary
     const summaryId = generateSummaryId(summary.content);
     const tokenCount = estimateTokens(summary.content);
-    // Note: removedTokens uses resolveMessageTokenCount values (which fall back to
-    // estimateTokens for messages with token_count <= 0). This can diverge from
-    // getContextTokenCount() which would sum the stored 0. The delta feeds into
-    // stopping decisions (threshold checks, progress guards), but the divergence
-    // is bounded to empty/corrupt messages (token_count=0) which are rare.
+    // removedTokens reflects the complete leaf source, including rendered sender
+    // identity and the content fallback for invalid stored token counts. It can
+    // exceed getContextTokenCount(), which stores content tokens only, but that
+    // keeps chunk/progress accounting aligned with actual summarizer input.
     // For summaries, removedTokens matches the DB exactly (same tokenCount column).
     const removedTokens = messageContents.reduce(
       (sum, message) => sum + Math.max(0, Math.floor(message.tokenCount)),
