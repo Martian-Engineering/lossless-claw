@@ -1,5 +1,13 @@
 # @martian-engineering/lossless-claw
 
+## 1.0.0-beta.1
+
+<!-- release-rollback-version: 0.15.1 -->
+
+### Patch Changes
+
+- [#1070](https://github.com/Martian-Engineering/lossless-claw/pull/1070) [`267f006`](https://github.com/Martian-Engineering/lossless-claw/commit/267f00696fd8266d57dc223ccaa91c20d9f871e6) Thanks [@hannesrudolph](https://github.com/hannesrudolph)! - Persist accepted OpenClaw turns with an atomic idempotency ledger so host retries cannot duplicate or partially advance LosslessClaw context.
+
 ## 1.0.0-beta.0
 
 <!-- release-rollback-version: 0.15.1 -->
