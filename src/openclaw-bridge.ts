@@ -218,6 +218,13 @@ export type PluginSessionActionResult =
 export type AgentMessage = {
   role: string;
   content?: any;
+  /** Optional host-owned envelope. Field values remain untrusted model input. */
+  __openclaw?: {
+    senderId?: string;
+    senderName?: string;
+    senderUsername?: string;
+    [key: string]: unknown;
+  };
   timestamp?: number;
   toolCallId?: string;
   toolUseId?: string;

@@ -8,6 +8,11 @@ import { buildMessageIdentityHash } from "./message-identity.js";
 import { parseUtcTimestamp, parseUtcTimestampOrNull } from "./parse-utc-timestamp.js";
 import { buildFtsOrderBy, type SearchSort } from "./full-text-sort.js";
 import { compileSafeSearchRegex } from "./search-regex.js";
+import {
+  parseOpenClawSenderMetadata,
+  serializeOpenClawSenderMetadata,
+  type OpenClawSenderMetadata,
+} from "../openclaw-sender-metadata.js";
 
 export type ConversationId = number;
 export type MessageId = number;
@@ -33,6 +38,8 @@ export type CreateMessageInput = {
   role: MessageRole;
   content: string;
   tokenCount: number;
+  /** Allowlisted OpenClaw sender identity for group-message replay. */
+  openClawSenderMetadata?: OpenClawSenderMetadata | null;
   identityHash?: string;
   /**
    * Optional historical message timestamp, used by transcript recovery imports.
@@ -107,6 +114,8 @@ export type MessageRecord = {
    * required before collapse.
    */
   transcriptEntryId: string | null;
+  /** Allowlisted OpenClaw sender identity, or null for legacy/direct messages. */
+  openClawSenderMetadata: OpenClawSenderMetadata | null;
 };
 
 export type CreateMessagePartInput = {
@@ -218,6 +227,8 @@ interface MessageRow {
   // Transcript provenance: non-null only for rows imported from a transcript
   // envelope (the host's own flush). Same optional-projection tolerance.
   transcript_entry_id?: string | null;
+  // Allowlisted OpenClaw sender envelope fields, serialized as JSON.
+  openclaw_sender_metadata?: string | null;
 }
 
 interface MessageSearchRow {
@@ -295,6 +306,7 @@ function toMessageRecord(row: MessageRow): MessageRecord {
   return {
     largeContent: row.large_content ?? null,
     transcriptEntryId: row.transcript_entry_id ?? null,
+    openClawSenderMetadata: parseOpenClawSenderMetadata(row.openclaw_sender_metadata),
     messageId: row.message_id,
     conversationId: row.conversation_id,
     seq: row.seq,
@@ -696,8 +708,8 @@ export class ConversationStore {
 
     const result = this.db
       .prepare(
-        `INSERT INTO messages (conversation_id, seq, role, content, token_count, identity_hash, transcript_entry_id, stable_event_key, created_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        `INSERT INTO messages (conversation_id, seq, role, content, token_count, identity_hash, openclaw_sender_metadata, transcript_entry_id, stable_event_key, created_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       )
       .run(
         prepared.conversationId,
@@ -706,6 +718,7 @@ export class ConversationStore {
         prepared.content,
         prepared.tokenCount,
         prepared.identityHash,
+        serializeOpenClawSenderMetadata(prepared.openClawSenderMetadata),
         prepared.transcriptEntryId ?? null,
         prepared.stableEventKey,
         prepared.createdAt,
@@ -717,7 +730,7 @@ export class ConversationStore {
 
     const row = this.db
       .prepare(
-        `SELECT message_id, conversation_id, seq, role, content, token_count, created_at, large_content, transcript_entry_id
+        `SELECT message_id, conversation_id, seq, role, content, token_count, created_at, large_content, transcript_entry_id, openclaw_sender_metadata
        FROM messages WHERE message_id = ?`,
       )
       .get(messageId) as unknown as MessageRow;
@@ -736,11 +749,11 @@ export class ConversationStore {
     );
 
     const insertStmt = this.db.prepare(
-      `INSERT INTO messages (conversation_id, seq, role, content, token_count, identity_hash, transcript_entry_id, stable_event_key, created_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      `INSERT INTO messages (conversation_id, seq, role, content, token_count, identity_hash, openclaw_sender_metadata, transcript_entry_id, stable_event_key, created_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
     );
     const selectStmt = this.db.prepare(
-      `SELECT message_id, conversation_id, seq, role, content, token_count, created_at, large_content, transcript_entry_id
+      `SELECT message_id, conversation_id, seq, role, content, token_count, created_at, large_content, transcript_entry_id, openclaw_sender_metadata
        FROM messages WHERE message_id = ?`,
     );
 
@@ -753,6 +766,7 @@ export class ConversationStore {
         input.content,
         input.tokenCount,
         input.identityHash,
+        serializeOpenClawSenderMetadata(input.openClawSenderMetadata),
         input.transcriptEntryId ?? null,
         input.stableEventKey,
         input.createdAt,
@@ -777,7 +791,7 @@ export class ConversationStore {
     if (limit != null) {
       const rows = this.db
         .prepare(
-          `SELECT message_id, conversation_id, seq, role, content, token_count, created_at, large_content, transcript_entry_id
+          `SELECT message_id, conversation_id, seq, role, content, token_count, created_at, large_content, transcript_entry_id, openclaw_sender_metadata
          FROM messages
          WHERE conversation_id = ? AND seq > ?
          ORDER BY seq
@@ -789,7 +803,7 @@ export class ConversationStore {
 
     const rows = this.db
       .prepare(
-        `SELECT message_id, conversation_id, seq, role, content, token_count, created_at, large_content, transcript_entry_id
+        `SELECT message_id, conversation_id, seq, role, content, token_count, created_at, large_content, transcript_entry_id, openclaw_sender_metadata
        FROM messages
        WHERE conversation_id = ? AND seq > ?
        ORDER BY seq`,
@@ -805,7 +819,7 @@ export class ConversationStore {
     }
     const rows = this.db
       .prepare(
-        `SELECT message_id, conversation_id, seq, role, content, token_count, created_at, large_content, transcript_entry_id
+        `SELECT message_id, conversation_id, seq, role, content, token_count, created_at, large_content, transcript_entry_id, openclaw_sender_metadata
        FROM messages
        WHERE conversation_id = ?
        ORDER BY seq DESC
@@ -818,7 +832,7 @@ export class ConversationStore {
   async getLastMessage(conversationId: ConversationId): Promise<MessageRecord | null> {
     const row = this.db
       .prepare(
-        `SELECT message_id, conversation_id, seq, role, content, token_count, created_at, large_content, transcript_entry_id
+        `SELECT message_id, conversation_id, seq, role, content, token_count, created_at, large_content, transcript_entry_id, openclaw_sender_metadata
        FROM messages
        WHERE conversation_id = ?
        ORDER BY seq DESC
@@ -952,7 +966,9 @@ export class ConversationStore {
    * Stamp a transcript entry id onto the earliest identity-matching row that
    * has none. Heals rows persisted from the runtime array (flush lag) or
    * before the entry-id migration when the transcript later delivers the
-   * same message with its envelope id, instead of importing a duplicate.
+   * same message with its envelope id, instead of importing a duplicate. A
+   * matching user row also adopts allowlisted sender identity only when its
+   * sender column is still NULL, preserving any identity captured at runtime.
    * Returns true when a row was adopted.
    */
   async adoptTranscriptEntryId(
@@ -960,12 +976,16 @@ export class ConversationStore {
     role: MessageRole,
     content: string,
     transcriptEntryId: string,
+    openClawSenderMetadata?: OpenClawSenderMetadata | null,
   ): Promise<boolean> {
     const identityHash = buildMessageIdentityHash(role, content);
+    const serializedSenderMetadata =
+      role === "user" ? serializeOpenClawSenderMetadata(openClawSenderMetadata) : null;
     const result = this.db
       .prepare(
         `UPDATE messages
-       SET transcript_entry_id = ?
+       SET transcript_entry_id = ?,
+           openclaw_sender_metadata = COALESCE(openclaw_sender_metadata, ?)
        WHERE message_id = (
          SELECT message_id
          FROM messages
@@ -978,7 +998,14 @@ export class ConversationStore {
          LIMIT 1
        )`,
       )
-      .run(transcriptEntryId, conversationId, identityHash, role, content);
+      .run(
+        transcriptEntryId,
+        serializedSenderMetadata,
+        conversationId,
+        identityHash,
+        role,
+        content,
+      );
     return result.changes > 0;
   }
 
@@ -1017,17 +1044,31 @@ export class ConversationStore {
 
   /**
    * Replace a row's stale transcript entry id with the id the host re-issued
-   * for the same message. Returns false when the new id already exists for
-   * the conversation (unique-index race: another path imported it first).
+   * for the same message. Missing user sender identity is enriched from the
+   * new envelope without overwriting existing metadata. Returns false when
+   * the new id already exists for the conversation (unique-index race:
+   * another path imported it first).
    */
   async restampTranscriptEntryId(
     messageId: number,
     transcriptEntryId: string,
+    openClawSenderMetadata?: OpenClawSenderMetadata | null,
   ): Promise<boolean> {
     try {
+      const serializedSenderMetadata = serializeOpenClawSenderMetadata(
+        openClawSenderMetadata,
+      );
       const result = this.db
-        .prepare(`UPDATE messages SET transcript_entry_id = ? WHERE message_id = ?`)
-        .run(transcriptEntryId, messageId);
+        .prepare(
+          `UPDATE messages
+           SET transcript_entry_id = ?,
+               openclaw_sender_metadata = CASE
+                 WHEN role = 'user' THEN COALESCE(openclaw_sender_metadata, ?)
+                 ELSE openclaw_sender_metadata
+               END
+           WHERE message_id = ?`,
+        )
+        .run(transcriptEntryId, serializedSenderMetadata, messageId);
       return result.changes > 0;
     } catch (error) {
       if (error instanceof Error && error.message.includes("UNIQUE constraint failed")) {
@@ -1264,7 +1305,7 @@ export class ConversationStore {
   async getMessageById(messageId: MessageId): Promise<MessageRecord | null> {
     const row = this.db
       .prepare(
-        `SELECT message_id, conversation_id, seq, role, content, token_count, created_at, large_content, transcript_entry_id
+        `SELECT message_id, conversation_id, seq, role, content, token_count, created_at, large_content, transcript_entry_id, openclaw_sender_metadata
        FROM messages WHERE message_id = ?`,
       )
       .get(messageId) as unknown as MessageRow | undefined;
@@ -1275,7 +1316,7 @@ export class ConversationStore {
   async getMessageByLargeContent(fileId: string): Promise<MessageRecord | null> {
     const row = this.db
       .prepare(
-        `SELECT message_id, conversation_id, seq, role, content, token_count, created_at, large_content, transcript_entry_id
+        `SELECT message_id, conversation_id, seq, role, content, token_count, created_at, large_content, transcript_entry_id, openclaw_sender_metadata
        FROM messages
        WHERE large_content = ?
        ORDER BY seq DESC
@@ -1494,6 +1535,7 @@ export class ConversationStore {
       ...input,
       createdAt: formatMessageCreatedAt(input.createdAt) ?? createdAt,
       identityHash: input.identityHash ?? buildMessageIdentityHash(input.role, input.content),
+      openClawSenderMetadata: input.role === "user" ? input.openClawSenderMetadata : null,
       stableEventKey: input.stableEventKey ?? null,
     };
   }
@@ -1762,7 +1804,7 @@ export class ConversationStore {
     const whereClause = where.length > 0 ? `WHERE ${where.join(" AND ")}` : "";
     const rows = this.db
       .prepare(
-        `SELECT message_id, conversation_id, seq, role, content, token_count, created_at, large_content, transcript_entry_id
+        `SELECT message_id, conversation_id, seq, role, content, token_count, created_at, large_content, transcript_entry_id, openclaw_sender_metadata
          FROM messages
          ${whereClause}
          ORDER BY created_at DESC
@@ -1824,7 +1866,7 @@ export class ConversationStore {
     const whereClause = where.length > 0 ? `WHERE ${where.join(" AND ")}` : "";
     const rows = this.db
       .prepare(
-        `SELECT message_id, conversation_id, seq, role, content, token_count, created_at, large_content, transcript_entry_id
+        `SELECT message_id, conversation_id, seq, role, content, token_count, created_at, large_content, transcript_entry_id, openclaw_sender_metadata
          FROM messages
          ${whereClause}
          ORDER BY created_at DESC`,

@@ -10,6 +10,7 @@ import type { FocusBriefRecord, FocusBriefStore } from "./store/focus-brief-stor
 import type { SummaryStore, ContextItemRecord, SummaryRecord } from "./store/summary-store.js";
 import { estimateTokens } from "./estimate-tokens.js";
 import { formatToolOutputReference } from "./large-files.js";
+import { serializeOpenClawSenderMetadata } from "./openclaw-sender-metadata.js";
 
 type AgentMessage = Parameters<ContextEngine["ingest"]>[0]["message"];
 type AssemblySegment = "evictable" | "freshTail";
@@ -1888,8 +1889,12 @@ export class ContextAssembler {
     const contentText =
       typeof content === "string" ? content : (JSON.stringify(content) ?? msg.content);
     const topLevelReasoningText = Object.values(topLevelAssistantReasoning).join("\n");
+    const senderMetadataText =
+      role === "user"
+        ? (serializeOpenClawSenderMetadata(msg.openClawSenderMetadata) ?? "")
+        : "";
     const tokenCount = estimateTokens(
-      [contentText, topLevelReasoningText].filter(Boolean).join("\n"),
+      [contentText, topLevelReasoningText, senderMetadataText].filter(Boolean).join("\n"),
     );
 
     // v4.2 §B (Option C) — `messages.large_content` now stores the
@@ -1941,6 +1946,9 @@ export class ContextAssembler {
           : ({
               role,
               content,
+              ...(role === "user" && msg.openClawSenderMetadata
+                ? { __openclaw: msg.openClawSenderMetadata }
+                : {}),
               ...(toolCallId ? { toolCallId } : {}),
               ...(toolName ? { toolName } : {}),
               ...(role === "toolResult" && toolIsError !== undefined ? { isError: toolIsError } : {}),

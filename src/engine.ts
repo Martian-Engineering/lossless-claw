@@ -90,6 +90,7 @@ import { appendUncoveredVolatileLiveInputsWithinBudget, isVolatileLiveInputMessa
 import { buildMessageParts, extractMessageContent, filterPersistableMessages, hasPersistableMessageRole, isOpenClawRuntimeContextLeak, toStoredMessage } from "./message-content.js";
 import { createBootstrapEntryHash, readBootstrapMessageFromJsonLine } from "./message-signatures.js";
 import { canonicalizeOpenClawInboundMetadataIdentityContent } from "./openclaw-inbound-metadata.js";
+import { extractOpenClawSenderMetadata } from "./openclaw-sender-metadata.js";
 import { PROMPT_RECALL_MAX_MESSAGES, PROMPT_RECALL_SEARCH_CANDIDATE_LIMIT, buildPromptRecallProjectionFingerprint, extractPromptRecallIdentifiers, extractPromptRecallSnippet, findPromptRecallIdentifierIndex, isPromptRecallEligibleRole, normalizePromptRecallCoverageText, normalizePromptRecallText, renderPromptRecallMessage } from "./prompt-recall.js";
 import { listTranscriptToolResultEntryIdsByCallId } from "./replay-metadata.js";
 import { extractRuntimePromptTokenCount } from "./token-accounting.js";
@@ -2714,6 +2715,7 @@ export class LcmContextEngine implements ContextEngine {
     if (!hasPersistableMessageRole(message)) {
       return { ingested: false };
     }
+    const openClawSenderMetadata = extractOpenClawSenderMetadata(message);
 
     // Skip assistant messages that failed with an error and have no useful content.
     // These occur when an API call returns a 500 or similar transient error.
@@ -2901,6 +2903,7 @@ export class LcmContextEngine implements ContextEngine {
       role: stored.role,
       content: stored.content,
       tokenCount: stored.tokenCount,
+      openClawSenderMetadata,
       transcriptEntryId,
       stableEventKey,
       createdAt,
