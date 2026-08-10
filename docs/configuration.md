@@ -2,9 +2,13 @@
 
 Lossless-claw reads plugin configuration from `plugins.entries.lossless-claw.config`.
 
-Lossless-claw requires OpenClaw `2026.5.28` or newer so the host can enforce
-context-engine runtime capabilities before an agent run starts. Agent runs need
-a native host that provides the full context-engine lifecycle: session bootstrap,
+Lossless Claw 0.x supports file-backed OpenClaw from `2026.5.28` through
+`2026.7.1`. OpenClaw `2026.7.2` prereleases and later use SQLite-backed session
+storage and require Lossless Claw 1.0 from the `next/1.0` release line. If you
+cannot move to 1.0, remain on OpenClaw `2026.7.1` or select OpenClaw's `legacy`
+context engine. The `2026.5.28` minimum lets the host enforce context-engine
+runtime capabilities before an agent run starts. Agent runs need a native host
+that provides the full context-engine lifecycle: session bootstrap,
 pre-prompt assembly, after-turn ingestion, maintenance, compaction, and runtime
 LLM completion. Native Codex and Pi embedded runs provide those capabilities;
 generic CLI harnesses such as `claude-cli` and `codex-cli` do not. If you must

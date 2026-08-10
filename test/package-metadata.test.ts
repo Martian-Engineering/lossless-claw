@@ -3,12 +3,14 @@ import { readFileSync } from "node:fs";
 import packageJson from "../package.json" with { type: "json" };
 
 describe("package OpenClaw compatibility metadata", () => {
-  it("declares the memory supplement context-engine minimum OpenClaw version without an upper bound", () => {
-    expect(packageJson.peerDependencies.openclaw).toBe(">=2026.5.28");
+  it("bounds the 0.x line to file-backed OpenClaw while preserving its minimum contract", () => {
+    expect(packageJson.peerDependencies.openclaw).toBe(">=2026.5.28 <2026.7.2-0");
+    expect(packageJson.peerDependenciesMeta.openclaw.optional).toBe(true);
     expect(packageJson.openclaw.compat.pluginApi).toBe(">=2026.5.28");
     expect(packageJson.openclaw.compat.minGatewayVersion).toBe("2026.5.28");
     expect(packageJson.openclaw.compat.tested).toEqual(["2026.5.28"]);
     expect(packageJson.openclaw.build.openclawVersion).toBe("2026.5.28");
+    expect(packageJson.openclaw.compat).not.toHaveProperty("maxGatewayVersion");
   });
 
   it("publishes the TypeScript lcm executable", () => {
