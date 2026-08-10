@@ -161,6 +161,23 @@ describe("LcmContextEngine commitTurn", () => {
     ).toEqual({ count: 1 });
   });
 
+  it("ignores the uncommitted transcript prefix when identifying a retry", async () => {
+    const engine = createEngine();
+    const params = buildCommitTurnParams();
+    await engine.commitTurn(params);
+    params.messages[0] = makeMessage({
+      role: "assistant",
+      content: "refreshed visible prefix",
+      timestamp: 1_500,
+    });
+
+    await expect(engine.commitTurn(params)).resolves.toEqual({ status: "duplicate" });
+    expect((await readStoredMessages(engine)).map((message) => message.content)).toEqual([
+      "current question",
+      "current answer",
+    ]);
+  });
+
   it("acknowledges excluded session turns without writing LCM state", async () => {
     const engine = createEngineWithConfig({
       ignoreSessionPatterns: ["agent:main:durable-turn-session"],

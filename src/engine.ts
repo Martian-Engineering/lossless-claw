@@ -180,7 +180,7 @@ function buildTurnAdvancementPayloadHash(params: CommitTurnParams): string {
   const canonicalPayload = canonicalizeTurnPayload({
     admission: params.admission,
     isHeartbeat: params.isHeartbeat === true,
-    messages: params.messages,
+    messages: params.messages.slice(params.prePromptMessageCount),
     prePromptMessageCount: params.prePromptMessageCount,
     sessionId: params.sessionId,
     sessionKey: params.sessionKey,
