@@ -130,6 +130,21 @@ describe("LcmContextEngine commitTurn", () => {
     });
   });
 
+  it("rejects a terminal anchor outside the supplied message range", async () => {
+    const engine = createEngine();
+    const params = buildCommitTurnParams();
+    params.messages = params.messages.slice(0, 2);
+
+    await expect(engine.commitTurn(params)).rejects.toThrow(
+      "turn advancement transcript range is invalid",
+    );
+
+    expect(await readStoredMessages(engine)).toHaveLength(0);
+    expect(
+      getEngineDatabase(engine).prepare("SELECT count(*) AS count FROM turn_advancements").get(),
+    ).toEqual({ count: 0 });
+  });
+
   it("returns duplicate without repeating message or context persistence", async () => {
     const engine = createEngine();
     const params = buildCommitTurnParams();
@@ -181,6 +196,32 @@ describe("LcmContextEngine commitTurn", () => {
     expect(
       getEngineDatabase(engine).prepare("SELECT count(*) AS count FROM turn_advancements").get(),
     ).toEqual({ count: 0 });
+  });
+
+  it("records deferred compaction debt after a durable turn commit", async () => {
+    const engine = createEngineWithConfig({
+      proactiveThresholdCompactionMode: "inline",
+    });
+    const params = buildCommitTurnParams();
+    params.runtimeContext = {
+      currentTokenCount: 1_000,
+      tokenBudget: 100,
+    };
+
+    await expect(engine.commitTurn(params)).resolves.toEqual({ status: "committed" });
+
+    const conversation = await engine
+      .getConversationStore()
+      .getConversationBySessionId(params.sessionId);
+    expect(conversation).not.toBeNull();
+    const maintenance = await engine
+      .getCompactionMaintenanceStore()
+      .getConversationCompactionMaintenance(conversation!.conversationId);
+    expect(maintenance).toMatchObject({
+      currentTokenCount: 1_000,
+      reason: "threshold",
+      tokenBudget: 100,
+    });
   });
 
   it("fails closed when the same advancement key carries a different payload", async () => {

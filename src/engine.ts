@@ -149,6 +149,17 @@ type CommitTurnParams = {
   isHeartbeat?: boolean;
 };
 
+type PostTurnCompactionParams = {
+  phase: "afterTurn" | "commitTurn";
+  sessionId: string;
+  sessionKey?: string;
+  sessionFile?: string;
+  tokenBudget?: number;
+  currentTokenCount?: number;
+  runtimeContext?: Record<string, unknown>;
+  legacyCompactionParams?: Record<string, unknown>;
+};
+
 /** JSON.stringify semantics with stable object-key ordering for retry identity. */
 function canonicalizeTurnPayload(value: unknown): unknown {
   if (Array.isArray(value)) {
@@ -207,7 +218,8 @@ function assertValidTurnAdvancement(params: CommitTurnParams): void {
     params.prePromptMessageCount < 0 ||
     params.prePromptMessageCount > params.messages.length ||
     params.prePromptMessageCount !== admission.activeMessagePosition ||
-    terminal.activeMessagePosition < admission.activeMessagePosition
+    terminal.activeMessagePosition < admission.activeMessagePosition ||
+    terminal.activeMessagePosition !== params.messages.length - 1
   ) {
     throw new Error("turn advancement transcript range is invalid");
   }
@@ -3802,6 +3814,223 @@ export class LcmContextEngine implements ContextEngine {
     );
   }
 
+  /** Evaluate and schedule the compaction work shared by both turn commit paths. */
+  private async evaluatePostTurnCompaction(
+    params: PostTurnCompactionParams,
+  ): Promise<number | undefined> {
+    const sessionLabel = formatSessionLabel(params.sessionId, params.sessionKey);
+    const legacyParams = asRecord(params.runtimeContext) ?? asRecord(params.legacyCompactionParams);
+    const defaultTokenBudget = 128_000;
+    const resolvedTokenBudget = this.resolveTokenBudget({
+      tokenBudget: params.tokenBudget,
+      runtimeContext: params.runtimeContext,
+      legacyParams,
+    });
+    const tokenBudget = this.applyAssemblyBudgetCap(resolvedTokenBudget ?? defaultTokenBudget);
+    if (resolvedTokenBudget === undefined) {
+      this.deps.log.warn(
+        `[lcm] ${params.phase}: tokenBudget not provided; using default ${defaultTokenBudget}`,
+      );
+    }
+
+    const conversation = await this.conversationStore.getConversationForSession({
+      sessionId: params.sessionId,
+      sessionKey: params.sessionKey,
+    });
+    const runtimePromptTokens = extractRuntimePromptTokenCount(asRecord(params.runtimeContext));
+    const suppliedCurrentTokenCount = this.normalizeObservedTokenCount(
+      params.currentTokenCount ??
+      (
+        (legacyParams ?? {}) as {
+          currentTokenCount?: unknown;
+        }
+      ).currentTokenCount,
+    );
+    const observedCurrentTokenCount = runtimePromptTokens ?? suppliedCurrentTokenCount;
+    if (runtimePromptTokens !== undefined) {
+      this.deps.log.debug(
+        `[lcm] ${params.phase}: using runtime prompt token count currentTokenCount=${runtimePromptTokens}`,
+      );
+    }
+    if (!conversation) {
+      this.deps.log.debug(
+        `[lcm] ${params.phase}: conversation lookup missed ${sessionLabel}`,
+      );
+      return undefined;
+    }
+
+    const recordCompactionRetry = async (
+      reason: string,
+      diagnostics?: {
+        projectedTokenCount?: number;
+        rawTokensOutsideTail?: number;
+        contextThreshold?: ResolvedContextThreshold;
+      },
+    ): Promise<void> => {
+      try {
+        await this.telemetryRecorder.recordDeferredCompactionDebt({
+          conversationId: conversation.conversationId,
+          reason,
+          tokenBudget,
+          currentTokenCount: observedCurrentTokenCount,
+          projectedTokenCount: diagnostics?.projectedTokenCount,
+          rawTokensOutsideTail: diagnostics?.rawTokensOutsideTail,
+          contextThreshold: diagnostics?.contextThreshold,
+        });
+      } catch (err) {
+        this.deps.log.warn(
+          `[lcm] ${params.phase}: failed to persist deferred compaction retry for ${sessionLabel}: ${describeLogError(err)}`,
+        );
+      }
+    };
+    let deferredCompactionDrain:
+      | {
+          reason: string;
+          tokenBudget: number;
+          currentTokenCount?: number;
+        }
+      | null = null;
+    let pendingSummaryPreparationDrain:
+      | {
+          reason: string;
+          tokenBudget: number;
+          currentTokenCount?: number;
+        }
+      | null = null;
+
+    try {
+      await this.telemetryRecorder.updateCompactionTelemetry({
+        conversationId: conversation.conversationId,
+        runtimeContext: legacyParams,
+        tokenBudget,
+      });
+    } catch (err) {
+      this.deps.log.warn(
+        `[lcm] ${params.phase}: compaction telemetry update failed: ${describeLogError(err)}`,
+      );
+    }
+
+    try {
+      const resolvedContextThreshold = this.contextThresholdResolver.resolve({
+        sessionKey: params.sessionKey,
+        runtime: readRuntimeModelContext(
+          asRecord(params.runtimeContext),
+          asRecord(params.legacyCompactionParams),
+        ),
+      });
+      const thresholdDecision = await this.compaction.evaluate(
+        conversation.conversationId,
+        tokenBudget,
+        observedCurrentTokenCount,
+        {
+          contextThreshold: resolvedContextThreshold.contextThreshold,
+          ...(resolvedContextThreshold.freshTailCount !== undefined
+            ? { freshTailCount: resolvedContextThreshold.freshTailCount }
+            : {}),
+        },
+      );
+      this.logContextThresholdSelection({
+        conversationId: conversation.conversationId,
+        sessionId: params.sessionId,
+        sessionKey: params.sessionKey,
+        tokenBudget,
+        thresholdTokens: thresholdDecision.threshold,
+        resolved: resolvedContextThreshold,
+        phase: params.phase,
+      });
+      const thresholdDiagnostics = {
+        projectedTokenCount: thresholdDecision.projectedTokens,
+        rawTokensOutsideTail: thresholdDecision.rawTokensOutsideTail,
+        contextThreshold: resolvedContextThreshold,
+      };
+      const canCompactInline =
+        this.config.proactiveThresholdCompactionMode === "inline" &&
+        params.sessionFile !== undefined;
+      if (canCompactInline) {
+        if (thresholdDecision.shouldCompact) {
+          const compactResult = await this.compact({
+            sessionId: params.sessionId,
+            sessionKey: params.sessionKey,
+            sessionFile: params.sessionFile!,
+            tokenBudget,
+            currentTokenCount: observedCurrentTokenCount,
+            compactionTarget: "threshold",
+            contextThresholdOverride: resolvedContextThreshold,
+            legacyParams,
+          });
+          if (!compactResult.ok) {
+            await recordCompactionRetry("threshold", thresholdDiagnostics);
+          }
+        }
+      } else if (thresholdDecision.shouldCompact) {
+        await this.telemetryRecorder.recordDeferredCompactionDebt({
+          conversationId: conversation.conversationId,
+          reason: "threshold",
+          tokenBudget,
+          currentTokenCount: observedCurrentTokenCount,
+          projectedTokenCount: thresholdDecision.projectedTokens,
+          rawTokensOutsideTail: thresholdDecision.rawTokensOutsideTail,
+          contextThreshold: resolvedContextThreshold,
+        });
+        deferredCompactionDrain = {
+          tokenBudget,
+          currentTokenCount: observedCurrentTokenCount,
+          reason: "threshold",
+        };
+        this.scheduleThresholdPublicationOpportunity({
+          conversationId: conversation.conversationId,
+          sessionId: params.sessionId,
+          sessionKey: params.sessionKey,
+          tokenBudget,
+          currentTokenCount: observedCurrentTokenCount,
+          reason: "threshold",
+        });
+      }
+      if (!thresholdDecision.shouldCompact) {
+        const leafDecision = await this.compaction.evaluateLeafTrigger(
+          conversation.conversationId,
+          this.config.leafChunkTokens,
+        );
+        this.deps.log.debug(
+          `[lcm] pending-summary-prep: selected phase=${params.phase} conversation=${conversation.conversationId} ${sessionLabel} rawTokensOutsideTail=${leafDecision.rawTokensOutsideTail} threshold=${leafDecision.threshold} shouldPrepare=${leafDecision.shouldCompact}`,
+        );
+        if (leafDecision.shouldCompact) {
+          pendingSummaryPreparationDrain = {
+            tokenBudget,
+            currentTokenCount: observedCurrentTokenCount,
+            reason: "leaf-prep",
+          };
+        }
+      }
+    } catch (err) {
+      this.deps.log.warn(
+        `[lcm] ${params.phase}: compaction policy check failed for ${sessionLabel}: ${describeLogError(err)}`,
+      );
+    }
+
+    if (deferredCompactionDrain) {
+      this.scheduleDeferredCompactionDebtDrain({
+        conversationId: conversation.conversationId,
+        sessionId: params.sessionId,
+        sessionKey: params.sessionKey,
+        tokenBudget: deferredCompactionDrain.tokenBudget,
+        currentTokenCount: deferredCompactionDrain.currentTokenCount,
+        reason: deferredCompactionDrain.reason,
+      });
+    }
+    if (pendingSummaryPreparationDrain) {
+      this.schedulePendingSummaryPreparationDrain({
+        conversationId: conversation.conversationId,
+        sessionId: params.sessionId,
+        sessionKey: params.sessionKey,
+        tokenBudget: pendingSummaryPreparationDrain.tokenBudget,
+        currentTokenCount: pendingSummaryPreparationDrain.currentTokenCount,
+        reason: pendingSummaryPreparationDrain.reason,
+      });
+    }
+    return conversation.conversationId;
+  }
+
   /**
    * Persist one host-accepted transcript turn and its advancement receipt in
    * the same SQLite transaction. The host may safely retry after losing the
@@ -3821,7 +4050,7 @@ export class LcmContextEngine implements ContextEngine {
     this.ensureMigrated();
     const payloadHash = buildTurnAdvancementPayloadHash(params);
 
-    return this.withSessionQueue(
+    const result = await this.withSessionQueue(
       this.resolveSessionQueueKey(sessionId, sessionKey),
       async () =>
         this.conversationStore.withTransaction(async () => {
@@ -3884,6 +4113,15 @@ export class LcmContextEngine implements ContextEngine {
         context: `session=${sessionId} sessionKey=${sessionKey} advancementKey=${params.advancementKey}`,
       },
     );
+    const runtimeLimits = asRecord(asRecord(params.runtimeSettings)?.limits);
+    await this.evaluatePostTurnCompaction({
+      phase: "commitTurn",
+      sessionId,
+      sessionKey,
+      tokenBudget: this.normalizeObservedTokenCount(runtimeLimits?.promptTokenBudget),
+      runtimeContext: params.runtimeContext,
+    });
+    return result;
   }
 
   async afterTurn(params: {
@@ -4094,216 +4332,22 @@ export class LcmContextEngine implements ContextEngine {
       }
     }
 
-    const legacyParams = asRecord(params.runtimeContext) ?? asRecord(params.legacyCompactionParams);
-    const DEFAULT_AFTER_TURN_TOKEN_BUDGET = 128_000;
-    const resolvedTokenBudget = this.resolveTokenBudget({
-      tokenBudget: params.tokenBudget,
-      runtimeContext: params.runtimeContext,
-      legacyParams,
-    });
-    const tokenBudget = this.applyAssemblyBudgetCap(resolvedTokenBudget ?? DEFAULT_AFTER_TURN_TOKEN_BUDGET);
-    if (resolvedTokenBudget === undefined) {
-      this.deps.log.warn(
-        `[lcm] afterTurn: tokenBudget not provided; using default ${DEFAULT_AFTER_TURN_TOKEN_BUDGET}`,
-      );
-    }
-
-    const conversation = await this.conversationStore.getConversationForSession({
+    const conversationId = await this.evaluatePostTurnCompaction({
+      phase: "afterTurn",
       sessionId,
       sessionKey,
+      sessionFile: params.sessionFile,
+      tokenBudget: params.tokenBudget,
+      currentTokenCount: params.currentTokenCount,
+      runtimeContext: params.runtimeContext,
+      legacyCompactionParams: params.legacyCompactionParams,
     });
-    const runtimePromptTokens = extractRuntimePromptTokenCount(asRecord(params.runtimeContext));
-    const suppliedCurrentTokenCount = this.normalizeObservedTokenCount(
-      params.currentTokenCount ??
-      (
-        (legacyParams ?? {}) as {
-          currentTokenCount?: unknown;
-        }
-      ).currentTokenCount,
-    );
-    const observedCurrentTokenCount = runtimePromptTokens ?? suppliedCurrentTokenCount;
-    if (runtimePromptTokens !== undefined) {
-      this.deps.log.debug(
-        `[lcm] afterTurn: using runtime prompt token count currentTokenCount=${runtimePromptTokens}`,
-      );
-    }
-    if (!conversation) {
-      this.deps.log.debug(
-        `[lcm] afterTurn: conversation lookup missed ${sessionLabel} ingestBatch=${ingestBatch.length} duration=${formatDurationMs(Date.now() - startedAt)}`,
-      );
+    if (conversationId === undefined) {
       return;
-    }
-    const recordAfterTurnCompactionRetry = async (
-      reason: string,
-      diagnostics?: {
-        projectedTokenCount?: number;
-        rawTokensOutsideTail?: number;
-        contextThreshold?: ResolvedContextThreshold;
-      },
-    ): Promise<void> => {
-      try {
-        await this.telemetryRecorder.recordDeferredCompactionDebt({
-          conversationId: conversation.conversationId,
-          reason,
-          tokenBudget,
-          currentTokenCount: observedCurrentTokenCount,
-          projectedTokenCount: diagnostics?.projectedTokenCount,
-          rawTokensOutsideTail: diagnostics?.rawTokensOutsideTail,
-          contextThreshold: diagnostics?.contextThreshold,
-        });
-      } catch (err) {
-        this.deps.log.warn(
-          `[lcm] afterTurn: failed to persist deferred compaction retry for ${sessionLabel}: ${describeLogError(err)}`,
-        );
-      }
-    };
-    let deferredCompactionDrain:
-      | {
-          reason: string;
-          tokenBudget: number;
-          currentTokenCount?: number;
-        }
-      | null = null;
-    let pendingSummaryPreparationDrain:
-      | {
-          reason: string;
-          tokenBudget: number;
-          currentTokenCount?: number;
-        }
-      | null = null;
-
-    try {
-      await this.telemetryRecorder.updateCompactionTelemetry({
-        conversationId: conversation.conversationId,
-        runtimeContext: legacyParams,
-        tokenBudget,
-      });
-    } catch (err) {
-      this.deps.log.warn(
-        `[lcm] afterTurn: compaction telemetry update failed: ${describeLogError(err)}`,
-      );
-    }
-
-    try {
-      const resolvedContextThreshold = this.contextThresholdResolver.resolve({
-        sessionKey,
-        runtime: readRuntimeModelContext(
-          asRecord(params.runtimeContext),
-          asRecord(params.legacyCompactionParams),
-        ),
-      });
-      const thresholdDecision = await this.compaction.evaluate(
-        conversation.conversationId,
-        tokenBudget,
-        observedCurrentTokenCount,
-        {
-          contextThreshold: resolvedContextThreshold.contextThreshold,
-          ...(resolvedContextThreshold.freshTailCount !== undefined
-            ? { freshTailCount: resolvedContextThreshold.freshTailCount }
-            : {}),
-        },
-      );
-      this.logContextThresholdSelection({
-        conversationId: conversation.conversationId,
-        sessionId,
-        sessionKey,
-        tokenBudget,
-        thresholdTokens: thresholdDecision.threshold,
-        resolved: resolvedContextThreshold,
-        phase: "afterTurn",
-      });
-      const thresholdDiagnostics = {
-        projectedTokenCount: thresholdDecision.projectedTokens,
-        rawTokensOutsideTail: thresholdDecision.rawTokensOutsideTail,
-        contextThreshold: resolvedContextThreshold,
-      };
-      if (this.config.proactiveThresholdCompactionMode === "inline") {
-        if (thresholdDecision.shouldCompact) {
-          const compactResult = await this.compact({
-            sessionId,
-            sessionKey,
-            sessionFile: params.sessionFile,
-            tokenBudget,
-            currentTokenCount: observedCurrentTokenCount,
-            compactionTarget: "threshold",
-            contextThresholdOverride: resolvedContextThreshold,
-            legacyParams,
-          });
-          if (!compactResult.ok) {
-            await recordAfterTurnCompactionRetry("threshold", thresholdDiagnostics);
-          }
-        }
-      } else if (thresholdDecision.shouldCompact) {
-        await this.telemetryRecorder.recordDeferredCompactionDebt({
-          conversationId: conversation.conversationId,
-          reason: "threshold",
-          tokenBudget,
-          currentTokenCount: observedCurrentTokenCount,
-          projectedTokenCount: thresholdDecision.projectedTokens,
-          rawTokensOutsideTail: thresholdDecision.rawTokensOutsideTail,
-          contextThreshold: resolvedContextThreshold,
-        });
-        deferredCompactionDrain = {
-          tokenBudget,
-          currentTokenCount: observedCurrentTokenCount,
-          reason: "threshold",
-        };
-        // Register this queue entry synchronously. A later foreground operation
-        // can enqueue behind it, but cannot extend the busy promise ahead of it.
-        this.scheduleThresholdPublicationOpportunity({
-          conversationId: conversation.conversationId,
-          sessionId,
-          sessionKey,
-          tokenBudget,
-          currentTokenCount: observedCurrentTokenCount,
-          reason: "threshold",
-        });
-      }
-      if (!thresholdDecision.shouldCompact) {
-        const leafDecision = await this.compaction.evaluateLeafTrigger(
-          conversation.conversationId,
-          this.config.leafChunkTokens,
-        );
-        this.deps.log.debug(
-          `[lcm] pending-summary-prep: selected phase=afterTurn conversation=${conversation.conversationId} ${sessionLabel} rawTokensOutsideTail=${leafDecision.rawTokensOutsideTail} threshold=${leafDecision.threshold} shouldPrepare=${leafDecision.shouldCompact}`,
-        );
-        if (leafDecision.shouldCompact) {
-          pendingSummaryPreparationDrain = {
-            tokenBudget,
-            currentTokenCount: observedCurrentTokenCount,
-            reason: "leaf-prep",
-          };
-        }
-      }
-    } catch (err) {
-      this.deps.log.warn(
-        `[lcm] afterTurn: compaction policy check failed for ${sessionLabel}: ${describeLogError(err)}`,
-      );
-    }
-
-    if (deferredCompactionDrain) {
-      this.scheduleDeferredCompactionDebtDrain({
-        conversationId: conversation.conversationId,
-        sessionId,
-        sessionKey,
-        tokenBudget: deferredCompactionDrain.tokenBudget,
-        currentTokenCount: deferredCompactionDrain.currentTokenCount,
-        reason: deferredCompactionDrain.reason,
-      });
-    }
-    if (pendingSummaryPreparationDrain) {
-      this.schedulePendingSummaryPreparationDrain({
-        conversationId: conversation.conversationId,
-        sessionId,
-        sessionKey,
-        tokenBudget: pendingSummaryPreparationDrain.tokenBudget,
-        currentTokenCount: pendingSummaryPreparationDrain.currentTokenCount,
-        reason: pendingSummaryPreparationDrain.reason,
-      });
     }
 
     this.deps.log.debug(
-      `[lcm] afterTurn: done conversation=${conversation.conversationId} ${sessionLabel} newMessages=${newMessages.length} dedupedMessages=${dedupedNewMessages.length} ingestedMessages=${ingestBatch.length} duration=${formatDurationMs(Date.now() - startedAt)}`,
+      `[lcm] afterTurn: done conversation=${conversationId} ${sessionLabel} newMessages=${newMessages.length} dedupedMessages=${dedupedNewMessages.length} ingestedMessages=${ingestBatch.length} duration=${formatDurationMs(Date.now() - startedAt)}`,
     );
   }
 
