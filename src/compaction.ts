@@ -29,7 +29,7 @@ export interface CompactionDecision {
   observedTokens?: number;
   /** Raw message tokens outside the protected fresh tail, when live prompt pressure is known. */
   rawTokensOutsideTail?: number;
-  /** Projected prompt pressure after adding unsummarized raw backlog to observed tokens. */
+  /** Larger of persisted and runtime-observed prompt pressure, when observation is available. */
   projectedTokens?: number;
   currentTokens: number;
   threshold: number;
@@ -716,9 +716,8 @@ export class CompactionEngine {
       liveTokens > 0
         ? await this.countRawTokensOutsideFreshTail(conversationId, options?.freshTailCount)
         : undefined;
-    const projectedTokens =
-      liveTokens > 0 ? liveTokens + (rawTokensOutsideTail ?? 0) : undefined;
-    const currentTokens = Math.max(storedTokens, projectedTokens ?? liveTokens);
+    const projectedTokens = liveTokens > 0 ? Math.max(storedTokens, liveTokens) : undefined;
+    const currentTokens = Math.max(storedTokens, liveTokens);
     const threshold = Math.floor(
       resolveContextThreshold(this.config, options?.contextThreshold) * tokenBudget,
     );
