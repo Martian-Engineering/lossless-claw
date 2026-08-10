@@ -3805,14 +3805,21 @@ export class LcmContextEngine implements ContextEngine {
   /**
    * Persist one host-accepted transcript turn and its advancement receipt in
    * the same SQLite transaction. The host may safely retry after losing the
-   * response; a reused key with a different payload fails closed.
+   * response; a reused key with a different payload fails closed. Sessions
+   * configured to skip LCM writes acknowledge the turn as an idempotent no-op.
    */
   async commitTurn(params: CommitTurnParams): Promise<{ status: "committed" | "duplicate" }> {
     assertValidTurnAdvancement(params);
-    this.ensureMigrated();
-    const payloadHash = buildTurnAdvancementPayloadHash(params);
     const sessionId = params.admission.sessionId;
     const sessionKey = params.admission.sessionKey;
+    if (
+      this.shouldIgnoreSession({ sessionId, sessionKey }) ||
+      this.isStatelessSession(sessionKey)
+    ) {
+      return { status: "committed" };
+    }
+    this.ensureMigrated();
+    const payloadHash = buildTurnAdvancementPayloadHash(params);
 
     return this.withSessionQueue(
       this.resolveSessionQueueKey(sessionId, sessionKey),

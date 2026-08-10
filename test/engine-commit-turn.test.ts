@@ -13,6 +13,7 @@ import {
   cleanupEngineTestState,
   createEngine,
   createEngineAtDatabasePath,
+  createEngineWithConfig,
   makeMessage,
   tempDirs,
 } from "./helpers.js";
@@ -143,6 +144,43 @@ describe("LcmContextEngine commitTurn", () => {
     expect(
       getEngineDatabase(engine).prepare("SELECT count(*) AS count FROM turn_advancements").get(),
     ).toEqual({ count: 1 });
+  });
+
+  it("acknowledges excluded session turns without writing LCM state", async () => {
+    const engine = createEngineWithConfig({
+      ignoreSessionPatterns: ["agent:main:durable-turn-session"],
+    });
+    const params = buildCommitTurnParams();
+
+    await expect(engine.commitTurn(params)).resolves.toEqual({ status: "committed" });
+    await expect(engine.commitTurn(params)).resolves.toEqual({ status: "committed" });
+
+    expect(await readStoredMessages(engine)).toHaveLength(0);
+    expect(
+      getEngineDatabase(engine).prepare("SELECT count(*) AS count FROM context_items").get(),
+    ).toEqual({ count: 0 });
+    expect(
+      getEngineDatabase(engine).prepare("SELECT count(*) AS count FROM turn_advancements").get(),
+    ).toEqual({ count: 0 });
+  });
+
+  it("acknowledges stateless session turns without writing LCM state", async () => {
+    const engine = createEngineWithConfig({
+      statelessSessionPatterns: ["agent:main:durable-turn-session"],
+      skipStatelessSessions: true,
+    });
+    const params = buildCommitTurnParams();
+
+    await expect(engine.commitTurn(params)).resolves.toEqual({ status: "committed" });
+    await expect(engine.commitTurn(params)).resolves.toEqual({ status: "committed" });
+
+    expect(await readStoredMessages(engine)).toHaveLength(0);
+    expect(
+      getEngineDatabase(engine).prepare("SELECT count(*) AS count FROM context_items").get(),
+    ).toEqual({ count: 0 });
+    expect(
+      getEngineDatabase(engine).prepare("SELECT count(*) AS count FROM turn_advancements").get(),
+    ).toEqual({ count: 0 });
   });
 
   it("fails closed when the same advancement key carries a different payload", async () => {
