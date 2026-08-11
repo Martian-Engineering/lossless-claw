@@ -851,7 +851,7 @@ export class ConversationStore {
   ): Promise<MessageRecord | null> {
     const row = this.db
       .prepare(
-        `SELECT message_id, conversation_id, seq, role, content, token_count, created_at, large_content, transcript_entry_id
+        `SELECT message_id, conversation_id, seq, role, content, token_count, created_at, large_content, transcript_entry_id, openclaw_sender_metadata
        FROM messages
        WHERE conversation_id = ? AND role = ?
        ORDER BY seq DESC
