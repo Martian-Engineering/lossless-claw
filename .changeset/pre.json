@@ -21,6 +21,7 @@
     "strict-metadata-decoration-gate",
     "transcript-provenance-dedup",
     "trust-conversation-prompt-hook",
+    "turn-local-durable-commit",
     "verified-transcript-anchors"
   ]
 }
