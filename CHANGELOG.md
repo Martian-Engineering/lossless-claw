@@ -1,5 +1,13 @@
 # @martian-engineering/lossless-claw
 
+## 1.0.0-beta.2
+
+<!-- release-rollback-version: 0.15.1 -->
+
+### Patch Changes
+
+- [#1077](https://github.com/Martian-Engineering/lossless-claw/pull/1077) [`d7d58ce`](https://github.com/Martian-Engineering/lossless-claw/commit/d7d58ce8bf78683d947d0582429c8ae51760da44) Thanks [@jalehman](https://github.com/jalehman)! - Accept the turn-local durable `commitTurn` payload defined by [OpenClaw PR 122149](https://github.com/openclaw/openclaw/pull/122149), and preserve idempotent retries for beta.1 receipts after the host removes `prePromptMessageCount`.
+
 ## 1.0.0-beta.1
 
 <!-- release-rollback-version: 0.15.1 -->
