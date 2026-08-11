@@ -301,7 +301,6 @@ export type ContextEngine = {
     admission: TranscriptTurnAdmission;
     terminal: TranscriptEntryAnchor;
     messages: AgentMessage[];
-    prePromptMessageCount: number;
     sessionId: string;
     sessionKey?: string;
     sessionTarget?: ContextEngineSessionTarget;
