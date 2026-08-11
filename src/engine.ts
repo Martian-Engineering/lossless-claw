@@ -140,7 +140,6 @@ type CommitTurnParams = {
   admission: TranscriptTurnAdmission;
   terminal: TranscriptEntryAnchor;
   messages: AgentMessage[];
-  prePromptMessageCount: number;
   sessionId: string;
   sessionKey?: string;
   sessionTarget?: ContextEngineSessionTarget;
@@ -176,12 +175,18 @@ function canonicalizeTurnPayload(value: unknown): unknown {
   return value;
 }
 
-function buildTurnAdvancementPayloadHash(params: CommitTurnParams): string {
+/** Build the current receipt hash or the beta.1 hash needed for upgrade retries. */
+function buildTurnAdvancementPayloadHash(
+  params: CommitTurnParams,
+  legacyPrePromptMessageCount?: number,
+): string {
   const canonicalPayload = canonicalizeTurnPayload({
     admission: params.admission,
     isHeartbeat: params.isHeartbeat === true,
-    messages: params.messages.slice(params.prePromptMessageCount),
-    prePromptMessageCount: params.prePromptMessageCount,
+    messages: params.messages,
+    ...(legacyPrePromptMessageCount === undefined
+      ? {}
+      : { prePromptMessageCount: legacyPrePromptMessageCount }),
     sessionId: params.sessionId,
     sessionKey: params.sessionKey,
     terminal: params.terminal,
@@ -214,12 +219,12 @@ function assertValidTurnAdvancement(params: CommitTurnParams): void {
     throw new Error("turn advancement transcript target changed after admission");
   }
   if (
-    !Number.isSafeInteger(params.prePromptMessageCount) ||
-    params.prePromptMessageCount < 0 ||
-    params.prePromptMessageCount > params.messages.length ||
-    params.prePromptMessageCount !== admission.activeMessagePosition ||
+    !Number.isSafeInteger(admission.activeMessagePosition) ||
+    admission.activeMessagePosition < 0 ||
+    !Number.isSafeInteger(terminal.activeMessagePosition) ||
     terminal.activeMessagePosition < admission.activeMessagePosition ||
-    terminal.activeMessagePosition !== params.messages.length - 1
+    params.messages.length !==
+      terminal.activeMessagePosition - admission.activeMessagePosition + 1
   ) {
     throw new Error("turn advancement transcript range is invalid");
   }
@@ -4062,7 +4067,11 @@ export class LcmContextEngine implements ContextEngine {
             )
             .get(params.advancementKey) as { payload_hash: string } | undefined;
           if (existing) {
-            if (existing.payload_hash !== payloadHash) {
+            if (
+              existing.payload_hash !== payloadHash &&
+              existing.payload_hash !==
+                buildTurnAdvancementPayloadHash(params, params.admission.activeMessagePosition)
+            ) {
               throw new Error(
                 `context-engine advancement key collision: ${params.advancementKey}`,
               );
@@ -4071,8 +4080,7 @@ export class LcmContextEngine implements ContextEngine {
           }
 
           let ingestedCount = 0;
-          const turnMessages = params.messages.slice(params.prePromptMessageCount);
-          for (const message of turnMessages) {
+          for (const message of params.messages) {
             const result = await this.ingestSingle({
               sessionId,
               sessionKey,

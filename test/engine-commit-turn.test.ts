@@ -20,6 +20,10 @@ import {
 
 afterEach(cleanupEngineTestState);
 
+/** Receipt produced for the default fixture by lossless-claw 1.0.0-beta.1. */
+const BETA_1_RECEIPT_HASH =
+  "894ebf9d9233e5d8ceb3da959cac9a4bb2ebf422633e65cacb4750fdbb8c8dfb";
+
 function buildCommitTurnParams(overrides?: {
   advancementKey?: string;
   answer?: string;
@@ -30,7 +34,7 @@ function buildCommitTurnParams(overrides?: {
   const generation = "generation-1";
   const advancementKey = overrides?.advancementKey ?? "logical-turn-1";
   const admission: TranscriptTurnAdmission = {
-    activeMessagePosition: 1,
+    activeMessagePosition: 41,
     agentId: "main",
     effectiveParentId: "prior-entry",
     entryId: "user-entry",
@@ -43,7 +47,7 @@ function buildCommitTurnParams(overrides?: {
     storePath,
   };
   const terminal: TranscriptEntryAnchor = {
-    activeMessagePosition: 2,
+    activeMessagePosition: 42,
     agentId: "main",
     effectiveParentId: admission.entryId,
     entryId: "assistant-entry",
@@ -58,7 +62,6 @@ function buildCommitTurnParams(overrides?: {
     admission,
     terminal,
     messages: [
-      makeMessage({ role: "assistant", content: "prior persisted prefix", timestamp: 1_000 }),
       makeMessage({ role: "user", content: "current question", timestamp: 2_000 }),
       makeMessage({
         role: "assistant",
@@ -66,7 +69,6 @@ function buildCommitTurnParams(overrides?: {
         timestamp: 3_000,
       }),
     ],
-    prePromptMessageCount: 1,
     sessionId,
     sessionKey,
     sessionTarget: {
@@ -133,7 +135,7 @@ describe("LcmContextEngine commitTurn", () => {
   it("rejects a terminal anchor outside the supplied message range", async () => {
     const engine = createEngine();
     const params = buildCommitTurnParams();
-    params.messages = params.messages.slice(0, 2);
+    params.messages = params.messages.slice(0, 1);
 
     await expect(engine.commitTurn(params)).rejects.toThrow(
       "turn advancement transcript range is invalid",
@@ -161,17 +163,31 @@ describe("LcmContextEngine commitTurn", () => {
     ).toEqual({ count: 1 });
   });
 
-  it("ignores the uncommitted transcript prefix when identifying a retry", async () => {
+  it("recognizes a beta.1 receipt after the turn-local contract upgrade", async () => {
+    const engine = createEngine();
+    const params = buildCommitTurnParams();
+    await engine.commitTurn(params);
+    getEngineDatabase(engine)
+      .prepare("UPDATE turn_advancements SET payload_hash = ? WHERE advancement_key = ?")
+      .run(BETA_1_RECEIPT_HASH, params.advancementKey);
+
+    await expect(engine.commitTurn(params)).resolves.toEqual({ status: "duplicate" });
+    expect(await readStoredMessages(engine)).toHaveLength(2);
+  });
+
+  it("includes the admitted user message in retry identity", async () => {
     const engine = createEngine();
     const params = buildCommitTurnParams();
     await engine.commitTurn(params);
     params.messages[0] = makeMessage({
-      role: "assistant",
-      content: "refreshed visible prefix",
+      role: "user",
+      content: "colliding question",
       timestamp: 1_500,
     });
 
-    await expect(engine.commitTurn(params)).resolves.toEqual({ status: "duplicate" });
+    await expect(engine.commitTurn(params)).rejects.toThrow(
+      `context-engine advancement key collision: ${params.advancementKey}`,
+    );
     expect((await readStoredMessages(engine)).map((message) => message.content)).toEqual([
       "current question",
       "current answer",
