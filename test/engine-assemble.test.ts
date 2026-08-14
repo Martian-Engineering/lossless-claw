@@ -264,7 +264,10 @@ describe("LcmContextEngine.assemble canonical path", () => {
     expect(result.messages).toStrictEqual(liveMessages);
     // Bounded fallback reports the real serialized estimate instead of 0.
     expect(result.estimatedTokens).toBeGreaterThan(0);
-    expect(result.contextProjection).toBeUndefined();
+    expect(result.contextProjection).toEqual({
+      mode: "thread_bootstrap",
+      epoch: expect.stringMatching(/^summary-prefix-v1:/),
+    });
   });
 
   it("assembles context from DB when coverage exists", async () => {

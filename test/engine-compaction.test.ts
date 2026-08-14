@@ -3374,6 +3374,74 @@ describe("LcmContextEngine.compact token budget plumbing", () => {
     ).toBe(true);
   });
 
+  it.each(["codex-app-server", "openclaw-embedded"])(
+    "does not make threshold convergence impossible when %s owns excess prompt framing",
+    async (executionHostId) => {
+    const engine = createEngine();
+    const privateEngine = engine as unknown as {
+      compaction: {
+        evaluate: (
+          conversationId: number,
+          tokenBudget: number,
+          observed?: number,
+        ) => Promise<unknown>;
+        compactFullSweep: (input: unknown) => Promise<unknown>;
+      };
+    };
+
+    const evaluateSpy = vi.spyOn(privateEngine.compaction, "evaluate").mockResolvedValue({
+      shouldCompact: true,
+      reason: "threshold",
+      storedTokens: 36_047,
+      observedTokens: 93_486,
+      currentTokens: 36_047,
+      threshold: 22_500,
+    });
+    vi.spyOn(privateEngine.compaction, "compactFullSweep").mockResolvedValue({
+      actionTaken: true,
+      tokensBefore: 36_047,
+      tokensAfter: 20_000,
+      condensed: false,
+    });
+
+    await engine.ingest({
+      sessionId: "codex-native-history-overhead",
+      message: { role: "user", content: "trigger threshold compact" } as AgentMessage,
+    });
+
+    const result = await engine.compact({
+      sessionId: "codex-native-history-overhead",
+      sessionFile: "/tmp/session.jsonl",
+      tokenBudget: 30_000,
+      currentTokenCount: 93_486,
+      compactionTarget: "threshold",
+      runtimeSettings: {
+        schemaVersion: 1,
+        executionHost: {
+          id: executionHostId,
+          label: "host-aware OpenClaw runtime",
+        },
+      },
+    });
+
+    expect(result.ok).toBe(true);
+    expect(evaluateSpy).toHaveBeenCalledWith(
+      expect.any(Number),
+      30_000,
+      undefined,
+      expect.any(Object),
+    );
+    expect(result.compacted).toBe(true);
+    expect(result.reason).toBe("compacted");
+    expect(result.result?.tokensAfter).toBe(20_000);
+    expect(result.result?.details).toEqual(
+      expect.objectContaining({
+        targetTokens: 22_500,
+      }),
+    );
+    },
+  );
+
   it("does not clear threshold pressure when persisted tokens are under target but runtime tokens remain over", async () => {
     const engine = createEngine();
     const privateEngine = engine as unknown as {
@@ -3697,6 +3765,52 @@ describe("LcmContextEngine.compact token budget plumbing", () => {
 });
 
 describe("#639 Mode 2 deferred-compaction wedge (live context exceeds target, no candidates)", () => {
+  it("preserves Codex host ownership through the background deferred-debt drain", async () => {
+    const engine = createEngine();
+    const sessionId = "codex-background-debt-runtime-settings";
+    const conversation = await engine
+      .getConversationStore()
+      .getOrCreateConversation(sessionId, { sessionKey: undefined });
+    await engine.getCompactionMaintenanceStore().requestProactiveCompactionDebt({
+      conversationId: conversation.conversationId,
+      reason: "threshold",
+      tokenBudget: 30_000,
+      currentTokenCount: 84_628,
+    });
+
+    const privateEngine = engine as unknown as {
+      drainDeferredCompactionDebtIfIdle: (params: unknown) => Promise<void>;
+      consumeDeferredCompactionDebt: (params: unknown) => Promise<unknown>;
+    };
+    const consumeSpy = vi
+      .spyOn(privateEngine, "consumeDeferredCompactionDebt")
+      .mockResolvedValue({
+        changed: true,
+        bytesFreed: 0,
+        rewrittenEntries: 0,
+        reason: "compacted",
+      });
+    const runtimeSettings = {
+      executionHost: {
+        id: "codex-app-server",
+        capabilities: ["thread-bootstrap-projection"],
+      },
+    };
+
+    await privateEngine.drainDeferredCompactionDebtIfIdle({
+      conversationId: conversation.conversationId,
+      sessionId,
+      tokenBudget: 30_000,
+      currentTokenCount: 84_628,
+      runtimeSettings,
+      reason: "threshold",
+    });
+
+    expect(consumeSpy).toHaveBeenCalledWith(
+      expect.objectContaining({ runtimeSettings }),
+    );
+  });
+
   it("over-target threshold debt with no compactable candidates is exhaustion: debt clears, no retry thrash", async () => {
     const engine = createEngine();
     const sessionId = "wedge-639-mode2-exhaustion";
