@@ -1296,4 +1296,156 @@ describe("lcm plugin registration", () => {
     lcmPlugin.register(api2);
     expect(createSpy).toHaveBeenCalledTimes(2);
   });
+
+  it.each(["restart", "shutdown"])(
+    "does not acquire the stopped engine for session_end %s",
+    async (reason) => {
+      const dbPath = join(tmpdir(), `lossless-claw-${Date.now()}-${Math.random().toString(16)}.db`);
+      dbPaths.add(dbPath);
+
+      const { api, getHook } = buildApi({ enabled: true, dbPath });
+      lcmPlugin.register(api);
+
+      const gatewayStop = getHook("gateway_stop");
+      const sessionEnd = getHook("session_end");
+      expect(gatewayStop).toBeTypeOf("function");
+      expect(sessionEnd).toBeTypeOf("function");
+
+      await gatewayStop?.({}, {});
+
+      await expect(
+        sessionEnd?.(
+          {
+            reason: ` ${reason} `,
+            sessionId: "session-before-restart",
+            sessionKey: "agent:main:main",
+          },
+          {},
+        ),
+      ).resolves.toBeUndefined();
+    },
+  );
+
+  it("delegates ordinary session_end reasons to the context engine", async () => {
+    const dbPath = join(tmpdir(), `lossless-claw-${Date.now()}-${Math.random().toString(16)}.db`);
+    dbPaths.add(dbPath);
+    const handleSessionEnd = vi
+      .spyOn(LcmContextEngine.prototype, "handleSessionEnd")
+      .mockResolvedValue(undefined);
+
+    const { api, getHook } = buildApi({ enabled: true, dbPath });
+    lcmPlugin.register(api);
+
+    const sessionEnd = getHook("session_end");
+    expect(sessionEnd).toBeTypeOf("function");
+
+    await sessionEnd?.(
+      {
+        reason: "deleted",
+        sessionId: "session-before-delete",
+        sessionKey: "agent:main:main",
+      },
+      {},
+    );
+
+    expect(handleSessionEnd).toHaveBeenCalledWith({
+      reason: "deleted",
+      sessionId: "session-before-delete",
+      sessionKey: "agent:main:main",
+      nextSessionId: undefined,
+      nextSessionKey: undefined,
+    });
+  });
+
+  it("reopens the retained context-engine factory on the next gateway lifecycle", async () => {
+    const dbPath = join(tmpdir(), `lossless-claw-${Date.now()}-${Math.random().toString(16)}.db`);
+    dbPaths.add(dbPath);
+
+    const createSpy = vi.spyOn(connectionModule, "createLcmDatabaseConnection");
+    const { api, getFactory, getHook } = buildApi({ enabled: true, dbPath });
+    lcmPlugin.register(api);
+
+    const retainedFactory = getFactory();
+    const gatewayStop = getHook("gateway_stop");
+    expect(retainedFactory).toBeTypeOf("function");
+    expect(gatewayStop).toBeTypeOf("function");
+    await expect(Promise.resolve(retainedFactory!())).resolves.toBeDefined();
+
+    await gatewayStop?.({}, {});
+
+    const gatewayStart = getHook("gateway_start");
+    expect(gatewayStart).toBeTypeOf("function");
+    await gatewayStart?.({ port: 3000 }, { port: 3000 });
+
+    await expect(Promise.resolve(retainedFactory!())).resolves.toBeDefined();
+    expect(api.registerContextEngine).toHaveBeenCalledTimes(1);
+    expect(createSpy).toHaveBeenCalledTimes(2);
+  });
+
+  it("refreshes the OpenClaw default model for a retained factory restart", async () => {
+    const dbPath = join(tmpdir(), `lossless-claw-${Date.now()}-${Math.random().toString(16)}.db`);
+    dbPaths.add(dbPath);
+    const runtimeConfig = {
+      agents: { defaults: { model: { primary: "openai/model-a" } } },
+    };
+    const { api, getFactory, getHook } = buildApi(
+      { enabled: true, databasePath: dbPath },
+      { runtimeConfig },
+    );
+    lcmPlugin.register(api);
+
+    const retainedFactory = getFactory();
+    const firstEngine = (await Promise.resolve(retainedFactory!())) as {
+      deps?: { resolveModel: (modelRef?: string, providerHint?: string) => unknown };
+    };
+    expect(firstEngine.deps?.resolveModel(undefined, undefined)).toEqual({
+      provider: "openai",
+      model: "model-a",
+    });
+
+    runtimeConfig.agents.defaults.model.primary = "anthropic/model-b";
+    await getHook("gateway_stop")?.({}, {});
+    await getHook("gateway_start")?.({ port: 3000 }, { port: 3000 });
+
+    const restartedEngine = (await Promise.resolve(retainedFactory!())) as {
+      deps?: { resolveModel: (modelRef?: string, providerHint?: string) => unknown };
+    };
+    expect(restartedEngine.deps?.resolveModel(undefined, undefined)).toEqual({
+      provider: "anthropic",
+      model: "model-b",
+    });
+  });
+
+  it("retries retained-factory initialization after a failed gateway lifecycle", async () => {
+    const dbPath = join(tmpdir(), `lossless-claw-${Date.now()}-${Math.random().toString(16)}.db`);
+    dbPaths.add(dbPath);
+
+    const originalCreate = connectionModule.createLcmDatabaseConnection;
+    const createSpy = vi.spyOn(connectionModule, "createLcmDatabaseConnection");
+    createSpy.mockImplementation((path: string) => {
+      if (createSpy.mock.calls.length === 2) {
+        throw new Error("database is locked");
+      }
+      return originalCreate(path);
+    });
+
+    const { api, getFactory, getHook } = buildApi({ enabled: true, dbPath });
+    lcmPlugin.register(api);
+    const retainedFactory = getFactory();
+    const gatewayStop = getHook("gateway_stop");
+    const gatewayStart = getHook("gateway_start");
+
+    await gatewayStop?.({}, {});
+    await gatewayStart?.({ port: 3000 }, { port: 3000 });
+    await expect(Promise.resolve(retainedFactory!())).rejects.toThrow(
+      "Database connection closed after gateway_stop",
+    );
+
+    await gatewayStop?.({}, {});
+    await gatewayStart?.({ port: 3000 }, { port: 3000 });
+
+    await expect(Promise.resolve(retainedFactory!())).resolves.toBeDefined();
+    expect(api.registerContextEngine).toHaveBeenCalledTimes(1);
+    expect(createSpy).toHaveBeenCalledTimes(3);
+  });
 });
