@@ -54,9 +54,9 @@ export type CreateMessageInput = {
    */
   transcriptEntryId?: string | null;
   /**
-   * Cross-representation stable event identity (responseId / toolCallId) used
-   * to short-circuit duplicate ingestion when the transcript (often redacted)
-   * and the live runtime batch describe the same semantic event.
+   * Cross-representation stable event identity (responseId or provider-minted
+   * toolCallId) used to short-circuit duplicate ingestion when the transcript
+   * and live runtime batch describe the same semantic event.
    * Null/undefined preserves the existing behavior.
    */
   stableEventKey?: string | null;
@@ -395,6 +395,10 @@ export class ConversationStore {
   private readonly fts5Available: boolean;
   private readonly replayFloodThresholdExternal: number;
   private readonly replayFloodThresholdInternal: number;
+  private readonly onStableEventKeyConflict?: (info: {
+    conversationId: ConversationId;
+    stableEventKey: string;
+  }) => void;
 
   constructor(
     private db: DatabaseSync,
@@ -412,11 +416,17 @@ export class ConversationStore {
        * calls returning identical results within the same SQLite-second).
        */
       replayFloodThresholdInternal?: number;
+      /** Report when a colliding stable key must be dropped to preserve a row. */
+      onStableEventKeyConflict?: (info: {
+        conversationId: ConversationId;
+        stableEventKey: string;
+      }) => void;
     },
   ) {
     this.fts5Available = options?.fts5Available ?? true;
     this.replayFloodThresholdExternal = options?.replayFloodThresholdExternal ?? 3;
     this.replayFloodThresholdInternal = options?.replayFloodThresholdInternal ?? 32;
+    this.onStableEventKeyConflict = options?.onStableEventKeyConflict;
   }
 
   // ── Transaction helpers ──────────────────────────────────────────────────
@@ -700,31 +710,63 @@ export class ConversationStore {
 
   // ── Message operations ────────────────────────────────────────────────────
 
+  /**
+   * Insert one prepared row, retrying without its stable key when the unique
+   * identity assumption is violated. The row remains durable while later
+   * dedup becomes conservative, which is the lossless failure direction.
+   */
+  private runMessageInsert(prepared: PreparedMessageInsert): number {
+    const insert = (stableEventKey: string | null): number => {
+      const result = this.db
+        .prepare(
+          `INSERT INTO messages (conversation_id, seq, role, content, token_count, identity_hash, openclaw_sender_metadata, transcript_entry_id, stable_event_key, created_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        )
+        .run(
+          prepared.conversationId,
+          prepared.seq,
+          prepared.role,
+          prepared.content,
+          prepared.tokenCount,
+          prepared.identityHash,
+          serializeOpenClawSenderMetadata(prepared.openClawSenderMetadata),
+          prepared.transcriptEntryId ?? null,
+          stableEventKey,
+          prepared.createdAt,
+        );
+      return Number(result.lastInsertRowid);
+    };
+
+    if (prepared.stableEventKey == null) {
+      return insert(null);
+    }
+    try {
+      return insert(prepared.stableEventKey);
+    } catch (error: unknown) {
+      const isStableKeyConflict =
+        error instanceof Error &&
+        /UNIQUE constraint failed|SQLITE_CONSTRAINT_UNIQUE/i.test(error.message) &&
+        error.message.includes("stable_event_key");
+      if (!isStableKeyConflict) {
+        throw error;
+      }
+
+      const messageId = insert(null);
+      this.onStableEventKeyConflict?.({
+        conversationId: prepared.conversationId,
+        stableEventKey: prepared.stableEventKey,
+      });
+      return messageId;
+    }
+  }
+
   async createMessage(input: CreateMessageInput): Promise<MessageRecord> {
     const prepared = this.prepareMessageInsert(input);
     if (!prepared.skipReplayTimestampFloodGuard) {
       this.assertNoReplayTimestampFlood([prepared]);
     }
 
-    const result = this.db
-      .prepare(
-        `INSERT INTO messages (conversation_id, seq, role, content, token_count, identity_hash, openclaw_sender_metadata, transcript_entry_id, stable_event_key, created_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-      )
-      .run(
-        prepared.conversationId,
-        prepared.seq,
-        prepared.role,
-        prepared.content,
-        prepared.tokenCount,
-        prepared.identityHash,
-        serializeOpenClawSenderMetadata(prepared.openClawSenderMetadata),
-        prepared.transcriptEntryId ?? null,
-        prepared.stableEventKey,
-        prepared.createdAt,
-      );
-
-    const messageId = Number(result.lastInsertRowid);
+    const messageId = this.runMessageInsert(prepared);
 
     this.indexMessageForFullText(messageId, input.content);
 
@@ -748,10 +790,6 @@ export class ConversationStore {
       preparedInputs.filter((input) => !input.skipReplayTimestampFloodGuard),
     );
 
-    const insertStmt = this.db.prepare(
-      `INSERT INTO messages (conversation_id, seq, role, content, token_count, identity_hash, openclaw_sender_metadata, transcript_entry_id, stable_event_key, created_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-    );
     const selectStmt = this.db.prepare(
       `SELECT message_id, conversation_id, seq, role, content, token_count, created_at, large_content, transcript_entry_id, openclaw_sender_metadata
        FROM messages WHERE message_id = ?`,
@@ -759,20 +797,7 @@ export class ConversationStore {
 
     const records: MessageRecord[] = [];
     for (const input of preparedInputs) {
-      const result = insertStmt.run(
-        input.conversationId,
-        input.seq,
-        input.role,
-        input.content,
-        input.tokenCount,
-        input.identityHash,
-        serializeOpenClawSenderMetadata(input.openClawSenderMetadata),
-        input.transcriptEntryId ?? null,
-        input.stableEventKey,
-        input.createdAt,
-      );
-
-      const messageId = Number(result.lastInsertRowid);
+      const messageId = this.runMessageInsert(input);
       this.indexMessageForFullText(messageId, input.content);
       const row = selectStmt.get(messageId) as unknown as MessageRow;
       records.push(toMessageRecord(row));

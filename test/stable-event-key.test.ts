@@ -1,5 +1,8 @@
 import { describe, expect, it } from "vitest";
-import { extractStableEventKey } from "../src/stable-event-key.js";
+import {
+  extractStableEventKey,
+  isProviderUniqueToolCallId,
+} from "../src/stable-event-key.js";
 
 describe("extractStableEventKey", () => {
   it("returns an assistant-response key for assistant messages with responseId", () => {
@@ -20,44 +23,46 @@ describe("extractStableEventKey", () => {
     expect(key).toBe("assistant-response:r-2");
   });
 
-  it("returns a tool-result key for tool/toolResult messages with toolCallId", () => {
+  it("returns a tool-result key for provider-minted toolCallIds", () => {
+    const toolCallId = "call_123456789012";
     expect(
-      extractStableEventKey({ role: "tool", content: "ok", toolCallId: "call-1" } as never),
-    ).toBe("tool-result:call-1");
+      extractStableEventKey({ role: "tool", content: "ok", toolCallId } as never),
+    ).toBe(`tool-result:${toolCallId}`);
     expect(
       extractStableEventKey({
         role: "toolResult",
         content: "ok",
-        toolCallId: "call-1",
+        toolCallId: "toolu_123456789012",
       } as never),
-    ).toBe("tool-result:call-1");
+    ).toBe("tool-result:toolu_123456789012");
   });
 
   it("returns a tool-result key using toolUseId fallback for tool messages", () => {
     const key = extractStableEventKey({
       role: "tool",
       content: "ok",
-      toolUseId: "call-x",
+      toolUseId: "call_abcdefghijkl",
     } as never);
-    expect(key).toBe("tool-result:call-x");
+    expect(key).toBe("tool-result:call_abcdefghijkl");
   });
 
   it("returns a tool-result key when top-level and block ids agree", () => {
+    const toolCallId = "call_123456789012";
     const key = extractStableEventKey({
       role: "toolResult",
-      toolCallId: "call-1",
-      content: [{ type: "tool_result", tool_use_id: "call-1", output: "ok" }],
+      toolCallId,
+      content: [{ type: "tool_result", tool_use_id: toolCallId, output: "ok" }],
     } as never);
-    expect(key).toBe("tool-result:call-1");
+    expect(key).toBe(`tool-result:${toolCallId}`);
   });
 
   it("returns null for aggregate tool-result messages", () => {
     const key = extractStableEventKey({
       role: "toolResult",
-      toolCallId: "call-1",
+      toolCallId: "call_123456789012",
       content: [
-        { type: "tool_result", tool_use_id: "call-1", output: "old" },
-        { type: "tool_result", tool_use_id: "call-2", output: "new" },
+        { type: "tool_result", tool_use_id: "call_123456789012", output: "old" },
+        { type: "tool_result", tool_use_id: "call_abcdefghijkl", output: "new" },
       ],
     } as never);
     expect(key).toBeNull();
@@ -66,10 +71,19 @@ describe("extractStableEventKey", () => {
   it("returns null when top-level and block tool ids conflict", () => {
     const key = extractStableEventKey({
       role: "toolResult",
-      toolCallId: "call-top",
-      content: [{ type: "tool_result", tool_use_id: "call-block", output: "ok" }],
+      toolCallId: "call_123456789012",
+      content: [{ type: "tool_result", tool_use_id: "call_abcdefghijkl", output: "ok" }],
     } as never);
     expect(key).toBeNull();
+  });
+
+  it("rejects recurrent model-authored tool ids as global identities", () => {
+    for (const toolCallId of ["exec:101", "update_plan:7", "call-1"]) {
+      expect(isProviderUniqueToolCallId(toolCallId)).toBe(false);
+      expect(
+        extractStableEventKey({ role: "toolResult", content: "same", toolCallId } as never),
+      ).toBeNull();
+    }
   });
 
   it("returns null for user message without responseId or toolCallId", () => {

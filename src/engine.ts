@@ -435,6 +435,11 @@ export class LcmContextEngine implements ContextEngine {
       fts5Available: this.fts5Available,
       replayFloodThresholdExternal: this.config.replayFloodThresholdExternal,
       replayFloodThresholdInternal: this.config.replayFloodThresholdInternal,
+      onStableEventKeyConflict: ({ conversationId, stableEventKey }) => {
+        this.deps.log.warn(
+          `[lcm] stable-event-key conflict conversation=${conversationId} key=${stableEventKey}; persisted row without stable key`,
+        );
+      },
     });
     this.summaryStore = new SummaryStore(this.db, { fts5Available: this.fts5Available });
     this.largeFileInterceptor = new LargeFileInterceptor(
@@ -2769,10 +2774,10 @@ export class LcmContextEngine implements ContextEngine {
       return { ingested: false };
     }
 
-    // Stable event identity short-circuit: when the message carries a stable
-    // event key (responseId / toolCallId) that the conversation already holds,
-    // this is the same event under a different (likely redacted) content
-    // representation. Skip the duplicate insert before any side effects.
+    // Stable event identity short-circuit: only provider-minted tool ids and
+    // assistant response ids can reach this path. Model-authored tool ids can
+    // recur across turns and deliberately fall through to occurrence-scoped
+    // ingestion so a later result is never discarded as a global duplicate.
     const stableEventKey = extractStableEventKey(message);
     if (
       stableEventKey &&
