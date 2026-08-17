@@ -4874,7 +4874,7 @@ describe("LcmContextEngine afterTurn", () => {
 
   it("afterTurn dedupes tool/toolResult messages by toolCallId", async () => {
     // The transcript imports a redacted toolResult message carrying
-    // toolCallId="call-001"; the runtime batch arrives with the same toolCallId
+    // a provider-minted toolCallId; the runtime batch arrives with the same id
     // but original content. The previously persisted redacted row stays canonical.
     const engine = createEngine();
     const sessionId = "after-turn-stable-event-tool-call-id";
@@ -4884,7 +4884,7 @@ describe("LcmContextEngine afterTurn", () => {
       makeMessage({
         role: "toolResult",
         content: [{ type: "text", text: "redacted by logging.redactPatterns" }],
-        toolCallId: "call-001",
+        toolCallId: "call_123456789012",
       }),
     ]);
     await engine.bootstrap({ sessionId, sessionKey, sessionFile });
@@ -4896,7 +4896,7 @@ describe("LcmContextEngine afterTurn", () => {
         makeMessage({
           role: "toolResult",
           content: "original unredacted tool result body",
-          toolCallId: "call-001",
+          toolCallId: "call_123456789012",
         } as never),
       ],
       prePromptMessageCount: 0,

@@ -168,9 +168,9 @@ export class BatchDeduplicator {
    *  - the transcript flush lagged mid-turn: a prefix of the batch aligns
    *    with the DB tail — ingest only the remainder;
    *  - no tail alignment: a batch with zero persisted-identity overlap is a
-   *    genuinely unflushed new turn (ingest all); any overlap means a stale
-   *    replay snapshot — fail closed, because a covered transcript read will
-   *    deliver anything real on the next turn idempotently.
+   *    genuinely unflushed new turn (ingest all); a fully persisted batch is
+   *    a replay (ingest none); partial overlap is ambiguous and fails open by
+   *    ingesting the full batch so repeated control rows cannot hide new data.
    */
   /**
    * A runtime batch row is covered by a persisted frontier row when their
@@ -345,16 +345,16 @@ export class BatchDeduplicator {
       storedBatch,
     );
     if (persistedIdentityOverlaps > 0) {
-      const overlapMessage = `[lcm] afterTurn: runtime batch does not align with the covered transcript frontier and overlaps persisted history (${persistedIdentityOverlaps}/${batch.length}); failing closed — the transcript reconcile delivers real messages next turn conversation=${conversationId}`;
-      // Full overlap (N === batch.length) means every row is already persisted, so
-      // failing closed drops nothing new: log at debug. A partial overlap still
-      // defers genuinely new rows to the reconcile and stays at warn.
       if (await this.batchIsFullyPersistedByMultiplicity(conversationId, storedBatch)) {
-        this.deps.log.debug(overlapMessage);
-      } else {
-        this.deps.log.warn(overlapMessage);
+        this.deps.log.debug(
+          `[lcm] afterTurn: runtime batch does not align with the covered transcript frontier but is fully persisted by multiplicity (${persistedIdentityOverlaps}/${batch.length}); skipping replay conversation=${conversationId}`,
+        );
+        return [];
       }
-      return [];
+      this.deps.log.warn(
+        `[lcm] afterTurn: runtime batch does not align with the covered transcript frontier and partially overlaps persisted history (${persistedIdentityOverlaps}/${batch.length}); ingesting full batch to preserve potentially new messages conversation=${conversationId}`,
+      );
+      return batch;
     }
     return batch;
   }
@@ -810,8 +810,7 @@ export class BatchDeduplicator {
     return overlaps;
   }
 
-  // Proves the debug-only case: every incoming occurrence has a distinct
-  // persisted occurrence, so fail-closed cannot be hiding a new duplicate row.
+  /** Return whether persisted multiplicity covers every incoming identity. */
   private async batchIsFullyPersistedByMultiplicity(
     conversationId: number,
     incomingBatch: StoredMessage[],
