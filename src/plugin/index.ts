@@ -298,7 +298,6 @@ type PluginEnvSnapshot = {
   pluginSummaryModel: string;
   pluginSummaryProvider: string;
   openclawProvider: string;
-  openclawDefaultModel: string;
   agentDir: string;
   home: string;
   /** Active OpenClaw state directory — respects OPENCLAW_STATE_DIR for multi-profile hosts. */
@@ -425,7 +424,6 @@ function snapshotPluginEnv(env: NodeJS.ProcessEnv = process.env): PluginEnvSnaps
     pluginSummaryModel: "",
     pluginSummaryProvider: "",
     openclawProvider: env.OPENCLAW_PROVIDER?.trim() ?? "",
-    openclawDefaultModel: "",
     agentDir: env.OPENCLAW_AGENT_DIR?.trim() || env.PI_CODING_AGENT_DIR?.trim() || "",
     home: env.HOME?.trim() ?? "",
     stateDir: resolveOpenclawStateDir(env),
@@ -1242,7 +1240,6 @@ function createLcmDependencies(
   registrationConfig = resolveRegistrationConfig(api),
 ): LcmDependencies {
   const envSnapshot = snapshotPluginEnv();
-  envSnapshot.openclawDefaultModel = readDefaultModelFromConfig(registrationConfig.openClawConfig);
   const pluginConfig = registrationConfig.pluginConfig;
   const { config, diagnostics } = resolveLcmConfigWithDiagnostics(process.env, pluginConfig);
   const log = createLcmLogger(api, config);
@@ -1436,7 +1433,7 @@ function createLcmDependencies(
           : envSnapshot.lcmSummaryModel ||
             config.summaryModel ||
             explicitModelRef ||
-            envSnapshot.openclawDefaultModel
+            readDefaultModelFromConfig(loadEffectiveOpenClawConfig(api))
       ).trim();
       if (!raw) {
         throw new Error("No model configured for LCM summarization.");

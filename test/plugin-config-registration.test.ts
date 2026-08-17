@@ -1382,6 +1382,40 @@ describe("lcm plugin registration", () => {
     expect(createSpy).toHaveBeenCalledTimes(2);
   });
 
+  it("refreshes the OpenClaw default model for a retained factory restart", async () => {
+    const dbPath = join(tmpdir(), `lossless-claw-${Date.now()}-${Math.random().toString(16)}.db`);
+    dbPaths.add(dbPath);
+    const runtimeConfig = {
+      agents: { defaults: { model: { primary: "openai/model-a" } } },
+    };
+    const { api, getFactory, getHook } = buildApi(
+      { enabled: true, databasePath: dbPath },
+      { runtimeConfig },
+    );
+    lcmPlugin.register(api);
+
+    const retainedFactory = getFactory();
+    const firstEngine = (await Promise.resolve(retainedFactory!())) as {
+      deps?: { resolveModel: (modelRef?: string, providerHint?: string) => unknown };
+    };
+    expect(firstEngine.deps?.resolveModel(undefined, undefined)).toEqual({
+      provider: "openai",
+      model: "model-a",
+    });
+
+    runtimeConfig.agents.defaults.model.primary = "anthropic/model-b";
+    await getHook("gateway_stop")?.({}, {});
+    await getHook("gateway_start")?.({ port: 3000 }, { port: 3000 });
+
+    const restartedEngine = (await Promise.resolve(retainedFactory!())) as {
+      deps?: { resolveModel: (modelRef?: string, providerHint?: string) => unknown };
+    };
+    expect(restartedEngine.deps?.resolveModel(undefined, undefined)).toEqual({
+      provider: "anthropic",
+      model: "model-b",
+    });
+  });
+
   it("retries retained-factory initialization after a failed gateway lifecycle", async () => {
     const dbPath = join(tmpdir(), `lossless-claw-${Date.now()}-${Math.random().toString(16)}.db`);
     dbPaths.add(dbPath);
