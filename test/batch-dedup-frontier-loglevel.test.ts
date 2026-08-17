@@ -47,7 +47,7 @@ function makeDedup(
   return { dedup, log };
 }
 
-describe("batch-dedup frontier-overlap fail-closed log level", () => {
+describe("batch-dedup frontier-overlap policy", () => {
   it("logs at debug, not warn, when the runtime batch is fully covered (N==M)", async () => {
     const { dedup, log } = makeDedup([true, true], [
       { role: "user", content: "u1", count: 1 },
@@ -63,11 +63,11 @@ describe("batch-dedup frontier-overlap fail-closed log level", () => {
     expect(result).toEqual([]);
     expect(log.warn).not.toHaveBeenCalled();
     expect(log.debug).toHaveBeenCalledWith(
-      expect.stringContaining("overlaps persisted history (2/2)"),
+      expect.stringContaining("fully persisted by multiplicity (2/2)"),
     );
   });
 
-  it("keeps warn on partial overlap (N<M) so the suspicious mixed case stays visible", async () => {
+  it("fails open with a warning on partial overlap (N<M)", async () => {
     const { dedup, log } = makeDedup([true, true, false], [
       { role: "user", content: "u1", count: 1 },
       { role: "assistant", content: "a1", count: 1 },
@@ -80,14 +80,15 @@ describe("batch-dedup frontier-overlap fail-closed log level", () => {
 
     const result = await dedup.alignRuntimeBatchAgainstCoveredFrontier("s2", undefined, batch);
 
-    expect(result).toEqual([]);
+    expect(result).toEqual(batch);
     expect(log.debug).not.toHaveBeenCalled();
     expect(log.warn).toHaveBeenCalledWith(
-      expect.stringContaining("overlaps persisted history (2/3)"),
+      expect.stringContaining("partially overlaps persisted history (2/3)"),
     );
+    expect(log.warn).toHaveBeenCalledWith(expect.stringContaining("ingesting full batch"));
   });
 
-  it("keeps warn when duplicate incoming rows outnumber persisted occurrences", async () => {
+  it("fails open when duplicate incoming rows outnumber persisted occurrences", async () => {
     const { dedup, log } = makeDedup([true, true], [
       { role: "user", content: "repeat", count: 1 },
     ]);
@@ -98,10 +99,10 @@ describe("batch-dedup frontier-overlap fail-closed log level", () => {
 
     const result = await dedup.alignRuntimeBatchAgainstCoveredFrontier("s2", undefined, batch);
 
-    expect(result).toEqual([]);
+    expect(result).toEqual(batch);
     expect(log.debug).not.toHaveBeenCalled();
     expect(log.warn).toHaveBeenCalledWith(
-      expect.stringContaining("overlaps persisted history (2/2)"),
+      expect.stringContaining("partially overlaps persisted history (2/2)"),
     );
   });
 

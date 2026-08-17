@@ -448,7 +448,11 @@ describe("BatchDeduplicator.alignRuntimeBatchAgainstCoveredFrontier", () => {
       conversationId: 1,
       messages: [
         storedMessage("assistant", "prior exact reply", 1),
-        { ...storedMessage("user", bareContent, 2), seq: 1 },
+        {
+          ...storedMessage("user", bareContent, 2),
+          seq: 1,
+          transcriptEntryId: "covered-user-entry",
+        },
       ],
     });
     const batch = [
@@ -464,7 +468,7 @@ describe("BatchDeduplicator.alignRuntimeBatchAgainstCoveredFrontier", () => {
     expect(result).toEqual([]);
   });
 
-  it("fails closed when persisted identity overlaps without frontier alignment", async () => {
+  it("fails open when persisted identity partially overlaps without frontier alignment", async () => {
     const dedup = makeDedup({
       conversationId: 1,
       messages: [storedMessage("user", "a"), storedMessage("assistant", "b")],
@@ -474,6 +478,33 @@ describe("BatchDeduplicator.alignRuntimeBatchAgainstCoveredFrontier", () => {
       makeMessage({ role: "assistant", content: "new" }),
     ];
     const result = await dedup.alignRuntimeBatchAgainstCoveredFrontier("s1", undefined, batch);
-    expect(result).toEqual([]);
+    expect(result).toEqual(batch);
+  });
+
+  it("preserves a new turn beside a high-multiplicity injected control row", async () => {
+    const control = "[OpenClaw heartbeat poll]";
+    const repeatedControls = Array.from({ length: 5 }, (_, index) => ({
+      ...storedMessage("user", control, index + 1),
+      seq: index,
+    }));
+    const dedup = makeDedup({
+      conversationId: 1,
+      messages: [
+        ...repeatedControls,
+        { ...storedMessage("assistant", "previous answer", 6), seq: 5 },
+      ],
+    });
+    const batch = [
+      makeMessage({ role: "user", content: control }),
+      makeMessage({ role: "user", content: "genuinely new user turn" }),
+    ];
+
+    const result = await dedup.alignRuntimeBatchAgainstCoveredFrontier(
+      "s1",
+      undefined,
+      batch,
+    );
+
+    expect(result).toEqual(batch);
   });
 });
