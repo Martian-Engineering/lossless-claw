@@ -32,3 +32,5 @@
 {"type":"status_update","timestamp":"2026-08-17T22:38:12.432267Z","issue_id":"lc-6a7.4","payload":{"status":"in_progress"}}
 {"type":"close","timestamp":"2026-08-17T22:39:35.098229Z","issue_id":"lc-6a7.4","payload":{}}
 {"type":"status_update","timestamp":"2026-08-17T22:39:59.521822Z","issue_id":"lc-6a7.5","payload":{"status":"in_progress"}}
+{"type":"close","timestamp":"2026-08-17T22:48:43.79441Z","issue_id":"lc-6a7.5","payload":{}}
+{"type":"close","timestamp":"2026-08-17T22:48:43.820661Z","issue_id":"lc-6a7","payload":{}}
