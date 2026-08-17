@@ -1,4 +1,4 @@
-.pebbles/pebbles.db
+.pebbles
 node_modules/
 dist/
 plugin-inspector-reports/
@@ -19,3 +19,4 @@ TASK.md
 BRIEF.md
 PROGRESS.md
 pnpm-lock.yaml
+
