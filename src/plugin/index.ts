@@ -322,6 +322,11 @@ type SessionEndLifecycleEvent = {
   nextSessionKey?: string;
 };
 
+function isGatewayLifecycleSessionEndReason(reason?: string): boolean {
+  const normalizedReason = reason?.trim();
+  return normalizedReason === "restart" || normalizedReason === "shutdown";
+}
+
 const RUNTIME_LLM_PR_URL = "https://github.com/openclaw/openclaw/pull/64294";
 const AUTH_ERROR_TEXT_PATTERN =
   /\b401\b|unauthorized|unauthorised|invalid[_ -]?token|invalid[_ -]?api[_ -]?key|authentication failed|authorization failed|missing scope|insufficient scope|model\.request\b/i;
@@ -1496,6 +1501,9 @@ function wirePluginHandlers(
   }));
   api.on("session_end", async (event) => {
     const lifecycleEvent = event as SessionEndLifecycleEvent;
+    if (isGatewayLifecycleSessionEndReason(lifecycleEvent.reason)) {
+      return;
+    }
     await (await shared.waitForEngine()).handleSessionEnd({
       reason: lifecycleEvent.reason,
       sessionId: lifecycleEvent.sessionId,
@@ -1702,6 +1710,41 @@ const lcmPlugin = {
       reject?.(error);
     }
 
+    /** Clear connection-local state so a retained factory can initialize the next gateway. */
+    function resetInitializationState(): void {
+      initPromise = null;
+      initError = null;
+      resolveDeferredInit = null;
+      rejectDeferredInit = null;
+    }
+
+    /** Reopen the stopped engine when OpenClaw reuses this registration for a new gateway. */
+    function reinitializeAfterGatewayStop(): void {
+      if (!allowRuntimeDatabaseInit || !stopped) {
+        return;
+      }
+
+      // Leave recovery to a fresh plugin registration when one already owns this database path.
+      const activeShared = getSharedInit(normalizedDbPath);
+      if (activeShared && activeShared !== nextShared && !activeShared.stopped) {
+        return;
+      }
+
+      stopped = false;
+      nextShared.stopped = false;
+      try {
+        const nextEngine = initializeEngine();
+        initPromise = Promise.resolve(nextEngine);
+        setSharedInit(normalizedDbPath, nextShared);
+      } catch (error) {
+        const normalized = toInitError(error);
+        rejectDeferredEngine(normalized);
+        stopped = true;
+        nextShared.stopped = true;
+        deps.log.error(`[lcm] DB reinitialization after gateway restart failed: ${normalized.message}`);
+      }
+    }
+
     /** Return the initialized engine, waiting for deferred startup when the DB is lock-contended. */
     async function waitForEngine(): Promise<LcmContextEngine> {
       if (!allowRuntimeDatabaseInit) {
@@ -1786,6 +1829,8 @@ const lcmPlugin = {
       setSharedInit(normalizedDbPath, nextShared);
     }
 
+    api.on("gateway_start", reinitializeAfterGatewayStop);
+
     api.on("gateway_stop", async () => {
       stopped = true;
       nextShared.stopped = true;
@@ -1797,6 +1842,7 @@ const lcmPlugin = {
         database = null;
       }
       lcm = null;
+      resetInitializationState();
       removeSharedInit(normalizedDbPath);
     });
 
