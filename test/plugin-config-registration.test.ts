@@ -1991,6 +1991,66 @@ describe("lcm plugin registration", () => {
     expect(createSpy).toHaveBeenCalledTimes(2);
   });
 
+  it.each(["restart", "shutdown"])(
+    "does not acquire the stopped engine for session_end %s",
+    async (reason) => {
+      const dbPath = join(tmpdir(), `lossless-claw-${Date.now()}-${Math.random().toString(16)}.db`);
+      dbPaths.add(dbPath);
+
+      const { api, getHook } = buildApi({ enabled: true, dbPath });
+      lcmPlugin.register(api);
+
+      const gatewayStop = getHook("gateway_stop");
+      const sessionEnd = getHook("session_end");
+      expect(gatewayStop).toBeTypeOf("function");
+      expect(sessionEnd).toBeTypeOf("function");
+
+      await gatewayStop?.({}, {});
+
+      await expect(
+        sessionEnd?.(
+          {
+            reason: ` ${reason} `,
+            sessionId: "session-before-restart",
+            sessionKey: "agent:main:main",
+          },
+          {},
+        ),
+      ).resolves.toBeUndefined();
+    },
+  );
+
+  it("delegates ordinary session_end reasons to the context engine", async () => {
+    const dbPath = join(tmpdir(), `lossless-claw-${Date.now()}-${Math.random().toString(16)}.db`);
+    dbPaths.add(dbPath);
+    const handleSessionEnd = vi
+      .spyOn(LcmContextEngine.prototype, "handleSessionEnd")
+      .mockResolvedValue(undefined);
+
+    const { api, getHook } = buildApi({ enabled: true, dbPath });
+    lcmPlugin.register(api);
+
+    const sessionEnd = getHook("session_end");
+    expect(sessionEnd).toBeTypeOf("function");
+
+    await sessionEnd?.(
+      {
+        reason: "deleted",
+        sessionId: "session-before-delete",
+        sessionKey: "agent:main:main",
+      },
+      {},
+    );
+
+    expect(handleSessionEnd).toHaveBeenCalledWith({
+      reason: "deleted",
+      sessionId: "session-before-delete",
+      sessionKey: "agent:main:main",
+      nextSessionId: undefined,
+      nextSessionKey: undefined,
+    });
+  });
+
   it("reopens the retained context-engine factory on the next gateway lifecycle", async () => {
     const dbPath = join(tmpdir(), `lossless-claw-${Date.now()}-${Math.random().toString(16)}.db`);
     dbPaths.add(dbPath);

@@ -373,6 +373,11 @@ type SessionEndLifecycleEvent = {
   nextSessionKey?: string;
 };
 
+function isGatewayLifecycleSessionEndReason(reason?: string): boolean {
+  const normalizedReason = reason?.trim();
+  return normalizedReason === "restart" || normalizedReason === "shutdown";
+}
+
 const RUNTIME_LLM_PR_URL = "https://github.com/openclaw/openclaw/pull/64294";
 const AUTH_ERROR_TEXT_PATTERN =
   /\b401\b|unauthorized|unauthorised|invalid[_ -]?token|invalid[_ -]?api[_ -]?key|authentication failed|authorization failed|missing scope|insufficient scope|model\.request\b/i;
@@ -1684,6 +1689,9 @@ function wirePluginHandlers(
   }));
   api.on("session_end", async (event) => {
     const lifecycleEvent = event as SessionEndLifecycleEvent;
+    if (isGatewayLifecycleSessionEndReason(lifecycleEvent.reason)) {
+      return;
+    }
     await (await shared.waitForEngine()).handleSessionEnd({
       reason: lifecycleEvent.reason,
       sessionId: lifecycleEvent.sessionId,
