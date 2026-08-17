@@ -316,7 +316,7 @@ function buildContextEngineProjectionEpoch(
 
 /** Return whether a typed host owns prompt framing outside Lossless storage. */
 function hostOwnsPromptFraming(runtimeSettings?: ContextEngineRuntimeSettings): boolean {
-  const executionHostId = runtimeSettings?.executionHost.id;
+  const executionHostId = runtimeSettings?.executionHost?.id;
   return typeof executionHostId === "string" && executionHostId.trim().length > 0;
 }
 

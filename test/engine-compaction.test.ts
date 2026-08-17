@@ -1166,6 +1166,42 @@ describe("LcmContextEngine.compact token budget plumbing", () => {
     },
   );
 
+  it("treats incomplete runtime settings as Lossless-owned prompt framing", async () => {
+    const engine = createEngine();
+    const privateEngine = engine as unknown as {
+      compaction: {
+        evaluate: (
+          conversationId: number,
+          tokenBudget: number,
+          observed?: number,
+        ) => Promise<unknown>;
+      };
+    };
+    const evaluateSpy = vi.spyOn(privateEngine.compaction, "evaluate").mockResolvedValue({
+      shouldCompact: false,
+      reason: "below_threshold",
+      storedTokens: 100,
+      observedTokens: 500,
+      currentTokens: 500,
+      threshold: 750,
+    });
+    await engine.ingest({
+      sessionId: "incomplete-runtime-settings",
+      message: { role: "user", content: "preserve legacy host behavior" } as AgentMessage,
+    });
+
+    await engine.compact({
+      sessionId: "incomplete-runtime-settings",
+      sessionFile: "/tmp/session.jsonl",
+      tokenBudget: 1_000,
+      currentTokenCount: 500,
+      compactionTarget: "threshold",
+      runtimeSettings: { limits: { promptTokenBudget: 1_000 } } as unknown as ContextEngineRuntimeSettings,
+    });
+
+    expect(evaluateSpy).toHaveBeenCalledWith(expect.any(Number), 1_000, 500, expect.any(Object));
+  });
+
   it("forces threshold sweeps to account for runtime prompt overhead", async () => {
     const engine = createEngine();
     const privateEngine = engine as unknown as {
