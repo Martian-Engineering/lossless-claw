@@ -132,6 +132,48 @@ describe("LcmContextEngine commitTurn", () => {
     });
   });
 
+  it("preserves recurrent model-authored tool results across committed turns", async () => {
+    const engine = createEngine();
+    const commands = ["ls /tmp/first", "ls /tmp/second"];
+
+    for (const [index, command] of commands.entries()) {
+      const params = buildCommitTurnParams({ advancementKey: `tool-turn-${index + 1}` });
+      const startPosition = 41 + index * 4;
+      params.admission = {
+        ...params.admission,
+        activeMessagePosition: startPosition,
+        entryId: `user-entry-${index + 1}`,
+      };
+      params.terminal = {
+        ...params.terminal,
+        activeMessagePosition: startPosition + 3,
+        effectiveParentId: `tool-result-entry-${index + 1}`,
+        entryId: `assistant-entry-${index + 1}`,
+      };
+      params.messages = [
+        makeMessage({ role: "user", content: `run ${command}` }),
+        makeMessage({
+          role: "assistant",
+          content: [{ type: "tool_use", id: "exec:101", name: "exec", input: { command } }],
+        }),
+        makeMessage({
+          role: "toolResult",
+          toolCallId: "exec:101",
+          content: [{ type: "text", text: "(no output)" }],
+        }),
+        makeMessage({ role: "assistant", content: `finished ${command}` }),
+      ];
+
+      await expect(engine.commitTurn(params)).resolves.toEqual({ status: "committed" });
+    }
+
+    const stored = await readStoredMessages(engine);
+    expect(
+      stored.filter((message) => message.role === "tool").map((message) => message.content),
+    ).toEqual(["(no output)", "(no output)"]);
+    expect(stored).toHaveLength(8);
+  });
+
   it("rejects a terminal anchor outside the supplied message range", async () => {
     const engine = createEngine();
     const params = buildCommitTurnParams();

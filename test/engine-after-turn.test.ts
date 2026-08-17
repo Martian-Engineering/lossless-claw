@@ -156,6 +156,50 @@ describe("LcmContextEngine afterTurn", () => {
     expect(maintenance).toBeNull();
   });
 
+  it("afterTurn excludes prompt counts owned by a typed execution host", async () => {
+    const engine = createEngine();
+    const sessionId = "after-turn-host-owned-prompt";
+    await seedBacklogContext(engine, sessionId, [100]);
+    const privateEngine = engine as unknown as {
+      compaction: {
+        evaluate: (
+          conversationId: number,
+          tokenBudget: number,
+          observed?: number,
+        ) => Promise<unknown>;
+      };
+    };
+    const evaluateSpy = vi.spyOn(privateEngine.compaction, "evaluate").mockResolvedValue({
+      shouldCompact: false,
+      reason: "none",
+      currentTokens: 100,
+      threshold: 22_500,
+    });
+
+    await engine.afterTurn({
+      sessionId,
+      sessionFile: createSessionFilePath("after-turn-host-owned-prompt"),
+      messages: [makeMessage({ role: "assistant", content: "fresh projected turn" })],
+      prePromptMessageCount: 0,
+      tokenBudget: 30_000,
+      currentTokenCount: 93_486,
+      runtimeSettings: {
+        schemaVersion: 1,
+        executionHost: {
+          id: "codex-app-server",
+          label: "Codex app-server harness",
+        },
+      },
+    });
+
+    expect(evaluateSpy).toHaveBeenCalledWith(
+      expect.any(Number),
+      30_000,
+      undefined,
+      expect.any(Object),
+    );
+  });
+
   it("afterTurn schedules prepare-only pending summaries below threshold", async () => {
     const engine = createEngineWithDeps({
       freshTailCount: 1,
