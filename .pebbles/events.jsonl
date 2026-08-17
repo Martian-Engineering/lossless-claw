@@ -23,3 +23,5 @@
 {"type":"dep_add","timestamp":"2026-08-17T22:26:20.68647Z","issue_id":"lc-6a7","payload":{"dep_type":"blocks","depends_on":"lc-6a7.3"}}
 {"type":"dep_add","timestamp":"2026-08-17T22:26:20.712099Z","issue_id":"lc-6a7","payload":{"dep_type":"blocks","depends_on":"lc-6a7.4"}}
 {"type":"dep_add","timestamp":"2026-08-17T22:26:20.738193Z","issue_id":"lc-6a7","payload":{"dep_type":"blocks","depends_on":"lc-6a7.5"}}
+{"type":"status_update","timestamp":"2026-08-17T22:26:54.565654Z","issue_id":"lc-6a7.1","payload":{"status":"in_progress"}}
+{"type":"close","timestamp":"2026-08-17T22:29:49.564923Z","issue_id":"lc-6a7.1","payload":{}}
