@@ -9,7 +9,11 @@ import { createLcmDatabaseConnection } from "../src/db/connection.js";
 import { LcmContextEngine } from "../src/engine.js";
 import { estimateTokens } from "../src/estimate-tokens.js";
 import { formatFileReference } from "../src/large-files.js";
-import type { AgentMessage } from "../src/openclaw-bridge.js";
+import type {
+  AgentMessage,
+  ContextEngine,
+  ContextEngineRuntimeSettings,
+} from "../src/openclaw-bridge.js";
 import { buildMessageIdentityHash } from "../src/store/message-identity.js";
 import {
   cleanupEngineTestState,
@@ -26,6 +30,39 @@ import {
 } from "./helpers.js";
 
 afterEach(cleanupEngineTestState);
+
+const OPENCLAW_HOST_PARAM_NAMES = new Set([
+  "sessionKey",
+  "prompt",
+  "runtimeSettings",
+  "sessionTarget",
+  "runtimeContext",
+]);
+
+/** Apply OpenClaw's accepted-host-parameter projection contract in integration tests. */
+function projectContextEngineHostParams(
+  engine: ContextEngine,
+  params: Record<string, unknown>,
+): Record<string, unknown> {
+  const accepted = engine.info.acceptedHostParams;
+  if (!accepted) return params;
+  return Object.fromEntries(
+    Object.entries(params).filter(
+      ([key]) => accepted.includes(key) || !OPENCLAW_HOST_PARAM_NAMES.has(key),
+    ),
+  );
+}
+
+/** Build the ownership metadata emitted by typed OpenClaw execution hosts. */
+function buildRuntimeSettings(executionHostId: string): ContextEngineRuntimeSettings {
+  return {
+    schemaVersion: 1,
+    executionHost: {
+      id: executionHostId,
+      label: "host-aware OpenClaw runtime",
+    },
+  };
+}
 
 describe("LcmContextEngine compaction telemetry", () => {
   it("does not feed engine-ingested reasoning parts into compaction summarizer input", async () => {
@@ -1063,6 +1100,72 @@ describe("LcmContextEngine.compact token budget plumbing", () => {
     );
   });
 
+  it.each(["codex-app-server", "openclaw-embedded"])(
+    "excludes %s-owned prompt framing after OpenClaw host-param projection",
+    async (executionHostId) => {
+      const engine = createEngine();
+      const privateEngine = engine as unknown as {
+        compaction: {
+          evaluate: (
+            conversationId: number,
+            tokenBudget: number,
+            observed?: number,
+          ) => Promise<unknown>;
+          compactFullSweep: (input: unknown) => Promise<unknown>;
+        };
+      };
+      const evaluateSpy = vi.spyOn(privateEngine.compaction, "evaluate").mockResolvedValue({
+        shouldCompact: true,
+        reason: "threshold",
+        storedTokens: 36_047,
+        observedTokens: 93_486,
+        currentTokens: 36_047,
+        threshold: 22_500,
+      });
+      vi.spyOn(privateEngine.compaction, "compactFullSweep").mockResolvedValue({
+        actionTaken: true,
+        tokensBefore: 36_047,
+        tokensAfter: 20_000,
+        condensed: false,
+      });
+      await engine.ingest({
+        sessionId: `host-owned-prompt-${executionHostId}`,
+        message: { role: "user", content: "trigger threshold compact" } as AgentMessage,
+      });
+
+      const runtimeSettings = buildRuntimeSettings(executionHostId);
+      const projectedParams = projectContextEngineHostParams(engine, {
+        sessionId: `host-owned-prompt-${executionHostId}`,
+        sessionFile: "/tmp/session.jsonl",
+        tokenBudget: 30_000,
+        currentTokenCount: 93_486,
+        compactionTarget: "threshold",
+        runtimeSettings,
+      });
+      expect(projectedParams.runtimeSettings).toBe(runtimeSettings);
+
+      const result = await engine.compact(
+        projectedParams as Parameters<typeof engine.compact>[0],
+      );
+
+      expect(evaluateSpy).toHaveBeenCalledWith(
+        expect.any(Number),
+        30_000,
+        undefined,
+        expect.any(Object),
+      );
+      expect(result).toMatchObject({
+        ok: true,
+        compacted: true,
+        reason: "compacted",
+        result: {
+          tokensAfter: 20_000,
+          details: { targetTokens: 22_500 },
+        },
+      });
+    },
+  );
+
   it("forces threshold sweeps to account for runtime prompt overhead", async () => {
     const engine = createEngine();
     const privateEngine = engine as unknown as {
@@ -1535,6 +1638,44 @@ describe("LcmContextEngine.compact token budget plumbing", () => {
 });
 
 describe("#639 Mode 2 deferred-compaction wedge (live context exceeds target, no candidates)", () => {
+  it("preserves prompt ownership through the background deferred-debt drain", async () => {
+    const engine = createEngine();
+    const sessionId = "background-debt-runtime-settings";
+    const conversation = await engine
+      .getConversationStore()
+      .getOrCreateConversation(sessionId, { sessionKey: undefined });
+    await engine.getCompactionMaintenanceStore().requestProactiveCompactionDebt({
+      conversationId: conversation.conversationId,
+      reason: "threshold",
+      tokenBudget: 30_000,
+      currentTokenCount: 84_628,
+    });
+    const privateEngine = engine as unknown as {
+      drainDeferredCompactionDebtIfIdle: (params: unknown) => Promise<void>;
+      consumeDeferredCompactionDebt: (params: unknown) => Promise<unknown>;
+    };
+    const consumeSpy = vi
+      .spyOn(privateEngine, "consumeDeferredCompactionDebt")
+      .mockResolvedValue({
+        changed: true,
+        bytesFreed: 0,
+        rewrittenEntries: 0,
+        reason: "compacted",
+      });
+    const runtimeSettings = buildRuntimeSettings("codex-app-server");
+
+    await privateEngine.drainDeferredCompactionDebtIfIdle({
+      conversationId: conversation.conversationId,
+      sessionId,
+      tokenBudget: 30_000,
+      currentTokenCount: 84_628,
+      runtimeSettings,
+      reason: "threshold",
+    });
+
+    expect(consumeSpy).toHaveBeenCalledWith(expect.objectContaining({ runtimeSettings }));
+  });
+
   it("over-target threshold debt with no compactable candidates is exhaustion: debt clears, no retry thrash", async () => {
     const engine = createEngine();
     const sessionId = "wedge-639-mode2-exhaustion";

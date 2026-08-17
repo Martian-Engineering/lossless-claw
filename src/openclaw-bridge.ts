@@ -33,6 +33,16 @@ export type ContextEngineProjection = {
   fingerprint?: string;
 };
 
+/** Runtime ownership metadata projected by host-aware OpenClaw versions. */
+export type ContextEngineRuntimeSettings = {
+  schemaVersion: 1;
+  executionHost: {
+    id: string | null;
+    label: string | null;
+  };
+  [key: string]: unknown;
+};
+
 export type AssembleResult = {
   messages: AgentMessage[];
   estimatedTokens: number;
@@ -269,6 +279,7 @@ export type ContextEngine = {
     sessionFile?: string;
     messages?: AgentMessage[];
     sessionTarget?: ContextEngineSessionTarget;
+    runtimeSettings?: ContextEngineRuntimeSettings;
     runtimeContext?: ContextEngineRuntimeContext;
   }): Promise<BootstrapResult>;
   ingest(params: {
@@ -294,6 +305,7 @@ export type ContextEngine = {
     tokenBudget?: number;
     currentTokenCount?: number;
     runtimeContext?: Record<string, unknown>;
+    runtimeSettings?: ContextEngineRuntimeSettings;
     legacyCompactionParams?: Record<string, unknown>;
   }): Promise<void>;
   commitTurn?(params: {
@@ -304,7 +316,7 @@ export type ContextEngine = {
     sessionId: string;
     sessionKey?: string;
     sessionTarget?: ContextEngineSessionTarget;
-    runtimeSettings?: Record<string, unknown>;
+    runtimeSettings?: ContextEngineRuntimeSettings;
     runtimeContext?: ContextEngineRuntimeContext;
     isHeartbeat?: boolean;
   }): Promise<{ status: "committed" | "duplicate" }>;
@@ -325,6 +337,7 @@ export type ContextEngine = {
     model?: string;
     /** Optional runtime context for override resolution (model, provider, etc.). */
     runtimeContext?: Record<string, unknown>;
+    runtimeSettings?: ContextEngineRuntimeSettings;
   }): Promise<AssembleResult>;
   compact(params: {
     sessionId: string;
@@ -335,6 +348,7 @@ export type ContextEngine = {
     compactionTarget?: "budget" | "threshold";
     customInstructions?: string;
     runtimeContext?: Record<string, unknown>;
+    runtimeSettings?: ContextEngineRuntimeSettings;
     legacyParams?: Record<string, unknown>;
     force?: boolean;
   }): Promise<CompactResult>;
@@ -359,6 +373,7 @@ export type ContextEngine = {
     sessionFile: string;
     sessionKey?: string;
     runtimeContext?: ContextEngineMaintenanceRuntimeContext;
+    runtimeSettings?: ContextEngineRuntimeSettings;
   }): Promise<ContextEngineMaintenanceResult>;
   dispose?(): Promise<void>;
 };
