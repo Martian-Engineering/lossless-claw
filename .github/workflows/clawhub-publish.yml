@@ -56,6 +56,11 @@ jobs:
           fi
 
           source_sha="$(git rev-parse HEAD)"
+          if [ "$source_sha" != "$GITHUB_SHA" ]; then
+            echo "Dispatch this workflow from $RELEASE_TAG, not $GITHUB_REF"
+            exit 1
+          fi
+
           git fetch --no-tags origin "refs/tags/$RELEASE_TAG:refs/tags/$RELEASE_TAG"
           tag_sha="$(git rev-list -n 1 "refs/tags/$RELEASE_TAG")"
           if [ "$source_sha" != "$tag_sha" ]; then

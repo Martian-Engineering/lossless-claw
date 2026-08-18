@@ -211,7 +211,7 @@ jobs:
       - name: Dispatch ClawHub publish
         env:
           GH_TOKEN: ${{ github.token }}
-          WORKFLOW_REF: ${{ github.event.repository.default_branch }}
+          WORKFLOW_REF: v${{ steps.package.outputs.version }}
           RELEASE_TAG: v${{ steps.package.outputs.version }}
         run: |
           jq -n \

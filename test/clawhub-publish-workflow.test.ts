@@ -41,6 +41,10 @@ describe("ClawHub publish workflow", () => {
     expect(workflow).toContain(
       'tag_sha="$(git rev-list -n 1 "refs/tags/$RELEASE_TAG")"',
     );
+    expect(workflow).toContain('source_sha" != "$GITHUB_SHA"');
+    expect(workflow).toContain(
+      'Dispatch this workflow from $RELEASE_TAG, not $GITHUB_REF',
+    );
     expect(workflow).toContain('source_sha" != "$tag_sha"');
     expect(workflow).toContain(
       'npm view "$package_name@$version" version gitHead --json',
@@ -78,7 +82,7 @@ describe("ClawHub publish workflow", () => {
       "actions/workflows/clawhub-publish.yml/dispatches",
     );
     expect(npmPublishWorkflow).toContain(
-      "WORKFLOW_REF: ${{ github.event.repository.default_branch }}",
+      "WORKFLOW_REF: v${{ steps.package.outputs.version }}",
     );
     expect(npmPublishWorkflow).toContain(
       'RELEASE_TAG: v${{ steps.package.outputs.version }}',
