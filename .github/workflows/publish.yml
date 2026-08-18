@@ -4,6 +4,7 @@ on:
   workflow_dispatch:
 
 permissions:
+  actions: write
   contents: write
   id-token: write
 
@@ -206,3 +207,20 @@ jobs:
             release_args+=(--prerelease)
           fi
           gh release create "$tag" --repo "$GITHUB_REPOSITORY" "${release_args[@]}"
+
+      - name: Dispatch ClawHub publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+          WORKFLOW_REF: v${{ steps.package.outputs.version }}
+          RELEASE_TAG: v${{ steps.package.outputs.version }}
+        run: |
+          jq -n \
+            --arg ref "$WORKFLOW_REF" \
+            --arg release_tag "$RELEASE_TAG" \
+            '{ref: $ref, inputs: {release_tag: $release_tag, dry_run: false}}' |
+            gh api \
+              --method POST \
+              -H "Accept: application/vnd.github+json" \
+              -H "X-GitHub-Api-Version: 2022-11-28" \
+              "repos/${GITHUB_REPOSITORY}/actions/workflows/clawhub-publish.yml/dispatches" \
+              --input -

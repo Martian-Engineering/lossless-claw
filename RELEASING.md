@@ -57,6 +57,7 @@ make sure a maintainer gets a `.changeset/*.md` file onto `main`.
    - create tag `vX.Y.Z`
    - create the GitHub release using the matching `CHANGELOG.md` section as the primary notes
    - prepend those notes ahead of GitHub's generated contributor and compare summary
+   - dispatch `Publish to ClawHub` for the same tag with `dry_run` set to `false`
 
 ## External setup required
 
@@ -71,6 +72,28 @@ Recommended external setup:
 When configuring npm trusted publishing, register the GitHub workflow using the exact workflow filename in this repo: `.github/workflows/publish.yml`.
 
 The publish workflow is intentionally manual. Release issuance should stay deliberate even after trusted publishing is enabled.
+
+## ClawHub releases
+
+Publish to npm first. After the npm workflow creates the matching `vX.Y.Z` tag
+and GitHub Release, it automatically dispatches `Publish to ClawHub` from that
+tag with `release_tag` set to the same tag and `dry_run` set to `false`.
+
+The standalone `Publish to ClawHub` workflow remains available for validation
+and recovery. Select the release tag as the workflow ref, set `release_tag` to
+the same tag, and use `dry_run` to choose validation or publication.
+
+The workflow refuses to publish unless the selected tag, `package.json`
+version, npm version, npm `gitHead`, and the tag's immutable commit all identify
+the same release. Real ClawHub publishes are serialized. Selecting the release
+tag for both the workflow ref and package source lets ClawHub verify that the
+trusted workflow commit matches the published package commit. Tags that predate
+this workflow cannot use OIDC trusted publishing.
+
+ClawHub trusted publishing is configured for
+`.github/workflows/clawhub-publish.yml`; no long-lived repository token is
+required. Deleting that trusted-publisher configuration disables future
+publishes.
 
 ## Beta releases
 
