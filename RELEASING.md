@@ -71,6 +71,10 @@ Recommended external setup:
 
 When configuring npm trusted publishing, register the GitHub workflow using the exact workflow filename in this repo: `.github/workflows/publish.yml`.
 
+The workflow requests an OIDC identity token, installs an npm CLI with trusted
+publishing support, and publishes with provenance. It intentionally does not
+inject `NODE_AUTH_TOKEN` or use the legacy `NPM_TOKEN` repository secret.
+
 The publish workflow is intentionally manual. Release issuance should stay deliberate even after trusted publishing is enabled.
 
 ## ClawHub releases
