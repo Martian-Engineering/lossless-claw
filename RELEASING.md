@@ -57,6 +57,7 @@ make sure a maintainer gets a `.changeset/*.md` file onto `main`.
    - create tag `vX.Y.Z`
    - create the GitHub release using the matching `CHANGELOG.md` section as the primary notes
    - prepend those notes ahead of GitHub's generated contributor and compare summary
+   - dispatch `Publish to ClawHub` for the same tag with `dry_run` set to `false`
 
 ## External setup required
 
@@ -74,10 +75,14 @@ The publish workflow is intentionally manual. Release issuance should stay delib
 
 ## ClawHub releases
 
-Publish to npm first. After the npm workflow creates the matching `vX.Y.Z` tag,
-manually run `Publish to ClawHub` from the default branch with `release_tag`
-set to that tag. Run once with `dry_run` set to `true`, review the validation,
-then run again with `dry_run` set to `false`.
+Publish to npm first. After the npm workflow creates the matching `vX.Y.Z` tag
+and GitHub Release, it automatically dispatches `Publish to ClawHub` from the
+default branch with `release_tag` set to that tag and `dry_run` set to `false`.
+
+The standalone `Publish to ClawHub` workflow remains available for validation
+and recovery. Run it with `dry_run` set to `true` to validate a release without
+publishing, or rerun it with `dry_run` set to `false` if the automatic ClawHub
+workflow failed or was not dispatched.
 
 The workflow refuses to publish unless the selected tag, `package.json`
 version, npm version, npm `gitHead`, and the tag's immutable commit all identify

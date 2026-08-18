@@ -7,6 +7,10 @@ const workflow = readFileSync(
   `${repositoryRoot}/.github/workflows/clawhub-publish.yml`,
   "utf8",
 );
+const npmPublishWorkflow = readFileSync(
+  `${repositoryRoot}/.github/workflows/publish.yml`,
+  "utf8",
+);
 const releasing = readFileSync(`${repositoryRoot}/RELEASING.md`, "utf8");
 const clawhubWorkflowCommit =
   "a230d962db64019462c2c8ee400755eb92169908";
@@ -64,5 +68,26 @@ describe("ClawHub publish workflow", () => {
     expect(releasing).toContain("Publish to npm first");
     expect(releasing).toContain("matching `vX.Y.Z` tag");
     expect(releasing).toContain("npm `gitHead`");
+  });
+
+  it("dispatches a real ClawHub publish after the npm release completes", () => {
+    expect(npmPublishWorkflow).toMatch(
+      /permissions:\n(?:.|\n)*?actions: write/,
+    );
+    expect(npmPublishWorkflow).toContain(
+      "actions/workflows/clawhub-publish.yml/dispatches",
+    );
+    expect(npmPublishWorkflow).toContain(
+      "WORKFLOW_REF: ${{ github.event.repository.default_branch }}",
+    );
+    expect(npmPublishWorkflow).toContain(
+      'RELEASE_TAG: v${{ steps.package.outputs.version }}',
+    );
+    expect(npmPublishWorkflow).toContain(
+      "inputs: {release_tag: $release_tag, dry_run: false}",
+    );
+    expect(npmPublishWorkflow.indexOf("Create GitHub release")).toBeLessThan(
+      npmPublishWorkflow.indexOf("Dispatch ClawHub publish"),
+    );
   });
 });
