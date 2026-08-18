@@ -2,7 +2,7 @@
 
 ## 1.0.0-beta.3
 
-<!-- release-rollback-version: 0.15.1 -->
+<!-- release-rollback-version: 0.15.2 -->
 
 ### Patch Changes
 
