@@ -5,6 +5,7 @@
     "@martian-engineering/lossless-claw": "0.15.1"
   },
   "changesets": [
+    "clawhub-prebuilt-artifacts",
     "durable-turn-advancement",
     "legacy-bootstrap-diagnostics",
     "minimax-tui-provider",
