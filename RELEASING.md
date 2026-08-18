@@ -90,6 +90,13 @@ tag for both the workflow ref and package source lets ClawHub verify that the
 trusted workflow commit matches the published package commit. Tags that predate
 this workflow cannot use OIDC trusted publishing.
 
+After identity verification, the workflow downloads the exact published npm
+tarball and passes that prebuilt artifact to ClawHub. This keeps generated
+files such as `dist/index.js` identical between npm and ClawHub even though
+`dist/` is excluded from the source tag. Pull-request dry runs build and pack
+the checkout before ClawHub validation so they exercise the same artifact
+shape as a release.
+
 ClawHub trusted publishing is configured for
 `.github/workflows/clawhub-publish.yml`; no long-lived repository token is
 required. Deleting that trusted-publisher configuration disables future

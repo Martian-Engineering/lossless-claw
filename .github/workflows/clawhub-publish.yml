@@ -15,7 +15,47 @@ on:
         type: boolean
 
 jobs:
+  pull-request-package:
+    if: github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Build package tarball
+        run: |
+          set -euo pipefail
+          npm ci
+          npm run build
+          mkdir -p "$RUNNER_TEMP/clawhub-pr-package"
+          npm pack --pack-destination "$RUNNER_TEMP/clawhub-pr-package"
+
+          shopt -s nullglob
+          tarballs=("$RUNNER_TEMP/clawhub-pr-package"/*.tgz)
+          if [ "${#tarballs[@]}" -ne 1 ]; then
+            echo "Expected one package tarball, found ${#tarballs[@]}"
+            exit 1
+          fi
+          tar -tzf "${tarballs[0]}" | grep -Fx 'package/dist/index.js'
+
+      - name: Upload package tarball
+        uses: actions/upload-artifact@v4
+        with:
+          name: clawhub-pr-package
+          path: ${{ runner.temp }}/clawhub-pr-package/*.tgz
+          if-no-files-found: error
+          retention-days: 1
+
   dry-run:
+    needs: pull-request-package
     if: github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository
     permissions:
       actions: read
@@ -24,6 +64,7 @@ jobs:
     # openclaw/clawhub package-publish.yml v0.23.1
     uses: openclaw/clawhub/.github/workflows/package-publish.yml@a230d962db64019462c2c8ee400755eb92169908
     with:
+      package_artifact_name: clawhub-pr-package
       dry_run: true
 
   release-preflight:
@@ -79,6 +120,30 @@ jobs:
 
           echo "source_sha=$source_sha" >> "$GITHUB_OUTPUT"
 
+      - name: Download exact npm package tarball
+        run: |
+          set -euo pipefail
+          package_name="$(node -p "require('./package.json').name")"
+          version="$(node -p "require('./package.json').version")"
+          mkdir -p "$RUNNER_TEMP/clawhub-release-package"
+          npm pack "$package_name@$version" --pack-destination "$RUNNER_TEMP/clawhub-release-package"
+
+          shopt -s nullglob
+          tarballs=("$RUNNER_TEMP/clawhub-release-package"/*.tgz)
+          if [ "${#tarballs[@]}" -ne 1 ]; then
+            echo "Expected one package tarball, found ${#tarballs[@]}"
+            exit 1
+          fi
+          tar -tzf "${tarballs[0]}" | grep -Fx 'package/dist/index.js'
+
+      - name: Upload exact npm package tarball
+        uses: actions/upload-artifact@v4
+        with:
+          name: clawhub-release-package
+          path: ${{ runner.temp }}/clawhub-release-package/*.tgz
+          if-no-files-found: error
+          retention-days: 1
+
   release-dry-run:
     needs: release-preflight
     if: github.event_name == 'workflow_dispatch' && inputs.dry_run
@@ -92,6 +157,7 @@ jobs:
       source: ${{ github.repository }}
       ref: ${{ needs.release-preflight.outputs.source_sha }}
       source_ref: refs/tags/${{ inputs.release_tag }}
+      package_artifact_name: clawhub-release-package
       dry_run: true
 
   publish:
@@ -110,4 +176,5 @@ jobs:
       source: ${{ github.repository }}
       ref: ${{ needs.release-preflight.outputs.source_sha }}
       source_ref: refs/tags/${{ inputs.release_tag }}
+      package_artifact_name: clawhub-release-package
       dry_run: false
