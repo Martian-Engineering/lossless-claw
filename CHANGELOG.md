@@ -2,6 +2,8 @@
 
 ## 0.15.2
 
+<!-- release-rollback-version: 0.15.1 -->
+
 ### Patch Changes
 
 - [#1075](https://github.com/Martian-Engineering/lossless-claw/pull/1075) [`8f4f240`](https://github.com/Martian-Engineering/lossless-claw/commit/8f4f240b00139fcefa158b57666442e96c6e2024) Thanks [@jalehman](https://github.com/jalehman)! - Preserve OpenClaw group sender identity through storage, replay, and leaf summaries.
