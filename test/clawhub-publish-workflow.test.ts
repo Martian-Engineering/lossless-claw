@@ -53,6 +53,26 @@ describe("ClawHub publish workflow", () => {
     expect(workflow).toContain('echo "source_sha=$source_sha" >> "$GITHUB_OUTPUT"');
   });
 
+  it("builds a prebuilt package for pull-request validation", () => {
+    expect(workflow).toMatch(
+      /pull-request-package:\n(?:.|\n)*?npm ci(?:.|\n)*?npm run build(?:.|\n)*?npm pack --pack-destination "\$RUNNER_TEMP\/clawhub-pr-package"/,
+    );
+    expect(workflow).toMatch(
+      /dry-run:\n\s+needs: pull-request-package(?:.|\n)*?package_artifact_name: clawhub-pr-package/,
+    );
+  });
+
+  it("publishes the exact npm tarball through ClawHub", () => {
+    expect(workflow).toContain(
+      'npm pack "$package_name@$version" --pack-destination "$RUNNER_TEMP/clawhub-release-package"',
+    );
+    expect(workflow.match(/package\/dist\/index\.js/g)).toHaveLength(2);
+    expect(workflow).toMatch(
+      /name: Upload exact npm package tarball(?:.|\n)*?name: clawhub-release-package/,
+    );
+    expect(workflow.match(/package_artifact_name: clawhub-release-package/g)).toHaveLength(2);
+  });
+
   it("binds manual validation and publication to the verified commit", () => {
     expect(workflow).toMatch(
       /release-dry-run:\n\s+needs: release-preflight(?:.|\n)*?source: \$\{\{ github\.repository \}\}(?:.|\n)*?ref: \$\{\{ needs\.release-preflight\.outputs\.source_sha \}\}(?:.|\n)*?source_ref: refs\/tags\/\$\{\{ inputs\.release_tag \}\}/,
@@ -72,6 +92,7 @@ describe("ClawHub publish workflow", () => {
     expect(releasing).toContain("Publish to npm first");
     expect(releasing).toContain("matching `vX.Y.Z` tag");
     expect(releasing).toContain("npm `gitHead`");
+    expect(releasing).toMatch(/exact published npm\s+tarball/);
   });
 
   it("dispatches a real ClawHub publish after the npm release completes", () => {
@@ -93,5 +114,17 @@ describe("ClawHub publish workflow", () => {
     expect(npmPublishWorkflow.indexOf("Create GitHub release")).toBeLessThan(
       npmPublishWorkflow.indexOf("Dispatch ClawHub publish"),
     );
+  });
+
+  it("publishes npm releases through the configured OIDC trust", () => {
+    expect(npmPublishWorkflow).toContain("id-token: write");
+    expect(npmPublishWorkflow).toContain(
+      "npm install --global npm@11.19.0",
+    );
+    expect(npmPublishWorkflow).toContain(
+      'npm publish --provenance --tag "${{ steps.package.outputs.npm_tag }}"',
+    );
+    expect(npmPublishWorkflow).not.toContain("NODE_AUTH_TOKEN");
+    expect(npmPublishWorkflow).not.toContain("secrets.NPM_TOKEN");
   });
 });

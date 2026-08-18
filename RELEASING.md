@@ -71,6 +71,10 @@ Recommended external setup:
 
 When configuring npm trusted publishing, register the GitHub workflow using the exact workflow filename in this repo: `.github/workflows/publish.yml`.
 
+The workflow requests an OIDC identity token, installs an npm CLI with trusted
+publishing support, and publishes with provenance. It intentionally does not
+inject `NODE_AUTH_TOKEN` or use the legacy `NPM_TOKEN` repository secret.
+
 The publish workflow is intentionally manual. Release issuance should stay deliberate even after trusted publishing is enabled.
 
 ## ClawHub releases
@@ -89,6 +93,13 @@ the same release. Real ClawHub publishes are serialized. Selecting the release
 tag for both the workflow ref and package source lets ClawHub verify that the
 trusted workflow commit matches the published package commit. Tags that predate
 this workflow cannot use OIDC trusted publishing.
+
+After identity verification, the workflow downloads the exact published npm
+tarball and passes that prebuilt artifact to ClawHub. This keeps generated
+files such as `dist/index.js` identical between npm and ClawHub even though
+`dist/` is excluded from the source tag. Pull-request dry runs build and pack
+the checkout before ClawHub validation so they exercise the same artifact
+shape as a release.
 
 ClawHub trusted publishing is configured for
 `.github/workflows/clawhub-publish.yml`; no long-lived repository token is
