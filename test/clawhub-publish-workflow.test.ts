@@ -115,4 +115,16 @@ describe("ClawHub publish workflow", () => {
       npmPublishWorkflow.indexOf("Dispatch ClawHub publish"),
     );
   });
+
+  it("publishes npm releases through the configured OIDC trust", () => {
+    expect(npmPublishWorkflow).toContain("id-token: write");
+    expect(npmPublishWorkflow).toContain(
+      "npm install --global npm@11.19.0",
+    );
+    expect(npmPublishWorkflow).toContain(
+      'npm publish --provenance --tag "${{ steps.package.outputs.npm_tag }}"',
+    );
+    expect(npmPublishWorkflow).not.toContain("NODE_AUTH_TOKEN");
+    expect(npmPublishWorkflow).not.toContain("secrets.NPM_TOKEN");
+  });
 });
