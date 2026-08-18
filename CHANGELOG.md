@@ -1,5 +1,21 @@
 # @martian-engineering/lossless-claw
 
+## 1.0.0-beta.3
+
+<!-- release-rollback-version: 0.15.1 -->
+
+### Patch Changes
+
+- [#1091](https://github.com/Martian-Engineering/lossless-claw/pull/1091) [`4aa98c6`](https://github.com/Martian-Engineering/lossless-claw/commit/4aa98c6f81992363a74a1b44a1cefaf5fee8d059) Thanks [@jalehman](https://github.com/jalehman)! - Preserve new `afterTurn` messages when an unaligned runtime batch only partially overlaps persisted history. Ambiguous mixed batches now ingest in full instead of repeatedly discarding genuine turns beside recurring control rows.
+
+- [#1091](https://github.com/Martian-Engineering/lossless-claw/pull/1091) [`4aa98c6`](https://github.com/Martian-Engineering/lossless-claw/commit/4aa98c6f81992363a74a1b44a1cefaf5fee8d059) Thanks [@jalehman](https://github.com/jalehman)! - Preserve distinct tool results when a model reuses tool-call IDs across turns. Only provider-minted IDs now participate in conversation-global event deduplication, and unexpected stable-key collisions retain the row without the conflicting key.
+
+- [#1089](https://github.com/Martian-Engineering/lossless-claw/pull/1089) [`13c70ec`](https://github.com/Martian-Engineering/lossless-claw/commit/13c70ecfd49109b39fadb889b2e7c072383a6e7b) Thanks [@PollyBot13](https://github.com/PollyBot13)! - Reopen the SQLite-backed context engine when OpenClaw starts a new gateway lifecycle from a cached plugin registry, preventing fallback to the legacy engine after in-process restarts and resolving the current host default model after config changes.
+
+- [#1091](https://github.com/Martian-Engineering/lossless-claw/pull/1091) [`4aa98c6`](https://github.com/Martian-Engineering/lossless-claw/commit/4aa98c6f81992363a74a1b44a1cefaf5fee8d059) Thanks [@jalehman](https://github.com/jalehman)! - Separate host-owned prompt framing from Lossless-owned context during threshold compaction. Typed OpenClaw runtime ownership metadata now survives host-parameter projection and follows foreground, maintenance, and deferred compaction paths so uncompactable system, tool, or native-thread history cannot make convergence impossible.
+
+- [#1089](https://github.com/Martian-Engineering/lossless-claw/pull/1089) [`13c70ec`](https://github.com/Martian-Engineering/lossless-claw/commit/13c70ecfd49109b39fadb889b2e7c072383a6e7b) Thanks [@PollyBot13](https://github.com/PollyBot13)! - Skip restart and shutdown `session_end` hooks before acquiring the context engine, preventing closed-database errors after `gateway_stop`.
+
 ## 1.0.0-beta.2
 
 <!-- release-rollback-version: 0.15.1 -->
