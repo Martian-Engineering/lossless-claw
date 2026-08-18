@@ -1,5 +1,13 @@
 # @martian-engineering/lossless-claw
 
+## 1.0.0-beta.4
+
+<!-- release-rollback-version: 0.15.3 -->
+
+### Patch Changes
+
+- [#1102](https://github.com/Martian-Engineering/lossless-claw/pull/1102) [`c686ad1`](https://github.com/Martian-Engineering/lossless-claw/commit/c686ad1371b3187096f9e167424506dad2533460) Thanks [@jalehman](https://github.com/jalehman)! - Publish the built npm tarball through ClawHub so marketplace installs include the declared `dist/index.js` extension entrypoint.
+
 ## 1.0.0-beta.3
 
 <!-- release-rollback-version: 0.15.2 -->
