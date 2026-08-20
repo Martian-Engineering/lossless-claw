@@ -38,6 +38,11 @@ import {
   type RolloverSplitCounts,
   type RolloverSplitExample,
 } from "./lcm-doctor-rollover-splits.js";
+import {
+  closeInactiveCompactionMaintenanceDebt,
+  scanCompactionMaintenanceDebt,
+  type InactiveMaintenanceCloseResult,
+} from "./lcm-doctor-maintenance.js";
 import { scanLcmVersionCopies, type LcmVersionDoctorScan } from "./lcm-version-doctor.js";
 import {
   CompactionMaintenanceStore,
@@ -113,6 +118,8 @@ type ParsedLcmCommand =
   | { kind: "refocus" }
   | { kind: "unfocus" }
   | { kind: "doctor"; apply: boolean; applyOptions?: DoctorApplyOptions }
+  | { kind: "doctor_maintenance"; apply: false }
+  | { kind: "doctor_maintenance"; apply: true; conversationId: number; confirmed: boolean }
   | { kind: "doctor_rollover_splits"; apply: boolean; applyOptions?: RolloverSplitApplyOptions }
   | { kind: "doctor_cleaners"; apply: boolean; filterId?: DoctorCleanerId; vacuum: boolean }
   | { kind: "help"; error?: string };
@@ -584,6 +591,32 @@ function parseRolloverSplitApplyArgs(tokens: string[]):
   };
 }
 
+function parseMaintenanceApplyArgs(tokens: string[]):
+  | { ok: true; conversationId: number; confirmed: boolean }
+  | { ok: false; error: string } {
+  const conversationId = Number(tokens[0]);
+  const validConversationId =
+    tokens[0] !== undefined &&
+    Number.isSafeInteger(conversationId) &&
+    conversationId > 0 &&
+    String(conversationId) === tokens[0];
+  const validConfirmation =
+    tokens.length === 1 ||
+    (tokens.length === 2 && tokens[1] === "confirm-inactive");
+  if (!validConversationId || !validConfirmation) {
+    return {
+      ok: false,
+      error:
+        `\`${VISIBLE_COMMAND} doctor apply maintenance\` requires a positive conversation id followed by optional exact \`confirm-inactive\`.`,
+    };
+  }
+  return {
+    ok: true,
+    conversationId,
+    confirmed: tokens.length === 2,
+  };
+}
+
 function parseLcmCommand(rawArgs: string | undefined): ParsedLcmCommand {
   const raw = (rawArgs ?? "").trim();
   if (raw === "") {
@@ -639,6 +672,9 @@ function parseLcmCommand(rawArgs: string | undefined): ParsedLcmCommand {
       if (rest.length === 1 && rest[0]?.toLowerCase() === "rollover-splits") {
         return { kind: "doctor_rollover_splits", apply: false };
       }
+      if (rest.length === 1 && rest[0]?.toLowerCase() === "maintenance") {
+        return { kind: "doctor_maintenance", apply: false };
+      }
       if (rest[0]?.toLowerCase() === "clean" && rest[1]?.toLowerCase() === "apply") {
         const parsedApply = parseDoctorCleanerApplyArgs(rest.slice(2));
         return parsedApply.ok
@@ -660,6 +696,17 @@ function parseLcmCommand(rawArgs: string | undefined): ParsedLcmCommand {
             }
           : { kind: "help", error: parsedApply.error };
       }
+      if (rest[0]?.toLowerCase() === "apply" && rest[1]?.toLowerCase() === "maintenance") {
+        const parsedApply = parseMaintenanceApplyArgs(rest.slice(2));
+        return parsedApply.ok
+          ? {
+              kind: "doctor_maintenance",
+              apply: true,
+              conversationId: parsedApply.conversationId,
+              confirmed: parsedApply.confirmed,
+            }
+          : { kind: "help", error: parsedApply.error };
+      }
       if (rest[0]?.toLowerCase() === "apply") {
         const parsedApply = parseDoctorApplyArgs(rest.slice(1));
         return parsedApply.ok
@@ -669,7 +716,7 @@ function parseLcmCommand(rawArgs: string | undefined): ParsedLcmCommand {
       return {
         kind: "help",
         error:
-          `\`${VISIBLE_COMMAND} doctor\` accepts no arguments, \`rollover-splits\` for global rollover diagnostics, \`apply rollover-splits [confirm]\` for backup-first split repair, \`clean\` for global high-confidence junk diagnostics, \`clean apply [filter-id] [vacuum]\` for cleanup, \`apply [confirm-offline]\` for current-conversation repair, or \`apply <conversation-id> confirm-offline\` for targeted repair.`,
+          `\`${VISIBLE_COMMAND} doctor\` accepts no arguments, \`maintenance\` for compaction-debt diagnostics, \`apply maintenance <conversation-id> confirm-inactive\` for audited inactive-debt closure, \`rollover-splits\` for global rollover diagnostics, \`apply rollover-splits [confirm]\` for backup-first split repair, \`clean\` for global high-confidence junk diagnostics, \`clean apply [filter-id] [vacuum]\` for cleanup, \`apply [confirm-offline]\` for current-conversation repair, or \`apply <conversation-id> confirm-offline\` for targeted repair.`,
       };
     case "help":
       return { kind: "help" };
@@ -1331,6 +1378,16 @@ function buildHelpText(error?: string): string {
       ),
       buildStatLine(formatCommand(`${VISIBLE_COMMAND} doctor`), "Scan for broken or truncated summaries."),
       buildStatLine(
+        formatCommand(`${VISIBLE_COMMAND} doctor maintenance`),
+        "Report active actionable and inactive historical compaction debt without writing.",
+      ),
+      buildStatLine(
+        formatCommand(
+          `${VISIBLE_COMMAND} doctor apply maintenance <conversation-id> confirm-inactive`,
+        ),
+        "Administratively close eligible inactive debt after creating a DB backup; recall data is preserved.",
+      ),
+      buildStatLine(
         formatCommand(`${VISIBLE_COMMAND} doctor rollover-splits`),
         "Report whole-DB fresh-transcript rollover split memory.",
       ),
@@ -1607,6 +1664,134 @@ async function buildDoctorText(params: {
     );
   }
 
+  return lines.join("\n");
+}
+
+function buildMaintenanceDoctorText(db: DatabaseSync): string {
+  const scan = scanCompactionMaintenanceDebt(db);
+  const lines = [
+    ...buildHeaderLines(),
+    "",
+    "🩺 Lossless Claw Maintenance Doctor",
+    "",
+    buildSection("📊 Pending compaction debt", [
+      buildStatLine("active actionable debt", formatNumber(scan.activeCount)),
+      buildStatLine("inactive historical debt", formatNumber(scan.inactiveCount)),
+      buildStatLine("mode", "read-only scan; no maintenance state changed"),
+    ]),
+  ];
+
+  if (scan.reasonCounts.length > 0) {
+    lines.push(
+      "",
+      buildSection(
+        "🧭 By state and reason",
+        scan.reasonCounts.map(
+          (entry) =>
+            `${entry.active ? "active" : "inactive"} / ${entry.reason}: ${formatNumber(entry.count)}`,
+        ),
+      ),
+    );
+  }
+
+  if (scan.inactiveExamples.length > 0) {
+    const examples = scan.inactiveExamples.map((example) => {
+      const sessionKey = example.sessionKey
+        ? formatCommand(truncateMiddle(example.sessionKey, 44))
+        : "missing";
+      const requestedAt = example.requestedAt?.toISOString() ?? "unknown";
+      return `conversation ${formatNumber(example.conversationId)} · ${example.reason} · requested ${requestedAt} · session key ${sessionKey}`;
+    });
+    if (scan.inactiveExamplesOmitted > 0) {
+      examples.push(`... ${formatNumber(scan.inactiveExamplesOmitted)} more inactive row(s)`);
+    }
+    lines.push("", buildSection("🧷 Inactive examples", examples));
+  }
+
+  if (scan.inactiveCount > 0) {
+    lines.push(
+      "",
+      buildSection("🛠️ Administrative close", [
+        `${formatCommand(`${VISIBLE_COMMAND} doctor apply maintenance <conversation-id> confirm-inactive`)} closes one eligible inactive debt row after creating a database backup.`,
+        "This records an operator-ignored resolution; it does not claim compaction completed and does not compact or delete recall data.",
+      ]),
+    );
+  }
+
+  return lines.join("\n");
+}
+
+function describeMaintenanceCloseRefusal(
+  result: Extract<InactiveMaintenanceCloseResult, { kind: "refused" }>,
+): string {
+  switch (result.reason) {
+    case "missing-confirmation":
+      return "The close requires exact `confirm-inactive`; no backup or write ran.";
+    case "active-conversation":
+      return "Refused because the conversation is active; active debt remains actionable.";
+    case "running":
+      return "Refused because maintenance is running; no maintenance state changed.";
+    case "conversation-not-found":
+      return "Refused because the conversation was not found; no maintenance state changed.";
+    case "already-resolved":
+      return "The maintenance debt is already resolved; no work performed and no backup created.";
+    case "not-pending":
+      return "Refused because the conversation has no pending maintenance debt; no work performed.";
+    case "backup-unavailable":
+      return "Refused because a successful backup requires a file-backed SQLite database.";
+    case "backup-failed":
+      return `Refused because the database backup failed: ${result.error ?? "unknown error"}`;
+    case "state-changed":
+      return "Refused because maintenance or conversation state changed before the guarded close; no maintenance row was changed.";
+    case "close-failed":
+      return `Refused because the guarded maintenance close failed: ${result.error ?? "unknown error"}`;
+  }
+}
+
+async function buildMaintenanceDoctorApplyText(params: {
+  db: DatabaseSync;
+  config: LcmConfig;
+  conversationId: number;
+  confirmed: boolean;
+}): Promise<string> {
+  const result = await closeInactiveCompactionMaintenanceDebt({
+    db: params.db,
+    databasePath: params.config.databasePath,
+    conversationId: params.conversationId,
+    confirmed: params.confirmed,
+  });
+  const lines = [
+    ...buildHeaderLines(),
+    "",
+    "🩺 Lossless Claw Maintenance Close",
+    "",
+  ];
+
+  if (result.kind === "refused") {
+    lines.push(
+      buildSection("⛔ Result", [
+        buildStatLine("status", "read-only refusal"),
+        buildStatLine("conversation", formatNumber(params.conversationId)),
+        buildStatLine("reason", describeMaintenanceCloseRefusal(result)),
+        ...(result.backupPath ? [buildStatLine("backup path", result.backupPath)] : []),
+      ]),
+    );
+    return lines.join("\n");
+  }
+
+  lines.push(
+    buildSection("✅ Result", [
+      buildStatLine("status", "administratively closed"),
+      buildStatLine("conversation", formatNumber(result.conversationId)),
+      buildStatLine("resolution", "operator-ignored"),
+      buildStatLine("resolved at", result.resolvedAt.toISOString()),
+      buildStatLine("backup path", result.backupPath),
+      buildStatLine(
+        "recall data",
+        "preserved; this did not compact or delete recall data",
+      ),
+    ]),
+  );
   return lines.join("\n");
 }
 
@@ -3395,6 +3580,17 @@ export function createLcmCommand(params: {
                   activeSourcePath: params.activeSourcePath,
                 }),
               };
+        case "doctor_maintenance":
+          return parsed.apply
+            ? {
+                text: await buildMaintenanceDoctorApplyText({
+                  db: await getDb(),
+                  config: params.config,
+                  conversationId: parsed.conversationId,
+                  confirmed: parsed.confirmed,
+                }),
+              }
+            : { text: buildMaintenanceDoctorText(await getDb()) };
         case "doctor_rollover_splits":
           return parsed.apply
             ? {

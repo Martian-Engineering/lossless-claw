@@ -21,6 +21,8 @@ export type ConversationCompactionMaintenanceRecord = {
   contextLeafChunkTokens: number | null;
   retryAttempts: number;
   nextAttemptAfter: Date | null;
+  resolutionReason: "operator-ignored" | null;
+  resolvedAt: Date | null;
   updatedAt: Date;
 };
 
@@ -43,6 +45,8 @@ type ConversationCompactionMaintenanceRow = {
   context_leaf_chunk_tokens: number | null;
   retry_attempts: number;
   next_attempt_after: string | null;
+  resolution_reason: string | null;
+  resolved_at: string | null;
   updated_at: string;
 };
 
@@ -105,6 +109,8 @@ function toMaintenanceRecord(
         ? Math.max(0, Math.floor(row.retry_attempts))
         : 0,
     nextAttemptAfter: parseUtcTimestampOrNull(row.next_attempt_after),
+    resolutionReason: row.resolution_reason === "operator-ignored" ? row.resolution_reason : null,
+    resolvedAt: parseUtcTimestampOrNull(row.resolved_at),
     updatedAt: parseUtcTimestampOrNull(row.updated_at) ?? new Date(0),
   };
 }
@@ -163,6 +169,11 @@ function mergeMaintenanceRecord(
       patch.nextAttemptAfter !== undefined
         ? patch.nextAttemptAfter
         : existing?.nextAttemptAfter ?? null,
+    resolutionReason:
+      patch.resolutionReason !== undefined
+        ? patch.resolutionReason
+        : existing?.resolutionReason ?? null,
+    resolvedAt: patch.resolvedAt !== undefined ? patch.resolvedAt : existing?.resolvedAt ?? null,
     updatedAt: new Date(),
   };
 }
@@ -207,6 +218,8 @@ export class CompactionMaintenanceStore {
            context_leaf_chunk_tokens,
            retry_attempts,
            next_attempt_after,
+           resolution_reason,
+           resolved_at,
            updated_at
          FROM conversation_compaction_maintenance
          WHERE conversation_id = ?`,
@@ -239,8 +252,10 @@ export class CompactionMaintenanceStore {
            context_leaf_chunk_tokens,
            retry_attempts,
            next_attempt_after,
+           resolution_reason,
+           resolved_at,
            updated_at
-         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'))
+         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'))
          ON CONFLICT(conversation_id) DO UPDATE SET
            pending = excluded.pending,
            requested_at = excluded.requested_at,
@@ -259,6 +274,8 @@ export class CompactionMaintenanceStore {
            context_leaf_chunk_tokens = excluded.context_leaf_chunk_tokens,
            retry_attempts = excluded.retry_attempts,
            next_attempt_after = excluded.next_attempt_after,
+           resolution_reason = excluded.resolution_reason,
+           resolved_at = excluded.resolved_at,
            updated_at = datetime('now')`,
       )
       .run(
@@ -280,6 +297,8 @@ export class CompactionMaintenanceStore {
         record.contextLeafChunkTokens ?? null,
         record.retryAttempts,
         record.nextAttemptAfter?.toISOString() ?? null,
+        record.resolutionReason,
+        record.resolvedAt?.toISOString() ?? null,
       );
   }
 
@@ -316,8 +335,37 @@ export class CompactionMaintenanceStore {
         contextThresholdSource: input.contextThresholdSource ?? null,
         contextFreshTailCount: input.contextFreshTailCount ?? null,
         contextLeafChunkTokens: input.contextLeafChunkTokens ?? null,
+        resolutionReason: null,
+        resolvedAt: null,
       }),
     );
+  }
+
+  /** Administratively close pending debt only when its conversation is inactive. */
+  async closeInactiveCompactionDebt(input: {
+    conversationId: number;
+    resolvedAt?: Date;
+  }): Promise<boolean> {
+    const result = this.db
+      .prepare(
+        `UPDATE conversation_compaction_maintenance
+         SET pending = 0,
+             running = 0,
+             resolution_reason = 'operator-ignored',
+             resolved_at = ?,
+             updated_at = datetime('now')
+         WHERE conversation_id = ?
+           AND pending = 1
+           AND running = 0
+           AND EXISTS (
+             SELECT 1
+             FROM conversations
+             WHERE conversations.conversation_id = conversation_compaction_maintenance.conversation_id
+               AND conversations.active = 0
+           )`,
+      )
+      .run((input.resolvedAt ?? new Date()).toISOString(), input.conversationId);
+    return Number(result.changes) === 1;
   }
 
   /** Mark deferred proactive compaction as actively running. */

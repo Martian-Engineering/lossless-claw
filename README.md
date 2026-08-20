@@ -54,6 +54,8 @@ The native OpenClaw command surface provides in-session operations:
 - `/lossless backup` creates a timestamped backup of the current LCM SQLite database
 - `/lossless rotate` rewrites the active session transcript into a compact tail-preserving form without changing the live OpenClaw session identity or current LCM conversation
 - `/lossless doctor` scans for broken or truncated summaries
+- `/lossless doctor maintenance` reports active actionable compaction debt separately from inactive historical debt, grouped by reason, without writing
+- `/lossless doctor apply maintenance <conversation-id> confirm-inactive` administratively closes one eligible inactive debt row after creating a SQLite backup
 - `/lossless doctor apply` repairs broken summaries in the current conversation after the normal safety preflight
 - `/lossless doctor apply <conversation-id> confirm-offline` repairs a specific conversation after its active channel path has been paused or moved away; targeted repair is restricted to authorized OpenClaw command senders and always requires the explicit offline confirmation
 - `/lossless doctor clean` shows read-only high-confidence junk diagnostics for archived subagents and cron sessions under every configured OpenClaw agent id, plus NULL-key orphaned subagent runs
@@ -66,6 +68,8 @@ Supported native command examples:
 - `/lossless backup`
 - `/lossless rotate`
 - `/lossless doctor`
+- `/lossless doctor maintenance`
+- `/lossless doctor apply maintenance 42 confirm-inactive`
 - `/lossless doctor apply 42 confirm-offline`
 - `/lossless doctor clean`
 - `/lcm`
@@ -78,6 +82,8 @@ The package does not register these OpenClaw root subcommands:
 - `openclaw /lcm`
 
 The bundled skill focuses on configuration, diagnostics, architecture, and recall-tool usage. Its reference set lives under `skills/lossless-claw/references/`.
+
+Deferred compaction debt on an active conversation is actionable maintenance pressure. Debt on an archived or otherwise inactive conversation is historical: normal stable-session maintenance cannot select that conversation, so `/lossless doctor maintenance` reports it separately and shows a bounded set of recent examples. Closing historical debt requires the exact `confirm-inactive` token and a successful file-backed SQLite backup. The close records an `operator-ignored` resolution on the maintenance row only; it does not run compaction and does not delete or rewrite conversations, messages, summaries, or context items. If that conversation later receives a genuine new debt request, the prior administrative resolution is cleared and the row becomes pending again.
 
 ### Programmatic control
 

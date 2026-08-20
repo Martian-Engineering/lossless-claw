@@ -218,6 +218,10 @@ function ensureCompactionMaintenanceColumns(db: DatabaseSync): void {
   const hasContextLeafChunkTokens = maintenanceColumns.some(
     (col) => col.name === "context_leaf_chunk_tokens",
   );
+  const hasResolutionReason = maintenanceColumns.some(
+    (col) => col.name === "resolution_reason",
+  );
+  const hasResolvedAt = maintenanceColumns.some((col) => col.name === "resolved_at");
 
   if (!hasProjectedTokenCount) {
     db.exec(`ALTER TABLE conversation_compaction_maintenance ADD COLUMN projected_token_count INTEGER`);
@@ -244,6 +248,12 @@ function ensureCompactionMaintenanceColumns(db: DatabaseSync): void {
   }
   if (!hasContextLeafChunkTokens) {
     db.exec(`ALTER TABLE conversation_compaction_maintenance ADD COLUMN context_leaf_chunk_tokens INTEGER`);
+  }
+  if (!hasResolutionReason) {
+    db.exec(`ALTER TABLE conversation_compaction_maintenance ADD COLUMN resolution_reason TEXT`);
+  }
+  if (!hasResolvedAt) {
+    db.exec(`ALTER TABLE conversation_compaction_maintenance ADD COLUMN resolved_at TEXT`);
   }
 }
 
@@ -1316,6 +1326,8 @@ export function runLcmMigrations(
       context_leaf_chunk_tokens INTEGER,
       retry_attempts INTEGER NOT NULL DEFAULT 0,
       next_attempt_after TEXT,
+      resolution_reason TEXT,
+      resolved_at TEXT,
       updated_at TEXT NOT NULL DEFAULT (datetime('now'))
     );
 
