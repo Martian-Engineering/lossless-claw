@@ -79,6 +79,18 @@ Use this only after `/lossless doctor` identifies broken summaries. The command 
 
 Conversation ids are gateway-wide maintenance identifiers rather than sender ownership credentials. Only authorized OpenClaw command senders can invoke the command; before targeting an id, pause or move active delivery away from that conversation and verify the displayed session key is the intended lane.
 
+### `/lossless doctor maintenance`
+
+Use this read-only scan to separate active actionable compaction debt from inactive historical debt. It groups pending rows by active state and reason and shows only a bounded set of recent inactive examples. The scan does not run maintenance or change database state.
+
+Normal stable-session maintenance selects active conversations, so pending debt attached to an archived conversation can remain historical even though its recall data is still valuable. To close one eligible row, run:
+
+`/lossless doctor apply maintenance <conversation-id> confirm-inactive`
+
+The target must be inactive, pending, and not running. The confirmation token must be exactly `confirm-inactive`, and Lossless Claw must successfully create a backup of a file-backed SQLite database before changing the maintenance row. Active, running, missing, already-resolved, non-pending, and in-memory targets are read-only refusals; repeating a successful close performs no work and creates no additional backup.
+
+This is an administrative `operator-ignored` resolution, not successful compaction. It changes only the compaction-maintenance row and does not delete or rewrite conversations, messages, summaries, or context items. A later genuine debt request clears the resolution metadata and makes the row actionable again.
+
 ### `/lossless doctor clean`
 
 Use this when the user wants read-only diagnostics for high-confidence junk patterns before any cleanup.

@@ -225,4 +225,152 @@ describe("CompactionMaintenanceStore", () => {
     expect(record?.retryAttempts).toBe(0);
     expect(record?.nextAttemptAfter).toBeNull();
   });
+
+  it("closes only inactive pending debt and clears the resolution when fresh debt is requested", async () => {
+    const db = createTestDb();
+    const { fts5Available } = getLcmDbFeatures(db);
+    const conversationStore = new ConversationStore(db, { fts5Available });
+    const inactive = await conversationStore.createConversation({
+      sessionId: "maintenance-store-inactive-session",
+      sessionKey: "agent:main:maintenance-store:inactive",
+    });
+    const active = await conversationStore.createConversation({
+      sessionId: "maintenance-store-active-session",
+      sessionKey: "agent:main:maintenance-store:active",
+    });
+    const store = new CompactionMaintenanceStore(db);
+    const resolvedAt = new Date("2026-08-20T12:00:00.000Z");
+
+    await store.requestProactiveCompactionDebt({
+      conversationId: inactive.conversationId,
+      reason: "threshold",
+    });
+    await store.requestProactiveCompactionDebt({
+      conversationId: active.conversationId,
+      reason: "budget-trigger",
+    });
+    await conversationStore.archiveConversation(inactive.conversationId, "rollover-fallback");
+    const activeMaintenance = await store.getConversationCompactionMaintenance(active.conversationId);
+    const inactiveMaintenance = await store.getConversationCompactionMaintenance(inactive.conversationId);
+
+    await expect(
+      store.closeInactiveCompactionDebt({
+        conversationId: active.conversationId,
+        expectedRevision: activeMaintenance!.maintenanceRevision,
+        resolvedAt,
+      }),
+    ).resolves.toBe(false);
+    await expect(
+      store.closeInactiveCompactionDebt({
+        conversationId: inactive.conversationId,
+        expectedRevision: inactiveMaintenance!.maintenanceRevision,
+        resolvedAt,
+      }),
+    ).resolves.toBe(true);
+
+    expect(await store.getConversationCompactionMaintenance(inactive.conversationId)).toMatchObject({
+      pending: false,
+      running: false,
+      reason: "threshold",
+      resolutionReason: "operator-ignored",
+      resolvedAt,
+    });
+
+    await expect(
+      store.closeInactiveCompactionDebt({
+        conversationId: inactive.conversationId,
+        expectedRevision: inactiveMaintenance!.maintenanceRevision,
+        resolvedAt: new Date("2026-08-20T13:00:00.000Z"),
+      }),
+    ).resolves.toBe(false);
+
+    await store.requestProactiveCompactionDebt({
+      conversationId: inactive.conversationId,
+      reason: "fresh-threshold",
+    });
+    expect(await store.getConversationCompactionMaintenance(inactive.conversationId)).toMatchObject({
+      pending: true,
+      running: false,
+      reason: "fresh-threshold",
+      resolutionReason: null,
+      resolvedAt: null,
+    });
+  });
+
+  it("refuses a stale close after debt is refreshed with the same timestamp and reason", async () => {
+    const db = createTestDb();
+    const { fts5Available } = getLcmDbFeatures(db);
+    const conversationStore = new ConversationStore(db, { fts5Available });
+    const conversation = await conversationStore.createConversation({
+      sessionId: "maintenance-store-refreshed-session",
+      sessionKey: "agent:main:maintenance-store:refreshed",
+    });
+    const store = new CompactionMaintenanceStore(db);
+    const requestedAt = new Date("2026-08-20T12:00:00.000Z");
+
+    await store.requestProactiveCompactionDebt({
+      conversationId: conversation.conversationId,
+      reason: "threshold",
+      requestedAt,
+    });
+    await conversationStore.archiveConversation(conversation.conversationId, "rollover-fallback");
+    const staleRevision = (
+      await store.getConversationCompactionMaintenance(conversation.conversationId)
+    )!.maintenanceRevision;
+
+    await store.requestProactiveCompactionDebt({
+      conversationId: conversation.conversationId,
+      reason: "threshold",
+      requestedAt,
+    });
+
+    await expect(
+      store.closeInactiveCompactionDebt({
+        conversationId: conversation.conversationId,
+        expectedRevision: staleRevision,
+      }),
+    ).resolves.toBe(false);
+    expect(await store.getConversationCompactionMaintenance(conversation.conversationId)).toMatchObject({
+      pending: true,
+      running: false,
+      reason: "threshold",
+      resolutionReason: null,
+      resolvedAt: null,
+      maintenanceRevision: staleRevision + 1,
+    });
+  });
+
+  it("refuses to close a running inactive maintenance row", async () => {
+    const db = createTestDb();
+    const { fts5Available } = getLcmDbFeatures(db);
+    const conversationStore = new ConversationStore(db, { fts5Available });
+    const conversation = await conversationStore.createConversation({
+      sessionId: "maintenance-store-running-session",
+      sessionKey: "agent:main:maintenance-store:running",
+    });
+    const store = new CompactionMaintenanceStore(db);
+
+    await store.requestProactiveCompactionDebt({
+      conversationId: conversation.conversationId,
+      reason: "threshold",
+    });
+    await conversationStore.archiveConversation(conversation.conversationId, "rollover-fallback");
+    db.prepare(
+      `UPDATE conversation_compaction_maintenance SET running = 1 WHERE conversation_id = ?`,
+    ).run(conversation.conversationId);
+    const maintenance = await store.getConversationCompactionMaintenance(conversation.conversationId);
+
+    await expect(
+      store.closeInactiveCompactionDebt({
+        conversationId: conversation.conversationId,
+        expectedRevision: maintenance!.maintenanceRevision,
+      }),
+    ).resolves.toBe(false);
+    expect(await store.getConversationCompactionMaintenance(conversation.conversationId)).toMatchObject({
+      pending: true,
+      running: true,
+      resolutionReason: null,
+      resolvedAt: null,
+    });
+  });
 });

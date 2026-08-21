@@ -1,4 +1,4 @@
-import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
@@ -11,6 +11,7 @@ import { resolveLcmConfig } from "../src/db/config.js";
 import { ConversationStore } from "../src/store/conversation-store.js";
 import { FocusBriefStore } from "../src/store/focus-brief-store.js";
 import { SummaryStore } from "../src/store/summary-store.js";
+import { CompactionMaintenanceStore } from "../src/store/compaction-maintenance-store.js";
 import {
   LcmProgrammaticControlUnavailableError,
   createLcmCommand,
@@ -232,8 +233,11 @@ function insertRolloverStateRows(fixture: CommandFixture, sourceId: number, targ
       `INSERT INTO conversation_compaction_maintenance (
          conversation_id,
          pending,
-         reason
-       ) VALUES (?, 0, 'target-maintenance')`,
+         reason,
+         resolution_reason,
+         resolved_at,
+         maintenance_revision
+       ) VALUES (?, 0, 'target-maintenance', 'operator-ignored', '2026-06-17T00:00:00.000Z', 7)`,
     )
     .run(targetId);
 }
@@ -1983,15 +1987,25 @@ describe("lcm command", () => {
 
     const maintenance = fixture.db
       .prepare(
-        `SELECT pending, reason, running
+        `SELECT pending, reason, running, resolution_reason, resolved_at, maintenance_revision
          FROM conversation_compaction_maintenance
          WHERE conversation_id = ?`,
       )
-      .get(active.conversationId) as { pending: number; reason: string; running: number };
+      .get(active.conversationId) as {
+      pending: number;
+      reason: string;
+      running: number;
+      resolution_reason: string | null;
+      resolved_at: string | null;
+      maintenance_revision: number;
+    };
     expect(maintenance).toEqual({
       pending: 1,
       reason: "doctor-rollover-split-repair",
       running: 0,
+      resolution_reason: null,
+      resolved_at: null,
+      maintenance_revision: 8,
     });
 
     const ftsRows = fixture.db
@@ -3612,6 +3626,279 @@ describe("lcm command", () => {
     expect(repaired?.content).not.toContain("[Truncated from 111 tokens]");
   });
 
+  it("reports active and inactive maintenance debt by reason without writing", async () => {
+    const fixture = createCommandFixture();
+    tempDirs.add(fixture.tempDir);
+    dbPaths.add(fixture.dbPath);
+    const maintenanceStore = new CompactionMaintenanceStore(fixture.db);
+    const active = await fixture.conversationStore.createConversation({
+      sessionId: "doctor-maintenance-active",
+      sessionKey: "agent:main:doctor-maintenance:active",
+    });
+    const inactiveThreshold = await fixture.conversationStore.createConversation({
+      sessionId: "doctor-maintenance-inactive-threshold",
+      sessionKey: "agent:main:doctor-maintenance:inactive-threshold",
+    });
+    const inactiveBudget = await fixture.conversationStore.createConversation({
+      sessionId: "doctor-maintenance-inactive-budget",
+      sessionKey: "agent:main:doctor-maintenance:inactive-budget",
+    });
+
+    await maintenanceStore.requestProactiveCompactionDebt({
+      conversationId: active.conversationId,
+      reason: "threshold",
+    });
+    await maintenanceStore.requestProactiveCompactionDebt({
+      conversationId: inactiveThreshold.conversationId,
+      reason: "threshold",
+    });
+    await maintenanceStore.requestProactiveCompactionDebt({
+      conversationId: inactiveBudget.conversationId,
+      reason: "budget-trigger",
+    });
+    await fixture.conversationStore.archiveConversation(
+      inactiveThreshold.conversationId,
+      "rollover-fallback",
+    );
+    await fixture.conversationStore.archiveConversation(
+      inactiveBudget.conversationId,
+      "rollover-fallback",
+    );
+    for (let index = 0; index < 4; index += 1) {
+      const extra = await fixture.conversationStore.createConversation({
+        sessionId: `doctor-maintenance-inactive-extra-${index}`,
+        sessionKey: `agent:main:doctor-maintenance:inactive-extra-${index}`,
+      });
+      await maintenanceStore.requestProactiveCompactionDebt({
+        conversationId: extra.conversationId,
+        reason: "threshold",
+      });
+      await fixture.conversationStore.archiveConversation(extra.conversationId, "rollover-fallback");
+    }
+    const before = fixture.db
+      .prepare(`SELECT * FROM conversation_compaction_maintenance ORDER BY conversation_id`)
+      .all();
+
+    const result = await fixture.command.handler(createCommandContext("doctor maintenance"));
+
+    expect(result.text).toContain("active actionable debt: 1");
+    expect(result.text).toContain("inactive historical debt: 6");
+    expect(result.text).toContain("active / threshold: 1");
+    expect(result.text).toContain("inactive / threshold: 5");
+    expect(result.text).toContain("inactive / budget-trigger: 1");
+    expect(result.text.match(/conversation \d+/g)).toHaveLength(5);
+    expect(result.text).toContain("... 1 more inactive row(s)");
+    expect(result.text).toContain("read-only scan; no maintenance state changed");
+    expect(
+      fixture.db.prepare(`SELECT * FROM conversation_compaction_maintenance ORDER BY conversation_id`).all(),
+    ).toEqual(before);
+  });
+
+  it("closes inactive maintenance debt after exact confirmation and a backup without changing recall data", async () => {
+    const fixture = createCommandFixture();
+    tempDirs.add(fixture.tempDir);
+    dbPaths.add(fixture.dbPath);
+    const maintenanceStore = new CompactionMaintenanceStore(fixture.db);
+    const conversation = await fixture.conversationStore.createConversation({
+      sessionId: "doctor-maintenance-apply",
+      sessionKey: "agent:main:doctor-maintenance:apply",
+    });
+    const message = await fixture.conversationStore.createMessage({
+      conversationId: conversation.conversationId,
+      seq: 0,
+      role: "user",
+      content: "valuable archived recall",
+      tokenCount: 4,
+    });
+    await fixture.summaryStore.insertSummary({
+      summaryId: "sum_doctor_maintenance_apply",
+      conversationId: conversation.conversationId,
+      kind: "leaf",
+      content: "valuable summary",
+      tokenCount: 2,
+      sourceMessageTokenCount: 4,
+    });
+    await fixture.summaryStore.linkSummaryToMessages("sum_doctor_maintenance_apply", [message.messageId]);
+    await fixture.summaryStore.appendContextSummary(
+      conversation.conversationId,
+      "sum_doctor_maintenance_apply",
+    );
+    await maintenanceStore.requestProactiveCompactionDebt({
+      conversationId: conversation.conversationId,
+      reason: "threshold",
+    });
+    await fixture.conversationStore.archiveConversation(conversation.conversationId, "rollover-fallback");
+    const countsBefore = fixture.db
+      .prepare(
+        `SELECT
+           (SELECT COUNT(*) FROM conversations) AS conversations,
+           (SELECT COUNT(*) FROM messages) AS messages,
+           (SELECT COUNT(*) FROM summaries) AS summaries,
+           (SELECT COUNT(*) FROM context_items) AS context_items`,
+      )
+      .get();
+
+    const missingConfirmation = await fixture.command.handler(
+      createCommandContext(`doctor apply maintenance ${conversation.conversationId}`),
+    );
+    expect(missingConfirmation.text).toContain("requires exact `confirm-inactive`");
+    expect(readdirSync(fixture.tempDir).filter((name) => name.endsWith(".bak"))).toHaveLength(0);
+
+    const applied = await fixture.command.handler(
+      createCommandContext(
+        `doctor apply maintenance ${conversation.conversationId} confirm-inactive`,
+      ),
+    );
+    const backupPath = applied.text.match(/backup path: (.+)/)?.[1]?.trim();
+    expect(applied.text).toContain("administratively closed");
+    expect(applied.text).toContain("did not compact or delete recall data");
+    expect(backupPath).toBeTruthy();
+    expect(existsSync(backupPath!)).toBe(true);
+    expect(await maintenanceStore.getConversationCompactionMaintenance(conversation.conversationId)).toMatchObject({
+      pending: false,
+      running: false,
+      reason: "threshold",
+      resolutionReason: "operator-ignored",
+    });
+    expect(
+      fixture.db
+        .prepare(
+          `SELECT
+             (SELECT COUNT(*) FROM conversations) AS conversations,
+             (SELECT COUNT(*) FROM messages) AS messages,
+             (SELECT COUNT(*) FROM summaries) AS summaries,
+             (SELECT COUNT(*) FROM context_items) AS context_items`,
+        )
+        .get(),
+    ).toEqual(countsBefore);
+
+    const repeated = await fixture.command.handler(
+      createCommandContext(
+        `doctor apply maintenance ${conversation.conversationId} confirm-inactive`,
+      ),
+    );
+    expect(repeated.text).toContain("already resolved; no work performed");
+    expect(readdirSync(fixture.tempDir).filter((name) => name.endsWith(".bak"))).toHaveLength(1);
+  });
+
+  it("refuses active, running, unknown, and in-memory maintenance close targets without writes", async () => {
+    const fixture = createCommandFixture();
+    tempDirs.add(fixture.tempDir);
+    dbPaths.add(fixture.dbPath);
+    const maintenanceStore = new CompactionMaintenanceStore(fixture.db);
+    const active = await fixture.conversationStore.createConversation({
+      sessionId: "doctor-maintenance-refuse-active",
+      sessionKey: "agent:main:doctor-maintenance:refuse-active",
+    });
+    const running = await fixture.conversationStore.createConversation({
+      sessionId: "doctor-maintenance-refuse-running",
+      sessionKey: "agent:main:doctor-maintenance:refuse-running",
+    });
+    await maintenanceStore.requestProactiveCompactionDebt({
+      conversationId: active.conversationId,
+      reason: "threshold",
+    });
+    await maintenanceStore.requestProactiveCompactionDebt({
+      conversationId: running.conversationId,
+      reason: "threshold",
+    });
+    await fixture.conversationStore.archiveConversation(running.conversationId, "rollover-fallback");
+    fixture.db.prepare(
+      `UPDATE conversation_compaction_maintenance SET running = 1 WHERE conversation_id = ?`,
+    ).run(running.conversationId);
+    const before = fixture.db
+      .prepare(`SELECT * FROM conversation_compaction_maintenance ORDER BY conversation_id`)
+      .all();
+
+    const activeResult = await fixture.command.handler(
+      createCommandContext(`doctor apply maintenance ${active.conversationId} confirm-inactive`),
+    );
+    const runningResult = await fixture.command.handler(
+      createCommandContext(`doctor apply maintenance ${running.conversationId} confirm-inactive`),
+    );
+    const unknownResult = await fixture.command.handler(
+      createCommandContext("doctor apply maintenance 999999 confirm-inactive"),
+    );
+    expect(activeResult.text).toContain("conversation is active");
+    expect(runningResult.text).toContain("maintenance is running");
+    expect(unknownResult.text).toContain("conversation was not found");
+    expect(
+      fixture.db.prepare(`SELECT * FROM conversation_compaction_maintenance ORDER BY conversation_id`).all(),
+    ).toEqual(before);
+    expect(readdirSync(fixture.tempDir).filter((name) => name.endsWith(".bak"))).toHaveLength(0);
+
+    const memoryDb = new DatabaseSync(":memory:");
+    runLcmMigrations(memoryDb);
+    const memoryConversationStore = new ConversationStore(memoryDb, {
+      fts5Available: getLcmDbFeatures(memoryDb).fts5Available,
+    });
+    const memoryConversation = await memoryConversationStore.createConversation({
+      sessionId: "doctor-maintenance-memory",
+      sessionKey: "agent:main:doctor-maintenance:memory",
+    });
+    const memoryMaintenanceStore = new CompactionMaintenanceStore(memoryDb);
+    await memoryMaintenanceStore.requestProactiveCompactionDebt({
+      conversationId: memoryConversation.conversationId,
+      reason: "threshold",
+    });
+    await memoryConversationStore.archiveConversation(
+      memoryConversation.conversationId,
+      "rollover-fallback",
+    );
+    const memoryCommand = createLcmCommand({
+      db: memoryDb,
+      config: resolveLcmConfig({}, { dbPath: ":memory:" }),
+    });
+    try {
+      const memoryResult = await memoryCommand.handler(
+        createCommandContext(
+          `doctor apply maintenance ${memoryConversation.conversationId} confirm-inactive`,
+        ),
+      );
+      expect(memoryResult.text).toContain("file-backed SQLite database");
+      expect(await memoryMaintenanceStore.getConversationCompactionMaintenance(
+        memoryConversation.conversationId,
+      )).toMatchObject({ pending: true, resolutionReason: null });
+    } finally {
+      memoryDb.close();
+    }
+  });
+
+  it("reports a guarded maintenance close failure after preserving the backup", async () => {
+    const fixture = createCommandFixture();
+    tempDirs.add(fixture.tempDir);
+    dbPaths.add(fixture.dbPath);
+    const maintenanceStore = new CompactionMaintenanceStore(fixture.db);
+    const conversation = await fixture.conversationStore.createConversation({
+      sessionId: "doctor-maintenance-close-failure",
+      sessionKey: "agent:main:doctor-maintenance:close-failure",
+    });
+    await maintenanceStore.requestProactiveCompactionDebt({
+      conversationId: conversation.conversationId,
+      reason: "threshold",
+    });
+    await fixture.conversationStore.archiveConversation(conversation.conversationId, "rollover-fallback");
+    vi.spyOn(
+      CompactionMaintenanceStore.prototype,
+      "closeInactiveCompactionDebt",
+    ).mockRejectedValueOnce(new Error("database is locked"));
+
+    const result = await fixture.command.handler(
+      createCommandContext(
+        `doctor apply maintenance ${conversation.conversationId} confirm-inactive`,
+      ),
+    );
+
+    expect(result.text).toContain("guarded maintenance close failed: database is locked");
+    const backupPath = result.text.match(/backup path: (.+)/)?.[1]?.trim();
+    expect(backupPath).toBeTruthy();
+    expect(existsSync(backupPath!)).toBe(true);
+    expect(await maintenanceStore.getConversationCompactionMaintenance(conversation.conversationId)).toMatchObject({
+      pending: true,
+      resolutionReason: null,
+    });
+  });
+
   it("creates a standalone database backup", async () => {
     const fixture = createCommandFixture();
     tempDirs.add(fixture.tempDir);
@@ -4540,6 +4827,10 @@ describe("lcm command", () => {
     expect(result.text).toContain("⚠️ Unknown subcommand `rewrite`.");
     expect(result.text).toContain("`/lossless backup`");
     expect(result.text).toContain("`/lossless rotate`");
+    expect(result.text).toContain("`/lossless doctor maintenance`");
+    expect(result.text).toContain(
+      "`/lossless doctor apply maintenance <conversation-id> confirm-inactive`",
+    );
     expect(result.text).toContain("`/lossless help`");
     expect(result.text).toContain("`/lcm` is accepted as a shorter alias.");
   });
@@ -4678,6 +4969,32 @@ describe("lcm command helpers", () => {
       kind: "doctor_rollover_splits",
       apply: true,
       applyOptions: { confirm: true },
+    });
+    expect(__testing.parseLcmCommand("doctor maintenance")).toEqual({
+      kind: "doctor_maintenance",
+      apply: false,
+    });
+    expect(__testing.parseLcmCommand("doctor apply maintenance 42 confirm-inactive")).toEqual({
+      kind: "doctor_maintenance",
+      apply: true,
+      conversationId: 42,
+      confirmed: true,
+    });
+    expect(__testing.parseLcmCommand("doctor apply maintenance 42")).toEqual({
+      kind: "doctor_maintenance",
+      apply: true,
+      conversationId: 42,
+      confirmed: false,
+    });
+    expect(__testing.parseLcmCommand("doctor apply maintenance 42 CONFIRM-INACTIVE")).toEqual({
+      kind: "help",
+      error:
+        "`/lossless doctor apply maintenance` requires a positive conversation id followed by optional exact `confirm-inactive`.",
+    });
+    expect(__testing.parseLcmCommand("doctor apply maintenance nope confirm-inactive")).toEqual({
+      kind: "help",
+      error:
+        "`/lossless doctor apply maintenance` requires a positive conversation id followed by optional exact `confirm-inactive`.",
     });
   });
 
