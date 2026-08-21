@@ -252,10 +252,11 @@ describe("runLcmMigrations summary depth backfill", () => {
     expect(columns.some((column) => column.name === "context_leaf_chunk_tokens")).toBe(true);
     expect(columns.some((column) => column.name === "resolution_reason")).toBe(true);
     expect(columns.some((column) => column.name === "resolved_at")).toBe(true);
+    expect(columns.some((column) => column.name === "maintenance_revision")).toBe(true);
 
     const row = db
       .prepare(
-        `SELECT pending, requested_at, reason, running, last_started_at, last_finished_at, last_failure_summary, token_budget, current_token_count, retry_attempts, next_attempt_after, context_threshold, context_threshold_source, context_fresh_tail_count, context_leaf_chunk_tokens, resolution_reason, resolved_at
+        `SELECT pending, requested_at, reason, running, last_started_at, last_finished_at, last_failure_summary, token_budget, current_token_count, retry_attempts, next_attempt_after, context_threshold, context_threshold_source, context_fresh_tail_count, context_leaf_chunk_tokens, resolution_reason, resolved_at, maintenance_revision
          FROM conversation_compaction_maintenance
          WHERE conversation_id = 1`,
       )
@@ -277,6 +278,7 @@ describe("runLcmMigrations summary depth backfill", () => {
       context_leaf_chunk_tokens: number | null;
       resolution_reason: string | null;
       resolved_at: string | null;
+      maintenance_revision: number;
     };
     expect(row).toEqual({
       pending: 1,
@@ -296,6 +298,7 @@ describe("runLcmMigrations summary depth backfill", () => {
       context_leaf_chunk_tokens: null,
       resolution_reason: null,
       resolved_at: null,
+      maintenance_revision: 0,
     });
     expect(
       db.prepare(`SELECT session_id, title FROM conversations WHERE conversation_id = 1`).get(),

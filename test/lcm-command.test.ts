@@ -233,8 +233,11 @@ function insertRolloverStateRows(fixture: CommandFixture, sourceId: number, targ
       `INSERT INTO conversation_compaction_maintenance (
          conversation_id,
          pending,
-         reason
-       ) VALUES (?, 0, 'target-maintenance')`,
+         reason,
+         resolution_reason,
+         resolved_at,
+         maintenance_revision
+       ) VALUES (?, 0, 'target-maintenance', 'operator-ignored', '2026-06-17T00:00:00.000Z', 7)`,
     )
     .run(targetId);
 }
@@ -1984,15 +1987,25 @@ describe("lcm command", () => {
 
     const maintenance = fixture.db
       .prepare(
-        `SELECT pending, reason, running
+        `SELECT pending, reason, running, resolution_reason, resolved_at, maintenance_revision
          FROM conversation_compaction_maintenance
          WHERE conversation_id = ?`,
       )
-      .get(active.conversationId) as { pending: number; reason: string; running: number };
+      .get(active.conversationId) as {
+      pending: number;
+      reason: string;
+      running: number;
+      resolution_reason: string | null;
+      resolved_at: string | null;
+      maintenance_revision: number;
+    };
     expect(maintenance).toEqual({
       pending: 1,
       reason: "doctor-rollover-split-repair",
       running: 0,
+      resolution_reason: null,
+      resolved_at: null,
+      maintenance_revision: 8,
     });
 
     const ftsRows = fixture.db

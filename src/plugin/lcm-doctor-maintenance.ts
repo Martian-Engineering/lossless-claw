@@ -23,6 +23,7 @@ type MaintenanceTargetRow = {
   pending: number | null;
   running: number | null;
   resolution_reason: string | null;
+  maintenance_revision: number | null;
 };
 
 export type MaintenanceDebtReasonCount = {
@@ -146,7 +147,8 @@ function loadMaintenanceTarget(
            conversations.active,
            maintenance.pending,
            maintenance.running,
-           maintenance.resolution_reason
+           maintenance.resolution_reason,
+           maintenance.maintenance_revision
          FROM conversations
          LEFT JOIN conversation_compaction_maintenance maintenance
            ON maintenance.conversation_id = conversations.conversation_id
@@ -178,9 +180,8 @@ export async function closeInactiveCompactionMaintenanceDebt(params: {
     return { kind: "refused", reason: "missing-confirmation" };
   }
 
-  const refusalReason = getTargetRefusalReason(
-    loadMaintenanceTarget(params.db, params.conversationId),
-  );
+  const target = loadMaintenanceTarget(params.db, params.conversationId);
+  const refusalReason = getTargetRefusalReason(target);
   if (refusalReason) {
     return { kind: "refused", reason: refusalReason };
   }
@@ -207,6 +208,7 @@ export async function closeInactiveCompactionMaintenanceDebt(params: {
   try {
     closed = await new CompactionMaintenanceStore(params.db).closeInactiveCompactionDebt({
       conversationId: params.conversationId,
+      expectedRevision: target?.maintenance_revision ?? 0,
       resolvedAt,
     });
   } catch (error) {

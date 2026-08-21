@@ -222,6 +222,9 @@ function ensureCompactionMaintenanceColumns(db: DatabaseSync): void {
     (col) => col.name === "resolution_reason",
   );
   const hasResolvedAt = maintenanceColumns.some((col) => col.name === "resolved_at");
+  const hasMaintenanceRevision = maintenanceColumns.some(
+    (col) => col.name === "maintenance_revision",
+  );
 
   if (!hasProjectedTokenCount) {
     db.exec(`ALTER TABLE conversation_compaction_maintenance ADD COLUMN projected_token_count INTEGER`);
@@ -254,6 +257,11 @@ function ensureCompactionMaintenanceColumns(db: DatabaseSync): void {
   }
   if (!hasResolvedAt) {
     db.exec(`ALTER TABLE conversation_compaction_maintenance ADD COLUMN resolved_at TEXT`);
+  }
+  if (!hasMaintenanceRevision) {
+    db.exec(
+      `ALTER TABLE conversation_compaction_maintenance ADD COLUMN maintenance_revision INTEGER NOT NULL DEFAULT 0`,
+    );
   }
 }
 
@@ -1328,6 +1336,7 @@ export function runLcmMigrations(
       next_attempt_after TEXT,
       resolution_reason TEXT,
       resolved_at TEXT,
+      maintenance_revision INTEGER NOT NULL DEFAULT 0,
       updated_at TEXT NOT NULL DEFAULT (datetime('now'))
     );
 

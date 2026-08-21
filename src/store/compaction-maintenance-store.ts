@@ -23,6 +23,7 @@ export type ConversationCompactionMaintenanceRecord = {
   nextAttemptAfter: Date | null;
   resolutionReason: "operator-ignored" | null;
   resolvedAt: Date | null;
+  maintenanceRevision: number;
   updatedAt: Date;
 };
 
@@ -47,6 +48,7 @@ type ConversationCompactionMaintenanceRow = {
   next_attempt_after: string | null;
   resolution_reason: string | null;
   resolved_at: string | null;
+  maintenance_revision: number;
   updated_at: string;
 };
 
@@ -111,6 +113,7 @@ function toMaintenanceRecord(
     nextAttemptAfter: parseUtcTimestampOrNull(row.next_attempt_after),
     resolutionReason: row.resolution_reason === "operator-ignored" ? row.resolution_reason : null,
     resolvedAt: parseUtcTimestampOrNull(row.resolved_at),
+    maintenanceRevision: Math.max(0, Math.floor(row.maintenance_revision)),
     updatedAt: parseUtcTimestampOrNull(row.updated_at) ?? new Date(0),
   };
 }
@@ -174,6 +177,10 @@ function mergeMaintenanceRecord(
         ? patch.resolutionReason
         : existing?.resolutionReason ?? null,
     resolvedAt: patch.resolvedAt !== undefined ? patch.resolvedAt : existing?.resolvedAt ?? null,
+    maintenanceRevision:
+      patch.maintenanceRevision !== undefined
+        ? Math.max(0, Math.floor(patch.maintenanceRevision))
+        : existing?.maintenanceRevision ?? 0,
     updatedAt: new Date(),
   };
 }
@@ -220,6 +227,7 @@ export class CompactionMaintenanceStore {
            next_attempt_after,
            resolution_reason,
            resolved_at,
+           maintenance_revision,
            updated_at
          FROM conversation_compaction_maintenance
          WHERE conversation_id = ?`,
@@ -254,8 +262,9 @@ export class CompactionMaintenanceStore {
            next_attempt_after,
            resolution_reason,
            resolved_at,
+           maintenance_revision,
            updated_at
-         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'))
+         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'))
          ON CONFLICT(conversation_id) DO UPDATE SET
            pending = excluded.pending,
            requested_at = excluded.requested_at,
@@ -276,6 +285,7 @@ export class CompactionMaintenanceStore {
            next_attempt_after = excluded.next_attempt_after,
            resolution_reason = excluded.resolution_reason,
            resolved_at = excluded.resolved_at,
+           maintenance_revision = conversation_compaction_maintenance.maintenance_revision + 1,
            updated_at = datetime('now')`,
       )
       .run(
@@ -299,6 +309,7 @@ export class CompactionMaintenanceStore {
         record.nextAttemptAfter?.toISOString() ?? null,
         record.resolutionReason,
         record.resolvedAt?.toISOString() ?? null,
+        record.maintenanceRevision,
       );
   }
 
@@ -344,6 +355,7 @@ export class CompactionMaintenanceStore {
   /** Administratively close pending debt only when its conversation is inactive. */
   async closeInactiveCompactionDebt(input: {
     conversationId: number;
+    expectedRevision: number;
     resolvedAt?: Date;
   }): Promise<boolean> {
     const result = this.db
@@ -353,8 +365,10 @@ export class CompactionMaintenanceStore {
              running = 0,
              resolution_reason = 'operator-ignored',
              resolved_at = ?,
+             maintenance_revision = maintenance_revision + 1,
              updated_at = datetime('now')
          WHERE conversation_id = ?
+           AND maintenance_revision = ?
            AND pending = 1
            AND running = 0
            AND EXISTS (
@@ -364,7 +378,11 @@ export class CompactionMaintenanceStore {
                AND conversations.active = 0
            )`,
       )
-      .run((input.resolvedAt ?? new Date()).toISOString(), input.conversationId);
+      .run(
+        (input.resolvedAt ?? new Date()).toISOString(),
+        input.conversationId,
+        input.expectedRevision,
+      );
     return Number(result.changes) === 1;
   }
 
