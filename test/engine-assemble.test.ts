@@ -270,6 +270,38 @@ describe("LcmContextEngine.assemble canonical path", () => {
     });
   });
 
+  it("marks a managed fork-bounded live suffix as a stable thread bootstrap", async () => {
+    const engine = createEngine();
+    const sessionId = "session-fork-bounded-projection";
+    const conversation = await engine
+      .getConversationStore()
+      .getOrCreateConversation(sessionId, { sessionKey: undefined });
+    await engine.getSummaryStore().upsertConversationBootstrapState({
+      conversationId: conversation.conversationId,
+      sessionFilePath: "/tmp/fork-bounded-projection.jsonl",
+      lastSeenSize: 0,
+      lastSeenMtimeMs: 0,
+      lastProcessedOffset: 0,
+      forkBounded: true,
+      forkSourceMessageCount: 1,
+    });
+
+    const result = await engine.assemble({
+      sessionId,
+      messages: [
+        makeMessage({ role: "user", content: "parent history" }),
+        makeMessage({ role: "user", content: "child turn" }),
+      ],
+      tokenBudget: 256,
+    });
+
+    expect(result.messages.map((message) => message.content)).toEqual(["child turn"]);
+    expect(result.contextProjection).toEqual({
+      mode: "thread_bootstrap",
+      epoch: expect.stringMatching(/^summary-prefix-v1:\d+:[a-f0-9]{32}$/),
+    });
+  });
+
   it("assembles context from DB when coverage exists", async () => {
     const engine = createEngine();
     const sessionId = "session-canonical";

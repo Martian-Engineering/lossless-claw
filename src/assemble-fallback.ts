@@ -170,6 +170,7 @@ export function isProtectedLeadingLiveContextMessage(message: AgentMessage): boo
   return role === "system" || role === "developer";
 }
 
+/** Build a budget-bounded live fallback that preserves the managed projection epoch. */
 export function buildDegradedLiveAssembleResult(params: {
   liveMessages: AgentMessage[];
   tokenBudget: number;
@@ -233,6 +234,7 @@ export function resolveDeferredAssemblyPressure(params: {
   };
 }
 
+/** Build a fork-local live suffix that preserves the managed projection epoch. */
 export function buildForkBoundedLiveFallback(params: {
   liveMessages: AgentMessage[];
   forkSourceMessageCount: number;

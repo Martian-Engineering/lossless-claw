@@ -33,6 +33,7 @@ export type ContextEngineProjection = {
   fingerprint?: string;
 };
 
+/** Runtime ownership metadata projected by host-aware OpenClaw versions. */
 export type ContextEngineRuntimeSettings = {
   schemaVersion: 1;
   executionHost: {
