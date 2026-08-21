@@ -110,6 +110,34 @@ describe("createLcmSummarizeFromLegacyParams", () => {
     ).resolves.toBeUndefined();
   });
 
+  it("resolves the effective OpenClaw default when no model candidate is supplied", async () => {
+    const deps = makeDeps({
+      resolveModel: vi.fn((modelRef?: string) => {
+        expect(modelRef).toBeUndefined();
+        return { provider: "openai-codex", model: "gpt-5.5" };
+      }),
+    });
+
+    const result = await createLcmSummarizeFromLegacyParams({
+      deps,
+      legacyParams: {},
+    });
+
+    expect(result?.model).toBe("gpt-5.5");
+    expect(vi.mocked(deps.resolveModel)).toHaveBeenCalledWith(undefined, undefined);
+
+    await result?.fn("default model summary source", false);
+    expect(vi.mocked(deps.complete)).toHaveBeenCalledWith(
+      expect.objectContaining({
+        provider: "openai-codex",
+        model: "gpt-5.5",
+      }),
+    );
+    expect(vi.mocked(deps.complete).mock.calls[0]?.[0]).not.toHaveProperty(
+      "runtimeModelOverride",
+    );
+  });
+
   it("plugin summaryProvider alone (no summaryModel) is ignored and falls back to legacy provider", async () => {
     const deps = makeDeps();
 
