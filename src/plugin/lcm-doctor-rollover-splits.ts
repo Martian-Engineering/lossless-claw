@@ -654,6 +654,9 @@ function clearSourceStateAndMarkTarget(db: DatabaseSync, group: SafeGroup): void
        requested_at = datetime('now'),
        reason = excluded.reason,
        running = 0,
+       resolution_reason = NULL,
+       resolved_at = NULL,
+       maintenance_revision = conversation_compaction_maintenance.maintenance_revision + 1,
        updated_at = datetime('now')`,
   ).run(group.targetConversationId, ROLLOVER_SPLIT_MAINTENANCE_REASON);
 }
