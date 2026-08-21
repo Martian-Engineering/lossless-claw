@@ -341,13 +341,20 @@ function buildLeafSourceText(params: {
        WHERE sm.summary_id = ?
        ORDER BY sm.ordinal ASC`,
     )
-    .all(params.target.summaryId) as Array<{ created_at: string; role: string | null; content: string }>;
+    .all(params.target.summaryId) as Array<{
+      created_at: string;
+      role: string | null;
+      content: string;
+    }>;
   if (rows.length === 0) {
     throw new Error("no messages linked to summary");
   }
 
   return rows
-    .map((row) => `[${formatSqliteTimestamp(row.created_at, params.timezone)} | ${row.role ?? "unknown"}]\n${row.content}`)
+    .map(
+      (row) =>
+        `[${formatSqliteTimestamp(row.created_at, params.timezone)} | ${row.role ?? "unknown"}]\n${row.content}`,
+    )
     .join("\n\n");
 }
 
