@@ -7,7 +7,11 @@ import { trimBootstrapMessagesToBudget } from "./bootstrap-budget.js";
 import { estimateSerializedMessageTokens, estimateSerializedMessagesTokens } from "./estimate-tokens.js";
 import { resolveForkBoundedLiveSuffix, stripTrailingAssistantPrefill } from "./live-coverage.js";
 import { toStoredMessage } from "./message-content.js";
-import type { AgentMessage, AssembleResult } from "./openclaw-bridge.js";
+import type {
+  AgentMessage,
+  AssembleResult,
+  ContextEngineProjection,
+} from "./openclaw-bridge.js";
 import type { ConversationCompactionMaintenanceRecord } from "./store/compaction-maintenance-store.js";
 import { estimateAgentMessageTokens, normalizeNonNegativeInteger, toRuntimeRoleForTokenEstimate } from "./token-accounting.js";
 
@@ -171,6 +175,7 @@ export function buildDegradedLiveAssembleResult(params: {
   liveMessages: AgentMessage[];
   tokenBudget: number;
   preserveSubstantiveAssistantTail?: boolean;
+  contextProjection: ContextEngineProjection;
 }): AssembleResult {
   const prefillOptions = {
     preserveSubstantiveAssistantTail: params.preserveSubstantiveAssistantTail,
@@ -200,6 +205,7 @@ export function buildDegradedLiveAssembleResult(params: {
     messages,
     estimatedTokens: estimateAgentMessageTokens(messages),
     promptAuthority: "preassembly_may_overflow",
+    contextProjection: params.contextProjection,
   };
 }
 
