@@ -7,7 +7,11 @@ import { trimBootstrapMessagesToBudget } from "./bootstrap-budget.js";
 import { estimateSerializedMessageTokens, estimateSerializedMessagesTokens } from "./estimate-tokens.js";
 import { resolveForkBoundedLiveSuffix, stripTrailingAssistantPrefill } from "./live-coverage.js";
 import { toStoredMessage } from "./message-content.js";
-import type { AgentMessage, AssembleResult } from "./openclaw-bridge.js";
+import type {
+  AgentMessage,
+  AssembleResult,
+  ContextEngineProjection,
+} from "./openclaw-bridge.js";
 import type { ConversationCompactionMaintenanceRecord } from "./store/compaction-maintenance-store.js";
 import { estimateAgentMessageTokens, normalizeNonNegativeInteger, toRuntimeRoleForTokenEstimate } from "./token-accounting.js";
 
@@ -166,10 +170,12 @@ export function isProtectedLeadingLiveContextMessage(message: AgentMessage): boo
   return role === "system" || role === "developer";
 }
 
+/** Build a budget-bounded live fallback that preserves the managed projection epoch. */
 export function buildDegradedLiveAssembleResult(params: {
   liveMessages: AgentMessage[];
   tokenBudget: number;
   preserveSubstantiveAssistantTail?: boolean;
+  contextProjection: ContextEngineProjection;
 }): AssembleResult {
   const prefillOptions = {
     preserveSubstantiveAssistantTail: params.preserveSubstantiveAssistantTail,
@@ -199,6 +205,7 @@ export function buildDegradedLiveAssembleResult(params: {
     messages,
     estimatedTokens: estimateAgentMessageTokens(messages),
     promptAuthority: "preassembly_may_overflow",
+    contextProjection: params.contextProjection,
   };
 }
 
@@ -227,12 +234,14 @@ export function resolveDeferredAssemblyPressure(params: {
   };
 }
 
+/** Build a fork-local live suffix that preserves the managed projection epoch. */
 export function buildForkBoundedLiveFallback(params: {
   liveMessages: AgentMessage[];
   forkSourceMessageCount: number;
   tokenBudget: number;
   bootstrapMaxTokens: number;
   preserveSubstantiveAssistantTail?: boolean;
+  contextProjection: ContextEngineProjection;
 }): AssembleResult {
   const suffix = resolveForkBoundedLiveSuffix({
     assembledMessages: [],
@@ -248,6 +257,7 @@ export function buildForkBoundedLiveFallback(params: {
   return {
     messages: boundedMessages,
     estimatedTokens: estimateAgentMessageTokens(boundedMessages),
+    contextProjection: params.contextProjection,
   };
 }
 

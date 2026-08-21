@@ -10,6 +10,7 @@ import type {
   ContextEngineControlResult,
   ContextEngineInfo,
   ContextEngineHostCapability,
+  ContextEngineRuntimeSettings,
   AssembleResult,
   BootstrapResult,
   CompactResult,
@@ -154,6 +155,7 @@ type CompactionExecutionParams = {
   customInstructions?: string;
   /** OpenClaw runtime param name (preferred). */
   runtimeContext?: Record<string, unknown>;
+  runtimeSettings?: ContextEngineRuntimeSettings;
   /** Back-compat param name. */
   legacyParams?: Record<string, unknown>;
   /** Force compaction even if below threshold */
@@ -171,6 +173,7 @@ type DeferredCompactionDebtDrainParams = {
   sessionKey?: string;
   tokenBudget: number;
   currentTokenCount?: number;
+  runtimeSettings?: ContextEngineRuntimeSettings;
   reason: string;
 };
 
@@ -222,6 +225,12 @@ function buildFocusProjectionKey(brief?: FocusBriefRecord | null): string | null
   hash.update("\0");
   hash.update(brief.content);
   return hash.digest("hex").slice(0, 32);
+}
+
+/** Return whether a typed execution host owns prompt framing outside Lossless storage. */
+function hostOwnsPromptFraming(runtimeSettings?: ContextEngineRuntimeSettings): boolean {
+  const executionHostId = runtimeSettings?.executionHost?.id;
+  return typeof executionHostId === "string" && executionHostId.trim().length > 0;
 }
 
 
@@ -387,7 +396,7 @@ export class LcmContextEngine implements ContextEngine {
       id: "lossless-claw",
       name: "Lossless Context Management Engine",
       version: packageJson.version,
-      acceptedHostParams: ["sessionKey", "prompt", "runtimeContext"],
+      acceptedHostParams: ["sessionKey", "prompt", "runtimeContext", "runtimeSettings"],
       ownsCompaction: migrationOk,
       turnMaintenanceMode: "background",
       hostRequirements: {
@@ -807,6 +816,7 @@ export class LcmContextEngine implements ContextEngine {
           sessionKey: params.sessionKey,
           tokenBudget: cappedTokenBudget,
           currentTokenCount: params.currentTokenCount,
+          runtimeSettings: params.runtimeSettings,
           legacyParams,
         });
         if (result) {
@@ -833,6 +843,7 @@ export class LcmContextEngine implements ContextEngine {
     tokenBudget: number;
     currentTokenCount?: number;
     runtimeContext?: ContextEngineMaintenanceRuntimeContext;
+    runtimeSettings?: ContextEngineRuntimeSettings;
     legacyParams?: Record<string, unknown>;
     /** When true, skip the backoff check — used by assemble emergency drain. */
     force?: boolean;
@@ -890,6 +901,9 @@ export class LcmContextEngine implements ContextEngine {
       const resolvedCurrentTokenCount = this.normalizeObservedTokenCount(
         params.currentTokenCount ?? maintenance.currentTokenCount ?? undefined,
       );
+      const compactableCurrentTokenCount = hostOwnsPromptFraming(params.runtimeSettings)
+        ? undefined
+        : resolvedCurrentTokenCount;
       const resolvedProjectedTokenCount = this.normalizeObservedTokenCount(
         maintenance.projectedTokenCount ?? undefined,
       );
@@ -948,7 +962,7 @@ export class LcmContextEngine implements ContextEngine {
         const thresholdDecision = await this.compaction.evaluate(
           params.conversationId,
           resolvedTokenBudget,
-          resolvedCurrentTokenCount,
+          compactableCurrentTokenCount,
           {
             contextThreshold: resolvedContextThreshold.contextThreshold,
             ...(resolvedContextThreshold.freshTailCount !== undefined
@@ -998,6 +1012,7 @@ export class LcmContextEngine implements ContextEngine {
         compactionTarget: "threshold",
         contextThresholdOverride: resolvedContextThreshold,
         runtimeContext: params.runtimeContext,
+        runtimeSettings: params.runtimeSettings,
         legacyParams: params.legacyParams,
         force: params.force,
       });
@@ -1070,6 +1085,7 @@ export class LcmContextEngine implements ContextEngine {
     sessionKey?: string;
     tokenBudget: number;
     currentTokenCount?: number;
+    runtimeSettings?: ContextEngineRuntimeSettings;
   }): Promise<{ exhausted: boolean }> {
     const sessionLabel = formatSessionLabel(params.sessionId, params.sessionKey);
     let drainResult = { exhausted: false };
@@ -1108,6 +1124,7 @@ export class LcmContextEngine implements ContextEngine {
           tokenBudget: cappedTokenBudget,
           currentTokenCount: normalizedCurrentTokenCount,
           legacyParams: deferredLegacyParams,
+          runtimeSettings: params.runtimeSettings,
           force: forceAllowed,
         });
         drainResult = { exhausted: result?.exhausted === true };
@@ -1208,6 +1225,13 @@ export class LcmContextEngine implements ContextEngine {
           }
         ).currentTokenCount,
     );
+    // A host-aware OpenClaw runtime reports the full provider prompt here,
+    // including system instructions, tool schemas, and (for Codex) native
+    // thread history. Lossless cannot compact any of that framing. Keep the
+    // legacy observed-token behavior only for older/generic callers that do
+    // not declare an execution host.
+    const promptFramingOwnedByHost = hostOwnsPromptFraming(params.runtimeSettings);
+    const compactableObservedTokens = promptFramingOwnedByHost ? undefined : observedTokens;
     // The resolved threshold is passed unconditionally: when no override rule
     // matches, the resolved value equals the global config.contextThreshold,
     // so the call is behavior-identical to omitting it.
@@ -1217,12 +1241,17 @@ export class LcmContextEngine implements ContextEngine {
         sessionKey: params.sessionKey,
         runtime: readRuntimeModelContext(asRecord(params.runtimeContext), asRecord(params.legacyParams)),
       });
-    const decision = await this.compaction.evaluate(conversationId, tokenBudget, observedTokens, {
+    const decision = await this.compaction.evaluate(
+      conversationId,
+      tokenBudget,
+      compactableObservedTokens,
+      {
       contextThreshold: resolvedContextThreshold.contextThreshold,
       ...(resolvedContextThreshold.freshTailCount !== undefined
         ? { freshTailCount: resolvedContextThreshold.freshTailCount }
         : {}),
-    });
+      },
+    );
     const targetTokens =
       params.compactionTarget === "threshold" ? decision.threshold : tokenBudget;
     // Codex can report a live prompt count that includes runtime framing,
@@ -1248,13 +1277,13 @@ export class LcmContextEngine implements ContextEngine {
         ? Math.floor(decision.rawTokensOutsideTail)
         : undefined;
     const observedRuntimeOverhead =
-      params.compactionTarget === "threshold" && observedTokens !== undefined
-        ? Math.max(0, observedTokens - decisionStoredTokens)
+      params.compactionTarget === "threshold" && compactableObservedTokens !== undefined
+        ? Math.max(0, compactableObservedTokens - decisionStoredTokens)
         : 0;
     const runtimeAdjustedSweepTargetTokens =
       observedRuntimeOverhead > 0 &&
-      observedTokens !== undefined &&
-      observedTokens > targetTokens
+      compactableObservedTokens !== undefined &&
+      compactableObservedTokens > targetTokens
         ? Math.max(1, targetTokens - observedRuntimeOverhead)
         : undefined;
     const projectedRawBacklogPressure =
@@ -1266,10 +1295,10 @@ export class LcmContextEngine implements ContextEngine {
       params.compactionTarget === "threshold"
         ? Math.max(
             decision.currentTokens,
-            observedTokens ?? 0,
+            compactableObservedTokens ?? 0,
             decisionProjectedTokens ?? 0,
           )
-        : observedTokens;
+        : compactableObservedTokens;
     const liveContextStillExceedsTarget =
       thresholdPressureTokens !== undefined && thresholdPressureTokens >= targetTokens;
 
@@ -1284,7 +1313,7 @@ export class LcmContextEngine implements ContextEngine {
     });
 
     this.deps.log.info(
-      `[lcm] compact: decision conversation=${conversationId} ${sessionLabel} compactionTarget=${params.compactionTarget ?? "budget"} force=${forceCompaction} tokenBudget=${tokenBudget} targetTokens=${targetTokens} storedTokens=${decisionStoredTokens} currentTokens=${decision.currentTokens} observedTokens=${observedTokens ?? "none"} projectedTokens=${decisionProjectedTokens ?? "none"} rawTokensOutsideTail=${decisionRawTokensOutsideTail ?? "none"} thresholdPressureTokens=${thresholdPressureTokens ?? "none"} observedRuntimeOverhead=${observedRuntimeOverhead} shouldCompact=${decision.shouldCompact}`,
+      `[lcm] compact: decision conversation=${conversationId} ${sessionLabel} compactionTarget=${params.compactionTarget ?? "budget"} force=${forceCompaction} tokenBudget=${tokenBudget} targetTokens=${targetTokens} storedTokens=${decisionStoredTokens} currentTokens=${decision.currentTokens} observedTokens=${observedTokens ?? "none"} hostOwnsPromptFraming=${promptFramingOwnedByHost} projectedTokens=${decisionProjectedTokens ?? "none"} rawTokensOutsideTail=${decisionRawTokensOutsideTail ?? "none"} thresholdPressureTokens=${thresholdPressureTokens ?? "none"} observedRuntimeOverhead=${observedRuntimeOverhead} shouldCompact=${decision.shouldCompact}`,
     );
 
     if (!forceCompaction && !decision.shouldCompact) {
@@ -1458,7 +1487,7 @@ export class LcmContextEngine implements ContextEngine {
       // session, and never fires on budget-stopped sweeps (more sweeps can
       // still make progress there).
       const thresholdSweepTranscriptWedge =
-        thresholdSweepExhaustedOverTarget && observedTokens !== undefined;
+        thresholdSweepExhaustedOverTarget && compactableObservedTokens !== undefined;
       const sweepOk =
         !sweepResult.authFailure &&
         (isUnderTargetAfterSweep || (sweepResult.actionTaken && !isThresholdSweep));
@@ -1479,7 +1508,7 @@ export class LcmContextEngine implements ContextEngine {
               : "live context still exceeds target";
       if (thresholdSweepTranscriptWedge) {
         this.deps.log.warn(
-          `[lcm] compact: transcript wedge detected conversation=${conversationId} ${sessionLabel} storedTokensAfter=${sweepTokensAfter ?? "none"} targetTokens=${targetTokens} observedTokens=${observedTokens} observedRuntimeOverhead=${observedRuntimeOverhead} projectedTokensAfter=${projectedTokensAfterSweep ?? "none"} — stored compaction cannot reduce the live transcript; reset the session (/new) or re-bootstrap`,
+          `[lcm] compact: transcript wedge detected conversation=${conversationId} ${sessionLabel} storedTokensAfter=${sweepTokensAfter ?? "none"} targetTokens=${targetTokens} observedTokens=${compactableObservedTokens} observedRuntimeOverhead=${observedRuntimeOverhead} projectedTokensAfter=${projectedTokensAfterSweep ?? "none"} — stored compaction cannot reduce the live transcript; reset the session (/new) or re-bootstrap`,
         );
       }
       let spendBackoffOpened = false;
@@ -1544,8 +1573,8 @@ export class LcmContextEngine implements ContextEngine {
     // compactUntilUnder does not bail with "already under target" while the
     // live context is actually overflowing.
     const effectiveCurrentTokens =
-      observedTokens !== undefined
-        ? observedTokens
+      compactableObservedTokens !== undefined
+        ? compactableObservedTokens
         : forceCompaction
           ? tokenBudget
           : undefined;
@@ -2493,6 +2522,7 @@ export class LcmContextEngine implements ContextEngine {
     sessionFile: string;
     sessionKey?: string;
     runtimeContext?: ContextEngineMaintenanceRuntimeContext;
+    runtimeSettings?: ContextEngineRuntimeSettings;
   }): Promise<ContextEngineMaintenanceResult> {
     const hostApprovedRuntimeMaintenance =
       params.runtimeContext?.allowDeferredCompactionExecution === true;
@@ -2572,6 +2602,7 @@ export class LcmContextEngine implements ContextEngine {
               tokenBudget: cappedTokenBudget,
               currentTokenCount: maintainCurrentTokenCount,
               runtimeContext: params.runtimeContext,
+              runtimeSettings: params.runtimeSettings,
               legacyParams: asRecord(params.runtimeContext),
             });
           }
@@ -3029,6 +3060,7 @@ export class LcmContextEngine implements ContextEngine {
     currentTokenCount?: number;
     /** OpenClaw runtime param name (preferred). */
     runtimeContext?: Record<string, unknown>;
+    runtimeSettings?: ContextEngineRuntimeSettings;
     /** Back-compat param name. */
     legacyCompactionParams?: Record<string, unknown>;
   }): Promise<void> {
@@ -3296,6 +3328,9 @@ export class LcmContextEngine implements ContextEngine {
       ).currentTokenCount,
     );
     const observedCurrentTokenCount = runtimePromptTokens ?? suppliedCurrentTokenCount;
+    const compactableObservedTokenCount = hostOwnsPromptFraming(params.runtimeSettings)
+      ? undefined
+      : observedCurrentTokenCount;
     if (runtimePromptTokens !== undefined) {
       this.deps.log.debug(
         `[lcm] afterTurn: using runtime prompt token count currentTokenCount=${runtimePromptTokens}`,
@@ -3378,7 +3413,7 @@ export class LcmContextEngine implements ContextEngine {
       const thresholdDecision = await this.compaction.evaluate(
         conversation.conversationId,
         tokenBudget,
-        observedCurrentTokenCount,
+        compactableObservedTokenCount,
         {
           contextThreshold: resolvedContextThreshold.contextThreshold,
           ...(resolvedContextThreshold.freshTailCount !== undefined
@@ -3411,6 +3446,7 @@ export class LcmContextEngine implements ContextEngine {
             compactionTarget: "threshold",
             contextThresholdOverride: resolvedContextThreshold,
             legacyParams,
+            runtimeSettings: params.runtimeSettings,
           });
           if (!compactResult.ok) {
             shouldRefreshBootstrapState = false;
@@ -3450,6 +3486,7 @@ export class LcmContextEngine implements ContextEngine {
         sessionKey: params.sessionKey,
         tokenBudget: deferredCompactionDrain.tokenBudget,
         currentTokenCount: deferredCompactionDrain.currentTokenCount,
+        runtimeSettings: params.runtimeSettings,
         reason: deferredCompactionDrain.reason,
       });
     }
@@ -3565,6 +3602,7 @@ export class LcmContextEngine implements ContextEngine {
     prompt?: string;
     /** Optional runtime context for override resolution (model, provider, etc.). */
     runtimeContext?: Record<string, unknown>;
+    runtimeSettings?: ContextEngineRuntimeSettings;
   }): Promise<AssembleResult> {
     let liveMessages = params.messages;
     // Return a new fallback array so the runtime hook treats this as assembled
@@ -3705,24 +3743,6 @@ export class LcmContextEngine implements ContextEngine {
           ? Math.floor(params.tokenBudget)
           : 128_000,
       );
-      // Bounded variant of safeFallback for paths where this engine manages
-      // the conversation but cannot produce assembled coverage. Returning the
-      // raw live transcript unbounded here is how an over-budget prompt
-      // reaches the model, so clamp it to the budget by serialized estimate.
-      const boundedLiveFallback = (reason: string): AssembleResult => {
-        const fallback = safeFallback();
-        const clamp = clampMessagesToSerializedBudget({
-          messages: fallback.messages,
-          tokenBudget,
-          preserveSubstantiveAssistantTail: hostDeliversCurrentTurnSeparately,
-        });
-        if (clamp.clamped || clamp.overBudget) {
-          this.deps.log.warn(
-            `[lcm] assemble: bounded live fallback conversation=${conversation.conversationId} ${sessionLabel} reason=${reason} serializedTokensBefore=${clamp.serializedTokensBefore} serializedTokens=${clamp.serializedTokens} evictedMessages=${clamp.evictedMessages} tokenBudget=${tokenBudget} overBudget=${clamp.overBudget}`,
-          );
-        }
-        return { messages: clamp.messages, estimatedTokens: clamp.serializedTokens };
-      };
       let storedContextTokens = await this.summaryStore.getContextTokenCount(
         conversation.conversationId,
       );
@@ -3758,6 +3778,7 @@ export class LcmContextEngine implements ContextEngine {
               sessionKey: params.sessionKey,
               tokenBudget,
               currentTokenCount: pressure.storedContextTokens,
+              runtimeSettings: params.runtimeSettings,
             });
           } catch (error) {
             this.deps.log.warn(
@@ -3802,11 +3823,46 @@ export class LcmContextEngine implements ContextEngine {
           );
         }
       }
+      const contextItems = await this.summaryStore.getContextItems(conversation.conversationId);
+      const activeFocusBrief = await this.focusBriefStore.getActiveFocusBrief(
+        conversation.conversationId,
+      );
+      const contextProjection = {
+        mode: "thread_bootstrap" as const,
+        epoch: buildContextEngineProjectionEpoch(
+          conversation.conversationId,
+          contextItems,
+          activeFocusBrief,
+        ),
+      };
+      // Bounded variant of safeFallback for paths where this engine manages
+      // the conversation but cannot produce assembled coverage. Returning the
+      // raw live transcript unbounded here is how an over-budget prompt
+      // reaches the model, so clamp it to the budget by serialized estimate.
+      const boundedLiveFallback = (reason: string): AssembleResult => {
+        const fallback = safeFallback();
+        const clamp = clampMessagesToSerializedBudget({
+          messages: fallback.messages,
+          tokenBudget,
+          preserveSubstantiveAssistantTail: hostDeliversCurrentTurnSeparately,
+        });
+        if (clamp.clamped || clamp.overBudget) {
+          this.deps.log.warn(
+            `[lcm] assemble: bounded live fallback conversation=${conversation.conversationId} ${sessionLabel} reason=${reason} serializedTokensBefore=${clamp.serializedTokensBefore} serializedTokens=${clamp.serializedTokens} evictedMessages=${clamp.evictedMessages} tokenBudget=${tokenBudget} overBudget=${clamp.overBudget}`,
+          );
+        }
+        return {
+          messages: clamp.messages,
+          estimatedTokens: clamp.serializedTokens,
+          contextProjection,
+        };
+      };
       if (deferredAssemblyDegradation) {
         const degraded = buildDegradedLiveAssembleResult({
           liveMessages,
           tokenBudget,
           preserveSubstantiveAssistantTail: hostDeliversCurrentTurnSeparately,
+          contextProjection,
         });
         this.deps.log.warn(
           `[lcm] assemble: degraded live fallback conversation=${conversation.conversationId} ${sessionLabel} reason=${deferredAssemblyDegradation.reason} storedContextTokens=${deferredAssemblyDegradation.pressure.storedContextTokens} projectedTokenCount=${deferredAssemblyDegradation.pressure.projectedTokenCount ?? "null"} tokenBudget=${tokenBudget} pressureThreshold=${Math.floor(tokenBudget * DEFERRED_ASSEMBLY_DEGRADED_PRESSURE_RATIO)} outputMessages=${degraded.messages.length} estimatedTokens=${degraded.estimatedTokens}`,
@@ -3819,7 +3875,6 @@ export class LcmContextEngine implements ContextEngine {
       );
       const forkBoundedBootstrap = bootstrapState?.forkBounded === true;
       const forkSourceMessageCount = bootstrapState?.forkSourceMessageCount ?? 0;
-      const contextItems = await this.summaryStore.getContextItems(conversation.conversationId);
       if (contextItems.length === 0) {
         if (forkBoundedBootstrap) {
           const boundedFallback = buildForkBoundedLiveFallback({
@@ -3828,6 +3883,7 @@ export class LcmContextEngine implements ContextEngine {
             tokenBudget,
             bootstrapMaxTokens: resolveBootstrapMaxTokens(this.config),
             preserveSubstantiveAssistantTail: hostDeliversCurrentTurnSeparately,
+            contextProjection,
           });
           this.deps.log.debug(
             `[lcm] assemble: no context items for fork-bounded bootstrap; using bounded live suffix conversation=${conversation.conversationId} ${sessionLabel} outputMessages=${boundedFallback.messages.length} duration=${formatDurationMs(Date.now() - startedAt)}`,
@@ -3909,6 +3965,7 @@ export class LcmContextEngine implements ContextEngine {
             tokenBudget,
             bootstrapMaxTokens: resolveBootstrapMaxTokens(this.config),
             preserveSubstantiveAssistantTail: hostDeliversCurrentTurnSeparately,
+            contextProjection,
           });
           this.deps.log.debug(
             `[lcm] assemble: empty assembled output for fork-bounded bootstrap; using bounded live suffix conversation=${conversation.conversationId} ${sessionLabel} outputMessages=${boundedFallback.messages.length} tokenBudget=${tokenBudget} duration=${formatDurationMs(Date.now() - startedAt)}`,
@@ -3935,6 +3992,7 @@ export class LcmContextEngine implements ContextEngine {
             tokenBudget,
             bootstrapMaxTokens: resolveBootstrapMaxTokens(this.config),
             preserveSubstantiveAssistantTail: hostDeliversCurrentTurnSeparately,
+            contextProjection,
           });
           this.deps.log.debug(
             `[lcm] assemble: fork-bounded context has no user turns; using bounded live suffix conversation=${conversation.conversationId} ${sessionLabel} outputMessages=${boundedFallback.messages.length} duration=${formatDurationMs(Date.now() - startedAt)}`,
@@ -4077,14 +4135,7 @@ export class LcmContextEngine implements ContextEngine {
       const stubStatsLog = assembled.debug?.stubStats
         ? ` stubbed=${assembled.debug.stubStats.stubbedCount} tokensSaved=${assembled.debug.stubStats.tokensSaved}`
         : "";
-      const activeFocusBrief = await this.focusBriefStore.getActiveFocusBrief(
-        conversation.conversationId,
-      );
-      const contextProjectionEpoch = buildContextEngineProjectionEpoch(
-        conversation.conversationId,
-        contextItems,
-        activeFocusBrief,
-      );
+      const contextProjectionEpoch = contextProjection.epoch;
       const contextProjectionFingerprint = budgetedPromptRecallCue
         ? buildPromptRecallProjectionFingerprint(budgetedPromptRecallCue.message)
         : undefined;
@@ -4210,6 +4261,7 @@ export class LcmContextEngine implements ContextEngine {
     customInstructions?: string;
     /** OpenClaw runtime param name (preferred). */
     runtimeContext?: Record<string, unknown>;
+    runtimeSettings?: ContextEngineRuntimeSettings;
     /** Back-compat param name. */
     legacyParams?: Record<string, unknown>;
     /** Force compaction even if below threshold */
@@ -4271,6 +4323,7 @@ export class LcmContextEngine implements ContextEngine {
           contextThresholdOverride: params.contextThresholdOverride,
           customInstructions: params.customInstructions,
           runtimeContext: params.runtimeContext,
+          runtimeSettings: params.runtimeSettings,
           legacyParams: params.legacyParams,
           force: params.force,
         });

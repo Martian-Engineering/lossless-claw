@@ -45,6 +45,7 @@ describe("LcmContextEngine metadata", () => {
       "sessionKey",
       "prompt",
       "runtimeContext",
+      "runtimeSettings",
     ]);
   });
 
