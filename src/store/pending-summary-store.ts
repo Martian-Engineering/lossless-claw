@@ -707,6 +707,7 @@ export class PendingSummaryStore {
     leaseExpiresAt: Date;
     content: string;
     tokenCount: number;
+    model?: string;
     readyAt?: Date;
   }): Promise<boolean> {
     const result = this.db
@@ -715,6 +716,7 @@ export class PendingSummaryStore {
          SET status = 'ready',
              content = ?,
              token_count = ?,
+             model = COALESCE(?, model),
              lease_owner = NULL,
              lease_expires_at = NULL,
              failure_summary = NULL,
@@ -730,6 +732,7 @@ export class PendingSummaryStore {
       .run(
         input.content,
         normalizeNonNegativeInteger(input.tokenCount),
+        input.model ?? null,
         nullableDateToIso(input.readyAt),
         input.nodeId,
         input.leaseOwner,

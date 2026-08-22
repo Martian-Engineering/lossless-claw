@@ -1,5 +1,32 @@
 import type { PendingSummaryNodeRecord } from "./store/pending-summary-store.js";
 
+/**
+ * Deterministic summary payload used when safety sanitation removes an entire
+ * pending source. Canonical leaf lineage still links to every raw source
+ * message, so this marker closes the publish range without inventing content
+ * or discarding the lossless expansion path. Condensed marker nodes preserve
+ * those leaf links through their parent lineage.
+ */
+export const PENDING_EMPTY_SOURCE_COVERAGE_CONTENT =
+  "[Lossless Claw empty-source coverage marker: no summarizable text remained after safety sanitization; no model was called, and the raw source remains linked for retrieval.]";
+
+/** Summary provenance recorded for deterministic empty-source coverage. */
+export const PENDING_EMPTY_SOURCE_COVERAGE_MODEL = "lossless-claw/empty-source";
+
+/**
+ * Explicit signal from a source loader that lineage was verified but safety
+ * sanitation removed every summarizable byte.
+ *
+ * A plain empty string is not sufficient evidence: it can also indicate
+ * missing links or records and remains a retryable preparation failure.
+ */
+export class PendingSummaryEmptySourceCoverage extends Error {
+  constructor() {
+    super("pending summary source sanitized empty");
+    this.name = "PendingSummaryEmptySourceCoverage";
+  }
+}
+
 export type PendingSummaryPreparationStore = {
   claimNextPlannedNode(input: {
     conversationId: number;
@@ -13,6 +40,7 @@ export type PendingSummaryPreparationStore = {
     leaseExpiresAt: Date;
     content: string;
     tokenCount: number;
+    model?: string;
     readyAt?: Date;
   }): Promise<boolean>;
   markNodeFailed(input: {
@@ -42,7 +70,7 @@ export type PendingSummaryPreparationWorkerOptions = {
 
 export type PendingSummaryPreparationResult =
   | { status: "idle" }
-  | { status: "prepared"; nodeId: string }
+  | { status: "prepared"; nodeId: string; emptySource?: true }
   | { status: "spend-limited"; nodeId: string }
   | { status: "failed"; nodeId: string; failureSummary: string; authFailure?: boolean };
 
@@ -141,6 +169,23 @@ export class PendingSummaryPreparationWorker {
       }
       return { status: "prepared", nodeId: node.nodeId };
     } catch (error) {
+      if (error instanceof PendingSummaryEmptySourceCoverage) {
+        const saved = await this.store.markNodeReady({
+          nodeId: node.nodeId,
+          leaseOwner: this.leaseOwner,
+          leaseExpiresAt: node.leaseExpiresAt,
+          content: PENDING_EMPTY_SOURCE_COVERAGE_CONTENT,
+          tokenCount: normalizeTokenCount(
+            this.estimateTokens(PENDING_EMPTY_SOURCE_COVERAGE_CONTENT),
+          ),
+          model: PENDING_EMPTY_SOURCE_COVERAGE_MODEL,
+          readyAt: this.now(),
+        });
+        if (!saved) {
+          return { status: "idle" };
+        }
+        return { status: "prepared", nodeId: node.nodeId, emptySource: true };
+      }
       // A spend-guard refusal is not a node failure: no model outcome exists,
       // so the claim is released untouched and the node stays planned.
       if (this.isSpendLimitFailure(error)) {

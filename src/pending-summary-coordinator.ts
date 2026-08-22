@@ -15,7 +15,12 @@ import {
   type PendingSummaryPlannerSnapshotItem,
 } from "./pending-summary-planner.js";
 import { PendingSummaryPublisher } from "./pending-summary-publisher.js";
-import { PendingSummaryPreparationWorker } from "./pending-summary-worker.js";
+import {
+  PENDING_EMPTY_SOURCE_COVERAGE_CONTENT,
+  PENDING_EMPTY_SOURCE_COVERAGE_MODEL,
+  PendingSummaryEmptySourceCoverage,
+  PendingSummaryPreparationWorker,
+} from "./pending-summary-worker.js";
 import type { ConversationStore, MessageRecord } from "./store/conversation-store.js";
 import {
   MAX_PENDING_NODE_RETRIES,
@@ -65,7 +70,7 @@ export type PendingCompactionPublishPolicy =
 export type PendingCompactionCoordinatorResult =
   | { status: "idle"; reason: string }
   | { status: "planned"; batchId: string; nodeCount: number }
-  | { status: "prepared"; batchId: string; nodeId: string }
+  | { status: "prepared"; batchId: string; nodeId: string; emptySource?: true }
   | { status: "ready"; batchId: string; reason: "pending summaries ready for publish" }
   | {
       status: "published";
@@ -222,7 +227,12 @@ export class PendingCompactionCoordinator {
     });
     const prepared = await worker.prepareOne({ conversationId: input.conversationId });
     if (prepared.status === "prepared") {
-      return { status: "prepared", batchId: batch.batchId, nodeId: prepared.nodeId };
+      return {
+        status: "prepared",
+        batchId: batch.batchId,
+        nodeId: prepared.nodeId,
+        ...(prepared.emptySource ? { emptySource: true } : {}),
+      };
     }
     if (prepared.status === "spend-limited") {
       return { status: "idle", reason: "summary spend backoff open" };
@@ -916,29 +926,48 @@ export class PendingCompactionCoordinator {
   private async loadSourceText(node: PendingSummaryNodeRecord): Promise<string> {
     if (node.kind === "leaf") {
       const messageLinks = await this.pendingSummaryStore.getNodeMessages(node.nodeId);
+      if (messageLinks.length === 0) {
+        throw new Error(`Pending leaf summary ${node.nodeId} has no linked source messages`);
+      }
       const chunks: string[] = [];
       for (const link of messageLinks) {
         const message = await this.conversationStore.getMessageById(link.messageId);
-        if (message) {
-          chunks.push(
-            await formatMessageForSummary(
-              this.conversationStore,
-              message,
-              this.config.stripInjectedContextTags,
-            ),
+        if (!message) {
+          throw new Error(
+            `Pending leaf summary ${node.nodeId} source message ${link.messageId} was not found`,
           );
         }
+        chunks.push(
+          await formatMessageForSummary(
+            this.conversationStore,
+            message,
+            this.config.stripInjectedContextTags,
+          ),
+        );
       }
-      return chunks.filter(Boolean).join("\n\n");
+      const sourceText = chunks.filter(Boolean).join("\n\n");
+      if (!sourceText.trim()) {
+        throw new PendingSummaryEmptySourceCoverage();
+      }
+      return sourceText;
     }
 
     const children = await this.pendingSummaryStore.getNodeChildren(node.nodeId);
+    if (children.length === 0) {
+      throw new Error(`Pending condensed summary ${node.nodeId} has no linked child summaries`);
+    }
     const chunks: string[] = [];
     for (const child of children) {
       if (child.childNodeId) {
         const pendingChild = await this.pendingSummaryStore.getNode(child.childNodeId);
         if (!pendingChild?.content) {
           throw new Error(`Pending child summary ${child.childNodeId} is not ready`);
+        }
+        if (
+          pendingChild.model === PENDING_EMPTY_SOURCE_COVERAGE_MODEL &&
+          pendingChild.content === PENDING_EMPTY_SOURCE_COVERAGE_CONTENT
+        ) {
+          continue;
         }
         chunks.push(pendingChild.content);
         continue;
@@ -948,9 +977,19 @@ export class PendingCompactionCoordinator {
         if (!canonicalChild) {
           throw new Error(`Canonical child summary ${child.childSummaryId} was not found`);
         }
+        if (
+          canonicalChild.model === PENDING_EMPTY_SOURCE_COVERAGE_MODEL &&
+          canonicalChild.content === PENDING_EMPTY_SOURCE_COVERAGE_CONTENT
+        ) {
+          continue;
+        }
         chunks.push(canonicalChild.content);
       }
     }
-    return chunks.filter(Boolean).join("\n\n");
+    const sourceText = chunks.filter(Boolean).join("\n\n");
+    if (!sourceText.trim()) {
+      throw new PendingSummaryEmptySourceCoverage();
+    }
+    return sourceText;
   }
 }
