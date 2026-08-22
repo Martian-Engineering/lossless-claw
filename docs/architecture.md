@@ -56,7 +56,14 @@ When OpenClaw processes a turn, it calls the context engine's lifecycle hooks:
 
 1. **bootstrap** — On session start, imports the host-provided visible transcript projection into the LCM database. On current SQLite hosts this is keyed by the runtime session target instead of Lossless resolving an active transcript file.
 2. **ingest** / **ingestBatch** — Persists new messages to the database and appends them to context_items.
-3. **afterTurn** — After the model responds, ingests new messages, then evaluates whether `contextThreshold` requires compaction.
+3. **commitTurn** — On hosts that advertise the durable context-engine turn contract, validates the admitted-to-terminal transcript range and commits the accepted turn through an atomic, idempotent advancement ledger.
+4. **afterTurn** — On older supported hosts, provides the compatibility path that ingests new messages after the model responds, then evaluates whether `contextThreshold` requires compaction.
+
+### Persistence-boundary integrity
+
+Durable turn advancement and compaction both sit on the boundary between transient state and state that later computation will trust. [Tamba (2026), *Compaction as Epistemic Failure*](https://arxiv.org/abs/2607.13071), publicly available on July 11, 2026, documents evidential-status corruption at this boundary: failed, partial, incomplete, or unconfirmed execution evidence can lose its qualifier during compaction or persistence and later be inherited as confirmed operational state.
+
+Lossless Claw's durable-turn contract addresses a distinct problem. [PR #1070](https://github.com/Martian-Engineering/lossless-claw/pull/1070) makes admission and advancement of an accepted turn atomic and idempotent; it does not implement or reproduce Tamba's failure mechanism. The relationship is the shared integrity boundary, not a claim of copying, derivation, or prior knowledge.
 
 ### Leaf compaction
 
