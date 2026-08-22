@@ -1,5 +1,8 @@
 import { describe, expect, it } from "vitest";
 import {
+  PENDING_EMPTY_SOURCE_COVERAGE_CONTENT,
+  PENDING_EMPTY_SOURCE_COVERAGE_MODEL,
+  PendingSummaryEmptySourceCoverage,
   PendingSummaryPreparationWorker,
   type PendingSummaryPreparationStore,
 } from "../src/pending-summary-worker.js";
@@ -130,14 +133,16 @@ describe("PendingSummaryPreparationWorker", () => {
     expect(events).toEqual(["failed:node_worker_a:worker-a:provider timeout"]);
   });
 
-  it("marks a claimed node failed when source text is empty", async () => {
+  it("marks an empty sanitized source ready with deterministic lossless coverage", async () => {
     const events: string[] = [];
     const store: PendingSummaryPreparationStore = {
       async claimNextPlannedNode() {
         return createNode();
       },
       async markNodeReady(input) {
-        events.push(`ready:${input.nodeId}`);
+        events.push(
+          `ready:${input.nodeId}:${input.content}:${input.tokenCount}:${input.model ?? ""}`,
+        );
         return true;
       },
       async markNodeFailed(input) {
@@ -154,10 +159,59 @@ describe("PendingSummaryPreparationWorker", () => {
       leaseOwner: "worker-a",
       leaseMs: 60_000,
       now: () => new Date("2026-06-30T12:00:00.000Z"),
-      loadSourceText: async () => "   ",
-      summarize: async () => {
-        throw new Error("should not be called");
+      loadSourceText: async () => {
+        throw new PendingSummaryEmptySourceCoverage();
       },
+      summarize: async () => {
+        events.push("summarize");
+        return "should not be called";
+      },
+      estimateTokens: (content) => {
+        expect(content).toBe(PENDING_EMPTY_SOURCE_COVERAGE_CONTENT);
+        return 19;
+      },
+    });
+
+    await expect(worker.prepareOne({ conversationId: 42 })).resolves.toEqual({
+      status: "prepared",
+      nodeId: "node_worker_a",
+      emptySource: true,
+    });
+    expect(events).toEqual([
+      `ready:node_worker_a:${PENDING_EMPTY_SOURCE_COVERAGE_CONTENT}:19:${PENDING_EMPTY_SOURCE_COVERAGE_MODEL}`,
+    ]);
+  });
+
+  it("does not classify an unverified empty loader result as sanitized coverage", async () => {
+    const events: string[] = [];
+    const store: PendingSummaryPreparationStore = {
+      async claimNextPlannedNode() {
+        return createNode();
+      },
+      async markNodeReady(input) {
+        events.push(`ready:${input.nodeId}`);
+        return true;
+      },
+      async markNodeFailed(input) {
+        events.push(`failed:${input.nodeId}:${input.failureSummary}`);
+        return true;
+      },
+      async releaseNodeClaim(input) {
+        events.push(`released:${input.nodeId}`);
+        return true;
+      },
+    };
+    const summarize = async () => {
+      events.push("summarize");
+      return "should not be called";
+    };
+    const worker = new PendingSummaryPreparationWorker({
+      store,
+      leaseOwner: "worker-a",
+      leaseMs: 60_000,
+      now: () => new Date("2026-06-30T12:00:00.000Z"),
+      loadSourceText: async () => "   ",
+      summarize,
       estimateTokens: () => 0,
     });
 
@@ -166,7 +220,7 @@ describe("PendingSummaryPreparationWorker", () => {
       nodeId: "node_worker_a",
       failureSummary: "empty pending summary source",
     });
-    expect(events).toEqual(["failed:node_worker_a:worker-a:empty pending summary source"]);
+    expect(events).toEqual(["failed:node_worker_a:empty pending summary source"]);
   });
 
   it("marks a claimed node failed when prepared content is empty", async () => {
