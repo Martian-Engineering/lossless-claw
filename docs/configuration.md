@@ -75,6 +75,7 @@ Most installations only need to override a handful of keys. If you want a comple
   "freshTailMaxTokens": 24000,
   "promptAwareEviction": false,
   "stubLargeToolPayloads": false,
+  "preserveNativeImages": false,
   "newSessionRetainDepth": 2,
   "leafMinFanout": 8,
   "condensedMinFanout": 4,
@@ -249,6 +250,7 @@ Every automatic decision emits grep-able log lines prefixed with `[lcm] auto-rot
 | `freshTailMaxTokens` | `integer` | unset | `LCM_FRESH_TAIL_MAX_TOKENS` | Optional token cap for the protected fresh tail. The newest user message and its following assistant/tool suffix are always preserved even if they exceed the cap. |
 | `promptAwareEviction` | `boolean` | `false` | `LCM_PROMPT_AWARE_EVICTION_ENABLED` | When enabled, budget-constrained assembly keeps older evictable items by prompt relevance instead of pure chronology. This improves retrieval under tight budgets, but it can reduce prompt-cache hit rates because the preserved prefix changes as prompts change. |
 | `stubLargeToolPayloads` | `boolean` | `false` | `LCM_STUB_LARGE_TOOL_PAYLOADS` | When enabled, evictable tool-result rows backfilled with `messages.large_content` are assembled as `[LCM Tool Output: file_xxx ...]` stubs while the fresh tail stays inline. Requires `scripts/lcm-blob-migrate.mjs`, which defaults to the same large-files root as runtime LCM (`LCM_LARGE_FILES_DIR` or `${OPENCLAW_STATE_DIR}/lcm-files`). |
+| `preserveNativeImages` | `boolean` | `false` | `LCM_PRESERVE_NATIVE_IMAGES` | When enabled, native and inline image blocks are left in place at ingest instead of being externalized to a `file_xxx` reference, so vision-capable models receive real image content. Off by default to preserve the existing externalization behavior. |
 | `leafMinFanout` | `integer` | `8` | `LCM_LEAF_MIN_FANOUT` | Minimum number of raw messages required before a leaf pass runs. |
 | `condensedMinFanout` | `integer` | `4` | `LCM_CONDENSED_MIN_FANOUT` | Number of same-depth summaries needed before condensation is attempted. |
 | `condensedMinFanoutHard` | `integer` | `2` | `LCM_CONDENSED_MIN_FANOUT_HARD` | Hard floor for condensation grouping during maintenance and repair flows. |

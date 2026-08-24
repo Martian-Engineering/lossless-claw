@@ -129,6 +129,21 @@ Good default:
 - `false`
 - enable it only after migration and live validation
 
+### `preserveNativeImages`
+
+Controls whether native and inline image blocks are externalized to a `file_xxx` reference at ingest time, or left in place so vision-capable models receive real image content.
+
+Why it matters:
+
+- when off (default), image blocks are written to a `file_xxx` reference and the model sees text only — this keeps context small but breaks vision-capable models that need actual pixels
+- when on, images stay inline as first-class image content so multimodal models can see them
+- it is the right choice for vision-capable models; keep it off for text-only models that would otherwise waste context on image bytes
+
+Good default:
+
+- `false`
+- enable it when your primary model is vision-capable and you send images
+
 ### `leafChunkTokens`
 
 Caps how much raw material gets summarized into one leaf summary.
@@ -448,6 +463,19 @@ Why it matters:
 Env override:
 
 - `LCM_STUB_LARGE_TOOL_PAYLOADS`
+
+### `preserveNativeImages`
+
+Boolean toggle for keeping native and inline image blocks in place at ingest instead of externalizing them to a `file_xxx` reference.
+
+Why it matters:
+
+- when off (default), images become a `file_xxx` reference and the model sees text only
+- when on, images stay inline so vision-capable models receive real image content
+
+Env override:
+
+- `LCM_PRESERVE_NATIVE_IMAGES`
 
 ### `leafChunkTokens`
 

@@ -30,6 +30,7 @@ function baseConfig(file: string, independentLogFileEnabled = true): LcmConfig {
     freshTailCount: 64,
     promptAwareEviction: false,
     stubLargeToolPayloads: false,
+    preserveNativeImages: false,
     newSessionRetainDepth: 2,
     leafMinFanout: 8,
     condensedMinFanout: 4,

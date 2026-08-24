@@ -15,6 +15,7 @@ const BASE_CONFIG: LcmConfig = {
   freshTailCount: 8,
   promptAwareEviction: false,
   stubLargeToolPayloads: false,
+  preserveNativeImages: false,
   newSessionRetainDepth: 2,
   leafMinFanout: 8,
   condensedMinFanout: 4,
