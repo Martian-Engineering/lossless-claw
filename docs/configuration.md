@@ -183,22 +183,25 @@ Notes on the example:
 
 ## Install and enable
 
+Lossless Claw 1.0 prereleases use the npm `beta` channel. The npm `latest`
+channel remains on the 0.x release line for stable OpenClaw hosts.
+
 Install with OpenClaw's plugin installer:
 
 ```bash
-openclaw plugins install @martian-engineering/lossless-claw@latest
+openclaw plugins install @martian-engineering/lossless-claw@beta
 ```
 
 If you are running from a local OpenClaw checkout:
 
 ```bash
-pnpm openclaw plugins install @martian-engineering/lossless-claw@latest
+pnpm openclaw plugins install @martian-engineering/lossless-claw@beta
 ```
 
 Use exact versions only for rollback or reproducible canary testing. OpenClaw treats an exact install spec such as `@martian-engineering/lossless-claw@0.12.0` as pinned, so plugin update sync will not follow newer LCM releases until you return to the moving track:
 
 ```bash
-openclaw plugins update @martian-engineering/lossless-claw@latest
+openclaw plugins update @martian-engineering/lossless-claw@beta
 ```
 
 For local plugin development, link a working copy:
