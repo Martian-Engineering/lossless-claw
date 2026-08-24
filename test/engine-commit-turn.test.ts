@@ -14,7 +14,9 @@ import {
   createEngine,
   createEngineAtDatabasePath,
   createEngineWithConfig,
+  createEngineWithDeps,
   makeMessage,
+  seedBacklogContext,
   tempDirs,
 } from "./helpers.js";
 
@@ -297,6 +299,96 @@ describe("LcmContextEngine commitTurn", () => {
       reason: "threshold",
       tokenBudget: 100,
     });
+  });
+
+  it("inherits the effective OpenClaw model during a context-free durable commit", async () => {
+    const complete = vi.fn(async (_input: unknown) => ({
+      content: [{ type: "text", text: "default-model summary" }],
+    }));
+    const resolveModel = vi.fn((modelRef?: string) => {
+      expect(modelRef).toBeUndefined();
+      return { provider: "openai-codex", model: "gpt-5.5" };
+    });
+    const engine = createEngineWithDeps(
+      {
+        freshTailCount: 1,
+        leafChunkTokens: 120,
+        maxSweepIterations: 1,
+      },
+      { complete, resolveModel },
+    );
+    const params = buildCommitTurnParams({ advancementKey: "default-model-turn" });
+    await seedBacklogContext(engine, params.sessionId, [120, 120]);
+
+    await expect(engine.commitTurn(params)).resolves.toEqual({ status: "committed" });
+
+    const conversation = await engine
+      .getConversationStore()
+      .getConversationBySessionId(params.sessionId);
+    expect(conversation).not.toBeNull();
+    await vi.waitFor(async () => {
+      expect(complete.mock.calls.length).toBeGreaterThan(0);
+      const batch = await engine
+        .getPendingSummaryStore()
+        .getActiveBatchForConversation(conversation!.conversationId);
+      expect(batch?.model).toBe("gpt-5.5");
+    });
+    expect(resolveModel).toHaveBeenCalledWith(undefined, undefined);
+    expect(complete.mock.calls[0]?.[0]).toMatchObject({
+      provider: "openai-codex",
+      model: "gpt-5.5",
+    });
+  });
+
+  it("retains raw pending work when a context-free durable commit cannot resolve a model", async () => {
+    const complete = vi.fn(async () => ({
+      content: [{ type: "text", text: "unexpected summary" }],
+    }));
+    const warn = vi.fn();
+    const engine = createEngineWithDeps(
+      {
+        freshTailCount: 1,
+        leafChunkTokens: 120,
+        maxSweepIterations: 1,
+      },
+      {
+        complete,
+        resolveModel: vi.fn(() => {
+          throw new Error("no model configured");
+        }),
+        log: {
+          info: vi.fn(),
+          warn,
+          error: vi.fn(),
+          debug: vi.fn(),
+        },
+      },
+    );
+    const params = buildCommitTurnParams({ advancementKey: "missing-model-turn" });
+    await seedBacklogContext(engine, params.sessionId, [120, 120]);
+
+    await expect(engine.commitTurn(params)).resolves.toEqual({ status: "committed" });
+
+    await vi.waitFor(() => {
+      expect(warn).toHaveBeenCalledWith(
+        expect.stringContaining(
+          "emergency truncation disabled for automatic pending preparation",
+        ),
+      );
+    });
+    const conversation = await engine
+      .getConversationStore()
+      .getConversationBySessionId(params.sessionId);
+    expect(conversation).not.toBeNull();
+    await expect(
+      engine.getSummaryStore().getSummariesByConversation(conversation!.conversationId),
+    ).resolves.toHaveLength(0);
+    await expect(
+      engine
+        .getPendingSummaryStore()
+        .getActiveBatchForConversation(conversation!.conversationId),
+    ).resolves.toBeNull();
+    expect(complete).not.toHaveBeenCalled();
   });
 
   it("fails closed when the same advancement key carries a different payload", async () => {
