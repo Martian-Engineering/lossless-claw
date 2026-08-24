@@ -1,5 +1,20 @@
 # @martian-engineering/lossless-claw
 
+## 0.15.4
+
+<!-- release-rollback-version: 0.15.3 -->
+
+### Patch Changes
+
+- [#1115](https://github.com/Martian-Engineering/lossless-claw/pull/1115) [`f55ed7a`](https://github.com/Martian-Engineering/lossless-claw/commit/f55ed7af35bc751c631c0449b631cb149a741234) Thanks [@jalehman](https://github.com/jalehman)! - Precompute live-coverage signatures before exact prompt-time reconciliation.
+
+- [#1104](https://github.com/Martian-Engineering/lossless-claw/pull/1104) [`76d5b15`](https://github.com/Martian-Engineering/lossless-claw/commit/76d5b155fa8a41bf072082484a4e8232d3653a63) Thanks [@mvanhorn](https://github.com/mvanhorn)! - Add read-only inactive compaction-debt diagnostics and a backup-first, explicitly confirmed administrative close command that preserves recall data.
+
+- [#1034](https://github.com/Martian-Engineering/lossless-claw/pull/1034) [`707de4d`](https://github.com/Martian-Engineering/lossless-claw/commit/707de4d98fabdeea9352c3492321227f7e75b0a3) Thanks [@syltharion](https://github.com/syltharion)! - Preserve each message's role in leaf-summary source text rebuilt by `doctor apply`,
+  so repaired summaries can distinguish operator input from assistant and tool content.
+
+- [#1086](https://github.com/Martian-Engineering/lossless-claw/pull/1086) [`4214b48`](https://github.com/Martian-Engineering/lossless-claw/commit/4214b4809a819ec847fd7ba1463cab131e304d34) Thanks [@meatwife](https://github.com/meatwife)! - Separate typed host-owned prompt framing from Lossless compaction pressure and preserve stable thread-bootstrap projection metadata across managed degraded and fork-bounded fallbacks.
+
 ## 0.15.3
 
 <!-- release-rollback-version: 0.15.2 -->
