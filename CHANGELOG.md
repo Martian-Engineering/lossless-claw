@@ -2,6 +2,8 @@
 
 ## 0.15.4
 
+<!-- release-rollback-version: 0.15.3 -->
+
 ### Patch Changes
 
 - [#1115](https://github.com/Martian-Engineering/lossless-claw/pull/1115) [`f55ed7a`](https://github.com/Martian-Engineering/lossless-claw/commit/f55ed7af35bc751c631c0449b631cb149a741234) Thanks [@jalehman](https://github.com/jalehman)! - Precompute live-coverage signatures before exact prompt-time reconciliation.
