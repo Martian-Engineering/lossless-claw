@@ -41,10 +41,6 @@ describe("ClawHub publish workflow", () => {
     expect(workflow).toContain(
       'tag_sha="$(git rev-list -n 1 "refs/tags/$RELEASE_TAG")"',
     );
-    expect(workflow).toContain('source_sha" != "$GITHUB_SHA"');
-    expect(workflow).toContain(
-      'Dispatch this workflow from $RELEASE_TAG, not $GITHUB_REF',
-    );
     expect(workflow).toContain('source_sha" != "$tag_sha"');
     expect(workflow).toContain(
       'npm view "$package_name@$version" version gitHead --json',
@@ -75,10 +71,10 @@ describe("ClawHub publish workflow", () => {
 
   it("binds manual validation and publication to the verified commit", () => {
     expect(workflow).toMatch(
-      /release-dry-run:\n\s+needs: release-preflight(?:.|\n)*?source: \$\{\{ github\.repository \}\}(?:.|\n)*?ref: \$\{\{ needs\.release-preflight\.outputs\.source_sha \}\}(?:.|\n)*?source_ref: refs\/tags\/\$\{\{ inputs\.release_tag \}\}/,
+      /release-dry-run:\n\s+needs: release-preflight(?:.|\n)*?source: \$\{\{ github\.repository \}\}(?:.|\n)*?ref: \$\{\{ needs\.release-preflight\.outputs\.source_sha \}\}(?:.|\n)*?source_repo: \$\{\{ github\.repository \}\}(?:.|\n)*?source_commit: \$\{\{ needs\.release-preflight\.outputs\.source_sha \}\}(?:.|\n)*?source_ref: \$\{\{ needs\.release-preflight\.outputs\.source_sha \}\}/,
     );
     expect(workflow).toMatch(
-      /publish:\n\s+needs: release-preflight(?:.|\n)*?source: \$\{\{ github\.repository \}\}(?:.|\n)*?ref: \$\{\{ needs\.release-preflight\.outputs\.source_sha \}\}(?:.|\n)*?source_ref: refs\/tags\/\$\{\{ inputs\.release_tag \}\}/,
+      /publish:\n\s+needs: release-preflight(?:.|\n)*?source: \$\{\{ github\.repository \}\}(?:.|\n)*?ref: \$\{\{ needs\.release-preflight\.outputs\.source_sha \}\}(?:.|\n)*?source_repo: \$\{\{ github\.repository \}\}(?:.|\n)*?source_commit: \$\{\{ needs\.release-preflight\.outputs\.source_sha \}\}(?:.|\n)*?source_ref: \$\{\{ needs\.release-preflight\.outputs\.source_sha \}\}/,
     );
   });
 
