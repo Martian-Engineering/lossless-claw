@@ -288,14 +288,17 @@ export function resolveProtectedFreshTailAssembledIndexes(params: {
   return protectedIndexes;
 }
 
+/** Match live messages to assembled occurrences without reusing an assembled slot. */
 export function resolveExactAssembledLiveSortIndexes(params: {
   assembledMessages: AgentMessage[];
   liveMessages: AgentMessage[];
 }): Map<number, number> {
+  const assembledSignatures = params.assembledMessages.map(createLiveCoverageSignature);
+  const liveSignatures = params.liveMessages.map(createLiveCoverageSignature);
   const liveSortIndexes = new Map<number, number>();
   const usedAssembledIndexes = new Set<number>();
   for (let liveIndex = params.liveMessages.length - 1; liveIndex >= 0; liveIndex--) {
-    const liveMessage = params.liveMessages[liveIndex] as AgentMessage;
+    const liveSignature = liveSignatures[liveIndex] as string;
     for (
       let assembledIndex = params.assembledMessages.length - 1;
       assembledIndex >= 0;
@@ -304,8 +307,7 @@ export function resolveExactAssembledLiveSortIndexes(params: {
       if (usedAssembledIndexes.has(assembledIndex)) {
         continue;
       }
-      const assembledMessage = params.assembledMessages[assembledIndex] as AgentMessage;
-      if (messagesHaveSameLiveCoverageSignature(assembledMessage, liveMessage)) {
+      if (assembledSignatures[assembledIndex] === liveSignature) {
         liveSortIndexes.set(assembledIndex, liveIndex);
         usedAssembledIndexes.add(assembledIndex);
         break;
