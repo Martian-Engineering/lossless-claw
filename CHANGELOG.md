@@ -1,5 +1,22 @@
 # @martian-engineering/lossless-claw
 
+## 1.0.0-beta.5
+
+<!-- release-rollback-version: 0.15.4 -->
+
+### Patch Changes
+
+- [#1114](https://github.com/Martian-Engineering/lossless-claw/pull/1114) [`4bcfc06`](https://github.com/Martian-Engineering/lossless-claw/commit/4bcfc069bed764ec29ecda2888cf714435e8129d) Thanks [@jalehman](https://github.com/jalehman)! - Keep Lossless Claw 1.0 install, update, migration, and status repair commands on the npm `beta` channel, and warn when an existing install still follows the incompatible 0.15.x `latest` channel.
+
+- [#1116](https://github.com/Martian-Engineering/lossless-claw/pull/1116) [`0fef96b`](https://github.com/Martian-Engineering/lossless-claw/commit/0fef96b8592c386f428512222bae62d0ff0309c7) Thanks [@jalehman](https://github.com/jalehman)! - Precompute live-coverage signatures before exact prompt-time reconciliation.
+
+- [`bf3d69e`](https://github.com/Martian-Engineering/lossless-claw/commit/bf3d69ef376030f749dbfa92be0c5e2abee59550) Thanks [@mvanhorn](https://github.com/mvanhorn)! - Add read-only inactive compaction-debt diagnostics and a backup-first, explicitly confirmed administrative close command that preserves recall data.
+
+- [`e9f8fe4`](https://github.com/Martian-Engineering/lossless-claw/commit/e9f8fe45026b181b4a5c51791135b2fc700f4a3e) Thanks [@syltharion](https://github.com/syltharion)! - Preserve each message's role in leaf-summary source text rebuilt by `doctor apply`,
+  so repaired summaries can distinguish operator input from assistant and tool content.
+
+- [#1108](https://github.com/Martian-Engineering/lossless-claw/pull/1108) [`b3e144b`](https://github.com/Martian-Engineering/lossless-claw/commit/b3e144b8683445454f27a6c23ad35c35b8ad3c84) Thanks [@jalehman](https://github.com/jalehman)! - Inherit OpenClaw's effective default model during context-free durable `commitTurn` summary preparation when no Lossless summary override is configured. Automatic pending-summary work now retains raw context instead of persisting emergency truncations when no model-backed summarizer can be resolved.
+
 ## 1.0.0-beta.4
 
 <!-- release-rollback-version: 0.15.3 -->

@@ -97,11 +97,6 @@ jobs:
           fi
 
           source_sha="$(git rev-parse HEAD)"
-          if [ "$source_sha" != "$GITHUB_SHA" ]; then
-            echo "Dispatch this workflow from $RELEASE_TAG, not $GITHUB_REF"
-            exit 1
-          fi
-
           git fetch --no-tags origin "refs/tags/$RELEASE_TAG:refs/tags/$RELEASE_TAG"
           tag_sha="$(git rev-list -n 1 "refs/tags/$RELEASE_TAG")"
           if [ "$source_sha" != "$tag_sha" ]; then
@@ -156,7 +151,9 @@ jobs:
     with:
       source: ${{ github.repository }}
       ref: ${{ needs.release-preflight.outputs.source_sha }}
-      source_ref: refs/tags/${{ inputs.release_tag }}
+      source_repo: ${{ github.repository }}
+      source_commit: ${{ needs.release-preflight.outputs.source_sha }}
+      source_ref: ${{ needs.release-preflight.outputs.source_sha }}
       package_artifact_name: clawhub-release-package
       dry_run: true
 
@@ -175,6 +172,8 @@ jobs:
     with:
       source: ${{ github.repository }}
       ref: ${{ needs.release-preflight.outputs.source_sha }}
-      source_ref: refs/tags/${{ inputs.release_tag }}
+      source_repo: ${{ github.repository }}
+      source_commit: ${{ needs.release-preflight.outputs.source_sha }}
+      source_ref: ${{ needs.release-preflight.outputs.source_sha }}
       package_artifact_name: clawhub-release-package
       dry_run: false

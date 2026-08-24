@@ -5,8 +5,13 @@
     "@martian-engineering/lossless-claw": "0.15.1"
   },
   "changesets": [
+    "beta-install-channel-guidance",
+    "calm-signatures-reconcile",
     "clawhub-prebuilt-artifacts",
+    "close-inactive-maintenance-debt",
+    "doctor-repair-role-provenance",
     "durable-turn-advancement",
+    "inherit-durable-default-summary-model",
     "legacy-bootstrap-diagnostics",
     "minimax-tui-provider",
     "pending-summary-projection-pressure",
