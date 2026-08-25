@@ -1,5 +1,11 @@
 # @martian-engineering/lossless-claw
 
+## 0.15.5
+
+### Patch Changes
+
+- [#1120](https://github.com/Martian-Engineering/lossless-claw/pull/1120) [`b31ad24`](https://github.com/Martian-Engineering/lossless-claw/commit/b31ad24a74bf882618788ff393edfe3a15e69af2) Thanks [@jalehman](https://github.com/jalehman)! - Expose the four Lossless recall tools through OpenClaw's coding, messaging, and full tool profiles, and mark their read-only executions as replay-safe.
+
 ## 0.15.4
 
 <!-- release-rollback-version: 0.15.3 -->
