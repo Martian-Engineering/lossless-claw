@@ -23,6 +23,27 @@ runtime LLM completion. Fully capable native hosts still advertise and execute
 the full lifecycle, and Lossless retains compaction ownership for those runs.
 Subagent forks continue to require `thread-bootstrap-projection`.
 
+## Recall tool availability
+
+Lossless declares `lcm_grep`, `lcm_describe`, `lcm_expand`, and
+`lcm_expand_query` for OpenClaw's `coding`, `messaging`, and `full` tool
+profiles. It also marks these read-only recall operations as safe to replay
+after an incomplete model turn. Explicit operator deny rules remain
+authoritative, and the `minimal` profile does not include the tools.
+
+OpenClaw `2026.8.1-beta.3` is the first release that supports manifest profile
+contributions. Stable OpenClaw `2026.7.1` and earlier require adding the
+Lossless plugin to `tools.alsoAllow`:
+
+```json
+{
+  "tools": {
+    "profile": "coding",
+    "alsoAllow": ["lossless-claw"]
+  }
+}
+```
+
 The optional programmatic `status` / `doctor` / `rotate` control surface requires
 a host that separately advertises context-engine capabilities/control dispatch.
 That host contract is not covered by the baseline plugin API version above. As
