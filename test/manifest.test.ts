@@ -131,6 +131,20 @@ describe("openclaw.plugin.json manifest drift guard (#570)", () => {
     expect(runtimeNames).toEqual(declared);
   });
 
+  it("exposes every recall tool through standard profiles as replay-safe", () => {
+    const declared = [...manifest.contracts.tools].sort();
+    const toolMetadata: Record<string, { profiles: string[]; replaySafe: boolean }> =
+      manifest.toolMetadata;
+
+    expect(Object.keys(toolMetadata).sort()).toEqual(declared);
+    for (const toolName of declared) {
+      expect(toolMetadata[toolName]).toEqual({
+        profiles: ["coding", "messaging", "full"],
+        replaySafe: true,
+      });
+    }
+  });
+
   it("declares startup activation until OpenClaw always loads selected context-engine plugins", () => {
     expect(manifest.name).toBe("Lossless Context Management");
     expect(manifest.kind).toBe("context-engine");
