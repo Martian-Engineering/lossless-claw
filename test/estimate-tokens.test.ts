@@ -98,6 +98,41 @@ describe("estimateSerializedMessageTokens", () => {
     expect(estimateSerializedMessageTokens(message)).toBeGreaterThan(2_000);
   });
 
+  it("ignores top-level private OpenClaw metadata", () => {
+    const visibleMessage = { role: "user", content: "hello" };
+    const messageWithPrivateMetadata = {
+      ...visibleMessage,
+      __openclaw: {
+        upstreamUserText: "x".repeat(400_000),
+      },
+    };
+
+    expect(estimateSerializedMessageTokens(messageWithPrivateMetadata)).toBe(
+      estimateSerializedMessageTokens(visibleMessage),
+    );
+  });
+
+  it("still counts private-looking keys inside rendered tool payloads", () => {
+    const baseline = {
+      role: "assistant",
+      content: [{ type: "toolCall", name: "example", arguments: {} }],
+    };
+    const renderedPayload = {
+      role: "assistant",
+      content: [
+        {
+          type: "toolCall",
+          name: "example",
+          arguments: { __openclaw: "y".repeat(8_000) },
+        },
+      ],
+    };
+
+    expect(estimateSerializedMessageTokens(renderedPayload)).toBeGreaterThan(
+      estimateSerializedMessageTokens(baseline) + 1_500,
+    );
+  });
+
   it("substitutes a fixed cost for embedded base64 payloads", () => {
     const base64 = "QUJDREVGR0hJSktMTU5PUFFSU1RVVldYWVo=".repeat(2_000); // ~74k chars
     const message = {
