@@ -19,6 +19,7 @@ import {
   seedBacklogContext,
   tempDirs,
 } from "./helpers.js";
+import { attachTranscriptEntryMeta } from "../src/transcript.js";
 
 afterEach(cleanupEngineTestState);
 
@@ -132,6 +133,206 @@ describe("LcmContextEngine commitTurn", () => {
       message_count: 2,
       hash_length: 64,
     });
+  });
+
+  it("records the receipt without duplicating a turn already ingested from the transcript", async () => {
+    const engine = createEngine();
+    const params = buildCommitTurnParams();
+    params.messages = [
+      makeMessage({ role: "user", content: "current question", timestamp: 2_000 }),
+      makeMessage({ role: "tool", content: "current tool result", timestamp: 2_500 }),
+      makeMessage({ role: "assistant", content: "current answer", timestamp: 3_000 }),
+    ];
+    params.terminal = {
+      ...params.terminal,
+      activeMessagePosition: params.admission.activeMessagePosition + params.messages.length - 1,
+      rawSeq: params.admission.rawSeq + params.messages.length - 1,
+    };
+
+    for (const [index, message] of params.messages.entries()) {
+      await engine.ingest({
+        sessionId: params.sessionId,
+        sessionKey: params.sessionKey,
+        message: attachTranscriptEntryMeta(
+          { ...message },
+          {
+            entryId: index === 0 ? params.admission.entryId : `transcript-entry-${index + 1}`,
+            parentId: null,
+            timestamp: null,
+          },
+        ),
+      });
+    }
+    expect(await readStoredMessages(engine)).toHaveLength(3);
+
+    await expect(engine.commitTurn(params)).resolves.toEqual({ status: "committed" });
+    await expect(engine.commitTurn(params)).resolves.toEqual({ status: "duplicate" });
+
+    expect((await readStoredMessages(engine)).map((message) => message.content)).toEqual([
+      "current question",
+      "current tool result",
+      "current answer",
+    ]);
+    expect(
+      getEngineDatabase(engine)
+        .prepare("SELECT count(*) AS count FROM turn_advancements")
+        .get(),
+    ).toEqual({ count: 1 });
+    expect(
+      getEngineDatabase(engine)
+        .prepare("SELECT message_count FROM turn_advancements WHERE advancement_key = ?")
+        .get(params.advancementKey),
+    ).toEqual({ message_count: 0 });
+  });
+
+  it("ingests only the unflushed suffix before recording the receipt", async () => {
+    const engine = createEngine();
+    const params = buildCommitTurnParams();
+    params.messages = [
+      makeMessage({ role: "user", content: "current question", timestamp: 2_000 }),
+      makeMessage({ role: "tool", content: "current tool result", timestamp: 2_500 }),
+      makeMessage({ role: "assistant", content: "current answer", timestamp: 3_000 }),
+    ];
+    params.terminal = {
+      ...params.terminal,
+      activeMessagePosition: params.admission.activeMessagePosition + params.messages.length - 1,
+      rawSeq: params.admission.rawSeq + params.messages.length - 1,
+    };
+
+    await engine.ingest({
+      sessionId: params.sessionId,
+      sessionKey: params.sessionKey,
+      message: attachTranscriptEntryMeta(
+        { ...params.messages[0]! },
+        {
+          entryId: params.admission.entryId,
+          parentId: null,
+          timestamp: null,
+        },
+      ),
+    });
+
+    await expect(engine.commitTurn(params)).resolves.toEqual({ status: "committed" });
+
+    expect((await readStoredMessages(engine)).map((message) => message.content)).toEqual([
+      "current question",
+      "current tool result",
+      "current answer",
+    ]);
+    expect(
+      getEngineDatabase(engine)
+        .prepare("SELECT message_count FROM turn_advancements WHERE advancement_key = ?")
+        .get(params.advancementKey),
+    ).toEqual({ message_count: 2 });
+  });
+
+  it("preserves the full accepted turn when its projected admission anchor is suspect", async () => {
+    const engine = createEngine();
+    const params = buildCommitTurnParams();
+    await engine.ingest({
+      sessionId: params.sessionId,
+      sessionKey: params.sessionKey,
+      message: attachTranscriptEntryMeta(
+        { ...params.messages[0]! },
+        {
+          entryId: params.admission.entryId,
+          parentId: null,
+          timestamp: null,
+        },
+      ),
+    });
+    const conversation = await engine
+      .getConversationStore()
+      .getConversationBySessionId(params.sessionId);
+    expect(conversation).not.toBeNull();
+    if (!conversation) throw new Error("conversation missing");
+    const candidate = await engine
+      .getConversationStore()
+      .getTranscriptEntryAnchorCandidate(conversation.conversationId, params.admission.entryId);
+    expect(candidate).not.toBeNull();
+    if (!candidate) throw new Error("admission anchor missing");
+    await engine.getConversationStore().upsertMessageTranscriptAnchorTrust({
+      messageId: candidate.messageId,
+      conversationId: conversation.conversationId,
+      transcriptEntryId: params.admission.entryId,
+      trustState: "suspect",
+      source: "test",
+      reason: "legacy anchor has not been verified",
+    });
+
+    await expect(engine.commitTurn(params)).resolves.toEqual({ status: "committed" });
+
+    expect((await readStoredMessages(engine)).map((message) => message.content)).toEqual([
+      "current question",
+      "current question",
+      "current answer",
+    ]);
+    expect(
+      getEngineDatabase(engine)
+        .prepare("SELECT message_count FROM turn_advancements WHERE advancement_key = ?")
+        .get(params.advancementKey),
+    ).toEqual({ message_count: 2 });
+  });
+
+  it("preserves the full accepted turn when a trusted admission anchor has different content", async () => {
+    const engine = createEngine();
+    const params = buildCommitTurnParams();
+    await engine.ingest({
+      sessionId: params.sessionId,
+      sessionKey: params.sessionKey,
+      message: attachTranscriptEntryMeta(
+        makeMessage({ role: "user", content: "stale projected question", timestamp: 2_000 }),
+        {
+          entryId: params.admission.entryId,
+          parentId: null,
+          timestamp: null,
+        },
+      ),
+    });
+
+    await expect(engine.commitTurn(params)).resolves.toEqual({ status: "committed" });
+
+    expect((await readStoredMessages(engine)).map((message) => message.content)).toEqual([
+      "stale projected question",
+      "current question",
+      "current answer",
+    ]);
+    expect(
+      getEngineDatabase(engine)
+        .prepare("SELECT message_count FROM turn_advancements WHERE advancement_key = ?")
+        .get(params.advancementKey),
+    ).toEqual({ message_count: 2 });
+  });
+
+  it("preserves a later accepted turn that repeats identical content", async () => {
+    const engine = createEngine();
+    const first = buildCommitTurnParams({ advancementKey: "logical-turn-1" });
+    const second = buildCommitTurnParams({ advancementKey: "logical-turn-2" });
+    second.admission = {
+      ...second.admission,
+      entryId: "user-entry-2",
+      logicalTurnId: second.advancementKey,
+    };
+    second.terminal = {
+      ...second.terminal,
+      entryId: "assistant-entry-2",
+      effectiveParentId: second.admission.entryId,
+    };
+
+    await expect(engine.commitTurn(first)).resolves.toEqual({ status: "committed" });
+    await expect(engine.commitTurn(second)).resolves.toEqual({ status: "committed" });
+
+    expect((await readStoredMessages(engine)).map((message) => message.content)).toEqual([
+      "current question",
+      "current answer",
+      "current question",
+      "current answer",
+    ]);
+    expect(
+      getEngineDatabase(engine)
+        .prepare("SELECT count(*) AS count FROM turn_advancements")
+        .get(),
+    ).toEqual({ count: 2 });
   });
 
   it("preserves recurrent model-authored tool results across committed turns", async () => {
