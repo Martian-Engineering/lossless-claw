@@ -4620,11 +4620,11 @@ export class LcmContextEngine implements ContextEngine {
           ? Math.floor(params.tokenBudget)
           : 128_000,
       );
-      const contextItems = await this.summaryStore.getContextItems(conversation.conversationId);
-      const activeFocusBrief = await this.focusBriefStore.getActiveFocusBrief(
+      let contextItems = await this.summaryStore.getContextItems(conversation.conversationId);
+      let activeFocusBrief = await this.focusBriefStore.getActiveFocusBrief(
         conversation.conversationId,
       );
-      const contextProjection = {
+      let contextProjection = {
         mode: "thread_bootstrap" as const,
         epoch: buildContextEngineProjectionEpoch(
           conversation.conversationId,
@@ -4696,6 +4696,20 @@ export class LcmContextEngine implements ContextEngine {
               `[lcm] assemble: deferred compaction execution failed for ${sessionLabel}: ${describeLogError(error)}`,
             );
           }
+          // Emergency maintenance may replace the canonical context prefix.
+          // Refresh both projection inputs before returning any assemble path.
+          contextItems = await this.summaryStore.getContextItems(conversation.conversationId);
+          activeFocusBrief = await this.focusBriefStore.getActiveFocusBrief(
+            conversation.conversationId,
+          );
+          contextProjection = {
+            mode: "thread_bootstrap",
+            epoch: buildContextEngineProjectionEpoch(
+              conversation.conversationId,
+              contextItems,
+              activeFocusBrief,
+            ),
+          };
           storedContextTokens = await this.summaryStore.getContextTokenCount(
             conversation.conversationId,
           );

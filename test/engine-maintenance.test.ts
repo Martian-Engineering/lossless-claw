@@ -2033,6 +2033,70 @@ describe("LcmContextEngine maintain and assemble budget", () => {
     expect(log.warn).toHaveBeenCalledWith(expect.stringContaining("reason=over-budget"));
   });
 
+  it("refreshes the projection epoch after emergency compaction replaces context", async () => {
+    const engine = createEngine();
+    const privateEngine = engine as unknown as {
+      executeCompactionCore: (params: unknown) => Promise<unknown>;
+    };
+    const sessionId = "assemble-emergency-refreshes-projection";
+    const conversation = await engine.getConversationStore().getOrCreateConversation(sessionId, {
+      sessionKey: undefined,
+    });
+    const summaryStore = engine.getSummaryStore();
+    const [storedMessage] = await engine.getConversationStore().createMessagesBulk([
+      {
+        conversationId: conversation.conversationId,
+        seq: 0,
+        role: "user",
+        content: "stored context before emergency compaction",
+        tokenCount: 150,
+      },
+    ]);
+    await summaryStore.appendContextMessages(conversation.conversationId, [
+      storedMessage.messageId,
+    ]);
+
+    const beforeCompaction = await engine.assemble({
+      sessionId,
+      messages: [makeMessage({ role: "user", content: storedMessage.content })],
+      tokenBudget: 1_000,
+    });
+    await engine.getCompactionMaintenanceStore().requestProactiveCompactionDebt({
+      conversationId: conversation.conversationId,
+      reason: "threshold",
+      tokenBudget: 100,
+      currentTokenCount: 150,
+    });
+    vi.spyOn(privateEngine, "executeCompactionCore").mockImplementation(async () => {
+      await summaryStore.insertSummary({
+        summaryId: "sum_emergency_projection_refresh",
+        conversationId: conversation.conversationId,
+        kind: "leaf",
+        depth: 0,
+        content: "Emergency compaction summary.",
+        tokenCount: 10,
+        descendantCount: 1,
+      });
+      await summaryStore.replaceContextRangeWithSummary({
+        conversationId: conversation.conversationId,
+        startOrdinal: 0,
+        endOrdinal: 0,
+        summaryId: "sum_emergency_projection_refresh",
+      });
+      return { ok: true, compacted: true, reason: "compacted" };
+    });
+
+    const afterCompaction = await engine.assemble({
+      sessionId,
+      messages: [makeMessage({ role: "user", content: "current emergency turn" })],
+      tokenBudget: 100,
+    });
+
+    expect(afterCompaction.contextProjection?.epoch).not.toBe(
+      beforeCompaction.contextProjection?.epoch,
+    );
+  });
+
   it("assemble() drains pending threshold debt when recorded runtime tokens are over budget", async () => {
     const engine = createEngine();
     const privateEngine = engine as unknown as {
