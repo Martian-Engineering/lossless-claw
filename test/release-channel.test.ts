@@ -28,14 +28,18 @@ describe("release-channel CLI", () => {
     const result = classify("0.13.2");
 
     expect(result.status).toBe(0);
-    expect(result.stdout).toBe("npm_tag=latest\nprerelease=false\n");
+    expect(result.stdout).toBe(
+      "npm_tag=latest\nclawhub_tags=stable,latest\nprerelease=false\n",
+    );
   });
 
   it("routes beta versions to beta and GitHub prerelease", () => {
     const result = classify("0.14.0-beta.0");
 
     expect(result.status).toBe(0);
-    expect(result.stdout).toBe("npm_tag=beta\nprerelease=true\n");
+    expect(result.stdout).toBe(
+      "npm_tag=beta\nclawhub_tags=beta,latest\nprerelease=true\n",
+    );
   });
 
   it.each(["0.14.0-rc.0", "0.14.0-alpha.1", "banana", "1.2"])(
