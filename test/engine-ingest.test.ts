@@ -1534,7 +1534,7 @@ describe("LcmContextEngine.ingest content extraction", () => {
         message: makeMessage({ role: "user", content: "keep LCM active" }),
       });
 
-      expect(ingested).toEqual({ ingested: true });
+      expect(ingested).toEqual({ ingested: true, messageId: expect.any(Number) });
 
       const result = await engine.maintain({
         sessionId,
@@ -1622,8 +1622,8 @@ describe("LcmContextEngine.ingest content extraction", () => {
     releaseFirstCreate();
 
     await expect(Promise.all([firstIngest, secondIngest])).resolves.toEqual([
-      { ingested: true },
-      { ingested: true },
+      { ingested: true, messageId: expect.any(Number) },
+      { ingested: true, messageId: expect.any(Number) },
     ]);
 
     const conversation = await store.getConversationBySessionKey(sessionKey);

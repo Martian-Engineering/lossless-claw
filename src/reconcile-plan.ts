@@ -107,6 +107,13 @@ export type TranscriptReconcileResult = {
   importedMessages: number;
   hasOverlap: boolean;
   /**
+   * message_ids of the rows THIS reconcile inserted, in insertion order.
+   * Ground truth for the same-turn metadata-face collapse: only a row whose
+   * id appears here may anchor it. Absent or empty when nothing was
+   * inserted, which keeps the strong collapse off.
+   */
+  insertedMessageIds?: number[];
+  /**
    * True only when the transcript file was actually read to its frontier and
    * reconciled into the DB this call (or proven already reconciled). When
    * true, the transcript is the single persistence source for the turn and

@@ -4,11 +4,14 @@
 // persists the BARE body (with a transcript_entry_id), while the runtime
 // AgentMessage carries the DECORATED face ("Conversation info (untrusted
 // metadata)" block + body). Their identity_hashes differ, so identity dedup
-// cannot see the pair; the metadata-body match must collapse it. Anchoring
-// The covered-frontier path requires both persisted transcript provenance and
-// an independent exact/timestamp replay anchor. Heuristic degraded and
-// oversized routes cannot prove that an incoming face belongs to that row, so
-// they preserve both faces (duplicates over deletion).
+// cannot see the pair; the metadata-body match must collapse it. Collapse
+// strength exists only on the transcript-covered route and requires the
+// persisted row to be host-proven (transcript provenance), among the exact
+// message ids the CURRENT turn's own reconcile reported as inserted, AND
+// the conversation's newest user row — a backfilled historical row imported
+// by the same reconcile never anchors while a newer user row exists. Any
+// other row, and any provenance-less row, stays weak and duplicates instead
+// of trimming; the degraded and oversized routes never strong-collapse.
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { LcmContextEngine } from "../src/engine.js";
 import {
@@ -121,7 +124,7 @@ describe("metadata-face covered-path double-write", () => {
     ).toBe(true);
   });
 
-  it("keeps the decorated turn on the degraded route even when the persisted row is transcript-proven", async () => {
+  it("keeps the pair on the degraded route even for a transcript-proven row created moments ago (not this turn's ingest; covers the rapid repeated-body case)", async () => {
     const engine = quietEngine();
     const sessionId = "metadata-face-degraded-double-write";
     const sessionKey = "agent:main:metadata-face-degraded-double-write";
@@ -164,6 +167,11 @@ describe("metadata-face covered-path double-write", () => {
       tokenBudget: 4_096,
     });
 
+    // The persisted row was seeded moments ago, yet the transcript is
+    // unavailable this turn: the degraded route runs without same-turn
+    // ingest proof and never strong-collapses, so the match stays weak. A
+    // rapid repeated body (same text within seconds) takes exactly this
+    // shape, and the pair duplicates instead of eating the new turn.
     const userRows = (
       await engine.getConversationStore().getMessages(conversation.conversationId)
     ).filter((m) => m.role === "user" && m.content.includes(BARE));
@@ -172,7 +180,7 @@ describe("metadata-face covered-path double-write", () => {
     expect(userRows.some((m) => m.content !== BARE)).toBe(true);
   });
 
-  it("keeps the decorated turn on the oversized-suffix route even when the persisted row is transcript-proven", async () => {
+  it("keeps the pair on the oversized-suffix route even for a transcript-proven row created moments ago (not this turn's ingest)", async () => {
     const engine = quietEngine();
     const sessionId = "metadata-face-oversized-double-write";
     const sessionKey = "agent:main:metadata-face-oversized-double-write";
@@ -335,5 +343,206 @@ describe("metadata-face covered-path double-write", () => {
     ).filter((m) => m.role === "user" && m.content.includes(BARE));
     expect(userRows).toHaveLength(2);
     expect(userRows.some((m) => m.content === BARE)).toBe(true);
+  });
+
+});
+
+describe("covered-frontier same-turn anchor", () => {
+  it("never anchors on a backfilled row: an older user row imported by the same reconcile stays weak and the batch is kept", async () => {
+    // Catch-up reconcile shape: several host-proven rows imported by the
+    // same reconcile (both ids in this turn's inserted set), among them an
+    // OLD user row whose body a decorated runtime face repeats. Set
+    // membership alone would call that row same-turn; the newest-user-row
+    // condition refuses it, and its provenanced sibling never extends
+    // strength to the refused neighbor.
+    const engine = quietEngine();
+    const sessionId = "metadata-face-backfill";
+    const sessionKey = "agent:main:metadata-face-backfill";
+    const conversation = await engine
+      .getConversationStore()
+      .getOrCreateConversation(sessionId, { sessionKey });
+
+    const bulk = await engine.getConversationStore().createMessagesBulk([
+      {
+        conversationId: conversation.conversationId,
+        seq: 0,
+        role: "user",
+        content: BARE,
+        tokenCount: 12,
+        transcriptEntryId: "backfill-entry-0001",
+        skipReplayTimestampFloodGuard: true,
+      },
+      {
+        conversationId: conversation.conversationId,
+        seq: 1,
+        role: "user",
+        content: DIFFERENT,
+        tokenCount: 8,
+        transcriptEntryId: "backfill-entry-0002",
+        skipReplayTimestampFloodGuard: true,
+      },
+    ]);
+    await engine
+      .getSummaryStore()
+      .appendContextMessages(conversation.conversationId, bulk.map((m) => m.messageId));
+
+    const result = await engine
+      .getBatchDeduplicator()
+      .alignRuntimeBatchAgainstCoveredFrontier(
+        sessionId,
+        sessionKey,
+        [
+          makeMessage({ role: "user", content: decorated(BARE) }),
+          makeMessage({ role: "user", content: decorated(DIFFERENT) }),
+        ],
+        new Set(bulk.map((m) => m.messageId)),
+      );
+
+    // The BARE-bodied face matched a row that is above the floor but not the
+    // newest user row (a backfill), so nothing in the suffix may trim.
+    expect(result).toHaveLength(2);
+  });
+
+  it("collapses a lone decorated face onto exactly its own same-turn ingest (in the inserted set and the newest user row)", async () => {
+    const engine = quietEngine();
+    const sessionId = "metadata-face-own-ingest";
+    const sessionKey = "agent:main:metadata-face-own-ingest";
+    const conversation = await engine
+      .getConversationStore()
+      .getOrCreateConversation(sessionId, { sessionKey });
+
+    const bulk = await engine.getConversationStore().createMessagesBulk([
+      {
+        conversationId: conversation.conversationId,
+        seq: 0,
+        role: "user",
+        content: BARE,
+        tokenCount: 12,
+        transcriptEntryId: "own-ingest-entry-0001",
+        skipReplayTimestampFloodGuard: true,
+      },
+    ]);
+    await engine
+      .getSummaryStore()
+      .appendContextMessages(conversation.conversationId, bulk.map((m) => m.messageId));
+
+    const result = await engine
+      .getBatchDeduplicator()
+      .alignRuntimeBatchAgainstCoveredFrontier(
+        sessionId,
+        sessionKey,
+        [makeMessage({ role: "user", content: decorated(BARE) })],
+        new Set([bulk[0]!.messageId]),
+      );
+
+    expect(result).toHaveLength(0);
+  });
+
+  it("keeps the pair when rows were inserted out of seq order before this turn (pre-existing rows are never in the inserted set)", async () => {
+    // Insertion order deliberately diverges from seq order: the assistant
+    // tail row (seq 1) is inserted FIRST, the user row (seq 0) SECOND, so
+    // the user row carries the higher message_id while the logical tail's
+    // id sits below it. Both rows predate this turn, so neither appears in
+    // the reconcile's inserted-id set and no watermark inference can
+    // misclassify them; the pair is kept.
+    const engine = quietEngine();
+    const sessionId = "metadata-face-out-of-order";
+    const sessionKey = "agent:main:metadata-face-out-of-order";
+    const conversation = await engine
+      .getConversationStore()
+      .getOrCreateConversation(sessionId, { sessionKey });
+
+    const assistantRows = await engine.getConversationStore().createMessagesBulk([
+      {
+        conversationId: conversation.conversationId,
+        seq: 1,
+        role: "assistant",
+        content: "previous exact reply",
+        tokenCount: 3,
+        transcriptEntryId: "ooo-entry-0002",
+        skipReplayTimestampFloodGuard: true,
+      },
+    ]);
+    const userRows = await engine.getConversationStore().createMessagesBulk([
+      {
+        conversationId: conversation.conversationId,
+        seq: 0,
+        role: "user",
+        content: BARE,
+        tokenCount: 12,
+        transcriptEntryId: "ooo-entry-0001",
+        skipReplayTimestampFloodGuard: true,
+      },
+    ]);
+    // The divergence this test exists for: the seq-0 user row was inserted
+    // after the seq-1 tail row and carries the higher message_id.
+    expect(userRows[0]!.messageId).toBeGreaterThan(assistantRows[0]!.messageId);
+    await engine
+      .getSummaryStore()
+      .appendContextMessages(conversation.conversationId, [
+        userRows[0]!.messageId,
+        assistantRows[0]!.messageId,
+      ]);
+
+    const sessionFile = createSessionFilePath("metadata-face-out-of-order");
+    writeLeafTranscript(sessionFile, [
+      { role: "user", content: BARE },
+      { role: "assistant", content: "previous exact reply" },
+    ]);
+    await engine.getSummaryStore().upsertConversationBootstrapState({
+      conversationId: conversation.conversationId,
+      sessionFilePath: sessionFile,
+      lastSeenSize: 0,
+      lastSeenMtimeMs: 0,
+      lastProcessedOffset: 0,
+      lastProcessedEntryHash: null,
+    });
+
+    await engine.afterTurn({
+      sessionId,
+      sessionKey,
+      sessionFile,
+      messages: [makeMessage({ role: "user", content: decorated(BARE) })],
+      prePromptMessageCount: 0,
+      tokenBudget: 4_096,
+    });
+
+    const stored = await engine.getConversationStore().getMessages(conversation.conversationId);
+    const bareRows = stored.filter((m) => m.role === "user" && m.content.includes(BARE));
+    expect(bareRows).toHaveLength(2);
+    expect(bareRows.some((m) => m.content === BARE)).toBe(true);
+    expect(bareRows.some((m) => m.content !== BARE)).toBe(true);
+  });
+
+  it("keeps the pair when no floor is available (lookup failure disables the strong collapse)", async () => {
+    const engine = quietEngine();
+    const sessionId = "metadata-face-no-floor";
+    const sessionKey = "agent:main:metadata-face-no-floor";
+    const conversation = await engine
+      .getConversationStore()
+      .getOrCreateConversation(sessionId, { sessionKey });
+
+    const bulk = await engine.getConversationStore().createMessagesBulk([
+      {
+        conversationId: conversation.conversationId,
+        seq: 0,
+        role: "user",
+        content: BARE,
+        tokenCount: 12,
+        transcriptEntryId: "no-floor-entry-0001",
+        skipReplayTimestampFloodGuard: true,
+      },
+    ]);
+    await engine
+      .getSummaryStore()
+      .appendContextMessages(conversation.conversationId, bulk.map((m) => m.messageId));
+
+    const result = await engine
+      .getBatchDeduplicator()
+      .alignRuntimeBatchAgainstCoveredFrontier(sessionId, sessionKey, [
+        makeMessage({ role: "user", content: decorated(BARE) }),
+      ]);
+
+    expect(result).toHaveLength(1);
   });
 });

@@ -91,6 +91,8 @@ export type ContextEngineMaintenanceRuntimeContext = Record<string, unknown> & {
 
 export type IngestResult = {
   ingested: boolean;
+  /** Set when ingested: the persisted row's message id. */
+  messageId?: number;
 };
 
 export type IngestBatchResult = {
