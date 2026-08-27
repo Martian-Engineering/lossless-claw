@@ -78,7 +78,7 @@ jobs:
       contents: read
     outputs:
       source_sha: ${{ steps.identity.outputs.source_sha }}
-      release_channel: ${{ steps.identity.outputs.release_channel }}
+      clawhub_tags: ${{ steps.identity.outputs.clawhub_tags }}
     steps:
       - name: Checkout selected release
         uses: actions/checkout@v4
@@ -109,6 +109,7 @@ jobs:
           fi
 
           source_sha="$(git rev-parse HEAD)"
+          clawhub_tags="$(node scripts/release-channel.mjs "$version" | sed -n 's/^clawhub_tags=//p')"
           git fetch --no-tags origin "refs/tags/$RELEASE_TAG:refs/tags/$RELEASE_TAG"
           tag_sha="$(git rev-list -n 1 "refs/tags/$RELEASE_TAG")"
           if [ "$source_sha" != "$tag_sha" ]; then
@@ -126,7 +127,7 @@ jobs:
           fi
 
           echo "source_sha=$source_sha" >> "$GITHUB_OUTPUT"
-          echo "release_channel=$RELEASE_CHANNEL" >> "$GITHUB_OUTPUT"
+          echo "clawhub_tags=$clawhub_tags" >> "$GITHUB_OUTPUT"
 
       - name: Download exact npm package tarball
         run: |
@@ -168,7 +169,7 @@ jobs:
       source_commit: ${{ needs.release-preflight.outputs.source_sha }}
       source_ref: ${{ needs.release-preflight.outputs.source_sha }}
       package_artifact_name: clawhub-release-package
-      tags: ${{ needs.release-preflight.outputs.release_channel }}
+      tags: ${{ needs.release-preflight.outputs.clawhub_tags }}
       dry_run: true
 
   publish:
@@ -190,5 +191,5 @@ jobs:
       source_commit: ${{ needs.release-preflight.outputs.source_sha }}
       source_ref: ${{ needs.release-preflight.outputs.source_sha }}
       package_artifact_name: clawhub-release-package
-      tags: ${{ needs.release-preflight.outputs.release_channel }}
+      tags: ${{ needs.release-preflight.outputs.clawhub_tags }}
       dry_run: false

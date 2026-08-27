@@ -9,6 +9,7 @@ function parseVersion(version) {
   if (stable) {
     return {
       channel: "latest",
+      clawhubTags: "stable,latest",
       parts: stable.slice(1).map(BigInt),
       prerelease: false,
     };
@@ -18,6 +19,7 @@ function parseVersion(version) {
   if (beta) {
     return {
       channel: "beta",
+      clawhubTags: "beta,latest",
       parts: beta.slice(1).map(BigInt),
       prerelease: true,
     };
@@ -110,7 +112,7 @@ if (process.argv[2] === "--read-rollback") {
 
   if (release) {
     process.stdout.write(
-      `npm_tag=${release.channel}\nprerelease=${release.prerelease}\n`,
+      `npm_tag=${release.channel}\nclawhub_tags=${release.clawhubTags}\nprerelease=${release.prerelease}\n`,
     );
   } else {
     fail(`Unsupported release version: ${version}`);
