@@ -2006,8 +2006,20 @@ export class LcmContextEngine implements ContextEngine {
           : {}),
       },
     );
+    // Overflow recovery can receive the host's raw context window before its
+    // response reserve is subtracted. Use the configured threshold target so
+    // a forced budget request creates the same headroom as proactive compaction.
+    const forcedBudgetRecovery = force && params.compactionTarget !== "threshold";
+    const forcedBudgetTargetTokens = Math.max(
+      1,
+      Math.min(decision.threshold, tokenBudget - 1),
+    );
     const targetTokens =
-      params.compactionTarget === "threshold" ? decision.threshold : tokenBudget;
+      params.compactionTarget === "threshold"
+        ? decision.threshold
+        : forcedBudgetRecovery
+          ? forcedBudgetTargetTokens
+          : tokenBudget;
     // Codex can report a live prompt count that includes runtime framing,
     // tool schemas, and other overhead not present in Lossless's compactable
     // stored count. Raw backlog is different: it can force a sweep, but once
@@ -2316,12 +2328,7 @@ export class LcmContextEngine implements ContextEngine {
       };
     }
 
-    // When forced, use the token budget as target
-    const convergenceTargetTokens = forceCompaction
-      ? tokenBudget
-      : params.compactionTarget === "threshold"
-        ? decision.threshold
-        : tokenBudget;
+    const convergenceTargetTokens = targetTokens;
 
     // When forced (overflow recovery) and the caller did not supply an
     // observed token count, assume we are at least at the token budget so
