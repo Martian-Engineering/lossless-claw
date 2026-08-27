@@ -110,7 +110,9 @@ const serializedEstimateCache = new WeakMap<object, number>();
 
 /**
  * Estimate the model-boundary token cost of a full message object by
- * serializing the entire structure, not just its text blocks.
+ * serializing its rendered structure, not just its text blocks. Top-level
+ * `__openclaw` metadata belongs to the host persistence boundary and is not
+ * rendered into the model prompt.
  *
  * The LLM-boundary prompt renderer serializes structured tool-call payloads
  * (tool inputs, tool result objects, mirrored identifiers) that text-only
@@ -135,7 +137,10 @@ export function estimateSerializedMessageTokens(message: unknown): number {
     // not occur in practice; shared (DAG) references serialize in full,
     // which is what the model boundary sees too.
     serialized =
-      JSON.stringify(message, (key, value) => {
+      JSON.stringify(message, function (this: unknown, key, value) {
+        if (this === message && key === "__openclaw") {
+          return undefined;
+        }
         if (typeof value === "string" && isLikelyOpaqueBinaryString(key, value)) {
           opaqueParts += 1;
           return "[opaque binary payload]";
