@@ -1,5 +1,17 @@
 # @martian-engineering/lossless-claw
 
+## 0.15.6
+
+<!-- release-rollback-version: 0.15.5 -->
+
+### Patch Changes
+
+- [#1133](https://github.com/Martian-Engineering/lossless-claw/pull/1133) [`8b37ecb`](https://github.com/Martian-Engineering/lossless-claw/commit/8b37ecb188358d33bd00cd3438678257edd2e5fc) Thanks [@jalehman](https://github.com/jalehman)! - Leave configured threshold headroom when OpenClaw forces overflow recovery, preventing a raw context-window budget from causing no-op compaction.
+
+- [#1128](https://github.com/Martian-Engineering/lossless-claw/pull/1128) [`13e8405`](https://github.com/Martian-Engineering/lossless-claw/commit/13e8405e48f7774924155e6b2b8499ef2dedf2a0) Thanks [@PollyBot13](https://github.com/PollyBot13)! - Ignore top-level private OpenClaw metadata when estimating model-boundary tokens.
+
+- [#1135](https://github.com/Martian-Engineering/lossless-claw/pull/1135) [`34c5b73`](https://github.com/Martian-Engineering/lossless-claw/commit/34c5b73a2fee6c2a0868165b94f7d30d8325b24d) Thanks [@jalehman](https://github.com/jalehman)! - Remove the unsupported `contracts.sessionActions` manifest field while preserving the runtime `lcm-control` session action.
+
 ## 0.15.5
 
 <!-- release-rollback-version: 0.15.4 -->
