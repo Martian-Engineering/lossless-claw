@@ -185,6 +185,40 @@ describe("LcmContextEngine commitTurn", () => {
     ).toEqual({ message_count: 0 });
   });
 
+  it("aligns a decorated accepted user message with its bare projected admission", async () => {
+    const engine = createEngine();
+    const params = buildCommitTurnParams();
+    await engine.ingest({
+      sessionId: params.sessionId,
+      sessionKey: params.sessionKey,
+      message: attachTranscriptEntryMeta(
+        { ...params.messages[0]! },
+        {
+          entryId: params.admission.entryId,
+          parentId: null,
+          timestamp: null,
+        },
+      ),
+    });
+    params.messages[0] = makeMessage({
+      role: "user",
+      content: `[Sun 2026-01-01 12:00 GMT+0]\ncurrent question`,
+      timestamp: 2_000,
+    });
+
+    await expect(engine.commitTurn(params)).resolves.toEqual({ status: "committed" });
+
+    expect((await readStoredMessages(engine)).map((message) => message.content)).toEqual([
+      "current question",
+      "current answer",
+    ]);
+    expect(
+      getEngineDatabase(engine)
+        .prepare("SELECT message_count FROM turn_advancements WHERE advancement_key = ?")
+        .get(params.advancementKey),
+    ).toEqual({ message_count: 1 });
+  });
+
   it("ingests only the unflushed suffix before recording the receipt", async () => {
     const engine = createEngine();
     const params = buildCommitTurnParams();

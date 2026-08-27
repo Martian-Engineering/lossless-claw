@@ -4157,10 +4157,10 @@ export class LcmContextEngine implements ContextEngine {
           }
 
           // The visible transcript can reach LCM before the host advances the
-          // accepted turn. Only align when that race is proven by the current
-          // admission's host-written transcript entry id; content equality
-          // alone cannot distinguish a replay from a legitimate later turn
-          // that repeats the same messages.
+          // accepted turn. Only enter covered-frontier alignment when the
+          // current admission's host-written entry id anchors a trusted row.
+          // The aligner validates exact or decorated content and fails open on
+          // mismatches, so repeated later turns remain preserved.
           const conversation = await this.conversationStore.getConversationForSession({
             sessionId,
             sessionKey,
@@ -4186,8 +4186,7 @@ export class LcmContextEngine implements ContextEngine {
             (admissionAnchorTrust.trustState === "verified" ||
               admissionAnchorTrust.trustState === "repaired") &&
             admissionAnchor.role === params.admission.role &&
-            admissionAnchor.role === admissionMessage.role &&
-            admissionAnchor.content === admissionMessage.content;
+            admissionAnchor.role === admissionMessage.role;
           // Keep alignment inside the same transaction as the receipt. Its
           // ambiguous-partial-overlap path fails open to preserve new data.
           const messagesToIngest = transcriptAlreadyProjected
