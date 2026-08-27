@@ -24,9 +24,6 @@
       "lcm_describe",
       "lcm_expand",
       "lcm_expand_query"
-    ],
-    "sessionActions": [
-      "lcm-control"
     ]
   },
   "toolMetadata": {

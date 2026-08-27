@@ -99,6 +99,10 @@ function extractRegisterToolFactoryCallSites(): RegisterToolFactoryCallSite[] {
   return sites.sort((a, b) => a.factory.localeCompare(b.factory));
 }
 describe("openclaw.plugin.json manifest drift guard (#570)", () => {
+  it("limits contracts to fields supported by the declared OpenClaw host", () => {
+    expect(Object.keys(manifest.contracts)).toEqual(["tools"]);
+  });
+
   it("contracts.tools matches the canonical name fields in src/tools/*", () => {
     const declared = [...manifest.contracts.tools].sort();
     const fromSource = extractToolNames();
