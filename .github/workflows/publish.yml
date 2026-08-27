@@ -214,11 +214,13 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           WORKFLOW_REF: v${{ steps.package.outputs.version }}
           RELEASE_TAG: v${{ steps.package.outputs.version }}
+          RELEASE_CHANNEL: ${{ steps.package.outputs.npm_tag }}
         run: |
           jq -n \
             --arg ref "$WORKFLOW_REF" \
             --arg release_tag "$RELEASE_TAG" \
-            '{ref: $ref, inputs: {release_tag: $release_tag, dry_run: false}}' |
+            --arg release_channel "$RELEASE_CHANNEL" \
+            '{ref: $ref, inputs: {release_tag: $release_tag, release_channel: $release_channel, dry_run: false}}' |
             gh api \
               --method POST \
               -H "Accept: application/vnd.github+json" \
