@@ -1,5 +1,23 @@
 # @martian-engineering/lossless-claw
 
+## 1.0.0-beta.7
+
+<!-- release-rollback-version: 0.15.6 -->
+
+### Patch Changes
+
+- [#1126](https://github.com/Martian-Engineering/lossless-claw/pull/1126) [`479beb6`](https://github.com/Martian-Engineering/lossless-claw/commit/479beb6760dfc21960e13180514998e085f9cfa1) Thanks [@t3t5ujin](https://github.com/t3t5ujin)! - Deduplicate host-accepted turn messages against the covered transcript frontier before recording a durable advancement, preventing native runtimes from storing a second copy when transcript projection ingestion wins the race while preserving unflushed suffixes and ambiguous data.
+
+- [#1134](https://github.com/Martian-Engineering/lossless-claw/pull/1134) [`aa85938`](https://github.com/Martian-Engineering/lossless-claw/commit/aa859380faa6e68ec55255e5e257db95b3d1c541) Thanks [@jalehman](https://github.com/jalehman)! - Leave configured threshold headroom when OpenClaw forces overflow recovery, preventing a raw context-window budget from causing no-op compaction.
+
+- [#1106](https://github.com/Martian-Engineering/lossless-claw/pull/1106) [`fe891a4`](https://github.com/Martian-Engineering/lossless-claw/commit/fe891a41ea8f3482d4664e8666b0bd46dc26aa75) Thanks [@astra-openclaw](https://github.com/astra-openclaw)! - Preserve stable `thread_bootstrap` projection metadata when a managed conversation uses bounded or degraded live fallback, preventing persistent Codex threads from appending the reconstructed transcript again on every turn while compaction maintenance is pending.
+
+- [#1130](https://github.com/Martian-Engineering/lossless-claw/pull/1130) [`bcaad7a`](https://github.com/Martian-Engineering/lossless-claw/commit/bcaad7aaaa4030f6ccbd020f1c31451c3abcee2a) Thanks [@jalehman](https://github.com/jalehman)! - Ignore top-level private OpenClaw metadata when estimating model-boundary tokens.
+
+- [#1111](https://github.com/Martian-Engineering/lossless-claw/pull/1111) [`5185250`](https://github.com/Martian-Engineering/lossless-claw/commit/5185250caa6afd64a4ba528576094b41f715ae85) Thanks [@astra-openclaw](https://github.com/astra-openclaw)! - Publish deterministic, raw-linked coverage for pending summary sources that sanitize empty, without retrying or calling the summary model, so later meaningful compaction work can continue and publish without an ordinal gap.
+
+- [#1136](https://github.com/Martian-Engineering/lossless-claw/pull/1136) [`bad9c34`](https://github.com/Martian-Engineering/lossless-claw/commit/bad9c344fab52733612117d39aa72ba1f0da594f) Thanks [@jalehman](https://github.com/jalehman)! - Remove the unsupported `contracts.sessionActions` manifest field while preserving the runtime `lcm-control` session action.
+
 ## 1.0.0-beta.6
 
 <!-- release-rollback-version: 0.15.5 -->
