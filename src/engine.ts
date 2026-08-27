@@ -4700,6 +4700,18 @@ export class LcmContextEngine implements ContextEngine {
           ? Math.floor(params.tokenBudget)
           : 128_000,
       );
+      let contextItems = await this.summaryStore.getContextItems(conversation.conversationId);
+      let activeFocusBrief = await this.focusBriefStore.getActiveFocusBrief(
+        conversation.conversationId,
+      );
+      let contextProjection = {
+        mode: "thread_bootstrap" as const,
+        epoch: buildContextEngineProjectionEpoch(
+          conversation.conversationId,
+          contextItems,
+          activeFocusBrief,
+        ),
+      };
       // Bounded variant of safeFallback for paths where this engine manages
       // the conversation but cannot produce assembled coverage. Returning the
       // raw live transcript unbounded here is how an over-budget prompt
@@ -4716,7 +4728,11 @@ export class LcmContextEngine implements ContextEngine {
             `[lcm] assemble: bounded live fallback conversation=${conversation.conversationId} ${sessionLabel} reason=${reason} serializedTokensBefore=${clamp.serializedTokensBefore} serializedTokens=${clamp.serializedTokens} evictedMessages=${clamp.evictedMessages} tokenBudget=${tokenBudget} overBudget=${clamp.overBudget}`,
           );
         }
-        return { messages: clamp.messages, estimatedTokens: clamp.serializedTokens };
+        return {
+          messages: clamp.messages,
+          estimatedTokens: clamp.serializedTokens,
+          contextProjection,
+        };
       };
       let storedContextTokens = await this.summaryStore.getContextTokenCount(
         conversation.conversationId,
@@ -4760,6 +4776,20 @@ export class LcmContextEngine implements ContextEngine {
               `[lcm] assemble: deferred compaction execution failed for ${sessionLabel}: ${describeLogError(error)}`,
             );
           }
+          // Emergency maintenance may replace the canonical context prefix.
+          // Refresh both projection inputs before returning any assemble path.
+          contextItems = await this.summaryStore.getContextItems(conversation.conversationId);
+          activeFocusBrief = await this.focusBriefStore.getActiveFocusBrief(
+            conversation.conversationId,
+          );
+          contextProjection = {
+            mode: "thread_bootstrap",
+            epoch: buildContextEngineProjectionEpoch(
+              conversation.conversationId,
+              contextItems,
+              activeFocusBrief,
+            ),
+          };
           storedContextTokens = await this.summaryStore.getContextTokenCount(
             conversation.conversationId,
           );
@@ -4803,6 +4833,7 @@ export class LcmContextEngine implements ContextEngine {
           liveMessages,
           tokenBudget,
           preserveSubstantiveAssistantTail: hostDeliversCurrentTurnSeparately,
+          contextProjection,
         });
         this.deps.log.warn(
           `[lcm] assemble: degraded live fallback conversation=${conversation.conversationId} ${sessionLabel} reason=${deferredAssemblyDegradation.reason} storedContextTokens=${deferredAssemblyDegradation.pressure.storedContextTokens} projectedTokenCount=${deferredAssemblyDegradation.pressure.projectedTokenCount ?? "null"} tokenBudget=${tokenBudget} pressureThreshold=${Math.floor(tokenBudget * DEFERRED_ASSEMBLY_DEGRADED_PRESSURE_RATIO)} outputMessages=${degraded.messages.length} estimatedTokens=${degraded.estimatedTokens}`,
@@ -4810,7 +4841,6 @@ export class LcmContextEngine implements ContextEngine {
         return degraded;
       }
 
-      const contextItems = await this.summaryStore.getContextItems(conversation.conversationId);
       if (contextItems.length === 0) {
         this.deps.log.debug(
           `[lcm] assemble: no context items conversation=${conversation.conversationId} ${sessionLabel} duration=${formatDurationMs(Date.now() - startedAt)}`,
@@ -4993,14 +5023,7 @@ export class LcmContextEngine implements ContextEngine {
       const stubStatsLog = assembled.debug?.stubStats
         ? ` stubbed=${assembled.debug.stubStats.stubbedCount} tokensSaved=${assembled.debug.stubStats.tokensSaved}`
         : "";
-      const activeFocusBrief = await this.focusBriefStore.getActiveFocusBrief(
-        conversation.conversationId,
-      );
-      const contextProjectionEpoch = buildContextEngineProjectionEpoch(
-        conversation.conversationId,
-        contextItems,
-        activeFocusBrief,
-      );
+      const contextProjectionEpoch = contextProjection.epoch;
       const contextProjectionFingerprint = budgetedPromptRecallCue
         ? buildPromptRecallProjectionFingerprint(budgetedPromptRecallCue.message)
         : undefined;
@@ -5052,8 +5075,7 @@ export class LcmContextEngine implements ContextEngine {
         messages: finalMessages,
         estimatedTokens: finalEstimatedTokens,
         contextProjection: {
-          mode: "thread_bootstrap",
-          epoch: contextProjectionEpoch,
+          ...contextProjection,
           ...(contextProjectionFingerprint ? { fingerprint: contextProjectionFingerprint } : {}),
         },
 
