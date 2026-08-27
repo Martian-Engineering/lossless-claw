@@ -4163,8 +4163,48 @@ export class LcmContextEngine implements ContextEngine {
             return { status: "duplicate" as const };
           }
 
+          // The visible transcript can reach LCM before the host advances the
+          // accepted turn. Only enter covered-frontier alignment when the
+          // current admission's host-written entry id anchors a trusted row.
+          // The aligner validates exact or decorated content and fails open on
+          // mismatches, so repeated later turns remain preserved.
+          const conversation = await this.conversationStore.getConversationForSession({
+            sessionId,
+            sessionKey,
+          });
+          const admissionMessage = toStoredMessage(params.messages[0]!);
+          const admissionAnchor = conversation
+            ? await this.conversationStore.getTranscriptEntryAnchorCandidate(
+                conversation.conversationId,
+                params.admission.entryId,
+              )
+            : null;
+          const admissionAnchorTrust = admissionAnchor
+            ? await this.conversationStore.getMessageTranscriptAnchorTrust(
+                admissionAnchor.messageId,
+              )
+            : null;
+          const transcriptAlreadyProjected =
+            conversation !== null &&
+            admissionAnchor !== null &&
+            admissionAnchorTrust !== null &&
+            admissionAnchorTrust.conversationId === conversation.conversationId &&
+            admissionAnchorTrust.transcriptEntryId === params.admission.entryId &&
+            (admissionAnchorTrust.trustState === "verified" ||
+              admissionAnchorTrust.trustState === "repaired") &&
+            admissionAnchor.role === params.admission.role &&
+            admissionAnchor.role === admissionMessage.role;
+          // Keep alignment inside the same transaction as the receipt. Its
+          // ambiguous-partial-overlap path fails open to preserve new data.
+          const messagesToIngest = transcriptAlreadyProjected
+            ? await this.batchDeduplicator.alignRuntimeBatchAgainstCoveredFrontier(
+                sessionId,
+                sessionKey,
+                params.messages,
+              )
+            : params.messages;
           let ingestedCount = 0;
-          for (const message of params.messages) {
+          for (const message of messagesToIngest) {
             const result = await this.ingestSingle({
               sessionId,
               sessionKey,
