@@ -110,6 +110,14 @@ ClawHub trusted publishing is configured for
 required. Deleting that trusted-publisher configuration disables future
 publishes.
 
+ClawHub's `latest` tag always follows the highest semantic version for code
+plugins, including prereleases. Stable releases therefore request the custom
+`stable` tag plus `latest`, while beta releases request `beta` plus `latest`.
+ClawHub keeps `stable` on the newest stable artifact and accepts `latest` only
+when the candidate is the highest version. This is intentionally independent
+of npm, where `latest` remains the stable channel and `beta` remains the beta
+channel.
+
 ## Beta releases
 
 Use a Changesets prerelease when `main` needs broader testing before a stable release:

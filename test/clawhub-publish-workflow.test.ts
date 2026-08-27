@@ -55,7 +55,10 @@ describe("ClawHub publish workflow", () => {
       'RELEASE_CHANNEL" != "$expected_channel"',
     );
     expect(workflow).toContain(
-      'echo "release_channel=$RELEASE_CHANNEL" >> "$GITHUB_OUTPUT"',
+      'clawhub_tags="$(node scripts/release-channel.mjs "$version"',
+    );
+    expect(workflow).toContain(
+      'echo "clawhub_tags=$clawhub_tags" >> "$GITHUB_OUTPUT"',
     );
   });
 
@@ -79,7 +82,7 @@ describe("ClawHub publish workflow", () => {
     expect(workflow.match(/package_artifact_name: clawhub-release-package/g)).toHaveLength(2);
     expect(
       workflow.match(
-        /tags: \$\{\{ needs\.release-preflight\.outputs\.release_channel \}\}/g,
+        /tags: \$\{\{ needs\.release-preflight\.outputs\.clawhub_tags \}\}/g,
       ),
     ).toHaveLength(2);
   });
