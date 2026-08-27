@@ -2,6 +2,8 @@
 
 ## 0.15.6
 
+<!-- release-rollback-version: 0.15.5 -->
+
 ### Patch Changes
 
 - [#1133](https://github.com/Martian-Engineering/lossless-claw/pull/1133) [`8b37ecb`](https://github.com/Martian-Engineering/lossless-claw/commit/8b37ecb188358d33bd00cd3438678257edd2e5fc) Thanks [@jalehman](https://github.com/jalehman)! - Leave configured threshold headroom when OpenClaw forces overflow recovery, preventing a raw context-window budget from causing no-op compaction.
