@@ -335,19 +335,26 @@ function buildLeafSourceText(params: {
 }): string {
   const rows = params.db
     .prepare(
-      `SELECT m.created_at, COALESCE(m.content, '') AS content
+      `SELECT m.created_at, m.role, COALESCE(m.content, '') AS content
        FROM summary_messages sm
        JOIN messages m ON m.message_id = sm.message_id
        WHERE sm.summary_id = ?
        ORDER BY sm.ordinal ASC`,
     )
-    .all(params.target.summaryId) as Array<{ created_at: string; content: string }>;
+    .all(params.target.summaryId) as Array<{
+      created_at: string;
+      role: string | null;
+      content: string;
+    }>;
   if (rows.length === 0) {
     throw new Error("no messages linked to summary");
   }
 
   return rows
-    .map((row) => `[${formatSqliteTimestamp(row.created_at, params.timezone)}]\n${row.content}`)
+    .map(
+      (row) =>
+        `[${formatSqliteTimestamp(row.created_at, params.timezone)} | ${row.role ?? "unknown"}]\n${row.content}`,
+    )
     .join("\n\n");
 }
 

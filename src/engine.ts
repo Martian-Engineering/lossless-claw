@@ -245,6 +245,7 @@ const HOST_SESSION_END_REASON_DELETED = "deleted";
 const HOST_SESSION_END_REASON_RESET = "reset";
 const CONTEXT_ENGINE_PROJECTION_EPOCH_VERSION = "summary-prefix-v1";
 const DEFERRED_ASSEMBLY_DEGRADED_PRESSURE_RATIO = 0.75;
+const PENDING_SUMMARY_MODEL_UNAVAILABLE_REASON = "pending summary model unavailable";
 /** Stop bypassing compaction backoff after repeated emergency failures. */
 const ASSEMBLE_FORCE_MAX_RETRY_ATTEMPTS = 3;
 type CompactionExecutionParams = {
@@ -1126,7 +1127,8 @@ export class LcmContextEngine implements ContextEngine {
       if (
         result.pending === true &&
         result.reason !== "pending summaries ready for publish" &&
-        result.reason !== "circuit breaker open"
+        result.reason !== "circuit breaker open" &&
+        result.reason !== PENDING_SUMMARY_MODEL_UNAVAILABLE_REASON
       ) {
         this.schedulePendingSummaryPreparationDrain(params);
       }
@@ -1215,11 +1217,14 @@ export class LcmContextEngine implements ContextEngine {
         nextMaintenance.nextAttemptAfter.getTime() > Date.now();
       const pendingSummariesReadyForPublish =
         result?.reason === "pending summaries ready for publish";
+      const pendingSummaryModelUnavailable =
+        result?.reason === PENDING_SUMMARY_MODEL_UNAVAILABLE_REASON;
       if (
         nextMaintenance?.pending &&
         !nextMaintenance.running &&
         !retryBackoffActive &&
-        !pendingSummariesReadyForPublish
+        !pendingSummariesReadyForPublish &&
+        !pendingSummaryModelUnavailable
       ) {
         const currentTokenCount =
           result?.changed === true && result.reason === "pending summaries published"
@@ -1572,6 +1577,9 @@ export class LcmContextEngine implements ContextEngine {
   }): Promise<CompactResult & { pending?: boolean }> {
     const breakerScope = this.resolveSessionQueueKey(params.sessionId, params.sessionKey);
     const publicationOnly = params.publishPolicy === "publish-ready-only";
+    const pendingManualCompaction =
+      (asRecord(params.runtimeContext) ?? asRecord(params.legacyParams))?.manualCompaction === true;
+    const allowEmergencyFallback = params.force === true || pendingManualCompaction;
     const resolvedSummarizer = publicationOnly ? {
       summarize: async () => {
         throw new Error("publication-only pending summary pass attempted model-backed preparation");
@@ -1585,7 +1593,20 @@ export class LcmContextEngine implements ContextEngine {
       }),
       customInstructions: params.customInstructions,
       breakerScope,
+      allowEmergencyFallback,
     });
+    if (
+      !publicationOnly &&
+      !allowEmergencyFallback &&
+      resolvedSummarizer.unavailable === true
+    ) {
+      return {
+        ok: false,
+        compacted: false,
+        pending: true,
+        reason: PENDING_SUMMARY_MODEL_UNAVAILABLE_REASON,
+      };
+    }
     if (!publicationOnly &&
       resolvedSummarizer.breakerKey &&
       this.compactionGuards.isCircuitBreakerOpen(resolvedSummarizer.breakerKey)
@@ -1603,8 +1624,6 @@ export class LcmContextEngine implements ContextEngine {
       kind: "compaction",
       scope: breakerScope,
     });
-    const pendingManualCompaction =
-      (asRecord(params.runtimeContext) ?? asRecord(params.legacyParams))?.manualCompaction === true;
     if (params.force === true || pendingManualCompaction) {
       const clearedBackoffUntil =
         this.compactionGuards.clearSummarySpendBackoff(summarySpendScopeKey);
@@ -1987,8 +2006,20 @@ export class LcmContextEngine implements ContextEngine {
           : {}),
       },
     );
+    // Overflow recovery can receive the host's raw context window before its
+    // response reserve is subtracted. Use the configured threshold target so
+    // a forced budget request creates the same headroom as proactive compaction.
+    const forcedBudgetRecovery = force && params.compactionTarget !== "threshold";
+    const forcedBudgetTargetTokens = Math.max(
+      1,
+      Math.min(decision.threshold, tokenBudget - 1),
+    );
     const targetTokens =
-      params.compactionTarget === "threshold" ? decision.threshold : tokenBudget;
+      params.compactionTarget === "threshold"
+        ? decision.threshold
+        : forcedBudgetRecovery
+          ? forcedBudgetTargetTokens
+          : tokenBudget;
     // Codex can report a live prompt count that includes runtime framing,
     // tool schemas, and other overhead not present in Lossless's compactable
     // stored count. Raw backlog is different: it can force a sweep, but once
@@ -2297,12 +2328,7 @@ export class LcmContextEngine implements ContextEngine {
       };
     }
 
-    // When forced, use the token budget as target
-    const convergenceTargetTokens = forceCompaction
-      ? tokenBudget
-      : params.compactionTarget === "threshold"
-        ? decision.threshold
-        : tokenBudget;
+    const convergenceTargetTokens = targetTokens;
 
     // When forced (overflow recovery) and the caller did not supply an
     // observed token count, assume we are at least at the token budget so
@@ -2449,10 +2475,12 @@ export class LcmContextEngine implements ContextEngine {
     legacyParams?: Record<string, unknown>;
     customInstructions?: string;
     breakerScope: string;
+    allowEmergencyFallback?: boolean;
   }): Promise<{
     summarize: LcmSummarizeFn;
     summaryModel: string;
     breakerKey?: string;
+    unavailable?: boolean;
   }> {
     const lp = params.legacyParams ?? {};
     const breakerScope = params.breakerScope || "global";
@@ -2493,8 +2521,20 @@ export class LcmContextEngine implements ContextEngine {
       this.deps.log.error(`[lcm] resolveSummarize: createLcmSummarizeFromLegacyParams returned undefined`);
     } catch (err) {
       this.deps.log.error(
-        `[lcm] resolveSummarize failed, using emergency fallback: ${describeLogError(err)}`,
+        `[lcm] resolveSummarize failed${params.allowEmergencyFallback === false ? " with emergency fallback disabled" : ", using emergency fallback"}: ${describeLogError(err)}`,
       );
+    }
+    if (params.allowEmergencyFallback === false) {
+      this.deps.log.warn(
+        "[lcm] resolveSummarize: model-backed summarizer unavailable; emergency truncation disabled for automatic pending preparation",
+      );
+      return {
+        summarize: async () => {
+          throw new Error(PENDING_SUMMARY_MODEL_UNAVAILABLE_REASON);
+        },
+        summaryModel: "unavailable",
+        unavailable: true,
+      };
     }
     this.deps.log.error(`[lcm] resolveSummarize: FALLING BACK TO EMERGENCY TRUNCATION`);
     return {
@@ -4123,8 +4163,48 @@ export class LcmContextEngine implements ContextEngine {
             return { status: "duplicate" as const };
           }
 
+          // The visible transcript can reach LCM before the host advances the
+          // accepted turn. Only enter covered-frontier alignment when the
+          // current admission's host-written entry id anchors a trusted row.
+          // The aligner validates exact or decorated content and fails open on
+          // mismatches, so repeated later turns remain preserved.
+          const conversation = await this.conversationStore.getConversationForSession({
+            sessionId,
+            sessionKey,
+          });
+          const admissionMessage = toStoredMessage(params.messages[0]!);
+          const admissionAnchor = conversation
+            ? await this.conversationStore.getTranscriptEntryAnchorCandidate(
+                conversation.conversationId,
+                params.admission.entryId,
+              )
+            : null;
+          const admissionAnchorTrust = admissionAnchor
+            ? await this.conversationStore.getMessageTranscriptAnchorTrust(
+                admissionAnchor.messageId,
+              )
+            : null;
+          const transcriptAlreadyProjected =
+            conversation !== null &&
+            admissionAnchor !== null &&
+            admissionAnchorTrust !== null &&
+            admissionAnchorTrust.conversationId === conversation.conversationId &&
+            admissionAnchorTrust.transcriptEntryId === params.admission.entryId &&
+            (admissionAnchorTrust.trustState === "verified" ||
+              admissionAnchorTrust.trustState === "repaired") &&
+            admissionAnchor.role === params.admission.role &&
+            admissionAnchor.role === admissionMessage.role;
+          // Keep alignment inside the same transaction as the receipt. Its
+          // ambiguous-partial-overlap path fails open to preserve new data.
+          const messagesToIngest = transcriptAlreadyProjected
+            ? await this.batchDeduplicator.alignRuntimeBatchAgainstCoveredFrontier(
+                sessionId,
+                sessionKey,
+                params.messages,
+              )
+            : params.messages;
           let ingestedCount = 0;
-          for (const message of params.messages) {
+          for (const message of messagesToIngest) {
             const result = await this.ingestSingle({
               sessionId,
               sessionKey,

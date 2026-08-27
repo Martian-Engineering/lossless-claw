@@ -29,6 +29,24 @@
       "lcm-control"
     ]
   },
+  "toolMetadata": {
+    "lcm_grep": {
+      "profiles": ["coding", "messaging", "full"],
+      "replaySafe": true
+    },
+    "lcm_describe": {
+      "profiles": ["coding", "messaging", "full"],
+      "replaySafe": true
+    },
+    "lcm_expand": {
+      "profiles": ["coding", "messaging", "full"],
+      "replaySafe": true
+    },
+    "lcm_expand_query": {
+      "profiles": ["coding", "messaging", "full"],
+      "replaySafe": true
+    }
+  },
   "uiHints": {
     "enabled": {
       "label": "Enabled",

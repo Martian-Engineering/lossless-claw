@@ -159,7 +159,7 @@ function seedLegacySummaryGraph(db: ReturnType<typeof getLcmConnection>): void {
 }
 
 describe("runLcmMigrations summary depth backfill", () => {
-  it("adds deferred compaction retry columns to legacy maintenance rows", () => {
+  it("adds deferred compaction retry and resolution columns without rewriting legacy maintenance rows", () => {
     const db = createTestDb("legacy-maintenance.db");
     db.exec(`
       CREATE TABLE conversations (
@@ -184,9 +184,10 @@ describe("runLcmMigrations summary depth backfill", () => {
         updated_at TEXT NOT NULL DEFAULT (datetime('now'))
       );
     `);
-    db.prepare(`INSERT INTO conversations (conversation_id, session_id) VALUES (?, ?)`).run(
+    db.prepare(`INSERT INTO conversations (conversation_id, session_id, title) VALUES (?, ?, ?)`).run(
       1,
       "legacy-maintenance-session",
+      "valuable legacy conversation",
     );
     db.prepare(
       `INSERT INTO conversation_compaction_maintenance (
@@ -195,16 +196,20 @@ describe("runLcmMigrations summary depth backfill", () => {
          requested_at,
          reason,
          running,
+         last_started_at,
+         last_finished_at,
          last_failure_summary,
          token_budget,
          current_token_count
-       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
     ).run(
       1,
       1,
       "2026-05-31T12:00:00.000Z",
       "threshold",
       0,
+      "2026-05-31T12:01:00.000Z",
+      "2026-05-31T12:02:00.000Z",
       "provider timeout",
       4096,
       3500,
@@ -223,16 +228,24 @@ describe("runLcmMigrations summary depth backfill", () => {
     expect(columns.some((column) => column.name === "context_threshold_source")).toBe(true);
     expect(columns.some((column) => column.name === "context_fresh_tail_count")).toBe(true);
     expect(columns.some((column) => column.name === "context_leaf_chunk_tokens")).toBe(true);
+    expect(columns.some((column) => column.name === "resolution_reason")).toBe(true);
+    expect(columns.some((column) => column.name === "resolved_at")).toBe(true);
+    expect(columns.some((column) => column.name === "maintenance_revision")).toBe(true);
 
     const row = db
       .prepare(
-        `SELECT pending, reason, token_budget, current_token_count, retry_attempts, next_attempt_after, context_threshold, context_threshold_source, context_fresh_tail_count, context_leaf_chunk_tokens
+        `SELECT pending, requested_at, reason, running, last_started_at, last_finished_at, last_failure_summary, token_budget, current_token_count, retry_attempts, next_attempt_after, context_threshold, context_threshold_source, context_fresh_tail_count, context_leaf_chunk_tokens, resolution_reason, resolved_at, maintenance_revision
          FROM conversation_compaction_maintenance
          WHERE conversation_id = 1`,
       )
       .get() as {
       pending: number;
+      requested_at: string;
       reason: string;
+      running: number;
+      last_started_at: string;
+      last_finished_at: string;
+      last_failure_summary: string;
       token_budget: number;
       current_token_count: number;
       retry_attempts: number;
@@ -241,10 +254,18 @@ describe("runLcmMigrations summary depth backfill", () => {
       context_threshold_source: string | null;
       context_fresh_tail_count: number | null;
       context_leaf_chunk_tokens: number | null;
+      resolution_reason: string | null;
+      resolved_at: string | null;
+      maintenance_revision: number;
     };
     expect(row).toEqual({
       pending: 1,
+      requested_at: "2026-05-31T12:00:00.000Z",
       reason: "threshold",
+      running: 0,
+      last_started_at: "2026-05-31T12:01:00.000Z",
+      last_finished_at: "2026-05-31T12:02:00.000Z",
+      last_failure_summary: "provider timeout",
       token_budget: 4096,
       current_token_count: 3500,
       retry_attempts: 0,
@@ -253,6 +274,15 @@ describe("runLcmMigrations summary depth backfill", () => {
       context_threshold_source: null,
       context_fresh_tail_count: null,
       context_leaf_chunk_tokens: null,
+      resolution_reason: null,
+      resolved_at: null,
+      maintenance_revision: 0,
+    });
+    expect(
+      db.prepare(`SELECT session_id, title FROM conversations WHERE conversation_id = 1`).get(),
+    ).toEqual({
+      session_id: "legacy-maintenance-session",
+      title: "valuable legacy conversation",
     });
   });
 

@@ -26,6 +26,27 @@ forks continue to require `thread-bootstrap-projection`.
 If you cannot use a beta or upgrade OpenClaw, use a `lossless-claw` release
 compatible with your installed OpenClaw version.
 
+## Recall tool availability
+
+Lossless declares `lcm_grep`, `lcm_describe`, `lcm_expand`, and
+`lcm_expand_query` for OpenClaw's `coding`, `messaging`, and `full` tool
+profiles. It also marks these read-only recall operations as safe to replay
+after an incomplete model turn. Explicit operator deny rules remain
+authoritative, and the `minimal` profile does not include the tools.
+
+OpenClaw `2026.8.1-beta.3` is the first release that supports manifest profile
+contributions. Earlier supported OpenClaw releases require adding the Lossless
+plugin to `tools.alsoAllow`:
+
+```json
+{
+  "tools": {
+    "profile": "coding",
+    "alsoAllow": ["lossless-claw"]
+  }
+}
+```
+
 The optional programmatic `status` / `doctor` control surface requires
 a host that separately advertises context-engine capabilities/control dispatch.
 That host contract is not covered by the baseline plugin API version above. As
@@ -183,22 +204,25 @@ Notes on the example:
 
 ## Install and enable
 
+Lossless Claw 1.0 prereleases use the npm `beta` channel. The npm `latest`
+channel remains on the 0.x release line for stable OpenClaw hosts.
+
 Install with OpenClaw's plugin installer:
 
 ```bash
-openclaw plugins install @martian-engineering/lossless-claw@latest
+openclaw plugins install @martian-engineering/lossless-claw@beta
 ```
 
 If you are running from a local OpenClaw checkout:
 
 ```bash
-pnpm openclaw plugins install @martian-engineering/lossless-claw@latest
+pnpm openclaw plugins install @martian-engineering/lossless-claw@beta
 ```
 
 Use exact versions only for rollback or reproducible canary testing. OpenClaw treats an exact install spec such as `@martian-engineering/lossless-claw@0.12.0` as pinned, so plugin update sync will not follow newer LCM releases until you return to the moving track:
 
 ```bash
-openclaw plugins update @martian-engineering/lossless-claw@latest
+openclaw plugins update @martian-engineering/lossless-claw@beta
 ```
 
 For local plugin development, link a working copy:

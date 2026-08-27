@@ -100,6 +100,7 @@ The **condensed pass** merges summaries at the same depth into a higher-level su
 - Runs up to `maxRounds` (default 10) of full sweeps
 - Stops when context is under the target token count
 - Used by the overflow recovery path
+- Forced recovery targets the resolved `contextThreshold`, leaving the configured threshold margin below a raw host context window for response reserve
 
 ### Three-level escalation
 

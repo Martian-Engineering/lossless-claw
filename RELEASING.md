@@ -86,6 +86,10 @@ tag with `release_tag` set to the same tag and `dry_run` set to `false`.
 The standalone `Publish to ClawHub` workflow remains available for validation
 and recovery. Select the release tag as the workflow ref, set `release_tag` to
 the same tag, and use `dry_run` to choose validation or publication.
+When recovering after the release workflow itself has changed, select the
+default branch as the workflow ref and keep `release_tag` pinned to the release
+being recovered. Preflight still resolves that tag and requires its commit to
+match npm `gitHead` before publication.
 
 The workflow refuses to publish unless the selected tag, `package.json`
 version, npm version, npm `gitHead`, and the tag's immutable commit all identify

@@ -8,6 +8,10 @@ on:
         description: Existing npm and GitHub release tag to publish
         required: true
         type: string
+      release_channel:
+        description: ClawHub tag matching the npm release channel
+        required: true
+        type: string
       dry_run:
         description: Validate the ClawHub package without publishing
         required: true
@@ -74,6 +78,7 @@ jobs:
       contents: read
     outputs:
       source_sha: ${{ steps.identity.outputs.source_sha }}
+      release_channel: ${{ steps.identity.outputs.release_channel }}
     steps:
       - name: Checkout selected release
         uses: actions/checkout@v4
@@ -84,6 +89,7 @@ jobs:
         id: identity
         env:
           RELEASE_TAG: ${{ inputs.release_tag }}
+          RELEASE_CHANNEL: ${{ inputs.release_channel }}
         run: |
           set -euo pipefail
 
@@ -96,12 +102,13 @@ jobs:
             exit 1
           fi
 
-          source_sha="$(git rev-parse HEAD)"
-          if [ "$source_sha" != "$GITHUB_SHA" ]; then
-            echo "Dispatch this workflow from $RELEASE_TAG, not $GITHUB_REF"
+          expected_channel="$(node scripts/release-channel.mjs "$version" | sed -n 's/^npm_tag=//p')"
+          if [ "$RELEASE_CHANNEL" != "$expected_channel" ]; then
+            echo "Select release channel $expected_channel for $version, not $RELEASE_CHANNEL"
             exit 1
           fi
 
+          source_sha="$(git rev-parse HEAD)"
           git fetch --no-tags origin "refs/tags/$RELEASE_TAG:refs/tags/$RELEASE_TAG"
           tag_sha="$(git rev-list -n 1 "refs/tags/$RELEASE_TAG")"
           if [ "$source_sha" != "$tag_sha" ]; then
@@ -119,6 +126,7 @@ jobs:
           fi
 
           echo "source_sha=$source_sha" >> "$GITHUB_OUTPUT"
+          echo "release_channel=$RELEASE_CHANNEL" >> "$GITHUB_OUTPUT"
 
       - name: Download exact npm package tarball
         run: |
@@ -156,8 +164,11 @@ jobs:
     with:
       source: ${{ github.repository }}
       ref: ${{ needs.release-preflight.outputs.source_sha }}
-      source_ref: refs/tags/${{ inputs.release_tag }}
+      source_repo: ${{ github.repository }}
+      source_commit: ${{ needs.release-preflight.outputs.source_sha }}
+      source_ref: ${{ needs.release-preflight.outputs.source_sha }}
       package_artifact_name: clawhub-release-package
+      tags: ${{ needs.release-preflight.outputs.release_channel }}
       dry_run: true
 
   publish:
@@ -175,6 +186,9 @@ jobs:
     with:
       source: ${{ github.repository }}
       ref: ${{ needs.release-preflight.outputs.source_sha }}
-      source_ref: refs/tags/${{ inputs.release_tag }}
+      source_repo: ${{ github.repository }}
+      source_commit: ${{ needs.release-preflight.outputs.source_sha }}
+      source_ref: ${{ needs.release-preflight.outputs.source_sha }}
       package_artifact_name: clawhub-release-package
+      tags: ${{ needs.release-preflight.outputs.release_channel }}
       dry_run: false
