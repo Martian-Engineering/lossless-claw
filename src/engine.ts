@@ -1815,7 +1815,9 @@ export class LcmContextEngine implements ContextEngine {
       }
       if (lastResult.status === "prepared") {
         preparedSteps += 1;
-        if (resolvedSummarizer.breakerKey) {
+        // Empty-source coverage is deterministic and makes no provider call,
+        // so it must not be recorded as a successful provider outcome.
+        if (!lastResult.emptySource && resolvedSummarizer.breakerKey) {
           this.compactionGuards.recordCompactionSuccess(resolvedSummarizer.breakerKey);
         }
       }

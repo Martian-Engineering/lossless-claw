@@ -3,6 +3,10 @@ import { describe, expect, it, vi } from "vitest";
 import { getLcmDbFeatures } from "../src/db/features.js";
 import { runLcmMigrations } from "../src/db/migration.js";
 import { PendingCompactionCoordinator } from "../src/pending-summary-coordinator.js";
+import {
+  PENDING_EMPTY_SOURCE_COVERAGE_CONTENT,
+  PENDING_EMPTY_SOURCE_COVERAGE_MODEL,
+} from "../src/pending-summary-worker.js";
 import { ConversationStore } from "../src/store/conversation-store.js";
 import { PendingSummaryStore } from "../src/store/pending-summary-store.js";
 import { SummaryStore } from "../src/store/summary-store.js";
@@ -298,6 +302,424 @@ describe("PendingCompactionCoordinator", () => {
     ).resolves.toMatchObject({ status: "prepared" });
     expect(summarizedSource).toContain("| tool]");
     expect(summarizedSource).toContain("Pending message-parts source detail.");
+  });
+
+  it("publishes later meaningful work after an oversized tool source sanitizes empty", async () => {
+    const { conversationStore, pendingSummaryStore, summaryStore } = createStores();
+    const conversation = await conversationStore.createConversation({
+      sessionId: "pending-coordinator-empty-tool-session",
+      sessionKey: "agent:main:pending-coordinator-empty-tool",
+    });
+    const rawEmptyToolOutput = "A".repeat(89_492);
+    const messages = await conversationStore.createMessagesBulk([
+      {
+        conversationId: conversation.conversationId,
+        seq: 1,
+        role: "tool",
+        content: rawEmptyToolOutput,
+        tokenCount: 22_373,
+        transcriptEntryId: "entry:empty-tool-output",
+      },
+      {
+        conversationId: conversation.conversationId,
+        seq: 2,
+        role: "tool",
+        content: "Meaningful tool result that must still publish after the empty source.",
+        tokenCount: 22_000,
+        transcriptEntryId: "entry:meaningful-tool-output",
+      },
+    ]);
+    await summaryStore.appendContextMessages(
+      conversation.conversationId,
+      messages.map((message) => message.messageId),
+    );
+
+    const summarize = vi.fn(async (sourceText: string) => {
+      expect(sourceText).toContain("Meaningful tool result");
+      return "Meaningful tool result summary";
+    });
+    const coordinator = new PendingCompactionCoordinator({
+      conversationStore,
+      pendingSummaryStore,
+      summaryStore,
+      model: "test-model",
+      leaseOwner: "test-worker",
+      config: {
+        freshTailCount: 0,
+        leafChunkTokens: 20_000,
+        condensedMinFanout: 3,
+        condensedMinSourceTokens: 100_000,
+        condensedChunkTokens: 100_000,
+      },
+      summarize,
+    });
+
+    const planned = await coordinator.runOnce({
+      conversationId: conversation.conversationId,
+      sessionKey: "agent:main:pending-coordinator-empty-tool",
+      publishPolicy: "prepare-only",
+    });
+    expect(planned).toMatchObject({ status: "planned", nodeCount: 2 });
+    if (planned.status !== "planned") {
+      throw new Error("Expected empty-source regression batch to be planned");
+    }
+
+    await expect(
+      coordinator.runOnce({
+        conversationId: conversation.conversationId,
+        publishPolicy: "prepare-only",
+      }),
+    ).resolves.toMatchObject({ status: "prepared", emptySource: true });
+    expect(summarize).not.toHaveBeenCalled();
+
+    const nodesAfterEmptySource = await pendingSummaryStore.getNodesByBatch(planned.batchId);
+    expect(nodesAfterEmptySource).toMatchObject([
+      {
+        status: "ready",
+        ordinalStart: 0,
+        ordinalEnd: 0,
+        content: PENDING_EMPTY_SOURCE_COVERAGE_CONTENT,
+        model: PENDING_EMPTY_SOURCE_COVERAGE_MODEL,
+        retryCount: 0,
+        failureSummary: null,
+      },
+      { status: "planned", ordinalStart: 1, ordinalEnd: 1 },
+    ]);
+
+    await expect(
+      coordinator.runOnce({
+        conversationId: conversation.conversationId,
+        publishPolicy: "prepare-only",
+      }),
+    ).resolves.toMatchObject({ status: "prepared" });
+    expect(summarize).toHaveBeenCalledOnce();
+    await expect(
+      coordinator.runOnce({
+        conversationId: conversation.conversationId,
+        publishPolicy: "prepare-only",
+      }),
+    ).resolves.toMatchObject({ status: "ready" });
+
+    await expect(
+      coordinator.runOnce({
+        conversationId: conversation.conversationId,
+        publishPolicy: "publish-ready-only",
+      }),
+    ).resolves.toMatchObject({ status: "published" });
+
+    const contextItems = await summaryStore.getContextItems(conversation.conversationId);
+    expect(contextItems.map((item) => item.ordinal)).toEqual([0, 1]);
+    expect(contextItems.map((item) => item.itemType)).toEqual(["summary", "summary"]);
+    const coverageSummary = await summaryStore.getSummary(contextItems[0]!.summaryId!);
+    const meaningfulSummary = await summaryStore.getSummary(contextItems[1]!.summaryId!);
+    expect(coverageSummary).toMatchObject({
+      content: PENDING_EMPTY_SOURCE_COVERAGE_CONTENT,
+      model: PENDING_EMPTY_SOURCE_COVERAGE_MODEL,
+      sourceMessageTokenCount: 22_373,
+    });
+    expect(meaningfulSummary).toMatchObject({
+      content: "Meaningful tool result summary",
+      model: "test-model",
+      sourceMessageTokenCount: 22_000,
+    });
+    await expect(summaryStore.getSummaryMessages(coverageSummary!.summaryId)).resolves.toEqual([
+      messages[0]!.messageId,
+    ]);
+    await expect(summaryStore.getSummaryMessages(meaningfulSummary!.summaryId)).resolves.toEqual([
+      messages[1]!.messageId,
+    ]);
+    await expect(conversationStore.getMessageById(messages[0]!.messageId)).resolves.toMatchObject({
+      content: rawEmptyToolOutput,
+    });
+    await expect(pendingSummaryStore.getBatch(planned.batchId)).resolves.toMatchObject({
+      status: "published",
+      failureSummary: null,
+    });
+  });
+
+  it("fails a leaf with missing source links instead of publishing false empty coverage", async () => {
+    const { db, conversationStore, pendingSummaryStore, summaryStore } = createStores();
+    const conversation = await conversationStore.createConversation({
+      sessionId: "pending-coordinator-missing-links-session",
+      sessionKey: "agent:main:pending-coordinator-missing-links",
+    });
+    const message = await conversationStore.createMessage({
+      conversationId: conversation.conversationId,
+      seq: 1,
+      role: "tool",
+      content: "A".repeat(80_000),
+      tokenCount: 20_000,
+    });
+    await summaryStore.appendContextMessage(conversation.conversationId, message.messageId);
+
+    const summarize = vi.fn(async () => "should not be called");
+    const coordinator = new PendingCompactionCoordinator({
+      conversationStore,
+      pendingSummaryStore,
+      summaryStore,
+      model: "test-model",
+      leaseOwner: "test-worker",
+      config: {
+        freshTailCount: 0,
+        leafChunkTokens: 20_000,
+        condensedMinFanout: 2,
+        condensedMinSourceTokens: 1,
+        condensedChunkTokens: 100_000,
+      },
+      summarize,
+    });
+
+    const planned = await coordinator.runOnce({
+      conversationId: conversation.conversationId,
+      publishPolicy: "prepare-only",
+    });
+    expect(planned).toMatchObject({ status: "planned", nodeCount: 1 });
+    if (planned.status !== "planned") {
+      throw new Error("Expected missing-link regression batch to be planned");
+    }
+    const [node] = await pendingSummaryStore.getNodesByBatch(planned.batchId);
+    db.prepare(`DELETE FROM pending_summary_node_messages WHERE node_id = ?`).run(node!.nodeId);
+
+    await expect(
+      coordinator.runOnce({
+        conversationId: conversation.conversationId,
+        publishPolicy: "prepare-only",
+      }),
+    ).resolves.toMatchObject({
+      status: "failed",
+      failureSummary: `Pending leaf summary ${node!.nodeId} has no linked source messages`,
+    });
+    expect(summarize).not.toHaveBeenCalled();
+    await expect(pendingSummaryStore.getNode(node!.nodeId)).resolves.toMatchObject({
+      status: "failed",
+      content: null,
+      model: "test-model",
+      retryCount: 1,
+      failureSummary: `Pending leaf summary ${node!.nodeId} has no linked source messages`,
+    });
+    await expect(pendingSummaryStore.getBatch(planned.batchId)).resolves.toMatchObject({
+      status: "planning",
+      failureSummary: null,
+    });
+  });
+
+  it("excludes empty-source markers when condensing mixed child coverage", async () => {
+    const { conversationStore, pendingSummaryStore, summaryStore } = createStores();
+    const conversation = await conversationStore.createConversation({
+      sessionId: "pending-coordinator-mixed-empty-condensed-session",
+      sessionKey: "agent:main:pending-coordinator-mixed-empty-condensed",
+    });
+    const messages = await conversationStore.createMessagesBulk([
+      {
+        conversationId: conversation.conversationId,
+        seq: 1,
+        role: "tool",
+        content: "A".repeat(80_000),
+        tokenCount: 20_000,
+      },
+      {
+        conversationId: conversation.conversationId,
+        seq: 2,
+        role: "tool",
+        content: "Meaningful child detail survives marker filtering.",
+        tokenCount: 20_000,
+      },
+    ]);
+    await summaryStore.appendContextMessages(
+      conversation.conversationId,
+      messages.map((message) => message.messageId),
+    );
+
+    const summarizedSources: string[] = [];
+    const summarize = vi.fn(async (sourceText: string, _aggressive, options) => {
+      summarizedSources.push(sourceText);
+      return options?.isCondensed ? "Condensed meaningful child" : "Meaningful child summary";
+    });
+    const coordinator = new PendingCompactionCoordinator({
+      conversationStore,
+      pendingSummaryStore,
+      summaryStore,
+      model: "test-model",
+      leaseOwner: "test-worker",
+      config: {
+        freshTailCount: 0,
+        leafChunkTokens: 20_000,
+        condensedMinFanout: 2,
+        condensedMinSourceTokens: 1,
+        condensedChunkTokens: 100_000,
+      },
+      summarize,
+    });
+
+    const planned = await coordinator.runOnce({
+      conversationId: conversation.conversationId,
+      publishPolicy: "prepare-only",
+    });
+    expect(planned).toMatchObject({ status: "planned", nodeCount: 3 });
+    if (planned.status !== "planned") {
+      throw new Error("Expected mixed empty-source condensed batch to be planned");
+    }
+    await expect(
+      coordinator.runOnce({
+        conversationId: conversation.conversationId,
+        publishPolicy: "prepare-only",
+      }),
+    ).resolves.toMatchObject({ status: "prepared", emptySource: true });
+    await expect(
+      coordinator.runOnce({
+        conversationId: conversation.conversationId,
+        publishPolicy: "prepare-only",
+      }),
+    ).resolves.toMatchObject({ status: "prepared" });
+    await expect(
+      coordinator.runOnce({
+        conversationId: conversation.conversationId,
+        publishPolicy: "prepare-only",
+      }),
+    ).resolves.toMatchObject({ status: "prepared" });
+    expect(summarize).toHaveBeenCalledTimes(2);
+    expect(summarizedSources[0]).toContain("Meaningful child detail");
+    expect(summarizedSources[1]).toBe("Meaningful child summary");
+    expect(summarizedSources.join("\n")).not.toContain(PENDING_EMPTY_SOURCE_COVERAGE_CONTENT);
+
+    await expect(
+      coordinator.runOnce({
+        conversationId: conversation.conversationId,
+        publishPolicy: "prepare-only",
+      }),
+    ).resolves.toMatchObject({ status: "ready" });
+    await expect(
+      coordinator.runOnce({
+        conversationId: conversation.conversationId,
+        publishPolicy: "publish-ready-only",
+      }),
+    ).resolves.toMatchObject({ status: "published" });
+
+    const [contextItem] = await summaryStore.getContextItems(conversation.conversationId);
+    const root = await summaryStore.getSummary(contextItem!.summaryId!);
+    expect(root).toMatchObject({
+      kind: "condensed",
+      content: "Condensed meaningful child",
+      model: "test-model",
+      sourceMessageTokenCount: 40_000,
+    });
+    const parents = await summaryStore.getSummaryParents(root!.summaryId);
+    expect(parents).toHaveLength(2);
+    const parentSummaries = await Promise.all(
+      parents.map((parent) => summaryStore.getSummary(parent.summaryId)),
+    );
+    expect(parentSummaries).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          content: PENDING_EMPTY_SOURCE_COVERAGE_CONTENT,
+          model: PENDING_EMPTY_SOURCE_COVERAGE_MODEL,
+        }),
+        expect.objectContaining({ content: "Meaningful child summary", model: "test-model" }),
+      ]),
+    );
+  });
+
+  it("propagates all-empty condensed coverage without calling the model", async () => {
+    const { conversationStore, pendingSummaryStore, summaryStore } = createStores();
+    const conversation = await conversationStore.createConversation({
+      sessionId: "pending-coordinator-all-empty-condensed-session",
+      sessionKey: "agent:main:pending-coordinator-all-empty-condensed",
+    });
+    const messages = await conversationStore.createMessagesBulk(
+      ["A".repeat(80_000), "B".repeat(80_000)].map((content, index) => ({
+        conversationId: conversation.conversationId,
+        seq: index + 1,
+        role: "tool" as const,
+        content,
+        tokenCount: 20_000,
+      })),
+    );
+    await summaryStore.appendContextMessages(
+      conversation.conversationId,
+      messages.map((message) => message.messageId),
+    );
+
+    const summarize = vi.fn(async () => "should not be called");
+    const coordinator = new PendingCompactionCoordinator({
+      conversationStore,
+      pendingSummaryStore,
+      summaryStore,
+      model: "test-model",
+      leaseOwner: "test-worker",
+      config: {
+        freshTailCount: 0,
+        leafChunkTokens: 20_000,
+        condensedMinFanout: 2,
+        condensedMinSourceTokens: 1,
+        condensedChunkTokens: 100_000,
+      },
+      summarize,
+    });
+
+    const planned = await coordinator.runOnce({
+      conversationId: conversation.conversationId,
+      publishPolicy: "prepare-only",
+    });
+    expect(planned).toMatchObject({ status: "planned", nodeCount: 3 });
+    if (planned.status !== "planned") {
+      throw new Error("Expected all-empty condensed batch to be planned");
+    }
+    for (let step = 0; step < 3; step += 1) {
+      await expect(
+        coordinator.runOnce({
+          conversationId: conversation.conversationId,
+          publishPolicy: "prepare-only",
+        }),
+      ).resolves.toMatchObject({ status: "prepared", emptySource: true });
+    }
+    expect(summarize).not.toHaveBeenCalled();
+    const readyNodes = await pendingSummaryStore.getNodesByBatch(planned.batchId);
+    expect(readyNodes).toHaveLength(3);
+    expect(readyNodes).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          kind: "condensed",
+          status: "ready",
+          content: PENDING_EMPTY_SOURCE_COVERAGE_CONTENT,
+          model: PENDING_EMPTY_SOURCE_COVERAGE_MODEL,
+          retryCount: 0,
+        }),
+      ]),
+    );
+
+    await expect(
+      coordinator.runOnce({
+        conversationId: conversation.conversationId,
+        publishPolicy: "prepare-only",
+      }),
+    ).resolves.toMatchObject({ status: "ready" });
+    await expect(
+      coordinator.runOnce({
+        conversationId: conversation.conversationId,
+        publishPolicy: "publish-ready-only",
+      }),
+    ).resolves.toMatchObject({ status: "published" });
+    expect(summarize).not.toHaveBeenCalled();
+
+    const [contextItem] = await summaryStore.getContextItems(conversation.conversationId);
+    expect(contextItem).toMatchObject({ ordinal: 0, itemType: "summary" });
+    const root = await summaryStore.getSummary(contextItem!.summaryId!);
+    expect(root).toMatchObject({
+      kind: "condensed",
+      content: PENDING_EMPTY_SOURCE_COVERAGE_CONTENT,
+      model: PENDING_EMPTY_SOURCE_COVERAGE_MODEL,
+      sourceMessageTokenCount: 40_000,
+    });
+    const parents = await summaryStore.getSummaryParents(root!.summaryId);
+    expect(parents).toHaveLength(2);
+    for (const parent of parents) {
+      await expect(summaryStore.getSummaryMessages(parent.summaryId)).resolves.toHaveLength(1);
+    }
+    for (const message of messages) {
+      await expect(conversationStore.getMessageById(message.messageId)).resolves.toMatchObject({
+        content: message.content,
+      });
+    }
   });
 
   it("keeps prepared pending summaries publishable when new tail messages arrive", async () => {
