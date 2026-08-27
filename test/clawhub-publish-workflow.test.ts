@@ -33,6 +33,7 @@ describe("ClawHub publish workflow", () => {
 
   it("resolves the requested release tag to the npm commit", () => {
     expect(workflow).toContain("release_tag:");
+    expect(workflow).toContain("release_channel:");
     expect(workflow).toContain("release-preflight:");
     expect(workflow).toContain("ref: ${{ inputs.release_tag }}");
     expect(workflow).toContain(
@@ -47,6 +48,15 @@ describe("ClawHub publish workflow", () => {
     );
     expect(workflow).toContain('published_sha" != "$source_sha"');
     expect(workflow).toContain('echo "source_sha=$source_sha" >> "$GITHUB_OUTPUT"');
+    expect(workflow).toContain(
+      'expected_channel="$(node scripts/release-channel.mjs "$version"',
+    );
+    expect(workflow).toContain(
+      'RELEASE_CHANNEL" != "$expected_channel"',
+    );
+    expect(workflow).toContain(
+      'echo "release_channel=$RELEASE_CHANNEL" >> "$GITHUB_OUTPUT"',
+    );
   });
 
   it("builds a prebuilt package for pull-request validation", () => {
@@ -67,6 +77,11 @@ describe("ClawHub publish workflow", () => {
       /name: Upload exact npm package tarball(?:.|\n)*?name: clawhub-release-package/,
     );
     expect(workflow.match(/package_artifact_name: clawhub-release-package/g)).toHaveLength(2);
+    expect(
+      workflow.match(
+        /tags: \$\{\{ needs\.release-preflight\.outputs\.release_channel \}\}/g,
+      ),
+    ).toHaveLength(2);
   });
 
   it("binds manual validation and publication to the verified commit", () => {
@@ -105,7 +120,10 @@ describe("ClawHub publish workflow", () => {
       'RELEASE_TAG: v${{ steps.package.outputs.version }}',
     );
     expect(npmPublishWorkflow).toContain(
-      "inputs: {release_tag: $release_tag, dry_run: false}",
+      "RELEASE_CHANNEL: ${{ steps.package.outputs.npm_tag }}",
+    );
+    expect(npmPublishWorkflow).toContain(
+      "inputs: {release_tag: $release_tag, release_channel: $release_channel, dry_run: false}",
     );
     expect(npmPublishWorkflow.indexOf("Create GitHub release")).toBeLessThan(
       npmPublishWorkflow.indexOf("Dispatch ClawHub publish"),
