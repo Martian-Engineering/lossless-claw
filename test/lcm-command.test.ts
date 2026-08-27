@@ -345,7 +345,7 @@ describe("lcm command", () => {
     expect(result.text).toContain("status: exact-pinned");
     expect(result.text).toContain("installed spec: `@martian-engineering/lossless-claw@0.12.0`");
     expect(result.text).toContain("impact: OpenClaw plugin update sync will keep this exact version");
-    expect(result.text).toContain("repair: `openclaw plugins update @martian-engineering/lossless-claw@latest`");
+    expect(result.text).toContain("repair: `openclaw plugins update @martian-engineering/lossless-claw@beta`");
   });
 
   it("warns when status sees an exact npm install spec in OpenClaw's installed plugin index", async () => {
@@ -370,7 +370,7 @@ describe("lcm command", () => {
     expect(result.text).toContain("installed spec: `@martian-engineering/lossless-claw@0.12.0`");
   });
 
-  it("does not warn when status sees a moving npm install spec", async () => {
+  it("warns when status sees the stable npm channel on the 1.0 beta line", async () => {
     const fixture = createCommandFixture();
     tempDirs.add(fixture.tempDir);
     dbPaths.add(fixture.dbPath);
@@ -391,7 +391,43 @@ describe("lcm command", () => {
               "lossless-claw": {
                 source: "npm",
                 spec: "@martian-engineering/lossless-claw@latest",
-                version: "0.13.1",
+                version: "0.15.3",
+              },
+            },
+          },
+        },
+      }),
+    );
+
+    expect(result.text).toContain("**⚠️ Update track**");
+    expect(result.text).toContain("status: wrong-channel");
+    expect(result.text).toContain("installed spec: `@martian-engineering/lossless-claw@latest`");
+    expect(result.text).toContain("impact: OpenClaw plugin update sync will follow the 0.x stable line");
+    expect(result.text).toContain("repair: `openclaw plugins update @martian-engineering/lossless-claw@beta`");
+  });
+
+  it("does not warn when status sees the moving beta npm install spec", async () => {
+    const fixture = createCommandFixture();
+    tempDirs.add(fixture.tempDir);
+    dbPaths.add(fixture.dbPath);
+
+    const result = await fixture.command.handler(
+      createCommandContext(undefined, {
+        config: {
+          plugins: {
+            entries: {
+              "lossless-claw": {
+                enabled: true,
+              },
+            },
+            slots: {
+              contextEngine: "lossless-claw",
+            },
+            installs: {
+              "lossless-claw": {
+                source: "npm",
+                spec: "@martian-engineering/lossless-claw@beta",
+                version: "1.0.0-beta.4",
               },
             },
           },

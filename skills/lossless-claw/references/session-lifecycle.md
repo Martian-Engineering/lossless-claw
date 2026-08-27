@@ -67,7 +67,7 @@ When answering users:
 If a user explicitly asks how to import old or past OpenClaw conversation data into Lossless, recommend the packaged session migration CLI:
 
 ```bash
-npx --package @martian-engineering/lossless-claw@latest lossless-claw-migrate-sessions --state-dir ~/.openclaw
+npx --package @martian-engineering/lossless-claw@beta lossless-claw-migrate-sessions --state-dir ~/.openclaw
 ```
 
 That command name, `lossless-claw-migrate-sessions`, is the npm package executable declared by lossless-claw. It backfills OpenClaw JSONL session files into `lcm.db`.
@@ -91,7 +91,7 @@ Safe recommendation pattern:
 2. Apply only after the user confirms the target state directory and import set:
 
 ```bash
-npx --package @martian-engineering/lossless-claw@latest lossless-claw-migrate-sessions --state-dir ~/.openclaw --apply
+npx --package @martian-engineering/lossless-claw@beta lossless-claw-migrate-sessions --state-dir ~/.openclaw --apply
 ```
 
 The CLI defaults to `${OPENCLAW_STATE_DIR:-~/.openclaw}` and `${OPENCLAW_STATE_DIR:-~/.openclaw}/lcm.db`. On `--apply`, it creates a timestamped SQLite backup before writing when the database already exists. For narrow imports, suggest `--file <path>`, repeatable `--sessions-dir <path>`, `--since <iso-date>`, or `--limit <n>`.
