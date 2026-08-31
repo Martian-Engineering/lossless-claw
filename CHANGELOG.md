@@ -1,5 +1,11 @@
 # @martian-engineering/lossless-claw
 
+## 1.0.1
+
+### Patch Changes
+
+- [#1145](https://github.com/Martian-Engineering/lossless-claw/pull/1145) [`c6d06e5`](https://github.com/Martian-Engineering/lossless-claw/commit/c6d06e528867004c85ae84897019d94f0cdbea50) Thanks [@jalehman](https://github.com/jalehman)! - Accept the retired `transcriptGcEnabled` and `autoRotateSessionFiles` settings so upgrades from 0.15 continue to load. Lossless ignores both settings and logs a startup warning that asks operators to remove them.
+
 ## 1.0.0
 
 <!-- release-rollback-version: 0.15.6 -->
