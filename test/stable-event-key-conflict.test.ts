@@ -7,28 +7,6 @@ import {
 afterEach(cleanupEngineTestState);
 
 describe("stable event key conflict fallback", () => {
-  it("preserves recurrent model-authored tool results across ingests", async () => {
-    const engine = createEngineWithDepsOverrides({
-      log: { debug: vi.fn(), info: vi.fn(), warn: vi.fn(), error: vi.fn() },
-    });
-    const sessionId = "recurrent-model-tool-id";
-    const toolResult = {
-      role: "toolResult" as const,
-      toolCallId: "exec:101",
-      content: "(no output)",
-    };
-
-    await engine.ingest({ sessionId, message: toolResult });
-    await engine.ingest({ sessionId, message: toolResult });
-
-    const conversation = await engine.getConversationStore().getConversationBySessionId(sessionId);
-    expect(conversation).not.toBeNull();
-    const rows = await engine
-      .getConversationStore()
-      .getMessages(conversation!.conversationId);
-    expect(rows.map((row) => row.content)).toEqual(["(no output)", "(no output)"]);
-  });
-
   it("persists a colliding row without its stable key", async () => {
     const warn = vi.fn();
     const engine = createEngineWithDepsOverrides({

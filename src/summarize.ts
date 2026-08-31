@@ -1469,6 +1469,26 @@ function resolveSummaryCandidates(params: {
     }
   }
 
+  if (resolutionCandidates.every((candidate) => !candidate.modelRef)) {
+    try {
+      const resolved = params.deps.resolveModel(undefined, providerHint || undefined);
+      if (resolved.provider && resolved.model) {
+        resolvedCandidates.push({
+          levelName: "effective OpenClaw default model",
+          modelRef: "",
+          providerHint: providerHint || undefined,
+          hasExplicitProvider: false,
+          provider: resolved.provider,
+          model: resolved.model,
+        });
+      }
+    } catch (err) {
+      params.deps.log.error(
+        `[lcm] createLcmSummarize: resolveModel FAILED at effective OpenClaw default model: ${describeLogError(err)}`,
+      );
+    }
+  }
+
   return dedupeResolvedCandidates(resolvedCandidates);
 }
 

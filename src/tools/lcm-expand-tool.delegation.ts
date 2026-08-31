@@ -217,12 +217,11 @@ function buildDelegatedExpansionTask(params: {
 }
 
 /**
- * Resolve the requester's active LCM conversation ID from the session store.
+ * Resolve the requester's active LCM conversation ID from the session key.
  * This allows delegated expansion to stay scoped even when conversationId
  * wasn't passed explicitly in the tool call.
  */
 export async function resolveRequesterConversationScopeId(params: {
-  deps: Pick<LcmDependencies, "resolveSessionIdFromSessionKey">;
   requesterSessionKey: string;
   lcm: LcmContextEngine;
 }): Promise<number | undefined> {
@@ -258,19 +257,7 @@ export async function resolveRequesterConversationScopeId(params: {
       }
     }
 
-    const runtimeSessionId = await params.deps.resolveSessionIdFromSessionKey(requesterSessionKey);
-    if (!runtimeSessionId) {
-      return undefined;
-    }
-    if (typeof store.getConversationForSession === "function") {
-      const conversation = await store.getConversationForSession({
-        sessionId: runtimeSessionId,
-        sessionKey: requesterSessionKey,
-      });
-      return conversation?.conversationId;
-    }
-    const conversation = await store.getConversationBySessionId(runtimeSessionId);
-    return conversation?.conversationId;
+    return undefined;
   } catch {
     return undefined;
   }

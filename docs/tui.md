@@ -49,7 +49,7 @@ Lists all agents discovered under `~/.openclaw/agents/`. Select an agent to see 
 
 ### Screen 2: Session List
 
-Shows JSONL session files for the selected agent, sorted by last modified time. Each entry shows the filename, last update time, message count, conversation ID (if LCM-tracked), summary count, and large file count. If an OpenClaw session has a Codex app-server binding, the row also shows a `codex:` marker with the local backend rollout row count when available.
+Shows runtime sessions for the selected agent, sorted by last activity. Each entry shows the session identifier, last update time, message count, conversation ID (if LCM-tracked), summary count, and large file count. If an OpenClaw session has a Codex app-server binding, the row also shows a `codex:` marker with the local backend rollout row count when available.
 
 Sessions load in batches of 50. Scrolling near the bottom automatically loads more.
 
