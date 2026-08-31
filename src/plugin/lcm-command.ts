@@ -398,7 +398,7 @@ function detectLcmInstallTrackWarning(params: {
         || readStringField(record, "installSpec")
         || readStringField(record, "packageSpec")
         || readStringField(record, "resolvedSpec");
-      if (spec.trim() === `${LOSSLESS_NPM_PACKAGE}@latest`) {
+      if (spec.trim() === `${LOSSLESS_NPM_PACKAGE}@beta`) {
         return { kind: "wrong-channel", spec };
       }
       const version = parseExactLosslessPackageVersion(spec);
@@ -411,10 +411,10 @@ function detectLcmInstallTrackWarning(params: {
   return null;
 }
 
-/** Format the update-track warning and the command that restores the 1.0 beta channel. */
+/** Format the update-track warning and the command that restores the stable channel. */
 function buildInstallTrackWarningSection(warning: LcmInstallTrackWarning): string {
   const impact = warning.kind === "wrong-channel"
-    ? "OpenClaw plugin update sync will follow the 0.x stable line instead of Lossless Claw 1.0 prereleases."
+    ? "OpenClaw plugin update sync will follow Lossless Claw prereleases instead of stable releases."
     : "OpenClaw plugin update sync will keep this exact version and will not follow new LCM releases.";
   return buildSection("⚠️ Update track", [
     buildStatLine("status", warning.kind),
@@ -422,7 +422,7 @@ function buildInstallTrackWarningSection(warning: LcmInstallTrackWarning): strin
     buildStatLine("impact", impact),
     buildStatLine(
       "repair",
-      formatCommand(`openclaw plugins update ${LOSSLESS_NPM_PACKAGE}@beta`),
+      formatCommand(`openclaw plugins update ${LOSSLESS_NPM_PACKAGE}@latest`),
     ),
   ]);
 }

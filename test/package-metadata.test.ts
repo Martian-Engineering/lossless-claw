@@ -30,17 +30,17 @@ describe("package OpenClaw compatibility metadata", () => {
     expect(readProjectFile("docs/tui.md")).toContain("Shows runtime sessions");
   });
 
-  it("keeps 1.0 package commands on the npm beta channel", () => {
-    const betaChannelDocuments = [
+  it("keeps 1.0 package commands on the npm stable channel", () => {
+    const stableChannelDocuments = [
       "README.md",
       "docs/configuration.md",
       "skills/lossless-claw/references/session-lifecycle.md",
     ];
 
-    for (const path of betaChannelDocuments) {
+    for (const path of stableChannelDocuments) {
       const content = readFileSync(join(process.cwd(), path), "utf8");
-      expect(content).toContain("@martian-engineering/lossless-claw@beta");
-      expect(content).not.toContain("@martian-engineering/lossless-claw@latest");
+      expect(content).toContain("@martian-engineering/lossless-claw@latest");
+      expect(content).not.toContain("@martian-engineering/lossless-claw@beta");
     }
   });
 
