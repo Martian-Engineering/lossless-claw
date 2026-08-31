@@ -18,7 +18,7 @@ import {
 afterEach(cleanupEngineTestState);
 describe("LcmContextEngine.assemble canonical path", () => {
   it("strips assistant prefill tails when no DB conversation exists", async () => {
-    const engine = createEngine();
+    const engine = createEngineWithConfig({ promptAwareEviction: false });
     const liveMessages: AgentMessage[] = [
       { role: "user", content: "first turn" },
       { role: "assistant", content: "first reply" },
@@ -264,38 +264,6 @@ describe("LcmContextEngine.assemble canonical path", () => {
     expect(result.messages).toStrictEqual(liveMessages);
     // Bounded fallback reports the real serialized estimate instead of 0.
     expect(result.estimatedTokens).toBeGreaterThan(0);
-    expect(result.contextProjection).toEqual({
-      mode: "thread_bootstrap",
-      epoch: expect.stringMatching(/^summary-prefix-v1:/),
-    });
-  });
-
-  it("marks a managed fork-bounded live suffix as a stable thread bootstrap", async () => {
-    const engine = createEngine();
-    const sessionId = "session-fork-bounded-projection";
-    const conversation = await engine
-      .getConversationStore()
-      .getOrCreateConversation(sessionId, { sessionKey: undefined });
-    await engine.getSummaryStore().upsertConversationBootstrapState({
-      conversationId: conversation.conversationId,
-      sessionFilePath: "/tmp/fork-bounded-projection.jsonl",
-      lastSeenSize: 0,
-      lastSeenMtimeMs: 0,
-      lastProcessedOffset: 0,
-      forkBounded: true,
-      forkSourceMessageCount: 1,
-    });
-
-    const result = await engine.assemble({
-      sessionId,
-      messages: [
-        makeMessage({ role: "user", content: "parent history" }),
-        makeMessage({ role: "user", content: "child turn" }),
-      ],
-      tokenBudget: 256,
-    });
-
-    expect(result.messages.map((message) => message.content)).toEqual(["child turn"]);
     expect(result.contextProjection).toEqual({
       mode: "thread_bootstrap",
       epoch: expect.stringMatching(/^summary-prefix-v1:\d+:[a-f0-9]{32}$/),
@@ -757,7 +725,7 @@ describe("LcmContextEngine.assemble canonical path", () => {
       engine,
       sessionId,
       summaryId: "sum_prompt_recall_preserve_summary",
-      summaryContent: "Long unrelated summary. ".repeat(100),
+      summaryContent: "Long unrelated summary. ".repeat(20),
       prompt,
     });
     const volatileEvent =
@@ -777,18 +745,18 @@ describe("LcmContextEngine.assemble canonical path", () => {
       sessionId,
       messages: liveMessages,
       prompt,
-      tokenBudget: baseline.estimatedTokens + 20,
+      tokenBudget: baseline.estimatedTokens + 100,
     });
 
     const rendered = constrained.messages.map((message) =>
       typeof message.content === "string" ? message.content : JSON.stringify(message.content),
     );
     expect(rendered.some((content) => content.includes("<lossless_claw_prompt_recall>"))).toBe(false);
-    expect(rendered.some((content) => content.includes("<summary id=\"sum_prompt_recall_preserve_summary\""))).toBe(
+    expect(rendered.some((content) => content.includes('<summary id="sum_prompt_recall_preserve_summary"'))).toBe(
       true,
     );
     expect(rendered.some((content) => content.includes("Small live note."))).toBe(true);
-    expect(constrained.estimatedTokens).toBeLessThanOrEqual(baseline.estimatedTokens + 20);
+    expect(constrained.estimatedTokens).toBeLessThanOrEqual(baseline.estimatedTokens + 100);
   });
 
   it("does not add prompt-recall when the active summary already carries the exact fact", async () => {

@@ -144,11 +144,11 @@ describe("setConfigValue", () => {
   it("supports validated nested config paths", () => {
     writeConfig({ plugins: { entries: { "lossless-claw": { config: {} } } } });
 
-    setConfigValue(configPath, "autoRotateSessionFiles.enabled", "false");
+    setConfigValue(configPath, "independentLogFile.enabled", "false");
 
     const written = JSON.parse(readFileSync(configPath, "utf8"));
     expect(written.plugins.entries["lossless-claw"].config).toEqual({
-      autoRotateSessionFiles: { enabled: false },
+      independentLogFile: { enabled: false },
     });
   });
 

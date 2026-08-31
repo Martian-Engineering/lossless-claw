@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { ContextAssembler } from "../src/assembler.js";
 import {
   extractOpenClawSenderMetadata,
@@ -11,8 +11,7 @@ import type { AgentMessage } from "../src/openclaw-bridge.js";
 import {
   cleanupEngineTestState,
   createEngine,
-  createSessionFilePath,
-  writeLeafTranscriptMessages,
+  createEngineWithDepsOverrides,
 } from "./helpers.js";
 
 afterEach(cleanupEngineTestState);
@@ -90,24 +89,45 @@ describe("OpenClaw sender metadata", () => {
     expect(assembled.messages[1]).not.toHaveProperty("__openclaw");
   });
 
-  it("preserves sender identity during JSONL bootstrap", async () => {
-    const engine = createEngine();
+  it("preserves sender identity during SQLite transcript projection bootstrap", async () => {
     const sessionId = randomUUID();
-    const sessionFile = createSessionFilePath("sender-bootstrap");
-    writeLeafTranscriptMessages(sessionFile, [
-      {
-        role: "user",
-        content: "bootstrapped group message",
-        __openclaw: {
-          senderId: "bootstrap-user",
-          senderName: "Grace Hopper",
-          senderUsername: "grace",
-          ignored: "not persisted",
+    const sessionKey = `agent:main:${sessionId}`;
+    const engine = createEngineWithDepsOverrides({
+      readVisibleSessionTranscriptMessageEntries: vi.fn(async () => [
+        {
+          entryId: "entry-bootstrap-user",
+          parentId: null,
+          seq: 1,
+          role: "user",
+          message: {
+            role: "user",
+            content: "bootstrapped group message",
+            __openclaw: {
+              senderId: "bootstrap-user",
+              senderName: "Grace Hopper",
+              senderUsername: "grace",
+              ignored: "not persisted",
+            },
+          },
+          createdAt: "2026-08-10T12:00:00.000Z",
+        },
+      ]),
+    });
+
+    const result = await engine.bootstrap({
+      sessionId,
+      sessionKey,
+      runtimeContext: {
+        transcriptStorage: { kind: "sqlite" },
+        sessionTarget: {
+          agentId: "main",
+          sessionId,
+          sessionKey,
+          storePath: "/tmp/openclaw-agent.sqlite",
+          threadId: "sender-bootstrap-thread",
         },
       },
-    ]);
-
-    const result = await engine.bootstrap({ sessionId, sessionFile });
+    });
     expect(result.importedMessages).toBe(1);
     const conversation = await engine.getConversationStore().getConversationBySessionId(sessionId);
     const stored = await engine

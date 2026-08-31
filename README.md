@@ -52,7 +52,6 @@ The native OpenClaw command surface provides in-session operations:
 
 - `/lossless` shows version, enablement/selection state, DB path and size, summary counts, and summary-health status
 - `/lossless backup` creates a timestamped backup of the current LCM SQLite database
-- `/lossless rotate` rewrites the active session transcript into a compact tail-preserving form without changing the live OpenClaw session identity or current LCM conversation
 - `/lossless doctor` scans for broken or truncated summaries
 - `/lossless doctor maintenance` reports active actionable compaction debt separately from inactive historical debt, grouped by reason, without writing
 - `/lossless doctor apply maintenance <conversation-id> confirm-inactive` administratively closes one eligible inactive debt row after creating a SQLite backup
@@ -66,7 +65,6 @@ Supported native command examples:
 
 - `/lossless`
 - `/lossless backup`
-- `/lossless rotate`
 - `/lossless doctor`
 - `/lossless doctor maintenance`
 - `/lossless doctor apply maintenance 42 confirm-inactive`
@@ -91,9 +89,8 @@ Lossless-claw also exposes an optional host-facing context-engine control contra
 
 - `status` returns whether an LCM conversation is active and the current stored message count.
 - `doctor` returns a bounded, sanitized warning list for summary-health issues.
-- `rotate` runs the same safe transcript rotation path as `/lossless rotate` and returns the post-rotate message count plus the timestamp for that successful rotate operation.
 
-Programmatic control never returns transcript text, local database paths, backup paths, credentials, provider debug, or shell output. `status` does not report `lastRotatedAt`; hosts that need durable rotation timestamps should persist that product state themselves after a successful `rotate` result.
+Programmatic control never returns transcript text, local database paths, backup paths, credentials, provider debug, or shell output.
 
 This surface is capability-gated by the OpenClaw host. At the time of this change there is not yet a stable OpenClaw release with the required context-engine control endpoints; downstream users should treat it as unavailable unless their host advertises the matching capability, for example through the pending `openclaw/openclaw#98060` contract or an equivalent downstream gateway.
 
@@ -104,13 +101,13 @@ This surface is capability-gated by the OpenClaw host. At the time of this chang
 Run it in dry-run mode first:
 
 ```bash
-npx --package @martian-engineering/lossless-claw@latest lossless-claw-migrate-sessions --state-dir ~/.openclaw
+npx --package @martian-engineering/lossless-claw@beta lossless-claw-migrate-sessions --state-dir ~/.openclaw
 ```
 
 Apply the import only after reviewing the dry-run output:
 
 ```bash
-npx --package @martian-engineering/lossless-claw@latest lossless-claw-migrate-sessions --state-dir ~/.openclaw --apply
+npx --package @martian-engineering/lossless-claw@beta lossless-claw-migrate-sessions --state-dir ~/.openclaw --apply
 ```
 
 The command defaults to `${OPENCLAW_STATE_DIR:-~/.openclaw}` and `${OPENCLAW_STATE_DIR:-~/.openclaw}/lcm.db`. `--apply` creates a timestamped SQLite backup before writing when the database already exists. Use `--file <path>` or repeatable `--sessions-dir <path>` for targeted imports, `--since <iso-date>` or `--limit <n>` to narrow a batch, and `--json` for machine-readable output.
@@ -123,26 +120,36 @@ The command defaults to `${OPENCLAW_STATE_DIR:-~/.openclaw}` and `${OPENCLAW_STA
 - Node.js 22+
 - An LLM provider configured in OpenClaw (used for summarization)
 
-> **Compatibility:** Lossless Claw 0.x supports file-backed OpenClaw from `2026.5.28` through `2026.7.1`. OpenClaw `2026.7.2` prereleases and later use SQLite-backed session storage and require Lossless Claw 1.0 from the `next/1.0` release line. If you cannot move to 1.0, remain on OpenClaw `2026.7.1` or select OpenClaw's `legacy` context engine. Lossless Claw `0.9.4` remains the fallback for OpenClaw versions older than `2026.5.28`.
+> **Compatibility:** `lossless-claw` requires OpenClaw `2026.7.2-beta.2` or newer. That beta is the first published build with the branch-safe visible transcript projection used to bootstrap SQLite-backed sessions; stable `2026.7.1` does not provide it. If you cannot use a beta or upgrade OpenClaw, stay on a `lossless-claw` release compatible with your installed OpenClaw version.
+
+On OpenClaw hosts that advertise the durable context-engine turn contract,
+LosslessClaw declares current-turn transcript fencing and commits each accepted
+turn through an atomic idempotency ledger. Older supported hosts continue to use
+the existing `afterTurn` compatibility path.
+
+> **Breaking upgrade:** Before upgrading, remove `transcriptGcEnabled` and `autoRotateSessionFiles` from `plugins.entries.lossless-claw.config`. OpenClaw rejects keys that are absent from the plugin manifest, so either removed key prevents Lossless Claw from loading.
 
 ### Install the plugin
+
+Lossless Claw 1.0 prereleases use the npm `beta` channel. The npm `latest`
+channel remains on the 0.x release line for stable OpenClaw hosts.
 
 Use OpenClaw's plugin installer (recommended):
 
 ```bash
-openclaw plugins install @martian-engineering/lossless-claw@latest
+openclaw plugins install @martian-engineering/lossless-claw@beta
 ```
 
 If you're running from a local OpenClaw checkout, use:
 
 ```bash
-pnpm openclaw plugins install @martian-engineering/lossless-claw@latest
+pnpm openclaw plugins install @martian-engineering/lossless-claw@beta
 ```
 
-Use exact versions only for rollback or reproducible canary testing. OpenClaw records an exact install spec such as `@martian-engineering/lossless-claw@0.12.0` as a pinned update track, so OpenClaw plugin update sync will keep that version until you move back to the stable track:
+Use exact versions only for rollback or reproducible canary testing. OpenClaw records an exact install spec such as `@martian-engineering/lossless-claw@0.12.0` as a pinned update track, so OpenClaw plugin update sync will keep that version until you move back to the beta track:
 
 ```bash
-openclaw plugins update @martian-engineering/lossless-claw@latest
+openclaw plugins update @martian-engineering/lossless-claw@beta
 ```
 
 For local plugin development, build your working copy first, then link it instead of copying files:
@@ -164,19 +171,30 @@ The install command records the plugin, enables it, and applies compatible slot 
 
 ### Configure OpenClaw
 
-In most cases, no manual JSON edits are needed after `openclaw plugins install`.
-
-If you need to set it manually, ensure the context engine slot points at lossless-claw:
+Ensure the context engine slot points at lossless-claw and explicitly allow its
+conversation prompt hook:
 
 ```json
 {
   "plugins": {
     "slots": {
       "contextEngine": "lossless-claw"
+    },
+    "entries": {
+      "lossless-claw": {
+        "hooks": {
+          "allowConversationAccess": true
+        }
+      }
     }
   }
 }
 ```
+
+OpenClaw builds that protect `before_prompt_build` as a conversation-access hook
+require this grant. Without it, the context engine still loads, but OpenClaw
+blocks Lossless's static recall-policy prompt hook and logs the missing setting.
+The grant belongs beside `config`, not inside it.
 
 Restart OpenClaw after configuration changes.
 
@@ -194,6 +212,9 @@ Add a `lossless-claw` entry under `plugins.entries` in your OpenClaw config:
     "entries": {
       "lossless-claw": {
         "enabled": true,
+        "hooks": {
+          "allowConversationAccess": true
+        },
         "llm": {
           "allowModelOverride": true,
           "allowedModels": ["openai/gpt-5.4-mini"]
@@ -225,7 +246,6 @@ Add a `lossless-claw` entry under `plugins.entries` in your OpenClaw config:
             "agent:*:**:active-memory:**",
             "agent:*:dreaming-narrative-**"
           ],
-          "transcriptGcEnabled": false,
           "proactiveThresholdCompactionMode": "deferred",
           "summaryModel": "openai/gpt-5.4-mini",
           "expansionModel": "openai/gpt-5.4-mini",
@@ -279,11 +299,9 @@ The `ignoreSessionPatterns` entries in this example are storage exclusions. Matc
 | `LCM_SUMMARY_MAX_CALLS_PER_WINDOW` | `24` | Max model-backed summarization calls per session/window before spend backoff opens |
 | `LCM_SUMMARY_SPEND_BACKOFF_MS` | `1800000` | Cooldown after the summarization spend guard opens |
 | `LCM_PRUNE_HEARTBEAT_OK` | `false` | Retroactively delete `HEARTBEAT_OK` turn cycles from LCM storage |
-| `LCM_TRANSCRIPT_GC_ENABLED` | `false` | Enable transcript rewrite GC during `maintain()` |
 | `LCM_PROACTIVE_THRESHOLD_COMPACTION_MODE` | `deferred` | Choose whether proactive threshold compaction is deferred into maintenance debt or kept inline for legacy behavior |
 | `LCM_CACHE_TTL_SECONDS` | `300` | Cache TTL used by cache-aware deferred compaction when provider/runtime telemetry does not supply a more specific retention window |
 
-Transcript GC rewrites are disabled by default. Set `transcriptGcEnabled` or `LCM_TRANSCRIPT_GC_ENABLED` to turn them on explicitly.
 Deferred proactive compaction is also the default. Set `proactiveThresholdCompactionMode` or `LCM_PROACTIVE_THRESHOLD_COMPACTION_MODE` to `inline` only if you need legacy foreground compaction behavior. In deferred mode, lossless-claw records one coalesced prompt-mutating debt item after the turn, leaves background `maintain()` to process only non-prompt-mutating work while Anthropic cache is still hot, and then consumes that debt pre-assembly once the cache is cold or the prompt is approaching overflow.
 
 ### Expansion model override requirements
@@ -327,7 +345,6 @@ Plugin config equivalents:
 - `ignoreSessionPatterns`
 - `statelessSessionPatterns`
 - `skipStatelessSessions`
-- `transcriptGcEnabled`
 - `newSessionRetainDepth`
 - `summaryModel`
 - `summaryProvider`
@@ -375,12 +392,7 @@ Lossless-claw distinguishes OpenClaw's two session-reset commands:
 - `/new` keeps the active conversation row and all stored summaries, but prunes `context_items` so the next turn rebuilds context from retained summaries instead of the fresh tail.
 - `/reset` archives the active conversation row and creates a new active row for the same stable `sessionKey`, giving the next turn a clean LCM conversation while preserving prior history.
 
-For large sessions, neither command is a perfect “keep my live agent context, but stop writing into this giant active LCM row” tool:
-
-- `/new` keeps writing into the same active LCM conversation row.
-- `/reset` changes OpenClaw session flow, which is heavier than users often want when their real problem is just LCM row size.
-
-`/lossless rotate` fills that gap. Before trimming the transcript, it forces leaf-only compaction for raw context outside the preserved live tail so older transcript messages are represented by LCM summaries. It then replaces one rolling `rotate-latest` SQLite backup, rewrites the current session transcript down to the preserved live tail plus current session settings, and refreshes the bootstrap frontier on the same active LCM conversation so dropped transcript history is not replayed. Existing durable messages, summaries, context items, and conversation identity stay in place; only the transcript backing is compacted. If you want additional timestamped snapshots instead, run `/lossless backup`.
+Lossless-claw no longer rewrites active OpenClaw transcripts for GC or session rotation. SQLite-backed OpenClaw owns active transcript storage; Lossless keeps durable conversation, summary, and recall data in its own SQLite database. If you want an LCM database snapshot before maintenance, run `/lossless backup`.
 
 `newSessionRetainDepth` (or `LCM_NEW_SESSION_RETAIN_DEPTH`) controls how much summary structure survives `/new`:
 

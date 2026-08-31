@@ -121,6 +121,7 @@ export type LargeFileReadOptions = {
   maxBytes?: number;
 };
 
+
 export type LargeFileSearchInput = {
   query: string;
   mode: "regex" | "full_text";
@@ -158,46 +159,6 @@ export type LargeFileSearchResult = {
   /** True when the file had content beyond the scanned prefix. */
   scanTruncated: boolean;
   createdAt: Date;
-};
-
-export type UpsertConversationBootstrapStateInput = {
-  conversationId: number;
-  sessionFilePath: string;
-  lastSeenSize: number;
-  lastSeenMtimeMs: number;
-  lastProcessedOffset: number;
-  lastProcessedEntryHash?: string | null;
-  /** Transcript session-header id; a non-null value overwrites, null preserves. */
-  sessionHeaderId?: string | null;
-  /** Envelope id of the last processed transcript entry (exact resume anchor). */
-  lastProcessedEntryId?: string | null;
-  forkBounded?: boolean;
-  forkSourceMessageCount?: number;
-};
-
-export type ConversationBootstrapStateRecord = {
-  conversationId: number;
-  sessionFilePath: string;
-  lastSeenSize: number;
-  lastSeenMtimeMs: number;
-  lastProcessedOffset: number;
-  lastProcessedEntryHash: string | null;
-  sessionHeaderId: string | null;
-  lastProcessedEntryId: string | null;
-  forkBounded: boolean;
-  forkSourceMessageCount: number;
-  softResetPrunedAt: Date | null;
-  updatedAt: Date;
-};
-
-export type TranscriptGcCandidateRecord = {
-  messageId: number;
-  conversationId: number;
-  seq: number;
-  toolCallId: string;
-  toolName: string | null;
-  externalizedFileId: string | null;
-  originalByteSize: number | null;
 };
 
 // ── DB row shapes (snake_case) ────────────────────────────────────────────────
@@ -284,32 +245,10 @@ interface LargeFileRow {
   created_at: string;
 }
 
-interface ConversationBootstrapStateRow {
-  conversation_id: number;
-  session_file_path: string;
-  last_seen_size: number;
-  last_seen_mtime_ms: number;
-  last_processed_offset: number;
-  last_processed_entry_hash: string | null;
-  session_header_id: string | null;
-  last_processed_entry_id: string | null;
-  fork_bounded: number;
-  fork_source_message_count: number;
-  soft_reset_pruned_at: string | null;
-  updated_at: string;
-}
 
 const CJK_QUERY_SEGMENT_RE =
   /[\u2E80-\u9FFF\u3400-\u4DBF\uF900-\uFAFF\uAC00-\uD7AF\u3040-\u309F\u30A0-\u30FF]+/g;
 const LATIN_QUERY_TOKEN_RE = /[a-zA-Z0-9][\w./-]*/g;
-interface TranscriptGcCandidateRow {
-  message_id: number;
-  conversation_id: number;
-  seq: number;
-  tool_call_id: string | null;
-  tool_name: string | null;
-  metadata: string | null;
-}
 // ── Row mappers ───────────────────────────────────────────────────────────────
 
 function toSummaryRecord(row: SummaryRow): SummaryRecord {
@@ -387,6 +326,7 @@ function toLargeFileRecord(row: LargeFileRow): LargeFileRecord {
     createdAt: parseUtcTimestamp(row.created_at),
   };
 }
+
 
 function isTextLikeMimeType(mimeType: string | null): boolean {
   if (mimeType == null) {
@@ -522,66 +462,6 @@ function createSearchSnippet(content: string, index: number, length: number): st
 
 function byteOffsetAt(content: string, index: number): number {
   return Buffer.byteLength(content.slice(0, index), "utf8");
-}
-
-function toConversationBootstrapStateRecord(
-  row: ConversationBootstrapStateRow,
-): ConversationBootstrapStateRecord {
-  return {
-    conversationId: row.conversation_id,
-    sessionFilePath: row.session_file_path,
-    lastSeenSize: row.last_seen_size,
-    lastSeenMtimeMs: row.last_seen_mtime_ms,
-    lastProcessedOffset: row.last_processed_offset,
-    lastProcessedEntryHash: row.last_processed_entry_hash,
-    sessionHeaderId: row.session_header_id ?? null,
-    lastProcessedEntryId: row.last_processed_entry_id ?? null,
-    forkBounded: row.fork_bounded === 1,
-    forkSourceMessageCount:
-      typeof row.fork_source_message_count === "number" &&
-      Number.isFinite(row.fork_source_message_count) &&
-      row.fork_source_message_count >= 0
-        ? Math.floor(row.fork_source_message_count)
-        : 0,
-    softResetPrunedAt: parseUtcTimestampOrNull(row.soft_reset_pruned_at),
-    updatedAt: parseUtcTimestamp(row.updated_at),
-  };
-}
-
-function toTranscriptGcCandidateRecord(
-  row: TranscriptGcCandidateRow,
-): TranscriptGcCandidateRecord | null {
-  if (typeof row.tool_call_id !== "string" || row.tool_call_id.length === 0) {
-    return null;
-  }
-
-  let metadata: Record<string, unknown> | null = null;
-  try {
-    metadata =
-      typeof row.metadata === "string" && row.metadata.length > 0
-        ? (JSON.parse(row.metadata) as Record<string, unknown>)
-        : null;
-  } catch {
-    metadata = null;
-  }
-
-  if (!metadata || metadata.toolOutputExternalized !== true) {
-    return null;
-  }
-
-  return {
-    messageId: row.message_id,
-    conversationId: row.conversation_id,
-    seq: row.seq,
-    toolCallId: row.tool_call_id,
-    toolName: row.tool_name,
-    externalizedFileId:
-      typeof metadata.externalizedFileId === "string" ? metadata.externalizedFileId : null,
-    originalByteSize:
-      typeof metadata.originalByteSize === "number" && Number.isFinite(metadata.originalByteSize)
-        ? Math.max(0, Math.floor(metadata.originalByteSize))
-        : null,
-  };
 }
 
 // ── SummaryStore ──────────────────────────────────────────────────────────────
@@ -861,71 +741,6 @@ export class SummaryStore {
     }
     return orderedLinks;
   }
-  /**
-   * Return summarized tool-result messages that are safe candidates for
-   * transcript GC because they are no longer present as raw context items.
-   */
-  async listTranscriptGcCandidates(
-    conversationId: number,
-    options?: { limit?: number },
-  ): Promise<TranscriptGcCandidateRecord[]> {
-    const limit =
-      typeof options?.limit === "number" && Number.isFinite(options.limit) && options.limit > 0
-        ? Math.max(1, Math.floor(options.limit))
-        : 25;
-
-    const rows = this.db
-      .prepare(
-        `SELECT
-           m.message_id,
-           m.conversation_id,
-           m.seq,
-           mp.tool_call_id,
-           mp.tool_name,
-           mp.metadata
-         FROM messages m
-         JOIN message_parts mp
-           ON mp.message_id = m.message_id
-         WHERE m.conversation_id = ?
-           AND m.role = 'tool'
-           AND mp.part_type = 'tool'
-           AND mp.tool_call_id IS NOT NULL
-           AND mp.tool_call_id != ''
-           AND EXISTS (
-             SELECT 1
-             FROM summary_messages sm
-             WHERE sm.message_id = m.message_id
-           )
-           AND NOT EXISTS (
-             SELECT 1
-             FROM context_items ci
-             WHERE ci.conversation_id = m.conversation_id
-               AND ci.item_type = 'message'
-               AND ci.message_id = m.message_id
-           )
-         ORDER BY m.seq ASC, mp.ordinal ASC`,
-      )
-      .all(conversationId) as unknown as TranscriptGcCandidateRow[];
-
-    const seenMessageIds = new Set<number>();
-    const candidates: TranscriptGcCandidateRecord[] = [];
-    for (const row of rows) {
-      if (seenMessageIds.has(row.message_id)) {
-        continue;
-      }
-      const candidate = toTranscriptGcCandidateRecord(row);
-      if (!candidate) {
-        continue;
-      }
-      seenMessageIds.add(candidate.messageId);
-      candidates.push(candidate);
-      if (candidates.length >= limit) {
-        break;
-      }
-    }
-
-    return candidates;
-  }
   async getSummaryChildren(parentSummaryId: string): Promise<SummaryRecord[]> {
     const rows = this.db
       .prepare(
@@ -1117,18 +932,6 @@ export class SummaryStore {
       .run(conversationId, conversationId, Math.floor(retainDepth));
   }
 
-  /** Mark that Lossless pruned this conversation for a host /new soft reset. */
-  async markSoftResetPruned(conversationId: number): Promise<void> {
-    this.db
-      .prepare(
-        `UPDATE conversation_bootstrap_state
-         SET soft_reset_pruned_at = datetime('now'),
-             updated_at = datetime('now')
-         WHERE conversation_id = ?`,
-      )
-      .run(conversationId);
-  }
-
   async appendContextMessage(conversationId: number, messageId: number): Promise<void> {
     const row = this.db
       .prepare(
@@ -1194,6 +997,19 @@ export class SummaryStore {
     });
   }
 
+  async replaceContextRangesWithSummaries(input: {
+    conversationId: number;
+    replacements: Array<{
+      startOrdinal: number;
+      endOrdinal: number;
+      summaryId: string;
+    }>;
+  }): Promise<void> {
+    await this.withTransaction(() => {
+      this.replaceContextRangesWithSummariesInTransaction(input);
+    });
+  }
+
   // Update the context slice in-place while the caller already owns the txn.
   private replaceContextRangeWithSummaryInTransaction(input: {
     conversationId: number;
@@ -1201,31 +1017,68 @@ export class SummaryStore {
     endOrdinal: number;
     summaryId: string;
   }): void {
-    const { conversationId, startOrdinal, endOrdinal, summaryId } = input;
+    this.replaceContextRangesWithSummariesInTransaction({
+      conversationId: input.conversationId,
+      replacements: [
+        {
+          startOrdinal: input.startOrdinal,
+          endOrdinal: input.endOrdinal,
+          summaryId: input.summaryId,
+        },
+      ],
+    });
+  }
 
-    // 1. Delete context items in the range [startOrdinal, endOrdinal]
-    this.db
-      .prepare(
-        `DELETE FROM context_items
-         WHERE conversation_id = ?
-           AND ordinal >= ?
-           AND ordinal <= ?`,
-      )
-      .run(conversationId, startOrdinal, endOrdinal);
+  private replaceContextRangesWithSummariesInTransaction(input: {
+    conversationId: number;
+    replacements: Array<{
+      startOrdinal: number;
+      endOrdinal: number;
+      summaryId: string;
+    }>;
+  }): void {
+    const { conversationId } = input;
+    const replacements = [...input.replacements].sort((a, b) => a.startOrdinal - b.startOrdinal);
+    let previousEndOrdinal = -1;
+    for (const replacement of replacements) {
+      if (replacement.startOrdinal < 0 || replacement.endOrdinal < replacement.startOrdinal) {
+        throw new Error(
+          `Invalid context replacement range ${replacement.startOrdinal}-${replacement.endOrdinal}`,
+        );
+      }
+      if (replacement.startOrdinal <= previousEndOrdinal) {
+        throw new Error("Context replacement ranges must not overlap");
+      }
+      previousEndOrdinal = replacement.endOrdinal;
+    }
 
-    // 2. Insert the replacement summary item at startOrdinal
-    this.db
-      .prepare(
-        `INSERT INTO context_items (conversation_id, ordinal, item_type, summary_id)
-         VALUES (?, ?, 'summary', ?)`,
-      )
-      .run(conversationId, startOrdinal, summaryId);
+    // 1. Delete all covered context items.
+    const deleteStmt = this.db.prepare(
+      `DELETE FROM context_items
+       WHERE conversation_id = ?
+         AND ordinal >= ?
+         AND ordinal <= ?`,
+    );
+    for (const replacement of replacements) {
+      deleteStmt.run(conversationId, replacement.startOrdinal, replacement.endOrdinal);
+    }
+
+    // 2. Insert replacement summary items at their original start ordinals.
+    const insertStmt = this.db.prepare(
+      `INSERT INTO context_items (conversation_id, ordinal, item_type, summary_id)
+       VALUES (?, ?, 'summary', ?)`,
+    );
+    for (const replacement of replacements) {
+      insertStmt.run(conversationId, replacement.startOrdinal, replacement.summaryId);
+    }
 
     // 3. Resequence all ordinals to maintain contiguity (no gaps).
-    //    Pre-compute ranks from a SELECT (safe snapshot), then apply
-    //    via 2-pass UPDATE loop using negative temps to avoid UNIQUE
-    //    constraint violations. The SELECT reads post-delete/insert
-    //    state and provides a consistent snapshot for resequencing.
+    this.resequenceContextItemsInTransaction(conversationId);
+  }
+
+  private resequenceContextItemsInTransaction(conversationId: number): void {
+    // Pre-compute ranks from a SELECT, then apply a 2-pass UPDATE loop using
+    // negative temps to avoid UNIQUE constraint violations.
     const items = this.db
       .prepare(
         `SELECT ordinal FROM context_items
@@ -2039,93 +1892,5 @@ export class SummaryStore {
     return open(realTarget, "r");
   }
 
-  // ── Bootstrap state ──────────────────────────────────────────────────────
 
-  async getConversationBootstrapState(
-    conversationId: number,
-  ): Promise<ConversationBootstrapStateRecord | null> {
-    const row = this.db
-      .prepare(
-        `SELECT conversation_id, session_file_path, last_seen_size, last_seen_mtime_ms,
-                last_processed_offset, last_processed_entry_hash, session_header_id,
-                last_processed_entry_id, fork_bounded,
-                fork_source_message_count, soft_reset_pruned_at, updated_at
-         FROM conversation_bootstrap_state
-         WHERE conversation_id = ?`,
-      )
-      .get(conversationId) as unknown as ConversationBootstrapStateRow | undefined;
-    return row ? toConversationBootstrapStateRecord(row) : null;
-  }
-
-  async upsertConversationBootstrapState(
-    input: UpsertConversationBootstrapStateInput,
-  ): Promise<ConversationBootstrapStateRecord> {
-    this.db
-      .prepare(
-        `INSERT INTO conversation_bootstrap_state (
-           conversation_id,
-           session_file_path,
-           last_seen_size,
-           last_seen_mtime_ms,
-           last_processed_offset,
-           last_processed_entry_hash,
-           session_header_id,
-           last_processed_entry_id,
-           fork_bounded,
-           fork_source_message_count
-         )
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-         ON CONFLICT (conversation_id) DO UPDATE SET
-           session_file_path = excluded.session_file_path,
-           last_seen_size = excluded.last_seen_size,
-           last_seen_mtime_ms = excluded.last_seen_mtime_ms,
-           last_processed_offset = excluded.last_processed_offset,
-           last_processed_entry_hash = excluded.last_processed_entry_hash,
-           session_header_id = COALESCE(
-             excluded.session_header_id,
-             conversation_bootstrap_state.session_header_id
-           ),
-           last_processed_entry_id = excluded.last_processed_entry_id,
-           fork_bounded = CASE
-             WHEN excluded.fork_bounded = 1 THEN 1
-             WHEN conversation_bootstrap_state.session_file_path != excluded.session_file_path THEN 0
-             ELSE conversation_bootstrap_state.fork_bounded
-           END,
-           fork_source_message_count = CASE
-             WHEN excluded.fork_bounded = 1 THEN excluded.fork_source_message_count
-             WHEN conversation_bootstrap_state.session_file_path != excluded.session_file_path THEN 0
-             ELSE conversation_bootstrap_state.fork_source_message_count
-           END,
-           soft_reset_pruned_at = CASE
-             WHEN conversation_bootstrap_state.session_file_path != excluded.session_file_path THEN NULL
-             ELSE conversation_bootstrap_state.soft_reset_pruned_at
-           END,
-           updated_at = datetime('now')`,
-      )
-      .run(
-        input.conversationId,
-        input.sessionFilePath,
-        Math.max(0, Math.floor(input.lastSeenSize)),
-        Math.max(0, Math.floor(input.lastSeenMtimeMs)),
-        Math.max(0, Math.floor(input.lastProcessedOffset)),
-        input.lastProcessedEntryHash ?? null,
-        input.sessionHeaderId ?? null,
-        input.lastProcessedEntryId ?? null,
-        input.forkBounded === true ? 1 : 0,
-        Math.max(0, Math.floor(input.forkSourceMessageCount ?? 0)),
-      );
-
-    const row = this.db
-      .prepare(
-        `SELECT conversation_id, session_file_path, last_seen_size, last_seen_mtime_ms,
-                last_processed_offset, last_processed_entry_hash, session_header_id,
-                last_processed_entry_id, fork_bounded,
-                fork_source_message_count, soft_reset_pruned_at, updated_at
-         FROM conversation_bootstrap_state
-         WHERE conversation_id = ?`,
-      )
-      .get(input.conversationId) as unknown as ConversationBootstrapStateRow;
-
-    return toConversationBootstrapStateRecord(row);
-  }
 }

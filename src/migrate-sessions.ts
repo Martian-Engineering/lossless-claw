@@ -6,7 +6,6 @@ import { DatabaseSync } from "node:sqlite";
 import { closeLcmConnection, createLcmDatabaseConnection } from "./db/connection.js";
 import { runLcmMigrations } from "./db/migration.js";
 import { buildMessageParts, filterPersistableMessages, toStoredMessage, type StoredMessage } from "./message-content.js";
-import { createBootstrapEntryHash } from "./message-signatures.js";
 import type { AgentMessage } from "./openclaw-bridge.js";
 import {
   extractOpenClawSenderMetadata,
@@ -361,20 +360,6 @@ async function importPreparedFile(
           continue;
         }
         seenEntryIds.add(entry.transcriptEntryId);
-        if (existingCount > 0) {
-          const adopted = await conversationStore.adoptTranscriptEntryId(
-            conversation.conversationId,
-            entry.stored.role,
-            entry.stored.content,
-            entry.transcriptEntryId,
-            entry.openClawSenderMetadata,
-          );
-          if (adopted) {
-            existingEntryIds.add(entry.transcriptEntryId);
-            skippedMessages += 1;
-            continue;
-          }
-        }
       }
       toImport.push(entry);
     }
@@ -393,6 +378,17 @@ async function importPreparedFile(
         createdAt: resolveTranscriptMessageCreatedAt(entry.message),
         skipReplayTimestampFloodGuard: true,
       });
+      if (entry.transcriptEntryId) {
+        await conversationStore.upsertMessageTranscriptAnchorTrust({
+          messageId: message.messageId,
+          conversationId: conversation.conversationId,
+          transcriptEntryId: entry.transcriptEntryId,
+          trustState: "verified",
+          source: "migrate-sessions",
+          reason: "message imported from transcript entry",
+          verifiedAt: new Date(),
+        });
+      }
       nextSeq += 1;
       await conversationStore.createMessageParts(
         message.messageId,
@@ -410,20 +406,6 @@ async function importPreparedFile(
       createdMessages.map((message) => message.messageId),
     );
     await conversationStore.markConversationBootstrapped(conversation.conversationId);
-
-    const lastImportable = importable[importable.length - 1] ?? null;
-    await summaryStore.upsertConversationBootstrapState({
-      conversationId: conversation.conversationId,
-      sessionFilePath: prepared.file,
-      lastSeenSize: prepared.stat.size,
-      lastSeenMtimeMs: prepared.stat.mtimeMs,
-      lastProcessedOffset: prepared.stat.size,
-      lastProcessedEntryHash: createBootstrapEntryHash(lastImportable?.stored ?? null),
-      sessionHeaderId: prepared.sessionHeaderId,
-      lastProcessedEntryId: lastImportable?.transcriptEntryId ?? null,
-      forkBounded: false,
-      forkSourceMessageCount: importable.length,
-    });
 
     if (createdMessages.length === 0) {
       return {
