@@ -1260,6 +1260,22 @@ function createLcmDependencies(
         "[lcm] LCM_STATELESS_SESSION_PATTERNS from env overrides plugins.entries.lossless-claw.config.statelessSessionPatterns; plugin config array will be ignored",
     });
   }
+  if (pluginConfig && Object.hasOwn(pluginConfig, "transcriptGcEnabled")) {
+    logStartupBannerOnce({
+      key: "retired-transcript-gc-config",
+      log: (message) => log.warn(message),
+      message:
+        "[lcm] Ignoring retired config key plugins.entries.lossless-claw.config.transcriptGcEnabled. Lossless Claw 1.x does not rewrite OpenClaw transcript storage; remove this key after upgrading.",
+    });
+  }
+  if (pluginConfig && Object.hasOwn(pluginConfig, "autoRotateSessionFiles")) {
+    logStartupBannerOnce({
+      key: "retired-auto-rotate-session-files-config",
+      log: (message) => log.warn(message),
+      message:
+        "[lcm] Ignoring retired config key plugins.entries.lossless-claw.config.autoRotateSessionFiles. Lossless Claw 1.x does not rotate OpenClaw session files; remove this key after upgrading.",
+    });
+  }
 
   // Read model overrides from plugin config
   if (pluginConfig) {

@@ -373,7 +373,9 @@ Why it matters:
 
 ### Active Transcript Storage
 
-Lossless-claw no longer rewrites active OpenClaw transcripts for transcript GC or session-file rotation. SQLite-backed OpenClaw owns active transcript storage; Lossless stores durable conversation, summary, and recall data in its own SQLite database.
+SQLite-backed OpenClaw owns active transcript storage and session-file rotation. Lossless stores durable conversation, summary, and recall data in its own SQLite database.
+
+Lossless accepts `transcriptGcEnabled` and `autoRotateSessionFiles` from 0.15 configs for upgrade compatibility. Both settings are ignored in 1.x and produce one startup warning when present. Remove them after upgrading.
 
 ### `independentLogFile`
 

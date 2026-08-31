@@ -787,10 +787,25 @@ describe("resolveLcmConfig", () => {
     });
   });
 
-  it("does not ship transcript rewrite maintenance settings in the manifest schema", () => {
-    const properties = manifest.configSchema.properties as Record<string, unknown>;
-    expect(properties.transcriptGcEnabled).toBeUndefined();
-    expect(properties.autoRotateSessionFiles).toBeUndefined();
+  it("accepts retired transcript maintenance settings for upgrade compatibility", () => {
+    expect(manifest.configSchema.properties.transcriptGcEnabled).toEqual({
+      description:
+        "Retired compatibility setting. Lossless Claw 1.x accepts and ignores this value.",
+      type: "boolean",
+    });
+    expect(manifest.configSchema.properties.autoRotateSessionFiles).toEqual({
+      description:
+        "Retired compatibility setting. Lossless Claw 1.x accepts and ignores these values.",
+      type: "object",
+      additionalProperties: false,
+      properties: {
+        enabled: { type: "boolean" },
+        createBackups: { type: "boolean" },
+        sizeBytes: { type: "integer", minimum: 1 },
+        startup: { type: "string", enum: ["rotate", "warn", "off"] },
+        runtime: { type: "string", enum: ["rotate", "warn", "off"] },
+      },
+    });
   });
 
   it("ships a manifest with independentLogFile in schema", () => {

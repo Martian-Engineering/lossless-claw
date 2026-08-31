@@ -289,6 +289,30 @@
       "label": "Prune HEARTBEAT_OK",
       "help": "Retroactively delete HEARTBEAT_OK turn cycles from LCM storage"
     },
+    "transcriptGcEnabled": {
+      "label": "Transcript GC (Retired)",
+      "help": "Accepted for upgrade compatibility and ignored. OpenClaw owns active transcript storage in Lossless Claw 1.x."
+    },
+    "autoRotateSessionFiles.enabled": {
+      "label": "Auto-Rotate Session Files (Retired)",
+      "help": "Accepted for upgrade compatibility and ignored. OpenClaw owns active session-file rotation in Lossless Claw 1.x."
+    },
+    "autoRotateSessionFiles.createBackups": {
+      "label": "Auto-Rotate Backups (Retired)",
+      "help": "Accepted for upgrade compatibility and ignored."
+    },
+    "autoRotateSessionFiles.sizeBytes": {
+      "label": "Auto-Rotate Size Bytes (Retired)",
+      "help": "Accepted for upgrade compatibility and ignored."
+    },
+    "autoRotateSessionFiles.startup": {
+      "label": "Startup Auto-Rotate (Retired)",
+      "help": "Accepted for upgrade compatibility and ignored."
+    },
+    "autoRotateSessionFiles.runtime": {
+      "label": "Runtime Auto-Rotate (Retired)",
+      "help": "Accepted for upgrade compatibility and ignored."
+    },
     "enableSummaryThinking": {
       "label": "Enable Summary Thinking",
       "help": "Request low reasoning budget from the model during summarization calls"
@@ -608,6 +632,35 @@
       },
       "pruneHeartbeatOk": {
         "type": "boolean"
+      },
+      "transcriptGcEnabled": {
+        "description": "Retired compatibility setting. Lossless Claw 1.x accepts and ignores this value.",
+        "type": "boolean"
+      },
+      "autoRotateSessionFiles": {
+        "description": "Retired compatibility setting. Lossless Claw 1.x accepts and ignores these values.",
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "enabled": {
+            "type": "boolean"
+          },
+          "createBackups": {
+            "type": "boolean"
+          },
+          "sizeBytes": {
+            "type": "integer",
+            "minimum": 1
+          },
+          "startup": {
+            "type": "string",
+            "enum": ["rotate", "warn", "off"]
+          },
+          "runtime": {
+            "type": "string",
+            "enum": ["rotate", "warn", "off"]
+          }
+        }
       },
       "enableSummaryThinking": {
         "type": "boolean"

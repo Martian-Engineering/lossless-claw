@@ -529,6 +529,43 @@ describe("lcm plugin registration", () => {
     );
   });
 
+  it("warns once and ignores retired transcript maintenance settings", () => {
+    const dbPath = join(tmpdir(), `lossless-claw-${Date.now()}-${Math.random().toString(16)}.db`);
+    dbPaths.add(dbPath);
+    const pluginConfig = {
+      enabled: true,
+      dbPath,
+      transcriptGcEnabled: true,
+      autoRotateSessionFiles: {
+        enabled: true,
+        sizeBytes: 4096,
+        startup: "rotate",
+        runtime: "warn",
+      },
+    };
+    const first = buildApi(pluginConfig);
+    const second = buildApi(pluginConfig);
+
+    lcmPlugin.register(first.api);
+    lcmPlugin.register(second.api);
+
+    expect(first.warnLog).toHaveBeenCalledWith(
+      "[lcm] Ignoring retired config key plugins.entries.lossless-claw.config.transcriptGcEnabled. Lossless Claw 1.x does not rewrite OpenClaw transcript storage; remove this key after upgrading.",
+    );
+    expect(first.warnLog).toHaveBeenCalledWith(
+      "[lcm] Ignoring retired config key plugins.entries.lossless-claw.config.autoRotateSessionFiles. Lossless Claw 1.x does not rotate OpenClaw session files; remove this key after upgrading.",
+    );
+    expect(second.warnLog).not.toHaveBeenCalledWith(
+      expect.stringContaining("Ignoring retired config key"),
+    );
+
+    const factory = first.getFactory();
+    expect(factory).toBeTypeOf("function");
+    const engine = factory!() as { config: Record<string, unknown> };
+    expect(engine.config).not.toHaveProperty("transcriptGcEnabled");
+    expect(engine.config).not.toHaveProperty("autoRotateSessionFiles");
+  });
+
   it.each([
     ["missing", undefined],
     ["invalid", ["not-a-plugin-config"]],
