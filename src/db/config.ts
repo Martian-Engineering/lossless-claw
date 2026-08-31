@@ -114,6 +114,15 @@ export type LcmConfig = {
    * Default false; flag-flip is reversible at runtime.
    */
   stubLargeToolPayloads: boolean;
+  /**
+   * When true, skip the inline-image/native-image externalization step at
+   * ingest time so image blocks stay in the message content and reach the
+   * model as first-class image content. This is useful for vision-capable
+   * models that must see actual pixels rather than a `file_xxx` reference.
+   * Off by default to preserve the existing externalization behavior; the
+   * flag is reversible at runtime.
+   */
+  preserveNativeImages: boolean;
   newSessionRetainDepth: number;
   leafMinFanout: number;
   condensedMinFanout: number;
@@ -703,6 +712,13 @@ export function resolveLcmConfigWithDiagnostics(
         env.LCM_STUB_LARGE_TOOL_PAYLOADS !== undefined
           ? env.LCM_STUB_LARGE_TOOL_PAYLOADS === "true"
           : toBool(pc.stubLargeToolPayloads) ?? false,
+      // When true, keep native image blocks inline at ingest so vision-capable
+      // models receive real image content instead of a file_xxx reference.
+      // Default false preserves the existing externalization behavior.
+      preserveNativeImages:
+        env.LCM_PRESERVE_NATIVE_IMAGES !== undefined
+          ? env.LCM_PRESERVE_NATIVE_IMAGES === "true"
+          : toBool(pc.preserveNativeImages) ?? false,
       newSessionRetainDepth:
         parseFiniteInt(env.LCM_NEW_SESSION_RETAIN_DEPTH)
           ?? toNumber(pc.newSessionRetainDepth) ?? 2,

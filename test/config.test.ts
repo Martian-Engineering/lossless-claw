@@ -875,6 +875,7 @@ describe("resolveLcmConfig", () => {
     });
     expect(manifest.configSchema.properties.timezone).toEqual({ type: "string" });
     expect(manifest.configSchema.properties.pruneHeartbeatOk).toEqual({ type: "boolean" });
+    expect(manifest.configSchema.properties.preserveNativeImages).toEqual({ type: "boolean" });
   });
 
   it("ships a manifest with bootstrapMaxTokens in schema", () => {

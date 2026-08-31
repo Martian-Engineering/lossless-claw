@@ -316,6 +316,10 @@
     "stripInjectedContextTags": {
       "label": "Strip Injected Context Tags",
       "help": "XML tag names whose blocks are stripped from messages before summarization. Covers memory/context plugin prepended blocks (active-memory, memory-lancedb, hindsight-openclaw). Set to [] to disable."
+    },
+    "preserveNativeImages": {
+      "label": "Preserve Native Images",
+      "help": "When enabled, native and inline image blocks are left in place at ingest instead of being externalized to a file_xxx reference, so vision-capable models receive real image content. Off by default to preserve the existing externalization behavior."
     }
   },
   "configSchema": {
@@ -327,7 +331,10 @@
       },
       "hostFallbackMode": {
         "type": "string",
-        "enum": ["error", "capture-only"]
+        "enum": [
+          "error",
+          "capture-only"
+        ]
       },
       "contextThreshold": {
         "type": "number",
@@ -648,10 +655,17 @@
         "items": {
           "type": "object",
           "properties": {
-            "provider": { "type": "string" },
-            "model": { "type": "string" }
+            "provider": {
+              "type": "string"
+            },
+            "model": {
+              "type": "string"
+            }
           },
-          "required": ["provider", "model"],
+          "required": [
+            "provider",
+            "model"
+          ],
           "additionalProperties": false
         }
       },
@@ -661,6 +675,9 @@
         "items": {
           "type": "string"
         }
+      },
+      "preserveNativeImages": {
+        "type": "boolean"
       }
     }
   }

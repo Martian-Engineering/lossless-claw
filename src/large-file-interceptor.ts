@@ -274,6 +274,11 @@ export class LargeFileInterceptor {
     conversationId: number;
     message: AgentMessage;
   }): Promise<{ rewrittenMessage: AgentMessage; fileIds: string[] } | null> {
+    // When preserveNativeImages is on, leave native image blocks inline so
+    // vision-capable models receive real image content (no file_xxx reference).
+    if (this.config.preserveNativeImages) {
+      return null;
+    }
     if (!("content" in params.message)) {
       return null;
     }
@@ -361,6 +366,11 @@ export class LargeFileInterceptor {
     content: string;
     role: string;
   }): Promise<{ rewrittenContent: string; fileIds: string[] } | null> {
+    // When preserveNativeImages is on, leave inline user image content in
+    // place so vision-capable models receive the original image data.
+    if (this.config.preserveNativeImages) {
+      return null;
+    }
     const mediaResult = await this.interceptUserMediaBase64(params);
     if (mediaResult) {
       return mediaResult;
@@ -551,6 +561,11 @@ export class LargeFileInterceptor {
     conversationId: number;
     message: AgentMessage;
   }): Promise<{ rewrittenMessage: AgentMessage; fileIds: string[] } | null> {
+    // When preserveNativeImages is on, leave tool image content inline so
+    // vision-capable models receive the original image data.
+    if (this.config.preserveNativeImages) {
+      return null;
+    }
     if (
       (params.message.role !== "toolResult" && params.message.role !== "tool") ||
       !("content" in params.message)
