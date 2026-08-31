@@ -127,7 +127,7 @@ LosslessClaw declares current-turn transcript fencing and commits each accepted
 turn through an atomic idempotency ledger. Older supported hosts continue to use
 the existing `afterTurn` compatibility path.
 
-> **Breaking upgrade:** Before upgrading, remove `transcriptGcEnabled` and `autoRotateSessionFiles` from `plugins.entries.lossless-claw.config`. OpenClaw rejects keys that are absent from the plugin manifest, so either removed key prevents Lossless Claw from loading.
+> **Upgrade compatibility:** Lossless Claw 1.x accepts `transcriptGcEnabled` and `autoRotateSessionFiles` so 0.15 configs continue to load. It ignores both settings and warns at startup. Remove them after upgrading; OpenClaw owns active transcript storage and session-file rotation.
 
 ### Install the plugin
 
