@@ -19,6 +19,7 @@ import { LcmContextEngine } from "../src/engine.js";
 import { estimateSerializedMessagesTokens } from "../src/estimate-tokens.js";
 import {
   SERIALIZED_OUTPUT_CLAMP_SAFETY_RATIO,
+  buildDegradedLiveAssembleResult,
   clampMessagesToSerializedBudget,
 } from "../src/assemble-fallback.js";
 import type { AgentMessage } from "../src/openclaw-bridge.js";
@@ -123,7 +124,69 @@ function makeHeavyLiveTranscript(pairs: number, payloadChars: number): AgentMess
   return messages;
 }
 
+function makeOversizedToolTurn(): AgentMessage[] {
+  return [
+    makeUserMessage(0),
+    {
+      role: "assistant",
+      content: [
+        {
+          type: "toolCall",
+          id: "call_image",
+          name: "view_image",
+          arguments: { paths: ["first.png", "second.png", "third.png"] },
+        },
+      ],
+    } as AgentMessage,
+    {
+      ...makeHeavyToolResultMessage(1, 20_000),
+      toolCallId: "call_image",
+      toolName: "view_image",
+      content: [
+        {
+          type: "toolResult",
+          id: "call_image",
+          toolCallId: "call_image",
+          content: "image data ".repeat(2_000),
+        },
+      ],
+    } as AgentMessage,
+  ];
+}
+
 describe("bounded assemble output", () => {
+  it("keeps an oversized degraded tool result paired with its assistant call", () => {
+    const result = buildDegradedLiveAssembleResult({
+      liveMessages: makeOversizedToolTurn(),
+      tokenBudget: 100,
+      contextProjection: { mode: "thread_bootstrap", epoch: "test-projection" },
+    });
+
+    expect(result.estimatedTokens).toBeGreaterThan(100);
+    expect(result.messages.map((message) => message.role)).toEqual([
+      "user",
+      "assistant",
+      "toolResult",
+    ]);
+    expect(result.messages[2]).toMatchObject({ toolCallId: "call_image" });
+  });
+
+  it("keeps an oversized serialized-clamp tool result paired with its assistant call", () => {
+    const result = clampMessagesToSerializedBudget({
+      messages: makeOversizedToolTurn(),
+      tokenBudget: 100,
+    });
+
+    expect(result.clamped).toBe(true);
+    expect(result.overBudget).toBe(true);
+    expect(result.messages.map((message) => message.role)).toEqual([
+      "user",
+      "assistant",
+      "toolResult",
+    ]);
+    expect(result.messages[2]).toMatchObject({ toolCallId: "call_image" });
+  });
+
   it("clamps near-budget serialized output to leave host renderer headroom", () => {
     const messages = makeHeavyLiveTranscript(12, 4_000);
     const serializedTokens = estimateSerializedMessagesTokens(messages);
