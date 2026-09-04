@@ -14,6 +14,69 @@ import type {
 } from "./openclaw-bridge.js";
 import type { ConversationCompactionMaintenanceRecord } from "./store/compaction-maintenance-store.js";
 import { estimateAgentMessageTokens, normalizeNonNegativeInteger, toRuntimeRoleForTokenEstimate } from "./token-accounting.js";
+import {
+  buildToolPairIndexesByAssembledIndex,
+  extractToolResultIdForPairing,
+} from "./tool-pairing.js";
+import { sanitizeToolUseResultPairing } from "./transcript-repair.js";
+
+/**
+ * Expand a retained suffix to a provider-valid turn without replaying the
+ * entire live transcript. Tool calls and results are one eviction unit; when
+ * the suffix begins inside such a unit, recover every matching partner and a
+ * preceding user message before repairing provider ordering.
+ */
+function buildProviderValidSuffix(params: {
+  messages: AgentMessage[];
+  retainedStartIndex: number;
+}): AgentMessage[] {
+  if (params.messages.length === 0 || params.retainedStartIndex >= params.messages.length) {
+    return [];
+  }
+
+  const retainedIndexes = new Set<number>();
+  const safeStartIndex = Math.max(0, params.retainedStartIndex);
+  for (let index = safeStartIndex; index < params.messages.length; index += 1) {
+    retainedIndexes.add(index);
+  }
+
+  const toolPairIndexes = buildToolPairIndexesByAssembledIndex(params.messages);
+  for (const index of [...retainedIndexes]) {
+    for (const relatedIndex of toolPairIndexes.get(index) ?? [index]) {
+      retainedIndexes.add(relatedIndex);
+    }
+  }
+
+  const hasUserMessage = [...retainedIndexes].some(
+    (index) => toRuntimeRoleForTokenEstimate(params.messages[index]!.role) === "user",
+  );
+  if (!hasUserMessage) {
+    const earliestRetainedIndex = Math.min(...retainedIndexes);
+    for (let index = earliestRetainedIndex - 1; index >= 0; index -= 1) {
+      if (toRuntimeRoleForTokenEstimate(params.messages[index]!.role) === "user") {
+        retainedIndexes.add(index);
+        break;
+      }
+    }
+  }
+
+  const retainedMessages = [...retainedIndexes]
+    .sort((left, right) => left - right)
+    .map((index) => {
+      const message = params.messages[index]!;
+      const toolCallId = extractToolResultIdForPairing(message);
+      if (
+        toolCallId &&
+        (message.role === "tool" || message.role === "toolResult") &&
+        !("toolCallId" in message && typeof message.toolCallId === "string") &&
+        !("toolUseId" in message && typeof message.toolUseId === "string")
+      ) {
+        return { ...message, toolCallId } as AgentMessage;
+      }
+      return message;
+    });
+  return sanitizeToolUseResultPairing(retainedMessages) as AgentMessage[];
+}
 
 /**
  * Suffix-trim live messages for prompt bounding, measured by serialized
@@ -70,9 +133,11 @@ export const SERIALIZED_OUTPUT_CLAMP_SAFETY_RATIO = 0.9;
  * Assembly budgets enforced on stored token counts can diverge from the
  * real prompt when live message objects carry structured payloads that
  * stored content omits (e.g. transcripts imported from a previous harness).
- * This clamp keeps the newest suffix that fits, drops leading tool results
- * orphaned by eviction, and re-seats the most recent user turn if eviction
- * removed every user message.
+ * This clamp keeps the newest suffix that fits, expands retained tool calls
+ * and results to complete pairing units, and re-seats the most recent user
+ * turn if eviction removed every user message. A single atomic turn can still
+ * exceed the target; returning it intact is safer than emitting an invalid
+ * partial tool exchange.
  */
 export function clampMessagesToSerializedBudget(params: {
   messages: AgentMessage[];
@@ -107,7 +172,8 @@ export function clampMessagesToSerializedBudget(params: {
     };
   }
 
-  // Keep the newest suffix that fits the target (always at least one message).
+  // Keep the newest suffix that fits the target (always at least one message),
+  // then recover any tool-pair partners displaced by the budget boundary.
   const kept: AgentMessage[] = [];
   let keptTokens = 0;
   for (let index = params.messages.length - 1; index >= 0; index -= 1) {
@@ -120,40 +186,25 @@ export function clampMessagesToSerializedBudget(params: {
     keptTokens += tokenCount;
   }
   kept.reverse();
-
-  // Eviction may have removed the assistant tool_use partner of leading
-  // tool results; drop those orphans rather than ship unpaired results.
-  while (kept.length > 1 && toRuntimeRoleForTokenEstimate(kept[0]!.role) === "toolResult") {
-    keptTokens -= estimateSerializedMessageTokens(kept[0]!);
-    kept.shift();
-  }
-
-  // The provider rejects contexts with no user turn; re-seat the most
-  // recent evicted user message if the suffix lost every one of them.
-  if (!kept.some((message) => toRuntimeRoleForTokenEstimate(message.role) === "user")) {
-    for (let index = params.messages.length - kept.length - 1; index >= 0; index -= 1) {
-      const candidate = params.messages[index]!;
-      if (toRuntimeRoleForTokenEstimate(candidate.role) === "user") {
-        kept.unshift(candidate);
-        keptTokens += estimateSerializedMessageTokens(candidate);
-        break;
-      }
-    }
-  }
+  const providerValidKept = buildProviderValidSuffix({
+    messages: params.messages,
+    retainedStartIndex: params.messages.length - kept.length,
+  });
+  keptTokens = estimateSerializedMessagesTokens(providerValidKept);
 
   // Historically an assistant-only suffix was retained when stripping would
   // empty the result. Prompt-separate hosts must still return an empty array
   // for blank or reasoning-only tails: restoring those tails would reintroduce
   // invalid assistant prefill content after the preservation policy rejected it.
-  const stripped = stripTrailingAssistantPrefill(kept, {
+  const stripped = stripTrailingAssistantPrefill(providerValidKept, {
     preserveSubstantiveAssistantTail: params.preserveSubstantiveAssistantTail,
   });
   const finalMessages =
     stripped.length > 0 || params.preserveSubstantiveAssistantTail === true
       ? stripped
-      : kept;
+      : providerValidKept;
   const serializedTokens =
-    finalMessages.length === kept.length
+    finalMessages.length === providerValidKept.length
       ? keptTokens
       : estimateSerializedMessagesTokens(finalMessages);
   return {
@@ -161,7 +212,7 @@ export function clampMessagesToSerializedBudget(params: {
     serializedTokens,
     serializedTokensBefore,
     clamped: true,
-    evictedMessages: params.messages.length - finalMessages.length,
+    evictedMessages: Math.max(0, params.messages.length - finalMessages.length),
     overBudget: serializedTokens > targetTokens,
   };
 }
@@ -200,6 +251,10 @@ export function buildDegradedLiveAssembleResult(params: {
   if (liveTailMessages.length === 0 && liveTail.length > 0) {
     liveTailMessages = [liveTail[liveTail.length - 1]!];
   }
+  liveTailMessages = buildProviderValidSuffix({
+    messages: liveTail,
+    retainedStartIndex: liveTail.length - liveTailMessages.length,
+  });
   const messages = [...protectedPrefix, ...liveTailMessages];
   return {
     messages,
