@@ -594,6 +594,9 @@ export class SummaryStore {
 
   /** Return the min/max source message sequence linked to a summary or its parent summaries. */
   async getSummaryMessageSeqRange(summaryId: string): Promise<SummaryMessageSeqRangeRecord> {
+    // SQLite preserves CROSS JOIN order: visit this lineage before looking up its messages.
+    // Reordering these joins can scan every conversation's message links once per summary,
+    // blocking context assembly on synchronous database reads.
     const row = this.db
       .prepare(
         `WITH RECURSIVE source_summaries(summary_id) AS (
@@ -606,8 +609,8 @@ export class SummaryStore {
          SELECT MIN(m.seq) AS min_seq,
                 MAX(m.seq) AS max_seq
          FROM source_summaries source
-         JOIN summary_messages sm ON sm.summary_id = source.summary_id
-         JOIN messages m ON m.message_id = sm.message_id
+         CROSS JOIN summary_messages sm ON sm.summary_id = source.summary_id
+         CROSS JOIN messages m ON m.message_id = sm.message_id
          `,
       )
       .get(summaryId) as unknown as { min_seq: number | null; max_seq: number | null } | undefined;

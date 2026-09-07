@@ -1,4 +1,4 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { DatabaseSync } from "node:sqlite";
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -22,6 +22,129 @@ function createStores() {
 }
 
 describe("SummaryStore shallow-tree helpers", () => {
+  it("resolves source ranges through shared ancestors without including unrelated history", async () => {
+    const { db, conversationStore, summaryStore } = createStores();
+    try {
+      const conversation = await conversationStore.createConversation({
+        sessionId: "source-ranges",
+      });
+      const unrelated = await conversationStore.createConversation({
+        sessionId: "unrelated-ranges",
+      });
+      const messages = await conversationStore.createMessagesBulk(
+        [2, 7, 19, 25].map((seq) => ({
+          conversationId: conversation.conversationId,
+          seq,
+          role: "user" as const,
+          content: `Source ${seq}`,
+          tokenCount: 3,
+        })),
+      );
+      const otherMessages = await conversationStore.createMessagesBulk(
+        [0, 999].map((seq) => ({
+          conversationId: unrelated.conversationId,
+          seq,
+          role: "user" as const,
+          content: "Unrelated source",
+          tokenCount: 3,
+        })),
+      );
+      for (const [summaryId, kind] of [
+        ["shared", "leaf"],
+        ["leaf", "leaf"],
+        ["left", "condensed"],
+        ["right", "condensed"],
+        ["root", "condensed"],
+        ["empty", "leaf"],
+        ["unrelated", "leaf"],
+      ] as const) {
+        await summaryStore.insertSummary({
+          summaryId,
+          conversationId:
+            summaryId === "unrelated" ? unrelated.conversationId : conversation.conversationId,
+          kind,
+          content: summaryId,
+          tokenCount: 1,
+        });
+      }
+      await summaryStore.linkSummaryToMessages(
+        "shared",
+        messages.slice(0, 2).map((m) => m.messageId),
+      );
+      await summaryStore.linkSummaryToMessages("leaf", [messages[2].messageId]);
+      await summaryStore.linkSummaryToMessages("root", [messages[3].messageId]);
+      await summaryStore.linkSummaryToMessages(
+        "unrelated",
+        otherMessages.map((m) => m.messageId),
+      );
+      await summaryStore.linkSummaryToParents("left", ["shared"]);
+      await summaryStore.linkSummaryToParents("right", ["shared", "leaf"]);
+      await summaryStore.linkSummaryToParents("root", ["left", "right"]);
+
+      for (const [summaryId, minSeq, maxSeq] of [
+        ["shared", 2, 7],
+        ["leaf", 19, 19],
+        ["left", 2, 7],
+        ["right", 2, 19],
+        ["root", 2, 25],
+        ["empty", null, null],
+        ["missing", null, null],
+      ] as const) {
+        expect(await summaryStore.getSummaryMessageSeqRange(summaryId), summaryId).toEqual({
+          minSeq,
+          maxSeq,
+        });
+      }
+    } finally {
+      db.close();
+    }
+  });
+
+  it("looks up source message links by summary instead of scanning unrelated history", async () => {
+    const { db, conversationStore, summaryStore } = createStores();
+    try {
+      const conversation = await conversationStore.createConversation({
+        sessionId: "range-query-plan",
+      });
+      // Real analyzed history makes SQLite prefer the global scan on the regressed query.
+      // Inspect the executed owner's plan rather than timing a machine-dependent benchmark.
+      db.prepare(
+        `WITH RECURSIVE sequences(seq) AS (
+        SELECT 1 UNION ALL SELECT seq + 1 FROM sequences WHERE seq < 4096
+      ) INSERT INTO messages (conversation_id, seq, role, content, token_count)
+        SELECT ?, seq, 'user', 'Historical message', 3 FROM sequences`,
+      ).run(conversation.conversationId);
+      db.prepare(
+        `INSERT INTO summaries (summary_id, conversation_id, kind, content, token_count)
+        SELECT 'summary_' || seq, ?, 'leaf', 'Historical summary', 3 FROM messages`,
+      ).run(conversation.conversationId);
+      db.exec(`INSERT INTO summary_messages (summary_id, message_id, ordinal)
+        SELECT 'summary_' || seq, message_id, 0 FROM messages;
+        ANALYZE;`);
+
+      const prepare = vi.spyOn(db, "prepare");
+      let queries: string[];
+      try {
+        await expect(summaryStore.getSummaryMessageSeqRange("summary_1")).resolves.toEqual({
+          minSeq: 1,
+          maxSeq: 1,
+        });
+        queries = prepare.mock.calls.map(([sql]) => sql);
+      } finally {
+        prepare.mockRestore();
+      }
+      const plan = queries.flatMap((sql) =>
+        db.prepare(`EXPLAIN QUERY PLAN ${sql}`).all("summary_1"),
+      );
+      expect(plan.some((step) => /^SEARCH sm\b.*\(summary_id=\?\)/.test(String(step.detail)))).toBe(
+        true,
+      );
+      expect(plan.some((step) => /^SCAN sm\b/.test(String(step.detail)))).toBe(false);
+    } finally {
+      db.close();
+    }
+  });
+
   it("returns conversation max depth and leaf links for message hits", async () => {
     const { conversationStore, summaryStore } = createStores();
     const conversation = await conversationStore.createConversation({
