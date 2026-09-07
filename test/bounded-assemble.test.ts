@@ -19,6 +19,7 @@ import { LcmContextEngine } from "../src/engine.js";
 import { estimateSerializedMessagesTokens } from "../src/estimate-tokens.js";
 import {
   SERIALIZED_OUTPUT_CLAMP_SAFETY_RATIO,
+  buildDegradedLiveAssembleResult,
   clampMessagesToSerializedBudget,
 } from "../src/assemble-fallback.js";
 import type { AgentMessage } from "../src/openclaw-bridge.js";
@@ -243,5 +244,29 @@ describe("bounded assemble output", () => {
     // Ignored sessions are not managed by LCM: no clamping, legacy shape.
     expect(result.messages.length).toBe(liveMessages.length);
     expect(result.estimatedTokens).toBe(0);
+  });
+});
+
+describe("degraded live fallback preserves a user turn", () => {
+  it("re-seats the most recent user turn when budget-trimming drops it from a tool loop", () => {
+    // conv-207 shape: one early user turn followed by a long run of heavy tool
+    // results. A tight budget keeps only the newest tool-result suffix, which
+    // would hand the provider a user-less context (Qwen chat templates 400
+    // "No user query found in messages") before this fallback re-seated one.
+    const liveMessages: AgentMessage[] = [makeUserMessage(0)];
+    for (let i = 1; i <= 12; i += 1) {
+      liveMessages.push(makeHeavyToolResultMessage(i, 4_000));
+    }
+
+    const result = buildDegradedLiveAssembleResult({
+      liveMessages,
+      tokenBudget: 3_000,
+      contextProjection: { mode: "thread_bootstrap" },
+    });
+
+    // The budget-trimmed tail alone is user-less; the fallback must re-seat one.
+    expect(result.messages.length).toBeLessThan(liveMessages.length);
+    expect(result.messages.some((m) => m.role === "user")).toBe(true);
+    expect(result.estimatedTokens).toBeGreaterThan(0);
   });
 });

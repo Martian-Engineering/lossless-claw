@@ -201,6 +201,21 @@ export function buildDegradedLiveAssembleResult(params: {
     liveTailMessages = [liveTail[liveTail.length - 1]!];
   }
   const messages = [...protectedPrefix, ...liveTailMessages];
+  // The provider rejects a context with no user turn (Qwen chat templates 400
+  // "No user query found in messages"). Budget-trimming the live tail can drop
+  // every user message on a long tool loop, and unlike the main assemble path
+  // this degraded fallback skips the no-user-turns guard. Re-seat the most
+  // recent evicted user turn after the protected prefix, mirroring
+  // clampMessagesToSerializedBudget.
+  if (!messages.some((message) => toRuntimeRoleForTokenEstimate(message.role) === "user")) {
+    for (let index = liveTail.length - liveTailMessages.length - 1; index >= 0; index -= 1) {
+      const candidate = liveTail[index]!;
+      if (toRuntimeRoleForTokenEstimate(candidate.role) === "user") {
+        messages.splice(protectedPrefix.length, 0, candidate);
+        break;
+      }
+    }
+  }
   return {
     messages,
     estimatedTokens: estimateAgentMessageTokens(messages),
