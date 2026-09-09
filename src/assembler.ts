@@ -11,6 +11,7 @@ import type { SummaryStore, ContextItemRecord, SummaryRecord } from "./store/sum
 import { estimateTokens } from "./estimate-tokens.js";
 import { formatToolOutputReference } from "./large-files.js";
 import { serializeOpenClawSenderMetadata } from "./openclaw-sender-metadata.js";
+import { attachTranscriptEntryMeta } from "./transcript.js";
 
 type AgentMessage = Parameters<ContextEngine["ingest"]>[0]["message"];
 type AssemblySegment = "evictable" | "freshTail";
@@ -1943,7 +1944,7 @@ export class ContextAssembler {
                 },
               },
             } as AgentMessage)
-          : ({
+          : attachTranscriptEntryMeta({
               role,
               content,
               ...(role === "user" && msg.openClawSenderMetadata
@@ -1952,7 +1953,13 @@ export class ContextAssembler {
               ...(toolCallId ? { toolCallId } : {}),
               ...(toolName ? { toolName } : {}),
               ...(role === "toolResult" && toolIsError !== undefined ? { isError: toolIsError } : {}),
-            } as AgentMessage),
+            } as AgentMessage, {
+              entryId: role === "user" && msg.transcriptEntryId &&
+                await this.conversationStore.isTrustedTranscriptAnchor(msg.conversationId, msg.transcriptEntryId)
+                ? msg.transcriptEntryId : null,
+              parentId: null,
+              timestamp: null,
+            }),
       tokens: tokenCount,
       isMessage: true,
       text: contentText,

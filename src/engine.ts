@@ -88,13 +88,14 @@ import {
   type TranscriptAnchorAuditEntry,
   type TranscriptAnchorAuditMessage,
 } from "./transcript-anchor-audit.js";
-import { estimateTokens } from "./estimate-tokens.js";
+import { estimateTokens, estimateSerializedMessagesTokens } from "./estimate-tokens.js";
 import {
   buildDeterministicFallbackSummary,
   FALLBACK_DIRECTIVE_SUMMARY_MARKER,
   MIN_FALLBACK_MAX_TOKENS,
 } from "./summary-fallback.js";
 import { attachTranscriptEntryMeta, getTranscriptEntryId, resolveTranscriptMessageCreatedAt } from "./transcript.js";
+import { restoreRawUserReplay } from "./user-replay.js";
 import { extractStableEventKey } from "./stable-event-key.js";
 import { transcriptImportCap, type TranscriptReconcileResult } from "./reconcile-plan.js";
 import { describeAssembledPrefixChange, formatOverflowDiagnosticsForLog, shouldLogOverflowDiagnostics, type AssemblePrefixSnapshot, type BootstrapImportObservation } from "./assemble-debug.js";
@@ -4993,8 +4994,19 @@ export class LcmContextEngine implements ContextEngine {
       // budget math above runs on stored-content token counts, which undercount
       // live messages that carry structured tool payloads; this is the last
       // line of defense that keeps assembled output deliverable to the model.
+      const replayTarget = resolveSessionTranscriptReadTarget(params);
+      let replayEntries: VisibleSessionTranscriptMessageEntry[] = [];
+      if (replayTarget && this.deps.readVisibleSessionTranscriptMessageEntries &&
+          liveMessages.some(message => message.role === "user" && typeof Reflect.get(message, "idempotencyKey") === "string")) {
+        try {
+          replayEntries = await this.deps.readVisibleSessionTranscriptMessageEntries(replayTarget);
+        } catch (error) {
+          this.deps.log.warn(`[lcm] assemble: user replay metadata unavailable for ${sessionLabel}: ${describeLogError(error)}`);
+        }
+      }
+      const replay = restoreRawUserReplay(volatileLiveInputAppend.messages, liveMessages, replayEntries);
       let serializedClamp = clampMessagesToSerializedBudget({
-        messages: volatileLiveInputAppend.messages,
+        messages: replay.messages,
         tokenBudget,
         preserveSubstantiveAssistantTail: hostDeliversCurrentTurnSeparately,
       });
@@ -5002,10 +5014,10 @@ export class LcmContextEngine implements ContextEngine {
         // The recall cue is optional enrichment: drop it before evicting any
         // real context, mirroring the internal cue-vs-eviction priority.
         const cueMessage = budgetedPromptRecallCue.message;
-        const withoutCue = volatileLiveInputAppend.messages.filter(
+        const withoutCue = replay.messages.filter(
           (message) => message !== cueMessage,
         );
-        if (withoutCue.length < volatileLiveInputAppend.messages.length) {
+        if (withoutCue.length < replay.messages.length) {
           serializedClamp = clampMessagesToSerializedBudget({
             messages: withoutCue,
             tokenBudget,
@@ -5019,8 +5031,14 @@ export class LcmContextEngine implements ContextEngine {
           `[lcm] assemble: serialized budget clamp conversation=${conversation.conversationId} ${sessionLabel} serializedTokensBefore=${serializedClamp.serializedTokensBefore} serializedTokens=${serializedClamp.serializedTokens} internalEstimatedTokens=${volatileLiveInputAppend.estimatedTokens} evictedMessages=${serializedClamp.evictedMessages} tokenBudget=${tokenBudget} clamped=${serializedClamp.clamped} overBudget=${serializedClamp.overBudget}`,
         );
       }
-      const finalMessages = serializedClamp.messages;
-      const finalEstimatedTokens = serializedClamp.serializedTokens;
+      const retainedMessages = new Set(serializedClamp.messages);
+      const finalMessages = serializedClamp.messages.filter(message => {
+        const parent = replay.carrierParents.get(message);
+        return !parent || retainedMessages.has(parent);
+      });
+      const finalEstimatedTokens = finalMessages.length === serializedClamp.messages.length
+        ? serializedClamp.serializedTokens
+        : estimateSerializedMessagesTokens(finalMessages);
 
       // v4.2 §B — surface stub telemetry on the standard "assemble: done" line
       // so live watchers can grep stubbedCount/tokensSaved without needing the
