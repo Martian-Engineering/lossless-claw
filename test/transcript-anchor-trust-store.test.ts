@@ -151,6 +151,38 @@ describe("ConversationStore transcript anchor trust", () => {
 });
 
 describe("weak anchor adoption", () => {
+  it("ignores repeated text outside the recent adoption window", async () => {
+    const { store, db } = createStoreFixture();
+    const { conversationId } = await store.createConversation({ sessionId: "tail-window" });
+    const rows = await store.createMessagesBulk(
+      ["repeated", "intervening", "repeated"].map((content, seq) => ({
+        conversationId,
+        seq,
+        role: "assistant" as const,
+        content,
+        tokenCount: 1,
+      })),
+    );
+
+    // The same rows are ambiguous in a wider window but unique in the tail.
+    expect(
+      await store.adoptRecentTranscriptEntryId(
+        conversationId, "assistant", "repeated", "tail-anchor", 3,
+      ),
+    ).toBe(false);
+    expect(
+      await store.adoptRecentTranscriptEntryId(
+        conversationId, "assistant", "repeated", "tail-anchor", 2,
+      ),
+    ).toBe(true);
+    expect(
+      await store.getTranscriptEntryAnchorCandidate(conversationId, "tail-anchor"),
+    ).toMatchObject({ messageId: rows[2]!.messageId });
+    expect((await store.getMessageById(rows[0]!.messageId))?.transcriptEntryId).toBeNull();
+    expect(await store.getMessageCount(conversationId)).toBe(3);
+    db.close();
+  });
+
   it("never stamps blank parent messages or ambiguous repeated text", async () => {
     const { store, db } = createStoreFixture();
     const { conversationId } = await store.createConversation({ sessionId: "weak" });

@@ -1289,7 +1289,7 @@ export class ConversationStore {
     return result.changes > 0;
   }
 
-  /** Stamp a transcript entry id onto the newest identity-matching unstamped tail row. */
+  /** Stamp a transcript entry id onto a unique plain-text unstamped tail row. */
   async adoptRecentTranscriptEntryId(
     conversationId: ConversationId,
     role: MessageRole,
@@ -1298,44 +1298,32 @@ export class ConversationStore {
     tailWindow: number,
   ): Promise<boolean> {
     if (content.trim() === "") return false;
+    const normalizedTailWindow = Math.max(1, Math.floor(tailWindow));
+    // Only rows in the adoption window can make this candidate ambiguous.
     const candidates = this.db
       .prepare(
-        `SELECT m.message_id FROM messages m WHERE m.conversation_id = ? AND m.transcript_entry_id IS NULL AND m.role = ? AND m.content = ? AND NOT EXISTS (SELECT 1 FROM message_parts p WHERE p.message_id = m.message_id AND (p.part_type != 'text' OR p.tool_call_id IS NOT NULL))`,
+        `SELECT m.message_id
+         FROM (
+           SELECT message_id, transcript_entry_id, role, content
+           FROM messages
+           WHERE conversation_id = ?
+           ORDER BY seq DESC
+           LIMIT ?
+         ) AS m
+         WHERE m.transcript_entry_id IS NULL AND m.role = ? AND m.content = ?
+           AND NOT EXISTS (
+             SELECT 1 FROM message_parts p
+             WHERE p.message_id = m.message_id
+               AND (p.part_type != 'text' OR p.tool_call_id IS NOT NULL)
+           )`,
       )
-      .all(conversationId, role, content);
+      .all(conversationId, normalizedTailWindow, role, content) as Array<{ message_id: number }>;
     if (candidates.length !== 1) return false;
-    const identityHash = buildMessageIdentityHash(role, content);
-    const result = this.db
-      .prepare(
-        `UPDATE messages
-         SET transcript_entry_id = ?
-         WHERE message_id = (
-           SELECT message_id
-           FROM (
-             SELECT message_id, transcript_entry_id, identity_hash, role, content
-             FROM messages
-             WHERE conversation_id = ?
-             ORDER BY seq DESC
-             LIMIT ?
-           ) AS tail
-           WHERE transcript_entry_id IS NULL
-             AND NOT EXISTS (SELECT 1 FROM message_parts p WHERE p.message_id = tail.message_id AND (p.part_type != 'text' OR p.tool_call_id IS NOT NULL))
-             AND identity_hash = ?
-             AND role = ?
-             AND content = ?
-           ORDER BY message_id DESC
-           LIMIT 1
-         )`,
-      )
-      .run(
-        transcriptEntryId,
-        conversationId,
-        Math.max(1, Math.floor(tailWindow)),
-        identityHash,
-        role,
-        content,
-      );
-    return result.changes > 0;
+    return this.adoptTranscriptEntryIdForMessage(
+      conversationId,
+      candidates[0]!.message_id,
+      transcriptEntryId,
+    );
   }
 
   /** Stamp a transcript entry id onto one known unstamped message row. */
