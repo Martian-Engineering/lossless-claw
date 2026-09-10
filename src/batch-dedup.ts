@@ -1,4 +1,4 @@
-/**
+import { structuredPartsIdentity } from "./structured-anchor-identity.js";/**
  * After-turn batch deduplication: guards ingest against gateway replays of
  * full history by aligning the runtime turn delta with the persisted
  * conversation tail (exact frontier alignment after a covered transcript
@@ -16,6 +16,7 @@ import {
 } from "./large-files.js";
 import { liveContentIsRecognizedDecoratedBareBody } from "./live-coverage.js";
 import {
+  buildMessageParts,
   extractStructuredText,
   RAW_PAYLOAD_EXTERNALIZATION_REASON,
   serializeRawPayloadContent,
@@ -37,11 +38,7 @@ import { getTranscriptEntryId } from "./transcript.js";
 import type { LcmDependencies } from "./types.js";
 
 type RedactSensitiveText = (content: string) => string;
-type StoredIncomingMatch =
-  | "exact"
-  | "externalized"
-  | "unproven-externalized"
-  | "redacted";
+type StoredIncomingMatch = "exact" | "externalized" | "unproven-externalized" | "redacted";
 type CoveredStoredIncomingMatch = StoredIncomingMatch | "decorated";
 type AlignmentMatch = CoveredStoredIncomingMatch | "unanchored-inbound";
 
@@ -198,15 +195,12 @@ export class BatchDeduplicator {
       allowUntimestampedInboundBodyMatch?: boolean;
     },
   ): boolean {
+    // This fallback only proves decorated user text, never structured messages.
+    if (persistedRole !== "user" || batchRole !== "user") return false;
     if (
-      messageIdentity(persistedRole, persistedContent) ===
-      messageIdentity(batchRole, batchContent)
-    ) {
+      messageIdentity(persistedRole, persistedContent) === messageIdentity(batchRole, batchContent)
+    )
       return true;
-    }
-    if (persistedRole !== "user" || batchRole !== "user") {
-      return false;
-    }
     // Whitespace-divergent faces of the same turn: core collapses the runtime
     // message's space runs to single spaces while the transcript keeps them
     // verbatim, so their identity_hashes differ and the decoration matcher's
@@ -345,7 +339,19 @@ export class BatchDeduplicator {
       storedBatch,
     );
     if (persistedIdentityOverlaps > 0) {
-      if (await this.batchIsFullyPersistedByMultiplicity(conversationId, storedBatch)) {
+      if (
+        !batch.some(
+          (message, index) =>
+            structuredPartsIdentity(
+              buildMessageParts({
+                sessionId: "",
+                message,
+                fallbackContent: storedBatch[index]!.content,
+              }),
+            ) !== null,
+        ) &&
+        (await this.batchIsFullyPersistedByMultiplicity(conversationId, storedBatch))
+      ) {
         this.deps.log.debug(
           `[lcm] afterTurn: runtime batch does not align with the covered transcript frontier but is fully persisted by multiplicity (${persistedIdentityOverlaps}/${batch.length}); skipping replay conversation=${conversationId}`,
         );
@@ -378,12 +384,7 @@ export class BatchDeduplicator {
     });
     if (!conversation) return batch;
 
-    if (
-      await this.batchIsFullyPersistedByTranscriptEntryId(
-        conversation.conversationId,
-        batch,
-      )
-    ) {
+    if (await this.batchIsFullyPersistedByTranscriptEntryId(conversation.conversationId, batch)) {
       this.deps.log.debug(
         `[lcm] afterTurn: transcript unavailable with preserved checkpoint; skipping fully persisted runtime replay conversation=${conversation.conversationId} batchLen=${batch.length}`,
       );
@@ -407,9 +408,18 @@ export class BatchDeduplicator {
     for (const message of batch) {
       const entryId = getTranscriptEntryId(message);
       if (!entryId) return false;
-      if (!(await this.conversationStore.hasMessageByTranscriptEntryId(conversationId, entryId))) {
+      const candidate = await this.conversationStore.getTranscriptEntryAnchorCandidate(
+        conversationId,
+        entryId,
+      );
+      const incoming = toStoredMessage(message);
+      if (
+        !candidate ||
+        candidate.role !== incoming.role ||
+        candidate.content !== incoming.content ||
+        !(await this.matchesStructuredAnchor(candidate.messageId, message))
+      )
         return false;
-      }
     }
     return true;
   }
@@ -575,7 +585,9 @@ export class BatchDeduplicator {
     const incomingHash = storedMessageIdentityHash(stored);
     const incomingRawPayloadContent =
       serializeRawPayloadContent(params.message, stored.content)?.content ?? null;
+    const candidates: number[] = [];
     for (let index = tail.length - 1; index >= 0; index -= 1) {
+      if (tail[index]!.transcriptEntryId) continue;
       const match = await this.matchStoredMessageToIncoming(
         tail[index]!,
         stored,
@@ -587,17 +599,14 @@ export class BatchDeduplicator {
       if (!match || match === "unproven-externalized") {
         continue;
       }
-      if (
-        await this.conversationStore.adoptTranscriptEntryIdForMessage(
-          params.conversationId,
-          tail[index]!.messageId,
-          params.transcriptEntryId,
-        )
-      ) {
-        return true;
-      }
+      candidates.push(tail[index]!.messageId);
     }
-    return false;
+    if (candidates.length !== 1) return false;
+    return this.conversationStore.adoptTranscriptEntryIdForMessage(
+      params.conversationId,
+      candidates[0]!,
+      params.transcriptEntryId,
+    );
   }
 
   /**
@@ -620,7 +629,10 @@ export class BatchDeduplicator {
     // Quick check: if the last DB identity_hash matches the last batch
     // identity_hash, verify that the entire batch matches the actual DB tail.
     if (lastDbIdentityHash === lastBatchHash) {
-      const tailMessages = await this.conversationStore.getLastMessages(conversationId, batch.length);
+      const tailMessages = await this.conversationStore.getLastMessages(
+        conversationId,
+        batch.length,
+      );
       const tailHashes = await this.conversationStore.getRecentMessageIdentityHashes(
         conversationId,
         batch.length,
@@ -825,6 +837,44 @@ export class BatchDeduplicator {
     storedHash: string,
     incomingRawPayloadContent?: string | null,
   ): Promise<StoredIncomingMatch | null> {
+    const storedParts = await this.conversationStore.getMessageParts(storedMessage.messageId);
+    const storedStructured = structuredPartsIdentity(storedParts);
+    const incomingStructured = structuredPartsIdentity(
+      buildMessageParts({
+        sessionId: "",
+        message: incomingMessage,
+        fallbackContent: incoming.content,
+      }),
+    );
+    const externalizedMatch = await this.messagesAreExternalizedEquivalent(
+      storedMessage,
+      incoming,
+      incomingRawPayloadContent,
+    );
+    if (externalizedMatch === "externalized") {
+      const storedIds = await this.storedToolCallIds(storedMessage.messageId);
+      const incomingIds = incomingToolCallIds(incomingMessage);
+      if (
+        (storedIds.size === 0 && incomingIds.size === 0) ||
+        sameNonEmptyIds(storedIds, incomingIds)
+      )
+        return "externalized";
+    }
+    // Text hashes are only candidate indexes. Never equate unrelated tool events.
+    if (
+      (storedStructured !== null || incomingStructured !== null) &&
+      storedStructured !== incomingStructured
+    ) {
+      // Preserve the separately proven, provenance-gated host-redaction path.
+      return (await this.messagesDifferOnlyByHostRedaction(
+        storedMessage,
+        incoming,
+        incomingMessage,
+      ))
+        ? "redacted"
+        : null;
+    }
+    if (incoming.content.trim() === "" && incomingStructured === null) return null;
     if (
       storedHash === incomingHash &&
       storedMessage.role === incoming.role &&
@@ -832,19 +882,35 @@ export class BatchDeduplicator {
     ) {
       return "exact";
     }
-    const externalizedMatch = await this.messagesAreExternalizedEquivalent(
-      storedMessage,
-      incoming,
-      incomingRawPayloadContent,
-    );
-    if (externalizedMatch) return externalizedMatch;
-    return (await this.messagesDifferOnlyByHostRedaction(
-      storedMessage,
-      incoming,
-      incomingMessage,
-    ))
+    if (externalizedMatch === "unproven-externalized") return externalizedMatch;
+    return (await this.messagesDifferOnlyByHostRedaction(storedMessage, incoming, incomingMessage))
       ? "redacted"
       : null;
+  }
+
+  async matchesPersistedAnchor(messageId: number, message: AgentMessage): Promise<boolean> {
+    const persisted = await this.conversationStore.getMessageById(messageId);
+    if (!persisted) return false;
+    const incoming = toStoredMessage(message);
+    const match = await this.matchStoredMessageToIncoming(
+      persisted,
+      incoming,
+      message,
+      storedMessageIdentityHash(incoming),
+      buildMessageIdentityHash(persisted.role, persisted.content),
+      serializeRawPayloadContent(message, incoming.content)?.content ?? null,
+    );
+    return match !== null && match !== "unproven-externalized";
+  }
+
+  async matchesStructuredAnchor(messageId: number, message: AgentMessage): Promise<boolean> {
+    const storedParts = await this.conversationStore.getMessageParts(messageId);
+    const incoming = toStoredMessage(message);
+    const expected = structuredPartsIdentity(
+      buildMessageParts({ sessionId: "", message, fallbackContent: incoming.content }),
+    );
+    const actual = structuredPartsIdentity(storedParts);
+    return actual === expected && (expected !== null || incoming.content.trim() !== "");
   }
 
   private async countPersistedIdentityOverlaps(
@@ -865,6 +931,7 @@ export class BatchDeduplicator {
     conversationId: number,
     incomingBatch: StoredMessage[],
   ): Promise<boolean> {
+    if (incomingBatch.some((message) => message.content.trim() === "")) return false;
     const requiredCounts = new Map<
       string,
       { role: StoredMessage["role"]; identityHash: string; count: number }
@@ -905,10 +972,7 @@ export class BatchDeduplicator {
     if (references.length === 0) {
       return null;
     }
-    const proofKeys = await this.getStoredExternalizedReferenceProofKeys(
-      storedMessage,
-      references,
-    );
+    const proofKeys = await this.getStoredExternalizedReferenceProofKeys(storedMessage, references);
     if (proofKeys.size > 0) {
       references = references.filter((reference) => proofKeys.has(referenceProofKey(reference)));
       if (references.length === 0) {
@@ -943,8 +1007,7 @@ export class BatchDeduplicator {
       ) {
         return provenanceBacked ? "externalized" : "unproven-externalized";
       }
-      return (
-        references.length === 1 &&
+      return references.length === 1 &&
         isWholeIncomingReference(references[0]!) &&
         (await this.referenceMatchesWholeIncoming(
           storedMessage,
@@ -952,8 +1015,9 @@ export class BatchDeduplicator {
           references[0]!,
           incomingRawPayloadContent,
         ))
-      )
-        ? provenanceBacked ? "externalized" : "unproven-externalized"
+        ? provenanceBacked
+          ? "externalized"
+          : "unproven-externalized"
         : null;
     }
 
@@ -1080,14 +1144,17 @@ export class BatchDeduplicator {
     if (!largeFile) {
       return false;
     }
-    if (this.formatExternalizedReference(reference, largeFile, storedMessage) !== storedMessage.content) {
+    if (
+      this.formatExternalizedReference(reference, largeFile, storedMessage) !==
+      storedMessage.content
+    ) {
       return false;
     }
     if (isImageReference(reference)) {
-      const incomingImage = extractSingleNativeImageBuffer(incomingRawPayloadContent ?? incoming.content);
-      return incomingImage
-        ? this.referenceMatchesNativeImage(reference, incomingImage)
-        : false;
+      const incomingImage = extractSingleNativeImageBuffer(
+        incomingRawPayloadContent ?? incoming.content,
+      );
+      return incomingImage ? this.referenceMatchesNativeImage(reference, incomingImage) : false;
     }
     const contentToCompare =
       reference.reference.startsWith("[LCM Raw Payload:") && incomingRawPayloadContent != null
@@ -1100,10 +1167,7 @@ export class BatchDeduplicator {
     ) {
       return true;
     }
-    if (
-      !reference.reference.startsWith("[LCM Raw Payload:") ||
-      incomingRawPayloadContent == null
-    ) {
+    if (!reference.reference.startsWith("[LCM Raw Payload:") || incomingRawPayloadContent == null) {
       return false;
     }
     const hasFileBlocks = parseFileBlocks(incomingRawPayloadContent).length > 0;
@@ -1334,9 +1398,7 @@ type ExternalizedReference = {
   end: number;
 };
 
-type NativeImageReplayBlock =
-  | { kind: "text"; text: string }
-  | { kind: "image"; buffer: Buffer };
+type NativeImageReplayBlock = { kind: "text"; text: string } | { kind: "image"; buffer: Buffer };
 
 function extractExternalizedReferences(content: string): ExternalizedReference[] {
   const references: ExternalizedReference[] = [];
@@ -1351,7 +1413,11 @@ function extractExternalizedReferences(content: string): ExternalizedReference[]
       continue;
     }
     const headerRemainder = content.slice(referencePattern.lastIndex, markerIndex);
-    if (/\][\s\S]*\[LCM (?:File|Raw Payload|Tool Output):\s*file_[a-f0-9]{16}\b/i.test(headerRemainder)) {
+    if (
+      /\][\s\S]*\[LCM (?:File|Raw Payload|Tool Output):\s*file_[a-f0-9]{16}\b/i.test(
+        headerRemainder,
+      )
+    ) {
       continue;
     }
     references.push({
@@ -1377,7 +1443,10 @@ function extractExternalizedReferences(content: string): ExternalizedReference[]
   return references;
 }
 
-function extractReferenceField(reference: string, field: "tool" | "role" | "reason"): string | undefined {
+function extractReferenceField(
+  reference: string,
+  field: "tool" | "role" | "reason",
+): string | undefined {
   const match = new RegExp(`\\b${field}=([^|\\]]+)`).exec(reference);
   return match?.[1]?.trim() || undefined;
 }
@@ -1447,7 +1516,9 @@ function extractNativeImageReplayBlocks(content: string): NativeImageReplayBlock
 
 function rawPayloadHasNativeImages(content: string): boolean {
   const parsed = parseJsonPayload(content);
-  return Array.isArray(parsed) && parsed.some((entry) => extractSingleNativeImageBufferFromValue(entry));
+  return (
+    Array.isArray(parsed) && parsed.some((entry) => extractSingleNativeImageBufferFromValue(entry))
+  );
 }
 
 function extractSingleNativeImageBufferFromValue(value: unknown): Buffer | null {
@@ -1517,7 +1588,7 @@ function parsePartMetadata(metadata: string | null): Record<string, unknown> | n
   try {
     const parsed = JSON.parse(metadata);
     return parsed && typeof parsed === "object" && !Array.isArray(parsed)
-      ? parsed as Record<string, unknown>
+      ? (parsed as Record<string, unknown>)
       : null;
   } catch {
     return null;

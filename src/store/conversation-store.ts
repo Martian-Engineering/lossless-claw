@@ -789,7 +789,7 @@ export class ConversationStore {
     sessionId: string,
     titleOrOpts?: string | { title?: string; sessionKey?: string },
   ): Promise<ConversationRecord> {
-    const opts = typeof titleOrOpts === "string" ? { title: titleOrOpts } : titleOrOpts ?? {};
+    const opts = typeof titleOrOpts === "string" ? { title: titleOrOpts } : (titleOrOpts ?? {});
     const normalizedSessionKey = opts.sessionKey?.trim();
     if (normalizedSessionKey) {
       const byKey = await this.getConversationBySessionKey(normalizedSessionKey);
@@ -825,7 +825,11 @@ export class ConversationStore {
       }
     }
 
-    return this.createConversation({ sessionId, title: opts.title, sessionKey: normalizedSessionKey });
+    return this.createConversation({
+      sessionId,
+      title: opts.title,
+      sessionKey: normalizedSessionKey,
+    });
   }
 
   async markConversationBootstrapped(conversationId: ConversationId): Promise<void> {
@@ -1250,6 +1254,13 @@ export class ConversationStore {
     transcriptEntryId: string,
     openClawSenderMetadata?: OpenClawSenderMetadata | null,
   ): Promise<boolean> {
+    if (content.trim() === "") return false;
+    const candidates = this.db
+      .prepare(
+        `SELECT m.message_id FROM messages m WHERE m.conversation_id = ? AND m.transcript_entry_id IS NULL AND m.role = ? AND m.content = ? AND NOT EXISTS (SELECT 1 FROM message_parts p WHERE p.message_id = m.message_id AND (p.part_type != 'text' OR p.tool_call_id IS NOT NULL))`,
+      )
+      .all(conversationId, role, content);
+    if (candidates.length !== 1) return false;
     const identityHash = buildMessageIdentityHash(role, content);
     const serializedSenderMetadata =
       role === "user" ? serializeOpenClawSenderMetadata(openClawSenderMetadata) : null;
@@ -1263,6 +1274,7 @@ export class ConversationStore {
          FROM messages
          WHERE conversation_id = ?
            AND transcript_entry_id IS NULL
+           AND NOT EXISTS (SELECT 1 FROM message_parts p WHERE p.message_id = messages.message_id AND (p.part_type != 'text' OR p.tool_call_id IS NOT NULL))
            AND identity_hash = ?
            AND role = ?
            AND content = ?
@@ -1289,6 +1301,13 @@ export class ConversationStore {
     transcriptEntryId: string,
     tailWindow: number,
   ): Promise<boolean> {
+    if (content.trim() === "") return false;
+    const candidates = this.db
+      .prepare(
+        `SELECT m.message_id FROM messages m WHERE m.conversation_id = ? AND m.transcript_entry_id IS NULL AND m.role = ? AND m.content = ? AND NOT EXISTS (SELECT 1 FROM message_parts p WHERE p.message_id = m.message_id AND (p.part_type != 'text' OR p.tool_call_id IS NOT NULL))`,
+      )
+      .all(conversationId, role, content);
+    if (candidates.length !== 1) return false;
     const identityHash = buildMessageIdentityHash(role, content);
     const result = this.db
       .prepare(
@@ -1302,8 +1321,9 @@ export class ConversationStore {
              WHERE conversation_id = ?
              ORDER BY seq DESC
              LIMIT ?
-           )
+           ) AS tail
            WHERE transcript_entry_id IS NULL
+             AND NOT EXISTS (SELECT 1 FROM message_parts p WHERE p.message_id = tail.message_id AND (p.part_type != 'text' OR p.tool_call_id IS NOT NULL))
              AND identity_hash = ?
              AND role = ?
              AND content = ?
@@ -1318,7 +1338,7 @@ export class ConversationStore {
         identityHash,
         role,
         content,
-    );
+      );
     return result.changes > 0;
   }
 
@@ -1450,9 +1470,7 @@ export class ConversationStore {
     openClawSenderMetadata?: OpenClawSenderMetadata | null,
   ): Promise<boolean> {
     try {
-      const serializedSenderMetadata = serializeOpenClawSenderMetadata(
-        openClawSenderMetadata,
-      );
+      const serializedSenderMetadata = serializeOpenClawSenderMetadata(openClawSenderMetadata);
       const result = this.db
         .prepare(
           `UPDATE messages
@@ -1702,9 +1720,13 @@ export class ConversationStore {
          AND content = ?
        LIMIT 1`,
       )
-      .get(conversationId, Math.max(1, Math.floor(tailWindow)), identityHash, role, content) as unknown as
-      | { found?: number }
-      | undefined;
+      .get(
+        conversationId,
+        Math.max(1, Math.floor(tailWindow)),
+        identityHash,
+        role,
+        content,
+      ) as unknown as { found?: number } | undefined;
     return row?.found === 1;
   }
 
@@ -1780,7 +1802,9 @@ export class ConversationStore {
          )
        LIMIT 1`,
       )
-      .get(conversationId, identityHash, role, content) as unknown as { found?: number } | undefined;
+      .get(conversationId, identityHash, role, content) as unknown as
+      | { found?: number }
+      | undefined;
     return row?.found === 1;
   }
 
@@ -2353,7 +2377,8 @@ export class ConversationStore {
 
     return rows
       .map((row): MessageSearchResult | null => {
-        const normalizedContent = normalizeMessageContentForFullTextIndex(row.content) ?? row.content;
+        const normalizedContent =
+          normalizeMessageContentForFullTextIndex(row.content) ?? row.content;
         const haystack = normalizedContent.toLowerCase();
         const matchesAllTerms = plan.terms.every((term) => haystack.includes(term));
         if (!matchesAllTerms) {
