@@ -499,7 +499,11 @@ describe("BatchDeduplicator.alignRuntimeBatchAgainstCoveredFrontier", () => {
       makeMessage({ role: "user", content: "genuinely new user turn" }),
     ];
 
-    const result = await dedup.alignRuntimeBatchAgainstCoveredFrontier("s1", undefined, batch);
+    const result = await dedup.alignRuntimeBatchAgainstCoveredFrontier(
+      "s1",
+      undefined,
+      batch,
+    );
 
     expect(result).toEqual(batch);
   });

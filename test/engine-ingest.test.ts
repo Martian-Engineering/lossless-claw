@@ -147,7 +147,9 @@ describe("LcmContextEngine.ingest content extraction", () => {
       expect(storedFile).not.toBeNull();
       expect(storedFile!.fileName).toBe("lcm-paper.md");
       expect(storedFile!.mimeType).toBe("text/markdown");
-      expect(storedFile!.storageUri).toContain(`lcm-files/${conversation!.conversationId}/`);
+      expect(storedFile!.storageUri).toContain(
+        `lcm-files/${conversation!.conversationId}/`,
+      );
       expect(readFileSync(storedFile!.storageUri, "utf8")).toBe(fileText);
 
       const parts = await engine.getConversationStore().getMessageParts(messages[0].messageId);
@@ -296,10 +298,7 @@ describe("LcmContextEngine.ingest content extraction", () => {
       expect(storedFile!.mimeType).toBe("application/json");
       expect(readFileSync(storedFile!.storageUri, "utf8")).toBe(JSON.stringify(rawPayload));
 
-      const assembler = new ContextAssembler(
-        engine.getConversationStore(),
-        engine.getSummaryStore(),
-      );
+      const assembler = new ContextAssembler(engine.getConversationStore(), engine.getSummaryStore());
       const assembled = await assembler.assemble({
         conversationId: conversation!.conversationId,
         tokenBudget: 10_000,
@@ -382,10 +381,14 @@ describe("LcmContextEngine.ingest content extraction", () => {
       }),
     });
 
-    const conversation = await engine.getConversationStore().getConversationBySessionId(sessionId);
+    const conversation = await engine
+      .getConversationStore()
+      .getConversationBySessionId(sessionId);
     expect(conversation).not.toBeNull();
 
-    const messages = await engine.getConversationStore().getMessages(conversation!.conversationId);
+    const messages = await engine
+      .getConversationStore()
+      .getMessages(conversation!.conversationId);
     expect(messages).toHaveLength(1);
     expect(messages[0].content).toContain("[User image: screenshot.png");
     expect(messages[0].content).not.toContain(base64Image.slice(0, 32));
@@ -395,7 +398,9 @@ describe("LcmContextEngine.ingest content extraction", () => {
     const storedFile = await engine.getSummaryStore().getLargeFile(fileIdMatch![0]);
     expect(storedFile).not.toBeNull();
     expect(storedFile!.mimeType).toBe("image/png");
-    expect(storedFile!.storageUri).toContain(`${largeFilesDir}/${conversation!.conversationId}/`);
+    expect(storedFile!.storageUri).toContain(
+      `${largeFilesDir}/${conversation!.conversationId}/`,
+    );
   });
 
   it("externalizes native user image blocks before raw payload fallback", async () => {
@@ -426,10 +431,14 @@ describe("LcmContextEngine.ingest content extraction", () => {
       }),
     });
 
-    const conversation = await engine.getConversationStore().getConversationBySessionId(sessionId);
+    const conversation = await engine
+      .getConversationStore()
+      .getConversationBySessionId(sessionId);
     expect(conversation).not.toBeNull();
 
-    const messages = await engine.getConversationStore().getMessages(conversation!.conversationId);
+    const messages = await engine
+      .getConversationStore()
+      .getMessages(conversation!.conversationId);
     expect(messages).toHaveLength(1);
     expect(messages[0].content).toContain("please inspect");
     expect(messages[0].content).toContain("[User image: screenshot.jpg");
@@ -485,10 +494,14 @@ describe("LcmContextEngine.ingest content extraction", () => {
       }),
     });
 
-    const conversation = await engine.getConversationStore().getConversationBySessionId(sessionId);
+    const conversation = await engine
+      .getConversationStore()
+      .getConversationBySessionId(sessionId);
     expect(conversation).not.toBeNull();
 
-    const messages = await engine.getConversationStore().getMessages(conversation!.conversationId);
+    const messages = await engine
+      .getConversationStore()
+      .getMessages(conversation!.conversationId);
     expect(messages).toHaveLength(1);
     expect(messages[0].content).toContain("Here is the rendered chart");
     expect(messages[0].content).toContain("[Assistant image:");
@@ -536,14 +549,20 @@ describe("LcmContextEngine.ingest content extraction", () => {
         role: "toolResult",
         toolCallId: "call_screenshot",
         toolName: "take_screenshot",
-        content: [{ type: "image", data: base64Image, mimeType: "image/png" }],
+        content: [
+          { type: "image", data: base64Image, mimeType: "image/png" },
+        ],
       } as AgentMessage,
     });
 
-    const conversation = await engine.getConversationStore().getConversationBySessionId(sessionId);
+    const conversation = await engine
+      .getConversationStore()
+      .getConversationBySessionId(sessionId);
     expect(conversation).not.toBeNull();
 
-    const messages = await engine.getConversationStore().getMessages(conversation!.conversationId);
+    const messages = await engine
+      .getConversationStore()
+      .getMessages(conversation!.conversationId);
     expect(messages).toHaveLength(2);
     const toolMessage = messages[1];
     expect(toolMessage.role).toBe("tool");
@@ -584,10 +603,14 @@ describe("LcmContextEngine.ingest content extraction", () => {
       } as AgentMessage,
     });
 
-    const conversation = await engine.getConversationStore().getConversationBySessionId(sessionId);
+    const conversation = await engine
+      .getConversationStore()
+      .getConversationBySessionId(sessionId);
     expect(conversation).not.toBeNull();
 
-    const messages = await engine.getConversationStore().getMessages(conversation!.conversationId);
+    const messages = await engine
+      .getConversationStore()
+      .getMessages(conversation!.conversationId);
     expect(messages).toHaveLength(1);
     expect(messages[0].content).toContain("Workspace bootstrap");
     expect(messages[0].content).toContain("[System image:");
@@ -636,7 +659,9 @@ describe("LcmContextEngine.ingest content extraction", () => {
       } as AgentMessage,
     });
 
-    const conversation = await engine.getConversationStore().getConversationBySessionId(sessionId);
+    const conversation = await engine
+      .getConversationStore()
+      .getConversationBySessionId(sessionId);
     expect(conversation).not.toBeNull();
 
     const largeFiles = await engine
@@ -758,9 +783,7 @@ describe("LcmContextEngine.ingest content extraction", () => {
       expect(storedFile!.mimeType).toBe("text/plain");
       expect(readFileSync(storedFile!.storageUri, "utf8")).toBe(toolOutput);
 
-      const parts = await engine
-        .getConversationStore()
-        .getMessageParts(storedMessages[1].messageId);
+      const parts = await engine.getConversationStore().getMessageParts(storedMessages[1].messageId);
       expect(parts).toHaveLength(1);
       expect(parts[0].partType).toBe("tool");
       const metadata = JSON.parse(parts[0].metadata ?? "{}") as Record<string, unknown>;
@@ -771,10 +794,7 @@ describe("LcmContextEngine.ingest content extraction", () => {
         externalizationReason: "large_tool_result",
       });
 
-      const assembler = new ContextAssembler(
-        engine.getConversationStore(),
-        engine.getSummaryStore(),
-      );
+      const assembler = new ContextAssembler(engine.getConversationStore(), engine.getSummaryStore());
       const assembled = await assembler.assemble({
         conversationId: conversation!.conversationId,
         tokenBudget: 10_000,
@@ -961,9 +981,7 @@ describe("LcmContextEngine.ingest content extraction", () => {
       expect(storedFile!.fileName).toBe("exec.txt");
       expect(readFileSync(storedFile!.storageUri, "utf8")).toBe(toolOutput);
 
-      const parts = await engine
-        .getConversationStore()
-        .getMessageParts(storedMessages[1].messageId);
+      const parts = await engine.getConversationStore().getMessageParts(storedMessages[1].messageId);
       expect(parts).toHaveLength(1);
       expect(parts[0].partType).toBe("tool");
       expect(parts[0].toolCallId).toBe("call_live_exec");
@@ -978,10 +996,7 @@ describe("LcmContextEngine.ingest content extraction", () => {
         externalizationReason: "large_tool_result",
       });
 
-      const assembler = new ContextAssembler(
-        engine.getConversationStore(),
-        engine.getSummaryStore(),
-      );
+      const assembler = new ContextAssembler(engine.getConversationStore(), engine.getSummaryStore());
       const assembled = await assembler.assemble({
         conversationId: conversation!.conversationId,
         tokenBudget: 10_000,
@@ -1117,7 +1132,9 @@ describe("LcmContextEngine.ingest content extraction", () => {
       } as AgentMessage,
     });
 
-    const conversation = await engine.getConversationStore().getConversationBySessionId(sessionId);
+    const conversation = await engine
+      .getConversationStore()
+      .getConversationBySessionId(sessionId);
     expect(conversation).not.toBeNull();
 
     const storedMessages = await engine
@@ -1161,9 +1178,7 @@ describe("LcmContextEngine.ingest content extraction", () => {
       content?: Array<{ content?: Array<{ text?: string }> }>;
     };
     expect(assembledToolResult.role).toBe("toolResult");
-    expect(assembledToolResult.content?.[0]?.content?.[0]?.text).toContain(
-      "[Tool image: tool-image.png",
-    );
+    expect(assembledToolResult.content?.[0]?.content?.[0]?.text).toContain("[Tool image: tool-image.png");
   });
 
   it("externalizes string-content tool-result images without converting them to text files", async () => {
@@ -1202,7 +1217,9 @@ describe("LcmContextEngine.ingest content extraction", () => {
       } as AgentMessage,
     });
 
-    const conversation = await engine.getConversationStore().getConversationBySessionId(sessionId);
+    const conversation = await engine
+      .getConversationStore()
+      .getConversationBySessionId(sessionId);
     expect(conversation).not.toBeNull();
 
     const storedMessages = await engine
@@ -1326,9 +1343,7 @@ describe("LcmContextEngine.ingest content extraction", () => {
         reason: "no deferred maintenance work",
       });
       expect(rewriteTranscriptEntries).not.toHaveBeenCalled();
-      expect(
-        await engine.getConversationStore().getConversationBySessionId(sessionId),
-      ).not.toBeNull();
+      expect(await engine.getConversationStore().getConversationBySessionId(sessionId)).not.toBeNull();
     });
   });
 
@@ -1357,16 +1372,18 @@ describe("LcmContextEngine.ingest content extraction", () => {
     });
     let heldFirstCreate = false;
 
-    const createMessageSpy = vi.spyOn(store, "createMessage").mockImplementation(async (input) => {
-      if (!heldFirstCreate) {
-        heldFirstCreate = true;
-        unblockFirstCreate();
-        await new Promise<void>((resolve) => {
-          releaseFirstCreate = resolve;
-        });
-      }
-      return originalCreateMessage(input);
-    });
+    const createMessageSpy = vi
+      .spyOn(store, "createMessage")
+      .mockImplementation(async (input) => {
+        if (!heldFirstCreate) {
+          heldFirstCreate = true;
+          unblockFirstCreate();
+          await new Promise<void>((resolve) => {
+            releaseFirstCreate = resolve;
+          });
+        }
+        return originalCreateMessage(input);
+      });
 
     const firstIngest = engine.ingest({
       sessionId: "runtime-a",
@@ -1428,10 +1445,11 @@ it("preserves both messages when a legacy anchor points at a different tool call
     );
   await engine.ingest({ sessionId, message: message("old") });
   await engine.ingest({ sessionId, message: message("actual") });
-  const store = engine.getConversationStore();
+
+    const store = engine.getConversationStore();
   const conversation = await store.getConversationBySessionId(sessionId);
   const messages = await store.getMessages(conversation!.conversationId);
-  expect(messages).toHaveLength(2);
+    expect(messages).toHaveLength(2);
   expect(messages[0]!.transcriptEntryId).toBeNull();
   expect(messages[1]!.transcriptEntryId).toBe("corrupt-anchor");
   expect((await store.getMessageParts(messages[0]!.messageId))[0]?.toolCallId).toBe("old");
@@ -1451,6 +1469,7 @@ it("keeps externalized transcript replay idempotent", async () => {
     );
     await engine.ingest({ sessionId, message });
     await engine.ingest({ sessionId, message });
+
     const store = engine.getConversationStore();
     const conversation = await store.getConversationBySessionId(sessionId);
     expect(await store.getMessageCount(conversation!.conversationId)).toBe(1);

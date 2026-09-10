@@ -1,4 +1,4 @@
-import { structuredPartsIdentity } from "./structured-anchor-identity.js";/**
+/**
  * After-turn batch deduplication: guards ingest against gateway replays of
  * full history by aligning the runtime turn delta with the persisted
  * conversation tail (exact frontier alignment after a covered transcript
@@ -35,10 +35,15 @@ import {
   extractToolResultIdForPairing,
 } from "./tool-pairing.js";
 import { getTranscriptEntryId } from "./transcript.js";
+import { structuredPartsIdentity } from "./structured-anchor-identity.js";
 import type { LcmDependencies } from "./types.js";
 
 type RedactSensitiveText = (content: string) => string;
-type StoredIncomingMatch = "exact" | "externalized" | "unproven-externalized" | "redacted";
+type StoredIncomingMatch =
+  | "exact"
+  | "externalized"
+  | "unproven-externalized"
+  | "redacted";
 type CoveredStoredIncomingMatch = StoredIncomingMatch | "decorated";
 type AlignmentMatch = CoveredStoredIncomingMatch | "unanchored-inbound";
 
@@ -198,9 +203,11 @@ export class BatchDeduplicator {
     // This fallback only proves decorated user text, never structured messages.
     if (persistedRole !== "user" || batchRole !== "user") return false;
     if (
-      messageIdentity(persistedRole, persistedContent) === messageIdentity(batchRole, batchContent)
-    )
+      messageIdentity(persistedRole, persistedContent) ===
+      messageIdentity(batchRole, batchContent)
+    ) {
       return true;
+    }
     // Whitespace-divergent faces of the same turn: core collapses the runtime
     // message's space runs to single spaces while the transcript keeps them
     // verbatim, so their identity_hashes differ and the decoration matcher's
@@ -384,7 +391,12 @@ export class BatchDeduplicator {
     });
     if (!conversation) return batch;
 
-    if (await this.batchIsFullyPersistedByTranscriptEntryId(conversation.conversationId, batch)) {
+    if (
+      await this.batchIsFullyPersistedByTranscriptEntryId(
+        conversation.conversationId,
+        batch,
+      )
+    ) {
       this.deps.log.debug(
         `[lcm] afterTurn: transcript unavailable with preserved checkpoint; skipping fully persisted runtime replay conversation=${conversation.conversationId} batchLen=${batch.length}`,
       );
@@ -412,14 +424,12 @@ export class BatchDeduplicator {
         conversationId,
         entryId,
       );
-      const incoming = toStoredMessage(message);
       if (
         !candidate ||
-        candidate.role !== incoming.role ||
-        candidate.content !== incoming.content ||
-        !(await this.matchesStructuredAnchor(candidate.messageId, message))
-      )
+        !(await this.matchesPersistedAnchor(candidate.messageId, message))
+      ) {
         return false;
+      }
     }
     return true;
   }
@@ -629,10 +639,7 @@ export class BatchDeduplicator {
     // Quick check: if the last DB identity_hash matches the last batch
     // identity_hash, verify that the entire batch matches the actual DB tail.
     if (lastDbIdentityHash === lastBatchHash) {
-      const tailMessages = await this.conversationStore.getLastMessages(
-        conversationId,
-        batch.length,
-      );
+      const tailMessages = await this.conversationStore.getLastMessages(conversationId, batch.length);
       const tailHashes = await this.conversationStore.getRecentMessageIdentityHashes(
         conversationId,
         batch.length,
@@ -857,8 +864,9 @@ export class BatchDeduplicator {
       if (
         (storedIds.size === 0 && incomingIds.size === 0) ||
         sameNonEmptyIds(storedIds, incomingIds)
-      )
+      ) {
         return "externalized";
+      }
     }
     // Text hashes are only candidate indexes. Never equate unrelated tool events.
     if (
@@ -883,11 +891,16 @@ export class BatchDeduplicator {
       return "exact";
     }
     if (externalizedMatch === "unproven-externalized") return externalizedMatch;
-    return (await this.messagesDifferOnlyByHostRedaction(storedMessage, incoming, incomingMessage))
+    return (await this.messagesDifferOnlyByHostRedaction(
+      storedMessage,
+      incoming,
+      incomingMessage,
+    ))
       ? "redacted"
       : null;
   }
 
+  /** Verify replay payloads, including proven externalization and host redaction. */
   async matchesPersistedAnchor(messageId: number, message: AgentMessage): Promise<boolean> {
     const persisted = await this.conversationStore.getMessageById(messageId);
     if (!persisted) return false;
@@ -903,6 +916,7 @@ export class BatchDeduplicator {
     return match !== null && match !== "unproven-externalized";
   }
 
+  /** Compare complete structured parts, rejecting blank text without payload proof. */
   async matchesStructuredAnchor(messageId: number, message: AgentMessage): Promise<boolean> {
     const storedParts = await this.conversationStore.getMessageParts(messageId);
     const incoming = toStoredMessage(message);
@@ -972,7 +986,10 @@ export class BatchDeduplicator {
     if (references.length === 0) {
       return null;
     }
-    const proofKeys = await this.getStoredExternalizedReferenceProofKeys(storedMessage, references);
+    const proofKeys = await this.getStoredExternalizedReferenceProofKeys(
+      storedMessage,
+      references,
+    );
     if (proofKeys.size > 0) {
       references = references.filter((reference) => proofKeys.has(referenceProofKey(reference)));
       if (references.length === 0) {
@@ -1007,7 +1024,8 @@ export class BatchDeduplicator {
       ) {
         return provenanceBacked ? "externalized" : "unproven-externalized";
       }
-      return references.length === 1 &&
+      return (
+        references.length === 1 &&
         isWholeIncomingReference(references[0]!) &&
         (await this.referenceMatchesWholeIncoming(
           storedMessage,
@@ -1015,9 +1033,8 @@ export class BatchDeduplicator {
           references[0]!,
           incomingRawPayloadContent,
         ))
-        ? provenanceBacked
-          ? "externalized"
-          : "unproven-externalized"
+      )
+        ? provenanceBacked ? "externalized" : "unproven-externalized"
         : null;
     }
 
@@ -1144,17 +1161,14 @@ export class BatchDeduplicator {
     if (!largeFile) {
       return false;
     }
-    if (
-      this.formatExternalizedReference(reference, largeFile, storedMessage) !==
-      storedMessage.content
-    ) {
+    if (this.formatExternalizedReference(reference, largeFile, storedMessage) !== storedMessage.content) {
       return false;
     }
     if (isImageReference(reference)) {
-      const incomingImage = extractSingleNativeImageBuffer(
-        incomingRawPayloadContent ?? incoming.content,
-      );
-      return incomingImage ? this.referenceMatchesNativeImage(reference, incomingImage) : false;
+      const incomingImage = extractSingleNativeImageBuffer(incomingRawPayloadContent ?? incoming.content);
+      return incomingImage
+        ? this.referenceMatchesNativeImage(reference, incomingImage)
+        : false;
     }
     const contentToCompare =
       reference.reference.startsWith("[LCM Raw Payload:") && incomingRawPayloadContent != null
@@ -1167,7 +1181,10 @@ export class BatchDeduplicator {
     ) {
       return true;
     }
-    if (!reference.reference.startsWith("[LCM Raw Payload:") || incomingRawPayloadContent == null) {
+    if (
+      !reference.reference.startsWith("[LCM Raw Payload:") ||
+      incomingRawPayloadContent == null
+    ) {
       return false;
     }
     const hasFileBlocks = parseFileBlocks(incomingRawPayloadContent).length > 0;
@@ -1398,7 +1415,9 @@ type ExternalizedReference = {
   end: number;
 };
 
-type NativeImageReplayBlock = { kind: "text"; text: string } | { kind: "image"; buffer: Buffer };
+type NativeImageReplayBlock =
+  | { kind: "text"; text: string }
+  | { kind: "image"; buffer: Buffer };
 
 function extractExternalizedReferences(content: string): ExternalizedReference[] {
   const references: ExternalizedReference[] = [];
@@ -1413,11 +1432,7 @@ function extractExternalizedReferences(content: string): ExternalizedReference[]
       continue;
     }
     const headerRemainder = content.slice(referencePattern.lastIndex, markerIndex);
-    if (
-      /\][\s\S]*\[LCM (?:File|Raw Payload|Tool Output):\s*file_[a-f0-9]{16}\b/i.test(
-        headerRemainder,
-      )
-    ) {
+    if (/\][\s\S]*\[LCM (?:File|Raw Payload|Tool Output):\s*file_[a-f0-9]{16}\b/i.test(headerRemainder)) {
       continue;
     }
     references.push({
@@ -1443,10 +1458,7 @@ function extractExternalizedReferences(content: string): ExternalizedReference[]
   return references;
 }
 
-function extractReferenceField(
-  reference: string,
-  field: "tool" | "role" | "reason",
-): string | undefined {
+function extractReferenceField(reference: string, field: "tool" | "role" | "reason"): string | undefined {
   const match = new RegExp(`\\b${field}=([^|\\]]+)`).exec(reference);
   return match?.[1]?.trim() || undefined;
 }
@@ -1516,9 +1528,7 @@ function extractNativeImageReplayBlocks(content: string): NativeImageReplayBlock
 
 function rawPayloadHasNativeImages(content: string): boolean {
   const parsed = parseJsonPayload(content);
-  return (
-    Array.isArray(parsed) && parsed.some((entry) => extractSingleNativeImageBufferFromValue(entry))
-  );
+  return Array.isArray(parsed) && parsed.some((entry) => extractSingleNativeImageBufferFromValue(entry));
 }
 
 function extractSingleNativeImageBufferFromValue(value: unknown): Buffer | null {
@@ -1588,7 +1598,7 @@ function parsePartMetadata(metadata: string | null): Record<string, unknown> | n
   try {
     const parsed = JSON.parse(metadata);
     return parsed && typeof parsed === "object" && !Array.isArray(parsed)
-      ? (parsed as Record<string, unknown>)
+      ? parsed as Record<string, unknown>
       : null;
   } catch {
     return null;

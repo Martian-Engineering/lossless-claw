@@ -1,8 +1,4 @@
-import type {
-  MessageId,
-  MessageRole,
-  TranscriptAnchorTrustState,
-} from "./store/conversation-store.js";
+import type { MessageId, MessageRole, TranscriptAnchorTrustState } from "./store/conversation-store.js";
 
 export type TranscriptAnchorAuditClassification =
   | "verified"

@@ -789,7 +789,7 @@ export class ConversationStore {
     sessionId: string,
     titleOrOpts?: string | { title?: string; sessionKey?: string },
   ): Promise<ConversationRecord> {
-    const opts = typeof titleOrOpts === "string" ? { title: titleOrOpts } : (titleOrOpts ?? {});
+    const opts = typeof titleOrOpts === "string" ? { title: titleOrOpts } : titleOrOpts ?? {};
     const normalizedSessionKey = opts.sessionKey?.trim();
     if (normalizedSessionKey) {
       const byKey = await this.getConversationBySessionKey(normalizedSessionKey);
@@ -825,11 +825,7 @@ export class ConversationStore {
       }
     }
 
-    return this.createConversation({
-      sessionId,
-      title: opts.title,
-      sessionKey: normalizedSessionKey,
-    });
+    return this.createConversation({ sessionId, title: opts.title, sessionKey: normalizedSessionKey });
   }
 
   async markConversationBootstrapped(conversationId: ConversationId): Promise<void> {
@@ -1470,7 +1466,9 @@ export class ConversationStore {
     openClawSenderMetadata?: OpenClawSenderMetadata | null,
   ): Promise<boolean> {
     try {
-      const serializedSenderMetadata = serializeOpenClawSenderMetadata(openClawSenderMetadata);
+      const serializedSenderMetadata = serializeOpenClawSenderMetadata(
+        openClawSenderMetadata,
+      );
       const result = this.db
         .prepare(
           `UPDATE messages
@@ -1720,13 +1718,9 @@ export class ConversationStore {
          AND content = ?
        LIMIT 1`,
       )
-      .get(
-        conversationId,
-        Math.max(1, Math.floor(tailWindow)),
-        identityHash,
-        role,
-        content,
-      ) as unknown as { found?: number } | undefined;
+      .get(conversationId, Math.max(1, Math.floor(tailWindow)), identityHash, role, content) as unknown as
+      | { found?: number }
+      | undefined;
     return row?.found === 1;
   }
 
@@ -1802,9 +1796,7 @@ export class ConversationStore {
          )
        LIMIT 1`,
       )
-      .get(conversationId, identityHash, role, content) as unknown as
-      | { found?: number }
-      | undefined;
+      .get(conversationId, identityHash, role, content) as unknown as { found?: number } | undefined;
     return row?.found === 1;
   }
 
@@ -2377,8 +2369,7 @@ export class ConversationStore {
 
     return rows
       .map((row): MessageSearchResult | null => {
-        const normalizedContent =
-          normalizeMessageContentForFullTextIndex(row.content) ?? row.content;
+        const normalizedContent = normalizeMessageContentForFullTextIndex(row.content) ?? row.content;
         const haystack = normalizedContent.toLowerCase();
         const matchesAllTerms = plan.terms.every((term) => haystack.includes(term));
         if (!matchesAllTerms) {

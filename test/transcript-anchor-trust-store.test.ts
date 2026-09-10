@@ -36,9 +36,7 @@ describe("ConversationStore transcript anchor trust", () => {
     await expect(
       store.isTrustedTranscriptAnchor(conversation.conversationId, "entry-suspect"),
     ).resolves.toBe(false);
-    await expect(
-      store.getMessageTranscriptAnchorTrust(legacyMessage.messageId),
-    ).resolves.toBeNull();
+    await expect(store.getMessageTranscriptAnchorTrust(legacyMessage.messageId)).resolves.toBeNull();
 
     await store.upsertMessageTranscriptAnchorTrust({
       messageId: legacyMessage.messageId,
@@ -48,9 +46,7 @@ describe("ConversationStore transcript anchor trust", () => {
       source: "audit",
       reason: "blank assistant content",
     });
-    await expect(
-      store.getMessageTranscriptAnchorTrust(legacyMessage.messageId),
-    ).resolves.toMatchObject({
+    await expect(store.getMessageTranscriptAnchorTrust(legacyMessage.messageId)).resolves.toMatchObject({
       messageId: legacyMessage.messageId,
       conversationId: conversation.conversationId,
       transcriptEntryId: "entry-suspect",
@@ -74,9 +70,7 @@ describe("ConversationStore transcript anchor trust", () => {
       verifiedAt,
     });
 
-    await expect(
-      store.getMessageTranscriptAnchorTrust(legacyMessage.messageId),
-    ).resolves.toMatchObject({
+    await expect(store.getMessageTranscriptAnchorTrust(legacyMessage.messageId)).resolves.toMatchObject({
       trustState: "repaired",
       reason: "unique sequence alignment",
       verifiedAt,

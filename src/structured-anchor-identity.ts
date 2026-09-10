@@ -1,5 +1,6 @@
 import type { CreateMessagePartInput } from "./store/conversation-store.js";
 
+// Sort nested object keys while preserving array order for payload comparisons.
 function canonical(value: unknown): unknown {
   if (Array.isArray(value)) return value.map(canonical);
   if (value && typeof value === "object") {
@@ -12,6 +13,7 @@ function canonical(value: unknown): unknown {
   return value;
 }
 
+// Retain malformed JSON verbatim so distinct corrupt values cannot compare equal.
 function json(value: string | null | undefined): unknown {
   if (value == null) return null;
   try {
