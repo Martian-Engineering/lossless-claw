@@ -25,6 +25,30 @@ describe("structured anchor identity", () => {
       structuredPartsIdentity(parts("a", { y: 2, x: 1 })),
     );
   });
+  it("ignores model affinity when replaying legacy structured parts", () => {
+    const message = {
+      role: "assistant",
+      content: [{ type: "toolCall", id: "call", name: "bash", arguments: { command: "pwd" } }],
+    } as AgentMessage;
+    const legacyParts = buildMessageParts({ sessionId: "s", message, fallbackContent: "" });
+    const replayParts = buildMessageParts({
+      sessionId: "s",
+      fallbackContent: "",
+      message: {
+        ...message,
+        provider: "provider",
+        api: "api",
+        model: "requested-model",
+        responseModel: "resolved-model",
+      } as AgentMessage,
+    });
+
+    // Exercise the actual persisted metadata, including the resolved model id.
+    expect(JSON.parse(replayParts[0]!.metadata!)).toMatchObject({
+      responseModelId: "resolved-model",
+    });
+    expect(structuredPartsIdentity(replayParts)).toBe(structuredPartsIdentity(legacyParts));
+  });
 });
 
 it("distinguishes result payloads with the same call id", () => {

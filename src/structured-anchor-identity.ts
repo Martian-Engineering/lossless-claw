@@ -1,3 +1,4 @@
+import { stripModelIdentityFromMetadataJson } from "./message-content.js";
 import type { CreateMessagePartInput } from "./store/conversation-store.js";
 
 // Sort nested object keys while preserving array order for payload comparisons.
@@ -31,16 +32,8 @@ export function structuredPartsIdentity(
   return JSON.stringify(
     canonical(
       parts.map((part) => {
-        const metadata = json(part.metadata);
         // Model bookkeeping is not part of the tool/file payload identity.
-        let payloadMetadata = metadata;
-        if (metadata && typeof metadata === "object" && !Array.isArray(metadata)) {
-          const { modelProvider, modelApi, modelId, ...payload } = metadata as Record<
-            string,
-            unknown
-          >;
-          payloadMetadata = payload;
-        }
+        const payloadMetadata = json(stripModelIdentityFromMetadataJson(part.metadata));
         return {
           type: part.partType,
           ordinal: part.ordinal,
