@@ -94,7 +94,7 @@ describe("createLcmSummarizeFromLegacyParams", () => {
     expect(calls[1]?.reasoningIfSupported).toBe("low");
   });
 
-  it("does not request reasoning on retry when summary thinking is disabled", async () => {
+  it("asks for reasoning off on both calls when summary thinking is disabled", async () => {
     const { deps, calls } = createDeps({
       config: {
         leafTargetTokens: 128,
@@ -124,9 +124,11 @@ describe("createLcmSummarizeFromLegacyParams", () => {
 
     expect(summary).toBe("Recovered summary");
     expect(calls).toHaveLength(2);
+    // An absent effort resolves to "high" host-side, so "disabled" has to be
+    // said out loud on both the initial call and the retry.
     expect(calls[0]?.reasoning).toBeUndefined();
-    expect(calls[0]?.reasoningIfSupported).toBeUndefined();
+    expect(calls[0]?.reasoningIfSupported).toBe("off");
     expect(calls[1]?.reasoning).toBeUndefined();
-    expect(calls[1]?.reasoningIfSupported).toBeUndefined();
+    expect(calls[1]?.reasoningIfSupported).toBe("off");
   });
 });

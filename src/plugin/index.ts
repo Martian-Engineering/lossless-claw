@@ -1378,7 +1378,15 @@ function createLcmDependencies(
           // agentId. Plugin-wide api.runtime.llm.complete is gateway-scoped and rejects
           // target-agent overrides unless OpenClaw is explicitly configured otherwise.
           ...(isBoundRuntimeLlm && agentId?.trim() ? { agentId: agentId.trim() } : {}),
-          ...(reasoning !== undefined ? { reasoning } : {}),
+          // reasoningIfSupported is the summarizer's "low, where the provider
+          // has it" request. runtime.llm has no separate field for it, and an
+          // absent effort resolves to "high" host-side, so forwarding it as
+          // reasoning is what makes both it and an explicit "off" take effect.
+          ...(reasoning !== undefined
+            ? { reasoning }
+            : reasoningIfSupported !== undefined
+              ? { reasoning: reasoningIfSupported }
+              : {}),
         });
         const text = typeof result.text === "string" ? result.text : "";
         return {

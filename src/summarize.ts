@@ -1609,9 +1609,14 @@ export async function createLcmSummarizeFromLegacyParams(params: {
       const model = candidate.model;
       const runtimeModelOverride = buildRuntimeModelOverride(candidate);
       const nextCandidate = index < resolvedCandidates.length - 1 ? resolvedCandidates[index + 1]! : undefined;
+      // Keep the two reasons for withholding "low" apart. An operator who set
+      // enableSummaryThinking: false asked for reasoning to be off, and the host
+      // defaults an absent effort to "high", so that request has to be sent
+      // explicitly. The ollama exclusion is ours, not the operator's, and keeps
+      // sending nothing.
+      const summaryThinkingDisabled = params.deps.config.enableSummaryThinking === false;
       const shouldRequestSummaryThinking =
-        params.deps.config.enableSummaryThinking !== false &&
-        provider.trim().toLowerCase() !== "ollama";
+        !summaryThinkingDisabled && provider.trim().toLowerCase() !== "ollama";
       const runSummarizerCall = async (
         label: string,
         reasoning?: string,
@@ -1634,7 +1639,9 @@ export async function createLcmSummarizeFromLegacyParams(params: {
           maxTokens: maxTokensOverride ?? initialMaxTokens,
           ...(shouldRequestSummaryThinking
             ? ({ reasoningIfSupported: "low" } as const)
-            : {}),
+            : summaryThinkingDisabled
+              ? ({ reasoningIfSupported: "off" } as const)
+              : {}),
           ...(reasoning ? { reasoning } : {}),
         }), summarizerTimeoutMs, label);
 
