@@ -80,6 +80,37 @@ describe("ContextThresholdResolver", () => {
     });
   });
 
+  it("names the absent-window case when a window-range rule cannot be evaluated", () => {
+    const resolver = new ContextThresholdResolver(0.75, [
+      { match: { modelContextWindowMin: 900_000 }, contextThreshold: 0.3 },
+    ]);
+    expect(resolver.resolve({ runtime: {} })).toMatchObject({
+      contextThreshold: 0.75,
+      source: "global",
+      reason: "no_override_matched_window_metadata_absent",
+    });
+  });
+
+  it("keeps the plain no-match reason when the host does report a window", () => {
+    const resolver = new ContextThresholdResolver(0.75, [
+      { match: { modelContextWindowMin: 900_000 }, contextThreshold: 0.3 },
+    ]);
+    expect(resolver.resolve({ runtime: { modelContextWindow: 200_000 } })).toMatchObject({
+      source: "global",
+      reason: "no_override_matched",
+    });
+  });
+
+  it("keeps the plain no-match reason when no rule constrains the window", () => {
+    const resolver = new ContextThresholdResolver(0.75, [
+      { match: { model: "openai/gpt-5.5" }, contextThreshold: 0.3 },
+    ]);
+    expect(resolver.resolve({ runtime: {} })).toMatchObject({
+      source: "global",
+      reason: "no_override_matched",
+    });
+  });
+
   it("matches an exact model id against modelRef or bare model", () => {
     const resolver = new ContextThresholdResolver(0.75, [
       {
