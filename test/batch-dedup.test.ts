@@ -508,3 +508,18 @@ describe("BatchDeduplicator.alignRuntimeBatchAgainstCoveredFrontier", () => {
     expect(result).toEqual(batch);
   });
 });
+
+describe("structured tool replay identity", () => {
+  it("does not consume an unrelated blank-parent tool call as a replay", async () => {
+    const dedup = makeDedup({
+      conversationId: 1,
+      messages: [storedMessage("assistant", "", 1)],
+      toolCallIdsByMessageId: { 1: ["old-call"] },
+    });
+    const incoming = {
+      role: "assistant",
+      content: [{ type: "toolCall", id: "new-call", name: "bash", arguments: { command: "new" } }],
+    } as AgentMessage;
+    expect(await dedup.deduplicateAfterTurnBatch("s1", undefined, [incoming])).toEqual([incoming]);
+  });
+});

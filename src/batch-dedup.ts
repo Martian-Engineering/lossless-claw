@@ -16,6 +16,7 @@ import {
 } from "./large-files.js";
 import { liveContentIsRecognizedDecoratedBareBody } from "./live-coverage.js";
 import {
+  buildMessageParts,
   extractStructuredText,
   RAW_PAYLOAD_EXTERNALIZATION_REASON,
   serializeRawPayloadContent,
@@ -34,6 +35,7 @@ import {
   extractToolResultIdForPairing,
 } from "./tool-pairing.js";
 import { getTranscriptEntryId } from "./transcript.js";
+import { structuredPartsIdentity } from "./structured-anchor-identity.js";
 import type { LcmDependencies } from "./types.js";
 
 type RedactSensitiveText = (content: string) => string;
@@ -198,14 +200,13 @@ export class BatchDeduplicator {
       allowUntimestampedInboundBodyMatch?: boolean;
     },
   ): boolean {
+    // This fallback only proves decorated user text, never structured messages.
+    if (persistedRole !== "user" || batchRole !== "user") return false;
     if (
       messageIdentity(persistedRole, persistedContent) ===
       messageIdentity(batchRole, batchContent)
     ) {
       return true;
-    }
-    if (persistedRole !== "user" || batchRole !== "user") {
-      return false;
     }
     // Whitespace-divergent faces of the same turn: core collapses the runtime
     // message's space runs to single spaces while the transcript keeps them
@@ -345,7 +346,19 @@ export class BatchDeduplicator {
       storedBatch,
     );
     if (persistedIdentityOverlaps > 0) {
-      if (await this.batchIsFullyPersistedByMultiplicity(conversationId, storedBatch)) {
+      if (
+        !batch.some(
+          (message, index) =>
+            structuredPartsIdentity(
+              buildMessageParts({
+                sessionId: "",
+                message,
+                fallbackContent: storedBatch[index]!.content,
+              }),
+            ) !== null,
+        ) &&
+        (await this.batchIsFullyPersistedByMultiplicity(conversationId, storedBatch))
+      ) {
         this.deps.log.debug(
           `[lcm] afterTurn: runtime batch does not align with the covered transcript frontier but is fully persisted by multiplicity (${persistedIdentityOverlaps}/${batch.length}); skipping replay conversation=${conversationId}`,
         );
@@ -407,7 +420,14 @@ export class BatchDeduplicator {
     for (const message of batch) {
       const entryId = getTranscriptEntryId(message);
       if (!entryId) return false;
-      if (!(await this.conversationStore.hasMessageByTranscriptEntryId(conversationId, entryId))) {
+      const candidate = await this.conversationStore.getTranscriptEntryAnchorCandidate(
+        conversationId,
+        entryId,
+      );
+      if (
+        !candidate ||
+        !(await this.matchesPersistedAnchor(candidate.messageId, message))
+      ) {
         return false;
       }
     }
@@ -575,7 +595,9 @@ export class BatchDeduplicator {
     const incomingHash = storedMessageIdentityHash(stored);
     const incomingRawPayloadContent =
       serializeRawPayloadContent(params.message, stored.content)?.content ?? null;
+    const candidates: number[] = [];
     for (let index = tail.length - 1; index >= 0; index -= 1) {
+      if (tail[index]!.transcriptEntryId) continue;
       const match = await this.matchStoredMessageToIncoming(
         tail[index]!,
         stored,
@@ -587,17 +609,14 @@ export class BatchDeduplicator {
       if (!match || match === "unproven-externalized") {
         continue;
       }
-      if (
-        await this.conversationStore.adoptTranscriptEntryIdForMessage(
-          params.conversationId,
-          tail[index]!.messageId,
-          params.transcriptEntryId,
-        )
-      ) {
-        return true;
-      }
+      candidates.push(tail[index]!.messageId);
     }
-    return false;
+    if (candidates.length !== 1) return false;
+    return this.conversationStore.adoptTranscriptEntryIdForMessage(
+      params.conversationId,
+      candidates[0]!,
+      params.transcriptEntryId,
+    );
   }
 
   /**
@@ -825,6 +844,45 @@ export class BatchDeduplicator {
     storedHash: string,
     incomingRawPayloadContent?: string | null,
   ): Promise<StoredIncomingMatch | null> {
+    const storedParts = await this.conversationStore.getMessageParts(storedMessage.messageId);
+    const storedStructured = structuredPartsIdentity(storedParts);
+    const incomingStructured = structuredPartsIdentity(
+      buildMessageParts({
+        sessionId: "",
+        message: incomingMessage,
+        fallbackContent: incoming.content,
+      }),
+    );
+    const externalizedMatch = await this.messagesAreExternalizedEquivalent(
+      storedMessage,
+      incoming,
+      incomingRawPayloadContent,
+    );
+    if (externalizedMatch === "externalized") {
+      const storedIds = await this.storedToolCallIds(storedMessage.messageId);
+      const incomingIds = incomingToolCallIds(incomingMessage);
+      if (
+        (storedIds.size === 0 && incomingIds.size === 0) ||
+        sameNonEmptyIds(storedIds, incomingIds)
+      ) {
+        return "externalized";
+      }
+    }
+    // Text hashes are only candidate indexes. Never equate unrelated tool events.
+    if (
+      (storedStructured !== null || incomingStructured !== null) &&
+      storedStructured !== incomingStructured
+    ) {
+      // Preserve the separately proven, provenance-gated host-redaction path.
+      return (await this.messagesDifferOnlyByHostRedaction(
+        storedMessage,
+        incoming,
+        incomingMessage,
+      ))
+        ? "redacted"
+        : null;
+    }
+    if (incoming.content.trim() === "" && incomingStructured === null) return null;
     if (
       storedHash === incomingHash &&
       storedMessage.role === incoming.role &&
@@ -832,12 +890,7 @@ export class BatchDeduplicator {
     ) {
       return "exact";
     }
-    const externalizedMatch = await this.messagesAreExternalizedEquivalent(
-      storedMessage,
-      incoming,
-      incomingRawPayloadContent,
-    );
-    if (externalizedMatch) return externalizedMatch;
+    if (externalizedMatch === "unproven-externalized") return externalizedMatch;
     return (await this.messagesDifferOnlyByHostRedaction(
       storedMessage,
       incoming,
@@ -845,6 +898,33 @@ export class BatchDeduplicator {
     ))
       ? "redacted"
       : null;
+  }
+
+  /** Verify replay payloads, including proven externalization and host redaction. */
+  async matchesPersistedAnchor(messageId: number, message: AgentMessage): Promise<boolean> {
+    const persisted = await this.conversationStore.getMessageById(messageId);
+    if (!persisted) return false;
+    const incoming = toStoredMessage(message);
+    const match = await this.matchStoredMessageToIncoming(
+      persisted,
+      incoming,
+      message,
+      storedMessageIdentityHash(incoming),
+      buildMessageIdentityHash(persisted.role, persisted.content),
+      serializeRawPayloadContent(message, incoming.content)?.content ?? null,
+    );
+    return match !== null && match !== "unproven-externalized";
+  }
+
+  /** Compare complete structured parts, rejecting blank text without payload proof. */
+  async matchesStructuredAnchor(messageId: number, message: AgentMessage): Promise<boolean> {
+    const storedParts = await this.conversationStore.getMessageParts(messageId);
+    const incoming = toStoredMessage(message);
+    const expected = structuredPartsIdentity(
+      buildMessageParts({ sessionId: "", message, fallbackContent: incoming.content }),
+    );
+    const actual = structuredPartsIdentity(storedParts);
+    return actual === expected && (expected !== null || incoming.content.trim() !== "");
   }
 
   private async countPersistedIdentityOverlaps(
@@ -865,6 +945,7 @@ export class BatchDeduplicator {
     conversationId: number,
     incomingBatch: StoredMessage[],
   ): Promise<boolean> {
+    if (incomingBatch.some((message) => message.content.trim() === "")) return false;
     const requiredCounts = new Map<
       string,
       { role: StoredMessage["role"]; identityHash: string; count: number }

@@ -149,3 +149,157 @@ describe("ConversationStore transcript anchor trust", () => {
     });
   });
 });
+
+describe("weak anchor adoption", () => {
+  it("ignores repeated text outside the recent adoption window", async () => {
+    const { store, db } = createStoreFixture();
+    const { conversationId } = await store.createConversation({ sessionId: "tail-window" });
+    const rows = await store.createMessagesBulk(
+      ["repeated", "intervening", "repeated"].map((content, seq) => ({
+        conversationId,
+        seq,
+        role: "assistant" as const,
+        content,
+        tokenCount: 1,
+      })),
+    );
+
+    // The same rows are ambiguous in a wider window but unique in the tail.
+    expect(
+      await store.adoptRecentTranscriptEntryId(
+        conversationId, "assistant", "repeated", "tail-anchor", 3,
+      ),
+    ).toBe(false);
+    expect(
+      await store.adoptRecentTranscriptEntryId(
+        conversationId, "assistant", "repeated", "tail-anchor", 2,
+      ),
+    ).toBe(true);
+    expect(
+      await store.getTranscriptEntryAnchorCandidate(conversationId, "tail-anchor"),
+    ).toMatchObject({ messageId: rows[2]!.messageId });
+    expect((await store.getMessageById(rows[0]!.messageId))?.transcriptEntryId).toBeNull();
+    expect(await store.getMessageCount(conversationId)).toBe(3);
+    db.close();
+  });
+
+  it("never stamps blank parent messages or ambiguous repeated text", async () => {
+    const { store, db } = createStoreFixture();
+    const { conversationId } = await store.createConversation({ sessionId: "weak" });
+    await store.createMessagesBulk(
+      [1, 2].map((seq) => ({
+        conversationId,
+        seq,
+        role: "assistant" as const,
+        content: "",
+        tokenCount: 1,
+      })),
+    );
+    expect(await store.adoptTranscriptEntryId(conversationId, "assistant", "", "wrong")).toBe(
+      false,
+    );
+    expect(
+      await store.adoptRecentTranscriptEntryId(conversationId, "assistant", "", "wrong", 64),
+    ).toBe(false);
+    await store.createMessagesBulk(
+      [3, 4].map((seq) => ({
+        conversationId,
+        seq,
+        role: "user" as const,
+        content: "repeated",
+        tokenCount: 1,
+      })),
+    );
+    expect(await store.adoptTranscriptEntryId(conversationId, "user", "repeated", "wrong")).toBe(
+      false,
+    );
+    expect(
+      await store.adoptRecentTranscriptEntryId(conversationId, "user", "repeated", "wrong", 64),
+    ).toBe(false);
+    expect(await store.getMessageCount(conversationId)).toBe(4);
+    db.close();
+  });
+});
+
+it("adopts the matching structured call, not the newest blank row", async () => {
+  const { store, db } = createStoreFixture();
+  const { BatchDeduplicator } = await import("../src/batch-dedup.js");
+  const { buildMessageParts } = await import("../src/message-content.js");
+  const { conversationId } = await store.createConversation({ sessionId: "structured" });
+  const calls = ["wanted", "unrelated"].map(
+    (id) =>
+      ({
+        role: "assistant",
+        content: [{ type: "toolCall", id, name: "bash", arguments: { command: id } }],
+      }) as import("../src/openclaw-bridge.js").AgentMessage,
+  );
+  const records = await store.createMessagesBulk(
+    calls.map((_, seq) => ({
+      conversationId,
+      seq,
+      role: "assistant" as const,
+      content: "",
+      tokenCount: 1,
+    })),
+  );
+  for (let i = 0; i < calls.length; i++)
+    await store.createMessageParts(
+      records[i]!.messageId,
+      buildMessageParts({ sessionId: "structured", message: calls[i]!, fallbackContent: "" }),
+    );
+  const dedup = new BatchDeduplicator(
+    store,
+    {} as import("../src/store/summary-store.js").SummaryStore,
+    "/tmp",
+    { log: { info: () => {}, warn: () => {}, error: () => {}, debug: () => {} } },
+  );
+  expect(
+    await dedup.adoptRecentTranscriptEntryIdForMessage({
+      conversationId,
+      message: calls[0]!,
+      transcriptEntryId: "correct",
+      tailWindow: 64,
+    }),
+  ).toBe(true);
+  expect(await store.getTranscriptEntryAnchorCandidate(conversationId, "correct")).toMatchObject({
+    messageId: records[0]!.messageId,
+  });
+  expect(await store.getMessageCount(conversationId)).toBe(2);
+  db.close();
+});
+
+it("does not substitute a structured row for a proven plain-text candidate", async () => {
+  const { store, db } = createStoreFixture();
+  const { conversationId } = await store.createConversation({ sessionId: "mixed-tail" });
+  const records = await store.createMessagesBulk(
+    [1, 2].map((seq) => ({
+      conversationId,
+      seq,
+      role: "assistant" as const,
+      content: "same text",
+      tokenCount: 2,
+    })),
+  );
+  await store.createMessageParts(records[1]!.messageId, [
+    {
+      sessionId: "mixed-tail",
+      partType: "tool",
+      ordinal: 0,
+      toolCallId: "unrelated",
+      textContent: "same text",
+    },
+  ]);
+  expect(
+    await store.adoptRecentTranscriptEntryId(
+      conversationId,
+      "assistant",
+      "same text",
+      "plain-anchor",
+      64,
+    ),
+  ).toBe(true);
+  expect(
+    await store.getTranscriptEntryAnchorCandidate(conversationId, "plain-anchor"),
+  ).toMatchObject({ messageId: records[0]!.messageId });
+  db.close();
+});

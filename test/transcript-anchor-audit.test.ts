@@ -217,3 +217,48 @@ describe("classifyTranscriptAnchors", () => {
     expect(result.requiresEpochBoundary).toBe(false);
   });
 });
+
+describe("structured anchor corruption", () => {
+  it("does not trust previously verified empty text without structured proof", () => {
+    const result = classifyTranscriptAnchors({
+      messages: [
+        {
+          messageId: 1,
+          seq: 1,
+          role: "assistant",
+          content: "",
+          transcriptEntryId: "old",
+          anchorTrustState: "verified",
+        },
+      ],
+      entries: [{ entryId: "old", parentId: null, seq: 1, role: "assistant", content: "" }],
+    });
+    expect(result.anchorDecisions[0]?.trustState).toBe("suspect");
+  });
+  it("rejects previously verified anchors with different structured payloads", () => {
+    const result = classifyTranscriptAnchors({
+      messages: [
+        {
+          messageId: 1,
+          seq: 1,
+          role: "assistant",
+          content: "",
+          structuredIdentity: "call-a",
+          transcriptEntryId: "old",
+          anchorTrustState: "verified",
+        },
+      ],
+      entries: [
+        {
+          entryId: "old",
+          parentId: null,
+          seq: 1,
+          role: "assistant",
+          content: "",
+          structuredIdentity: "call-b",
+        },
+      ],
+    });
+    expect(result.anchorDecisions[0]?.reason).toBe("entry id structured content mismatch");
+  });
+});

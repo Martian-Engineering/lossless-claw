@@ -88,14 +88,16 @@ import {
   type TranscriptAnchorAuditEntry,
   type TranscriptAnchorAuditMessage,
 } from "./transcript-anchor-audit.js";
-import { estimateTokens } from "./estimate-tokens.js";
+import { estimateTokens, estimateSerializedMessagesTokens } from "./estimate-tokens.js";
 import {
   buildDeterministicFallbackSummary,
   FALLBACK_DIRECTIVE_SUMMARY_MARKER,
   MIN_FALLBACK_MAX_TOKENS,
 } from "./summary-fallback.js";
 import { attachTranscriptEntryMeta, getTranscriptEntryId, resolveTranscriptMessageCreatedAt } from "./transcript.js";
+import { restoreRawUserReplay } from "./user-replay.js";
 import { extractStableEventKey } from "./stable-event-key.js";
+import { structuredPartsIdentity } from "./structured-anchor-identity.js";
 import { transcriptImportCap, type TranscriptReconcileResult } from "./reconcile-plan.js";
 import { describeAssembledPrefixChange, formatOverflowDiagnosticsForLog, shouldLogOverflowDiagnostics, type AssemblePrefixSnapshot, type BootstrapImportObservation } from "./assemble-debug.js";
 
@@ -409,6 +411,9 @@ function auditEntryFromVisibleTranscriptEntry(
   }
   const stored = toStoredMessage(entry.message);
   return {
+    structuredIdentity: structuredPartsIdentity(
+      buildMessageParts({ sessionId: "", message: entry.message, fallbackContent: stored.content }),
+    ),
     entryId: entry.entryId,
     parentId: entry.parentId,
     seq: entry.seq,
@@ -2789,7 +2794,8 @@ export class LcmContextEngine implements ContextEngine {
           candidate &&
           trustedAnchor &&
           candidate.role === stored.role &&
-          candidate.content === stored.content
+          candidate.content === stored.content &&
+          (await this.batchDeduplicator.matchesStructuredAnchor(candidate.messageId, message))
         ) {
           await this.conversationStore.upsertMessageTranscriptAnchorTrust({
             messageId: candidate.messageId,
@@ -2810,7 +2816,12 @@ export class LcmContextEngine implements ContextEngine {
               ? "entry id role mismatch"
               : candidate.content !== stored.content
                 ? "entry id content mismatch"
-                : "entry id lacks explicit trust";
+                : !(await this.batchDeduplicator.matchesStructuredAnchor(
+                      candidate.messageId,
+                      message,
+                    ))
+                  ? "entry id structured content mismatch"
+                  : "entry id lacks explicit trust";
           await this.conversationStore.upsertMessageTranscriptAnchorTrust({
             messageId: candidate.messageId,
             conversationId: params.conversationId,
@@ -2819,7 +2830,11 @@ export class LcmContextEngine implements ContextEngine {
             source: "projection-reconcile",
             reason,
           });
-          if (reason === "entry id role mismatch" || reason === "entry id content mismatch") {
+          if (
+            reason === "entry id role mismatch" ||
+            reason === "entry id content mismatch" ||
+            reason === "entry id structured content mismatch"
+          ) {
             await this.conversationStore.clearTranscriptEntryIdForMessage(
               params.conversationId,
               candidate.messageId,
@@ -2857,23 +2872,6 @@ export class LcmContextEngine implements ContextEngine {
       const canUseWeakIdentityAdoption =
         (!params.legacyPrefixAnchorEntryId || hasOverlap) && !establishedEpochBoundary;
       if (entryId && canUseWeakIdentityAdoption) {
-        const adopted = await this.conversationStore.adoptRecentTranscriptEntryId(
-          params.conversationId,
-          stored.role,
-          stored.content,
-          entryId,
-          this.config.freshTailCount,
-        );
-        if (adopted) {
-          await this.markProjectionReconciledAnchorTrusted({
-            conversationId: params.conversationId,
-            transcriptEntryId: entryId,
-            reason: "recent tail message adopted as projection anchor",
-          });
-          hasOverlap = true;
-          overlapAnchorIndex = index;
-          continue;
-        }
         const adoptedExternalized = await this.batchDeduplicator.adoptRecentTranscriptEntryIdForMessage({
           conversationId: params.conversationId,
           message,
@@ -2890,7 +2888,13 @@ export class LcmContextEngine implements ContextEngine {
           overlapAnchorIndex = index;
           continue;
         }
-        if (hasOverlap) {
+        if (
+          hasOverlap &&
+          stored.content.trim() !== "" &&
+          buildMessageParts({ sessionId: "", message, fallbackContent: stored.content }).every(
+            (part) => part.partType === "text" && !part.toolCallId,
+          )
+        ) {
           const staleEntryMatch =
             await this.conversationStore.findUniqueRecentStaleTranscriptEntryIdByIdentityAndCreatedAt(
               params.conversationId,
@@ -3038,7 +3042,15 @@ export class LcmContextEngine implements ContextEngine {
     const entries = params.entries
       .map(auditEntryFromVisibleTranscriptEntry)
       .filter((entry): entry is TranscriptAnchorAuditEntry => entry !== null);
-    const audit = classifyTranscriptAnchors({ messages, entries });
+    const messagesWithParts = await Promise.all(
+      messages.map(async (message) => ({
+        ...message,
+        structuredIdentity: structuredPartsIdentity(
+          await this.conversationStore.getMessageParts(message.messageId),
+        ),
+      })),
+    );
+    const audit = classifyTranscriptAnchors({ messages: messagesWithParts, entries });
     const existingEpoch = await this.conversationStore.getConversationTranscriptEpoch(
       params.conversationId,
     );
@@ -3650,26 +3662,44 @@ export class LcmContextEngine implements ContextEngine {
     });
     const conversationId = conversation.conversationId;
 
-    // Exact idempotency: a message imported from a transcript entry whose id
-    // is already persisted is a replay by definition. Skip before any side
-    // effects (large-file interception, parts, context items).
+    // A historical anchor can be corrupt. The id alone is not replay proof.
     const transcriptEntryId = getTranscriptEntryId(message);
-    if (
-      transcriptEntryId &&
-      (await this.conversationStore.hasMessageByTranscriptEntryId(
+    let rejectedTranscriptAnchor = false;
+    if (transcriptEntryId) {
+      const candidate = await this.conversationStore.getTranscriptEntryAnchorCandidate(
         conversationId,
         transcriptEntryId,
-      ))
-    ) {
-      return { ingested: false };
+      );
+      if (candidate) {
+        if (await this.batchDeduplicator.matchesPersistedAnchor(candidate.messageId, message)) {
+          return { ingested: false };
+        }
+        // Detach only the invalid metadata; retain the old message and its parts.
+        await this.conversationStore.upsertMessageTranscriptAnchorTrust({
+          messageId: candidate.messageId,
+          conversationId,
+          transcriptEntryId,
+          trustState: "suspect",
+          source: "transcript-import",
+          reason: "entry id payload mismatch on replay",
+        });
+        await this.conversationStore.clearTranscriptEntryIdForMessage(
+          conversationId,
+          candidate.messageId,
+        );
+        rejectedTranscriptAnchor = true;
+      }
     }
 
     // Stable event identity short-circuit: only provider-minted tool ids and
     // assistant response ids can reach this path. Model-authored tool ids can
     // recur across turns and deliberately fall through to occurrence-scoped
     // ingestion so a later result is never discarded as a global duplicate.
+    // A rejected anchor leaves the payload unproven. Preserve it through the
+    // store's stable-key conflict fallback even if the event id is reused.
     const stableEventKey = extractStableEventKey(message);
     if (
+      !rejectedTranscriptAnchor &&
       stableEventKey &&
       (await this.conversationStore.hasMessageByStableEventKey(
         conversationId,
@@ -5016,8 +5046,19 @@ export class LcmContextEngine implements ContextEngine {
       // budget math above runs on stored-content token counts, which undercount
       // live messages that carry structured tool payloads; this is the last
       // line of defense that keeps assembled output deliverable to the model.
+      const replayTarget = resolveSessionTranscriptReadTarget(params);
+      let replayEntries: VisibleSessionTranscriptMessageEntry[] = [];
+      if (replayTarget && this.deps.readVisibleSessionTranscriptMessageEntries &&
+          liveMessages.some(message => message.role === "user" && typeof Reflect.get(message, "idempotencyKey") === "string")) {
+        try {
+          replayEntries = await this.deps.readVisibleSessionTranscriptMessageEntries(replayTarget);
+        } catch (error) {
+          this.deps.log.warn(`[lcm] assemble: user replay metadata unavailable for ${sessionLabel}: ${describeLogError(error)}`);
+        }
+      }
+      const replay = restoreRawUserReplay(volatileLiveInputAppend.messages, liveMessages, replayEntries);
       let serializedClamp = clampMessagesToSerializedBudget({
-        messages: volatileLiveInputAppend.messages,
+        messages: replay.messages,
         tokenBudget,
         preserveSubstantiveAssistantTail: hostDeliversCurrentTurnSeparately,
       });
@@ -5025,10 +5066,10 @@ export class LcmContextEngine implements ContextEngine {
         // The recall cue is optional enrichment: drop it before evicting any
         // real context, mirroring the internal cue-vs-eviction priority.
         const cueMessage = budgetedPromptRecallCue.message;
-        const withoutCue = volatileLiveInputAppend.messages.filter(
+        const withoutCue = replay.messages.filter(
           (message) => message !== cueMessage,
         );
-        if (withoutCue.length < volatileLiveInputAppend.messages.length) {
+        if (withoutCue.length < replay.messages.length) {
           serializedClamp = clampMessagesToSerializedBudget({
             messages: withoutCue,
             tokenBudget,
@@ -5042,8 +5083,14 @@ export class LcmContextEngine implements ContextEngine {
           `[lcm] assemble: serialized budget clamp conversation=${conversation.conversationId} ${sessionLabel} serializedTokensBefore=${serializedClamp.serializedTokensBefore} serializedTokens=${serializedClamp.serializedTokens} internalEstimatedTokens=${volatileLiveInputAppend.estimatedTokens} evictedMessages=${serializedClamp.evictedMessages} tokenBudget=${tokenBudget} clamped=${serializedClamp.clamped} overBudget=${serializedClamp.overBudget}`,
         );
       }
-      const finalMessages = serializedClamp.messages;
-      const finalEstimatedTokens = serializedClamp.serializedTokens;
+      const retainedMessages = new Set(serializedClamp.messages);
+      const finalMessages = serializedClamp.messages.filter(message => {
+        const parent = replay.carrierParents.get(message);
+        return !parent || retainedMessages.has(parent);
+      });
+      const finalEstimatedTokens = finalMessages.length === serializedClamp.messages.length
+        ? serializedClamp.serializedTokens
+        : estimateSerializedMessagesTokens(finalMessages);
 
       // v4.2 §B — surface stub telemetry on the standard "assemble: done" line
       // so live watchers can grep stubbedCount/tokensSaved without needing the

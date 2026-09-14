@@ -1430,3 +1430,48 @@ describe("LcmContextEngine.ingest content extraction", () => {
     ]);
   });
 });
+
+it("preserves both messages when a legacy anchor points at a different tool call", async () => {
+  const { attachTranscriptEntryMeta } = await import("../src/transcript.js");
+  const engine = createEngine();
+  const sessionId = randomUUID();
+  const message = (id: string) =>
+    attachTranscriptEntryMeta(
+      {
+        role: "assistant",
+        content: [{ type: "toolCall", id, name: "bash", arguments: { command: id } }],
+      } as AgentMessage,
+      { entryId: "corrupt-anchor", parentId: null, timestamp: null },
+    );
+  await engine.ingest({ sessionId, message: message("old") });
+  await engine.ingest({ sessionId, message: message("actual") });
+
+    const store = engine.getConversationStore();
+  const conversation = await store.getConversationBySessionId(sessionId);
+  const messages = await store.getMessages(conversation!.conversationId);
+    expect(messages).toHaveLength(2);
+  expect(messages[0]!.transcriptEntryId).toBeNull();
+  expect(messages[1]!.transcriptEntryId).toBe("corrupt-anchor");
+  expect((await store.getMessageParts(messages[0]!.messageId))[0]?.toolCallId).toBe("old");
+  expect((await store.getMessageParts(messages[1]!.messageId))[0]?.toolCallId).toBe("actual");
+  await engine.ingest({ sessionId, message: message("actual") });
+  expect(await store.getMessageCount(conversation!.conversationId)).toBe(2);
+});
+
+it("keeps externalized transcript replay idempotent", async () => {
+  await withTempHome(async () => {
+    const { attachTranscriptEntryMeta } = await import("../src/transcript.js");
+    const engine = createEngineWithConfig({ largeFileTokenThreshold: 20 });
+    const sessionId = randomUUID();
+    const message = attachTranscriptEntryMeta(
+      makeMessage({ role: "user", content: "large original payload\n".repeat(200) }),
+      { entryId: "externalized-entry", parentId: null, timestamp: null },
+    );
+    await engine.ingest({ sessionId, message });
+    await engine.ingest({ sessionId, message });
+
+    const store = engine.getConversationStore();
+    const conversation = await store.getConversationBySessionId(sessionId);
+    expect(await store.getMessageCount(conversation!.conversationId)).toBe(1);
+  });
+});

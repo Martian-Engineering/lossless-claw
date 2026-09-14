@@ -332,6 +332,8 @@ export function describeResolvedContextThreshold(resolved: ResolvedContextThresh
  */
 export class ContextThresholdResolver {
   private readonly rules: CompiledOverrideRule[];
+  /** True when any configured rule constrains the model context window. */
+  private readonly hasWindowRangeRules: boolean;
 
   constructor(
     private readonly globalThreshold: number,
@@ -345,6 +347,11 @@ export class ContextThresholdResolver {
         ? { sessionPattern: compileSessionPattern(rule.match.sessionPattern) }
         : {}),
     }));
+    this.hasWindowRangeRules = this.rules.some(
+      ({ rule }) =>
+        rule.match.modelContextWindowMin !== undefined ||
+        rule.match.modelContextWindowMax !== undefined,
+    );
   }
 
   /** Pick the highest-specificity matching rule (earliest wins ties). */
@@ -374,7 +381,14 @@ export class ContextThresholdResolver {
       return {
         contextThreshold: this.globalThreshold,
         source: "global",
-        reason: "no_override_matched",
+        // A window-range rule on a host that reports no window size can never
+        // match, and "no_override_matched" alone reads as "your ranges did not
+        // cover this model" rather than "the host never told us the size".
+        // Name that case so the selection log says which one it was.
+        reason:
+          this.hasWindowRangeRules && runtime.modelContextWindow === undefined
+            ? "no_override_matched_window_metadata_absent"
+            : "no_override_matched",
         specificity: 0,
         ...runtimeFields,
       };

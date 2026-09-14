@@ -11,6 +11,7 @@ export type TranscriptAnchorAuditMessage = {
   seq: number;
   role: MessageRole;
   content: string;
+  structuredIdentity?: string | null;
   transcriptEntryId: string | null;
   anchorTrustState?: TranscriptAnchorTrustState | null;
   createdAt?: Date | string;
@@ -22,6 +23,7 @@ export type TranscriptAnchorAuditEntry = {
   seq: number;
   role: MessageRole;
   content: string;
+  structuredIdentity?: string | null;
   createdAt?: Date | string;
 };
 
@@ -90,9 +92,20 @@ function classifyStampedAnchor(
       reason: "entry id content mismatch",
     };
   }
+  if (
+    (message.structuredIdentity != null || entry.structuredIdentity != null) &&
+    message.structuredIdentity !== entry.structuredIdentity
+  ) {
+    return {
+      messageId: message.messageId,
+      transcriptEntryId,
+      trustState: "suspect",
+      reason: "entry id structured content mismatch",
+    };
+  }
   const hasExplicitTrust =
     message.anchorTrustState === "verified" || message.anchorTrustState === "repaired";
-  if (!hasExplicitTrust && message.content.trim() === "") {
+  if (message.content.trim() === "" && message.structuredIdentity == null) {
     return {
       messageId: message.messageId,
       transcriptEntryId,
@@ -129,7 +142,11 @@ function inspectSequenceAlignment(params: {
   for (let index = 0; index < messages.length; index += 1) {
     const message = messages[index]!;
     const entry = entries[index]!;
-    if (message.role !== entry.role || message.content !== entry.content) {
+    if (
+      message.role !== entry.role ||
+      message.content !== entry.content ||
+      message.structuredIdentity !== entry.structuredIdentity
+    ) {
       return { aligned: false, uniqueNonEmpty: false };
     }
     if (message.content.trim() === "") {
