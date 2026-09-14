@@ -153,6 +153,7 @@ host policy.
   "summarySpendBackoffMs": 1800000,
   "timezone": "America/Los_Angeles",
   "pruneHeartbeatOk": false,
+  "preserveHeartbeatPoll": false,
   "enableSummaryThinking": true,
   "maxAssemblyTokenBudget": 30000,
   "summaryMaxOverageFactor": 3,
@@ -262,6 +263,7 @@ output.
 | `newSessionRetainDepth` | `integer` | `2` | `LCM_NEW_SESSION_RETAIN_DEPTH` | Controls what survives `/new`. `-1` keeps all context, `0` keeps summaries only, higher values keep only deeper summaries. |
 | `timezone` | `string` | `TZ` or system timezone | `TZ` | IANA timezone used for timestamp rendering in summaries. |
 | `pruneHeartbeatOk` | `boolean` | `false` | `LCM_PRUNE_HEARTBEAT_OK` | Retroactively removes `HEARTBEAT_OK` turn cycles from persisted storage. |
+| `preserveHeartbeatPoll` | `boolean` | `false` | `LCM_PRESERVE_HEARTBEAT_POLL` | Keeps OpenClaw heartbeat poll system events in LCM storage and assembled context instead of filtering them out. Pure `HEARTBEAT_OK` acks remain prunable. |
 | `transcriptGcEnabled` | `boolean` | ignored | none | Retired 0.15 compatibility setting. Lossless accepts the key, ignores its value, and warns at startup. |
 | `autoRotateSessionFiles` | `object` | ignored | none | Retired 0.15 compatibility setting. Lossless accepts its former nested shape, ignores its values, and warns at startup. |
 | `enableSummaryThinking` | `boolean` | `true` | `LCM_ENABLE_SUMMARY_THINKING` | When true, requests low reasoning budget from the model during summarization calls. Set to false to disable reasoning and keep summarization output concise. |

@@ -136,8 +136,9 @@ export function turnLooksLikeHeartbeatTurn(turnMessages: Array<{ content: string
  * Returns the number of messages deleted.
  */
 export async function pruneHeartbeatOkTurns(
-conversationStore: ConversationStore,
-conversationId: number,
+  conversationStore: ConversationStore,
+  conversationId: number,
+  options?: { keepPoll?: boolean },
 ): Promise<number> {
   const allMessages = await conversationStore.getMessages(conversationId);
   if (allMessages.length === 0) {
@@ -172,6 +173,12 @@ conversationId: number,
       continue;
     }
     if (!turnLooksLikeHeartbeatTurn(turnMessages)) {
+      continue;
+    }
+
+    if (options?.keepPoll) {
+      // Preserve the poll prompt (and any other message in the turn); drop only the ack.
+      toDelete.push(msg.messageId);
       continue;
     }
 

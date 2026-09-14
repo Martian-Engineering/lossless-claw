@@ -3168,7 +3168,9 @@ export class LcmContextEngine implements ContextEngine {
             await this.conversationStore.markConversationBootstrapped(conversationId);
 
             if (this.config.pruneHeartbeatOk) {
-              const pruned = await pruneHeartbeatOkTurns(this.conversationStore, conversationId);
+              const pruned = await pruneHeartbeatOkTurns(this.conversationStore, conversationId, {
+                keepPoll: this.config.preserveHeartbeatPoll,
+              });
               if (pruned > 0) {
                 this.deps.log.info(
                   `[lcm] bootstrap: pruned ${pruned} HEARTBEAT_OK messages from conversation ${conversationId}`,
@@ -3330,7 +3332,7 @@ export class LcmContextEngine implements ContextEngine {
         this.conversationStore.withTransaction(async () => {
           const entries = await readVisibleSessionTranscriptMessageEntries(params.target!);
           const historicalMessages = entries.map(messageFromVisibleTranscriptEntry);
-          if (params.isHeartbeat) {
+          if (params.isHeartbeat && !this.config.preserveHeartbeatPoll) {
             return {
               importedMessages: 0,
               blockedByImportCap: false,
@@ -3593,7 +3595,7 @@ export class LcmContextEngine implements ContextEngine {
     skipReplayTimestampFloodGuard?: boolean;
   }): Promise<IngestResult> {
     const { sessionId, sessionKey, message, isHeartbeat, createdAt, skipReplayTimestampFloodGuard } = params;
-    if (isHeartbeat) {
+    if (isHeartbeat && !this.config.preserveHeartbeatPoll) {
       return { ingested: false };
     }
     if (!hasPersistableMessageRole(message)) {
@@ -4481,7 +4483,9 @@ export class LcmContextEngine implements ContextEngine {
           sessionKey,
         });
         if (conversation) {
-            const pruned = await pruneHeartbeatOkTurns(this.conversationStore, conversation.conversationId);
+            const pruned = await pruneHeartbeatOkTurns(this.conversationStore, conversation.conversationId, {
+              keepPoll: this.config.preserveHeartbeatPoll,
+            });
             if (pruned > 0) {
               const sessionContext = this.formatSessionLogContext({
                 conversationId: conversation.conversationId,

@@ -289,6 +289,10 @@
       "label": "Prune HEARTBEAT_OK",
       "help": "Retroactively delete HEARTBEAT_OK turn cycles from LCM storage"
     },
+    "preserveHeartbeatPoll": {
+      "label": "Preserve Heartbeat Poll",
+      "help": "Keep OpenClaw heartbeat poll system events in LCM storage and assembled context instead of filtering them out. Default off; pure HEARTBEAT_OK acks are still pruned."
+    },
     "transcriptGcEnabled": {
       "label": "Transcript GC (Retired)",
       "help": "Accepted for upgrade compatibility and ignored. OpenClaw owns active transcript storage in Lossless Claw 1.x."
@@ -631,6 +635,9 @@
         "type": "string"
       },
       "pruneHeartbeatOk": {
+        "type": "boolean"
+      },
+      "preserveHeartbeatPoll": {
         "type": "boolean"
       },
       "transcriptGcEnabled": {

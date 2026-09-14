@@ -163,6 +163,13 @@ export type LcmConfig = {
   timezone: string;
   /** When true, retroactively delete HEARTBEAT_OK turn cycles from LCM storage. */
   pruneHeartbeatOk: boolean;
+
+  /**
+   * When true, OpenClaw heartbeat poll system events are ingested and kept in
+   * assembled context instead of being short-circuited out of the transcript
+   * pipeline. Pure HEARTBEAT_OK acks are still prunable (see pruneHeartbeatOk).
+   */
+  preserveHeartbeatPoll: boolean;
   /** When true, requests low reasoning from the model for summarization calls. */
   enableSummaryThinking: boolean;
   /** Controls whether proactive threshold compaction runs inline or is deferred. */
@@ -761,6 +768,11 @@ export function resolveLcmConfigWithDiagnostics(
         env.LCM_PRUNE_HEARTBEAT_OK !== undefined
           ? env.LCM_PRUNE_HEARTBEAT_OK === "true"
           : toBool(pc.pruneHeartbeatOk) ?? false,
+      preserveHeartbeatPoll:
+        env.LCM_PRESERVE_HEARTBEAT_POLL !== undefined
+          ? env.LCM_PRESERVE_HEARTBEAT_POLL === "true" ||
+            env.LCM_PRESERVE_HEARTBEAT_POLL === "1"
+          : toBool(pc.preserveHeartbeatPoll) ?? false,
       enableSummaryThinking:
         env.LCM_ENABLE_SUMMARY_THINKING !== undefined
           ? env.LCM_ENABLE_SUMMARY_THINKING === "true"
