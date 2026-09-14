@@ -2,4 +2,4 @@
 "@martian-engineering/lossless-claw": patch
 ---
 
-Treat a threshold sweep that made progress but still misses the ideal target as settled when the projected post-sweep prompt stays within the token budget. Stored compaction cannot shrink fixed runtime framing (anchors, tool schemas, fresh tail), so an in-budget projection no longer pins deferred-compaction debt behind a summary spend backoff — avoiding near-budget degradation getting stuck on the host's raw-transcript precheck. Without an observed prompt token count, the previous strict judgment is preserved.
+Clear deferred compaction debt when a threshold sweep made progress, then stalled above the ideal target, and both the stored context and observed prompt projection fit the token budget. Keep recoverable debt pending when a sweep stops at a work limit or is still reducing context. Sweeps without a usable observed prompt count retain the strict threshold verdict.

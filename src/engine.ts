@@ -2257,20 +2257,18 @@ export class LcmContextEngine implements ContextEngine {
       // still make progress there).
       const thresholdSweepTranscriptWedge =
         thresholdSweepExhaustedOverTarget && compactableObservedTokens !== undefined;
-      // Safe-watermark clearance: a threshold sweep that made real progress
-      // but cannot reach the ideal target is only a failure when the
-      // projected post-sweep prompt would exceed the token budget. Stored
-      // compaction cannot shrink fixed runtime framing (anchors, tool
-      // schemas, fresh tail), so an in-budget projection clears the sweep
-      // honestly. Pinning a debt here would degrade every subsequent
-      // assemble and deadlock the session behind the host's raw-transcript
-      // precheck. Requires an observed prompt token count so overhead inferred
-      // from estimator methodology gaps alone cannot wrongly clear a sweep;
-      // without one the strict verdict below stands.
+      // A stalled sweep can settle above the ideal target when both stored
+      // context and the observed prompt projection fit the budget. Negative
+      // estimator gaps cannot discount the stored count. Work-limited or
+      // still-progressing sweeps retain their recoverable threshold debt.
       const promptSafeAfterSweep =
         isThresholdSweep &&
         sweepResult.actionTaken &&
+        !thresholdSweepStoppedAtBudget &&
+        !lastRoundMadeProgress &&
         compactableObservedTokens !== undefined &&
+        sweepTokensAfter !== undefined &&
+        sweepTokensAfter <= tokenBudget &&
         projectedTokensAfterSweep !== undefined &&
         projectedTokensAfterSweep <= tokenBudget;
       if (thresholdSweepStillOverTarget) {

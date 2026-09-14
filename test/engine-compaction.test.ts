@@ -1927,11 +1927,16 @@ describe("#639 Mode 2 deferred-compaction wedge (live context exceeds target, no
 });
 
 describe("safe-watermark threshold sweep verdict (fixed runtime framing)", () => {
+  /** Run a threshold sweep with consistent stored and observed pressure. */
   const createThresholdSweepFixture = async (params: {
     tokensAfter: number;
     observed?: number;
+    stored?: number;
+    authFailure?: boolean;
+    runtimeSettings?: ContextEngineRuntimeSettings;
   }) => {
     const engine = createEngine();
+    const storedTokens = params.stored ?? 92_171;
     const privateEngine = engine as unknown as {
       compaction: {
         evaluate: (
@@ -1946,18 +1951,23 @@ describe("safe-watermark threshold sweep verdict (fixed runtime framing)", () =>
     vi.spyOn(privateEngine.compaction, "evaluate").mockResolvedValue({
       shouldCompact: true,
       reason: "threshold",
-      storedTokens: 92_171,
-      currentTokens: 92_171,
+      storedTokens,
+      currentTokens: Math.max(storedTokens, params.observed ?? 0),
       threshold: 64_828,
-      ...(params.observed !== undefined ? { observedTokens: params.observed } : {}),
+      ...(params.observed !== undefined ? {
+        observedTokens: params.observed,
+        projectedTokens: Math.max(storedTokens, params.observed),
+        rawTokensOutsideTail: storedTokens,
+      } : {}),
     });
     const compactFullSweepSpy = vi
       .spyOn(privateEngine.compaction, "compactFullSweep")
       .mockResolvedValue({
         actionTaken: true,
-        tokensBefore: 92_171,
+        tokensBefore: storedTokens,
         tokensAfter: params.tokensAfter,
         condensed: false,
+        ...(params.authFailure ? { authFailure: true } : {}),
       });
     const compactUntilUnderSpy = vi.spyOn(privateEngine.compaction, "compactUntilUnder");
     const sessionId = `safe-watermark-${params.tokensAfter}-${params.observed ?? "none"}`;
@@ -1970,6 +1980,7 @@ describe("safe-watermark threshold sweep verdict (fixed runtime framing)", () =>
       sessionFile: "/tmp/session.jsonl",
       tokenBudget: 92_612,
       ...(params.observed !== undefined ? { currentTokenCount: params.observed } : {}),
+      ...(params.runtimeSettings ? { runtimeSettings: params.runtimeSettings } : {}),
       compactionTarget: "threshold",
     });
     return { result, compactFullSweepSpy, compactUntilUnderSpy };
@@ -2001,6 +2012,53 @@ describe("safe-watermark threshold sweep verdict (fixed runtime framing)", () =>
 
   it("does not apply the safe-watermark clearance when no observed prompt token count is available", async () => {
     const { result } = await createThresholdSweepFixture({ tokensAfter: 77_794 });
+
+    expect(result.ok).toBe(false);
+    expect(result.reason).toBe("compacted but still over target");
+  });
+
+  it("retains debt when stored context exceeds budget despite a smaller observed count", async () => {
+    const { result } = await createThresholdSweepFixture({
+      stored: 150_000,
+      observed: 110_000,
+      tokensAfter: 130_000,
+    });
+
+    expect(result.ok).toBe(false);
+    expect(result.reason).toBe("compacted but still over target");
+  });
+
+  it.each([
+    { tokensAfter: 82_000, ok: true },
+    { tokensAfter: 84_000, ok: false },
+  ])("includes positive runtime overhead at the budget boundary: $tokensAfter", async ({ tokensAfter, ok }) => {
+    const { result } = await createThresholdSweepFixture({
+      stored: 90_000,
+      observed: 100_000,
+      tokensAfter,
+    });
+
+    expect(result.ok).toBe(ok);
+    expect(result.result?.details).toMatchObject({ projectedTokensAfter: tokensAfter + 10_000 });
+  });
+
+  it("preserves provider auth failure after in-budget partial progress", async () => {
+    const { result } = await createThresholdSweepFixture({
+      tokensAfter: 77_794,
+      observed: 88_235,
+      authFailure: true,
+    });
+
+    expect(result.ok).toBe(false);
+    expect(result.reason).toBe("provider auth failure after partial compaction");
+  });
+
+  it("does not use host-owned prompt counts to clear stored threshold debt", async () => {
+    const { result } = await createThresholdSweepFixture({
+      tokensAfter: 77_794,
+      observed: 88_235,
+      runtimeSettings: buildRuntimeSettings("openclaw-embedded"),
+    });
 
     expect(result.ok).toBe(false);
     expect(result.reason).toBe("compacted but still over target");
