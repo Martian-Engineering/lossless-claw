@@ -1870,7 +1870,7 @@ describe("createLcmSummarizeFromLegacyParams", () => {
 
       const firstArgs = vi.mocked(deps.complete).mock.calls[0]?.[0];
       expect(firstArgs?.maxTokens).toBe(192);
-      expect(firstArgs?.reasoningIfSupported).toBeUndefined();
+      expect(firstArgs?.reasoningIfSupported).toBe("off");
     });
 
     it("falls back to truncation when retry also returns empty for non-text-only blocks", async () => {
