@@ -166,6 +166,58 @@ describe("bounded assemble output", () => {
     ["tool", true],
   ] as const;
 
+  it.each([false, true])("repairs earlier calls before a preserved assistant reply (preserve: %s)", (preserveSubstantiveAssistantTail) => {
+    const messages = makeOversizedToolTurn("toolResult", false);
+    // An evicted heavy prefix forces clamping while retaining both assistants.
+    messages[0] = { ...makeUserMessage(0), content: "question ".repeat(10_000) } as AgentMessage;
+    messages.pop();
+    messages.push({ role: "assistant", content: "completed reply" } as AgentMessage);
+    const result = clampMessagesToSerializedBudget({
+      messages,
+      tokenBudget: 500,
+      preserveSubstantiveAssistantTail,
+    });
+
+    expect(result.clamped).toBe(true);
+    if (preserveSubstantiveAssistantTail) {
+      expect(result.messages.map((message) => message.role)).toEqual([
+        "user", "assistant", "toolResult", "assistant",
+      ]);
+      expect(result.messages[2]).toMatchObject({ toolCallId: "call_image", isError: true });
+      expect(result.messages[3]).toEqual(messages[2]);
+    } else {
+      expect(result.messages).toEqual([messages[0]]);
+    }
+  });
+
+  it.each([false, true])("preserves the serialized-clamp assistant-tail policy (preserve: %s)", (preserveSubstantiveAssistantTail) => {
+    const messages = makeOversizedToolTurn("toolResult", false).slice(0, 2);
+    const result = clampMessagesToSerializedBudget({
+      messages,
+      tokenBudget: 1,
+      preserveSubstantiveAssistantTail,
+    });
+
+    expect(result.clamped).toBe(true);
+    expect(result.messages).toEqual(
+      preserveSubstantiveAssistantTail ? messages : [messages[0]],
+    );
+  });
+
+  it.each([false, true])("preserves the degraded assistant-tail policy (preserve: %s)", (preserveSubstantiveAssistantTail) => {
+    const liveMessages = makeOversizedToolTurn("toolResult", false).slice(0, 2);
+    const result = buildDegradedLiveAssembleResult({
+      liveMessages,
+      tokenBudget: 1,
+      preserveSubstantiveAssistantTail,
+      contextProjection: { mode: "thread_bootstrap" },
+    });
+
+    expect(result.messages).toEqual(
+      preserveSubstantiveAssistantTail ? liveMessages : [liveMessages[0]],
+    );
+  });
+
   it.each(resultShapes)("keeps an oversized degraded %s result paired (nested ID only: %s)", (role, nestedIdOnly) => {
     const liveMessages = makeOversizedToolTurn(role, nestedIdOnly);
     const originalMessages = structuredClone(liveMessages);

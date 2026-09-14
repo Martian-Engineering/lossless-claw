@@ -29,6 +29,7 @@ import { sanitizeToolUseResultPairing } from "./transcript-repair.js";
 function buildProviderValidSuffix(params: {
   messages: AgentMessage[];
   retainedStartIndex: number;
+  preserveSubstantiveAssistantTail?: boolean;
 }): AgentMessage[] {
   if (params.messages.length === 0 || params.retainedStartIndex >= params.messages.length) {
     return [];
@@ -76,7 +77,24 @@ function buildProviderValidSuffix(params: {
         ...(toolCallId ? { toolCallId } : {}),
       } as AgentMessage;
     });
-  return sanitizeToolUseResultPairing(retainedMessages) as AgentMessage[];
+  // Apply the caller's prefill policy before repair can synthesize results.
+  // Keep the legacy assistant-only fallback when stripping would empty it.
+  const stripped = stripTrailingAssistantPrefill(retainedMessages, params);
+  const repairMessages =
+    stripped.length > 0 || params.preserveSubstantiveAssistantTail === true
+      ? stripped
+      : retainedMessages;
+  // Prompt-separate hosts repair the final adopted assistant turn, which may
+  // contain a pending call. Earlier calls still need local pairing repair
+  // when a subsequent assistant turn follows them.
+  const repairEndIndex =
+    repairMessages[repairMessages.length - 1]?.role === "assistant"
+      ? repairMessages.length - 1
+      : repairMessages.length;
+  return [
+    ...sanitizeToolUseResultPairing(repairMessages.slice(0, repairEndIndex)),
+    ...repairMessages.slice(repairEndIndex),
+  ] as AgentMessage[];
 }
 
 /**
@@ -190,6 +208,7 @@ export function clampMessagesToSerializedBudget(params: {
   const providerValidKept = buildProviderValidSuffix({
     messages: params.messages,
     retainedStartIndex: params.messages.length - kept.length,
+    preserveSubstantiveAssistantTail: params.preserveSubstantiveAssistantTail,
   });
   keptTokens = estimateSerializedMessagesTokens(providerValidKept);
 
@@ -255,6 +274,7 @@ export function buildDegradedLiveAssembleResult(params: {
   liveTailMessages = buildProviderValidSuffix({
     messages: liveTail,
     retainedStartIndex: liveTail.length - liveTailMessages.length,
+    preserveSubstantiveAssistantTail: params.preserveSubstantiveAssistantTail,
   });
   const messages = [...protectedPrefix, ...liveTailMessages];
   return {
