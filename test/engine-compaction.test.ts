@@ -1267,6 +1267,230 @@ describe("LcmContextEngine.compact token budget plumbing", () => {
     );
   });
 
+  describe("executeCompactionCore observedRuntimeOverhead", () => {
+    it("preserves positive overhead and arms sweep target when observed exceeds stored", async () => {
+      const engine = createEngine();
+      const privateEngine = engine as unknown as {
+        compaction: {
+          evaluate: (
+            conversationId: number,
+            tokenBudget: number,
+            observed?: number,
+          ) => Promise<unknown>;
+          compactFullSweep: (input: unknown) => Promise<unknown>;
+        };
+      };
+
+      vi.spyOn(privateEngine.compaction, "evaluate").mockResolvedValue({
+        shouldCompact: true,
+        reason: "threshold",
+        storedTokens: 7_000,
+        observedTokens: 12_000,
+        currentTokens: 12_000,
+        threshold: 8_200,
+      });
+      const compactFullSweepSpy = vi
+        .spyOn(privateEngine.compaction, "compactFullSweep")
+        .mockResolvedValue({
+          actionTaken: true,
+          tokensBefore: 7_000,
+          tokensAfter: 3_200,
+          condensed: false,
+        });
+
+      await engine.ingest({
+        sessionId: "overhead-positive-session",
+        message: { role: "user", content: "trigger positive overhead" } as AgentMessage,
+      });
+
+      const result = await engine.compact({
+        sessionId: "overhead-positive-session",
+        sessionFile: "/tmp/session-overhead-positive.jsonl",
+        tokenBudget: 10_000,
+        currentTokenCount: 12_000,
+        compactionTarget: "threshold",
+      });
+
+      expect(result.ok).toBe(true);
+      expect(result.compacted).toBe(true);
+      expect(compactFullSweepSpy).toHaveBeenCalledWith(
+        expect.objectContaining({
+          conversationId: expect.any(Number),
+          tokenBudget: 10_000,
+          summarize: expect.any(Function),
+          force: true,
+          hardTrigger: false,
+          stopAtTokens: 3_200,
+        }),
+      );
+      expect(result.result?.details).toEqual(
+        expect.objectContaining({
+          observedOverheadTokens: 5_000,
+        }),
+      );
+    });
+
+    it("preserves negative overhead, omits stopAtTokens, and emits debug log", async () => {
+      const debugLog = vi.fn();
+      const infoLog = vi.fn();
+      const engine = createEngineWithDeps(
+        {},
+        {
+          log: {
+            info: infoLog,
+            warn: vi.fn(),
+            error: vi.fn(),
+            debug: debugLog,
+          },
+        },
+      );
+      const privateEngine = engine as unknown as {
+        compaction: {
+          evaluate: (
+            conversationId: number,
+            tokenBudget: number,
+            observed?: number,
+          ) => Promise<unknown>;
+          compactFullSweep: (input: {
+            stopAtTokens?: number;
+            [key: string]: unknown;
+          }) => Promise<unknown>;
+        };
+      };
+
+      vi.spyOn(privateEngine.compaction, "evaluate").mockResolvedValue({
+        shouldCompact: true,
+        reason: "threshold",
+        storedTokens: 92_171,
+        observedTokens: 88_235,
+        currentTokens: 88_235,
+        threshold: 8_200,
+      });
+      const compactFullSweepSpy = vi
+        .spyOn(privateEngine.compaction, "compactFullSweep")
+        .mockResolvedValue({
+          actionTaken: true,
+          tokensBefore: 92_171,
+          tokensAfter: 1_000,
+          condensed: false,
+        });
+
+      await engine.ingest({
+        sessionId: "overhead-negative-session",
+        message: { role: "user", content: "trigger negative overhead" } as AgentMessage,
+      });
+
+      const result = await engine.compact({
+        sessionId: "overhead-negative-session",
+        sessionFile: "/tmp/session-overhead-negative.jsonl",
+        tokenBudget: 10_000,
+        currentTokenCount: 88_235,
+        compactionTarget: "threshold",
+      });
+
+      // compactFullSweep must NOT receive a stopAtTokens when overhead is negative.
+      const sweepCallArgs = compactFullSweepSpy.mock.calls[0]?.[0] as
+        | { stopAtTokens?: number }
+        | undefined;
+      expect(sweepCallArgs?.stopAtTokens).toBeUndefined();
+      expect(compactFullSweepSpy).toHaveBeenCalledWith(
+        expect.not.objectContaining({ stopAtTokens: expect.anything() }),
+      );
+      // No runtime-adjustment field in details when overhead is negative
+      // (the detail gate requires runtimeAdjustedSweepTargetTokens to be set).
+      expect(result.result?.details).toEqual(
+        expect.objectContaining({
+          targetTokens: 8_200,
+        }),
+      );
+      expect(result.result?.details).not.toHaveProperty("observedOverheadTokens");
+      // A debug log line MUST be emitted that surfaces the discrepancy.
+      const negativeOverheadLogCalls = debugLog.mock.calls.filter((call) => {
+        const message = call[0];
+        return (
+          typeof message === "string" &&
+          message.includes("[lcm] compact: observed runtime overhead negative")
+        );
+      });
+      expect(negativeOverheadLogCalls).toHaveLength(1);
+      const negativeOverheadMessage = negativeOverheadLogCalls[0]?.[0] as string;
+      expect(negativeOverheadMessage).toContain("storedTokens=92171");
+      expect(negativeOverheadMessage).toContain("observedTokens=88235");
+      expect(negativeOverheadMessage).toContain("observedRuntimeOverhead=-3936");
+    });
+
+    it("keeps zero overhead behavior unchanged: no stopAtTokens, no debug log", async () => {
+      const debugLog = vi.fn();
+      const engine = createEngineWithDeps(
+        {},
+        {
+          log: {
+            info: vi.fn(),
+            warn: vi.fn(),
+            error: vi.fn(),
+            debug: debugLog,
+          },
+        },
+      );
+      const privateEngine = engine as unknown as {
+        compaction: {
+          evaluate: (
+            conversationId: number,
+            tokenBudget: number,
+            observed?: number,
+          ) => Promise<unknown>;
+          compactFullSweep: (input: unknown) => Promise<unknown>;
+        };
+      };
+
+      vi.spyOn(privateEngine.compaction, "evaluate").mockResolvedValue({
+        shouldCompact: true,
+        reason: "threshold",
+        storedTokens: 9_000,
+        observedTokens: 9_000,
+        currentTokens: 9_000,
+        threshold: 8_200,
+      });
+      const compactFullSweepSpy = vi
+        .spyOn(privateEngine.compaction, "compactFullSweep")
+        .mockResolvedValue({
+          actionTaken: true,
+          tokensBefore: 9_000,
+          tokensAfter: 1_000,
+          condensed: false,
+        });
+
+      await engine.ingest({
+        sessionId: "overhead-zero-session",
+        message: { role: "user", content: "trigger zero overhead" } as AgentMessage,
+      });
+
+      const result = await engine.compact({
+        sessionId: "overhead-zero-session",
+        sessionFile: "/tmp/session-overhead-zero.jsonl",
+        tokenBudget: 10_000,
+        currentTokenCount: 9_000,
+        compactionTarget: "threshold",
+      });
+
+      // The > 0 guard (not >= 0) keeps stopAtTokens unset when overhead is zero.
+      expect(compactFullSweepSpy).toHaveBeenCalledWith(
+        expect.not.objectContaining({ stopAtTokens: expect.anything() }),
+      );
+      // No runtime-adjustment field in details when overhead is zero.
+      expect(result.result?.details).not.toHaveProperty("observedOverheadTokens");
+      // The negative-overhead debug log gate is < 0, so zero overhead does not log.
+      const negativeOverheadLogCalls = debugLog.mock.calls.filter((call) => {
+        const message = call[0];
+        return (
+          typeof message === "string" &&
+          message.includes("observed runtime overhead negative")
+        );
+      });
+      expect(negativeOverheadLogCalls).toHaveLength(0);
+    });
+  });
+
   it("forces threshold sweeps to account for projected raw backlog pressure", async () => {
     const infoLog = vi.fn();
     const engine = createEngineWithDeps(

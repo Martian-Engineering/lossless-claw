@@ -2052,7 +2052,7 @@ export class LcmContextEngine implements ContextEngine {
         : undefined;
     const observedRuntimeOverhead =
       params.compactionTarget === "threshold" && compactableObservedTokens !== undefined
-        ? Math.max(0, compactableObservedTokens - decisionStoredTokens)
+        ? compactableObservedTokens - decisionStoredTokens
         : 0;
     const runtimeAdjustedSweepTargetTokens =
       observedRuntimeOverhead > 0 &&
@@ -2089,6 +2089,12 @@ export class LcmContextEngine implements ContextEngine {
     this.deps.log.info(
       `[lcm] compact: decision conversation=${conversationId} ${sessionLabel} compactionTarget=${params.compactionTarget ?? "budget"} force=${forceCompaction} tokenBudget=${tokenBudget} targetTokens=${targetTokens} storedTokens=${decisionStoredTokens} currentTokens=${decision.currentTokens} observedTokens=${observedTokens ?? "none"} hostOwnsPromptFraming=${promptFramingOwnedByHost} projectedTokens=${decisionProjectedTokens ?? "none"} rawTokensOutsideTail=${decisionRawTokensOutsideTail ?? "none"} thresholdPressureTokens=${thresholdPressureTokens ?? "none"} observedRuntimeOverhead=${observedRuntimeOverhead} shouldCompact=${decision.shouldCompact}`,
     );
+
+    if (observedRuntimeOverhead < 0) {
+      this.deps.log.debug(
+        `[lcm] compact: observed runtime overhead negative conversation=${conversationId} ${sessionLabel} storedTokens=${decisionStoredTokens} observedTokens=${compactableObservedTokens} observedRuntimeOverhead=${observedRuntimeOverhead} — LCM stored counter exceeds host-observed prompt; methodology gap, no runtime sweep target adjustment`,
+      );
+    }
 
     if (!forceCompaction && !decision.shouldCompact) {
       this.deps.log.info(
