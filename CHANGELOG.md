@@ -1,5 +1,27 @@
 # @martian-engineering/lossless-claw
 
+## 1.1.0
+
+### Minor Changes
+
+- [#1170](https://github.com/Martian-Engineering/lossless-claw/pull/1170) [`db29bc6`](https://github.com/Martian-Engineering/lossless-claw/commit/db29bc6dbeb1d9181ba020379b6f7ffc96079d4b) Thanks [@cv-forever](https://github.com/cv-forever)! - Add the opt-in `preserveHeartbeatPoll` configuration option to retain heartbeat poll events in stored and assembled context. When `pruneHeartbeatOk` is enabled, preserve poll and intermediate messages while removing pure `HEARTBEAT_OK` acknowledgements across transcript projection and durable turn commits.
+
+### Patch Changes
+
+- [#1145](https://github.com/Martian-Engineering/lossless-claw/pull/1145) [`c6d06e5`](https://github.com/Martian-Engineering/lossless-claw/commit/c6d06e528867004c85ae84897019d94f0cdbea50) Thanks [@jalehman](https://github.com/jalehman)! - Accept the retired `transcriptGcEnabled` and `autoRotateSessionFiles` settings so upgrades from 0.15 continue to load. Lossless ignores both settings and logs a startup warning that asks operators to remove them.
+
+- [#1155](https://github.com/Martian-Engineering/lossless-claw/pull/1155) [`188b235`](https://github.com/Martian-Engineering/lossless-claw/commit/188b235e46839893ef52a4915ba0e98206b94ff9) Thanks [@FtlC-ian](https://github.com/FtlC-ian)! - Avoid scanning unrelated message history when resolving summary source ranges. This prevents repeated synchronous database scans from stalling context assembly on large databases while preserving summary coverage and generated context.
+
+- [#1163](https://github.com/Martian-Engineering/lossless-claw/pull/1163) [`703cc0f`](https://github.com/Martian-Engineering/lossless-claw/commit/703cc0f57a50b667cdd7e767fd9808c533a3cfb4) Thanks [@jalehman](https://github.com/jalehman)! - Preserve retained user replay identity and adjacent OpenClaw runtime context during context assembly.
+
+- [#1149](https://github.com/Martian-Engineering/lossless-claw/pull/1149) [`c84dd8c`](https://github.com/Martian-Engineering/lossless-claw/commit/c84dd8cff727eff3bb6c9a26f3cf4c0510fbc343) Thanks [@jarvis-mns1](https://github.com/jarvis-mns1)! - Keep assistant tool calls and their results as one atomic unit when degraded or serialized-budget fallback trims live context. This prevents oversized multimodal tool results from reaching providers as orphaned outputs and failing the next model request.
+
+- [#1162](https://github.com/Martian-Engineering/lossless-claw/pull/1162) [`a3eedf5`](https://github.com/Martian-Engineering/lossless-claw/commit/a3eedf5c94ea838fa0a1eeb28bb2388eb450de78) Thanks [@Marvinthebored](https://github.com/Marvinthebored)! - Verify structured tool provenance and payloads before adopting transcript anchors or deduplicating replays. Treat blank-text and ambiguous weak matches as unproven, and stop re-verifying mismatched legacy tool anchors. Preserve all message content when continuity is uncertain.
+
+- [#1157](https://github.com/Martian-Engineering/lossless-claw/pull/1157) [`946441f`](https://github.com/Martian-Engineering/lossless-claw/commit/946441fcd1fd8b13044fc066f434b9ca9455a42a) Thanks [@mpz4life](https://github.com/mpz4life)! - Clear deferred compaction debt when a threshold sweep made progress, then stalled above the ideal target, and both the stored context and observed prompt projection fit the token budget. Keep recoverable debt pending when a sweep stops at a work limit or is still reducing context. Sweeps without a usable observed prompt count retain the strict threshold verdict.
+
+- [#1165](https://github.com/Martian-Engineering/lossless-claw/pull/1165) [`621b702`](https://github.com/Martian-Engineering/lossless-claw/commit/621b702e349f22444e362c2a1db14f87c6fc3ca9) Thanks [@igs-rogenlo](https://github.com/igs-rogenlo)! - Report `no_override_matched_window_metadata_absent` when no context threshold override matches, a window-range rule is configured, and the host supplies no model context-window metadata. This distinguishes missing metadata from an out-of-range window without changing threshold selection.
+
 ## 1.0.0
 
 <!-- release-rollback-version: 0.15.6 -->
