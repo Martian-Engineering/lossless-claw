@@ -64,16 +64,17 @@ function buildProviderValidSuffix(params: {
     .sort((left, right) => left - right)
     .map((index) => {
       const message = params.messages[index]!;
-      const toolCallId = extractToolResultIdForPairing(message);
-      if (
-        toolCallId &&
-        (message.role === "tool" || message.role === "toolResult") &&
-        !("toolCallId" in message && typeof message.toolCallId === "string") &&
-        !("toolUseId" in message && typeof message.toolUseId === "string")
-      ) {
-        return { ...message, toolCallId } as AgentMessage;
+      if (message.role !== "tool" && message.role !== "toolResult") {
+        return message;
       }
-      return message;
+      // Pairing repair consumes the runtime toolResult role and top-level ID.
+      // Normalize a copy so the host-owned live transcript stays unchanged.
+      const toolCallId = extractToolResultIdForPairing(message);
+      return {
+        ...message,
+        role: "toolResult",
+        ...(toolCallId ? { toolCallId } : {}),
+      } as AgentMessage;
     });
   return sanitizeToolUseResultPairing(retainedMessages) as AgentMessage[];
 }

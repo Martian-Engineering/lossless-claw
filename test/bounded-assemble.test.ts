@@ -124,7 +124,11 @@ function makeHeavyLiveTranscript(pairs: number, payloadChars: number): AgentMess
   return messages;
 }
 
-function makeOversizedToolTurn(): AgentMessage[] {
+/** Build a tool exchange with either runtime result role and ID placement. */
+function makeOversizedToolTurn(
+  resultRole: "tool" | "toolResult",
+  nestedIdOnly: boolean,
+): AgentMessage[] {
   return [
     makeUserMessage(0),
     {
@@ -139,8 +143,8 @@ function makeOversizedToolTurn(): AgentMessage[] {
       ],
     } as AgentMessage,
     {
-      ...makeHeavyToolResultMessage(1, 20_000),
-      toolCallId: "call_image",
+      role: resultRole,
+      ...(nestedIdOnly ? {} : { toolCallId: "call_image" }),
       toolName: "view_image",
       content: [
         {
@@ -155,9 +159,18 @@ function makeOversizedToolTurn(): AgentMessage[] {
 }
 
 describe("bounded assemble output", () => {
-  it("keeps an oversized degraded tool result paired with its assistant call", () => {
+  const resultShapes = [
+    ["toolResult", false],
+    ["toolResult", true],
+    ["tool", false],
+    ["tool", true],
+  ] as const;
+
+  it.each(resultShapes)("keeps an oversized degraded %s result paired (nested ID only: %s)", (role, nestedIdOnly) => {
+    const liveMessages = makeOversizedToolTurn(role, nestedIdOnly);
+    const originalMessages = structuredClone(liveMessages);
     const result = buildDegradedLiveAssembleResult({
-      liveMessages: makeOversizedToolTurn(),
+      liveMessages,
       tokenBudget: 100,
       contextProjection: { mode: "thread_bootstrap", epoch: "test-projection" },
     });
@@ -168,12 +181,19 @@ describe("bounded assemble output", () => {
       "assistant",
       "toolResult",
     ]);
-    expect(result.messages[2]).toMatchObject({ toolCallId: "call_image" });
+    expect(result.messages[2]).toEqual({
+      ...liveMessages[2],
+      role: "toolResult",
+      toolCallId: "call_image",
+    });
+    expect(liveMessages).toEqual(originalMessages);
   });
 
-  it("keeps an oversized serialized-clamp tool result paired with its assistant call", () => {
+  it.each(resultShapes)("keeps an oversized clamped %s result paired (nested ID only: %s)", (role, nestedIdOnly) => {
+    const messages = makeOversizedToolTurn(role, nestedIdOnly);
+    const originalMessages = structuredClone(messages);
     const result = clampMessagesToSerializedBudget({
-      messages: makeOversizedToolTurn(),
+      messages,
       tokenBudget: 100,
     });
 
@@ -184,7 +204,12 @@ describe("bounded assemble output", () => {
       "assistant",
       "toolResult",
     ]);
-    expect(result.messages[2]).toMatchObject({ toolCallId: "call_image" });
+    expect(result.messages[2]).toEqual({
+      ...messages[2],
+      role: "toolResult",
+      toolCallId: "call_image",
+    });
+    expect(messages).toEqual(originalMessages);
   });
 
   it("clamps near-budget serialized output to leave host renderer headroom", () => {
@@ -306,5 +331,26 @@ describe("bounded assemble output", () => {
     // Ignored sessions are not managed by LCM: no clamping, legacy shape.
     expect(result.messages.length).toBe(liveMessages.length);
     expect(result.estimatedTokens).toBe(0);
+  });
+});
+
+describe("degraded live fallback preserves a user turn", () => {
+  it("re-seats the most recent user turn when budget-trimming drops it from a tool loop", () => {
+    // Regression contributed by @JerretK in #1156: Qwen chat templates require
+    // a user query even when budget pressure retains only a long tool-loop tail.
+    const liveMessages: AgentMessage[] = [makeUserMessage(0)];
+    for (let i = 1; i <= 12; i += 1) {
+      liveMessages.push(makeHeavyToolResultMessage(i, 4_000));
+    }
+
+    const result = buildDegradedLiveAssembleResult({
+      liveMessages,
+      tokenBudget: 3_000,
+      contextProjection: { mode: "thread_bootstrap" },
+    });
+
+    expect(result.messages.length).toBeLessThan(liveMessages.length);
+    expect(result.messages.some((message) => message.role === "user")).toBe(true);
+    expect(result.estimatedTokens).toBeGreaterThan(0);
   });
 });
