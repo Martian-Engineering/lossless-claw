@@ -98,6 +98,22 @@ function getEngineDatabase(engine: ReturnType<typeof createEngine>): DatabaseSyn
 }
 
 describe("LcmContextEngine commitTurn", () => {
+  it.each([false, true])("preserves heartbeat polls with pruneHeartbeatOk=%s", async (pruneHeartbeatOk) => {
+    const engine = createEngineWithConfig({ preserveHeartbeatPoll: true, pruneHeartbeatOk });
+    const params = {
+      ...buildCommitTurnParams({ answer: "HEARTBEAT_OK" }),
+      isHeartbeat: true,
+    };
+    params.messages[0] = makeMessage({ role: "user", content: "[OpenClaw heartbeat poll] read HEARTBEAT.md" });
+
+    // The receipt and surviving messages must remain stable when the host retries.
+    await expect(engine.commitTurn(params)).resolves.toEqual({ status: "committed" });
+    await expect(engine.commitTurn(params)).resolves.toEqual({ status: "duplicate" });
+    expect((await readStoredMessages(engine)).map((message) => message.content)).toEqual(
+      pruneHeartbeatOk ? [params.messages[0].content] : params.messages.map((message) => message.content),
+    );
+  });
+
   it("declares the fenced atomic-idempotent transcript contract", () => {
     const engine = createEngine();
 

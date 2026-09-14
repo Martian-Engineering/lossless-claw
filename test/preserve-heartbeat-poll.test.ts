@@ -11,7 +11,7 @@
  * allowing pure HEARTBEAT_OK acknowledgements to be pruned. It defaults to false, so
  * behaviour for existing users is unchanged.
  */
-import { describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it } from "vitest";
 import manifest from "../openclaw.plugin.json" with { type: "json" };
 import { resolveLcmConfig } from "../src/db/config.js";
 import {
@@ -21,10 +21,19 @@ import {
   pruneHeartbeatOkTurns,
 } from "../src/heartbeat-filter.js";
 import type { ConversationStore } from "../src/store/conversation-store.js";
-import { createEngine, createEngineWithConfig, makeMessage } from "./helpers.js";
+import {
+  cleanupEngineTestState,
+  createEngine,
+  createEngineWithConfig,
+  createEngineWithDepsOverridesAndDb,
+  makeMessage,
+} from "./helpers.js";
+
+afterEach(cleanupEngineTestState);
 
 type StoredLike = { messageId: number; role: string; content: string };
 
+// Build a complete poll/ack cycle recognized by the heartbeat detector.
 function heartbeatTurnMessages(): StoredLike[] {
   return [
     { messageId: 1, role: "user", content: `${OPENCLAW_HEARTBEAT_POLL} — read ${HEARTBEAT_TURN_MARKER}` },
@@ -32,6 +41,7 @@ function heartbeatTurnMessages(): StoredLike[] {
   ];
 }
 
+// Record deletion requests without mutating message data in detector unit tests.
 function fakeStore(messages: StoredLike[]) {
   const deleted: number[] = [];
   const store = {
@@ -73,6 +83,16 @@ describe("preserveHeartbeatPoll config resolution", () => {
   it("declares the flag in the plugin manifest schema", () => {
     const schema = manifest.configSchema as { properties?: Record<string, unknown> };
     expect(schema.properties?.preserveHeartbeatPoll).toEqual({ type: "boolean" });
+    expect(manifest.uiHints.preserveHeartbeatPoll).toBeDefined();
+  });
+
+  it("lets an explicit environment value override the plugin config", () => {
+    expect(resolveLcmConfig({ LCM_PRESERVE_HEARTBEAT_POLL: "0" }, {
+      preserveHeartbeatPoll: true,
+    }).preserveHeartbeatPoll).toBe(false);
+    expect(resolveLcmConfig({ LCM_PRESERVE_HEARTBEAT_POLL: "1" }, {
+      preserveHeartbeatPoll: false,
+    }).preserveHeartbeatPoll).toBe(true);
   });
 });
 
@@ -136,4 +156,61 @@ describe("pruneHeartbeatOkTurns with keepPoll", () => {
     expect(pruned).toBe(0);
     expect(deleted).toEqual([]);
   });
+
+  it("preserves intermediate tool and assistant messages with keepPoll", async () => {
+    const [poll, ack] = heartbeatTurnMessages();
+    const { store, deleted } = fakeStore([
+      poll!,
+      { messageId: 3, role: "assistant", content: "Checking a scheduled task" },
+      { messageId: 4, role: "tool", content: "Scheduled task completed successfully" },
+      ack!,
+    ]);
+    expect(await pruneHeartbeatOkTurns(store, 1, { keepPoll: true })).toBe(1);
+    expect(deleted).toEqual([2]);
+  });
+});
+
+describe("heartbeat preservation through afterTurn", () => {
+  for (const projected of [false, true]) {
+    it.each([false, true])(`honours pruneHeartbeatOk=%s with projected=${projected}`, async (pruneHeartbeatOk) => {
+      const sessionId = `heartbeat-after-turn-${projected}-${pruneHeartbeatOk}`;
+      const sessionKey = `agent:main:${sessionId}`;
+      const messages = heartbeatTurnMessages().map(({ role, content }) =>
+        makeMessage({ role: role as "user" | "assistant", content }),
+      );
+      // Keep a visible prefix so runtime-only and fully flushed turns both have coverage proof.
+      const prefix = makeMessage({ role: "user", content: "Earlier ordinary conversation" });
+      const visible = projected ? [prefix, ...messages] : [prefix];
+      const { engine } = createEngineWithDepsOverridesAndDb({
+        readVisibleSessionTranscriptMessageEntries: async () => visible.map((message, index) => ({
+          entryId: `heartbeat-${index}`,
+          parentId: index === 0 ? null : `heartbeat-${index - 1}`,
+          seq: index + 1,
+          role: message.role,
+          message,
+          createdAt: `2026-09-14T12:00:0${index}.000Z`,
+        })),
+      }, { preserveHeartbeatPoll: true, pruneHeartbeatOk });
+      await engine.afterTurn({
+        sessionId,
+        sessionKey,
+        sessionFile: "",
+        sessionTarget: { agentId: "main", sessionId, sessionKey, storePath: "/tmp/heartbeat-host.sqlite" },
+        messages,
+        prePromptMessageCount: 0,
+        isHeartbeat: true,
+        tokenBudget: 100_000,
+      });
+
+      const conversation = await engine.getConversationStore().getConversationBySessionId(sessionId);
+      const stored = await engine.getConversationStore().getMessages(conversation!.conversationId);
+      const expectedTurn = pruneHeartbeatOk
+        ? [messages[0]!.content]
+        : messages.map((message) => message.content);
+      const expected = [prefix.content, ...expectedTurn];
+      expect(stored.map((message) => message.content)).toEqual(expected);
+      const assembled = await engine.assemble({ sessionId, messages: [], tokenBudget: 10_000 });
+      expect(JSON.stringify(assembled.messages)).toContain(OPENCLAW_HEARTBEAT_POLL);
+    });
+  }
 });

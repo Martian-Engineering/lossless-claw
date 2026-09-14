@@ -291,7 +291,7 @@
     },
     "preserveHeartbeatPoll": {
       "label": "Preserve Heartbeat Poll",
-      "help": "Keep OpenClaw heartbeat poll system events in LCM storage and assembled context instead of filtering them out. Default off; pure HEARTBEAT_OK acks are still pruned."
+      "help": "Keep OpenClaw heartbeat poll system events in LCM storage and assembled context. Default off. With pruneHeartbeatOk enabled, remove only pure HEARTBEAT_OK acknowledgements and preserve the poll and intermediate messages."
     },
     "transcriptGcEnabled": {
       "label": "Transcript GC (Retired)",

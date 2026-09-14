@@ -263,7 +263,7 @@ output.
 | `newSessionRetainDepth` | `integer` | `2` | `LCM_NEW_SESSION_RETAIN_DEPTH` | Controls what survives `/new`. `-1` keeps all context, `0` keeps summaries only, higher values keep only deeper summaries. |
 | `timezone` | `string` | `TZ` or system timezone | `TZ` | IANA timezone used for timestamp rendering in summaries. |
 | `pruneHeartbeatOk` | `boolean` | `false` | `LCM_PRUNE_HEARTBEAT_OK` | Retroactively removes `HEARTBEAT_OK` turn cycles from persisted storage. |
-| `preserveHeartbeatPoll` | `boolean` | `false` | `LCM_PRESERVE_HEARTBEAT_POLL` | Keeps OpenClaw heartbeat poll system events in LCM storage and assembled context instead of filtering them out. Pure `HEARTBEAT_OK` acks remain prunable. |
+| `preserveHeartbeatPoll` | `boolean` | `false` | `LCM_PRESERVE_HEARTBEAT_POLL` | Keeps OpenClaw heartbeat poll events in LCM storage and assembled context. With `pruneHeartbeatOk` enabled, removes only pure `HEARTBEAT_OK` acknowledgements and preserves the poll and intermediate messages. The env override accepts `1` or `true` to enable; any other value disables. |
 | `transcriptGcEnabled` | `boolean` | ignored | none | Retired 0.15 compatibility setting. Lossless accepts the key, ignores its value, and warns at startup. |
 | `autoRotateSessionFiles` | `object` | ignored | none | Retired 0.15 compatibility setting. Lossless accepts its former nested shape, ignores its values, and warns at startup. |
 | `enableSummaryThinking` | `boolean` | `true` | `LCM_ENABLE_SUMMARY_THINKING` | When true, requests low reasoning budget from the model during summarization calls. Set to false to disable reasoning and keep summarization output concise. |
