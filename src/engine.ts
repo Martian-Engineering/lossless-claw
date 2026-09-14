@@ -3231,6 +3231,11 @@ export class LcmContextEngine implements ContextEngine {
             await this.conversationStore.markConversationBootstrapped(
               freshConversation.conversationId,
             );
+            if (this.config.pruneHeartbeatOk) {
+              await pruneHeartbeatOkTurns(this.conversationStore, freshConversation.conversationId, {
+                keepPoll: this.config.preserveHeartbeatPoll,
+              });
+            }
             this.deps.log.info(
               `[lcm] bootstrap: sqlite projection started fresh conversation=${freshConversation.conversationId} archivedConversation=${conversationId} ${params.sessionLabel} importedMessages=${importedMessages} sourceMessages=${historicalMessages.length}`,
             );
@@ -3262,6 +3267,13 @@ export class LcmContextEngine implements ContextEngine {
 
           if (!conversation.bootstrappedAt) {
             await this.conversationStore.markConversationBootstrapped(conversationId);
+          }
+
+          // Reconcile can restore host transcript acknowledgements that LCM previously pruned.
+          if (this.config.pruneHeartbeatOk) {
+            await pruneHeartbeatOkTurns(this.conversationStore, conversationId, {
+              keepPoll: this.config.preserveHeartbeatPoll,
+            });
           }
 
           if (reconcile.importedMessages > 0) {

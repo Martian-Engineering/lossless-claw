@@ -214,3 +214,40 @@ describe("heartbeat preservation through afterTurn", () => {
     });
   }
 });
+
+describe("heartbeat preservation through bootstrap", () => {
+  it("prunes acknowledgements re-imported into an existing conversation", async () => {
+    const sessionId = "heartbeat-bootstrap-reconcile";
+    const sessionKey = `agent:main:${sessionId}`;
+    const messages = [makeMessage({ role: "user", content: "Earlier ordinary conversation" })];
+    const { engine } = createEngineWithDepsOverridesAndDb({
+      readVisibleSessionTranscriptMessageEntries: async () => messages.map((message, index) => ({
+        entryId: `bootstrap-${index}`,
+        parentId: index === 0 ? null : `bootstrap-${index - 1}`,
+        seq: index + 1,
+        role: message.role,
+        message,
+        createdAt: `2026-09-14T12:00:0${index}.000Z`,
+      })),
+    }, { preserveHeartbeatPoll: true, pruneHeartbeatOk: true });
+    const params = {
+      sessionId,
+      sessionKey,
+      runtimeContext: {
+        sessionTarget: { agentId: "main", sessionId, sessionKey, storePath: "/tmp/heartbeat-host.sqlite" },
+      },
+    };
+    await engine.bootstrap(params);
+
+    // The host's visible transcript retains acknowledgements across LCM restarts/replays.
+    messages.push(
+      makeMessage({ role: "user", content: "[OpenClaw heartbeat poll] read HEARTBEAT.md" }),
+      makeMessage({ role: "assistant", content: "HEARTBEAT_OK" }),
+    );
+    await engine.bootstrap(params);
+    await engine.bootstrap(params);
+    const conversation = await engine.getConversationStore().getConversationBySessionId(sessionId);
+    const stored = await engine.getConversationStore().getMessages(conversation!.conversationId);
+    expect(stored.map((message) => message.content)).toEqual(messages.slice(0, 2).map((message) => message.content));
+  });
+});
