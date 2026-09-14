@@ -2121,10 +2121,12 @@ export class LcmContextEngine implements ContextEngine {
         typeof result.tokensAfter === "number" && Number.isFinite(result.tokensAfter)
           ? result.tokensAfter
           : undefined;
+      // Estimator discrepancies cannot discount persisted context in either
+      // the threshold verdict or the safe-watermark verdict.
       const projectSweepTokensAfter = (tokensAfter: number | undefined): number | undefined =>
         tokensAfter !== undefined &&
         (runtimeAdjustedSweepTargetTokens !== undefined || projectedRawBacklogPressure)
-          ? tokensAfter + observedRuntimeOverhead
+          ? tokensAfter + Math.max(0, observedRuntimeOverhead)
           : tokensAfter;
       const isUnderTargetAfter = (
         result: Awaited<ReturnType<CompactionEngine["compact"]>>,
@@ -2272,8 +2274,6 @@ export class LcmContextEngine implements ContextEngine {
         !thresholdSweepStoppedAtBudget &&
         !lastRoundMadeProgress &&
         compactableObservedTokens !== undefined &&
-        sweepTokensAfter !== undefined &&
-        sweepTokensAfter <= tokenBudget &&
         projectedTokensAfterSweep !== undefined &&
         projectedTokensAfterSweep <= tokenBudget;
       if (thresholdSweepStillOverTarget) {

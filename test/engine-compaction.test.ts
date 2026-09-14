@@ -2017,10 +2017,10 @@ describe("safe-watermark threshold sweep verdict (fixed runtime framing)", () =>
     expect(result.reason).toBe("compacted but still over target");
   });
 
-  it("retains debt when stored context exceeds budget despite a smaller observed count", async () => {
+  it.each([110_000, 80_000])("retains debt when stored context exceeds budget despite observed count %i", async (observed) => {
     const { result } = await createThresholdSweepFixture({
       stored: 150_000,
-      observed: 110_000,
+      observed,
       tokensAfter: 130_000,
     });
 
