@@ -99,6 +99,24 @@ function extractRegisterToolFactoryCallSites(): RegisterToolFactoryCallSite[] {
   return sites.sort((a, b) => a.factory.localeCompare(b.factory));
 }
 describe("openclaw.plugin.json manifest drift guard (#570)", () => {
+  it("groups every root setting exactly once without changing its configuration path", () => {
+    const groups = manifest.configGroups;
+    expect(groups).toBeInstanceOf(Array);
+    expect(new Set(groups.map((group) => group.id)).size).toBe(groups.length);
+    for (const group of groups) {
+      expect(group.id.trim()).not.toBe("");
+      expect(group.title.trim()).not.toBe("");
+      expect(Number.isInteger(group.order)).toBe(true);
+      expect(group.properties.length).toBeGreaterThan(0);
+      expect(Object.keys(group).sort()).toEqual(["id", "order", "properties", "title"]);
+    }
+
+    // Equality against the schema catches new settings omitted from the UI,
+    // duplicate assignments, and nested paths that the host cannot group.
+    const groupedProperties = groups.flatMap((group) => group.properties).sort();
+    expect(groupedProperties).toEqual(Object.keys(manifest.configSchema.properties).sort());
+  });
+
   it("limits contracts to fields supported by the declared OpenClaw host", () => {
     expect(Object.keys(manifest.contracts)).toEqual(["tools"]);
   });

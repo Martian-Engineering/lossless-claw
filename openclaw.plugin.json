@@ -44,6 +44,133 @@
       "replaySafe": true
     }
   },
+  "configGroups": [
+    {
+      "id": "session-capture",
+      "title": "Session capture",
+      "order": 10,
+      "properties": [
+        "enabled",
+        "hostFallbackMode",
+        "bootstrapMaxTokens",
+        "newSessionRetainDepth",
+        "ignoreSessionPatterns",
+        "statelessSessionPatterns",
+        "skipStatelessSessions",
+        "pruneHeartbeatOk",
+        "preserveHeartbeatPoll",
+        "replayFloodThresholdExternal",
+        "replayFloodThresholdInternal"
+      ]
+    },
+    {
+      "id": "context-budget",
+      "title": "Context budget",
+      "order": 20,
+      "properties": [
+        "contextThreshold",
+        "contextThresholdOverrides",
+        "freshTailCount",
+        "freshTailMaxTokens",
+        "maxAssemblyTokenBudget",
+        "promptAwareEviction"
+      ]
+    },
+    {
+      "id": "compaction",
+      "title": "Compaction",
+      "order": 30,
+      "properties": [
+        "sweepMaxDepth",
+        "leafChunkTokens",
+        "summaryPrefixTargetTokens",
+        "leafMinFanout",
+        "condensedMinFanout",
+        "condensedMinFanoutHard",
+        "maxSweepIterations",
+        "sweepDeadlineMs",
+        "compactUntilUnderDeadlineMs",
+        "proactiveThresholdCompactionMode"
+      ]
+    },
+    {
+      "id": "summaries",
+      "title": "Summaries",
+      "order": 40,
+      "properties": [
+        "summaryModel",
+        "summaryProvider",
+        "leafTargetTokens",
+        "condensedTargetTokens",
+        "enableSummaryThinking",
+        "customInstructions",
+        "timezone",
+        "stripInjectedContextTags"
+      ]
+    },
+    {
+      "id": "summary-reliability",
+      "title": "Summary reliability",
+      "order": 50,
+      "properties": [
+        "summaryTimeoutMs",
+        "summaryCallWindowMs",
+        "summaryMaxCallsPerWindow",
+        "summarySpendBackoffMs",
+        "summaryMaxOverageFactor",
+        "fallbackMaxTokens",
+        "fallbackProviders",
+        "circuitBreakerThreshold",
+        "circuitBreakerCooldownMs"
+      ]
+    },
+    {
+      "id": "recall",
+      "title": "Recall",
+      "order": 60,
+      "properties": [
+        "maxExpandTokens",
+        "expansionModel",
+        "expansionProvider",
+        "delegationTimeoutMs"
+      ]
+    },
+    {
+      "id": "external-files",
+      "title": "External files",
+      "order": 70,
+      "properties": [
+        "largeFilesDir",
+        "largeFileThresholdTokens",
+        "largeFileSummaryModel",
+        "largeFileSummaryProvider",
+        "stubLargeToolPayloads"
+      ]
+    },
+    {
+      "id": "storage-logging",
+      "title": "Storage and logging",
+      "order": 80,
+      "properties": [
+        "databasePath",
+        "independentLogFile"
+      ]
+    },
+    {
+      "id": "compatibility",
+      "title": "Compatibility",
+      "order": 90,
+      "properties": [
+        "dbPath",
+        "largeFileTokenThreshold",
+        "incrementalMaxDepth",
+        "cacheAwareCompaction",
+        "dynamicLeafChunkTokens",
+        "transcriptGcEnabled",
+        "autoRotateSessionFiles"
+      ]
+    }
+  ],
   "uiHints": {
     "enabled": {
       "label": "Enabled",

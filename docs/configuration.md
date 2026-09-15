@@ -26,6 +26,31 @@ forks continue to require `thread-bootstrap-projection`.
 If you cannot use a beta or upgrade OpenClaw, use a `lossless-claw` release
 compatible with your installed OpenClaw version.
 
+## Settings in OpenClaw
+
+Hosts that support the optional `configGroups` manifest field organize the settings
+into these sections:
+
+| Section | Settings |
+| --- | --- |
+| Session capture | Capture behavior, session retention, heartbeat handling, and replay protection |
+| Context budget | Context thresholds, fresh-tail retention, and prompt assembly limits |
+| Compaction | Summary depth, chunk sizes, fanout, and sweep limits |
+| Summaries | Models, summary sizes, instructions, and injected-context filtering |
+| Summary reliability | Timeouts, call limits, fallback providers, and circuit breakers |
+| Recall | Expansion models, token limits, and delegation timeout |
+| External files | Payload offloading, file summaries, and assembly stubs |
+| Storage and logging | Database location and independent logging |
+| Compatibility | Existing aliases and retired options |
+
+Grouping requires [OpenClaw's supporting settings UI change](https://github.com/openclaw/openclaw/pull/149246).
+OpenClaw `2026.9.4` ignores this optional metadata and continues to show the
+complete flat form.
+Groups do not introduce configuration nesting or change any setting's path,
+default, validation, or runtime behavior. The host version requirements above
+remain unchanged. Retired options remain ignored; grouping does not reactivate
+them.
+
 ## Recall tool availability
 
 Lossless declares `lcm_grep`, `lcm_describe`, `lcm_expand`, and
