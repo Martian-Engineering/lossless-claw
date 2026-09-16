@@ -1356,11 +1356,13 @@ export class BatchDeduplicator {
     }
 
     if (reference.reference.startsWith("[LCM Tool Output:")) {
+      const localPath = reference.reference.match(/^Local path:\s*(.+)$/m)?.[1]?.trim();
       return formatToolOutputReference({
         fileId: largeFile.fileId,
         toolName: extractReferenceField(reference.reference, "tool"),
         byteSize: largeFile.byteSize ?? 0,
         summary: largeFile.explorationSummary ?? "",
+        localPath,
       });
     }
 
