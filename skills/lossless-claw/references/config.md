@@ -154,6 +154,22 @@ Good default:
 - `false`
 - enable it only after migration and live validation
 
+### `exposeLargeFilePaths`
+
+Controls whether newly externalized large tool-output references include the validated local file path in addition to the LCM file ID.
+
+Why it matters:
+
+- local tools can search or read bounded ranges without expanding the whole payload into model context
+- the path is emitted only when the stored file resolves beneath `largeFilesDir`
+- remote or sandboxed agents may not be able to access the host path
+- local paths may reveal deployment details, so the feature is opt-in
+
+Good default:
+
+- `false`
+- enable it only when OpenClaw and the tool runtime share the same trusted filesystem
+
 ### `leafChunkTokens`
 
 Caps how much raw material gets summarized into one leaf summary.
@@ -464,6 +480,20 @@ Why it matters:
 Env override:
 
 - `LCM_STUB_LARGE_TOOL_PAYLOADS`
+
+### `exposeLargeFilePaths`
+
+Boolean toggle for including a validated local filesystem path in newly externalized large tool-output references.
+
+Why it matters:
+
+- the path is accepted only when it resolves to a regular file beneath `largeFilesDir`
+- the reference recommends bounded search or ranged reads instead of loading the whole file
+- `file_xxx`, `lcm_grep`, and `lcm_describe` remain available when the path cannot be used
+
+Env override:
+
+- `LCM_EXPOSE_LARGE_FILE_PATHS`
 
 ### `leafChunkTokens`
 

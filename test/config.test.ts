@@ -35,6 +35,7 @@ describe("resolveLcmConfig", () => {
     expect(config.freshTailCount).toBe(64);
     expect(config.freshTailMaxTokens).toBeUndefined();
     expect(config.promptAwareEviction).toBe(false);
+    expect(config.exposeLargeFilePaths).toBe(false);
     expect(config.newSessionRetainDepth).toBe(2);
     expect(config.sweepMaxDepth).toBe(1);
     expect(config.incrementalMaxDepth).toBe(1);
@@ -447,6 +448,17 @@ describe("resolveLcmConfig", () => {
       { largeFilesDir: "/plugin/path/lcm-files" },
     );
     expect(config.largeFilesDir).toBe("/env/path/lcm-files");
+  });
+
+  it("supports opt-in local path exposure with env precedence", () => {
+    expect(resolveLcmConfig({}, { exposeLargeFilePaths: true }).exposeLargeFilePaths).toBe(true);
+    expect(
+      resolveLcmConfig(
+        { LCM_EXPOSE_LARGE_FILE_PATHS: "false" } as NodeJS.ProcessEnv,
+        { exposeLargeFilePaths: true },
+      ).exposeLargeFilePaths,
+    ).toBe(false);
+    expect(manifest.configSchema.properties.exposeLargeFilePaths).toEqual({ type: "boolean" });
   });
 
   it("accepts manifest largeFileThresholdTokens from plugin config", () => {

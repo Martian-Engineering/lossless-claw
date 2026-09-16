@@ -114,6 +114,12 @@ export type LcmConfig = {
    * Default false; flag-flip is reversible at runtime.
    */
   stubLargeToolPayloads: boolean;
+  /**
+   * Include a validated local path in newly externalized large tool-output
+   * references. Default false because remote/sandboxed agents may not share
+   * the host filesystem and local paths can reveal deployment details.
+   */
+  exposeLargeFilePaths: boolean;
   newSessionRetainDepth: number;
   leafMinFanout: number;
   condensedMinFanout: number;
@@ -710,6 +716,10 @@ export function resolveLcmConfigWithDiagnostics(
         env.LCM_STUB_LARGE_TOOL_PAYLOADS !== undefined
           ? env.LCM_STUB_LARGE_TOOL_PAYLOADS === "true"
           : toBool(pc.stubLargeToolPayloads) ?? false,
+      exposeLargeFilePaths:
+        env.LCM_EXPOSE_LARGE_FILE_PATHS !== undefined
+          ? env.LCM_EXPOSE_LARGE_FILE_PATHS === "true"
+          : toBool(pc.exposeLargeFilePaths) ?? false,
       newSessionRetainDepth:
         parseFiniteInt(env.LCM_NEW_SESSION_RETAIN_DEPTH)
           ?? toNumber(pc.newSessionRetainDepth) ?? 2,
