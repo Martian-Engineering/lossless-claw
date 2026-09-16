@@ -307,6 +307,8 @@ Lossless-claw writes routine operational JSONL logs by default at `/tmp/openclaw
 
 ### Compaction thresholds and summary sizing
 
+The Settings editor displays fixed defaults from the plugin manifest. Automatic values remain unset: Bootstrap Max Tokens uses the greater of 6000 or 30% of Leaf Chunk Tokens (rounded down), so its input shows **Auto** until you choose an override.
+
 | Key | Type | Default | Env override | Purpose |
 | --- | --- | --- | --- | --- |
 | `contextThreshold` | `number` | `0.75` | `LCM_CONTEXT_THRESHOLD` | Fraction of the active model context window that triggers compaction. |

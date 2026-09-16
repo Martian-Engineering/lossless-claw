@@ -69,6 +69,29 @@ describe("resolveLcmConfig", () => {
     });
   });
 
+  it("publishes fixed defaults that match runtime behavior without fixing automatic values", () => {
+    const defaults = resolveLcmConfig({}, {});
+    const schema = manifest.configSchema as { properties: Record<string, { default?: unknown; properties?: Record<string, unknown> }> };
+    expect(schema.properties.enabled.default).toBe(true);
+    expect(schema.properties.freshTailCount.default).toBe(64);
+    expect(schema.properties.bootstrapMaxTokens.default).toBeUndefined();
+    // A canonical default would hide the accepted incrementalMaxDepth alias.
+    expect(schema.properties.sweepMaxDepth.default).toBeUndefined();
+    expect(resolveLcmConfig({}, { incrementalMaxDepth: -1 }).sweepMaxDepth).toBe(-1);
+    const check = (properties: Record<string, unknown>, runtime: Record<string, unknown>) => {
+      for (const [key, raw] of Object.entries(properties)) {
+        const node = raw as { default?: unknown; properties?: Record<string, unknown> };
+        if (Object.hasOwn(node, "default")) expect(node.default, key).toEqual(runtime[key]);
+        if (node.properties && runtime[key] && typeof runtime[key] === "object") {
+          check(node.properties, runtime[key] as Record<string, unknown>);
+        }
+      }
+    };
+    check(schema.properties, defaults as unknown as Record<string, unknown>);
+    expect(resolveLcmConfig({}, { leafChunkTokens: 40000 }).bootstrapMaxTokens).toBe(12000);
+    expect(manifest.uiHints.bootstrapMaxTokens.placeholder).toBe("Auto (at least 6000)");
+  });
+
   it("reads values from plugin config", () => {
     const config = resolveLcmConfig({}, {
       contextThreshold: 0.5,
@@ -646,12 +669,12 @@ describe("resolveLcmConfig", () => {
   });
 
   it("ships a manifest that accepts sweep depth and deprecated incremental depth", () => {
-    expect(manifest.configSchema.properties.sweepMaxDepth).toEqual({
+    expect(manifest.configSchema.properties.sweepMaxDepth).toMatchObject({
       type: "integer",
       minimum: -1,
     });
     expect(manifest.configSchema.properties.incrementalMaxDepth.minimum).toBe(-1);
-    expect(manifest.configSchema.properties.summaryPrefixTargetTokens).toEqual({
+    expect(manifest.configSchema.properties.summaryPrefixTargetTokens).toMatchObject({
       type: "integer",
       minimum: 1,
     });
@@ -659,23 +682,23 @@ describe("resolveLcmConfig", () => {
   });
 
   it("ships a manifest with expansionModel, expansionProvider, and delegationTimeoutMs in schema", () => {
-    expect(manifest.configSchema.properties.expansionModel).toEqual({ type: "string" });
-    expect(manifest.configSchema.properties.expansionProvider).toEqual({ type: "string" });
-    expect(manifest.configSchema.properties.delegationTimeoutMs).toEqual({
+    expect(manifest.configSchema.properties.expansionModel).toMatchObject({ type: "string" });
+    expect(manifest.configSchema.properties.expansionProvider).toMatchObject({ type: "string" });
+    expect(manifest.configSchema.properties.delegationTimeoutMs).toMatchObject({
       type: "integer",
       minimum: 1,
     });
   });
 
   it("ships a manifest with leafChunkTokens in schema", () => {
-    expect(manifest.configSchema.properties.leafChunkTokens).toEqual({
+    expect(manifest.configSchema.properties.leafChunkTokens).toMatchObject({
       type: "integer",
       minimum: 1,
     });
   });
 
   it("ships a manifest with promptAwareEviction in schema", () => {
-    expect(manifest.configSchema.properties.promptAwareEviction).toEqual({
+    expect(manifest.configSchema.properties.promptAwareEviction).toMatchObject({
       type: "boolean",
     });
   });
@@ -765,7 +788,7 @@ describe("resolveLcmConfig", () => {
   });
 
   it("ships a manifest with dynamicLeafChunkTokens in schema", () => {
-    expect(manifest.configSchema.properties.dynamicLeafChunkTokens).toEqual({
+    expect(manifest.configSchema.properties.dynamicLeafChunkTokens).toMatchObject({
       type: "object",
       additionalProperties: false,
       properties: {
@@ -781,19 +804,19 @@ describe("resolveLcmConfig", () => {
   });
 
   it("ships a manifest with proactiveThresholdCompactionMode in schema", () => {
-    expect(manifest.configSchema.properties.proactiveThresholdCompactionMode).toEqual({
+    expect(manifest.configSchema.properties.proactiveThresholdCompactionMode).toMatchObject({
       type: "string",
       enum: ["deferred", "inline"],
     });
   });
 
   it("accepts retired transcript maintenance settings for upgrade compatibility", () => {
-    expect(manifest.configSchema.properties.transcriptGcEnabled).toEqual({
+    expect(manifest.configSchema.properties.transcriptGcEnabled).toMatchObject({
       description:
         "Retired compatibility setting. Lossless Claw 1.x accepts and ignores this value.",
       type: "boolean",
     });
-    expect(manifest.configSchema.properties.autoRotateSessionFiles).toEqual({
+    expect(manifest.configSchema.properties.autoRotateSessionFiles).toMatchObject({
       description:
         "Retired compatibility setting. Lossless Claw 1.x accepts and ignores these values.",
       type: "object",
@@ -809,7 +832,7 @@ describe("resolveLcmConfig", () => {
   });
 
   it("ships a manifest with independentLogFile in schema", () => {
-    expect(manifest.configSchema.properties.independentLogFile).toEqual({
+    expect(manifest.configSchema.properties.independentLogFile).toMatchObject({
       type: "object",
       additionalProperties: false,
       properties: {
@@ -821,7 +844,7 @@ describe("resolveLcmConfig", () => {
   });
 
   it("ships a manifest with cacheAwareCompaction in schema", () => {
-    expect(manifest.configSchema.properties.cacheAwareCompaction).toEqual({
+    expect(manifest.configSchema.properties.cacheAwareCompaction).toMatchObject({
       type: "object",
       additionalProperties: false,
       properties: {
@@ -859,47 +882,47 @@ describe("resolveLcmConfig", () => {
   });
 
   it("ships a manifest with plugin-config schema entries for runtime token controls", () => {
-    expect(manifest.configSchema.properties.leafTargetTokens).toEqual({
+    expect(manifest.configSchema.properties.leafTargetTokens).toMatchObject({
       type: "integer",
       minimum: 1,
     });
-    expect(manifest.configSchema.properties.condensedTargetTokens).toEqual({
+    expect(manifest.configSchema.properties.condensedTargetTokens).toMatchObject({
       type: "integer",
       minimum: 1,
     });
-    expect(manifest.configSchema.properties.maxExpandTokens).toEqual({
+    expect(manifest.configSchema.properties.maxExpandTokens).toMatchObject({
       type: "integer",
       minimum: 1,
     });
   });
 
   it("ships a manifest with schema entries for runtime-only toggles and model overrides", () => {
-    expect(manifest.configSchema.properties.largeFileSummaryModel).toEqual({ type: "string" });
-    expect(manifest.configSchema.properties.largeFileSummaryProvider).toEqual({ type: "string" });
-    expect(manifest.configSchema.properties.summaryCallWindowMs).toEqual({
+    expect(manifest.configSchema.properties.largeFileSummaryModel).toMatchObject({ type: "string" });
+    expect(manifest.configSchema.properties.largeFileSummaryProvider).toMatchObject({ type: "string" });
+    expect(manifest.configSchema.properties.summaryCallWindowMs).toMatchObject({
       type: "integer",
       minimum: 1,
     });
-    expect(manifest.configSchema.properties.summaryMaxCallsPerWindow).toEqual({
+    expect(manifest.configSchema.properties.summaryMaxCallsPerWindow).toMatchObject({
       type: "integer",
       minimum: 1,
     });
-    expect(manifest.configSchema.properties.summarySpendBackoffMs).toEqual({
+    expect(manifest.configSchema.properties.summarySpendBackoffMs).toMatchObject({
       type: "integer",
       minimum: 1,
     });
-    expect(manifest.configSchema.properties.timezone).toEqual({ type: "string" });
-    expect(manifest.configSchema.properties.pruneHeartbeatOk).toEqual({ type: "boolean" });
+    expect(manifest.configSchema.properties.timezone).toMatchObject({ type: "string" });
+    expect(manifest.configSchema.properties.pruneHeartbeatOk).toMatchObject({ type: "boolean" });
   });
 
   it("ships a manifest with bootstrapMaxTokens in schema", () => {
-    expect(manifest.configSchema.properties.bootstrapMaxTokens).toEqual({
+    expect(manifest.configSchema.properties.bootstrapMaxTokens).toMatchObject({
       type: "integer",
       minimum: 1,
     });
   });
   it("ships a manifest with fallbackMaxTokens in schema", () => {
-    expect(manifest.configSchema.properties.fallbackMaxTokens).toEqual({
+    expect(manifest.configSchema.properties.fallbackMaxTokens).toMatchObject({
       type: "integer",
       minimum: 64,
     });
