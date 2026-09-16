@@ -238,7 +238,8 @@
     },
     "bootstrapMaxTokens": {
       "label": "Bootstrap Max Tokens",
-      "help": "Maximum raw parent-history tokens imported into a brand-new conversation bootstrap; oldest turns are dropped first"
+      "help": "Maximum raw parent-history tokens imported into a brand-new conversation bootstrap; oldest turns are dropped first. Automatic: the greater of 6000 or 30% of Leaf Chunk Tokens, rounded down.",
+      "placeholder": "Auto (at least 6000)"
     },
     "newSessionRetainDepth": {
       "label": "New Session Retain Depth",
@@ -410,7 +411,8 @@
     },
     "dynamicLeafChunkTokens.max": {
       "label": "Dynamic Leaf Chunk Max (Deprecated)",
-      "help": "Deprecated compatibility setting. Automatic compaction now uses leafChunkTokens directly."
+      "help": "Deprecated compatibility setting. Automatic compaction now uses leafChunkTokens directly.",
+      "placeholder": "Auto (2 × Leaf Chunk Tokens)"
     },
     "timezone": {
       "label": "Timezone",
@@ -482,16 +484,22 @@
     "additionalProperties": false,
     "properties": {
       "enabled": {
-        "type": "boolean"
+        "type": "boolean",
+        "default": true
       },
       "hostFallbackMode": {
         "type": "string",
-        "enum": ["error", "capture-only"]
+        "enum": [
+          "error",
+          "capture-only"
+        ],
+        "default": "error"
       },
       "contextThreshold": {
         "type": "number",
         "minimum": 0,
-        "maximum": 1
+        "maximum": 1,
+        "default": 0.75
       },
       "contextThresholdOverrides": {
         "type": "array",
@@ -543,7 +551,8 @@
               "minimum": 1
             }
           }
-        }
+        },
+        "default": []
       },
       "sweepMaxDepth": {
         "type": "integer",
@@ -555,21 +564,25 @@
       },
       "freshTailCount": {
         "type": "integer",
-        "minimum": 1
+        "minimum": 1,
+        "default": 64
       },
       "freshTailMaxTokens": {
         "type": "integer",
         "minimum": 0
       },
       "promptAwareEviction": {
-        "type": "boolean"
+        "type": "boolean",
+        "default": false
       },
       "stubLargeToolPayloads": {
-        "type": "boolean"
+        "type": "boolean",
+        "default": false
       },
       "leafChunkTokens": {
         "type": "integer",
-        "minimum": 1
+        "minimum": 1,
+        "default": 20000
       },
       "summaryPrefixTargetTokens": {
         "type": "integer",
@@ -577,15 +590,18 @@
       },
       "maxSweepIterations": {
         "type": "integer",
-        "minimum": 1
+        "minimum": 1,
+        "default": 12
       },
       "sweepDeadlineMs": {
         "type": "integer",
-        "minimum": 1
+        "minimum": 1,
+        "default": 120000
       },
       "compactUntilUnderDeadlineMs": {
         "type": "integer",
-        "minimum": 1
+        "minimum": 1,
+        "default": 300000
       },
       "bootstrapMaxTokens": {
         "type": "integer",
@@ -593,31 +609,38 @@
       },
       "newSessionRetainDepth": {
         "type": "integer",
-        "minimum": -1
+        "minimum": -1,
+        "default": 2
       },
       "leafTargetTokens": {
         "type": "integer",
-        "minimum": 1
+        "minimum": 1,
+        "default": 2400
       },
       "condensedTargetTokens": {
         "type": "integer",
-        "minimum": 1
+        "minimum": 1,
+        "default": 2000
       },
       "maxExpandTokens": {
         "type": "integer",
-        "minimum": 1
+        "minimum": 1,
+        "default": 4000
       },
       "leafMinFanout": {
         "type": "integer",
-        "minimum": 2
+        "minimum": 2,
+        "default": 8
       },
       "condensedMinFanout": {
         "type": "integer",
-        "minimum": 2
+        "minimum": 2,
+        "default": 4
       },
       "condensedMinFanoutHard": {
         "type": "integer",
-        "minimum": 2
+        "minimum": 2,
+        "default": 2
       },
       "dbPath": {
         "type": "string"
@@ -626,16 +649,19 @@
         "type": "array",
         "items": {
           "type": "string"
-        }
+        },
+        "default": []
       },
       "statelessSessionPatterns": {
         "type": "array",
         "items": {
           "type": "string"
-        }
+        },
+        "default": []
       },
       "skipStatelessSessions": {
-        "type": "boolean"
+        "type": "boolean",
+        "default": true
       },
       "largeFileThresholdTokens": {
         "type": "integer",
@@ -643,7 +669,8 @@
       },
       "largeFileTokenThreshold": {
         "type": "integer",
-        "minimum": 1000
+        "minimum": 1000,
+        "default": 25000
       },
       "summaryModel": {
         "type": "string"
@@ -665,23 +692,28 @@
       },
       "delegationTimeoutMs": {
         "type": "integer",
-        "minimum": 1
+        "minimum": 1,
+        "default": 120000
       },
       "summaryTimeoutMs": {
         "type": "integer",
-        "minimum": 1
+        "minimum": 1,
+        "default": 60000
       },
       "summaryCallWindowMs": {
         "type": "integer",
-        "minimum": 1
+        "minimum": 1,
+        "default": 600000
       },
       "summaryMaxCallsPerWindow": {
         "type": "integer",
-        "minimum": 1
+        "minimum": 1,
+        "default": 24
       },
       "summarySpendBackoffMs": {
         "type": "integer",
-        "minimum": 1
+        "minimum": 1,
+        "default": 1800000
       },
       "maxAssemblyTokenBudget": {
         "type": "integer",
@@ -689,63 +721,76 @@
       },
       "summaryMaxOverageFactor": {
         "type": "number",
-        "minimum": 1
+        "minimum": 1,
+        "default": 3
       },
       "fallbackMaxTokens": {
         "type": "integer",
-        "minimum": 64
+        "minimum": 64,
+        "default": 512
       },
       "customInstructions": {
         "type": "string"
       },
       "circuitBreakerThreshold": {
         "type": "integer",
-        "minimum": 1
+        "minimum": 1,
+        "default": 5
       },
       "circuitBreakerCooldownMs": {
         "type": "integer",
-        "minimum": 1
+        "minimum": 1,
+        "default": 1800000
       },
       "replayFloodThresholdExternal": {
         "type": "integer",
-        "minimum": 1
+        "minimum": 1,
+        "default": 3
       },
       "replayFloodThresholdInternal": {
         "type": "integer",
-        "minimum": 1
+        "minimum": 1,
+        "default": 32
       },
       "cacheAwareCompaction": {
         "type": "object",
         "additionalProperties": false,
         "properties": {
           "enabled": {
-            "type": "boolean"
+            "type": "boolean",
+            "default": true
           },
           "cacheTTLSeconds": {
             "type": "integer",
-            "minimum": 1
+            "minimum": 1,
+            "default": 300
           },
           "maxColdCacheCatchupPasses": {
             "type": "integer",
-            "minimum": 1
+            "minimum": 1,
+            "default": 2
           },
           "hotCachePressureFactor": {
             "type": "number",
-            "minimum": 1
+            "minimum": 1,
+            "default": 4
           },
           "hotCacheBudgetHeadroomRatio": {
             "type": "number",
             "minimum": 0,
-            "maximum": 0.95
+            "maximum": 0.95,
+            "default": 0.2
           },
           "coldCacheObservationThreshold": {
             "type": "integer",
-            "minimum": 1
+            "minimum": 1,
+            "default": 3
           },
           "criticalBudgetPressureRatio": {
             "type": "number",
             "minimum": 0,
-            "maximum": 1
+            "maximum": 1,
+            "default": 0.9
           }
         }
       },
@@ -754,7 +799,8 @@
         "additionalProperties": false,
         "properties": {
           "enabled": {
-            "type": "boolean"
+            "type": "boolean",
+            "default": true
           },
           "max": {
             "type": "integer",
@@ -766,10 +812,12 @@
         "type": "string"
       },
       "pruneHeartbeatOk": {
-        "type": "boolean"
+        "type": "boolean",
+        "default": false
       },
       "preserveHeartbeatPoll": {
-        "type": "boolean"
+        "type": "boolean",
+        "default": false
       },
       "transcriptGcEnabled": {
         "description": "Retired compatibility setting. Lossless Claw 1.x accepts and ignores this value.",
@@ -792,37 +840,49 @@
           },
           "startup": {
             "type": "string",
-            "enum": ["rotate", "warn", "off"]
+            "enum": [
+              "rotate",
+              "warn",
+              "off"
+            ]
           },
           "runtime": {
             "type": "string",
-            "enum": ["rotate", "warn", "off"]
+            "enum": [
+              "rotate",
+              "warn",
+              "off"
+            ]
           }
         }
       },
       "enableSummaryThinking": {
-        "type": "boolean"
+        "type": "boolean",
+        "default": true
       },
       "proactiveThresholdCompactionMode": {
         "type": "string",
         "enum": [
           "deferred",
           "inline"
-        ]
+        ],
+        "default": "deferred"
       },
       "independentLogFile": {
         "type": "object",
         "additionalProperties": false,
         "properties": {
           "enabled": {
-            "type": "boolean"
+            "type": "boolean",
+            "default": true
           },
           "file": {
             "type": "string"
           },
           "maxFileBytes": {
             "type": "integer",
-            "minimum": 1
+            "minimum": 1,
+            "default": 104857600
           }
         }
       },
@@ -839,19 +899,33 @@
         "items": {
           "type": "object",
           "properties": {
-            "provider": { "type": "string" },
-            "model": { "type": "string" }
+            "provider": {
+              "type": "string"
+            },
+            "model": {
+              "type": "string"
+            }
           },
-          "required": ["provider", "model"],
+          "required": [
+            "provider",
+            "model"
+          ],
           "additionalProperties": false
-        }
+        },
+        "default": []
       },
       "stripInjectedContextTags": {
         "description": "XML tag names whose blocks are stripped from messages before summarization. Memory/context plugins prepend tagged blocks via prependContext that should not leak into compacted summaries.",
         "type": "array",
         "items": {
           "type": "string"
-        }
+        },
+        "default": [
+          "active_memory_plugin",
+          "relevant-memories",
+          "relevant_memories",
+          "hindsight_memories"
+        ]
       }
     }
   }
