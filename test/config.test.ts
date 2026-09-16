@@ -77,6 +77,14 @@ describe("resolveLcmConfig", () => {
     expect(schema.properties.bootstrapMaxTokens.default).toBeUndefined();
     // A canonical default would hide the accepted incrementalMaxDepth alias.
     expect(schema.properties.sweepMaxDepth.default).toBeUndefined();
+    // The host applies manifest defaults before the resolver classifies pattern sources.
+    // Keep absent arrays absent so defaults are not reported as operator configuration.
+    expect(schema.properties.ignoreSessionPatterns.default).toBeUndefined();
+    expect(schema.properties.statelessSessionPatterns.default).toBeUndefined();
+    expect(resolveLcmConfigWithDiagnostics({}, {}).diagnostics).toMatchObject({
+      ignoreSessionPatternsSource: "default",
+      statelessSessionPatternsSource: "default",
+    });
     expect(resolveLcmConfig({}, { incrementalMaxDepth: -1 }).sweepMaxDepth).toBe(-1);
     const check = (properties: Record<string, unknown>, runtime: Record<string, unknown>) => {
       for (const [key, raw] of Object.entries(properties)) {

@@ -82,7 +82,7 @@ describe("preserveHeartbeatPoll config resolution", () => {
 
   it("declares the flag in the plugin manifest schema", () => {
     const schema = manifest.configSchema as { properties?: Record<string, unknown> };
-    expect(schema.properties?.preserveHeartbeatPoll).toEqual({ type: "boolean" });
+    expect(schema.properties?.preserveHeartbeatPoll).toEqual({ type: "boolean", default: false });
     expect(manifest.uiHints.preserveHeartbeatPoll).toBeDefined();
   });
 

@@ -649,15 +649,13 @@
         "type": "array",
         "items": {
           "type": "string"
-        },
-        "default": []
+        }
       },
       "statelessSessionPatterns": {
         "type": "array",
         "items": {
           "type": "string"
-        },
-        "default": []
+        }
       },
       "skipStatelessSessions": {
         "type": "boolean",
