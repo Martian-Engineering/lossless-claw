@@ -583,6 +583,9 @@ export class BatchDeduplicator {
   }): Promise<boolean> {
     const tailWindow = Math.max(1, Math.floor(params.tailWindow));
     const tail = await this.conversationStore.getLastMessages(params.conversationId, tailWindow);
+    if (tail.every((message) => message.transcriptEntryId)) {
+      return false;
+    }
     const tailHashes = await this.conversationStore.getRecentMessageIdentityHashes(
       params.conversationId,
       tailWindow,

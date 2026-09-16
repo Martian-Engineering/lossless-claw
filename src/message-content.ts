@@ -826,13 +826,19 @@ export const OPENCLAW_RUNTIME_CONTEXT_SENTINEL =
 /**
  * Normalize AgentMessage variants into the storage shape used by LCM.
  */
-export function toStoredMessage(message: AgentMessage): StoredMessage {
+export function toStoredMessageIdentity(message: AgentMessage): Pick<StoredMessage, "role" | "content"> {
   const content =
     "content" in message
       ? extractMessageContent(message.content)
       : "output" in message
         ? `$ ${String(message.command ?? "")}\n${String(message.output)}`
         : "";
+  return { role: toDbRole(message.role), content };
+}
+
+/** Include token accounting only when persisting or budgeting a message. */
+export function toStoredMessage(message: AgentMessage): StoredMessage {
+  const { role, content } = toStoredMessageIdentity(message);
   const runtimeRole = toRuntimeRoleForTokenEstimate(message.role);
   const normalizedContent =
     "content" in message
@@ -855,7 +861,7 @@ export function toStoredMessage(message: AgentMessage): StoredMessage {
   );
 
   return {
-    role: toDbRole(message.role),
+    role,
     content,
     tokenCount: tokenCount + (topLevelReasoning ? estimateTokens(topLevelReasoning.content) : 0),
   };

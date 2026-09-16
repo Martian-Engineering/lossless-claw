@@ -105,7 +105,7 @@ import { buildDegradedLiveAssembleResult, clampMessagesToSerializedBudget, resol
 import { resolveBootstrapMaxTokens, trimBootstrapMessagesToBudget } from "./bootstrap-budget.js";
 import { batchLooksLikeHeartbeatAckTurn, pruneHeartbeatOkTurns } from "./heartbeat-filter.js";
 import { appendUncoveredVolatileLiveInputsWithinBudget, isVolatileLiveInputMessage, messageContentCoveredBySummary, resolveProtectedFreshTailAssembledIndexes, stripTrailingAssistantPrefill } from "./live-coverage.js";
-import { buildMessageParts, extractMessageContent, filterPersistableMessages, hasPersistableMessageRole, isOpenClawRuntimeContextLeak, toStoredMessage } from "./message-content.js";
+import { buildMessageParts, extractMessageContent, filterPersistableMessages, hasPersistableMessageRole, isOpenClawRuntimeContextLeak, toStoredMessage, toStoredMessageIdentity } from "./message-content.js";
 import { batchHasRawReplayIds, filterPersistedRawIdReplayBatch } from "./raw-id-replay-filter.js";
 import { PROMPT_RECALL_MAX_MESSAGES, PROMPT_RECALL_SEARCH_CANDIDATE_LIMIT, buildPromptRecallProjectionFingerprint, extractPromptRecallIdentifiers, extractPromptRecallSnippet, findPromptRecallIdentifierIndex, isPromptRecallEligibleRole, normalizePromptRecallCoverageText, normalizePromptRecallText, renderPromptRecallMessage } from "./prompt-recall.js";
 import { extractRuntimePromptTokenCount } from "./token-accounting.js";
@@ -409,7 +409,7 @@ function auditEntryFromVisibleTranscriptEntry(
   if (!hasPersistableMessageRole(entry.message)) {
     return null;
   }
-  const stored = toStoredMessage(entry.message);
+  const stored = toStoredMessageIdentity(entry.message);
   return {
     structuredIdentity: structuredPartsIdentity(
       buildMessageParts({ sessionId: "", message: entry.message, fallbackContent: stored.content }),
@@ -2767,7 +2767,7 @@ export class LcmContextEngine implements ContextEngine {
         : new Set<string>();
     const projectedUserBodyCounts = new Map<string, number>();
     for (const message of params.historicalMessages) {
-      const stored = toStoredMessage(message);
+      const stored = toStoredMessageIdentity(message);
       if (stored.role === "user") {
         const body = stripLeadingOpenClawInboundTimestamp(stored.content);
         projectedUserBodyCounts.set(
@@ -2781,7 +2781,7 @@ export class LcmContextEngine implements ContextEngine {
       const message = params.historicalMessages[index]!;
       const entryId = getTranscriptEntryId(message);
       if (entryId && existingEntryIds.has(entryId)) {
-        const stored = toStoredMessage(message);
+        const stored = toStoredMessageIdentity(message);
         const candidate = await this.conversationStore.getTranscriptEntryAnchorCandidate(
           params.conversationId,
           entryId,
@@ -2847,7 +2847,7 @@ export class LcmContextEngine implements ContextEngine {
         }
       }
 
-      const stored = toStoredMessage(message);
+      const stored = toStoredMessageIdentity(message);
       if (
         entryId &&
         !establishedEpochBoundary &&
