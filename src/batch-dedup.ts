@@ -34,7 +34,11 @@ import {
   extractToolPairingIdFromRecord,
   extractToolResultIdForPairing,
 } from "./tool-pairing.js";
-import { getTranscriptEntryId } from "./transcript.js";
+import {
+  filterByCreatedAt,
+  getTranscriptEntryId,
+  resolveTranscriptMessageCreatedAt,
+} from "./transcript.js";
 import { structuredPartsIdentity } from "./structured-anchor-identity.js";
 import type { LcmDependencies } from "./types.js";
 
@@ -598,7 +602,7 @@ export class BatchDeduplicator {
     const incomingHash = storedMessageIdentityHash(stored);
     const incomingRawPayloadContent =
       serializeRawPayloadContent(params.message, stored.content)?.content ?? null;
-    const candidates: number[] = [];
+    const candidates: MessageRecord[] = [];
     for (let index = tail.length - 1; index >= 0; index -= 1) {
       if (tail[index]!.transcriptEntryId) continue;
       const match = await this.matchStoredMessageToIncoming(
@@ -612,12 +616,20 @@ export class BatchDeduplicator {
       if (!match || match === "unproven-externalized") {
         continue;
       }
-      candidates.push(tail[index]!.messageId);
+      candidates.push(tail[index]!);
     }
-    if (candidates.length !== 1) return false;
+    // One exact match is strong evidence on its own (rows ingested without a
+    // message timestamp carry wall-clock created_at). Repeated bodies such as
+    // restart-recovery prompts are told apart by the row's own created time,
+    // which live ingest takes from the message.
+    const adoptable =
+      candidates.length === 1
+        ? candidates
+        : filterByCreatedAt(candidates, resolveTranscriptMessageCreatedAt(params.message));
+    if (adoptable.length !== 1) return false;
     return this.conversationStore.adoptTranscriptEntryIdForMessage(
       params.conversationId,
-      candidates[0]!,
+      adoptable[0]!.messageId,
       params.transcriptEntryId,
     );
   }
