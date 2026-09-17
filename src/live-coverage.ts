@@ -750,6 +750,8 @@ function resolveStructuralCurrentTurnLiveIndex(params: {
 export function collectUncoveredVolatileLiveInputs(params: {
   assembledMessages: AgentMessage[];
   liveMessages: AgentMessage[];
+  /** Live indexes the caller has identified as the current turn by identity. */
+  forcedVolatileLiveIndexes?: ReadonlySet<number>;
 }): {
   entries: VolatileLiveInputEntry[];
   estimatedTokens: number;
@@ -764,7 +766,8 @@ export function collectUncoveredVolatileLiveInputs(params: {
     .filter(
       (entry) =>
         isVolatileLiveInputMessage(entry.message) ||
-        entry.liveIndex === structuralCurrentTurnLiveIndex,
+        entry.liveIndex === structuralCurrentTurnLiveIndex ||
+        params.forcedVolatileLiveIndexes?.has(entry.liveIndex) === true,
     )
     .map((entry) => ({
       ...entry,
@@ -779,7 +782,9 @@ export function collectUncoveredVolatileLiveInputs(params: {
 
   for (let entryIndex = 0; entryIndex < volatileLiveInputs.length; entryIndex++) {
     const entry = volatileLiveInputs[entryIndex] as VolatileLiveInputCandidate;
-    const assembledIndex = entryToAssembledIndex.get(entryIndex);
+    const assembledIndex = params.forcedVolatileLiveIndexes?.has(entry.liveIndex)
+      ? undefined
+      : entryToAssembledIndex.get(entryIndex);
     if (assembledIndex !== undefined) {
       const coveredEntries = coveredEntriesByAssembledIndex.get(assembledIndex);
       if (coveredEntries) {
@@ -806,6 +811,7 @@ export function appendUncoveredVolatileLiveInputsWithinBudget(params: {
   protectedAssembledIndexes?: Set<number>;
   tokenBudget: number;
   log?: RepairLogger;
+  forcedVolatileLiveIndexes?: ReadonlySet<number>;
 }): {
   messages: AgentMessage[];
   estimatedTokens: number;
@@ -823,6 +829,7 @@ export function appendUncoveredVolatileLiveInputsWithinBudget(params: {
   const uncovered = collectUncoveredVolatileLiveInputs({
     assembledMessages: params.assembledMessages,
     liveMessages,
+    forcedVolatileLiveIndexes: params.forcedVolatileLiveIndexes,
   });
   if (uncovered.entries.length === 0) {
     return {

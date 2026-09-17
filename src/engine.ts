@@ -94,6 +94,7 @@ import {
   FALLBACK_DIRECTIVE_SUMMARY_MARKER,
   MIN_FALLBACK_MAX_TOKENS,
 } from "./summary-fallback.js";
+import { estimateAgentMessageTokens } from "./token-accounting.js";
 import { attachTranscriptEntryMeta, getTranscriptEntryId, resolveTranscriptMessageCreatedAt } from "./transcript.js";
 import { restoreRawUserReplay } from "./user-replay.js";
 import { extractStableEventKey } from "./stable-event-key.js";
@@ -151,6 +152,21 @@ type CommitTurnParams = {
   runtimeContext?: ContextEngineRuntimeContext;
   isHeartbeat?: boolean;
 };
+
+/**
+ * Store rows that the loop hook's afterTurn persisted for the live current turn.
+ * The host keeps carrying that turn in the live message array until the turn
+ * commits, so assemble must not replay these rows next to the live copy.
+ */
+type HostCarriedLiveTurnRows = {
+  conversationId: number;
+  messageIds: number[];
+  contents: string[];
+  transcriptEntryIds: string[];
+  recordedAt: number;
+};
+
+const HOST_CARRIED_LIVE_TURN_MAX_AGE_MS = 30 * 60 * 1000;
 
 type PostTurnCompactionParams = {
   phase: "afterTurn" | "commitTurn";
@@ -499,6 +515,7 @@ function selectLegacyPrefixFrontier(params: {
 
 
 export class LcmContextEngine implements ContextEngine {
+  private readonly hostCarriedLiveTurnRows = new Map<string, HostCarriedLiveTurnRows>();
   readonly info: ContextEngineInfo;
 
   private config: LcmConfig;
@@ -3513,14 +3530,20 @@ export class LcmContextEngine implements ContextEngine {
       };
     }
 
-    return this.bootstrapFromVisibleTranscriptProjection({
-
+    const lastMessageIdBeforeBootstrap = await this.resolveLastMessageId({ sessionId, sessionKey });
+    const result = await this.bootstrapFromVisibleTranscriptProjection({
       sessionId,
       sessionKey,
       target: transcriptReadTarget,
       startedAt,
       sessionLabel,
     });
+    await this.rememberHostCarriedLiveTurnRows({
+      sessionId,
+      sessionKey,
+      lastMessageIdBeforeIngest: lastMessageIdBeforeBootstrap,
+    });
+    return result;
   }
 
   async maintain(params: {
@@ -4202,6 +4225,7 @@ export class LcmContextEngine implements ContextEngine {
     assertValidTurnAdvancement(params);
     const sessionId = params.admission.sessionId;
     const sessionKey = params.admission.sessionKey;
+    this.hostCarriedLiveTurnRows.delete(this.resolveSessionQueueKey(sessionId, sessionKey));
     if (
       this.shouldIgnoreSession({ sessionId, sessionKey }) ||
       this.isStatelessSession(sessionKey)
@@ -4374,6 +4398,7 @@ export class LcmContextEngine implements ContextEngine {
     this.ensureMigrated();
     const startedAt = Date.now();
     const sessionLabel = formatSessionLabel(sessionId, sessionKey);
+    const lastMessageIdBeforeIngest = await this.resolveLastMessageId({ sessionId, sessionKey });
 
     // Dedup guard: prevent duplicate ingestion when gateway restart replays
     // full history. Run on newMessages BEFORE prepending autoCompactionSummary
@@ -4526,6 +4551,9 @@ export class LcmContextEngine implements ContextEngine {
         return;
       }
     }
+    if (params.isHeartbeat !== true && newMessages.some((message) => message.role === "user")) {
+      await this.rememberHostCarriedLiveTurnRows({ sessionId, sessionKey, lastMessageIdBeforeIngest });
+    }
 
     // The visible projection may already contain the turn, leaving ingestBatch empty.
     if (
@@ -4577,6 +4605,157 @@ export class LcmContextEngine implements ContextEngine {
     this.deps.log.debug(
       `[lcm] afterTurn: done conversation=${conversationId} ${sessionLabel} newMessages=${newMessages.length} dedupedMessages=${dedupedNewMessages.length} ingestedMessages=${ingestBatch.length} duration=${formatDurationMs(Date.now() - startedAt)}`,
     );
+  }
+
+  private async resolveLastMessageId(params: {
+    sessionId: string;
+    sessionKey?: string;
+  }): Promise<number> {
+    const conversation = await this.conversationStore.getConversationForSession({
+      sessionId: params.sessionId,
+      sessionKey: params.sessionKey,
+    });
+    if (!conversation) {
+      return 0;
+    }
+    const last = await this.conversationStore.getLastMessage(conversation.conversationId);
+    return last?.messageId ?? 0;
+  }
+
+  private async rememberHostCarriedLiveTurnRows(params: {
+    sessionId: string;
+    sessionKey?: string;
+    lastMessageIdBeforeIngest: number;
+  }): Promise<void> {
+    const conversation = await this.conversationStore.getConversationForSession({
+      sessionId: params.sessionId,
+      sessionKey: params.sessionKey,
+    });
+    if (!conversation) {
+      return;
+    }
+    const recent = await this.conversationStore.getLastMessages(conversation.conversationId, 32);
+    const fresh = recent.filter(
+      (row) => row.role === "user" && row.messageId > params.lastMessageIdBeforeIngest,
+    );
+    if (fresh.length === 0) {
+      return;
+    }
+    this.hostCarriedLiveTurnRows.set(
+      this.resolveSessionQueueKey(params.sessionId, params.sessionKey),
+      {
+        conversationId: conversation.conversationId,
+        messageIds: fresh.map((row) => row.messageId),
+        contents: fresh.map((row) => row.content),
+        transcriptEntryIds: fresh.flatMap((row) =>
+          row.transcriptEntryId ? [row.transcriptEntryId] : [],
+        ),
+        recordedAt: Date.now(),
+      },
+    );
+  }
+
+  /**
+   * On the loop-hook path the host hands assemble the live message array that
+   * still carries the current user turn, right after afterTurn persisted that
+   * same turn. Replaying the persisted row next to the live copy sends the turn
+   * twice, so the rows afterTurn just wrote are dropped by identity and the live
+   * copy is appended in their place. On the pre-prompt path the host submits the
+   * current turn itself after assemble returns, so a projection-imported copy of
+   * that turn (the store's final user row, absent from the host history) is
+   * dropped without appending anything.
+   */
+  private suppressHostCarriedLiveTurnReplay(params: {
+    sessionId: string;
+    sessionKey?: string;
+    conversationId: number;
+    assembledMessages: AgentMessage[];
+    liveMessages: AgentMessage[];
+    hostDeliversCurrentTurnSeparately: boolean;
+  }): { messages: AgentMessage[]; removed: AgentMessage[]; forcedVolatileLiveIndexes: Set<number> } {
+    const untouched = {
+      messages: params.assembledMessages,
+      removed: [] as AgentMessage[],
+      forcedVolatileLiveIndexes: new Set<number>(),
+    };
+    const queueKey = this.resolveSessionQueueKey(params.sessionId, params.sessionKey);
+    const carried = this.hostCarriedLiveTurnRows.get(queueKey);
+    if (!carried || carried.conversationId !== params.conversationId) {
+      return untouched;
+    }
+    if (Date.now() - carried.recordedAt > HOST_CARRIED_LIVE_TURN_MAX_AGE_MS) {
+      this.hostCarriedLiveTurnRows.delete(queueKey);
+      return untouched;
+    }
+    if (params.hostDeliversCurrentTurnSeparately) {
+      // Pre-prompt path: the host submits the current turn itself after this
+      // call. When the transcript projection already carried that turn into the
+      // store, it sits as the store's final user row and is absent from the
+      // history the host handed us. Drop that single row; nothing is appended.
+      const lastIndex = params.assembledMessages.length - 1;
+      if (lastIndex < 0) {
+        return untouched;
+      }
+      const lastMessage = params.assembledMessages[lastIndex] as AgentMessage;
+      const last = toStoredMessage(lastMessage);
+      if (last.role !== "user") {
+        return untouched;
+      }
+      const lastEntryId = getTranscriptEntryId(lastMessage);
+      const matchesCarried =
+        (lastEntryId !== null && carried.transcriptEntryIds.includes(lastEntryId)) ||
+        carried.contents.includes(last.content);
+      if (!matchesCarried) {
+        return untouched;
+      }
+      const presentInHostHistory = params.liveMessages.some(
+        (message) => toStoredMessage(message).content === last.content,
+      );
+      if (presentInHostHistory) {
+        return untouched;
+      }
+      return {
+        messages: params.assembledMessages.slice(0, lastIndex),
+        removed: [lastMessage],
+        forcedVolatileLiveIndexes: new Set<number>(),
+      };
+    }
+    let lastLiveUserIndex = -1;
+    for (let index = params.liveMessages.length - 1; index >= 0; index--) {
+      if (toStoredMessage(params.liveMessages[index] as AgentMessage).role === "user") {
+        lastLiveUserIndex = index;
+        break;
+      }
+    }
+    if (lastLiveUserIndex < 0) {
+      return untouched;
+    }
+    const carriedContents = new Set(carried.contents);
+    const carriedEntryIds = new Set(carried.transcriptEntryIds);
+    const removeIndexes = new Set<number>();
+    for (
+      let index = params.assembledMessages.length - 1;
+      index >= 0 && removeIndexes.size < carried.messageIds.length;
+      index--
+    ) {
+      const message = params.assembledMessages[index] as AgentMessage;
+      const stored = toStoredMessage(message);
+      if (stored.role !== "user") {
+        continue;
+      }
+      const entryId = getTranscriptEntryId(message);
+      if ((entryId && carriedEntryIds.has(entryId)) || carriedContents.has(stored.content)) {
+        removeIndexes.add(index);
+      }
+    }
+    if (removeIndexes.size === 0) {
+      return untouched;
+    }
+    return {
+      messages: params.assembledMessages.filter((_, index) => !removeIndexes.has(index)),
+      removed: params.assembledMessages.filter((_, index) => removeIndexes.has(index)),
+      forcedVolatileLiveIndexes: new Set([lastLiveUserIndex]),
+    };
   }
 
   private async buildPromptRecallCue(params: {
@@ -4973,8 +5152,24 @@ export class LcmContextEngine implements ContextEngine {
       });
 
 
-      const preRecallMessages = assembled.messages;
-      const preRecallEstimatedTokens = assembled.estimatedTokens;
+      const hostCarriedLiveTurn = this.suppressHostCarriedLiveTurnReplay({
+        sessionId: params.sessionId,
+        sessionKey: params.sessionKey,
+        conversationId: conversation.conversationId,
+        assembledMessages: assembled.messages,
+        liveMessages,
+        hostDeliversCurrentTurnSeparately,
+      });
+      if (hostCarriedLiveTurn.removed.length > 0) {
+        this.deps.log.debug(
+          `[lcm] assemble: suppressed replay of ${hostCarriedLiveTurn.removed.length} host-carried live turn row(s) conversation=${conversation.conversationId} ${sessionLabel}`,
+        );
+      }
+      const preRecallMessages = hostCarriedLiveTurn.messages;
+      const preRecallEstimatedTokens = Math.max(
+        0,
+        assembled.estimatedTokens - estimateAgentMessageTokens(hostCarriedLiveTurn.removed),
+      );
 
       // If assembly produced no messages for a non-empty live session,
       // fail safe to the live context.
@@ -5045,6 +5240,7 @@ export class LcmContextEngine implements ContextEngine {
         protectedAssembledIndexes,
         tokenBudget,
         log: this.deps.log,
+        forcedVolatileLiveIndexes: hostCarriedLiveTurn.forcedVolatileLiveIndexes,
       });
       if (
         budgetedPromptRecallCue &&
@@ -5066,6 +5262,7 @@ export class LcmContextEngine implements ContextEngine {
           protectedAssembledIndexes,
           tokenBudget,
           log: this.deps.log,
+          forcedVolatileLiveIndexes: hostCarriedLiveTurn.forcedVolatileLiveIndexes,
         });
       }
       if (volatileLiveInputAppend.appendedMessages > 0) {
@@ -5141,6 +5338,10 @@ export class LcmContextEngine implements ContextEngine {
       const volatileLiveInputLog = volatileLiveInputAppend.appendedMessages > 0
         ? ` volatileLiveInputsAppended=${volatileLiveInputAppend.appendedMessages} volatileLiveInputEvicted=${volatileLiveInputAppend.evictedMessages} volatileLiveInputOverBudget=${volatileLiveInputAppend.overBudget}`
         : "";
+      const hostCarriedLiveTurnLog =
+        hostCarriedLiveTurn.removed.length > 0
+          ? ` hostCarriedLiveTurnRowsSuppressed=${hostCarriedLiveTurn.removed.length}`
+          : "";
       const promptRecallLog = budgetedPromptRecallCue
         ? ` promptRecallMatches=${budgetedPromptRecallCue.matchedMessages}`
         : "";
@@ -5148,7 +5349,7 @@ export class LcmContextEngine implements ContextEngine {
         ? ` contextProjectionFingerprint=${contextProjectionFingerprint}`
         : "";
       this.deps.log.info(
-        `[lcm] assemble: done conversation=${conversation.conversationId} ${sessionLabel} contextItems=${contextItems.length} summaryContextItems=${summaryContextItems} hasSummaryItems=${hasSummaryItems} inputMessages=${params.messages.length} outputMessages=${finalMessages.length} tokenBudget=${tokenBudget} estimatedTokens=${finalEstimatedTokens} internalEstimatedTokens=${volatileLiveInputAppend.estimatedTokens} serializedClamped=${serializedClamp.clamped} contextProjectionMode=thread_bootstrap contextProjectionEpoch=${contextProjectionEpoch}${contextProjectionFingerprintLog}${stubStatsLog}${volatileLiveInputLog}${promptRecallLog} duration=${formatDurationMs(Date.now() - startedAt)}`,
+        `[lcm] assemble: done conversation=${conversation.conversationId} ${sessionLabel} contextItems=${contextItems.length} summaryContextItems=${summaryContextItems} hasSummaryItems=${hasSummaryItems} inputMessages=${params.messages.length} outputMessages=${finalMessages.length} tokenBudget=${tokenBudget} estimatedTokens=${finalEstimatedTokens} internalEstimatedTokens=${volatileLiveInputAppend.estimatedTokens} serializedClamped=${serializedClamp.clamped} contextProjectionMode=thread_bootstrap contextProjectionEpoch=${contextProjectionEpoch}${contextProjectionFingerprintLog}${stubStatsLog}${volatileLiveInputLog}${promptRecallLog}${hostCarriedLiveTurnLog} duration=${formatDurationMs(Date.now() - startedAt)}`,
 
       );
       const prefixChange = describeAssembledPrefixChange(
