@@ -135,6 +135,25 @@ The assembler runs before each model turn and builds the message array:
 6. Normalize assistant content to array blocks (Anthropic API compatibility).
 7. Sanitize tool-use/result pairing (ensures every tool_result has a matching tool_use).
 
+### Current user occurrence
+
+On OpenClaw's eager loop path, `afterTurn` can persist transcript text before
+`assemble` receives the same user message with host-injected prompt context.
+Lossless preserves that provider form when the live user and visible transcript
+share a unique `idempotencyKey`, and the retained raw row has the matching trusted
+transcript entry ID and unchanged canonical content. It replaces only that
+occurrence. Repeated bodies do not establish identity, and summaries or
+externalized payloads are not replaced.
+
+This proof is reconstructed during assembly; it has no timeout or turn cache.
+When keys are missing or ambiguous, Lossless preserves stored history and uses
+its existing live-coverage behavior. Such eager calls can still duplicate the
+current turn or omit an unrecognized live injection. The separate pre-prompt
+scalar does not identify a stored occurrence, so Lossless does not suppress a
+row based on that scalar. OpenClaw 2026.9.4's admitted-turn loop assembles history
+and appends its pending user/tool exchange itself; its standalone eager loop
+still requires occurrence proof.
+
 ### XML summary format
 
 Summaries are presented to the model as user messages wrapped in XML:

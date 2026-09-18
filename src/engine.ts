@@ -95,7 +95,7 @@ import {
   MIN_FALLBACK_MAX_TOKENS,
 } from "./summary-fallback.js";
 import { attachTranscriptEntryMeta, getTranscriptEntryId, resolveTranscriptMessageCreatedAt } from "./transcript.js";
-import { restoreRawUserReplay } from "./user-replay.js";
+import { restoreCurrentUserTurn, restoreRawUserReplay } from "./user-replay.js";
 import { extractStableEventKey } from "./stable-event-key.js";
 import { structuredPartsIdentity } from "./structured-anchor-identity.js";
 import { transcriptImportCap, type TranscriptReconcileResult } from "./reconcile-plan.js";
@@ -4923,8 +4923,23 @@ export class LcmContextEngine implements ContextEngine {
       });
 
 
-      const preRecallMessages = assembled.messages;
-      const preRecallEstimatedTokens = assembled.estimatedTokens;
+      const replayTarget = resolveSessionTranscriptReadTarget(params);
+      let replayEntries: VisibleSessionTranscriptMessageEntry[] = [];
+      if (replayTarget && this.deps.readVisibleSessionTranscriptMessageEntries &&
+          liveMessages.some(message => message.role === "user" && typeof Reflect.get(message, "idempotencyKey") === "string")) {
+        try {
+          replayEntries = await this.deps.readVisibleSessionTranscriptMessageEntries(replayTarget);
+        } catch (error) {
+          this.deps.log.warn(`[lcm] assemble: user replay metadata unavailable for ${sessionLabel}: ${describeLogError(error)}`);
+        }
+      }
+      // The eager loop carries the current provider message. A separate prompt
+      // belongs to the host; it provides no occurrence identity to suppress here.
+      const currentTurnReplay = hostDeliversCurrentTurnSeparately
+        ? { messages: assembled.messages, replacedIndex: -1, tokenDelta: 0, currentTurn: undefined }
+        : restoreCurrentUserTurn(assembled.messages, liveMessages, replayEntries);
+      const preRecallMessages = currentTurnReplay.messages;
+      const preRecallEstimatedTokens = Math.max(0, assembled.estimatedTokens + currentTurnReplay.tokenDelta);
 
       // If assembly produced no messages for a non-empty live session,
       // fail safe to the live context.
@@ -4988,6 +5003,9 @@ export class LcmContextEngine implements ContextEngine {
       if (budgetedPromptRecallCue) {
         protectedAssembledIndexes.add(0);
       }
+      if (currentTurnReplay.replacedIndex >= 0) {
+        protectedAssembledIndexes.add(currentTurnReplay.replacedIndex + (budgetedPromptRecallCue ? 1 : 0));
+      }
       let volatileLiveInputAppend = appendUncoveredVolatileLiveInputsWithinBudget({
         assembledMessages,
         assembledEstimatedTokens,
@@ -5009,6 +5027,9 @@ export class LcmContextEngine implements ContextEngine {
             assembled.debug?.freshTailProtectionMessageHashes ??
             assembled.debug?.preSanitizeFreshTailMessageHashes,
         });
+        if (currentTurnReplay.replacedIndex >= 0) {
+          protectedAssembledIndexes.add(currentTurnReplay.replacedIndex);
+        }
         volatileLiveInputAppend = appendUncoveredVolatileLiveInputsWithinBudget({
           assembledMessages,
           assembledEstimatedTokens,
@@ -5031,17 +5052,7 @@ export class LcmContextEngine implements ContextEngine {
       // budget math above runs on stored-content token counts, which undercount
       // live messages that carry structured tool payloads; this is the last
       // line of defense that keeps assembled output deliverable to the model.
-      const replayTarget = resolveSessionTranscriptReadTarget(params);
-      let replayEntries: VisibleSessionTranscriptMessageEntry[] = [];
-      if (replayTarget && this.deps.readVisibleSessionTranscriptMessageEntries &&
-          liveMessages.some(message => message.role === "user" && typeof Reflect.get(message, "idempotencyKey") === "string")) {
-        try {
-          replayEntries = await this.deps.readVisibleSessionTranscriptMessageEntries(replayTarget);
-        } catch (error) {
-          this.deps.log.warn(`[lcm] assemble: user replay metadata unavailable for ${sessionLabel}: ${describeLogError(error)}`);
-        }
-      }
-      const replay = restoreRawUserReplay(volatileLiveInputAppend.messages, liveMessages, replayEntries);
+      const replay = restoreRawUserReplay(volatileLiveInputAppend.messages, liveMessages, replayEntries, currentTurnReplay.currentTurn);
       let serializedClamp = clampMessagesToSerializedBudget({
         messages: replay.messages,
         tokenBudget,
