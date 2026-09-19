@@ -5,7 +5,9 @@ import { join } from "node:path";
 import type { AgentMessage } from "../src/openclaw-bridge.js";
 import {
   MAX_LIVE_READ_RECOVERY_BYTES,
+  isInstructionFilePath,
   recoverLiveReadToolContent,
+  resolveLiveToolResultExternalization,
 } from "../src/read-tool-recovery.js";
 import { buildToolCallInputMap } from "../src/tool-pairing.js";
 import {
@@ -67,6 +69,49 @@ function readToolResultMessages(params: {
 }
 
 describe("read tool truncation recovery", () => {
+  it.each(["SKILL.md", "AGENTS.md", "AGENTS.override.md", "CLAUDE.md"])(
+    "recognizes %s as an instruction-bearing file",
+    (fileName) => {
+      expect(isInstructionFilePath(`/workspace/project/${fileName}`)).toBe(true);
+      expect(isInstructionFilePath(`C:\\workspace\\project\\${fileName}`)).toBe(true);
+    },
+  );
+
+  it.each(["SKILL.md", "AGENTS.md"])(
+    "preserves bounded %s output instead of recovering the full file",
+    (fileName) => {
+      const fileDir = mkdtempSync(join(tmpdir(), "lossless-claw-instruction-read-"));
+      tempDirs.push(fileDir);
+      const filePath = join(fileDir, fileName);
+      const fullContent = "private instruction body that must not be recovered wholesale".repeat(100);
+      writeFileSync(filePath, fullContent, "utf8");
+      const truncatedOutput = makeTruncatedOutput("[Read output capped at 32768 bytes]");
+
+      const recovered = recoverLiveReadToolContent({
+        callId: "call_instruction_read",
+        extractedText: truncatedOutput,
+        toolCallInputMap: new Map([
+          ["call_instruction_read", { name: "read", input: { path: filePath } }],
+        ]),
+      });
+
+      expect(recovered).toBe(truncatedOutput);
+      expect(recovered).not.toContain(fullContent.slice(-128));
+
+      const resolved = resolveLiveToolResultExternalization({
+        toolName: "read",
+        callId: "call_instruction_read",
+        extractedText: truncatedOutput,
+        toolCallInputMap: new Map([
+          ["call_instruction_read", { name: "read", input: { path: filePath } }],
+        ]),
+      });
+      expect(resolved.content).toContain(truncatedOutput);
+      expect(resolved.content).toContain(`Source path (JSON): ${JSON.stringify(filePath)}`);
+      expect(resolved.content).toContain("bounded offset/limit ranges");
+    },
+  );
+
   it("rejects non-file read paths during live recovery", () => {
     const dirPath = mkdtempSync(join(tmpdir(), "lossless-claw-read-dir-"));
     tempDirs.push(dirPath);
@@ -260,6 +305,47 @@ describe("read tool truncation recovery", () => {
     expect(promptText).toContain("Recovered content should be visible to the model.");
     expect(promptText).toContain("Lossless should still use the paired live read path.");
     expect(promptText).not.toContain("[Read output capped at 32768 bytes]");
+  });
+
+  it("assemble() keeps an oversized SKILL.md source-addressable instead of creating file_xxx", async () => {
+    const engine = createEngineForRecovery({ largeFileTokenThreshold: 20 });
+    const sessionId = "assemble-instruction-read-source-path";
+
+    const fileDir = mkdtempSync(join(tmpdir(), "lossless-claw-instruction-source-"));
+    tempDirs.push(fileDir);
+    const filePath = join(fileDir, "SKILL.md");
+    const fullContent = `${"workflow instruction line\n".repeat(200)}final private rule`;
+    writeFileSync(filePath, fullContent, "utf8");
+
+    const liveMessages = [
+      makeMessage({ role: "user", content: "load the workflow skill" }),
+      ...readToolResultMessages({ filePath, truncatedOutput: fullContent }),
+    ];
+
+    await engine.getConversationStore().getOrCreateConversation(sessionId);
+
+    const assembleResult = await engine.assemble({
+      sessionId,
+      messages: liveMessages,
+      tokenBudget: 4096,
+    });
+
+    const conversation = await engine.getConversationStore().getConversationBySessionId(sessionId);
+    expect(conversation).not.toBeNull();
+    const largeFiles = await engine
+      .getSummaryStore()
+      .getLargeFilesByConversation(conversation!.conversationId);
+    expect(largeFiles).toHaveLength(0);
+
+    const instructionResult = assembleResult.messages[2] as {
+      content?: Array<{ output?: string }>;
+    };
+    const instructionOutput = instructionResult.content?.[0]?.output ?? "";
+    expect(instructionOutput).toContain("[LCM Instruction File]");
+    expect(instructionOutput).toContain(`Source path (JSON): ${JSON.stringify(filePath)}`);
+    expect(instructionOutput).toContain("bounded offset/limit ranges");
+    expect(instructionOutput).not.toContain("[LCM Tool Output: file_");
+    expect(instructionOutput).not.toContain("final private rule");
   });
 
   it("ingestBatch() preserves truncated read tool result without recovery", async () => {
