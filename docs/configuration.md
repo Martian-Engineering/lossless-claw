@@ -376,7 +376,7 @@ Automatic compaction is threshold-only:
 - below threshold, no automatic compaction runs and no leaf debt is recorded
 - at or above threshold, inline mode runs a threshold full sweep immediately
 - deferred mode records one coalesced `"threshold"` maintenance row and normally drains it in the background or host-approved `maintain()`
-- pre-assembly drain is reserved as an emergency safeguard when the live prompt is already over the active token budget
+- pre-assembly publication is reserved for an over-budget live prompt and only promotes already-ready, validated summaries; it never starts model-backed preparation
 
 Lossless still records prompt-cache telemetry for status and diagnostics, but cache hotness no longer delays threshold debt. Legacy `cacheAwareCompaction.*` and `dynamicLeafChunkTokens.*` settings remain accepted so existing OpenClaw config continues to load, but they do not change automatic compaction behavior.
 
@@ -476,8 +476,9 @@ Lossless-claw now defaults `proactiveThresholdCompactionMode` to `deferred`.
 - deferred mode records a single coalesced maintenance debt row per conversation
 - new deferred compaction debt is only created for `contextThreshold` pressure and uses reason `"threshold"`
 - `maintain()` consumes threshold debt when the host explicitly opts in to deferred execution
+- Background progress requires the host to schedule maintenance after durable turns. OpenClaw [#151936](https://github.com/openclaw/openclaw/pull/151936) repairs that scheduling path; installed 2026.9.5 lacks it. Ready-only assembly does not substitute for missing host admission. Until using a host containing that fix, retain a known-working deployment or explicitly choose legacy `inline` behavior if foreground compaction is acceptable.
 - `assemble()` leaves pending threshold debt for after-turn background drain or host-approved `maintain()` while the live prompt is still within budget
-- `assemble()` only consumes pending threshold debt synchronously as an emergency safeguard when the live prompt estimate is already over the active token budget
+- When the live prompt estimate is over the active token budget, `assemble()` synchronously attempts ready-only publication. Incomplete work stays pending for host-approved `maintain()` and assembly uses its existing bounded live-context fallback. This removes foreground summary generation, not session-queue ordering or publication validation.
 - old non-threshold debt from earlier builds is revalidated; if the conversation is no longer over threshold, it is cleared as a no-op
 - `/lossless status` (`/lcm status` alias) shows the current maintenance state, including pending/running/last-failure details
 - status output also surfaces the latest API/cache telemetry as diagnostics, not as a deferral gate
