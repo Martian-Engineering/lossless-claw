@@ -1847,7 +1847,7 @@ describe("LcmContextEngine maintain and assemble budget", () => {
     ).resolves.toHaveLength(1);
   });
 
-  it("assemble() clears exhausted threshold debt and preserves leading system context via degraded fallback (#639 Mode 2)", async () => {
+  it("assemble() retains unprepared threshold debt and preserves leading system context", async () => {
     const log = {
       info: vi.fn(),
       warn: vi.fn(),
@@ -1887,10 +1887,8 @@ describe("LcmContextEngine maintain and assemble budget", () => {
       tokenBudget: 10,
     });
 
-    // #639 Mode 2: exhausted threshold debt (empty conversation -> nothing to
-    // compact) is now CLEARED rather than left pending. Because this drain
-    // happens during an already-over-budget assemble call, the current turn still
-    // uses the degraded fallback instead of returning raw live messages.
+    // Foreground publication cannot determine planning exhaustion. Retain debt
+    // for host-owned maintenance and preserve the current turn via fallback.
     expect(assembleResult.messages.map((message) => message.content)).toEqual([
       "critical runtime policy",
       "current delivery turn",
@@ -1902,16 +1900,16 @@ describe("LcmContextEngine maintain and assemble budget", () => {
     const maintenance = await engine
       .getCompactionMaintenanceStore()
       .getConversationCompactionMaintenance(conversation.conversationId);
-    expect(maintenance?.pending).toBe(false);
+    expect(maintenance?.pending).toBe(true);
     expect(log.warn).toHaveBeenCalledWith(
       expect.stringContaining("[lcm] assemble: degraded live fallback"),
     );
     expect(log.warn).toHaveBeenCalledWith(
-      expect.stringContaining("reason=emergency-debt-exhausted"),
+      expect.stringContaining("reason=emergency-debt-still-pending"),
     );
   });
 
-  it("assemble() bounds live context when emergency debt drain reaches exhaustion", async () => {
+  it("assemble() bounds live context while unprepared debt awaits maintenance", async () => {
     const log = {
       info: vi.fn(),
       warn: vi.fn(),
@@ -1954,7 +1952,7 @@ describe("LcmContextEngine maintain and assemble budget", () => {
     const maintenance = await engine
       .getCompactionMaintenanceStore()
       .getConversationCompactionMaintenance(conversation.conversationId);
-    expect(maintenance?.pending).toBe(false);
+    expect(maintenance?.pending).toBe(true);
     expect(assembleResult.messages.map((message) => message.content)).toEqual([
       "current delivery turn",
     ]);
@@ -1967,7 +1965,7 @@ describe("LcmContextEngine maintain and assemble budget", () => {
       expect.stringContaining("[lcm] assemble: degraded live fallback"),
     );
     expect(log.warn).toHaveBeenCalledWith(
-      expect.stringContaining("reason=emergency-debt-exhausted"),
+      expect.stringContaining("reason=emergency-debt-still-pending"),
     );
   });
 
@@ -1980,7 +1978,7 @@ describe("LcmContextEngine maintain and assemble budget", () => {
     };
     const engine = createEngineWithDepsOverrides({ log });
     const privateEngine = engine as unknown as {
-      executeCompactionCore: (params: unknown) => Promise<unknown>;
+      executePendingCompactionCore: (params: unknown) => Promise<unknown>;
     };
     const sessionId = "assemble-threshold-debt-emergency-failed-degrades";
     const conversation = await engine.getConversationStore().getOrCreateConversation(sessionId, {
@@ -2004,13 +2002,13 @@ describe("LcmContextEngine maintain and assemble budget", () => {
       tokenBudget: 100,
       currentTokenCount: 150,
     });
-    const executeCompactionCoreSpy = vi.spyOn(
+    const executePendingCompactionCoreSpy = vi.spyOn(
       privateEngine,
-      "executeCompactionCore",
+      "executePendingCompactionCore",
     ).mockResolvedValue({
       ok: false,
       compacted: false,
-      reason: "provider timeout",
+      reason: "publication failed",
     });
 
     const assembleResult = await engine.assemble({
@@ -2022,16 +2020,17 @@ describe("LcmContextEngine maintain and assemble budget", () => {
     const maintenance = await engine
       .getCompactionMaintenanceStore()
       .getConversationCompactionMaintenance(conversation.conversationId);
-    expect(executeCompactionCoreSpy).toHaveBeenCalledWith(
+    expect(executePendingCompactionCoreSpy).toHaveBeenCalledWith(
       expect.objectContaining({
         conversationId: conversation.conversationId,
         sessionId,
         tokenBudget: 100,
         compactionTarget: "threshold",
+        publishPolicy: "publish-ready-only",
       }),
     );
     expect(maintenance?.pending).toBe(true);
-    expect(maintenance?.lastFailureSummary).toBe("provider timeout");
+    expect(maintenance?.lastFailureSummary).toBe("publication failed");
     expect(assembleResult.messages.map((message) => message.content)).toEqual([
       "current emergency turn",
     ]);
@@ -2061,7 +2060,7 @@ describe("LcmContextEngine maintain and assemble budget", () => {
     };
     const engine = createEngineWithDepsOverrides({ log });
     const privateEngine = engine as unknown as {
-      executeCompactionCore: (params: unknown) => Promise<unknown>;
+      executePendingCompactionCore: (params: unknown) => Promise<unknown>;
     };
     const sessionId = "assemble-threshold-debt-over-budget-drains";
     const conversation = await engine.getConversationStore().getOrCreateConversation(sessionId, {
@@ -2085,9 +2084,9 @@ describe("LcmContextEngine maintain and assemble budget", () => {
       tokenBudget: 4_096,
       currentTokenCount: 3_500,
     });
-    const executeCompactionCoreSpy = vi.spyOn(
+    const executePendingCompactionCoreSpy = vi.spyOn(
       privateEngine,
-      "executeCompactionCore",
+      "executePendingCompactionCore",
     ).mockResolvedValue({
       ok: true,
       compacted: true,
@@ -2103,15 +2102,16 @@ describe("LcmContextEngine maintain and assemble budget", () => {
     const maintenance = await engine
       .getCompactionMaintenanceStore()
       .getConversationCompactionMaintenance(conversation.conversationId);
-    expect(executeCompactionCoreSpy).toHaveBeenCalledWith(
+    expect(executePendingCompactionCoreSpy).toHaveBeenCalledWith(
       expect.objectContaining({
         conversationId: conversation.conversationId,
         sessionId,
         tokenBudget: 10,
         compactionTarget: "threshold",
+        publishPolicy: "publish-ready-only",
       }),
     );
-    expect(maintenance?.pending).toBe(false);
+    expect(maintenance?.pending).toBe(true);
     expect(maintenance?.running).toBe(false);
     expect(assembleResult.messages).toHaveLength(1);
     expect(log.warn).toHaveBeenCalledWith(
@@ -2125,7 +2125,7 @@ describe("LcmContextEngine maintain and assemble budget", () => {
   it("refreshes the projection epoch after emergency compaction replaces context", async () => {
     const engine = createEngine();
     const privateEngine = engine as unknown as {
-      executeCompactionCore: (params: unknown) => Promise<unknown>;
+      executePendingCompactionCore: (params: unknown) => Promise<unknown>;
     };
     const sessionId = "assemble-emergency-refreshes-projection";
     const conversation = await engine.getConversationStore().getOrCreateConversation(sessionId, {
@@ -2156,7 +2156,7 @@ describe("LcmContextEngine maintain and assemble budget", () => {
       tokenBudget: 100,
       currentTokenCount: 150,
     });
-    vi.spyOn(privateEngine, "executeCompactionCore").mockImplementation(async () => {
+    vi.spyOn(privateEngine, "executePendingCompactionCore").mockImplementation(async () => {
       await summaryStore.insertSummary({
         summaryId: "sum_emergency_projection_refresh",
         conversationId: conversation.conversationId,
@@ -2189,7 +2189,7 @@ describe("LcmContextEngine maintain and assemble budget", () => {
   it("assemble() drains pending threshold debt when recorded runtime tokens are over budget", async () => {
     const engine = createEngine();
     const privateEngine = engine as unknown as {
-      executeCompactionCore: (params: unknown) => Promise<unknown>;
+      executePendingCompactionCore: (params: unknown) => Promise<unknown>;
     };
     const sessionId = "assemble-threshold-debt-runtime-over-budget-drains";
     const conversation = await engine.getConversationStore().getOrCreateConversation(sessionId, {
@@ -2213,9 +2213,9 @@ describe("LcmContextEngine maintain and assemble budget", () => {
       tokenBudget: 4_096,
       currentTokenCount: 5_000,
     });
-    const executeCompactionCoreSpy = vi.spyOn(
+    const executePendingCompactionCoreSpy = vi.spyOn(
       privateEngine,
-      "executeCompactionCore",
+      "executePendingCompactionCore",
     ).mockResolvedValue({
       ok: true,
       compacted: true,
@@ -2231,16 +2231,17 @@ describe("LcmContextEngine maintain and assemble budget", () => {
     const maintenance = await engine
       .getCompactionMaintenanceStore()
       .getConversationCompactionMaintenance(conversation.conversationId);
-    expect(executeCompactionCoreSpy).toHaveBeenCalledWith(
+    expect(executePendingCompactionCoreSpy).toHaveBeenCalledWith(
       expect.objectContaining({
         conversationId: conversation.conversationId,
         sessionId,
         tokenBudget: 4_096,
         currentTokenCount: 5_000,
         compactionTarget: "threshold",
+        publishPolicy: "publish-ready-only",
       }),
     );
-    expect(maintenance?.pending).toBe(false);
+    expect(maintenance?.pending).toBe(true);
     expect(maintenance?.running).toBe(false);
     expect(assembleResult.messages).toHaveLength(1);
   });
@@ -2254,7 +2255,7 @@ describe("LcmContextEngine maintain and assemble budget", () => {
     };
     const engine = createEngineWithDepsOverrides({ log });
     const privateEngine = engine as unknown as {
-      executeCompactionCore: (params: unknown) => Promise<unknown>;
+      executePendingCompactionCore: (params: unknown) => Promise<unknown>;
     };
     const sessionId = "assemble-threshold-debt-projected-over-budget-drains";
     const conversation = await engine.getConversationStore().getOrCreateConversation(sessionId, {
@@ -2280,9 +2281,9 @@ describe("LcmContextEngine maintain and assemble budget", () => {
       projectedTokenCount: 5_000,
       rawTokensOutsideTail: 4_700,
     });
-    const executeCompactionCoreSpy = vi.spyOn(
+    const executePendingCompactionCoreSpy = vi.spyOn(
       privateEngine,
-      "executeCompactionCore",
+      "executePendingCompactionCore",
     ).mockResolvedValue({
       ok: true,
       compacted: true,
@@ -2298,16 +2299,17 @@ describe("LcmContextEngine maintain and assemble budget", () => {
     const maintenance = await engine
       .getCompactionMaintenanceStore()
       .getConversationCompactionMaintenance(conversation.conversationId);
-    expect(executeCompactionCoreSpy).toHaveBeenCalledWith(
+    expect(executePendingCompactionCoreSpy).toHaveBeenCalledWith(
       expect.objectContaining({
         conversationId: conversation.conversationId,
         sessionId,
         tokenBudget: 4_096,
         currentTokenCount: 5000,
         compactionTarget: "threshold",
+        publishPolicy: "publish-ready-only",
       }),
     );
-    expect(maintenance?.pending).toBe(false);
+    expect(maintenance?.pending).toBe(true);
     expect(maintenance?.running).toBe(false);
     expect(assembleResult.messages).toHaveLength(1);
     expect(log.warn).toHaveBeenCalledWith(
@@ -2327,7 +2329,7 @@ describe("LcmContextEngine maintain and assemble budget", () => {
     };
     const engine = createEngineWithDepsOverrides({ log });
     const privateEngine = engine as unknown as {
-      executeCompactionCore: (params: unknown) => Promise<unknown>;
+      executePendingCompactionCore: (params: unknown) => Promise<unknown>;
     };
     const sessionId = "assemble-refreshes-pressure-after-partial-drain";
     const conversation = await engine.getConversationStore().getOrCreateConversation(sessionId, {
@@ -2356,7 +2358,7 @@ describe("LcmContextEngine maintain and assemble budget", () => {
       .spyOn(engine.getSummaryStore(), "getContextTokenCount")
       .mockResolvedValueOnce(5_000)
       .mockResolvedValue(100);
-    vi.spyOn(privateEngine, "executeCompactionCore").mockResolvedValue({
+    vi.spyOn(privateEngine, "executePendingCompactionCore").mockResolvedValue({
       ok: false,
       compacted: true,
       reason: "compacted but still over target",
@@ -2371,8 +2373,7 @@ describe("LcmContextEngine maintain and assemble budget", () => {
     const maintenance = await engine
       .getCompactionMaintenanceStore()
       .getConversationCompactionMaintenance(conversation.conversationId);
-    // Initial pressure, the pending-publication before snapshot, and the
-    // post-drain pressure refresh each read the active projection once.
+    // Initial pressure, post-publication evaluation and refreshed pressure.
     expect(contextTokenCountSpy).toHaveBeenCalledTimes(3);
     expect(maintenance?.pending).toBe(true);
     expect(assembleResult.messages.length).toBeGreaterThan(0);
@@ -2492,7 +2493,7 @@ describe("LcmContextEngine maintain and assemble budget", () => {
   it("assemble() emergency drain bypasses backoff and runs compaction with force=true", async () => {
     const engine = createEngine();
     const privateEngine = engine as unknown as {
-      executeCompactionCore: (params: unknown) => Promise<unknown>;
+      executePendingCompactionCore: (params: unknown) => Promise<unknown>;
     };
     const sessionId = "assemble-deferred-compaction-backoff-degrades";
     const conversation = await engine.getConversationStore().getOrCreateConversation(sessionId, {
@@ -2524,7 +2525,7 @@ describe("LcmContextEngine maintain and assemble budget", () => {
       failureSummary: "provider timeout",
       keepPending: true,
     });
-    const executeSpy = vi.spyOn(privateEngine, "executeCompactionCore");
+    const executeSpy = vi.spyOn(privateEngine, "executePendingCompactionCore");
 
     const assembleResult = await engine.assemble({
       sessionId,

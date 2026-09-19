@@ -408,6 +408,8 @@ export class CompactionMaintenanceStore {
     failureSummary?: string | null;
     keepPending?: boolean;
     nextAttemptAfter?: Date | null;
+    /** A ready-only no-op is not a successful retry of model-backed work. */
+    preserveRetryState?: boolean;
   }): Promise<void> {
     const existing = await this.getConversationCompactionMaintenance(input.conversationId);
     const finishedAt = input.finishedAt ?? new Date();
@@ -426,11 +428,11 @@ export class CompactionMaintenanceStore {
         running: false,
         lastFinishedAt: finishedAt,
         lastFailureSummary:
-          input.failureSummary === undefined
+          input.preserveRetryState || input.failureSummary === undefined
             ? existing?.lastFailureSummary ?? null
             : input.failureSummary,
-        retryAttempts,
-        nextAttemptAfter,
+        retryAttempts: input.preserveRetryState ? existing?.retryAttempts ?? 0 : retryAttempts,
+        nextAttemptAfter: input.preserveRetryState ? existing?.nextAttemptAfter ?? null : nextAttemptAfter,
       }),
     );
   }

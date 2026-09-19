@@ -1511,6 +1511,9 @@ export class LcmContextEngine implements ContextEngine {
         finishedAt: new Date(),
         failureSummary,
         keepPending,
+        preserveRetryState:
+          params.pendingPublishPolicy === "publish-ready-only" &&
+          result.ok && !result.compacted && keepPending,
         ...(summarySpendBackoffUntil ? { nextAttemptAfter: summarySpendBackoffUntil } : {}),
       });
       this.deps.log.debug(
@@ -1609,7 +1612,7 @@ export class LcmContextEngine implements ContextEngine {
       kind: "compaction",
       scope: breakerScope,
     });
-    if (params.force === true || pendingManualCompaction) {
+    if (!publicationOnly && (params.force === true || pendingManualCompaction)) {
       const clearedBackoffUntil =
         this.compactionGuards.clearSummarySpendBackoff(summarySpendScopeKey);
       if (clearedBackoffUntil) {
@@ -1822,8 +1825,9 @@ export class LcmContextEngine implements ContextEngine {
    * that the live prompt is already over budget. Routine threshold debt is
    * drained after turns or by host-approved maintain() calls so the next user
    * turn is not held hostage by proactive compaction work. Hitting this path
-   * means idle/background maintenance did not catch up before the prompt became
-   * unusable, so callers should treat it as an emergency safeguard.
+   * means idle/background maintenance did not catch up. Only publish work that
+   * is already ready; model-backed preparation belongs to host-owned maintenance,
+   * and incomplete work must leave assemble free to use its bounded fallback.
    */
   private async maybeConsumeDeferredCompactionDebtForAssemble(params: {
     conversationId: number;
@@ -1872,7 +1876,7 @@ export class LcmContextEngine implements ContextEngine {
           legacyParams: deferredLegacyParams,
           force: forceAllowed,
           sessionQueueHeld: true,
-          pendingPublishPolicy: "publish-if-ready",
+          pendingPublishPolicy: "publish-ready-only",
         });
         drainResult = { exhausted: result?.exhausted === true };
       },
