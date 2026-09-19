@@ -18,8 +18,10 @@ type ConversationScopeStore = ReturnType<LcmContextEngine["getConversationStore"
   getConversationForSession?: (input: {
     sessionId?: string;
     sessionKey?: string;
-  }) => Promise<{ conversationId: number } | null>;
-  getConversationBySessionKey?: (sessionKey: string) => Promise<{ conversationId: number } | null>;
+  }) => Promise<{ conversationId: number; active?: boolean } | null>;
+  getConversationBySessionKey?: (
+    sessionKey: string,
+  ) => Promise<{ conversationId: number; active?: boolean } | null>;
   getConversationFamilyIds?: (input: {
     conversationId?: number;
     sessionId?: string;
@@ -31,7 +33,7 @@ async function lookupConversationForSession(input: {
   lcm: LcmContextEngine;
   sessionId?: string;
   sessionKey?: string;
-}): Promise<{ conversationId: number } | null> {
+}): Promise<{ conversationId: number; active?: boolean } | null> {
   const store = input.lcm.getConversationStore() as ConversationScopeStore;
 
   if (typeof store.getConversationForSession === "function") {
@@ -158,6 +160,22 @@ export async function resolveLcmConversationScope(input: {
         delegated: true,
         error: "Delegated LCM retrieval grant has no allowed conversation scope.",
       };
+    }
+
+    // A delegated session may create its own active LCM conversation while
+    // processing the delegated task. Large tool outputs written into that
+    // conversation must remain retrievable by the same session, even when the
+    // propagated grant only names the parent/source conversation.
+    const delegatedSessionConversation = await lookupConversationForSession({
+      lcm,
+      sessionId: sessionIdAsSessionKey ? undefined : normalizedInputSessionId,
+      sessionKey: normalizedSessionKey,
+    });
+    if (
+      delegatedSessionConversation?.active === true
+      && !allowedConversationIds.includes(delegatedSessionConversation.conversationId)
+    ) {
+      allowedConversationIds.push(delegatedSessionConversation.conversationId);
     }
 
     if (explicitConversationId != null) {
