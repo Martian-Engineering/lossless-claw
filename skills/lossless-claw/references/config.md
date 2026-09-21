@@ -4,8 +4,6 @@ This reference covers the current `lossless-claw` config surface on `main`, base
 
 `lossless-claw` is most effective when the operator understands which settings change compaction behavior and why.
 
-The Settings editor displays fixed defaults from the plugin manifest. Automatic values remain unset: Bootstrap Max Tokens uses the greater of 6000 or 30% of Leaf Chunk Tokens (rounded down), so its input shows **Auto** until you choose an override.
-
 ## First checks
 
 - Ensure the plugin is installed and enabled.
