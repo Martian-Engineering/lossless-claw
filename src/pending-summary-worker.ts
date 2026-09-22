@@ -64,6 +64,7 @@ export type PendingSummaryPreparationWorkerOptions = {
   loadSourceText: (node: PendingSummaryNodeRecord) => Promise<string>;
   summarize: (sourceText: string, node: PendingSummaryNodeRecord) => Promise<string>;
   estimateTokens: (content: string) => number;
+  isLifecycleFailure?: (error: unknown) => boolean;
   isAuthFailure?: (error: unknown) => boolean;
   isSpendLimitFailure?: (error: unknown) => boolean;
 };
@@ -71,6 +72,7 @@ export type PendingSummaryPreparationWorkerOptions = {
 export type PendingSummaryPreparationResult =
   | { status: "idle" }
   | { status: "prepared"; nodeId: string; emptySource?: true }
+  | { status: "interrupted"; nodeId: string; failureSummary: string }
   | { status: "spend-limited"; nodeId: string }
   | { status: "failed"; nodeId: string; failureSummary: string; authFailure?: boolean };
 
@@ -116,6 +118,7 @@ export class PendingSummaryPreparationWorker {
     node: PendingSummaryNodeRecord,
   ) => Promise<string>;
   private readonly estimateTokens: (content: string) => number;
+  private readonly isLifecycleFailure: (error: unknown) => boolean;
   private readonly isAuthFailure: (error: unknown) => boolean;
   private readonly isSpendLimitFailure: (error: unknown) => boolean;
 
@@ -127,6 +130,7 @@ export class PendingSummaryPreparationWorker {
     this.loadSourceText = options.loadSourceText;
     this.summarize = options.summarize;
     this.estimateTokens = options.estimateTokens;
+    this.isLifecycleFailure = options.isLifecycleFailure ?? (() => false);
     this.isAuthFailure = options.isAuthFailure ?? (() => false);
     this.isSpendLimitFailure = options.isSpendLimitFailure ?? (() => false);
   }
@@ -195,6 +199,16 @@ export class PendingSummaryPreparationWorker {
           leaseExpiresAt: node.leaseExpiresAt,
         });
         return { status: "spend-limited", nodeId: node.nodeId };
+      }
+      // Retirement ends this host invocation, not the node's preparation budget.
+      // Leave the source and prepared siblings intact for a fresh invocation.
+      if (this.isLifecycleFailure(error)) {
+        await this.store.releaseNodeClaim({
+          nodeId: node.nodeId,
+          leaseOwner: this.leaseOwner,
+          leaseExpiresAt: node.leaseExpiresAt,
+        });
+        return { status: "interrupted", nodeId: node.nodeId, failureSummary: describeError(error) };
       }
       const failureSummary = describeError(error);
       const authFailure = this.isAuthFailure(error);
