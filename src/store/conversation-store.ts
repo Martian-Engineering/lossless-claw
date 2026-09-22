@@ -1722,12 +1722,12 @@ export class ConversationStore {
     conversationId: ConversationId,
     role: MessageRole,
     tailWindow: number,
-  ): Promise<Array<{ messageId: MessageId; content: string }>> {
+  ): Promise<Array<{ messageId: MessageId; content: string; createdAt: Date }>> {
     const rows = this.db
       .prepare(
-        `SELECT message_id, content
+        `SELECT message_id, content, created_at
          FROM (
-           SELECT message_id, content, transcript_entry_id, role, seq
+           SELECT message_id, content, created_at, transcript_entry_id, role, seq
            FROM messages
            WHERE conversation_id = ?
            ORDER BY seq DESC
@@ -1739,8 +1739,13 @@ export class ConversationStore {
       .all(conversationId, Math.max(1, Math.floor(tailWindow)), role) as unknown as Array<{
       message_id: number;
       content: string;
+      created_at: string;
     }>;
-    return rows.map((row) => ({ messageId: row.message_id, content: row.content }));
+    return rows.map((row) => ({
+      messageId: row.message_id,
+      content: row.content,
+      createdAt: parseUtcTimestamp(row.created_at),
+    }));
   }
 
   /**

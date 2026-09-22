@@ -94,7 +94,11 @@ import {
   FALLBACK_DIRECTIVE_SUMMARY_MARKER,
   MIN_FALLBACK_MAX_TOKENS,
 } from "./summary-fallback.js";
-import { attachTranscriptEntryMeta, getTranscriptEntryId, resolveTranscriptMessageCreatedAt } from "./transcript.js";
+import {
+  attachTranscriptEntryMeta,
+  getTranscriptEntryId,
+  resolveTranscriptMessageCreatedAt,
+} from "./transcript.js";
 import { restoreRawUserReplay } from "./user-replay.js";
 import { extractStableEventKey } from "./stable-event-key.js";
 import { structuredPartsIdentity } from "./structured-anchor-identity.js";
@@ -110,10 +114,6 @@ import { batchHasRawReplayIds, filterPersistedRawIdReplayBatch } from "./raw-id-
 import { PROMPT_RECALL_MAX_MESSAGES, PROMPT_RECALL_SEARCH_CANDIDATE_LIMIT, buildPromptRecallProjectionFingerprint, extractPromptRecallIdentifiers, extractPromptRecallSnippet, findPromptRecallIdentifierIndex, isPromptRecallEligibleRole, normalizePromptRecallCoverageText, normalizePromptRecallText, renderPromptRecallMessage } from "./prompt-recall.js";
 import { extractRuntimePromptTokenCount } from "./token-accounting.js";
 import { asRecord, formatDurationMs, resolvePositiveInteger } from "./value-utils.js";
-import {
-  openClawInboundBodiesMatch,
-  stripLeadingOpenClawInboundTimestamp,
-} from "./openclaw-inbound-metadata.js";
 import { extractOpenClawSenderMetadata } from "./openclaw-sender-metadata.js";
 
 type AgentMessage = Parameters<ContextEngine["ingest"]>[0]["message"];
@@ -2708,30 +2708,6 @@ export class LcmContextEngine implements ContextEngine {
     });
   }
 
-  /** Adopt one exact decorated runtime face of a bare projected user message. */
-  private async adoptDecoratedProjectionEntryId(params: {
-    conversationId: number;
-    bareContent: string;
-    transcriptEntryId: string;
-  }): Promise<boolean> {
-    const candidates = await this.conversationStore.listRecentUnstampedMessagesByRole(
-      params.conversationId,
-      "user",
-      this.config.freshTailCount,
-    );
-    const matches = candidates.filter((candidate) =>
-      openClawInboundBodiesMatch(candidate.content, params.bareContent),
-    );
-    if (matches.length !== 1) {
-      return false;
-    }
-    return this.conversationStore.adoptTranscriptEntryIdForMessage(
-      params.conversationId,
-      matches[0]!.messageId,
-      params.transcriptEntryId,
-    );
-  }
-
   private async reconcileProjectedTranscriptMessages(params: {
     sessionId: string;
     sessionKey?: string;
@@ -2760,17 +2736,12 @@ export class LcmContextEngine implements ContextEngine {
             entryIds,
           )
         : new Set<string>();
-    const projectedUserBodyCounts = new Map<string, number>();
-    for (const message of params.historicalMessages) {
-      const stored = toStoredMessageIdentity(message);
-      if (stored.role === "user") {
-        const body = stripLeadingOpenClawInboundTimestamp(stored.content);
-        projectedUserBodyCounts.set(
-          body,
-          (projectedUserBodyCounts.get(body) ?? 0) + 1,
-        );
-      }
-    }
+    const adoptionPlan = await this.batchDeduplicator.planRecentTranscriptEntryAdoptions({
+      conversationId: params.conversationId,
+      messages: params.historicalMessages,
+      tailWindow: this.config.freshTailCount,
+      existingEntryIds,
+    });
 
     for (let index = 0; index < params.historicalMessages.length; index += 1) {
       const message = params.historicalMessages[index]!;
@@ -2843,46 +2814,33 @@ export class LcmContextEngine implements ContextEngine {
       }
 
       const stored = toStoredMessageIdentity(message);
+      const canUseWeakIdentityAdoption =
+        (!params.legacyPrefixAnchorEntryId || hasOverlap) && !establishedEpochBoundary;
+      const adoption = adoptionPlan.get(index);
       if (
         entryId &&
+        !existingEntryIds.has(entryId) &&
         !establishedEpochBoundary &&
-        stored.role === "user" &&
-        projectedUserBodyCounts.get(stripLeadingOpenClawInboundTimestamp(stored.content)) === 1 &&
-        (await this.adoptDecoratedProjectionEntryId({
-          conversationId: params.conversationId,
-          bareContent: stored.content,
-          transcriptEntryId: entryId,
-        }))
+        adoption &&
+        (adoption.decorated || canUseWeakIdentityAdoption) &&
+        (await this.conversationStore.adoptTranscriptEntryIdForMessage(
+          params.conversationId,
+          adoption.messageId,
+          entryId,
+        ))
       ) {
         await this.markProjectionReconciledAnchorTrusted({
           conversationId: params.conversationId,
           transcriptEntryId: entryId,
-          reason: "decorated runtime row adopted as projection anchor",
+          reason: adoption.decorated
+            ? "decorated runtime row adopted as projection anchor"
+            : "recent externalized tail message adopted as projection anchor",
         });
         hasOverlap = true;
         overlapAnchorIndex = index;
         continue;
       }
-
-      const canUseWeakIdentityAdoption =
-        (!params.legacyPrefixAnchorEntryId || hasOverlap) && !establishedEpochBoundary;
       if (entryId && canUseWeakIdentityAdoption) {
-        const adoptedExternalized = await this.batchDeduplicator.adoptRecentTranscriptEntryIdForMessage({
-          conversationId: params.conversationId,
-          message,
-          transcriptEntryId: entryId,
-          tailWindow: this.config.freshTailCount,
-        });
-        if (adoptedExternalized) {
-          await this.markProjectionReconciledAnchorTrusted({
-            conversationId: params.conversationId,
-            transcriptEntryId: entryId,
-            reason: "recent externalized tail message adopted as projection anchor",
-          });
-          hasOverlap = true;
-          overlapAnchorIndex = index;
-          continue;
-        }
         if (
           hasOverlap &&
           stored.content.trim() !== "" &&
