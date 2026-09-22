@@ -302,7 +302,7 @@ The `ignoreSessionPatterns` entries in this example are storage exclusions. Matc
 | `LCM_PROACTIVE_THRESHOLD_COMPACTION_MODE` | `deferred` | Choose whether proactive threshold compaction is deferred into maintenance debt or kept inline for legacy behavior |
 | `LCM_CACHE_TTL_SECONDS` | `300` | Cache TTL used by cache-aware deferred compaction when provider/runtime telemetry does not supply a more specific retention window |
 
-Deferred proactive compaction is also the default. Set `proactiveThresholdCompactionMode` or `LCM_PROACTIVE_THRESHOLD_COMPACTION_MODE` to `inline` only if you need legacy foreground compaction behavior. In deferred mode, lossless-claw records one coalesced prompt-mutating debt item after the turn, leaves background `maintain()` to process only non-prompt-mutating work while Anthropic cache is still hot, and then consumes that debt pre-assembly once the cache is cold or the prompt is approaching overflow.
+Deferred proactive compaction is also the default. Set `proactiveThresholdCompactionMode` or `LCM_PROACTIVE_THRESHOLD_COMPACTION_MODE` to `inline` only if you need legacy foreground compaction behavior. In deferred mode, lossless-claw records coalesced maintenance debt after the turn and leaves model-backed preparation to host-owned background `maintain()`. Over-budget pre-assembly attempts only validated publication of already-ready summaries; incomplete work remains pending while assembly uses its existing live-context fallback.
 
 ### Expansion model override requirements
 

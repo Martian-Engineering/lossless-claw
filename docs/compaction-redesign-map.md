@@ -93,7 +93,7 @@ Relevant code:
 - `src/engine.ts`: `drainDeferredCompactionDebtNow()`
 - `src/engine.ts`: `consumeDeferredCompactionDebt()`
 - `src/engine.ts`: `maintain()`
-- `src/engine.ts`: pre-assembly maintenance drain
+- `src/engine.ts`: ready-only pre-assembly publication
 
 ### Full Sweep
 
@@ -212,7 +212,7 @@ The implementation should cover:
 - inline mode runs threshold full sweep rather than leaf-trigger compaction
 - background drain consumes threshold debt without prompt-cache telemetry or TTL
 - `maintain()` consumes threshold debt without prompt-cache delay
-- pre-assembly drain consumes threshold debt without prompt-cache delay
+- over-budget pre-assembly publishes ready-only work without model-backed preparation
 - legacy non-threshold debt is cleared when threshold no longer applies
 - legacy non-threshold debt is upgraded to threshold full sweep when threshold still applies
 - `compactFullSweep()` treats `sweepMaxDepth` as a preferred depth
