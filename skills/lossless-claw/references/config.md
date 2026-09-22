@@ -4,6 +4,10 @@ This reference covers the current `lossless-claw` config surface on `main`, base
 
 `lossless-claw` is most effective when the operator understands which settings change compaction behavior and why.
 
+The Settings editor displays fixed defaults from the plugin manifest. Automatic values remain unset: Bootstrap Max Tokens uses the greater of 6000 or 30% of Leaf Chunk Tokens (rounded down), so its input shows **Auto** until you choose an override.
+
+Grouped settings require OpenClaw `2026.9.5` or newer. Earlier supported hosts ignore the optional `configGroups` metadata and show the complete flat settings form. The runtime minimum remains `2026.9.2`; configuration paths and runtime defaults are unchanged. See [Settings in OpenClaw](../../../docs/configuration.md#settings-in-openclaw) for the section list and compatibility details.
+
 ## First checks
 
 - Ensure the plugin is installed and enabled.

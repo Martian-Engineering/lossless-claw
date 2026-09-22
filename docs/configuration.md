@@ -27,6 +27,33 @@ forks continue to require `thread-bootstrap-projection`.
 If you cannot use a beta or upgrade OpenClaw, use a `lossless-claw` release
 compatible with your installed OpenClaw version.
 
+## Settings in OpenClaw
+
+Hosts that support the optional `configGroups` manifest field organize the settings
+into these sections:
+
+| Section | Settings |
+| --- | --- |
+| Session capture | Capture behavior, session retention, heartbeat handling, and replay protection |
+| Context budget | Context thresholds, fresh-tail retention, and prompt assembly limits |
+| Compaction | Summary depth, chunk sizes, fanout, and sweep limits |
+| Summaries | Models, summary sizes, instructions, and injected-context filtering |
+| Summary reliability | Timeouts, call limits, fallback providers, and circuit breakers |
+| Recall | Expansion models, token limits, and delegation timeout |
+| External files | Payload offloading, file summaries, and assembly stubs |
+| Storage and logging | Database location and independent logging |
+| Compatibility | Existing aliases and retired options |
+
+Grouped settings require OpenClaw `2026.9.5` or newer, the first stable release
+with the [`configGroups` settings UI](https://github.com/openclaw/openclaw/pull/149246).
+Earlier supported hosts, including `2026.9.4` and `2026.9.2`, ignore this
+optional metadata and show the complete flat settings form. No upgrade is needed
+to keep configuring or running Lossless on those hosts.
+Groups do not introduce configuration nesting or change any setting's path,
+default, validation, or runtime behavior. The host version requirements above
+remain unchanged. Retired options remain ignored; grouping does not reactivate
+them.
+
 ## Recall tool availability
 
 Lossless declares `lcm_grep`, `lcm_describe`, `lcm_expand`, and
@@ -282,6 +309,8 @@ Lossless accepts the retired `transcriptGcEnabled` and `autoRotateSessionFiles` 
 Lossless-claw writes routine operational JSONL logs by default at `/tmp/openclaw/lossless-claw-YYYY-MM-DD.log`, beside OpenClaw's `/tmp/openclaw/openclaw-YYYY-MM-DD.log`. Routine info and debug lines go to the independent file instead of the shared OpenClaw log. Startup banners and warning/error lines still go through OpenClaw's runtime logger so gateway-level startup and failure diagnostics remain visible. The independent file follows the same practical rotation model as OpenClaw: a dated filename rolls over when the local date changes, stale dated files are pruned after 3 days, and an oversized active file is rotated through `.1.log` to `.5.log`.
 
 ### Compaction thresholds and summary sizing
+
+The Settings editor displays fixed defaults from the plugin manifest. Automatic values remain unset: Bootstrap Max Tokens uses the greater of 6000 or 30% of Leaf Chunk Tokens (rounded down), so its input shows **Auto** until you choose an override.
 
 | Key | Type | Default | Env override | Purpose |
 | --- | --- | --- | --- | --- |
