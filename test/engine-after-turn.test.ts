@@ -287,6 +287,10 @@ describe("LcmContextEngine afterTurn", () => {
     });
     expect(complete).not.toHaveBeenCalled();
 
+    const maintenance = engine.maintain({
+      sessionId, sessionFile: createSessionFilePath(sessionId),
+      runtimeContext: { allowDeferredCompactionExecution: true, tokenBudget: 600, currentTokenCount: 300 },
+    });
     await completeStartedPromise;
     const ingestWhileSummaryRuns = await Promise.race([
       engine.ingest({
@@ -303,6 +307,7 @@ describe("LcmContextEngine afterTurn", () => {
     resolveComplete?.({
       content: [{ type: "text", text: "background pending summary" }],
     });
+    await maintenance;
   });
 
 
@@ -372,6 +377,11 @@ describe("LcmContextEngine afterTurn", () => {
       },
     });
 
+    await engine.maintain({
+      sessionId, sessionFile: createSessionFilePath(sessionId),
+      runtimeContext: { allowDeferredCompactionExecution: true, tokenBudget: 128_000,
+        currentTokenCount: 189_666, provider: "openai-codex", model: "gpt-5.5" },
+    });
     await vi.waitFor(() => {
       expect(executeCompactionCoreSpy).toHaveBeenCalledWith(
         expect.objectContaining({
@@ -380,10 +390,10 @@ describe("LcmContextEngine afterTurn", () => {
           tokenBudget: 128_000,
           currentTokenCount: 189_666,
           compactionTarget: "threshold",
-          legacyParams: {
+          legacyParams: expect.objectContaining({
             provider: "openai-codex",
             model: "gpt-5.5",
-          },
+          }),
         }),
       );
     });

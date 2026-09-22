@@ -1517,6 +1517,7 @@ export class ContextAssembler {
     // Step 2: Resolve each context item into a ResolvedItem, then apply any
     // active focus overlay without mutating canonical context_items rows.
     const canonicalResolved = await this.resolveItems(contextItems);
+    await this.preserveCurrentUserBoundary(canonicalResolved);
     const resolved = await this.applyFocusOverlay(conversationId, canonicalResolved);
 
     // Count stats from the full (pre-truncation) set
@@ -1837,6 +1838,53 @@ export class ContextAssembler {
     return resolved;
   }
 
+  /** Prove that every source in a summary DAG is assistant/tool history after this user. */
+  private async isCurrentTurnToolSummary(summary: SummaryRecord, userSeq: number): Promise<boolean> {
+    const pending = [summary];
+    const visited = new Set<string>();
+    let hasAssistant = false;
+    let hasTool = false;
+    while (pending.length > 0) {
+      const current = pending.pop()!;
+      if (visited.has(current.summaryId)) continue;
+      visited.add(current.summaryId);
+      const sourceIds = await this.summaryStore.getSummaryMessages(current.summaryId);
+      if (current.kind === "leaf" && sourceIds.length === 0) return false;
+      // Inspect every direct source, including any links on condensed records.
+      // A user, missing row, or source before the boundary invalidates the proof.
+      for (const id of sourceIds) {
+        const source = await this.conversationStore.getMessageById(id);
+        if (!source || source.conversationId !== summary.conversationId ||
+            source.seq <= userSeq || (source.role !== "assistant" && source.role !== "tool")) return false;
+        hasAssistant ||= source.role === "assistant";
+        hasTool ||= source.role === "tool";
+      }
+      if (current.kind === "condensed") {
+        const parents = await this.summaryStore.getSummaryParents(current.summaryId);
+        // Strictly descending depth also rejects cycles without unbounded traversal.
+        if (parents.length === 0 || parents.some((parent) =>
+          parent.conversationId !== summary.conversationId || parent.depth >= current.depth)) return false;
+        pending.push(...parents);
+      }
+    }
+    return hasAssistant && hasTool;
+  }
+
+  /** Keep proven tool-history summaries from creating a synthetic current-user boundary. */
+  private async preserveCurrentUserBoundary(items: ResolvedItem[]): Promise<void> {
+    const user = items.findLast((item) => item.isMessage && item.sourceRole === "user");
+    if (user?.seq === undefined) return;
+    for (const item of items) {
+      if (!item.summary || item.ordinal <= user.ordinal) continue;
+      // Prefix summaries retain their user role, including the first-message guarantee.
+      if (!await this.isCurrentTurnToolSummary(item.summary, user.seq)) continue;
+      item.message = {
+        role: "assistant",
+        content: [{ type: "text", text: String(item.message.content) }],
+      } as AgentMessage;
+    }
+  }
+
   /**
    * Resolve a single context item.
    */
@@ -1995,16 +2043,10 @@ export class ContextAssembler {
         ? await this.summaryStore.getSummaryMessageSeqRange(summary.summaryId)
         : { maxSeq: null };
 
-    // Summaries are synthetic user messages — content carries a
-    // trust="untrusted" taint label on the <summary> tag to mitigate
-    // injection persistence (semantics defined in the recall system prompt).
-    //
-    // NOTE: the role stays "user" deliberately. A non-user role would be
-    // stronger (issue #71 rec. 1), but neither available runtime role is safe
-    // here: "toolResult" has no paired tool call and is dropped by
-    // sanitizeToolUseResultPairing, and "assistant" risks provider
-    // first-message/alternation constraints handled only by OpenClaw upstream.
-    // Downgrading the role requires upstream support; tracked in issue #71.
+    // Prefix summaries use the user role so a projection can start with them.
+    // The wrapper remains explicitly untrusted. Tool-only summaries inside a
+    // retained raw user turn are rendered as assistant history by
+    // preserveCurrentUserBoundary; they must not replace the initiating user.
     return {
       ordinal: item.ordinal,
       message: { role: "user" as const, content } as AgentMessage,

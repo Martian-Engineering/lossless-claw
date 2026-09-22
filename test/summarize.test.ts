@@ -2,6 +2,7 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 import {
   createLcmSummarizeFromLegacyParams,
   LcmProviderAuthError,
+  LcmRuntimeLifecycleError,
   LcmRuntimeLlmUnavailableError,
   LcmRuntimeLlmPolicyError,
   type LcmSummarizeFn,
@@ -90,6 +91,22 @@ describe("createLcmSummarizeFromLegacyParams", () => {
   beforeEach(() => {
     vi.clearAllMocks();
     vi.unstubAllEnvs();
+  });
+
+  it.each([false, true])("does not retry providers or synthesize fallback after host scope closure (retry=%s)", async (retry) => {
+    const complete = vi.fn().mockResolvedValue({
+      content: [], error: { kind: "runtime_lifecycle", message: "Async work scope is closed" },
+    });
+    if (retry) complete.mockResolvedValueOnce({ content: [] });
+    const base = makeDeps();
+    const deps = makeDeps({ complete, config: { ...base.config,
+      fallbackProviders: [{ provider: "openai", model: "gpt-4.1-mini" }],
+    } });
+    const summarize = await createSummarizeFn({ deps, legacyParams: {} });
+    await expect(summarize!("source material", false)).rejects.toBeInstanceOf(LcmRuntimeLifecycleError);
+    expect(complete).toHaveBeenCalledTimes(retry ? 2 : 1);
+    expect(getDepsLogText(deps)).not.toContain("PROVIDER FALLBACK");
+    expect(getDepsLogText(deps)).not.toContain("falling back to truncation");
   });
 
   it("returns undefined when model resolution fails", async () => {

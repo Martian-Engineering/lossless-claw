@@ -358,6 +358,14 @@ describe("createLcmDependencies.complete runtime.llm bridge", () => {
     }
   });
 
+  it("classifies a closed host work scope separately from provider failures", async () => {
+    const runtimeLlmComplete = vi.fn().mockRejectedValue(new Error("Async work scope is closed"));
+    const { api, getFactory } = buildApi({ runtimeLlmComplete });
+    const engine = getRegisteredEngine(api, getFactory);
+    const result = await engine.deps.complete({ model: "test", messages: [], maxTokens: 100 });
+    expect(result.error).toEqual({ kind: "runtime_lifecycle", message: "Async work scope is closed" });
+  });
+
   it("fails clearly when runtime.llm is unavailable", async () => {
     const { api, getFactory, dbPath } = buildApi();
     const engine = getRegisteredEngine(api, getFactory);

@@ -87,7 +87,11 @@ The **condensed pass** merges summaries at the same depth into a higher-level su
 **Automatic threshold sweep (after each turn):**
 - Checks if the assembled context crosses `contextThreshold`
 - Below threshold, does not compact and does not record leaf debt
-- In deferred mode, records one `"threshold"` maintenance row for background, `maintain()`, or pre-assembly execution
+- In deferred mode, records one `"threshold"` maintenance row for host-owned background `maintain()` or emergency pre-assembly execution
+- Below threshold, eligible raw history can be prepared as hidden pending summaries during background `maintain()`; this does not publish them or record threshold debt
+- Background preparation returns its full promise to the host and uses that maintenance call's LLM capability. Turn hooks only record data-only requests; no detached timers inherit a completed turn's async scope
+- Each maintenance invocation runs one bounded pass. Unfinished nodes and threshold debt resume on a later pass. Model calls do not hold the foreground ingestion queue; publication still uses the session lock
+- Host lifecycle rejection is not a provider failure: a closed async work scope leaves work retryable instead of producing a deterministic fallback summary
 - In inline mode, runs a full sweep before `afterTurn()` completes
 
 **Full sweep (threshold, manual `/compact`, or overflow):**

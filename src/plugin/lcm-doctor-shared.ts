@@ -92,7 +92,7 @@ export function detectDoctorMarker(content: string): DoctorMarkerKind | null {
   return null;
 }
 
-function detectDoctorMarkerForRow(row: { content: string; model?: string }): DoctorMarkerKind | null {
+export function detectDoctorMarkerForRow(row: { content: string; model?: string }): DoctorMarkerKind | null {
   const markerKind = detectDoctorMarker(row.content);
   if (markerKind) {
     return markerKind;

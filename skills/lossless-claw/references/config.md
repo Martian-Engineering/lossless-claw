@@ -99,7 +99,9 @@ Debugging:
 
 ### `freshTailCount`
 
-Keeps the newest messages raw instead of compacting them. If the configured count would split the newest user turn, Lossless expands the protected tail to include that user and its following assistant/tool suffix.
+Keeps the newest messages raw during routine compaction. If the configured count would split the newest user turn, Lossless expands the protected tail to include that user and its following assistant/tool suffix.
+
+Forced budget recovery can summarize older, complete assistant/tool groups after the newest user once the authoritative transcript is fully reconciled. It retains the initiating user and recent raw suffix, never splits a tool group, and stops at incomplete or ambiguous calls. Raw history remains persisted. See [forced recovery details](../../../docs/configuration.md).
 
 Why it matters:
 
@@ -117,7 +119,7 @@ Optional token cap for the protected fresh tail.
 Why it matters:
 
 - Prevents a few huge tool results from making the "fresh" suffix effectively uncompactable.
-- Still preserves the newest user message and its following assistant/tool suffix even when that turn exceeds the cap.
+- Routine compaction preserves the newest user and its following suffix even above the cap. Forced budget recovery may summarize older complete tool groups, as described above.
 
 Good starting range:
 

@@ -61,6 +61,12 @@ async function runAfterTurn(
     tokenBudget: options.tokenBudget,
     currentTokenCount: options.currentTokenCount,
   });
+  if (options.tokenBudget === 10_000) {
+    await engine.maintain({
+      sessionId, sessionFile,
+      runtimeContext: { allowDeferredCompactionExecution: true, ...options },
+    });
+  }
 }
 
 /** Wait until the batch has exactly `count` nodes, all ready. */
@@ -103,7 +109,7 @@ describe("pending summary compaction engine e2e (mocked LLM)", () => {
       ).resolves.toBeNull();
 
       // Threshold handling synchronously queues publication-ready-only, while
-      // the general deferred drain is scheduled for a later idle callback.
+      // the general deferred drain waits for host-owned background maintenance.
       await runAfterTurn(engine, sessionId, sessionFile, {
         tokenBudget: 600,
         currentTokenCount: 500,

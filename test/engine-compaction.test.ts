@@ -1538,6 +1538,7 @@ describe("LcmContextEngine.compact token budget plumbing", () => {
     });
     vi.spyOn(privateEngine.compaction, "compactUntilUnder").mockResolvedValue({
       success: true,
+      actionTaken: false,
       rounds: 0,
       finalTokens: 2_000,
     });
@@ -1685,6 +1686,7 @@ describe("LcmContextEngine.compact token budget plumbing", () => {
     const compactFullSweepSpy = vi.spyOn(privateEngine.compaction, "compactFullSweep");
     const compactUntilUnderSpy = vi.spyOn(privateEngine.compaction, "compactUntilUnder").mockResolvedValue({
       success: true,
+      actionTaken: true,
       rounds: 2,
       finalTokens: 149_500,
     });
@@ -1750,6 +1752,7 @@ describe("LcmContextEngine.compact token budget plumbing", () => {
       .spyOn(privateEngine.compaction, "compactUntilUnder")
       .mockResolvedValue({
         success: true,
+        actionTaken: true,
         rounds: 1,
         finalTokens: 200_000,
       });
@@ -1805,6 +1808,7 @@ describe("LcmContextEngine.compact token budget plumbing", () => {
     const compactFullSweepSpy = vi.spyOn(privateEngine.compaction, "compactFullSweep");
     const compactUntilUnderSpy = vi.spyOn(privateEngine.compaction, "compactUntilUnder").mockResolvedValue({
       success: true,
+      actionTaken: true,
       rounds: 1,
       finalTokens: 88_000,
     });

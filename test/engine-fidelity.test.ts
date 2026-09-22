@@ -1805,6 +1805,7 @@ describe("LcmContextEngine fidelity and token budget", () => {
         await input.summarize("source text for custom summarizer");
         return {
           success: false,
+          actionTaken: true,
           rounds: 1,
           finalTokens: 3_500,
         };
@@ -1862,6 +1863,7 @@ describe("LcmContextEngine fidelity and token budget", () => {
       await input.summarize("source text for custom summarizer");
       return {
         success: false,
+        actionTaken: true,
         rounds: 1,
         finalTokens: 3_500,
       };

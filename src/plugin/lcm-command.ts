@@ -1078,7 +1078,7 @@ function buildTargetSummaryValuesSql(summaryIds: string[]): string {
   return summaryIds.map(() => "(?)").join(", ");
 }
 
-function loadDoctorApplyRepairMetrics(
+export function loadDoctorApplyRepairMetrics(
   db: DatabaseSync,
   doctor: DoctorSummaryStats,
 ): DoctorApplyRepairMetrics {
@@ -1148,7 +1148,7 @@ function loadDoctorApplyRepairMetrics(
   };
 }
 
-function buildDoctorApplySafetyPreflight(params: {
+export function buildDoctorApplySafetyPreflight(params: {
   config: LcmConfig;
   doctor: DoctorSummaryStats;
   repairMetrics: DoctorApplyRepairMetrics;

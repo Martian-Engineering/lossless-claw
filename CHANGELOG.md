@@ -1,5 +1,84 @@
 # @martian-engineering/lossless-claw
 
+## 1.1.0
+
+<!-- release-rollback-version: 1.0.0 -->
+
+### OpenClaw host note
+
+OpenClaw 2026.9.2 and 2026.9.4 can duplicate the current user message in model
+context during bootstrap. This pre-existing host issue is fixed upstream in
+[OpenClaw #149690](https://github.com/openclaw/openclaw/pull/149690). A source
+build containing that fix passes a fresh two-turn gateway check with this
+Lossless release candidate. OpenClaw 2026.9.5 is the expected fixed release;
+confirm its stable publication before upgrading. Lossless 1.1.0 retains its
+OpenClaw 2026.9.2 minimum.
+
+### Minor Changes
+
+- [#1185](https://github.com/Martian-Engineering/lossless-claw/pull/1185) [`c82b992`](https://github.com/Martian-Engineering/lossless-claw/commit/c82b992551d5c18a1a6d982be5c933733d88a342) Thanks [@jalehman](https://github.com/jalehman)! - Add a read-only Context explorer native session panel with active-summary
+  metadata, token totals, summary text, and child-summary drill-down. Explicitly
+  distinguish stored active context from the last model prompt. Require OpenClaw
+  2026.9.2+, the first stable release with native plugin UI; older hosts can keep
+  their compatible Lossless release and use lcm-tui.
+
+- [#1185](https://github.com/Martian-Engineering/lossless-claw/pull/1185) [`c82b992`](https://github.com/Martian-Engineering/lossless-claw/commit/c82b992551d5c18a1a6d982be5c933733d88a342) Thanks [@jalehman](https://github.com/jalehman)! - Add a compact version/database footer, reveal flagged summaries directly from
+  Context explorer checks, and offer a native-style, explicitly confirmed repair
+  flow with doctor preflights and offline acknowledgement. Scope confirmations to
+  the reviewed targets, preserve backup-first repairs, reject stale/concurrent
+  requests, and clear emergency markers after successful rewrites.
+
+- [#1185](https://github.com/Martian-Engineering/lossless-claw/pull/1185) [`c82b992`](https://github.com/Martian-Engineering/lossless-claw/commit/c82b992551d5c18a1a6d982be5c933733d88a342) Thanks [@jalehman](https://github.com/jalehman)! - Show doctor-aligned fallback, truncation, and emergency warnings in the Context
+  explorer, including nested summaries. Add an on-demand, read-only summary quality
+  check for the selected conversation without model calls or repair side effects.
+
+- [#1170](https://github.com/Martian-Engineering/lossless-claw/pull/1170) [`db29bc6`](https://github.com/Martian-Engineering/lossless-claw/commit/db29bc6dbeb1d9181ba020379b6f7ffc96079d4b) Thanks [@cv-forever](https://github.com/cv-forever)! - Add the opt-in `preserveHeartbeatPoll` configuration option to retain heartbeat poll events in stored and assembled context. When `pruneHeartbeatOk` is enabled, preserve poll and intermediate messages while removing pure `HEARTBEAT_OK` acknowledgements across transcript projection and durable turn commits.
+
+### Patch Changes
+
+- [#1145](https://github.com/Martian-Engineering/lossless-claw/pull/1145) [`c6d06e5`](https://github.com/Martian-Engineering/lossless-claw/commit/c6d06e528867004c85ae84897019d94f0cdbea50) Thanks [@jalehman](https://github.com/jalehman)! - Accept the retired `transcriptGcEnabled` and `autoRotateSessionFiles` settings so upgrades from 0.15 continue to load. Lossless ignores both settings and logs a startup warning that asks operators to remove them.
+
+- [#1185](https://github.com/Martian-Engineering/lossless-claw/pull/1185) [`c82b992`](https://github.com/Martian-Engineering/lossless-claw/commit/c82b992551d5c18a1a6d982be5c933733d88a342) Thanks [@jalehman](https://github.com/jalehman)! - Make Context explorer inherit the selected OpenClaw theme’s colors, accents,
+  focus outlines, hover surfaces, and UI font, including live theme changes.
+
+- [#1185](https://github.com/Martian-Engineering/lossless-claw/pull/1185) [`c82b992`](https://github.com/Martian-Engineering/lossless-claw/commit/c82b992551d5c18a1a6d982be5c933733d88a342) Thanks [@jalehman](https://github.com/jalehman)! - Show numeric summary depth badges (D0, D1, and higher) in Context explorer and
+  add an accessible loading spinner to the repair confirmation button.
+
+- [#1185](https://github.com/Martian-Engineering/lossless-claw/pull/1185) [`c82b992`](https://github.com/Martian-Engineering/lossless-claw/commit/c82b992551d5c18a1a6d982be5c933733d88a342) Thanks [@jalehman](https://github.com/jalehman)! - Polish Context explorer with readable source-summary previews, friendlier labels,
+  leaf-only message counts, and a compact conversation-size and doctor-compatible
+  compression overview. Hide internal summary IDs.
+
+- [#1185](https://github.com/Martian-Engineering/lossless-claw/pull/1185) [`c82b992`](https://github.com/Martian-Engineering/lossless-claw/commit/c82b992551d5c18a1a6d982be5c933733d88a342) Thanks [@jalehman](https://github.com/jalehman)! - Rename the context explorer session tab to LCM.
+
+- [#1185](https://github.com/Martian-Engineering/lossless-claw/pull/1185) [`c82b992`](https://github.com/Martian-Engineering/lossless-claw/commit/c82b992551d5c18a1a6d982be5c933733d88a342) Thanks [@jalehman](https://github.com/jalehman)! - Make Context explorer scrollable with sanitized Markdown previews, full-summary
+  expansion, and recursively indented descendant summaries.
+
+- [#1185](https://github.com/Martian-Engineering/lossless-claw/pull/1185) [`c82b992`](https://github.com/Martian-Engineering/lossless-claw/commit/c82b992551d5c18a1a6d982be5c933733d88a342) Thanks [@jalehman](https://github.com/jalehman)! - Check the LCM panel against OpenClaw's public SDK types instead of a locally maintained structural subset, without adding host runtime code to the browser bundle.
+
+- [#1155](https://github.com/Martian-Engineering/lossless-claw/pull/1155) [`188b235`](https://github.com/Martian-Engineering/lossless-claw/commit/188b235e46839893ef52a4915ba0e98206b94ff9) Thanks [@FtlC-ian](https://github.com/FtlC-ian)! - Avoid scanning unrelated message history when resolving summary source ranges. This prevents repeated synchronous database scans from stalling context assembly on large databases while preserving summary coverage and generated context.
+
+- [#1186](https://github.com/Martian-Engineering/lossless-claw/pull/1186) [`fb03f8a`](https://github.com/Martian-Engineering/lossless-claw/commit/fb03f8a79671489ac4d565cda1c9246c5d0a5f20) Thanks [@jalehman](https://github.com/jalehman)! - Report forced compaction as changed only when a summary pass commits work. Preserve partial progress when later passes fail, and avoid opening summary-spend backoff when no model or custom summarizer call was attempted.
+
+- [#1184](https://github.com/Martian-Engineering/lossless-claw/pull/1184) [`c4b5090`](https://github.com/Martian-Engineering/lossless-claw/commit/c4b5090690222c831b08deda3f98da4db2fa49a9) Thanks [@jalehman](https://github.com/jalehman)! - Run pending-summary preparation and deferred compaction in awaited, host-owned
+  background maintenance instead of detached turn callbacks. Preserve prepare-only
+  and threshold publication behavior without blocking foreground ingestion. Treat
+  closed host async scopes as lifecycle failures rather than provider failures,
+  preventing provider retries and deterministic fallback for this condition.
+
+- [#1163](https://github.com/Martian-Engineering/lossless-claw/pull/1163) [`703cc0f`](https://github.com/Martian-Engineering/lossless-claw/commit/703cc0f57a50b667cdd7e767fd9808c533a3cfb4) Thanks [@jalehman](https://github.com/jalehman)! - Preserve retained user replay identity and adjacent OpenClaw runtime context during context assembly.
+
+- [#1175](https://github.com/Martian-Engineering/lossless-claw/pull/1175) [`6586d56`](https://github.com/Martian-Engineering/lossless-claw/commit/6586d56efa7c53af7eb8c6807335f79cdcc9e42e) Thanks [@PollyBot13](https://github.com/PollyBot13)! - Reduce bootstrap reconciliation work without changing transcript-anchor checks: avoid token accounting for identity-only comparisons and skip adoption attempts on rows that already have transcript IDs.
+
+- [#1188](https://github.com/Martian-Engineering/lossless-claw/pull/1188) [`3a2409c`](https://github.com/Martian-Engineering/lossless-claw/commit/3a2409c55dd6aab5298e25601564b3cc6d2d233a) Thanks [@jalehman](https://github.com/jalehman)! - Recover first-turn and tool-heavy context overflows by reconciling the authoritative OpenClaw transcript and summarizing older complete tool groups while preserving the initiating user, recent raw context, and persisted history. Refuse current-turn compaction when transcript coverage or tool pairing is uncertain.
+
+- [#1149](https://github.com/Martian-Engineering/lossless-claw/pull/1149) [`c84dd8c`](https://github.com/Martian-Engineering/lossless-claw/commit/c84dd8cff727eff3bb6c9a26f3cf4c0510fbc343) Thanks [@jarvis-mns1](https://github.com/jarvis-mns1)! - Keep assistant tool calls and their results as one atomic unit when degraded or serialized-budget fallback trims live context. This prevents oversized multimodal tool results from reaching providers as orphaned outputs and failing the next model request.
+
+- [#1162](https://github.com/Martian-Engineering/lossless-claw/pull/1162) [`a3eedf5`](https://github.com/Martian-Engineering/lossless-claw/commit/a3eedf5c94ea838fa0a1eeb28bb2388eb450de78) Thanks [@Marvinthebored](https://github.com/Marvinthebored)! - Verify structured tool provenance and payloads before adopting transcript anchors or deduplicating replays. Treat blank-text and ambiguous weak matches as unproven, and stop re-verifying mismatched legacy tool anchors. Preserve all message content when continuity is uncertain.
+
+- [#1157](https://github.com/Martian-Engineering/lossless-claw/pull/1157) [`946441f`](https://github.com/Martian-Engineering/lossless-claw/commit/946441fcd1fd8b13044fc066f434b9ca9455a42a) Thanks [@mpz4life](https://github.com/mpz4life)! - Clear deferred compaction debt when a threshold sweep made progress, then stalled above the ideal target, and both the stored context and observed prompt projection fit the token budget. Keep recoverable debt pending when a sweep stops at a work limit or is still reducing context. Sweeps without a usable observed prompt count retain the strict threshold verdict.
+
+- [#1165](https://github.com/Martian-Engineering/lossless-claw/pull/1165) [`621b702`](https://github.com/Martian-Engineering/lossless-claw/commit/621b702e349f22444e362c2a1db14f87c6fc3ca9) Thanks [@igs-rogenlo](https://github.com/igs-rogenlo)! - Report `no_override_matched_window_metadata_absent` when no context threshold override matches, a window-range rule is configured, and the host supplies no model context-window metadata. This distinguishes missing metadata from an out-of-range window without changing threshold selection.
+
 ## 1.0.0
 
 <!-- release-rollback-version: 0.15.6 -->

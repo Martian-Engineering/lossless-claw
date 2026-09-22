@@ -2,11 +2,12 @@
 
 Lossless-claw reads plugin configuration from `plugins.entries.lossless-claw.config`.
 
-Lossless-claw requires OpenClaw `2026.7.2-beta.2` or newer so the host can provide
-the branch-safe visible transcript projection used during SQLite session bootstrap
-and enforce context-engine runtime capabilities before an agent run starts. That
-beta is the first published build with the required API; stable `2026.7.1` does
-not provide it.
+Lossless-claw requires OpenClaw `2026.9.2` or newer, the first stable release with
+native plugin session panels. It also provides the branch-safe visible transcript
+projection used during SQLite session bootstrap and context-engine runtime
+capability enforcement. Enable **Settings → Labs → Custom plugin UI** for the
+[Context explorer](context-explorer.md). If you cannot upgrade, keep your earlier
+compatible Lossless release and use `lcm-tui` to inspect context.
 Agent runs need a native host that provides the full context-engine lifecycle:
 session bootstrap, pre-prompt assembly, after-turn ingestion, maintenance,
 compaction, and runtime LLM completion. Native Codex and Pi embedded runs provide
@@ -286,8 +287,8 @@ Lossless-claw writes routine operational JSONL logs by default at `/tmp/openclaw
 | --- | --- | --- | --- | --- |
 | `contextThreshold` | `number` | `0.75` | `LCM_CONTEXT_THRESHOLD` | Fraction of the active model context window that triggers compaction. |
 | `contextThresholdOverrides` | `Array<{ name?: string; match: object; contextThreshold: number; freshTailCount?: integer; leafChunkTokens?: integer }>` | `[]` | none | Optional ordered rules that override `contextThreshold` and, optionally, `freshTailCount` and `leafChunkTokens` by model id, model context-window range, or session glob pattern. |
-| `freshTailCount` | `integer` | `64` | `LCM_FRESH_TAIL_COUNT` | Number of newest messages always kept raw. |
-| `freshTailMaxTokens` | `integer` | unset | `LCM_FRESH_TAIL_MAX_TOKENS` | Optional token cap for the protected fresh tail. The newest message is always preserved even if it exceeds the cap. |
+| `freshTailCount` | `integer` | `64` | `LCM_FRESH_TAIL_COUNT` | Number of recent raw messages protected from compaction. Routine compaction also protects the entire newest user turn; see forced overflow recovery below. |
+| `freshTailMaxTokens` | `integer` | unset | `LCM_FRESH_TAIL_MAX_TOKENS` | Optional token cap for the protected fresh tail. Routine compaction preserves the newest user turn even above the cap. Forced overflow recovery keeps its user and complete recent tool groups. |
 | `promptAwareEviction` | `boolean` | `false` | `LCM_PROMPT_AWARE_EVICTION_ENABLED` | When enabled, budget-constrained assembly keeps older evictable items by prompt relevance instead of pure chronology. This improves retrieval under tight budgets, but it can reduce prompt-cache hit rates because the preserved prefix changes as prompts change. |
 | `stubLargeToolPayloads` | `boolean` | `false` | `LCM_STUB_LARGE_TOOL_PAYLOADS` | When enabled, evictable tool-result rows backfilled with `messages.large_content` are assembled as `[LCM Tool Output: file_xxx ...]` stubs while the fresh tail stays inline. Requires `scripts/lcm-blob-migrate.mjs`, which defaults to the same large-files root as runtime LCM (`LCM_LARGE_FILES_DIR` or `${OPENCLAW_STATE_DIR}/lcm-files`). |
 | `leafMinFanout` | `integer` | `8` | `LCM_LEAF_MIN_FANOUT` | Minimum number of raw messages required before a leaf pass runs. |
@@ -378,6 +379,8 @@ Automatic compaction is threshold-only:
 - pre-assembly drain is reserved as an emergency safeguard when the live prompt is already over the active token budget
 
 Lossless still records prompt-cache telemetry for status and diagnostics, but cache hotness no longer delays threshold debt. Legacy `cacheAwareCompaction.*` and `dynamicLeafChunkTokens.*` settings remain accepted so existing OpenClaw config continues to load, but they do not change automatic compaction behavior.
+
+Forced budget recovery first reconciles OpenClaw's authoritative visible transcript, including a first turn that has not reached `afterTurn`. It may summarize older, fully matched assistant/tool groups within the current turn while retaining the initiating user and a recent raw suffix bounded by `freshTailCount` and `freshTailMaxTokens`. A tool group is never split across the boundary. Incomplete or ambiguous groups block further in-turn compaction; uncertain transcript coverage refuses this exception. Persisted messages and tool payloads remain available for recall. Recovery summaries stay in chronological order as untrusted assistant history so they do not become a new user boundary. Routine threshold compaction and pending summary preparation retain their existing newest-user protection. A protected or unresolved suffix can still exceed the provider budget; recovery does not guarantee every overflow is recoverable.
 
 `contextThresholdOverrides` are optional and never replace the global fallback. Each rule's `match` object can include `model`, `modelContextWindowMin`, `modelContextWindowMax`, and `sessionPattern`; all fields in a rule must match. If several rules match, Lossless picks the highest-specificity rule, then the earliest rule in the array for ties. Exact `model` matches have higher specificity than `sessionPattern` matches, and session-pattern matches have higher specificity than context-window range matches. A matching rule may also set `freshTailCount`, which overrides the global fresh-tail count for assembly and threshold compaction, and `leafChunkTokens`, which overrides the global leaf chunk size for matching threshold sweeps. Threshold selection logs include the chosen threshold, source, rule index/name, token budget, threshold tokens, fresh-tail count, leaf chunk size, model, context-window value, and match reason.
 

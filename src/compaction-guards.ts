@@ -238,15 +238,19 @@ export class CompactionGuards {
     return state.backoffUntil > Date.now() ? new Date(state.backoffUntil) : null;
   }
 
+  /** Guard provider calls and observe attempts only after spend admission. */
   buildSummarySpendGuardedDeps(params: {
     scopeKey: string;
     reason: string;
+    /** Observe allowed model calls, excluding guard rejections. */
+    onAttempt?: () => void;
   }): LcmDependencies {
     const complete: CompleteFn = async (input) => {
       this.assertSummarySpendCallAllowed({
         scopeKey: params.scopeKey,
         reason: params.reason,
       });
+      params.onAttempt?.();
       try {
         const result = await this.deps.complete(input);
         if (!extractProviderAuthFailure(result, { requireStructuralSignal: true })) {
@@ -272,15 +276,19 @@ export class CompactionGuards {
     };
   }
 
+  /** Apply the same spend admission and attempt accounting to custom summarizers. */
   guardCustomSummarize(params: {
     summarize: LcmSummarizeFn;
     scopeKey: string;
+    /** Observe allowed custom summarizer calls, excluding guard rejections. */
+    onAttempt?: () => void;
   }): LcmSummarizeFn {
     return async (text, aggressive, options) => {
       this.assertSummarySpendCallAllowed({
         scopeKey: params.scopeKey,
         reason: "custom summarizer call",
       });
+      params.onAttempt?.();
       try {
         const result = await params.summarize(text, aggressive, options);
         this.recordSummarySpendCall({

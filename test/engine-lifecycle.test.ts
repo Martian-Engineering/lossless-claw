@@ -43,6 +43,7 @@ describe("LcmContextEngine metadata", () => {
     expect(engine.info.version).toBe(packageJson.version);
     expect(engine.info.acceptedHostParams).toEqual([
       "sessionKey",
+      "sessionTarget",
       "prompt",
       "runtimeContext",
       "runtimeSettings",

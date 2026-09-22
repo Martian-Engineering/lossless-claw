@@ -120,7 +120,7 @@ The command defaults to `${OPENCLAW_STATE_DIR:-~/.openclaw}` and `${OPENCLAW_STA
 - Node.js 22+
 - An LLM provider configured in OpenClaw (used for summarization)
 
-> **Compatibility:** `lossless-claw` requires OpenClaw `2026.7.2-beta.2` or newer. That beta is the first published build with the branch-safe visible transcript projection used to bootstrap SQLite-backed sessions; stable `2026.7.1` does not provide it. If you cannot use a beta or upgrade OpenClaw, stay on a `lossless-claw` release compatible with your installed OpenClaw version.
+> **Compatibility:** `lossless-claw` requires OpenClaw `2026.9.2` or newer, the first stable release with native plugin session panels. The Context explorer requires **Settings → Labs → Custom plugin UI**. If you cannot upgrade, keep your earlier compatible Lossless release and use `lcm-tui` to inspect context. See [Context explorer](docs/context-explorer.md).
 
 On OpenClaw hosts that advertise the durable context-engine turn contract,
 LosslessClaw declares current-turn transcript fencing and commits each accepted

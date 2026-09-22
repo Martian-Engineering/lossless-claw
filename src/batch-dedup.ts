@@ -588,12 +588,7 @@ export class BatchDeduplicator {
   }): Promise<Map<number, { messageId: number; decorated: boolean }>> {
     const tailWindow = Math.max(1, Math.floor(params.tailWindow));
     const tail = await this.conversationStore.getLastMessages(params.conversationId, tailWindow);
-    const tailHashes = await this.conversationStore.getRecentMessageIdentityHashes(
-      params.conversationId,
-      tailWindow,
-    );
     const plan = new Map<number, { messageId: number; decorated: boolean }>();
-    if (tail.length !== tailHashes.length) return plan;
     // Preserve the decorated path's role-specific window, which can reach
     // further back than the mixed-role exact-match tail.
     const users = await this.conversationStore.listRecentUnstampedMessagesByRole(
@@ -602,6 +597,11 @@ export class BatchDeduplicator {
       tailWindow,
     );
     if (users.length === 0 && tail.every((row) => row.transcriptEntryId)) return plan;
+    const tailHashes = await this.conversationStore.getRecentMessageIdentityHashes(
+      params.conversationId,
+      tailWindow,
+    );
+    if (tail.length !== tailHashes.length) return plan;
 
     type Candidate = {
       row: Pick<MessageRecord, "messageId" | "createdAt">;

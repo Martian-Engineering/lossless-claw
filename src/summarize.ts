@@ -205,6 +205,14 @@ export class LcmRuntimeLlmUnavailableError extends Error {
   }
 }
 
+/** Host ownership failures must not become provider retries or lossy fallback. */
+export class LcmRuntimeLifecycleError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "LcmRuntimeLifecycleError";
+  }
+}
+
 /** Signals that Lossless has opened its non-auth summarization spend guard. */
 export class LcmSummarySpendLimitError extends Error {
   readonly scopeKey: string;
@@ -1645,6 +1653,9 @@ export async function createLcmSummarizeFromLegacyParams(params: {
       ): Promise<Awaited<ReturnType<typeof params.deps.complete>>> => {
         try {
           const result = await runSummarizerCall(label, reasoning, maxTokensOverride);
+          if (result.error?.kind === "runtime_lifecycle") {
+            throw new LcmRuntimeLifecycleError(result.error.message ?? "Host runtime lifecycle ended");
+          }
           const policyFailure = extractRuntimeLlmPolicyFailure(result);
           if (policyFailure) {
             throw new LcmRuntimeLlmPolicyError({
@@ -1680,6 +1691,7 @@ export async function createLcmSummarizeFromLegacyParams(params: {
           return result;
         } catch (err) {
           if (
+            err instanceof LcmRuntimeLifecycleError ||
             err instanceof LcmRuntimeLlmPolicyError ||
             err instanceof LcmRuntimeLlmUnavailableError ||
             err instanceof LcmSummarySpendLimitError ||
@@ -1704,7 +1716,7 @@ export async function createLcmSummarizeFromLegacyParams(params: {
           params.deps.log.error(err.message);
           throw err;
         }
-        if (err instanceof LcmRuntimeLlmUnavailableError) {
+        if (err instanceof LcmRuntimeLlmUnavailableError || err instanceof LcmRuntimeLifecycleError) {
           params.deps.log.error(err.message);
           throw err;
         }
@@ -1925,7 +1937,7 @@ export async function createLcmSummarizeFromLegacyParams(params: {
             params.deps.log.error(retryErr.message);
             throw retryErr;
           }
-          if (retryErr instanceof LcmRuntimeLlmUnavailableError) {
+          if (retryErr instanceof LcmRuntimeLlmUnavailableError || retryErr instanceof LcmRuntimeLifecycleError) {
             params.deps.log.error(retryErr.message);
             throw retryErr;
           }

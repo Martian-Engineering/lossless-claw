@@ -1,5 +1,9 @@
 {
   "id": "lossless-claw",
+  "controlUi": {
+    "entry": "dist/control-ui/index.js",
+    "styles": ["dist/control-ui/index.css"]
+  },
   "name": "Lossless Context Management",
   "kind": "context-engine",
   "activation": {
@@ -71,11 +75,11 @@
     },
     "freshTailCount": {
       "label": "Fresh Tail Count",
-      "help": "Number of recent messages protected from compaction"
+      "help": "Number of recent messages protected from compaction; forced overflow recovery can summarize older complete tool groups while retaining their initiating user"
     },
     "freshTailMaxTokens": {
       "label": "Fresh Tail Max Tokens",
-      "help": "Optional token cap for the protected fresh tail; the newest user message and its following assistant/tool suffix are always preserved"
+      "help": "Optional token cap for the protected fresh tail; routine compaction preserves the newest user-led suffix, while forced overflow recovery may summarize older complete tool groups"
     },
     "promptAwareEviction": {
       "label": "Prompt-Aware Eviction",

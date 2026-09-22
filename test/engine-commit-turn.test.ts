@@ -572,11 +572,23 @@ describe("LcmContextEngine commitTurn", () => {
     await seedBacklogContext(engine, params.sessionId, [120, 120]);
 
     await expect(engine.commitTurn(params)).resolves.toEqual({ status: "committed" });
+    expect(complete).not.toHaveBeenCalled();
+    await engine.maintain({
+      sessionId: params.sessionId, sessionKey: params.sessionKey, sessionFile: "unused",
+      runtimeContext: { allowDeferredCompactionExecution: true },
+    });
 
     const conversation = await engine
       .getConversationStore()
       .getConversationBySessionId(params.sessionId);
     expect(conversation).not.toBeNull();
+    // maxSweepIterations=1 allows planning only in the first host pass.
+    // Resume in a new owned pass, not a detached retry after the first returns.
+    expect(complete).not.toHaveBeenCalled();
+    await engine.maintain({
+      sessionId: params.sessionId, sessionKey: params.sessionKey, sessionFile: "unused",
+      runtimeContext: { allowDeferredCompactionExecution: true },
+    });
     await vi.waitFor(async () => {
       expect(complete.mock.calls.length).toBeGreaterThan(0);
       const batch = await engine
@@ -619,6 +631,11 @@ describe("LcmContextEngine commitTurn", () => {
     await seedBacklogContext(engine, params.sessionId, [120, 120]);
 
     await expect(engine.commitTurn(params)).resolves.toEqual({ status: "committed" });
+    expect(complete).not.toHaveBeenCalled();
+    await engine.maintain({
+      sessionId: params.sessionId, sessionKey: params.sessionKey, sessionFile: "unused",
+      runtimeContext: { allowDeferredCompactionExecution: true },
+    });
 
     await vi.waitFor(() => {
       expect(warn).toHaveBeenCalledWith(

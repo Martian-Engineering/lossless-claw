@@ -101,7 +101,7 @@ export type LcmConfig = {
   /** Optional ordered rules that override contextThreshold for matching runtime contexts. */
   contextThresholdOverrides?: ContextThresholdOverride[];
   freshTailCount: number;
-  /** Optional token cap for the protected fresh tail; the newest user-led suffix is preserved. */
+  /** Optional token cap for the fresh tail; routine compaction preserves the newest user-led suffix. */
   freshTailMaxTokens?: number;
   /** When true, budget-constrained assembly may keep older items by prompt relevance instead of pure chronology. */
   promptAwareEviction: boolean;

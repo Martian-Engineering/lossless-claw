@@ -1,6 +1,6 @@
 {
   "name": "@martian-engineering/lossless-claw",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "description": "Lossless Context Management plugin for OpenClaw — DAG-based conversation summarization with threshold compaction",
   "type": "module",
   "main": "dist/index.js",
@@ -20,7 +20,7 @@
     "dag"
   ],
   "scripts": {
-    "build": "npm run build:plugin && npm run build:migrate-sessions && npm run build:cli",
+    "build": "npm run build:plugin && npm run build:migrate-sessions && npm run build:cli && npm run build:ui",
     "build:plugin": "esbuild index.ts --bundle --platform=node --target=node22 --format=esm --outfile=dist/index.js --external:openclaw --external:\"@earendil-works/*\" --minify-whitespace",
     "build:migrate-sessions": "esbuild src/cli/migrate-sessions.ts --bundle --platform=node --target=node22 --format=esm --outfile=dist/migrate-sessions.js --external:openclaw --external:\"@earendil-works/*\" --minify-whitespace",
     "build:cli": "esbuild cli.ts --bundle --platform=node --target=node22 --format=esm --outfile=dist/cli.js --minify-whitespace",
@@ -29,8 +29,9 @@
     "release:verify": "npm run typecheck && npm run build && npm test && npm run test:tui && npm pack --dry-run",
     "test": "vitest run --dir test",
     "test:tui": "cd tui && go test ./...",
-    "typecheck": "tsc --noEmit --pretty false",
-    "version-packages": "changeset version"
+    "typecheck": "tsc --noEmit --pretty false && tsc -p tsconfig.ui.json",
+    "version-packages": "changeset version",
+    "build:ui": "esbuild ui/control-ui.ts --bundle --platform=browser --target=es2022 --format=esm --outfile=dist/control-ui/index.js --minify"
   },
   "files": [
     "dist/",
@@ -52,12 +53,15 @@
     "@earendil-works/pi-agent-core": "^0.79.8",
     "@earendil-works/pi-ai": "^0.79.8",
     "@earendil-works/pi-coding-agent": "^0.79.8",
+    "dompurify": "^3.4.15",
     "esbuild": "^0.28.1",
+    "marked": "^18.0.13",
+    "openclaw": "2026.9.2",
     "typescript": "^5.7.0",
     "vitest": "^4.1.9"
   },
   "peerDependencies": {
-    "openclaw": ">=2026.7.2-beta.2"
+    "openclaw": ">=2026.9.2"
   },
   "peerDependenciesMeta": {
     "openclaw": {
@@ -72,14 +76,14 @@
       "./dist/index.js"
     ],
     "compat": {
-      "pluginApi": ">=2026.7.2-beta.2",
-      "minGatewayVersion": "2026.7.2-beta.2",
+      "pluginApi": ">=2026.9.2",
+      "minGatewayVersion": "2026.9.2",
       "tested": [
-        "2026.7.2-beta.2"
+        "2026.9.4"
       ]
     },
     "build": {
-      "openclawVersion": "2026.7.2-beta.2"
+      "openclawVersion": "2026.9.4"
     }
   },
   "repository": {

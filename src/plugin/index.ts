@@ -5,6 +5,8 @@
  * full-text search, and sub-agent expansion.
  */
 import { join } from "node:path";
+import { registerContextExplorerRepair } from "../context-explorer-repair.js";
+import { registerContextExplorer } from "../context-explorer.js";
 import { writeFile } from "node:fs/promises";
 import type { DatabaseSync } from "node:sqlite";
 import type {
@@ -37,7 +39,7 @@ import type {
 } from "../types.js";
 import { listConfiguredAgentIds, normalizeAgentId } from "./openclaw-agent-ids.js";
 
-const MIN_CONTEXT_ENGINE_OPENCLAW_VERSION = "2026.7.2-beta.2";
+const MIN_CONTEXT_ENGINE_OPENCLAW_VERSION = "2026.9.2";
 
 type PluginSdkCoreModule = {
   delegateCompactionToRuntime?: RuntimeCompactionDelegateFn;
@@ -1392,6 +1394,13 @@ function createLcmDependencies(
         };
       } catch (err) {
         log.error(`[lcm] runtime.llm.complete error: ${describeLogError(err)}`);
+        if (describeLogError(err) === "Async work scope is closed") {
+          return {
+            content: [],
+            error: { kind: "runtime_lifecycle", message: describeLogError(err) },
+            ...requestMetadata,
+          };
+        }
         if (runtimeModelOverride && isRuntimeLlmModelPolicyDenial(err)) {
           return {
             content: [],
@@ -1502,6 +1511,8 @@ function wirePluginHandlers(
   shared: SharedLcmInit,
   openClawConfig?: unknown,
 ): void {
+  registerContextExplorer(api, shared.waitForDatabase);
+  registerContextExplorerRepair(api, shared.waitForDatabase, { config: deps.config, deps, runtimeConfig: openClawConfig });
   api.on("before_reset", async (event, ctx) => {
     await (await shared.waitForEngine()).handleBeforeReset({
       reason: event.reason,

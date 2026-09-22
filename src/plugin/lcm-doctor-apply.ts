@@ -59,8 +59,12 @@ export async function applyScopedDoctorRepair(params: {
   runtimeConfig?: unknown;
   runtimeContext?: Record<string, unknown>;
   sessionKey?: string;
+  /** UI confirmations bind to an exact target set, never newly discovered work. */
+  targetSummaryIds?: string[];
+  beforeCommit?: () => void;
 }): Promise<DoctorApplyResult> {
-  const targets = loadDoctorTargets(params.db, params.conversationId);
+  const targets = loadDoctorTargets(params.db, params.conversationId)
+    .filter(target => !params.targetSummaryIds || params.targetSummaryIds.includes(target.summaryId));
   if (targets.length === 0) {
     return {
       kind: "applied",
@@ -175,6 +179,7 @@ export async function applyScopedDoctorRepair(params: {
 
           params.db.exec("BEGIN IMMEDIATE");
           try {
+            params.beforeCommit?.();
             for (const summaryId of repairedSummaryIds) {
               const override = overrides.get(summaryId);
               if (!override) {
@@ -183,7 +188,8 @@ export async function applyScopedDoctorRepair(params: {
               params.db
                 .prepare(
                   `UPDATE summaries
-                   SET content = ?, token_count = ?
+                   SET content = ?, token_count = ?,
+                     model = CASE WHEN trim(model) = 'emergency-fallback' THEN 'doctor-repair' ELSE model END
                    WHERE summary_id = ?`,
                 )
                 .run(override.content, override.tokenCount, summaryId);

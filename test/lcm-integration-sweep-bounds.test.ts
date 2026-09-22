@@ -322,6 +322,7 @@ describe("LCM integration: compactUntilUnder bounds", () => {
     expect(elapsed).toBeLessThan(5_000);
     // It stopped on the deadline, not by reaching the (unreachable) target.
     expect(result.success).toBe(false);
+    expect(result.actionTaken).toBe(true);
     expect(result.rounds).toBeGreaterThanOrEqual(1);
     expect(result.rounds).toBeLessThan(10);
   });
@@ -349,6 +350,7 @@ describe("LCM integration: compactUntilUnder bounds", () => {
     // finalTokens is the real post-compaction context size: progress was made
     // (below the seeded total) but the target was not reached.
     const liveTokens = await sumStore.getContextTokenCount(CONV_ID);
+    expect(result.actionTaken).toBe(true);
     expect(result.finalTokens).toBe(liveTokens);
     expect(result.finalTokens).toBeGreaterThan(50);
     // Context is internally consistent: the swept prefix is now summaries and
@@ -420,6 +422,7 @@ describe("LCM integration: compactUntilUnder bounds", () => {
     });
 
     expect(result.success).toBe(false);
+    expect(result.actionTaken).toBe(true);
     expect(result.rounds).toBeLessThanOrEqual(maxRounds);
     expect(summarize.mock.calls.length).toBeGreaterThan(0);
     expect(summarize.mock.calls.length).toBeLessThanOrEqual(maxRounds * maxSweepIterations);
