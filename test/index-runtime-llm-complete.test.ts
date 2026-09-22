@@ -2,6 +2,9 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { OpenClawPluginApi } from "../src/openclaw-bridge.js";
+import type { LcmContextEngine } from "../src/engine.js";
+import { seedBacklogContext } from "./helpers.js";
+import { MAX_PENDING_NODE_RETRIES } from "../src/store/pending-summary-store.js";
 import lcmPlugin from "../index.js";
 import { closeLcmConnection } from "../src/db/connection.js";
 import type { CompletionResult, RuntimeCompactionDelegateFn } from "../src/types.js";
@@ -358,12 +361,107 @@ describe("createLcmDependencies.complete runtime.llm bridge", () => {
     }
   });
 
-  it("classifies a closed host work scope separately from provider failures", async () => {
-    const runtimeLlmComplete = vi.fn().mockRejectedValue(new Error("Async work scope is closed"));
-    const { api, getFactory } = buildApi({ runtimeLlmComplete });
-    const engine = getRegisteredEngine(api, getFactory);
-    const result = await engine.deps.complete({ model: "test", messages: [], maxTokens: 100 });
-    expect(result.error).toEqual({ kind: "runtime_lifecycle", message: "Async work scope is closed" });
+  it.each([
+    "Async work scope is closed",
+    "Plugin inventory has retired; begin a new plugin operation.",
+  ])("classifies host lifecycle rejection separately from provider failures: %s", async (message) => {
+    const runtimeLlmComplete = vi.fn().mockRejectedValue(new Error(message));
+    const { api, getFactory, dbPath } = buildApi({ runtimeLlmComplete });
+    try {
+      const engine = getRegisteredEngine(api, getFactory);
+      const result = await engine.deps.complete({ model: "test", messages: [], maxTokens: 100 });
+      expect(result.error).toEqual({ kind: "runtime_lifecycle", message });
+    } finally {
+      closeLcmConnection(dbPath);
+    }
+  });
+
+  it.each([
+    { partial: false, tokenBudget: 10_000 },
+    { partial: true, tokenBudget: 10_000 },
+    { partial: false, tokenBudget: 300 },
+    { partial: true, tokenBudget: 300 },
+  ])("resumes retired-inventory work with fresh maintenance capabilities ($partial, $tokenBudget)", async ({ partial, tokenBudget }) => {
+    const message = "Plugin inventory has retired; begin a new plugin operation.";
+    const retired = vi.fn().mockRejectedValue(new Error(message));
+    if (partial) retired.mockResolvedValueOnce({ text: "prepared before retirement" });
+    const pluginComplete = vi.fn(async () => { throw new Error("must use call-bound capability"); });
+    const { api, getFactory, dbPath } = buildApi({
+      runtimeLlmComplete: pluginComplete,
+      pluginConfig: {
+        freshTailCount: 1, leafChunkTokens: 120, maxSweepIterations: 8,
+        summaryProvider: "anthropic", summaryModel: "claude-opus-4-5",
+      },
+    });
+    const engine = getRegisteredEngine(api, getFactory) as unknown as Pick<
+      LcmContextEngine, "maintain" | "getConversationStore" | "getSummaryStore"
+    > & { inner: LcmContextEngine };
+    try {
+      const sessionId = `retirement-${partial}`;
+      const sessionFile = "/tmp/retirement-unused.jsonl";
+      await seedBacklogContext(engine.inner, sessionId, [120, 120, 120, 120]);
+      const conversation = await engine.getConversationStore().getConversationBySessionId(sessionId);
+      const conversationId = conversation!.conversationId;
+      const sources = await engine.getConversationStore().getMessages(conversationId);
+      const context = await engine.getSummaryStore().getContextItems(conversationId);
+      const maintenanceStore = engine.inner.getCompactionMaintenanceStore();
+      if (tokenBudget === 300) {
+        await maintenanceStore.requestProactiveCompactionDebt({
+          conversationId, reason: "threshold", tokenBudget, currentTokenCount: 480,
+        });
+      }
+      vi.useFakeTimers({ toFake: ["Date"] });
+      const maintain = (complete: RuntimeLlmComplete) => engine.maintain({
+        sessionId, sessionFile,
+        runtimeContext: { allowDeferredCompactionExecution: true, tokenBudget, llm: { complete } },
+      });
+      for (let attempt = 0; attempt <= MAX_PENDING_NODE_RETRIES; attempt++) {
+        const debt = await maintenanceStore.getConversationCompactionMaintenance(conversationId);
+        if (debt?.nextAttemptAfter) vi.setSystemTime(debt.nextAttemptAfter.getTime() + 1);
+        const callsBefore = retired.mock.calls.length;
+        const result = await maintain(retired);
+        expect(result.reason).toContain(message);
+        expect(retired.mock.calls.length - callsBefore).toBe(partial && attempt === 0 ? 2 : 1);
+        const batch = await engine.inner.getPendingSummaryStore().getActiveBatchForConversation(conversationId);
+        expect(batch).not.toBeNull();
+        const nodes = await engine.inner.getPendingSummaryStore().getNodesByBatch(batch!.batchId);
+        expect(nodes.filter(node => node.status === "ready")).toHaveLength(partial ? 1 : 0);
+        expect(nodes.every(node => node.retryCount === 0 && node.leaseOwner === null)).toBe(true);
+        expect(nodes.filter(node => node.status === "planned").length).toBeGreaterThan(0);
+        expect(nodes.every(node => !node.content?.includes("LCM fallback summary"))).toBe(true);
+      }
+      expect(await engine.getSummaryStore().getSummariesByConversation(conversationId)).toEqual([]);
+      expect(await engine.getSummaryStore().getContextItems(conversationId)).toEqual(context);
+      expect(await engine.getConversationStore().getMessages(conversationId)).toEqual(sources);
+      const debt = await maintenanceStore.getConversationCompactionMaintenance(conversationId);
+      if (tokenBudget === 300) expect(debt?.pending).toBe(true);
+      if (debt?.nextAttemptAfter) vi.setSystemTime(debt.nextAttemptAfter.getTime() + 1);
+      const callsBeforeRecovery = retired.mock.calls.length;
+      const fresh = vi.fn().mockResolvedValue({ text: "proper fresh summary" });
+      await maintain(fresh);
+      expect(fresh).toHaveBeenCalled();
+      expect(retired).toHaveBeenCalledTimes(callsBeforeRecovery);
+      expect(pluginComplete).not.toHaveBeenCalled();
+      const summaries = await engine.getSummaryStore().getSummariesByConversation(conversationId);
+      if (tokenBudget === 300) {
+        expect(summaries.length).toBeGreaterThan(0);
+        expect(summaries.every(summary => !summary.content.includes("LCM fallback summary"))).toBe(true);
+        expect(summaries.map(summary => summary.content)).toContain("proper fresh summary");
+      } else {
+        const batch = await engine.inner.getPendingSummaryStore().getActiveBatchForConversation(conversationId);
+        const nodes = await engine.inner.getPendingSummaryStore().getNodesByBatch(batch!.batchId);
+        expect(nodes.every(node => node.status === "ready")).toBe(true);
+        expect(nodes.map(node => node.content)).toContain("proper fresh summary");
+        if (partial) expect(nodes.map(node => node.content)).toContain("prepared before retirement");
+      }
+      expect(await engine.getConversationStore().getMessages(conversationId)).toEqual(sources);
+      const logs = [api.logger.warn, api.logger.error].flatMap(log => vi.mocked(log).mock.calls).flat().join(" ");
+      expect(logs).not.toContain("ALL PROVIDERS EXHAUSTED");
+      expect(logs).not.toContain("Check provider keys and quotas");
+    } finally {
+      vi.useRealTimers();
+      closeLcmConnection(dbPath);
+    }
   });
 
   it("fails clearly when runtime.llm is unavailable", async () => {

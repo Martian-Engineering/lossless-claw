@@ -31,6 +31,7 @@ import {
 import type { ContextItemRecord, SummaryRecord, SummaryStore } from "./store/summary-store.js";
 import {
   LcmProviderAuthError,
+  LcmRuntimeLifecycleError,
   LcmSummarySpendLimitError,
   type LcmSummarizeFn,
 } from "./summarize.js";
@@ -222,6 +223,7 @@ export class PendingCompactionCoordinator {
           depth: node.kind === "condensed" ? node.depth : undefined,
         }),
       estimateTokens,
+      isLifecycleFailure: (error) => error instanceof LcmRuntimeLifecycleError,
       isAuthFailure: (error) => error instanceof LcmProviderAuthError,
       isSpendLimitFailure: (error) => error instanceof LcmSummarySpendLimitError,
     });
@@ -236,6 +238,14 @@ export class PendingCompactionCoordinator {
     }
     if (prepared.status === "spend-limited") {
       return { status: "idle", reason: "summary spend backoff open" };
+    }
+    if (prepared.status === "interrupted") {
+      return {
+        status: "failed",
+        batchId: batch.batchId,
+        nodeId: prepared.nodeId,
+        failureSummary: prepared.failureSummary,
+      };
     }
     if (prepared.status === "failed") {
       // A transient failure leaves the node claimable again after its backoff
