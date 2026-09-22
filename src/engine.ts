@@ -96,7 +96,6 @@ import {
 } from "./summary-fallback.js";
 import {
   attachTranscriptEntryMeta,
-  filterByCreatedAt,
   getTranscriptEntryId,
   resolveTranscriptMessageCreatedAt,
 } from "./transcript.js";
@@ -115,10 +114,6 @@ import { batchHasRawReplayIds, filterPersistedRawIdReplayBatch } from "./raw-id-
 import { PROMPT_RECALL_MAX_MESSAGES, PROMPT_RECALL_SEARCH_CANDIDATE_LIMIT, buildPromptRecallProjectionFingerprint, extractPromptRecallIdentifiers, extractPromptRecallSnippet, findPromptRecallIdentifierIndex, isPromptRecallEligibleRole, normalizePromptRecallCoverageText, normalizePromptRecallText, renderPromptRecallMessage } from "./prompt-recall.js";
 import { extractRuntimePromptTokenCount } from "./token-accounting.js";
 import { asRecord, formatDurationMs, resolvePositiveInteger } from "./value-utils.js";
-import {
-  openClawInboundBodiesMatch,
-  stripLeadingOpenClawInboundTimestamp,
-} from "./openclaw-inbound-metadata.js";
 import { extractOpenClawSenderMetadata } from "./openclaw-sender-metadata.js";
 
 type AgentMessage = Parameters<ContextEngine["ingest"]>[0]["message"];
@@ -2720,43 +2715,6 @@ export class LcmContextEngine implements ContextEngine {
     });
   }
 
-  /**
-   * Adopt one exact decorated runtime face of a bare projected user message.
-   * A repeated body (restart-recovery prompts, "ok") is disambiguated by the
-   * projection's created time: live ingest stores the message's own timestamp,
-   * so the matching row sits within a few milliseconds of the transcript entry.
-   * Without this, every repeat imported a second row and the assembled prefix
-   * alternated between the two faces across runs.
-   */
-  private async adoptDecoratedProjectionEntryId(params: {
-    conversationId: number;
-    bareContent: string;
-    transcriptEntryId: string;
-    bodyIsUniqueInProjection: boolean;
-    createdAt?: Date | string;
-  }): Promise<boolean> {
-    const candidates = await this.conversationStore.listRecentUnstampedMessagesByRole(
-      params.conversationId,
-      "user",
-      this.config.freshTailCount,
-    );
-    const bodyMatches = candidates.filter((candidate) =>
-      openClawInboundBodiesMatch(candidate.content, params.bareContent),
-    );
-    const matches =
-      params.bodyIsUniqueInProjection && bodyMatches.length === 1
-        ? bodyMatches
-        : filterByCreatedAt(bodyMatches, params.createdAt);
-    if (matches.length !== 1) {
-      return false;
-    }
-    return this.conversationStore.adoptTranscriptEntryIdForMessage(
-      params.conversationId,
-      matches[0]!.messageId,
-      params.transcriptEntryId,
-    );
-  }
-
   private async reconcileProjectedTranscriptMessages(params: {
     sessionId: string;
     sessionKey?: string;
@@ -2783,17 +2741,12 @@ export class LcmContextEngine implements ContextEngine {
             entryIds,
           )
         : new Set<string>();
-    const projectedUserBodyCounts = new Map<string, number>();
-    for (const message of params.historicalMessages) {
-      const stored = toStoredMessage(message);
-      if (stored.role === "user") {
-        const body = stripLeadingOpenClawInboundTimestamp(stored.content);
-        projectedUserBodyCounts.set(
-          body,
-          (projectedUserBodyCounts.get(body) ?? 0) + 1,
-        );
-      }
-    }
+    const adoptionPlan = await this.batchDeduplicator.planRecentTranscriptEntryAdoptions({
+      conversationId: params.conversationId,
+      messages: params.historicalMessages,
+      tailWindow: this.config.freshTailCount,
+      existingEntryIds,
+    });
 
     for (let index = 0; index < params.historicalMessages.length; index += 1) {
       const message = params.historicalMessages[index]!;
@@ -2866,49 +2819,33 @@ export class LcmContextEngine implements ContextEngine {
       }
 
       const stored = toStoredMessage(message);
+      const canUseWeakIdentityAdoption =
+        (!params.legacyPrefixAnchorEntryId || hasOverlap) && !establishedEpochBoundary;
+      const adoption = adoptionPlan.get(index);
       if (
         entryId &&
+        !existingEntryIds.has(entryId) &&
         !establishedEpochBoundary &&
-        stored.role === "user" &&
-        (await this.adoptDecoratedProjectionEntryId({
-          conversationId: params.conversationId,
-          bareContent: stored.content,
-          transcriptEntryId: entryId,
-          bodyIsUniqueInProjection:
-            projectedUserBodyCounts.get(stripLeadingOpenClawInboundTimestamp(stored.content)) ===
-            1,
-          createdAt: resolveTranscriptMessageCreatedAt(message),
-        }))
+        adoption &&
+        (adoption.decorated || canUseWeakIdentityAdoption) &&
+        (await this.conversationStore.adoptTranscriptEntryIdForMessage(
+          params.conversationId,
+          adoption.messageId,
+          entryId,
+        ))
       ) {
         await this.markProjectionReconciledAnchorTrusted({
           conversationId: params.conversationId,
           transcriptEntryId: entryId,
-          reason: "decorated runtime row adopted as projection anchor",
+          reason: adoption.decorated
+            ? "decorated runtime row adopted as projection anchor"
+            : "recent externalized tail message adopted as projection anchor",
         });
         hasOverlap = true;
         overlapAnchorIndex = index;
         continue;
       }
-
-      const canUseWeakIdentityAdoption =
-        (!params.legacyPrefixAnchorEntryId || hasOverlap) && !establishedEpochBoundary;
       if (entryId && canUseWeakIdentityAdoption) {
-        const adoptedExternalized = await this.batchDeduplicator.adoptRecentTranscriptEntryIdForMessage({
-          conversationId: params.conversationId,
-          message,
-          transcriptEntryId: entryId,
-          tailWindow: this.config.freshTailCount,
-        });
-        if (adoptedExternalized) {
-          await this.markProjectionReconciledAnchorTrusted({
-            conversationId: params.conversationId,
-            transcriptEntryId: entryId,
-            reason: "recent externalized tail message adopted as projection anchor",
-          });
-          hasOverlap = true;
-          overlapAnchorIndex = index;
-          continue;
-        }
         if (
           hasOverlap &&
           stored.content.trim() !== "" &&

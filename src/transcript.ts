@@ -61,7 +61,7 @@ export function filterByCreatedAt<T extends { createdAt: Date }>(
   );
 }
 
-function transcriptTimestampMs(value: Date | string): number | null {
+export function transcriptTimestampMs(value: Date | string): number | null {
   // Timezone-less strings are UTC, matching how the store reads created_at.
   const ms = value instanceof Date ? value.getTime() : parseUtcTimestamp(value).getTime();
   return Number.isFinite(ms) ? ms : null;
