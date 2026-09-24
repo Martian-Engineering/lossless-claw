@@ -89,6 +89,7 @@ import {
   type TranscriptAnchorAuditMessage,
 } from "./transcript-anchor-audit.js";
 import { estimateTokens, estimateSerializedMessagesTokens } from "./estimate-tokens.js";
+import { hashAgentMessageForAssemblyProtection, messagesHaveSameLiveCoverageSignature } from "./message-signatures.js";
 import {
   buildDeterministicFallbackSummary,
   FALLBACK_DIRECTIVE_SUMMARY_MARKER,
@@ -105,14 +106,14 @@ import { structuredPartsIdentity } from "./structured-anchor-identity.js";
 import { transcriptImportCap, type TranscriptReconcileResult } from "./reconcile-plan.js";
 import { describeAssembledPrefixChange, formatOverflowDiagnosticsForLog, shouldLogOverflowDiagnostics, type AssemblePrefixSnapshot, type BootstrapImportObservation } from "./assemble-debug.js";
 
-import { buildDegradedLiveAssembleResult, clampMessagesToSerializedBudget, resolveDeferredAssemblyPressure } from "./assemble-fallback.js";
+import { buildDegradedLiveAssembleResult, clampMessagesToSerializedBudget, SERIALIZED_OUTPUT_CLAMP_SAFETY_RATIO } from "./assemble-fallback.js";
 import { resolveBootstrapMaxTokens, trimBootstrapMessagesToBudget } from "./bootstrap-budget.js";
 import { batchLooksLikeHeartbeatAckTurn, pruneHeartbeatOkTurns } from "./heartbeat-filter.js";
 import { appendUncoveredVolatileLiveInputsWithinBudget, isVolatileLiveInputMessage, messageContentCoveredBySummary, resolveProtectedFreshTailAssembledIndexes, stripTrailingAssistantPrefill } from "./live-coverage.js";
 import { buildMessageParts, extractMessageContent, filterPersistableMessages, hasPersistableMessageRole, isOpenClawRuntimeContextLeak, toStoredMessage, toStoredMessageIdentity } from "./message-content.js";
 import { batchHasRawReplayIds, filterPersistedRawIdReplayBatch } from "./raw-id-replay-filter.js";
 import { PROMPT_RECALL_MAX_MESSAGES, PROMPT_RECALL_SEARCH_CANDIDATE_LIMIT, buildPromptRecallProjectionFingerprint, extractPromptRecallIdentifiers, extractPromptRecallSnippet, findPromptRecallIdentifierIndex, isPromptRecallEligibleRole, normalizePromptRecallCoverageText, normalizePromptRecallText, renderPromptRecallMessage } from "./prompt-recall.js";
-import { extractRuntimePromptTokenCount } from "./token-accounting.js";
+import { estimateAgentMessageTokens, extractRuntimePromptTokenCount } from "./token-accounting.js";
 import { asRecord, formatDurationMs, resolvePositiveInteger } from "./value-utils.js";
 import { extractOpenClawSenderMetadata } from "./openclaw-sender-metadata.js";
 
@@ -247,10 +248,8 @@ const HOST_BEFORE_RESET_REASON_RESET = "reset";
 const HOST_SESSION_END_REASON_DELETED = "deleted";
 const HOST_SESSION_END_REASON_RESET = "reset";
 const CONTEXT_ENGINE_PROJECTION_EPOCH_VERSION = "summary-prefix-v1";
-const DEFERRED_ASSEMBLY_DEGRADED_PRESSURE_RATIO = 0.75;
+const DEFERRED_ASSEMBLY_PRESSURE_RATIO = 0.75;
 const PENDING_SUMMARY_MODEL_UNAVAILABLE_REASON = "pending summary model unavailable";
-/** Stop bypassing compaction backoff after repeated emergency failures. */
-const ASSEMBLE_FORCE_MAX_RETRY_ATTEMPTS = 3;
 type CompactionExecutionParams = {
   /** Authoritative forced-recovery snapshot is fully reconciled. */
   allowCurrentTurnCompaction?: boolean;
@@ -1419,7 +1418,8 @@ export class LcmContextEngine implements ContextEngine {
             }
           : reconciledContextThreshold.resolved;
 
-      const isThresholdDebt = maintenance.reason?.trim() === "threshold";
+      const isThresholdDebt = maintenance.reason?.trim() === "threshold" ||
+        maintenance.reason?.trim() === "assembly-pressure";
       if (!isThresholdDebt) {
         const thresholdDecision = await this.compaction.evaluate(
           params.conversationId,
@@ -1842,71 +1842,146 @@ export class LcmContextEngine implements ContextEngine {
     };
   }
 
-  /**
-   * Consume deferred debt for assemble() only after the caller has established
-   * that the live prompt is already over budget. Routine threshold debt is
-   * drained after turns or by host-approved maintain() calls so the next user
-   * turn is not held hostage by proactive compaction work. Hitting this path
-   * means idle/background maintenance did not catch up before the prompt became
-   * unusable, so callers should treat it as an emergency safeguard.
-   */
-  private async maybeConsumeDeferredCompactionDebtForAssemble(params: {
+  /** Publish ready work, then prepare at most one bounded pass before eviction. */
+  private async relieveAssemblyPressure(params: {
     conversationId: number;
     sessionId: string;
     sessionKey?: string;
     tokenBudget: number;
-    currentTokenCount?: number;
+    contextThreshold: ResolvedContextThreshold;
+    runtimeContext?: Record<string, unknown>;
     runtimeSettings?: ContextEngineRuntimeSettings;
-  }): Promise<{ exhausted: boolean }> {
+    measure: () => Promise<number>;
+  }): Promise<{ pressure: number; reason: string; deferred: boolean; reachedTarget: boolean } | null> {
+    const queueKey = this.resolveSessionQueueKey(params.sessionId, params.sessionKey);
     const sessionLabel = formatSessionLabel(params.sessionId, params.sessionKey);
-    let drainResult = { exhausted: false };
-    await this.withSessionQueue(
-      this.resolveSessionQueueKey(params.sessionId, params.sessionKey),
-      async () => {
-        const maintenance =
-          await this.compactionMaintenanceStore.getConversationCompactionMaintenance(
-            params.conversationId,
-          );
-        if (!maintenance?.pending && !maintenance?.running) {
-          return;
-        }
+    const initialMaintenance = await this.compactionMaintenanceStore.getConversationCompactionMaintenance(params.conversationId);
+    const initialTrigger = initialMaintenance?.pending || initialMaintenance?.running
+      ? DEFERRED_ASSEMBLY_PRESSURE_RATIO
+      : SERIALIZED_OUTPUT_CLAMP_SAFETY_RATIO;
+    if (await params.measure() <= Math.floor(params.tokenBudget * initialTrigger)) return null;
 
-        const cappedTokenBudget = this.applyAssemblyBudgetCap(params.tokenBudget);
-        const normalizedCurrentTokenCount = this.normalizeObservedTokenCount(
-          params.currentTokenCount,
+    return this.withSessionQueue(
+      queueKey,
+      async () => {
+        const maintenance = await this.compactionMaintenanceStore.getConversationCompactionMaintenance(
+          params.conversationId,
         );
-        const telemetry =
-          await this.compactionTelemetryStore.getConversationCompactionTelemetry(
-            params.conversationId,
-          );
-        const deferredLegacyParams =
-          telemetry?.provider || telemetry?.model
-            ? {
-                ...(telemetry.provider ? { provider: telemetry.provider } : {}),
-                ...(telemetry.model ? { model: telemetry.model } : {}),
-              }
-            : undefined;
-        const forceAllowed = maintenance.retryAttempts < ASSEMBLE_FORCE_MAX_RETRY_ATTEMPTS;
-        const result = await this.consumeDeferredCompactionDebt({
+        const before = await params.measure();
+        const triggerRatio = maintenance?.pending || maintenance?.running
+          ? DEFERRED_ASSEMBLY_PRESSURE_RATIO
+          : SERIALIZED_OUTPUT_CLAMP_SAFETY_RATIO;
+        if (before <= Math.floor(params.tokenBudget * triggerRatio)) return null;
+
+        const target = Math.max(1, Math.floor(params.tokenBudget * Math.min(
+          params.contextThreshold.contextThreshold, SERIALIZED_OUTPUT_CLAMP_SAFETY_RATIO,
+        )));
+        const ownsDebt = !this.deferredCompactionDrains.has(queueKey);
+        const backgroundActive = !ownsDebt ||
+          this.pendingSummaryPreparationDrains.has(queueKey);
+        const telemetry = await this.compactionTelemetryStore.getConversationCompactionTelemetry(
+          params.conversationId,
+        );
+        const execution = {
           conversationId: params.conversationId,
           sessionId: params.sessionId,
           sessionKey: params.sessionKey,
-          tokenBudget: cappedTokenBudget,
-          currentTokenCount: normalizedCurrentTokenCount,
+          tokenBudget: params.tokenBudget,
+          contextThresholdOverride: params.contextThreshold,
           runtimeSettings: params.runtimeSettings,
-          legacyParams: deferredLegacyParams,
-          force: forceAllowed,
+          legacyParams: {
+            ...(telemetry?.provider ? { provider: telemetry.provider } : {}),
+            ...(telemetry?.model ? { model: telemetry.model } : {}),
+            ...params.runtimeContext,
+            manualCompaction: false,
+          },
           sessionQueueHeld: true,
-          pendingPublishPolicy: "publish-if-ready",
-        });
-        drainResult = { exhausted: result?.exhausted === true };
+        };
+        let after = before;
+        let reason = "no canonical reduction";
+        let pending = true;
+        let failure: string | null = null;
+        const backoffActive = maintenance?.nextAttemptAfter != null &&
+          maintenance.nextAttemptAfter.getTime() > Date.now();
+
+        // Both background drains own generation, but only a deferred debt drain
+        // finishes maintenance rows. Claim debt even during preparation-only
+        // work, without waiting for or duplicating its generation.
+        if (ownsDebt) {
+          this.deferredCompactionDrains.add(queueKey);
+        }
+        try {
+          if (ownsDebt) {
+            await this.telemetryRecorder.recordDeferredCompactionDebt({
+              ...params, reason: "assembly-pressure", currentTokenCount: before,
+            });
+          }
+          let publication = await this.executePendingCompactionCore({
+            ...execution, publishPolicy: "publish-ready-only",
+          });
+          after = await params.measure();
+          pending = publication.pending === true;
+          reason = publication.reason ?? reason;
+          if (after > target) {
+            if (backgroundActive) {
+              reason = "background maintenance active";
+            } else if (backoffActive) {
+              reason = "deferred compaction backoff active";
+            } else {
+              // prepare-only avoids legacy forced/truncation fallback. The
+              // existing step limit, provider timeout and spend guard bound it.
+              await this.compactionMaintenanceStore.markProactiveCompactionRunning(params);
+              const preparation = await this.executePendingCompactionCore({
+                ...execution, publishPolicy: "prepare-only",
+              });
+              publication = await this.executePendingCompactionCore({
+                ...execution, publishPolicy: "publish-ready-only",
+              });
+              after = await params.measure();
+              pending = publication.pending === true;
+              failure = preparation.ok ? null : preparation.reason ?? "summary preparation failed";
+              reason = failure ?? (publication.compacted ? publication.reason : preparation.reason) ?? reason;
+            }
+          }
+        } catch (error) {
+          failure = describeLogError(error);
+          reason = failure;
+        } finally {
+          if (ownsDebt) {
+            this.deferredCompactionDrains.delete(queueKey);
+            const keepPending = after > target || pending;
+            const scope = this.compactionGuards.resolveSummarySpendScope({ kind: "compaction", scope: queueKey });
+            const backoff = this.compactionGuards.getSummarySpendBackoffUntil(scope) ?? maintenance?.nextAttemptAfter;
+            await this.telemetryRecorder.recordDeferredCompactionDebt({
+              ...params, reason: "assembly-pressure", currentTokenCount: after,
+            });
+            // A publication opportunity during cooldown is not a generation
+            // retry. Preserve its attempt count, failure and retry horizon.
+            if (!backoffActive || !keepPending) {
+              await this.compactionMaintenanceStore.markProactiveCompactionFinished({
+                conversationId: params.conversationId,
+                keepPending,
+                failureSummary: failure,
+                ...(keepPending && backoff && backoff.getTime() > Date.now() ? { nextAttemptAfter: backoff } : {}),
+              });
+            }
+          }
+        }
+        this.deps.log.info(
+          `[lcm] assemble: foreground compaction conversation=${params.conversationId} ${sessionLabel} before=${before} after=${after} target=${target} reduced=${after < before} reachedTarget=${after <= target} pending=${pending || after > target} reason=${reason}`,
+        );
+        return {
+          pressure: after,
+          reason,
+          deferred: maintenance?.pending === true || maintenance?.running === true,
+          reachedTarget: after <= target,
+        };
       },
       {
-        operationName: "assembleDeferredCompaction",
+        operationName: "assembleForegroundCompaction",
         context: sessionLabel,
       },
     );
-    return drainResult;
   }
 
   /** Log which context threshold was selected for a compaction decision. */
@@ -4743,11 +4818,80 @@ export class LcmContextEngine implements ContextEngine {
           ? Math.floor(params.tokenBudget)
           : 128_000,
       );
-      let contextItems = await this.summaryStore.getContextItems(conversation.conversationId);
-      let activeFocusBrief = await this.focusBriefStore.getActiveFocusBrief(
+      const resolvedContextThreshold = this.contextThresholdResolver.resolve({
+        sessionKey: params.sessionKey,
+        runtime: readRuntimeModelContext(asRecord(params.runtimeContext), { model: params.model }),
+      });
+      const assembledFreshTailCount =
+        resolvedContextThreshold.freshTailCount ?? this.config.freshTailCount;
+      const replayTarget = resolveSessionTranscriptReadTarget(params);
+      let replayEntries: VisibleSessionTranscriptMessageEntry[] = [];
+      if (replayTarget && this.deps.readVisibleSessionTranscriptMessageEntries &&
+          liveMessages.some(message => message.role === "user" && typeof Reflect.get(message, "idempotencyKey") === "string")) {
+        try {
+          replayEntries = await this.deps.readVisibleSessionTranscriptMessageEntries(replayTarget);
+        } catch (error) {
+          this.deps.log.warn(`[lcm] assemble: user replay metadata unavailable for ${sessionLabel}: ${describeLogError(error)}`);
+        }
+      }
+      const assemblyInput = {
+        conversationId: conversation.conversationId,
+        freshTailCount: assembledFreshTailCount,
+        freshTailMaxTokens: this.config.freshTailMaxTokens,
+        promptAwareEviction: this.config.promptAwareEviction,
+        prompt: params.prompt,
+        stubLargeToolPayloads: this.config.stubLargeToolPayloads,
+      };
+      const initialContextItems = await this.summaryStore.getContextItems(conversation.conversationId);
+      const initiallyRaw = !initialContextItems.some(item => item.itemType === "summary");
+      let coverageTrailsLive = initiallyRaw &&
+        initialContextItems.length < liveMessages.length;
+      let unpersistedLiveSuffix: AgentMessage[] = [];
+      // Render without eviction so neither stored-count selection nor the
+      // serialized clamp can hide pressure from foreground recovery. Include
+      // live inputs and replay metadata, but not optional recall enrichment.
+      const foregroundRelief = await this.relieveAssemblyPressure({
+        ...params,
+        conversationId: conversation.conversationId,
+        tokenBudget,
+        contextThreshold: resolvedContextThreshold,
+        measure: async () => {
+          const projection = await this.assembler.assemble({
+            ...assemblyInput, tokenBudget: Number.MAX_SAFE_INTEGER,
+          });
+          // A complete raw prefix proves where unpersisted live input starts.
+          // Carry only that suffix across publication, never the summarized
+          // live prefix. Ambiguous/incomplete coverage keeps the live fallback.
+          if (initiallyRaw && projection.stats.summaryCount === 0) {
+            const completeRawPrefix = projection.messages.length > 0 &&
+              projection.messages.length === projection.stats.totalContextItems &&
+              projection.messages.length <= liveMessages.length &&
+              projection.messages.every((message, index) =>
+                messagesHaveSameLiveCoverageSignature(message, liveMessages[index]!));
+            unpersistedLiveSuffix = completeRawPrefix ? liveMessages.slice(projection.messages.length) : [];
+            coverageTrailsLive = !completeRawPrefix && projection.stats.totalContextItems <= liveMessages.length;
+          }
+          const withLiveInputs = appendUncoveredVolatileLiveInputsWithinBudget({
+            assembledMessages: [...projection.messages, ...unpersistedLiveSuffix],
+            assembledEstimatedTokens: projection.estimatedTokens + estimateAgentMessageTokens(unpersistedLiveSuffix),
+            liveMessages,
+            protectedAssembledIndexes: new Set<number>(),
+            tokenBudget: Number.MAX_SAFE_INTEGER,
+          });
+          const replay = restoreRawUserReplay(withLiveInputs.messages, liveMessages, replayEntries);
+          return Math.max(
+            await this.summaryStore.getContextTokenCount(conversation.conversationId),
+            estimateSerializedMessagesTokens(replay.messages),
+            coverageTrailsLive ? estimateSerializedMessagesTokens(liveMessages) : 0,
+          );
+        },
+      });
+
+      const contextItems = await this.summaryStore.getContextItems(conversation.conversationId);
+      const activeFocusBrief = await this.focusBriefStore.getActiveFocusBrief(
         conversation.conversationId,
       );
-      let contextProjection = {
+      const contextProjection = {
         mode: "thread_bootstrap" as const,
         epoch: buildContextEngineProjectionEpoch(
           conversation.conversationId,
@@ -4777,101 +4921,10 @@ export class LcmContextEngine implements ContextEngine {
           contextProjection,
         };
       };
-      let storedContextTokens = await this.summaryStore.getContextTokenCount(
+      const storedContextTokens = await this.summaryStore.getContextTokenCount(
         conversation.conversationId,
       );
-      const maintenance = await this.compactionMaintenanceStore.getConversationCompactionMaintenance(
-        conversation.conversationId,
-      );
-      let deferredAssemblyDegradation:
-        | {
-            reason:
-              | "near-budget"
-              | "emergency-debt-still-pending"
-              | "emergency-debt-exhausted";
-            pressure: ReturnType<typeof resolveDeferredAssemblyPressure>;
-          }
-        | null = null;
-      if (maintenance?.pending || maintenance?.running) {
-        const pressureThreshold = Math.floor(
-          tokenBudget * DEFERRED_ASSEMBLY_DEGRADED_PRESSURE_RATIO,
-        );
-        let pressure = resolveDeferredAssemblyPressure({
-          storedContextTokens,
-          maintenance,
-        });
-        if (pressure.pressureTokenCount > tokenBudget) {
-          this.deps.log.warn(
-            `[lcm] assemble: emergency deferred compaction debt draining pre-assembly conversation=${conversation.conversationId} ${sessionLabel} storedContextTokens=${pressure.storedContextTokens} projectedTokenCount=${pressure.projectedTokenCount ?? "null"} tokenBudget=${tokenBudget} reason=over-budget`,
-          );
-          let emergencyDrainResult: { exhausted: boolean } | null = null;
-          try {
-            emergencyDrainResult = await this.maybeConsumeDeferredCompactionDebtForAssemble({
-              conversationId: conversation.conversationId,
-              sessionId: params.sessionId,
-              sessionKey: params.sessionKey,
-              tokenBudget,
-              currentTokenCount: pressure.storedContextTokens,
-              runtimeSettings: params.runtimeSettings,
-            });
-          } catch (error) {
-            this.deps.log.warn(
-              `[lcm] assemble: deferred compaction execution failed for ${sessionLabel}: ${describeLogError(error)}`,
-            );
-          }
-          // Emergency maintenance may replace the canonical context prefix.
-          // Refresh both projection inputs before returning any assemble path.
-          contextItems = await this.summaryStore.getContextItems(conversation.conversationId);
-          activeFocusBrief = await this.focusBriefStore.getActiveFocusBrief(
-            conversation.conversationId,
-          );
-          contextProjection = {
-            mode: "thread_bootstrap",
-            epoch: buildContextEngineProjectionEpoch(
-              conversation.conversationId,
-              contextItems,
-              activeFocusBrief,
-            ),
-          };
-          storedContextTokens = await this.summaryStore.getContextTokenCount(
-            conversation.conversationId,
-          );
-          const latestMaintenance =
-            await this.compactionMaintenanceStore.getConversationCompactionMaintenance(
-              conversation.conversationId,
-            );
-          if (latestMaintenance?.pending || latestMaintenance?.running) {
-            pressure = resolveDeferredAssemblyPressure({
-              storedContextTokens,
-              maintenance: latestMaintenance,
-            });
-            if (pressure.pressureTokenCount > pressureThreshold) {
-              deferredAssemblyDegradation = {
-                reason: "emergency-debt-still-pending",
-                pressure,
-              };
-            }
-          } else if (
-            emergencyDrainResult?.exhausted === true &&
-            pressure.pressureTokenCount > pressureThreshold
-          ) {
-            deferredAssemblyDegradation = {
-              reason: "emergency-debt-exhausted",
-              pressure,
-            };
-          }
-        } else if (pressure.pressureTokenCount > pressureThreshold) {
-          deferredAssemblyDegradation = {
-            reason: "near-budget",
-            pressure,
-          };
-        } else {
-          this.deps.log.debug(
-            `[lcm] assemble: deferred compaction debt left pending conversation=${conversation.conversationId} ${sessionLabel} storedContextTokens=${pressure.storedContextTokens} projectedTokenCount=${pressure.projectedTokenCount ?? "null"} tokenBudget=${tokenBudget} reason=not-over-budget`,
-          );
-        }
-      }
-      if (deferredAssemblyDegradation) {
+      if (foregroundRelief?.deferred && !foregroundRelief.reachedTarget && liveMessages.length > 0 && foregroundRelief.pressure > Math.floor(tokenBudget * DEFERRED_ASSEMBLY_PRESSURE_RATIO)) {
         const degraded = buildDegradedLiveAssembleResult({
           liveMessages,
           tokenBudget,
@@ -4879,7 +4932,7 @@ export class LcmContextEngine implements ContextEngine {
           contextProjection,
         });
         this.deps.log.warn(
-          `[lcm] assemble: degraded live fallback conversation=${conversation.conversationId} ${sessionLabel} reason=${deferredAssemblyDegradation.reason} storedContextTokens=${deferredAssemblyDegradation.pressure.storedContextTokens} projectedTokenCount=${deferredAssemblyDegradation.pressure.projectedTokenCount ?? "null"} tokenBudget=${tokenBudget} pressureThreshold=${Math.floor(tokenBudget * DEFERRED_ASSEMBLY_DEGRADED_PRESSURE_RATIO)} outputMessages=${degraded.messages.length} estimatedTokens=${degraded.estimatedTokens}`,
+          `[lcm] assemble: degraded live fallback conversation=${conversation.conversationId} ${sessionLabel} reason=${coverageTrailsLive ? "coverage-trails-live" : foregroundRelief.reason} pressure=${foregroundRelief.pressure} tokenBudget=${tokenBudget} estimatedTokens=${degraded.estimatedTokens}`,
         );
         return degraded;
       }
@@ -4895,36 +4948,22 @@ export class LcmContextEngine implements ContextEngine {
       // raw context items and clearly trails the current live history, keep
       // the live path to avoid dropping prompt context.
       const hasSummaryItems = contextItems.some((item) => item.itemType === "summary");
-      if (!hasSummaryItems && contextItems.length < liveMessages.length) {
+      if ((coverageTrailsLive && foregroundRelief !== null) ||
+          (!hasSummaryItems && contextItems.length < liveMessages.length)) {
         this.deps.log.debug(
           `[lcm] assemble: falling back to live context conversation=${conversation.conversationId} ${sessionLabel} contextItems=${contextItems.length} liveMessages=${liveMessages.length} duration=${formatDurationMs(Date.now() - startedAt)}`,
         );
         return boundedLiveFallback("coverage-trails-live");
       }
 
-      const resolvedContextThreshold = this.contextThresholdResolver.resolve({
-        sessionKey: params.sessionKey,
-        runtime: readRuntimeModelContext(asRecord(params.runtimeContext), { model: params.model }),
-      });
-      const assembledFreshTailCount =
-        resolvedContextThreshold.freshTailCount ?? this.config.freshTailCount;
-
       const assembled = await this.assembler.assemble({
-        conversationId: conversation.conversationId,
+        ...assemblyInput,
         tokenBudget,
-        freshTailCount: assembledFreshTailCount,
-        freshTailMaxTokens: this.config.freshTailMaxTokens,
-        promptAwareEviction: this.config.promptAwareEviction,
-        prompt: params.prompt,
-        // v4.2 §B — gated by config.stubLargeToolPayloads (default false).
-        // Off-by-default so v4.1 behavior is preserved until the migration
-        // tool has populated `messages.large_content` for the running DB.
-        stubLargeToolPayloads: this.config.stubLargeToolPayloads,
       });
 
 
-      const preRecallMessages = assembled.messages;
-      const preRecallEstimatedTokens = assembled.estimatedTokens;
+      const preRecallMessages = [...assembled.messages, ...unpersistedLiveSuffix];
+      const preRecallEstimatedTokens = assembled.estimatedTokens + estimateAgentMessageTokens(unpersistedLiveSuffix);
 
       // If assembly produced no messages for a non-empty live session,
       // fail safe to the live context.
@@ -4979,11 +5018,13 @@ export class LcmContextEngine implements ContextEngine {
         : preRecallMessages;
       let assembledEstimatedTokens =
         preRecallEstimatedTokens + (budgetedPromptRecallCue?.tokenCount ?? 0);
+      const freshTailProtectionMessageHashes = [
+        ...(assembled.debug?.freshTailProtectionMessageHashes ?? assembled.debug?.preSanitizeFreshTailMessageHashes ?? []),
+        ...unpersistedLiveSuffix.map(hashAgentMessageForAssemblyProtection),
+      ];
       let protectedAssembledIndexes = resolveProtectedFreshTailAssembledIndexes({
         assembledMessages,
-        freshTailMessageHashes:
-          assembled.debug?.freshTailProtectionMessageHashes ??
-          assembled.debug?.preSanitizeFreshTailMessageHashes,
+        freshTailMessageHashes: freshTailProtectionMessageHashes,
       });
       if (budgetedPromptRecallCue) {
         protectedAssembledIndexes.add(0);
@@ -5005,9 +5046,7 @@ export class LcmContextEngine implements ContextEngine {
         assembledEstimatedTokens = preRecallEstimatedTokens;
         protectedAssembledIndexes = resolveProtectedFreshTailAssembledIndexes({
           assembledMessages,
-          freshTailMessageHashes:
-            assembled.debug?.freshTailProtectionMessageHashes ??
-            assembled.debug?.preSanitizeFreshTailMessageHashes,
+          freshTailMessageHashes: freshTailProtectionMessageHashes,
         });
         volatileLiveInputAppend = appendUncoveredVolatileLiveInputsWithinBudget({
           assembledMessages,
@@ -5031,16 +5070,6 @@ export class LcmContextEngine implements ContextEngine {
       // budget math above runs on stored-content token counts, which undercount
       // live messages that carry structured tool payloads; this is the last
       // line of defense that keeps assembled output deliverable to the model.
-      const replayTarget = resolveSessionTranscriptReadTarget(params);
-      let replayEntries: VisibleSessionTranscriptMessageEntry[] = [];
-      if (replayTarget && this.deps.readVisibleSessionTranscriptMessageEntries &&
-          liveMessages.some(message => message.role === "user" && typeof Reflect.get(message, "idempotencyKey") === "string")) {
-        try {
-          replayEntries = await this.deps.readVisibleSessionTranscriptMessageEntries(replayTarget);
-        } catch (error) {
-          this.deps.log.warn(`[lcm] assemble: user replay metadata unavailable for ${sessionLabel}: ${describeLogError(error)}`);
-        }
-      }
       const replay = restoreRawUserReplay(volatileLiveInputAppend.messages, liveMessages, replayEntries);
       let serializedClamp = clampMessagesToSerializedBudget({
         messages: replay.messages,
