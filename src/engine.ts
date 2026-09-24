@@ -1827,7 +1827,7 @@ export class LcmContextEngine implements ContextEngine {
     runtimeContext?: Record<string, unknown>;
     runtimeSettings?: ContextEngineRuntimeSettings;
     measure: () => Promise<number>;
-  }): Promise<{ pressure: number; reason: string; deferred: boolean } | null> {
+  }): Promise<{ pressure: number; reason: string; deferred: boolean; reachedTarget: boolean } | null> {
     const queueKey = this.resolveSessionQueueKey(params.sessionId, params.sessionKey);
     const sessionLabel = formatSessionLabel(params.sessionId, params.sessionKey);
     const initialMaintenance = await this.compactionMaintenanceStore.getConversationCompactionMaintenance(params.conversationId);
@@ -1851,7 +1851,8 @@ export class LcmContextEngine implements ContextEngine {
         const target = Math.max(1, Math.floor(params.tokenBudget * Math.min(
           params.contextThreshold.contextThreshold, SERIALIZED_OUTPUT_CLAMP_SAFETY_RATIO,
         )));
-        const backgroundActive = this.deferredCompactionDrains.has(queueKey) ||
+        const ownsDebt = !this.deferredCompactionDrains.has(queueKey);
+        const backgroundActive = !ownsDebt ||
           this.pendingSummaryPreparationDrains.has(queueKey);
         const telemetry = await this.compactionTelemetryStore.getConversationCompactionTelemetry(
           params.conversationId,
@@ -1878,14 +1879,14 @@ export class LcmContextEngine implements ContextEngine {
         const backoffActive = maintenance?.nextAttemptAfter != null &&
           maintenance.nextAttemptAfter.getTime() > Date.now();
 
-        // A background owner may be waiting to publish on this queue. Never
-        // wait for it here or claim its maintenance row, but publication itself
-        // is safe under this lock and requires no generation permission.
-        if (!backgroundActive) {
+        // Both background drains own generation, but only a deferred debt drain
+        // finishes maintenance rows. Claim debt even during preparation-only
+        // work, without waiting for or duplicating its generation.
+        if (ownsDebt) {
           this.deferredCompactionDrains.add(queueKey);
         }
         try {
-          if (!backgroundActive || !maintenance?.running) {
+          if (ownsDebt) {
             await this.telemetryRecorder.recordDeferredCompactionDebt({
               ...params, reason: "assembly-pressure", currentTokenCount: before,
             });
@@ -1921,7 +1922,7 @@ export class LcmContextEngine implements ContextEngine {
           failure = describeLogError(error);
           reason = failure;
         } finally {
-          if (!backgroundActive) {
+          if (ownsDebt) {
             this.deferredCompactionDrains.delete(queueKey);
             const keepPending = after > target || pending;
             const scope = this.compactionGuards.resolveSummarySpendScope({ kind: "compaction", scope: queueKey });
@@ -1944,7 +1945,12 @@ export class LcmContextEngine implements ContextEngine {
         this.deps.log.info(
           `[lcm] assemble: foreground compaction conversation=${params.conversationId} ${sessionLabel} before=${before} after=${after} target=${target} reduced=${after < before} reachedTarget=${after <= target} pending=${pending || after > target} reason=${reason}`,
         );
-        return { pressure: after, reason, deferred: maintenance?.pending === true || maintenance?.running === true };
+        return {
+          pressure: after,
+          reason,
+          deferred: maintenance?.pending === true || maintenance?.running === true,
+          reachedTarget: after <= target,
+        };
       },
       {
         operationName: "assembleForegroundCompaction",
@@ -4893,7 +4899,7 @@ export class LcmContextEngine implements ContextEngine {
       const storedContextTokens = await this.summaryStore.getContextTokenCount(
         conversation.conversationId,
       );
-      if (foregroundRelief?.deferred && liveMessages.length > 0 && foregroundRelief.pressure > Math.floor(tokenBudget * DEFERRED_ASSEMBLY_PRESSURE_RATIO)) {
+      if (foregroundRelief?.deferred && !foregroundRelief.reachedTarget && liveMessages.length > 0 && foregroundRelief.pressure > Math.floor(tokenBudget * DEFERRED_ASSEMBLY_PRESSURE_RATIO)) {
         const degraded = buildDegradedLiveAssembleResult({
           liveMessages,
           tokenBudget,

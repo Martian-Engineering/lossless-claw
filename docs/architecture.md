@@ -100,6 +100,7 @@ The **condensed pass** merges summaries at the same depth into a higher-level su
 - If pressure still exceeds the configured `contextThreshold` target (capped at the serialized safety target), runs one bounded prepare-only pass and another publication opportunity. `maxSweepIterations`, summarizer timeouts, spend limits, and cooldowns still apply
 - Does not start generation while background maintenance owns preparation. It never waits for a background publisher while holding the session queue
 - Rebuilds and remeasures canonical context after publication. Remaining pressure or pending work retains maintenance debt; publication alone is not proof that the target was reached
+- Keeps the canonical summary projection when recovery reaches its target, including targets above the 75% degraded-context trigger. Foreground recovery finishes its own debt during preparation-only background work; an active debt drain retains ownership of its maintenance row
 - Logs reduction, target attainment, and the blocker. Protected-tail pressure, unavailable summarization, or exhausted work limits leave the bounded assembly fallback in place. Original messages, parts, and summary lineage remain persisted
 
 **Full sweep (threshold, manual `/compact`, or overflow):**

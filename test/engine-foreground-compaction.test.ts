@@ -133,6 +133,35 @@ describe("foreground compaction before pressure eviction", () => {
     expect(complete).toHaveBeenCalledTimes(callCount);
   });
 
+  it("retains published context after reaching a target above the degraded trigger", async () => {
+    const { engine, complete, log } = fixture({ contextThreshold: 0.85, freshTailCount: 20, leafChunkTokens: 3_000 });
+    const { messages, conversationId } = await seed(engine, true);
+    const before = await persisted(engine, conversationId);
+    const tokensBefore = await engine.getSummaryStore().getContextTokenCount(conversationId);
+    const budget = 24_000;
+    const output = await assemble(engine, messages, budget);
+    const tokensAfter = await engine.getSummaryStore().getContextTokenCount(conversationId);
+    expect(tokensAfter).toBeLessThan(tokensBefore);
+    expect(estimateSerializedMessagesTokens(output.messages)).toBeGreaterThan(budget * 0.75);
+    expect(estimateSerializedMessagesTokens(output.messages)).toBeLessThan(budget * 0.85);
+    expect(JSON.stringify(output.messages)).toContain("Foreground summary");
+    expect(await persisted(engine, conversationId)).toEqual(before);
+    expect(await engine.getCompactionMaintenanceStore().getConversationCompactionMaintenance(conversationId))
+      .toMatchObject({ pending: false, running: false });
+    expect(log.info.mock.calls.flat().join("\n")).toContain("reduced=true reachedTarget=true pending=false");
+    expect(log.warn.mock.calls.flat().join("\n")).not.toMatch(/degraded live fallback|serialized budget clamp/);
+
+    const calls = complete.mock.calls.length;
+    for (let turn = 0; turn < 2; turn += 1) {
+      const message = makeMessage({ role: "user", content: `Small following turn ${turn}` });
+      await engine.ingest({ sessionId: SESSION, message });
+      const later = await assemble(engine, [message], budget);
+      expect(later.messages.slice(0, output.messages.length)).toEqual(output.messages);
+      expect(later.contextProjection?.epoch).toBe(output.contextProjection?.epoch);
+    }
+    expect(complete).toHaveBeenCalledTimes(calls);
+  });
+
   it("publishes a complete ready batch during debt cooldown with zero new calls", async () => {
     const { engine, complete } = fixture();
     const { messages, conversationId } = await seed(engine);
@@ -305,6 +334,62 @@ describe("foreground compaction before pressure eviction", () => {
     const output = await assemble(engine, live, 100_000);
     expect(output.messages).toEqual(live);
     expect(complete).not.toHaveBeenCalled();
+  });
+
+  it.each([false, true])("finishes only foreground-owned debt during ready publication (background debt owner: %s)", async backgroundOwnsDebt => {
+    const { engine, complete, log } = fixture({ contextThreshold: 0.85, freshTailCount: 20, leafChunkTokens: 3_000 });
+    const { messages, conversationId } = await seed(engine);
+    const before = await persisted(engine, conversationId);
+    const store = engine.getPendingSummaryStore();
+    const markNodeReady = store.markNodeReady.bind(store);
+    let release!: () => void;
+    let ready!: () => void;
+    const gate = new Promise<void>(resolve => { release = resolve; });
+    const entered = new Promise<void>(resolve => { ready = resolve; });
+    // Pause after the real SQLite write makes the complete frontier visible,
+    // before the preparation drain can release its in-memory ownership.
+    vi.spyOn(store, "markNodeReady").mockImplementation(async input => {
+      const saved = await markNodeReady(input);
+      const batch = await store.getActiveBatchForConversation(conversationId);
+      const nodes = batch ? await store.getNodesByBatch(batch.batchId) : [];
+      if (saved && nodes.length > 0 && nodes.every(node => node.status === "ready")) {
+        ready();
+        await gate;
+      }
+      return saved;
+    });
+    if (backgroundOwnsDebt) {
+      await engine.getCompactionMaintenanceStore().requestProactiveCompactionDebt({
+        conversationId, reason: "threshold", tokenBudget: 24_000,
+      });
+    }
+    const maintenance = backgroundOwnsDebt ? engine.maintain({
+      sessionId: SESSION, sessionFile: createSessionFilePath(SESSION),
+      runtimeContext: { allowDeferredCompactionExecution: true, tokenBudget: 24_000 },
+    }) : prepare(engine);
+    try {
+      await entered;
+      const debtBefore = await engine.getCompactionMaintenanceStore().getConversationCompactionMaintenance(conversationId);
+      if (backgroundOwnsDebt) expect(debtBefore).toMatchObject({ running: true });
+      else expect(debtBefore).toBeNull();
+      const calls = complete.mock.calls.length;
+      const output = await assemble(engine, messages, 24_000);
+      expect(JSON.stringify(output.messages)).toContain("Foreground summary");
+      expect(output.estimatedTokens).toBeLessThan(24_000 * 0.85);
+      expect(complete).toHaveBeenCalledTimes(calls);
+      expect(log.info.mock.calls.flat().join("\n")).toContain("reduced=true reachedTarget=true pending=false");
+      const debtAfter = await engine.getCompactionMaintenanceStore().getConversationCompactionMaintenance(conversationId);
+      if (backgroundOwnsDebt) expect(debtAfter).toEqual(debtBefore);
+      else expect(debtAfter).toMatchObject({ pending: false, running: false, lastFinishedAt: expect.any(Date) });
+    } finally {
+      release();
+      await maintenance;
+    }
+    if (!backgroundOwnsDebt) {
+      expect(await engine.getCompactionMaintenanceStore().getConversationCompactionMaintenance(conversationId))
+        .toMatchObject({ pending: false, running: false });
+    }
+    expect(await persisted(engine, conversationId)).toEqual(before);
   });
 
   it("does not duplicate generation or deadlock behind active background maintenance", async () => {
