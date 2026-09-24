@@ -417,29 +417,27 @@ export function selectPendingPublishCoverageTarget(
     return null;
   }
 
+  // Work backwards so each candidate knows how far its following coverage
+  // reaches. Depth breaks ties only after maximizing the contiguous prefix.
+  const candidates = input.nodes.filter((node) =>
+    node.ordinalStart >= startOrdinal && node.ordinalEnd <= endOrdinal &&
+    node.ordinalEnd >= node.ordinalStart,
+  ).sort((a, b) => b.ordinalStart - a.ordinalStart || b.depth - a.depth ||
+    b.ordinalEnd - a.ordinalEnd || a.nodeId.localeCompare(b.nodeId));
+  const choices = new Map<number, { node: PendingSummaryPlannerNode; end: number }>();
+  for (const node of candidates) {
+    const end = choices.get(node.ordinalEnd + 1)?.end ?? node.ordinalEnd;
+    const previous = choices.get(node.ordinalStart);
+    if (!previous || end > previous.end) {
+      choices.set(node.ordinalStart, { node, end });
+    }
+  }
   const frontier: PendingSummaryPlannerNode[] = [];
   let cursor = startOrdinal;
-  while (cursor <= endOrdinal) {
-    const candidate = input.nodes
-      .filter(
-        (node) =>
-          node.ordinalStart === cursor &&
-          node.ordinalEnd <= endOrdinal &&
-          node.ordinalEnd >= node.ordinalStart,
-      )
-      .sort(
-        (first, second) =>
-          second.depth - first.depth ||
-          second.ordinalEnd - first.ordinalEnd ||
-          first.nodeId.localeCompare(second.nodeId),
-      )[0];
-
-    if (!candidate) {
-      break;
-    }
-
-    frontier.push(candidate);
-    cursor = candidate.ordinalEnd + 1;
+  while (choices.has(cursor)) {
+    const node = choices.get(cursor)!.node;
+    frontier.push(node);
+    cursor = node.ordinalEnd + 1;
   }
 
   if (frontier.length === 0) {
@@ -449,7 +447,7 @@ export function selectPendingPublishCoverageTarget(
 }
 
 /**
- * Select the highest-depth nodes that exactly cover a contiguous publish prefix.
+ * Select ready nodes covering the longest contiguous publish prefix.
  */
 export function selectPendingPublishFrontier(
   input: SelectPendingPublishFrontierInput,
@@ -458,7 +456,5 @@ export function selectPendingPublishFrontier(
   if (!target) {
     return null;
   }
-  return target.endOrdinal === normalizeNonNegativeInteger(input.endOrdinal)
-    ? target.frontier
-    : null;
+  return target.frontier;
 }

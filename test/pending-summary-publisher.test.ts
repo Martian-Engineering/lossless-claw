@@ -167,6 +167,7 @@ describe("PendingSummaryPublisher", () => {
       }),
     ).resolves.toEqual({
       batchId: "batch_publish_a",
+      remainingPreparation: false,
       canonicalSummaryIds: ["sum_leaf_a", "sum_leaf_b", "sum_condensed_root"],
       frontierSummaryIds: ["sum_condensed_root"],
     });
@@ -222,6 +223,7 @@ describe("PendingSummaryPublisher", () => {
       }),
     ).resolves.toEqual({
       batchId: "batch_publish_a",
+      remainingPreparation: false,
       canonicalSummaryIds: ["sum_leaf_a", "sum_leaf_b", "sum_condensed_root"],
       frontierSummaryIds: ["sum_condensed_root"],
     });
@@ -434,8 +436,8 @@ describe("PendingSummaryPublisher", () => {
       }),
     ).rejects.toThrow(/stale/);
     await expect(pendingSummaryStore.getBatch("batch_stale_a")).resolves.toMatchObject({
-      status: "stale",
-      failureSummary: "source projection fingerprint changed before publish",
+      status: "planning",
+      failureSummary: null,
     });
     await expect(summaryStore.getSummary("sum_leaf_stale_a")).resolves.toBeNull();
   });

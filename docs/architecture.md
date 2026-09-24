@@ -89,6 +89,8 @@ The **condensed pass** merges summaries at the same depth into a higher-level su
 - Below threshold, does not compact and does not record leaf debt
 - In deferred mode, records one `"threshold"` maintenance row for host-owned background `maintain()` or emergency pre-assembly execution
 - Below threshold, eligible raw history can be prepared as hidden pending summaries during background `maintain()`; this does not publish them or record threshold debt
+- At a compaction event, the longest contiguous ready prefix can publish atomically, even when later chunks or higher-level condensation are unfinished. Publication uses no model calls and remains available during generation cooldown
+- Partial publication preserves uncovered context and the protected fresh tail. Pending suffixes retain their prepared content; unfinished parents read promoted children from canonical summaries. The batch stays active until its remaining preparation and publication finish
 - Background preparation returns its full promise to the host and uses that maintenance call's LLM capability. Turn hooks only record data-only requests; no detached timers inherit a completed turn's async scope
 - Each maintenance invocation runs one bounded pass. Unfinished nodes and threshold debt resume on a later pass. Model calls do not hold the foreground ingestion queue; publication still uses the session lock
 - Host lifecycle rejection is not a provider failure: a closed async work scope leaves work retryable instead of producing a deterministic fallback summary

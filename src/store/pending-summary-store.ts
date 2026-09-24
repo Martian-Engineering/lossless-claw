@@ -447,8 +447,8 @@ export class PendingSummaryStore {
                 kind,
                 depth,
                 status,
-                ordinal_start,
-                ordinal_end,
+                COALESCE(active_ordinal_start, ordinal_start) AS ordinal_start,
+                COALESCE(active_ordinal_end, ordinal_end) AS ordinal_end,
                 source_fingerprint,
                 source_context_hash,
                 content,
@@ -482,8 +482,8 @@ export class PendingSummaryStore {
                 kind,
                 depth,
                 status,
-                ordinal_start,
-                ordinal_end,
+                COALESCE(active_ordinal_start, ordinal_start) AS ordinal_start,
+                COALESCE(active_ordinal_end, ordinal_end) AS ordinal_end,
                 source_fingerprint,
                 source_context_hash,
                 content,
@@ -605,8 +605,8 @@ export class PendingSummaryStore {
                   pending_summary_nodes.kind,
                   pending_summary_nodes.depth,
                   pending_summary_nodes.status,
-                  pending_summary_nodes.ordinal_start,
-                  pending_summary_nodes.ordinal_end,
+                  COALESCE(pending_summary_nodes.active_ordinal_start, pending_summary_nodes.ordinal_start) AS ordinal_start,
+                  COALESCE(pending_summary_nodes.active_ordinal_end, pending_summary_nodes.ordinal_end) AS ordinal_end,
                   pending_summary_nodes.source_fingerprint,
                   pending_summary_nodes.source_context_hash,
                   pending_summary_nodes.content,
@@ -896,6 +896,21 @@ export class PendingSummaryStore {
       )
       .run(input.conversationId, cutoff);
     return Number(result.changes ?? 0);
+  }
+
+  /** Rebase a node's active source positions after this batch publishes a prefix. */
+  async updateNodeContext(input: {
+    nodeId: string;
+    ordinalStart: number;
+    ordinalEnd: number;
+    sourceContextHash: string | null;
+  }): Promise<void> {
+    this.db.prepare(
+      `UPDATE pending_summary_nodes
+       SET active_ordinal_start = ?, active_ordinal_end = ?, source_context_hash = ?,
+           updated_at = datetime('now')
+       WHERE node_id = ?`,
+    ).run(input.ordinalStart, input.ordinalEnd, input.sourceContextHash, input.nodeId);
   }
 
   /** Record the canonical summary id created from a pending node. */

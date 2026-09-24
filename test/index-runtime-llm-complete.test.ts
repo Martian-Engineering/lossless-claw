@@ -420,18 +420,31 @@ describe("createLcmDependencies.complete runtime.llm bridge", () => {
         if (debt?.nextAttemptAfter) vi.setSystemTime(debt.nextAttemptAfter.getTime() + 1);
         const callsBefore = retired.mock.calls.length;
         const result = await maintain(retired);
-        expect(result.reason).toContain(message);
-        expect(retired.mock.calls.length - callsBefore).toBe(partial && attempt === 0 ? 2 : 1);
+        const publishesPrefix = partial && tokenBudget === 300 && attempt === 1;
+        expect(result.reason).toContain(publishesPrefix ? "pending summaries published" : message);
+        expect(retired.mock.calls.length - callsBefore).toBe(
+          publishesPrefix ? 0 : partial && attempt === 0 ? 2 : 1,
+        );
         const batch = await engine.inner.getPendingSummaryStore().getActiveBatchForConversation(conversationId);
         expect(batch).not.toBeNull();
         const nodes = await engine.inner.getPendingSummaryStore().getNodesByBatch(batch!.batchId);
-        expect(nodes.filter(node => node.status === "ready")).toHaveLength(partial ? 1 : 0);
+        const prefixPublished = partial && tokenBudget === 300 && attempt >= 1;
+        expect(nodes.filter(node => node.status === "ready")).toHaveLength(partial && !prefixPublished ? 1 : 0);
+        expect(nodes.filter(node => node.status === "promoted")).toHaveLength(prefixPublished ? 1 : 0);
         expect(nodes.every(node => node.retryCount === 0 && node.leaseOwner === null)).toBe(true);
         expect(nodes.filter(node => node.status === "planned").length).toBeGreaterThan(0);
         expect(nodes.every(node => !node.content?.includes("LCM fallback summary"))).toBe(true);
       }
-      expect(await engine.getSummaryStore().getSummariesByConversation(conversationId)).toEqual([]);
-      expect(await engine.getSummaryStore().getContextItems(conversationId)).toEqual(context);
+      if (partial && tokenBudget === 300) {
+        expect(await engine.getSummaryStore().getSummariesByConversation(conversationId))
+          .toMatchObject([{ content: "prepared before retirement" }]);
+        const active = await engine.getSummaryStore().getContextItems(conversationId);
+        expect(active[0]?.itemType).toBe("summary");
+        expect(active.slice(1)).toEqual(context.slice(1));
+      } else {
+        expect(await engine.getSummaryStore().getSummariesByConversation(conversationId)).toEqual([]);
+        expect(await engine.getSummaryStore().getContextItems(conversationId)).toEqual(context);
+      }
       expect(await engine.getConversationStore().getMessages(conversationId)).toEqual(sources);
       const debt = await maintenanceStore.getConversationCompactionMaintenance(conversationId);
       if (tokenBudget === 300) expect(debt?.pending).toBe(true);

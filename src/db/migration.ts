@@ -204,6 +204,16 @@ function ensurePendingSummaryNodeRetryColumns(db: DatabaseSync): void {
   }
 }
 
+/** Keep immutable planning ranges separate from rebased active-context ranges. */
+function ensurePendingSummaryNodeActiveRangeColumns(db: DatabaseSync): void {
+  const columns = db.prepare("PRAGMA table_info(pending_summary_nodes)").all() as SummaryColumnInfo[];
+  for (const name of ["active_ordinal_start", "active_ordinal_end"]) {
+    if (!columns.some((column) => column.name === name)) {
+      db.exec(`ALTER TABLE pending_summary_nodes ADD COLUMN ${name} INTEGER`);
+    }
+  }
+}
+
 function ensureCompactionMaintenanceColumns(db: DatabaseSync): void {
   const maintenanceColumns = db
     .prepare(`PRAGMA table_info(conversation_compaction_maintenance)`)
@@ -1371,6 +1381,8 @@ export function runLcmMigrations(
         CHECK (status IN ('planned', 'running', 'ready', 'promoted', 'stale', 'failed')),
       ordinal_start INTEGER NOT NULL,
       ordinal_end INTEGER NOT NULL,
+      active_ordinal_start INTEGER,
+      active_ordinal_end INTEGER,
       source_fingerprint TEXT NOT NULL,
       source_context_hash TEXT,
       content TEXT,
@@ -1613,6 +1625,9 @@ export function runLcmMigrations(
     );
     runMigrationStep("ensureLargeFilesLineCountColumn", log, () =>
       ensureLargeFilesLineCountColumn(db),
+    );
+    runMigrationStep("ensurePendingSummaryNodeActiveRangeColumns", log, () =>
+      ensurePendingSummaryNodeActiveRangeColumns(db),
     );
     runMigrationStep("ensurePendingSummaryNodeRetryColumns", log, () =>
       ensurePendingSummaryNodeRetryColumns(db),

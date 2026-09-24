@@ -1320,7 +1320,17 @@ export class LcmContextEngine implements ContextEngine {
     const nextAttemptAfter = maintenance.nextAttemptAfter;
     const backoffActive =
       nextAttemptAfter !== null && nextAttemptAfter.getTime() > Date.now();
-    if (!params.force && backoffActive) {
+    if (!params.force && backoffActive && params.pendingPublishPolicy !== "publish-ready-only") {
+      // Generation cooldown must not strand a ready prefix behind maintenance
+      // debt. The recursive pass is publication-only and cannot call a model.
+      const batch = await this.pendingSummaryStore.getActiveBatchForConversation(params.conversationId);
+      if (batch && (await this.pendingSummaryStore.getNodesByBatch(batch.batchId))
+        .some((node) => node.status === "ready")) {
+        const publication = await this.consumeDeferredCompactionDebt({
+          ...params, pendingPublishPolicy: "publish-ready-only",
+        });
+        if (publication?.changed) return publication;
+      }
       this.deps.log.debug(
         `[lcm] maintain: deferred compaction backoff active conversation=${params.conversationId} ${sessionLabel} retryAttempts=${maintenance.retryAttempts} nextAttemptAfter=${nextAttemptAfter.toISOString()} debtReason=${maintenance.reason ?? "null"}`,
       );
@@ -1504,7 +1514,8 @@ export class LcmContextEngine implements ContextEngine {
           ? null
           : result.reason ?? "deferred compaction failed";
       const summarySpendBackoffUntil = keepPending
-        ? this.compactionGuards.getSummarySpendBackoffUntil(summarySpendScopeKey)
+        ? this.compactionGuards.getSummarySpendBackoffUntil(summarySpendScopeKey) ??
+          (backoffActive ? nextAttemptAfter : null)
         : null;
       await this.compactionMaintenanceStore.markProactiveCompactionFinished({
         conversationId: params.conversationId,
@@ -1562,6 +1573,18 @@ export class LcmContextEngine implements ContextEngine {
   }): Promise<CompactResult & { pending?: boolean }> {
     const breakerScope = this.resolveSessionQueueKey(params.sessionId, params.sessionKey);
     const publicationOnly = params.publishPolicy === "publish-ready-only";
+    // Publication consumes prepared work without resolving a model or spending
+    // tokens. Give it a chance before any guard that blocks new generation.
+    if (!publicationOnly && params.publishPolicy !== "prepare-only") {
+      const batch = await this.pendingSummaryStore.getActiveBatchForConversation(params.conversationId);
+      if (batch && (await this.pendingSummaryStore.getNodesByBatch(batch.batchId))
+        .some((node) => node.status === "ready")) {
+        const publication = await this.executePendingCompactionCore({
+          ...params, publishPolicy: "publish-ready-only",
+        });
+        if (publication.compacted) return publication;
+      }
+    }
     const pendingManualCompaction =
       (asRecord(params.runtimeContext) ?? asRecord(params.legacyParams))?.manualCompaction === true;
     const allowEmergencyFallback = params.force === true || pendingManualCompaction;
@@ -1603,7 +1626,7 @@ export class LcmContextEngine implements ContextEngine {
       };
     }
     // Manual and force compaction are informed consent to spend; automatic
-    // preparation and publish passes must not burn summarizer calls while the
+    // preparation passes must not burn summarizer calls while the
     // poor-reduction spend backoff is open for this scope.
     const summarySpendScopeKey = this.compactionGuards.resolveSummarySpendScope({
       kind: "compaction",
@@ -1689,6 +1712,8 @@ export class LcmContextEngine implements ContextEngine {
           summaryId: lastResult.frontierSummaryIds[0],
           result: {
             ...lastResult,
+            summarySpendBackoffUntil: this.compactionGuards
+              .getSummarySpendBackoffUntil(summarySpendScopeKey)?.toISOString() ?? null,
             tokensBefore: tokensBeforePublication ?? tokensAfterPublication,
             tokensAfter: tokensAfterPublication,
           },
