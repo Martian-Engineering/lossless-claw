@@ -1,6 +1,12 @@
 import { createHash } from "node:crypto";
+import {
+  buildPendingProjectionSnapshot,
+  buildBatchSourceFingerprint,
+  digestText,
+} from "./pending-summary-projection.js";
 import type { ConversationStore, MessageRecord } from "./store/conversation-store.js";
 import type {
+  PendingCompactionBatchRecord,
   PendingSummaryNodeRecord,
   PendingSummaryStore,
 } from "./store/pending-summary-store.js";
@@ -24,6 +30,7 @@ export type PublishReadyFrontierResult = {
   batchId: string;
   canonicalSummaryIds: string[];
   frontierSummaryIds: string[];
+  remainingPreparation: boolean;
 };
 
 type ChildSummaryLink =
@@ -105,24 +112,6 @@ export class PendingSummaryPublisher {
       throw new Error("Cannot publish an empty pending summary frontier");
     }
 
-    const batchBeforeTransaction = await this.pendingSummaryStore.getBatch(input.batchId);
-    if (!batchBeforeTransaction) {
-      throw new Error(`Pending compaction batch ${input.batchId} was not found`);
-    }
-    if (batchBeforeTransaction.status === "published") {
-      return this.readPublishedResult(input);
-    }
-    if (
-      input.expectedSourceProjectionFingerprint != null &&
-      batchBeforeTransaction.sourceProjectionFingerprint !== input.expectedSourceProjectionFingerprint
-    ) {
-      await this.pendingSummaryStore.markBatchStale({
-        batchId: input.batchId,
-        failureSummary: "source projection fingerprint changed before publish",
-      });
-      throw new Error(`Pending compaction batch ${input.batchId} source fingerprint is stale`);
-    }
-
     return this.summaryStore.withTransaction(async () => {
       const batch = await this.pendingSummaryStore.getBatch(input.batchId);
       if (!batch) {
@@ -130,6 +119,10 @@ export class PendingSummaryPublisher {
       }
       if (batch.status === "published") {
         return this.readPublishedResult(input);
+      }
+
+      if (batch.status !== "planning" && batch.status !== "ready") {
+        throw new Error(`Pending compaction batch ${input.batchId} is not active`);
       }
 
       const frontierNodes: PendingSummaryNodeRecord[] = [];
@@ -145,6 +138,20 @@ export class PendingSummaryPublisher {
         frontierNodes.push(node);
       }
 
+      // A retry of an already committed prefix must not replace its shifted range.
+      if (frontierNodes.every((node) => node.status === "promoted")) {
+        return this.readPublishedResult(input);
+      }
+      if (frontierNodes.some((node) => node.status === "promoted")) {
+        throw new Error("Cannot mix promoted and ready pending frontier nodes");
+      }
+      // An obsolete selection is not evidence that the surviving batch is
+      // stale: another publication may have advanced its projection.
+      if (input.expectedSourceProjectionFingerprint != null &&
+          batch.sourceProjectionFingerprint !== input.expectedSourceProjectionFingerprint) {
+        throw new Error(`Pending compaction batch ${input.batchId} source fingerprint is stale`);
+      }
+      await this.validateFrontier(batch, frontierNodes);
       const orderedAncestors = await this.collectPendingAncestors(frontierNodes);
       const canonicalIdsByNodeId = new Map<string, string>();
       for (const node of orderedAncestors) {
@@ -182,17 +189,127 @@ export class PendingSummaryPublisher {
           }))
           .sort((a, b) => a.startOrdinal - b.startOrdinal),
       });
-      await this.pendingSummaryStore.markBatchPublished({
-        batchId: input.batchId,
-        publishedAt: input.publishedAt,
-      });
+      const remainingPreparation = await this.rebaseBatch(batch, frontierNodes);
+      if (!remainingPreparation) {
+        await this.pendingSummaryStore.markBatchPublished({
+          batchId: input.batchId,
+          publishedAt: input.publishedAt,
+        });
+      }
 
       return {
         batchId: input.batchId,
+        remainingPreparation,
         canonicalSummaryIds: orderedAncestors.map((node) => canonicalIdsByNodeId.get(node.nodeId)!),
         frontierSummaryIds,
       };
     });
+  }
+
+  /** Verify active identity, ordering, canonical gaps, and the planned tail boundary. */
+  private async validateFrontier(
+    batch: PendingCompactionBatchRecord,
+    frontier: PendingSummaryNodeRecord[],
+  ): Promise<void> {
+    const items = await this.summaryStore.getContextItems(batch.conversationId);
+    const identities = new Map(items.map((item) => [item.ordinal,
+      item.itemType === "message" ? `message:${item.messageId}` : `summary:${item.summaryId}`]));
+    let cursor = batch.compactableStartOrdinal;
+    for (const node of [...frontier].sort((a, b) => a.ordinalStart - b.ordinalStart)) {
+      if (node.ordinalStart < cursor || node.ordinalEnd < node.ordinalStart ||
+          node.ordinalEnd > batch.compactableEndOrdinal ||
+          node.ordinalEnd >= (batch.plannedFreshTailStartOrdinal ?? Infinity)) {
+        throw new Error("Pending frontier crosses its source range or fresh tail");
+      }
+      // Canonical summaries may bridge ready pending nodes. Raw or missing
+      // items are an uncovered gap and cannot be skipped during publication.
+      for (; cursor < node.ordinalStart; cursor += 1) {
+        if (!identities.get(cursor)?.startsWith("summary:")) {
+          throw new Error("Pending frontier crosses uncovered source coverage");
+        }
+      }
+      const expected = await this.activeSourceIdentities(node);
+      const actual: string[] = [];
+      for (; cursor <= node.ordinalEnd; cursor += 1) actual.push(identities.get(cursor) ?? "missing");
+      if (expected.length !== actual.length || expected.some((id, index) => id !== actual[index])) {
+        throw new Error("Pending frontier source identity or ordering changed before publish");
+      }
+    }
+  }
+
+  /** Resolve a prepared node to the canonical items that still represent its sources. */
+  private async activeSourceIdentities(node: PendingSummaryNodeRecord): Promise<string[]> {
+    if (node.canonicalSummaryId) return [`summary:${node.canonicalSummaryId}`];
+    if (node.kind === "leaf") {
+      return (await this.pendingSummaryStore.getNodeMessages(node.nodeId))
+        .map((link) => `message:${link.messageId}`);
+    }
+    const identities: string[] = [];
+    for (const child of await this.readChildSummaryLinks(node.nodeId)) {
+      if (child.kind === "canonical") {
+        identities.push(`summary:${child.summaryId}`);
+      } else {
+        const childNode = await this.pendingSummaryStore.getNode(child.childNodeId);
+        if (!childNode) throw new Error(`Missing pending child ${child.childNodeId}`);
+        identities.push(...await this.activeSourceIdentities(childNode));
+      }
+    }
+    return identities;
+  }
+
+  /** Persist the post-publication projection while retaining all pending DAG links. */
+  private async rebaseBatch(
+    batch: PendingCompactionBatchRecord,
+    frontier: PendingSummaryNodeRecord[],
+  ): Promise<boolean> {
+    const replacements = [...frontier].sort((a, b) => a.ordinalStart - b.ordinalStart);
+    // Every source ordinal maps either to its replacement or to the same item
+    // shifted left by preceding replacements. Parents spanning a prefix keep
+    // their promoted children and can later condense the canonical summaries.
+    const rebaseOrdinal = (ordinal: number): number => {
+      let removed = 0;
+      for (const node of replacements) {
+        if (ordinal < node.ordinalStart) break;
+        if (ordinal <= node.ordinalEnd) return node.ordinalStart - removed;
+        removed += node.ordinalEnd - node.ordinalStart;
+      }
+      return ordinal - removed;
+    };
+    const snapshot = await buildPendingProjectionSnapshot(
+      batch.conversationId, this.conversationStore, this.summaryStore, { freshTailCount: 0 },
+    );
+    const nodes = await this.pendingSummaryStore.getNodesByBatch(batch.batchId);
+    for (const node of nodes) {
+      // Promoted ranges describe immutable lineage and never re-enter selection.
+      if (node.status === "promoted") continue;
+      const ordinalStart = rebaseOrdinal(node.ordinalStart);
+      const ordinalEnd = rebaseOrdinal(node.ordinalEnd);
+      // Leaf validation includes ordinals. Refresh only that projection hash;
+      // the immutable source fingerprint still identifies the prepared result.
+      const sourceContextHash = node.kind === "leaf"
+        ? digestText("pending-node-context", [
+            String(ordinalStart), String(ordinalEnd),
+            ...snapshot.items.filter((item) => item.ordinal >= ordinalStart && item.ordinal <= ordinalEnd)
+              .map((item) => item.sourceFingerprint),
+          ])
+        : node.sourceContextHash;
+      await this.pendingSummaryStore.updateNodeContext({
+        nodeId: node.nodeId, ordinalStart, ordinalEnd, sourceContextHash,
+      });
+    }
+    const startOrdinal = rebaseOrdinal(batch.compactableStartOrdinal);
+    const endOrdinal = rebaseOrdinal(batch.compactableEndOrdinal);
+    await this.pendingSummaryStore.updateBatchPlanningTarget({
+      batchId: batch.batchId,
+      compactableStartOrdinal: startOrdinal,
+      compactableEndOrdinal: endOrdinal,
+      plannedFreshTailStartOrdinal: batch.plannedFreshTailStartOrdinal == null
+        ? null : rebaseOrdinal(batch.plannedFreshTailStartOrdinal),
+      sourceProjectionFingerprint: buildBatchSourceFingerprint({
+        conversationId: batch.conversationId, snapshot, startOrdinal, endOrdinal,
+      }),
+    });
+    return nodes.some((node) => node.status !== "promoted");
   }
 
   private async readPublishedResult(
@@ -201,7 +318,7 @@ export class PendingSummaryPublisher {
     const frontierNodes: PendingSummaryNodeRecord[] = [];
     for (const nodeId of input.frontierNodeIds) {
       const node = await this.pendingSummaryStore.getNode(nodeId);
-      if (!node?.canonicalSummaryId) {
+      if (!node?.canonicalSummaryId || node.batchId !== input.batchId) {
         throw new Error(`Published frontier node ${nodeId} has no canonical summary id`);
       }
       frontierNodes.push(node);
@@ -209,6 +326,7 @@ export class PendingSummaryPublisher {
     const orderedAncestors = await this.collectPendingAncestors(frontierNodes);
     return {
       batchId: input.batchId,
+      remainingPreparation: (await this.pendingSummaryStore.getBatch(input.batchId))?.status !== "published",
       canonicalSummaryIds: orderedAncestors
         .map((node) => node.canonicalSummaryId)
         .filter((summaryId): summaryId is string => typeof summaryId === "string"),

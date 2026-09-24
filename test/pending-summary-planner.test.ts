@@ -323,6 +323,17 @@ describe("pending summary planner", () => {
     ).toEqual(["condensed-condensed-d1-0-1"]);
   });
 
+  it("prefers longer lower-level coverage over a deeper node that leaves a gap", () => {
+    const [leaf] = planPendingLeafNodes({
+      items: [message(0, 10, 5)], freshTailCount: 0, leafChunkTokens: 5, nodeIdPrefix: "leaf",
+    });
+    const wide = { ...leaf!, nodeId: "wide", ordinalEnd: 3 };
+    const deep = { ...leaf!, nodeId: "deep", depth: 1, ordinalEnd: 1 };
+    expect(selectPendingPublishFrontier({ nodes: [deep, wide], startOrdinal: 0, endOrdinal: 4 }))
+      .toEqual([wide]);
+    expect(selectPendingPublishFrontier({ nodes: [wide], startOrdinal: 1, endOrdinal: 4 })).toBeNull();
+  });
+
   it("selects the longest publishable prefix when later ordinals are uncovered", () => {
     const leafNodes = planPendingLeafNodes({
       items: [message(0, 10, 5), message(1, 11, 5), message(2, 12, 3)],
@@ -347,6 +358,6 @@ describe("pending summary planner", () => {
         startOrdinal: 0,
         endOrdinal: 2,
       }),
-    ).toBeNull();
+    ).toEqual(target?.frontier);
   });
 });
