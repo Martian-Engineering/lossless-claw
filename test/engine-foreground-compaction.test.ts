@@ -79,6 +79,29 @@ async function persisted(engine: LcmContextEngine, conversationId: number) {
   })));
 }
 
+/** Verify partial publication preserves prefix lineage, raw suffix and resumable work. */
+async function expectPartialCoverage(engine: LcmContextEngine, conversationId: number, original: Awaited<ReturnType<typeof persisted>>) {
+  const summaries = await engine.getSummaryStore().getSummariesByConversation(conversationId);
+  expect(summaries).toHaveLength(1);
+  const context = await engine.getSummaryStore().getContextItems(conversationId);
+  expect(context[0]).toMatchObject({ itemType: "summary", summaryId: summaries[0].summaryId });
+  const linked = await engine.getSummaryStore().getSummaryMessages(summaries[0].summaryId);
+  expect(linked.length).toBeGreaterThan(0);
+  expect(linked).toEqual(original.slice(0, linked.length).map(entry => entry.message.messageId));
+  const retainedIds = context.slice(1).map(item => item.messageId);
+  expect(retainedIds.length).toBeGreaterThan(0);
+  expect(retainedIds).toEqual(original.slice(linked.length).map(entry => entry.message.messageId));
+  expect(await persisted(engine, conversationId)).toEqual(original);
+
+  // Publication must leave a valid unfinished batch, not only a pending flag.
+  const batch = await engine.getPendingSummaryStore().getActiveBatchForConversation(conversationId);
+  expect(batch).not.toBeNull();
+  const nodes = await engine.getPendingSummaryStore().getNodesByBatch(batch!.batchId);
+  expect(nodes.some(node => node.status === "planned")).toBe(true);
+  expect(nodes.some(node => node.status === "stale" || node.status === "failed")).toBe(false);
+  return { context, summaries, batch, nodes };
+}
+
 /** Exercise the host's prompt-separate assembly contract. */
 function assemble(engine: LcmContextEngine, messages: AgentMessage[], tokenBudget = BUDGET) {
   return engine.assemble({ sessionId: SESSION, messages, tokenBudget, prompt: "Next observation", availableTools: new Set(["inspect"]) });
@@ -186,18 +209,32 @@ describe("foreground compaction before pressure eviction", () => {
     const { engine, complete, log } = fixture({ summaryMaxCallsPerWindow: 1, summaryCallWindowMs: 600_000, summarySpendBackoffMs: 600_000 });
     const { messages, conversationId } = await seed(engine);
     const before = await persisted(engine, conversationId);
-    await assemble(engine, messages);
+    const tokensBefore = await engine.getSummaryStore().getContextTokenCount(conversationId);
+    const output = await assemble(engine, messages);
     expect(complete).toHaveBeenCalledTimes(1);
+    const tokensAfter = await engine.getSummaryStore().getContextTokenCount(conversationId);
+    expect(tokensAfter).toBeLessThan(tokensBefore);
+    expect(output.estimatedTokens).toBeGreaterThan(BUDGET * 0.65);
+    expect(JSON.stringify(output.messages)).toContain("Foreground summary");
+    const partial = await expectPartialCoverage(engine, conversationId, before);
     const debt = await engine.getCompactionMaintenanceStore().getConversationCompactionMaintenance(conversationId);
-    expect(debt?.pending).toBe(true);
+    expect(debt).toMatchObject({ pending: true, running: false, lastFailureSummary: "summary spend backoff open" });
     expect(debt?.nextAttemptAfter!.getTime()).toBeGreaterThan(Date.now());
-    await assemble(engine, messages);
+    expect(log.info.mock.calls.flat().join("\n")).toContain("reduced=true reachedTarget=false pending=true reason=summary spend backoff open");
+
+    // Force another pressure pass while the real generation cooldown is open.
+    const cooldownBudget = 20_000;
+    expect(output.estimatedTokens).toBeGreaterThan(cooldownBudget * 0.75);
+    log.info.mockClear();
+    await assemble(engine, messages, cooldownBudget);
     expect(complete).toHaveBeenCalledTimes(1);
     const afterCooldownAttempt = await engine.getCompactionMaintenanceStore().getConversationCompactionMaintenance(conversationId);
+    expect(afterCooldownAttempt).toMatchObject({ pending: true, running: false, lastFailureSummary: debt?.lastFailureSummary });
     expect(afterCooldownAttempt?.retryAttempts).toBe(debt?.retryAttempts);
     expect(afterCooldownAttempt?.nextAttemptAfter).toEqual(debt?.nextAttemptAfter);
-    expect(await persisted(engine, conversationId)).toEqual(before);
-    expect(log.info.mock.calls.flat().join("\n")).toContain("reduced=false reachedTarget=false");
+    expect(await engine.getSummaryStore().getContextTokenCount(conversationId)).toBe(tokensAfter);
+    expect(await expectPartialCoverage(engine, conversationId, before)).toEqual(partial);
+    expect(log.info.mock.calls.flat().join("\n")).toContain("reduced=false reachedTarget=false pending=true reason=deferred compaction backoff active");
   });
 
   it("bounds summarizer failure and falls back without reporting recovery", async () => {
@@ -239,17 +276,30 @@ describe("foreground compaction before pressure eviction", () => {
       resolveModel: () => { throw new Error("no configured summarizer"); },
     });
     const first = await seed(unavailable.engine);
-    await assemble(unavailable.engine, first.messages);
+    const unavailableBefore = await persisted(unavailable.engine, first.conversationId);
+    const unavailableContext = await unavailable.engine.getSummaryStore().getContextItems(first.conversationId);
+    const unavailableOutput = await assemble(unavailable.engine, first.messages);
     expect(unavailable.complete).not.toHaveBeenCalled();
-    expect(unavailable.log.info.mock.calls.flat().join("\n")).toContain("reason=pending summary model unavailable");
+    expect(unavailableOutput.messages.length).toBeGreaterThan(0);
+    expect(await unavailable.engine.getSummaryStore().getSummariesByConversation(first.conversationId)).toHaveLength(0);
+    expect(await unavailable.engine.getSummaryStore().getContextItems(first.conversationId)).toEqual(unavailableContext);
+    expect(await persisted(unavailable.engine, first.conversationId)).toEqual(unavailableBefore);
+    expect((await unavailable.engine.getCompactionMaintenanceStore().getConversationCompactionMaintenance(first.conversationId))?.pending).toBe(true);
+    expect(unavailable.log.info.mock.calls.flat().join("\n")).toContain("reduced=false reachedTarget=false pending=true reason=pending summary model unavailable");
 
     const bounded = fixture({ maxSweepIterations: 2 });
     const second = await seed(bounded.engine);
-    await assemble(bounded.engine, second.messages);
+    const boundedBefore = await persisted(bounded.engine, second.conversationId);
+    const tokensBefore = await bounded.engine.getSummaryStore().getContextTokenCount(second.conversationId);
+    const output = await assemble(bounded.engine, second.messages);
     expect(bounded.complete).toHaveBeenCalledTimes(1);
-    expect(await bounded.engine.getSummaryStore().getSummariesByConversation(second.conversationId)).toHaveLength(0);
-    expect(bounded.log.info.mock.calls.flat().join("\n")).toContain("reason=pending summary work remains");
-    expect((await bounded.engine.getCompactionMaintenanceStore().getConversationCompactionMaintenance(second.conversationId))?.pending).toBe(true);
+    expect(await bounded.engine.getSummaryStore().getContextTokenCount(second.conversationId)).toBeLessThan(tokensBefore);
+    expect(output.estimatedTokens).toBeGreaterThan(BUDGET * 0.65);
+    expect(JSON.stringify(output.messages)).toContain("Foreground summary");
+    await expectPartialCoverage(bounded.engine, second.conversationId, boundedBefore);
+    expect(bounded.log.info.mock.calls.flat().join("\n")).toContain("reduced=true reachedTarget=false pending=true reason=pending summaries published");
+    expect(await bounded.engine.getCompactionMaintenanceStore().getConversationCompactionMaintenance(second.conversationId))
+      .toMatchObject({ pending: true, running: false, lastFailureSummary: null });
   });
 
   it("keeps the current user admission and complete tool exchange outside compaction", async () => {
