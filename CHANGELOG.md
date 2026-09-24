@@ -1,5 +1,21 @@
 # @martian-engineering/lossless-claw
 
+## 1.1.1
+
+### Patch Changes
+
+- [#1174](https://github.com/Martian-Engineering/lossless-claw/pull/1174) [`2580af0`](https://github.com/Martian-Engineering/lossless-claw/commit/2580af0c55f4515bb8ce3895b874a1a70b9d1edd) Thanks [@Marvinthebored](https://github.com/Marvinthebored)! - Adopt a projected transcript entry id onto a live-ingested user row by the row's created time when the message body repeats in the projection. Repeated bodies such as restart-recovery prompts were imported as a second row, and assembly then alternated between the two rows across runs, breaking the provider prompt-cache prefix.
+
+  Require unambiguous matches in both the stored history and the full projection before assigning entry IDs. Preserve ambiguity across timestamp adoption and anchor audit, including nearby repeats and missing timestamps.
+
+- [#1204](https://github.com/Martian-Engineering/lossless-claw/pull/1204) [`8e3050c`](https://github.com/Martian-Engineering/lossless-claw/commit/8e3050c1d5d5e46911b480815884276834ab6080) Thanks [@jalehman](https://github.com/jalehman)! - Try prepared-summary publication and bounded foreground compaction before pressure-driven context eviction. Measure serialized assembly pressure even without recorded maintenance debt, preserve generation cooldowns, and rebuild context after publication. Retain unresolved work and report why bounded fallback remains necessary.
+
+- [#1172](https://github.com/Martian-Engineering/lossless-claw/pull/1172) [`1ce937f`](https://github.com/Martian-Engineering/lossless-claw/commit/1ce937f49112c16898e7aface93513e2ead4f9da) Thanks [@Patrick-Erichsen](https://github.com/Patrick-Erichsen)! - Add author-defined settings groups for OpenClaw `2026.9.5` and newer hosts that support manifest `configGroups`. Older hosts retain the complete flat settings form; configuration paths and runtime behavior are unchanged. Publish fixed runtime defaults for the settings editor and identify automatically calculated values without turning them into fixed overrides.
+
+- [#1203](https://github.com/Martian-Engineering/lossless-claw/pull/1203) [`4ac610f`](https://github.com/Martian-Engineering/lossless-claw/commit/4ac610fbde4e80106329b6ae6c6f701638d9bb57) Thanks [@jalehman](https://github.com/jalehman)! - Allow compaction to atomically publish a contiguous ready summary prefix while remaining chunks or condensation are unfinished, including during summarization cooldown. Preserve pending suffix work, canonical lineage, original messages, and the protected fresh tail; report remaining preparation after partial publication.
+
+- [#1196](https://github.com/Martian-Engineering/lossless-claw/pull/1196) [`544c6c8`](https://github.com/Martian-Engineering/lossless-claw/commit/544c6c8424f74e0469f9219cf83d9147167d007b) Thanks [@pavonis-martian](https://github.com/pavonis-martian)! - Treat retired OpenClaw plugin inventories as lifecycle interruptions during summarization. Preserve pending work for a fresh maintenance invocation without creating fallback summaries or consuming pending-node retries.
+
 ## 1.1.0
 
 <!-- release-rollback-version: 1.0.0 -->
