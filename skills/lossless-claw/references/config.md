@@ -375,7 +375,7 @@ Why it matters:
 - `deferred` also stores provider/model/cache telemetry so Anthropic-family sessions can avoid rewriting a still-hot prompt cache
 - `inline` preserves the legacy foreground compaction path for hosts that do not yet support deferred execution
 - `/lossless status` (`/lcm status` alias) surfaces pending/running/last-failure maintenance state so operators can see when compaction is queued
-- after-turn background drain and host-approved `maintain()` consume routine threshold debt; `assemble()` only drains pending threshold debt synchronously as an emergency safeguard when the live prompt estimate is already over budget
+- host-approved `maintain()` consumes routine threshold debt; before pressure-driven eviction, `assemble()` publishes ready summaries and may run one bounded foreground preparation pass toward `contextThreshold`. Generation respects spend limits, cooldowns, and background ownership; ready publication requires no new model calls. Unrelieved pressure retains `assembly-pressure` debt and uses bounded fallback
 
 ### Active Transcript Storage
 

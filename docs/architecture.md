@@ -87,12 +87,20 @@ The **condensed pass** merges summaries at the same depth into a higher-level su
 **Automatic threshold sweep (after each turn):**
 - Checks if the assembled context crosses `contextThreshold`
 - Below threshold, does not compact and does not record leaf debt
-- In deferred mode, records one `"threshold"` maintenance row for host-owned background `maintain()` or emergency pre-assembly execution
+- In deferred mode, records one `"threshold"` maintenance row for host-owned background `maintain()` or foreground recovery before pressure-driven eviction
 - Below threshold, eligible raw history can be prepared as hidden pending summaries during background `maintain()`; this does not publish them or record threshold debt
 - Background preparation returns its full promise to the host and uses that maintenance call's LLM capability. Turn hooks only record data-only requests; no detached timers inherit a completed turn's async scope
 - Each maintenance invocation runs one bounded pass. Unfinished nodes and threshold debt resume on a later pass. Model calls do not hold the foreground ingestion queue; publication still uses the session lock
 - Host lifecycle rejection is not a provider failure: a closed async work scope leaves work retryable instead of producing a deterministic fallback summary
 - In inline mode, runs a full sweep before `afterTurn()` completes
+
+**Foreground pressure recovery (before assembly eviction):**
+- Measures the full assembled projection, including serialized payloads, restored replay metadata, and uncovered volatile live inputs. Stored estimates cannot hide pressure that appears during rendering
+- Above 75% of the assembly budget with pending debt, or the 90% serialized clamp threshold without debt, takes the session queue and first publishes usable prepared summaries with zero model calls
+- If pressure still exceeds the configured `contextThreshold` target (capped at the serialized safety target), runs one bounded prepare-only pass and another publication opportunity. `maxSweepIterations`, summarizer timeouts, spend limits, and cooldowns still apply
+- Does not start generation while background maintenance owns preparation. It never waits for a background publisher while holding the session queue
+- Rebuilds and remeasures canonical context after publication. Remaining pressure or pending work retains maintenance debt; publication alone is not proof that the target was reached
+- Logs reduction, target attainment, and the blocker. Protected-tail pressure, unavailable summarization, or exhausted work limits leave the bounded assembly fallback in place. Original messages, parts, and summary lineage remain persisted
 
 **Full sweep (threshold, manual `/compact`, or overflow):**
 - Phase 1: Repeatedly runs leaf passes until no more eligible chunks
