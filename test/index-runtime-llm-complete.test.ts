@@ -168,6 +168,7 @@ describe("createLcmDependencies.complete runtime.llm bridge", () => {
         systemPrompt: "System summary policy.",
         purpose: "lossless-claw compaction summarization",
         authProfileId: "openai-codex:work",
+        reasoning: "low",
       });
       expect(result).toMatchObject({
         content: [{ type: "text", text: "summary output" }],
