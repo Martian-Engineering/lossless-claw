@@ -160,6 +160,20 @@ export async function resolveLcmConversationScope(input: {
       };
     }
 
+    // A delegated session may create its own active LCM conversation while
+    // processing the delegated task. Large tool outputs written into that
+    // conversation must remain retrievable by the same session, even when the
+    // propagated grant only names the parent/source conversation.
+    // Scope expansion requires the exact child key, without runtime-ID fallback.
+    const delegatedSessionConversation = await lcm.getConversationStore()
+      .getConversationBySessionKey(normalizedSessionKey!);
+    if (
+      delegatedSessionConversation?.active === true
+      && !allowedConversationIds.includes(delegatedSessionConversation.conversationId)
+    ) {
+      allowedConversationIds.push(delegatedSessionConversation.conversationId);
+    }
+
     if (explicitConversationId != null) {
       if (!allowedConversationIds.includes(explicitConversationId)) {
         return {

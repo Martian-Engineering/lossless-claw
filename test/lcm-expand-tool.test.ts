@@ -94,6 +94,7 @@ function makeEngine(params: {
     info: { id: "lcm" },
     getRetrieval: () => params.retrieval,
     getConversationStore: () => ({
+      getConversationBySessionKey: vi.fn().mockResolvedValue(null),
       getConversationBySessionId: vi.fn().mockResolvedValue(
         typeof params.conversationId === "number"
           ? {
