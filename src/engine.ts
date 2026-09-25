@@ -545,6 +545,7 @@ export class LcmContextEngine implements ContextEngine {
   // never capture a foreground async scope or call-bound LLM capability here.
   private maintenanceRequests = new Map<string, DeferredCompactionDebtDrainParams>();
   private previousAssembledMessagesByConversation = new Map<number, AssemblePrefixSnapshot>();
+  private previousAssembledTokenBudgetsByConversation = new Map<number, number>();
   private recentBootstrapImportsByConversation = new Map<number, BootstrapImportObservation>();
   private deps: LcmDependencies;
 
@@ -4005,17 +4006,20 @@ export class LcmContextEngine implements ContextEngine {
       runtimeContext: params.runtimeContext,
       legacyParams,
     });
-    const tokenBudget = this.applyAssemblyBudgetCap(resolvedTokenBudget ?? defaultTokenBudget);
-    if (resolvedTokenBudget === undefined) {
-      this.deps.log.warn(
-        `[lcm] ${params.phase}: tokenBudget not provided; using default ${defaultTokenBudget}`,
-      );
-    }
-
     const conversation = await this.conversationStore.getConversationForSession({
       sessionId: params.sessionId,
       sessionKey: params.sessionKey,
     });
+    const assembledTokenBudget = conversation
+      ? this.previousAssembledTokenBudgetsByConversation.get(conversation.conversationId)
+      : undefined;
+    const effectiveTokenBudget = resolvedTokenBudget ?? assembledTokenBudget;
+    const tokenBudget = this.applyAssemblyBudgetCap(effectiveTokenBudget ?? defaultTokenBudget);
+    if (effectiveTokenBudget === undefined) {
+      this.deps.log.warn(
+        `[lcm] ${params.phase}: tokenBudget not provided and no assembled budget is available; using default ${defaultTokenBudget}`,
+      );
+    }
     const runtimePromptTokens = extractRuntimePromptTokenCount(asRecord(params.runtimeContext));
     const suppliedCurrentTokenCount = this.normalizeObservedTokenCount(
       params.currentTokenCount ??
@@ -5138,6 +5142,13 @@ export class LcmContextEngine implements ContextEngine {
         conversation.conversationId,
         prefixChange.currentSnapshot,
       );
+      this.previousAssembledTokenBudgetsByConversation.delete(conversation.conversationId);
+      this.previousAssembledTokenBudgetsByConversation.set(conversation.conversationId, tokenBudget);
+      while (this.previousAssembledTokenBudgetsByConversation.size > MAX_PREVIOUS_ASSEMBLED_SNAPSHOTS) {
+        const oldestConversationId = this.previousAssembledTokenBudgetsByConversation.keys().next().value;
+        if (typeof oldestConversationId !== "number") break;
+        this.previousAssembledTokenBudgetsByConversation.delete(oldestConversationId);
+      }
       if (assembled.debug) {
         const promotedOrdinals =
           assembled.debug.promotedOrdinals.length > 0
