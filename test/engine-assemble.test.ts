@@ -1773,6 +1773,11 @@ describe("LcmContextEngine.assemble canonical path", () => {
 
     await engine.ingest({
       sessionId,
+      message: { role: "user", content: "Check both files." } as AgentMessage,
+    });
+
+    await engine.ingest({
+      sessionId,
       message: {
         role: "assistant",
         content: [
@@ -2100,6 +2105,11 @@ describe("LcmContextEngine.assemble canonical path", () => {
 
     await engine.ingest({
       sessionId,
+      message: { role: "user", content: "Inspect the working directory." } as AgentMessage,
+    });
+
+    await engine.ingest({
+      sessionId,
       message: {
         role: "assistant",
         content: [
@@ -2138,9 +2148,9 @@ describe("LcmContextEngine.assemble canonical path", () => {
       tokenBudget: 10_000,
     });
 
-    expect(result.messages).toHaveLength(3);
+    expect(result.messages).toHaveLength(4);
 
-    const assistant = result.messages[0] as {
+    const assistant = result.messages[1] as {
       role: string;
       content?: Array<{ type?: string; call_id?: string }>;
     };
@@ -2148,9 +2158,9 @@ describe("LcmContextEngine.assemble canonical path", () => {
     expect(assistant.content?.map((block) => block.type)).toEqual(["reasoning", "function_call"]);
     expect(assistant.content?.[1]?.call_id).toBe("fc_1");
 
-    expect(result.messages[1]?.role).toBe("toolResult");
-    expect((result.messages[1] as { toolCallId?: string }).toolCallId).toBe("fc_1");
-    expect(result.messages[2]?.role).toBe("user");
+    expect(result.messages[2]?.role).toBe("toolResult");
+    expect((result.messages[2] as { toolCallId?: string }).toolCallId).toBe("fc_1");
+    expect(result.messages[3]?.role).toBe("user");
   });
 
   it("filters assistant messages with blank-text content during assembly", async () => {
