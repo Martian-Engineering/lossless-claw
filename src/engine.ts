@@ -1504,6 +1504,7 @@ export class LcmContextEngine implements ContextEngine {
         sessionKey: params.sessionKey,
         result,
         publicationPressureRemains,
+        publicationOnly: params.pendingPublishPolicy === "publish-ready-only",
       });
       this.deps.log.debug(
         `[lcm] maintain: deferred compaction ${result.compacted ? "completed" : "skipped"} conversation=${params.conversationId} ${sessionLabel} changed=${result.compacted} ok=${result.ok} reason=${result.reason ?? "none"} currentTokenCount=${resolvedCurrentTokenCount ?? "null"} projectedTokenCount=${resolvedProjectedTokenCount ?? "null"} rawTokensOutsideTail=${maintenance.rawTokensOutsideTail ?? "null"}`,
@@ -1541,6 +1542,7 @@ export class LcmContextEngine implements ContextEngine {
     sessionKey?: string;
     result: CompactResult & { pending?: boolean; exhausted?: boolean };
     publicationPressureRemains?: boolean;
+    publicationOnly?: boolean;
   }): Promise<void> {
     const { result } = params;
     const maintenance = await this.compactionMaintenanceStore
@@ -1560,6 +1562,9 @@ export class LcmContextEngine implements ContextEngine {
       failureSummary,
       keepPending,
       clearTokenObservations: result.compacted,
+      // A publication check that cannot advance is not a successful retry of
+      // the provider operation that established the failure and cooldown.
+      preserveRetryState: params.publicationOnly === true && result.ok && !result.compacted && keepPending,
       ...(backoff ? { nextAttemptAfter: backoff } : {}),
     });
     // Queued requests carry the same pre-publication observation as the durable
@@ -1649,7 +1654,7 @@ export class LcmContextEngine implements ContextEngine {
       kind: "compaction",
       scope: breakerScope,
     });
-    if (params.force === true || pendingManualCompaction) {
+    if (!publicationOnly && (params.force === true || pendingManualCompaction)) {
       const clearedBackoffUntil =
         this.compactionGuards.clearSummarySpendBackoff(summarySpendScopeKey);
       if (clearedBackoffUntil) {
