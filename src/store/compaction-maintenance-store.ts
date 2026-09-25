@@ -408,18 +408,30 @@ export class CompactionMaintenanceStore {
     failureSummary?: string | null;
     keepPending?: boolean;
     nextAttemptAfter?: Date | null;
+    /** Canonical publication invalidates observations of the preceding prompt. */
+    clearTokenObservations?: boolean;
   }): Promise<void> {
     const existing = await this.getConversationCompactionMaintenance(input.conversationId);
     const finishedAt = input.finishedAt ?? new Date();
     const isFailure = input.failureSummary != null;
     const shouldBackOff = shouldBackOffDeferredCompactionFailure(input.failureSummary);
     const retryAttempts = shouldBackOff ? (existing?.retryAttempts ?? 0) + 1 : 0;
-    const nextAttemptAfter =
+    let nextAttemptAfter =
       input.nextAttemptAfter !== undefined
         ? input.nextAttemptAfter
         : shouldBackOff
           ? new Date(finishedAt.getTime() + computeDeferredCompactionRetryDelayMs(retryAttempts))
           : null;
+    // Retained debt must honor every applicable cooldown. An explicit
+    // spend deadline cannot shorten a later maintenance retry (or vice versa).
+    if (input.keepPending ?? isFailure) {
+      const retryDeadline = shouldBackOff
+        ? finishedAt.getTime() + computeDeferredCompactionRetryDelayMs(retryAttempts)
+        : 0;
+      const latest = Math.max(retryDeadline, existing?.nextAttemptAfter?.getTime() ?? 0,
+        nextAttemptAfter?.getTime() ?? 0);
+      nextAttemptAfter = latest > finishedAt.getTime() ? new Date(latest) : null;
+    }
     await this.saveConversationCompactionMaintenance(
       mergeMaintenanceRecord(input.conversationId, existing, {
         pending: input.keepPending ?? isFailure,
@@ -431,6 +443,11 @@ export class CompactionMaintenanceStore {
             : input.failureSummary,
         retryAttempts,
         nextAttemptAfter,
+        ...(input.clearTokenObservations ? {
+          currentTokenCount: null,
+          projectedTokenCount: null,
+          rawTokensOutsideTail: null,
+        } : {}),
       }),
     );
   }
