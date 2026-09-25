@@ -16,9 +16,49 @@ import type { ConversationCompactionMaintenanceRecord } from "./store/compaction
 import { estimateAgentMessageTokens, normalizeNonNegativeInteger, toRuntimeRoleForTokenEstimate } from "./token-accounting.js";
 import {
   buildToolPairIndexesByAssembledIndex,
+  extractAssistantToolCallIdsForPairing,
   extractToolResultIdForPairing,
 } from "./tool-pairing.js";
 import { sanitizeToolUseResultPairing } from "./transcript-repair.js";
+
+/** Recognize tool exchange rows without interpreting ordinary assistant text. */
+function isToolExchangeMessage(message: AgentMessage): boolean {
+  return message.role === "tool" || message.role === "toolResult" ||
+    extractAssistantToolCallIdsForPairing(message).length > 0;
+}
+
+/** Omit an incomplete leading tool turn from the prompt without changing stored history. */
+function omitLeadingOrphanedToolTurn(messages: AgentMessage[]): AgentMessage[] {
+  const firstUserIndex = messages.findIndex((message) => message.role === "user");
+  // With no user boundary, the host may own an in-flight initiating turn.
+  // A later provider-visible user boundary proves the exchange is historical.
+  if (firstUserIndex < 0) {
+    return messages;
+  }
+  const prefix = messages.slice(0, firstUserIndex);
+  const hasToolExchange = prefix.some(isToolExchangeMessage);
+  if (!hasToolExchange) {
+    return messages;
+  }
+
+  // A later user cannot initiate an earlier call. Preserve host framing and
+  // begin at the next user boundary; never invent a replacement initiating turn.
+  const omittedCallIds = new Set(prefix.flatMap(extractAssistantToolCallIdsForPairing));
+  const retainedCallIds = new Set<string>();
+  const suffix = messages.slice(firstUserIndex).filter((message) => {
+    for (const id of extractAssistantToolCallIdsForPairing(message)) {
+      retainedCallIds.add(id);
+    }
+    // A displaced result of an omitted call must not survive past the boundary.
+    // A new retained call with that ID owns its own result.
+    const resultId = extractToolResultIdForPairing(message);
+    return !resultId || !omittedCallIds.has(resultId) || retainedCallIds.has(resultId);
+  });
+  return [
+    ...prefix.filter(isProtectedLeadingLiveContextMessage),
+    ...suffix,
+  ];
+}
 
 /**
  * Expand a retained suffix to a provider-valid turn without replaying the
@@ -48,17 +88,35 @@ function buildProviderValidSuffix(params: {
     }
   }
 
-  const hasUserMessage = [...retainedIndexes].some(
-    (index) => toRuntimeRoleForTokenEstimate(params.messages[index]!.role) === "user",
-  );
-  if (!hasUserMessage) {
-    const earliestRetainedIndex = Math.min(...retainedIndexes);
+  const earliestRetainedIndex = Math.min(...retainedIndexes);
+  // A later user does not anchor the leading retained tool exchange. Recover
+  // the earlier initiating user without changing ordinary text-only eviction.
+  const retainedBeforeFirstUser: AgentMessage[] = [];
+  let hasUserMessage = false;
+  for (const index of [...retainedIndexes].sort((left, right) => left - right)) {
+    const message = params.messages[index]!;
+    if (toRuntimeRoleForTokenEstimate(message.role) === "user") {
+      hasUserMessage = true;
+      break;
+    }
+    retainedBeforeFirstUser.push(message);
+  }
+  const startsWithToolExchange = retainedBeforeFirstUser.some(isToolExchangeMessage);
+  if (!hasUserMessage || startsWithToolExchange) {
     for (let index = earliestRetainedIndex - 1; index >= 0; index -= 1) {
       if (toRuntimeRoleForTokenEstimate(params.messages[index]!.role) === "user") {
         retainedIndexes.add(index);
         break;
       }
     }
+  }
+
+  // System/developer framing belongs to the whole prompt, not an evicted turn.
+  for (let index = 0; index < safeStartIndex; index += 1) {
+    if (!isProtectedLeadingLiveContextMessage(params.messages[index]!)) {
+      break;
+    }
+    retainedIndexes.add(index);
   }
 
   const retainedMessages = [...retainedIndexes]
@@ -91,10 +149,10 @@ function buildProviderValidSuffix(params: {
     repairMessages[repairMessages.length - 1]?.role === "assistant"
       ? repairMessages.length - 1
       : repairMessages.length;
-  return [
+  return omitLeadingOrphanedToolTurn([
     ...sanitizeToolUseResultPairing(repairMessages.slice(0, repairEndIndex)),
     ...repairMessages.slice(repairEndIndex),
-  ] as AgentMessage[];
+  ] as AgentMessage[]);
 }
 
 /**
@@ -153,8 +211,8 @@ export const SERIALIZED_OUTPUT_CLAMP_SAFETY_RATIO = 0.9;
  * real prompt when live message objects carry structured payloads that
  * stored content omits (e.g. transcripts imported from a previous harness).
  * This clamp keeps the newest suffix that fits, expands retained tool calls
- * and results to complete pairing units, and re-seats the most recent user
- * turn if eviction removed every user message. A single atomic turn can still
+ * and results to complete pairing units, and re-seats their initiating user
+ * turn. Incomplete leading tool turns are omitted even below budget. A single atomic turn can still
  * exceed the target; returning it intact is safer than emitting an invalid
  * partial tool exchange.
  */
@@ -180,14 +238,18 @@ export function clampMessagesToSerializedBudget(params: {
     Math.floor(params.tokenBudget * SERIALIZED_OUTPUT_CLAMP_SAFETY_RATIO),
   );
   const serializedTokensBefore = estimateSerializedMessagesTokens(params.messages);
-  if (serializedTokensBefore <= targetTokens || params.messages.length === 0) {
+  const messages = omitLeadingOrphanedToolTurn(params.messages);
+  const serializedTokens = messages === params.messages
+    ? serializedTokensBefore
+    : estimateSerializedMessagesTokens(messages);
+  if (serializedTokens <= targetTokens || messages.length === 0) {
     return {
-      messages: params.messages,
-      serializedTokens: serializedTokensBefore,
+      messages,
+      serializedTokens,
       serializedTokensBefore,
-      clamped: false,
-      evictedMessages: 0,
-      overBudget: serializedTokensBefore > triggerTokens,
+      clamped: messages.length !== params.messages.length,
+      evictedMessages: params.messages.length - messages.length,
+      overBudget: serializedTokens > triggerTokens,
     };
   }
 
@@ -195,8 +257,8 @@ export function clampMessagesToSerializedBudget(params: {
   // then recover any tool-pair partners displaced by the budget boundary.
   const kept: AgentMessage[] = [];
   let keptTokens = 0;
-  for (let index = params.messages.length - 1; index >= 0; index -= 1) {
-    const message = params.messages[index]!;
+  for (let index = messages.length - 1; index >= 0; index -= 1) {
+    const message = messages[index]!;
     const tokenCount = estimateSerializedMessageTokens(message);
     if (kept.length > 0 && keptTokens + tokenCount > targetTokens) {
       break;
@@ -206,8 +268,8 @@ export function clampMessagesToSerializedBudget(params: {
   }
   kept.reverse();
   const providerValidKept = buildProviderValidSuffix({
-    messages: params.messages,
-    retainedStartIndex: params.messages.length - kept.length,
+    messages,
+    retainedStartIndex: messages.length - kept.length,
     preserveSubstantiveAssistantTail: params.preserveSubstantiveAssistantTail,
   });
   keptTokens = estimateSerializedMessagesTokens(providerValidKept);
@@ -223,17 +285,17 @@ export function clampMessagesToSerializedBudget(params: {
     stripped.length > 0 || params.preserveSubstantiveAssistantTail === true
       ? stripped
       : providerValidKept;
-  const serializedTokens =
+  const finalSerializedTokens =
     finalMessages.length === providerValidKept.length
       ? keptTokens
       : estimateSerializedMessagesTokens(finalMessages);
   return {
     messages: finalMessages,
-    serializedTokens,
+    serializedTokens: finalSerializedTokens,
     serializedTokensBefore,
     clamped: true,
     evictedMessages: Math.max(0, params.messages.length - finalMessages.length),
-    overBudget: serializedTokens > targetTokens,
+    overBudget: finalSerializedTokens > targetTokens,
   };
 }
 
@@ -323,11 +385,11 @@ export function buildForkBoundedLiveFallback(params: {
     forkSourceMessageCount: params.forkSourceMessageCount,
   });
   const candidateMessages = suffix.length > 0 ? suffix : params.liveMessages;
-  const boundedMessages = trimMessagesToBudget(
+  const boundedMessages = omitLeadingOrphanedToolTurn(trimMessagesToBudget(
     candidateMessages,
     Math.min(params.tokenBudget, params.bootstrapMaxTokens),
     { preserveSubstantiveAssistantTail: params.preserveSubstantiveAssistantTail },
-  );
+  ));
   return {
     messages: boundedMessages,
     estimatedTokens: estimateAgentMessageTokens(boundedMessages),
