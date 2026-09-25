@@ -226,6 +226,28 @@ describe("CompactionMaintenanceStore", () => {
     expect(record?.nextAttemptAfter).toBeNull();
   });
 
+  it.each([
+    { previous: 60, spend: 30, expected: 60 },
+    { previous: 10, spend: 60, expected: 60 },
+    { previous: 1, spend: 2, expected: 5 },
+  ])("preserves the latest applicable retry horizon: $expected minutes", async ({ previous, spend, expected }) => {
+    const db = createTestDb();
+    const conversationStore = new ConversationStore(db, getLcmDbFeatures(db));
+    const conversation = await conversationStore.createConversation({ sessionId: "retry-horizon" });
+    const store = new CompactionMaintenanceStore(db);
+    const finishedAt = new Date("2026-09-25T12:00:00Z");
+    const deadline = (minutes: number) => new Date(finishedAt.getTime() + minutes * 60_000);
+    await store.requestProactiveCompactionDebt({ conversationId: conversation.conversationId, reason: "threshold" });
+    // A pending publication is not a failed provider attempt and starts no
+    // exponential retry. Its external cooldown remains applicable afterwards.
+    await store.markProactiveCompactionFinished({ conversationId: conversation.conversationId,
+      finishedAt, keepPending: true, failureSummary: null, nextAttemptAfter: deadline(previous) });
+    await store.markProactiveCompactionFinished({ conversationId: conversation.conversationId,
+      finishedAt, keepPending: true, failureSummary: "could not reach target", nextAttemptAfter: deadline(spend) });
+    expect(await store.getConversationCompactionMaintenance(conversation.conversationId))
+      .toMatchObject({ pending: true, retryAttempts: 1, nextAttemptAfter: deadline(expected) });
+  });
+
   it("closes only inactive pending debt and clears the resolution when fresh debt is requested", async () => {
     const db = createTestDb();
     const { fts5Available } = getLcmDbFeatures(db);

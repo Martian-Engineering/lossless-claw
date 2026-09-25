@@ -1209,7 +1209,7 @@ export class LcmContextEngine implements ContextEngine {
         !pendingSummaryModelUnavailable
       ) {
         const currentTokenCount =
-          result?.changed === true && result.reason === "pending summaries published"
+          result?.changed === true
             ? await this.summaryStore.getContextTokenCount(params.conversationId)
             : params.currentTokenCount;
         const { runtimeContext: _runtimeContext, queueKey: _queueKey, ...request } = params;
@@ -1250,11 +1250,6 @@ export class LcmContextEngine implements ContextEngine {
     }
 
     const sessionLabel = formatSessionLabel(params.sessionId, params.sessionKey);
-    const summarySpendScopeKey = this.compactionGuards.resolveSummarySpendScope({
-      kind: "compaction",
-      scope: this.resolveSessionQueueKey(params.sessionId, params.sessionKey),
-    });
-
     // A published pending batch rewrites the canonical projection, so token
     // observations captured before that publication are no longer valid. Clear
     // satisfied threshold debt even when the stale row currently has backoff.
@@ -1495,7 +1490,6 @@ export class LcmContextEngine implements ContextEngine {
         );
         publicationPressureRemains = postPublicationDecision.shouldCompact;
       }
-      const blockedByAuthCircuitBreaker = result.reason === "circuit breaker open";
       // #639 Mode 2: terminal compaction exhaustion (no eligible candidates while
       // over target) is non-retryable — clear the debt instead of pinning it and
       // climbing retry_attempts forever (which thrashes the assemble degraded
@@ -1504,25 +1498,12 @@ export class LcmContextEngine implements ContextEngine {
       // treats it as done.
       const compactionExhausted =
         (result as { exhausted?: boolean }).exhausted === true;
-      const keepPending =
-        result.pending === true ||
-        publicationPressureRemains ||
-        ((!result.ok || blockedByAuthCircuitBreaker) && !compactionExhausted);
-      const failureSummary = blockedByAuthCircuitBreaker
-        ? "summary provider circuit breaker is open"
-        : result.ok || compactionExhausted
-          ? null
-          : result.reason ?? "deferred compaction failed";
-      const summarySpendBackoffUntil = keepPending
-        ? this.compactionGuards.getSummarySpendBackoffUntil(summarySpendScopeKey) ??
-          (backoffActive ? nextAttemptAfter : null)
-        : null;
-      await this.compactionMaintenanceStore.markProactiveCompactionFinished({
+      await this.finishCompactionDebt({
         conversationId: params.conversationId,
-        finishedAt: new Date(),
-        failureSummary,
-        keepPending,
-        ...(summarySpendBackoffUntil ? { nextAttemptAfter: summarySpendBackoffUntil } : {}),
+        sessionId: params.sessionId,
+        sessionKey: params.sessionKey,
+        result,
+        publicationPressureRemains,
       });
       this.deps.log.debug(
         `[lcm] maintain: deferred compaction ${result.compacted ? "completed" : "skipped"} conversation=${params.conversationId} ${sessionLabel} changed=${result.compacted} ok=${result.ok} reason=${result.reason ?? "none"} currentTokenCount=${resolvedCurrentTokenCount ?? "null"} projectedTokenCount=${resolvedProjectedTokenCount ?? "null"} rawTokensOutsideTail=${maintenance.rawTokensOutsideTail ?? "null"}`,
@@ -1550,6 +1531,42 @@ export class LcmContextEngine implements ContextEngine {
         rewrittenEntries: 0,
         reason: error instanceof Error ? error.message : "deferred compaction failed",
       };
+    }
+  }
+
+  /** Settle existing debt from the outcome, independently of committed progress. */
+  private async finishCompactionDebt(params: {
+    conversationId: number;
+    sessionId: string;
+    sessionKey?: string;
+    result: CompactResult & { pending?: boolean; exhausted?: boolean };
+    publicationPressureRemains?: boolean;
+  }): Promise<void> {
+    const { result } = params;
+    const maintenance = await this.compactionMaintenanceStore
+      .getConversationCompactionMaintenance(params.conversationId);
+    // Manual compaction must not manufacture automatic work or finished rows.
+    if (!maintenance?.pending && !maintenance?.running) return;
+    const circuitOpen = result.reason === "circuit breaker open";
+    const keepPending = result.pending === true || params.publicationPressureRemains === true ||
+      ((!result.ok || circuitOpen) && result.exhausted !== true);
+    const failureSummary = circuitOpen ? "summary provider circuit breaker is open"
+      : result.ok || result.exhausted === true ? null : result.reason ?? "compaction failed";
+    const queueKey = this.resolveSessionQueueKey(params.sessionId, params.sessionKey);
+    const scopeKey = this.compactionGuards.resolveSummarySpendScope({ kind: "compaction", scope: queueKey });
+    const backoff = keepPending ? this.compactionGuards.getSummarySpendBackoffUntil(scopeKey) : null;
+    await this.compactionMaintenanceStore.markProactiveCompactionFinished({
+      conversationId: params.conversationId,
+      failureSummary,
+      keepPending,
+      clearTokenObservations: result.compacted,
+      ...(backoff ? { nextAttemptAfter: backoff } : {}),
+    });
+    // Queued requests carry the same pre-publication observation as the durable
+    // row. A later host callback may supply a fresh count; otherwise use storage.
+    const queued = this.maintenanceRequests.get(queueKey);
+    if (result.compacted && queued?.conversationId === params.conversationId) {
+      this.maintenanceRequests.set(queueKey, { ...queued, currentTokenCount: undefined });
     }
   }
 
@@ -5386,14 +5403,12 @@ export class LcmContextEngine implements ContextEngine {
         const result: CompactResult & { pending?: boolean } = authoritativeRecovery
           ? await this.executeCompactionCore(execution)
           : await this.executePendingCompactionCore(execution);
-        if (result.compacted && result.pending !== true) {
-          await this.compactionMaintenanceStore.markProactiveCompactionFinished({
-            conversationId: conversation.conversationId,
-            finishedAt: new Date(),
-            failureSummary: null,
-            keepPending: false,
-          });
-        }
+        await this.finishCompactionDebt({
+          conversationId: conversation.conversationId,
+          sessionId: params.sessionId,
+          sessionKey: params.sessionKey,
+          result,
+        });
         return result;
       },
     );
