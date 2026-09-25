@@ -4,6 +4,10 @@ This reference covers the current `lossless-claw` config surface on `main`, base
 
 `lossless-claw` is most effective when the operator understands which settings change compaction behavior and why.
 
+The Settings editor displays fixed defaults from the plugin manifest. Automatic values remain unset: Bootstrap Max Tokens uses the greater of 6000 or 30% of Leaf Chunk Tokens (rounded down), so its input shows **Auto** until you choose an override.
+
+Grouped settings require OpenClaw `2026.9.5` or newer. Earlier supported hosts ignore the optional `configGroups` metadata and show the complete flat settings form. The runtime minimum remains `2026.9.2`; configuration paths and runtime defaults are unchanged. See [Settings in OpenClaw](../../../docs/configuration.md#settings-in-openclaw) for the section list and compatibility details.
+
 ## First checks
 
 - Ensure the plugin is installed and enabled.
@@ -371,7 +375,7 @@ Why it matters:
 - `deferred` also stores provider/model/cache telemetry so Anthropic-family sessions can avoid rewriting a still-hot prompt cache
 - `inline` preserves the legacy foreground compaction path for hosts that do not yet support deferred execution
 - `/lossless status` (`/lcm status` alias) surfaces pending/running/last-failure maintenance state so operators can see when compaction is queued
-- after-turn background drain and host-approved `maintain()` consume routine threshold debt; `assemble()` only drains pending threshold debt synchronously as an emergency safeguard when the live prompt estimate is already over budget
+- host-approved `maintain()` consumes routine threshold debt; before pressure-driven eviction, `assemble()` publishes ready summaries and may run one bounded foreground preparation pass toward `contextThreshold`. Generation respects spend limits, cooldowns, and background ownership; ready publication requires no new model calls. Unrelieved pressure retains `assembly-pressure` debt and uses bounded fallback
 
 ### Active Transcript Storage
 

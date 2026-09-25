@@ -69,6 +69,37 @@ describe("resolveLcmConfig", () => {
     });
   });
 
+  it("publishes fixed defaults that match runtime behavior without fixing automatic values", () => {
+    const defaults = resolveLcmConfig({}, {});
+    const schema = manifest.configSchema as { properties: Record<string, { default?: unknown; properties?: Record<string, unknown> }> };
+    expect(schema.properties.enabled.default).toBe(true);
+    expect(schema.properties.freshTailCount.default).toBe(64);
+    expect(schema.properties.bootstrapMaxTokens.default).toBeUndefined();
+    // A canonical default would hide the accepted incrementalMaxDepth alias.
+    expect(schema.properties.sweepMaxDepth.default).toBeUndefined();
+    // The host applies manifest defaults before the resolver classifies pattern sources.
+    // Keep absent arrays absent so defaults are not reported as operator configuration.
+    expect(schema.properties.ignoreSessionPatterns.default).toBeUndefined();
+    expect(schema.properties.statelessSessionPatterns.default).toBeUndefined();
+    expect(resolveLcmConfigWithDiagnostics({}, {}).diagnostics).toMatchObject({
+      ignoreSessionPatternsSource: "default",
+      statelessSessionPatternsSource: "default",
+    });
+    expect(resolveLcmConfig({}, { incrementalMaxDepth: -1 }).sweepMaxDepth).toBe(-1);
+    const check = (properties: Record<string, unknown>, runtime: Record<string, unknown>) => {
+      for (const [key, raw] of Object.entries(properties)) {
+        const node = raw as { default?: unknown; properties?: Record<string, unknown> };
+        if (Object.hasOwn(node, "default")) expect(node.default, key).toEqual(runtime[key]);
+        if (node.properties && runtime[key] && typeof runtime[key] === "object") {
+          check(node.properties, runtime[key] as Record<string, unknown>);
+        }
+      }
+    };
+    check(schema.properties, defaults as unknown as Record<string, unknown>);
+    expect(resolveLcmConfig({}, { leafChunkTokens: 40000 }).bootstrapMaxTokens).toBe(12000);
+    expect(manifest.uiHints.bootstrapMaxTokens.placeholder).toBe("Auto (at least 6000)");
+  });
+
   it("reads values from plugin config", () => {
     const config = resolveLcmConfig({}, {
       contextThreshold: 0.5,
@@ -664,6 +695,7 @@ describe("resolveLcmConfig", () => {
     expect(manifest.configSchema.properties.delegationTimeoutMs).toEqual({
       type: "integer",
       minimum: 1,
+      default: 120000,
     });
   });
 
@@ -671,12 +703,14 @@ describe("resolveLcmConfig", () => {
     expect(manifest.configSchema.properties.leafChunkTokens).toEqual({
       type: "integer",
       minimum: 1,
+      default: 20000,
     });
   });
 
   it("ships a manifest with promptAwareEviction in schema", () => {
     expect(manifest.configSchema.properties.promptAwareEviction).toEqual({
       type: "boolean",
+      default: false,
     });
   });
 
@@ -771,6 +805,7 @@ describe("resolveLcmConfig", () => {
       properties: {
         enabled: {
           type: "boolean",
+          default: true,
         },
         max: {
           type: "integer",
@@ -784,6 +819,7 @@ describe("resolveLcmConfig", () => {
     expect(manifest.configSchema.properties.proactiveThresholdCompactionMode).toEqual({
       type: "string",
       enum: ["deferred", "inline"],
+      default: "deferred",
     });
   });
 
@@ -813,9 +849,9 @@ describe("resolveLcmConfig", () => {
       type: "object",
       additionalProperties: false,
       properties: {
-        enabled: { type: "boolean" },
+        enabled: { type: "boolean", default: true },
         file: { type: "string" },
-        maxFileBytes: { type: "integer", minimum: 1 },
+        maxFileBytes: { type: "integer", minimum: 1, default: 104857600 },
       },
     });
   });
@@ -827,32 +863,39 @@ describe("resolveLcmConfig", () => {
       properties: {
         enabled: {
           type: "boolean",
+          default: true,
         },
         cacheTTLSeconds: {
           type: "integer",
           minimum: 1,
+          default: 300,
         },
         maxColdCacheCatchupPasses: {
           type: "integer",
           minimum: 1,
+          default: 2,
         },
         hotCachePressureFactor: {
           type: "number",
           minimum: 1,
+          default: 4,
         },
         hotCacheBudgetHeadroomRatio: {
           type: "number",
           minimum: 0,
           maximum: 0.95,
+          default: 0.2,
         },
         coldCacheObservationThreshold: {
           type: "integer",
           minimum: 1,
+          default: 3,
         },
         criticalBudgetPressureRatio: {
           type: "number",
           minimum: 0,
           maximum: 1,
+          default: 0.9,
         },
       },
     });
@@ -862,14 +905,17 @@ describe("resolveLcmConfig", () => {
     expect(manifest.configSchema.properties.leafTargetTokens).toEqual({
       type: "integer",
       minimum: 1,
+      default: 2400,
     });
     expect(manifest.configSchema.properties.condensedTargetTokens).toEqual({
       type: "integer",
       minimum: 1,
+      default: 2000,
     });
     expect(manifest.configSchema.properties.maxExpandTokens).toEqual({
       type: "integer",
       minimum: 1,
+      default: 4000,
     });
   });
 
@@ -879,17 +925,20 @@ describe("resolveLcmConfig", () => {
     expect(manifest.configSchema.properties.summaryCallWindowMs).toEqual({
       type: "integer",
       minimum: 1,
+      default: 600000,
     });
     expect(manifest.configSchema.properties.summaryMaxCallsPerWindow).toEqual({
       type: "integer",
       minimum: 1,
+      default: 24,
     });
     expect(manifest.configSchema.properties.summarySpendBackoffMs).toEqual({
       type: "integer",
       minimum: 1,
+      default: 1800000,
     });
     expect(manifest.configSchema.properties.timezone).toEqual({ type: "string" });
-    expect(manifest.configSchema.properties.pruneHeartbeatOk).toEqual({ type: "boolean" });
+    expect(manifest.configSchema.properties.pruneHeartbeatOk).toEqual({ type: "boolean", default: false });
   });
 
   it("ships a manifest with bootstrapMaxTokens in schema", () => {
@@ -902,6 +951,7 @@ describe("resolveLcmConfig", () => {
     expect(manifest.configSchema.properties.fallbackMaxTokens).toEqual({
       type: "integer",
       minimum: 64,
+      default: 512,
     });
   });
   it("defaults summaryMaxOverageFactor to 3 and maxAssemblyTokenBudget to undefined", () => {

@@ -993,6 +993,198 @@ describe("LcmContextEngine.bootstrap sqlite transcript projection", () => {
     expect(rows).toEqual([{ content: decoratedContent, transcript_entry_id: null }]);
   });
 
+  it("adopts a repeated runtime body by created time instead of importing a second row", async () => {
+    const sessionId = "sqlite-bootstrap-repeated-created-at-session";
+    const sessionKey = "agent:main:sqlite-bootstrap-repeated-created-at-session";
+    const bareContent = "[System] Your previous turn was interrupted by a gateway restart.";
+    const olderAt = "2026-06-21T10:18:00.000Z";
+    const currentAt = "2026-06-21T10:19:00.000Z";
+    const readVisibleSessionTranscriptMessageEntries = vi.fn(async () => [
+      {
+        entryId: "entry-older-user",
+        parentId: null,
+        seq: 1,
+        role: "user",
+        message: { role: "user", content: bareContent } satisfies AgentMessage,
+        createdAt: olderAt,
+      },
+      {
+        entryId: "entry-older-reply",
+        parentId: "entry-older-user",
+        seq: 2,
+        role: "assistant",
+        message: { role: "assistant", content: "older reply" } satisfies AgentMessage,
+        createdAt: "2026-06-21T10:18:01.000Z",
+      },
+      {
+        entryId: "entry-current-user",
+        parentId: "entry-older-reply",
+        seq: 3,
+        role: "user",
+        message: { role: "user", content: bareContent } satisfies AgentMessage,
+        createdAt: currentAt,
+      },
+    ]);
+    const { engine, db } = createEngineWithDepsOverridesAndDb({
+      readVisibleSessionTranscriptMessageEntries,
+    } satisfies Partial<LcmDependencies>);
+
+    // Hosts ingest live turns in batches; each row keeps the message's own
+    // timestamp, which lands within milliseconds of the transcript entry.
+    await engine.ingestBatch({
+      sessionId,
+      sessionKey,
+      messages: [
+        { role: "user", content: bareContent, timestamp: Date.parse(olderAt) + 40 },
+        { role: "assistant", content: "older reply", timestamp: Date.parse("2026-06-21T10:18:01.000Z") },
+        { role: "user", content: bareContent, timestamp: Date.parse(currentAt) + 40 },
+      ] as AgentMessage[],
+    });
+    await engine.bootstrap({
+      sessionId,
+      sessionKey,
+      runtimeContext: {
+        transcriptStorage: { kind: "sqlite" },
+        sessionTarget: {
+          agentId: "main",
+          sessionId,
+          sessionKey,
+          storePath: "/tmp/openclaw-agent.sqlite",
+        },
+      },
+    });
+
+    const conversation = await engine.getConversationStore().getConversationForSession({
+      sessionId,
+      sessionKey,
+    });
+    expect(conversation).not.toBeNull();
+    const rows = db
+      .prepare(
+        `SELECT content, transcript_entry_id FROM messages WHERE conversation_id = ? ORDER BY seq`,
+      )
+      .all(conversation!.conversationId) as Array<{
+      content: string;
+      transcript_entry_id: string | null;
+    }>;
+    expect(rows).toEqual([
+      { content: bareContent, transcript_entry_id: "entry-older-user" },
+      { content: "older reply", transcript_entry_id: "entry-older-reply" },
+      { content: bareContent, transcript_entry_id: "entry-current-user" },
+    ]);
+  });
+
+  it("adopts by created time even when store order disagrees with projection order", async () => {
+    const sessionId = "sqlite-bootstrap-reversed-created-at-session";
+    const sessionKey = "agent:main:sqlite-bootstrap-reversed-created-at-session";
+    const bareContent = "[System] Your previous turn was interrupted by a gateway restart.";
+    const olderAt = "2026-06-21T10:18:00.000Z";
+    const newerAt = "2026-06-21T10:19:00.000Z";
+    const readVisibleSessionTranscriptMessageEntries = vi.fn(async () => [
+      {
+        entryId: "entry-older-user",
+        parentId: null,
+        seq: 1,
+        role: "user",
+        message: { role: "user", content: bareContent } satisfies AgentMessage,
+        createdAt: olderAt,
+      },
+      {
+        entryId: "entry-older-reply",
+        parentId: "entry-older-user",
+        seq: 2,
+        role: "assistant",
+        message: { role: "assistant", content: "older reply" } satisfies AgentMessage,
+        createdAt: "2026-06-21T10:18:01.000Z",
+      },
+      {
+        entryId: "entry-newer-user",
+        parentId: "entry-older-reply",
+        seq: 3,
+        role: "user",
+        message: { role: "user", content: bareContent } satisfies AgentMessage,
+        createdAt: newerAt,
+      },
+    ]);
+    const { engine, db } = createEngineWithDepsOverridesAndDb({
+      readVisibleSessionTranscriptMessageEntries,
+    } satisfies Partial<LcmDependencies>);
+
+    // Store rows arrive newest-first, so a first-in-tail or oldest-first pick
+    // would stamp the wrong row; only the created time identifies each one.
+    await engine.ingestBatch({
+      sessionId,
+      sessionKey,
+      messages: [
+        { role: "user", content: bareContent, timestamp: Date.parse(newerAt) + 900 },
+        { role: "user", content: bareContent, timestamp: Date.parse(olderAt) + 40 },
+        { role: "assistant", content: "older reply", timestamp: Date.parse("2026-06-21T10:18:01.000Z") },
+      ] as AgentMessage[],
+    });
+    await engine.bootstrap({
+      sessionId,
+      sessionKey,
+      runtimeContext: {
+        transcriptStorage: { kind: "sqlite" },
+        sessionTarget: { agentId: "main", sessionId, sessionKey, storePath: "/tmp/openclaw-agent.sqlite" },
+      },
+    });
+
+    const conversation = await engine.getConversationStore().getConversationForSession({ sessionId, sessionKey });
+    const rows = db
+      .prepare(`SELECT created_at, transcript_entry_id FROM messages WHERE conversation_id = ? ORDER BY seq`)
+      .all(conversation!.conversationId) as Array<{ created_at: string; transcript_entry_id: string | null }>;
+    expect(rows).toEqual([
+      { created_at: "2026-06-21 10:19:00", transcript_entry_id: "entry-newer-user" },
+      { created_at: "2026-06-21 10:18:00", transcript_entry_id: "entry-older-user" },
+      { created_at: "2026-06-21 10:18:01", transcript_entry_id: "entry-older-reply" },
+    ]);
+  });
+
+  it("fails closed when repeated bodies share the same created second", async () => {
+    const sessionId = "sqlite-bootstrap-same-second-session";
+    const sessionKey = "agent:main:sqlite-bootstrap-same-second-session";
+    const bareContent = "ok";
+    const at = "2026-06-21T10:18:00.000Z";
+    const readVisibleSessionTranscriptMessageEntries = vi.fn(async () => [
+      {
+        entryId: "entry-twin-user",
+        parentId: null,
+        seq: 1,
+        role: "user",
+        message: { role: "user", content: bareContent } satisfies AgentMessage,
+        createdAt: at,
+      },
+    ]);
+    const { engine, db } = createEngineWithDepsOverridesAndDb({
+      readVisibleSessionTranscriptMessageEntries,
+    } satisfies Partial<LcmDependencies>);
+
+    await engine.ingestBatch({
+      sessionId,
+      sessionKey,
+      messages: [
+        { role: "user", content: bareContent, timestamp: Date.parse(at) + 100 },
+        { role: "user", content: bareContent, timestamp: Date.parse(at) + 700 },
+      ] as AgentMessage[],
+    });
+    await engine.bootstrap({
+      sessionId,
+      sessionKey,
+      runtimeContext: {
+        transcriptStorage: { kind: "sqlite" },
+        sessionTarget: { agentId: "main", sessionId, sessionKey, storePath: "/tmp/openclaw-agent.sqlite" },
+      },
+    });
+
+    const conversation = await engine.getConversationStore().getConversationForSession({ sessionId, sessionKey });
+    const stamped = db
+      .prepare(`SELECT transcript_entry_id FROM messages WHERE conversation_id = ? AND transcript_entry_id IS NOT NULL`)
+      .all(conversation!.conversationId) as Array<{ transcript_entry_id: string }>;
+    // Ambiguous twins never get an id guessed onto them.
+    expect(stamped).toEqual([]);
+  });
+
   it("does not adopt an ambiguous decorated projection candidate", async () => {
     const sessionId = "sqlite-bootstrap-ambiguous-decorated-session";
     const sessionKey = "agent:main:sqlite-bootstrap-ambiguous-decorated-session";

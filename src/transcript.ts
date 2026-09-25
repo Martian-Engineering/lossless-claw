@@ -1,6 +1,7 @@
 import { createReadStream } from "node:fs";
 import { createInterface } from "node:readline";
 import type { ContextEngine } from "./openclaw-bridge.js";
+import { parseUtcTimestamp } from "./store/parse-utc-timestamp.js";
 
 type AgentMessage = Parameters<ContextEngine["ingest"]>[0]["message"];
 
@@ -40,6 +41,30 @@ export function getTranscriptEntryMeta(message: AgentMessage): TranscriptEntryMe
 
 export function getTranscriptEntryId(message: AgentMessage): string | null {
   return getTranscriptEntryMeta(message)?.entryId ?? null;
+}
+
+/** Live ingest stores the message's own timestamp; allow a small clock skew. */
+const ADOPTION_CREATED_AT_TOLERANCE_MS = 2_000;
+
+export function filterByCreatedAt<T extends { createdAt: Date }>(
+  candidates: T[],
+  createdAt: Date | string | undefined,
+): T[] {
+  const targetMs = createdAt === undefined ? null : transcriptTimestampMs(createdAt);
+  if (targetMs === null) {
+    return [];
+  }
+  return candidates.filter(
+    (candidate) =>
+      Number.isFinite(candidate.createdAt.getTime()) &&
+      Math.abs(candidate.createdAt.getTime() - targetMs) <= ADOPTION_CREATED_AT_TOLERANCE_MS,
+  );
+}
+
+export function transcriptTimestampMs(value: Date | string): number | null {
+  // Timezone-less strings are UTC, matching how the store reads created_at.
+  const ms = value instanceof Date ? value.getTime() : parseUtcTimestamp(value).getTime();
+  return Number.isFinite(ms) ? ms : null;
 }
 
 export function resolveTranscriptMessageCreatedAt(message: AgentMessage): Date | string | undefined {

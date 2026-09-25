@@ -1,4 +1,10 @@
-import { createHash, randomUUID } from "node:crypto";
+import { randomUUID } from "node:crypto";
+import {
+  buildPendingProjectionSnapshot,
+  buildBatchSourceFingerprint,
+  digestText,
+  type ProjectionSnapshot,
+} from "./pending-summary-projection.js";
 import {
   extractMeaningfulMessageText,
   resolveLeafSummaryMessageContent,
@@ -8,7 +14,6 @@ import { estimateTokens } from "./estimate-tokens.js";
 import {
   planPendingCondensedNodes,
   planPendingLeafNodes,
-  resolvePendingFreshTailOrdinal,
   selectPendingPublishCoverageTarget,
   selectPendingPublishFrontier,
   type PendingSummaryPlannerNode,
@@ -28,9 +33,10 @@ import {
   type PendingSummaryNodeRecord,
   type PendingSummaryStore,
 } from "./store/pending-summary-store.js";
-import type { ContextItemRecord, SummaryRecord, SummaryStore } from "./store/summary-store.js";
+import type { SummaryStore } from "./store/summary-store.js";
 import {
   LcmProviderAuthError,
+  LcmRuntimeLifecycleError,
   LcmSummarySpendLimitError,
   type LcmSummarizeFn,
 } from "./summarize.js";
@@ -87,30 +93,10 @@ export type PendingCompactionCoordinatorResult =
       authFailure?: boolean;
     };
 
-type ProjectionSnapshot = {
-  items: PendingSummaryPlannerSnapshotItem[];
-  contextItems: ContextItemRecord[];
-  summaryById: Map<string, SummaryRecord>;
-  sourceProjectionFingerprint: string;
-  freshTailStartOrdinal: number | null;
-  compactableStartOrdinal: number | null;
-  compactableEndOrdinal: number | null;
-};
-
 type PublishFrontierSelection = {
   frontier: PendingSummaryPlannerNode[];
   pendingFrontier: PendingSummaryPlannerNode[];
 };
-
-function digestText(prefix: string, parts: string[]): string {
-  const hash = createHash("sha256");
-  hash.update(prefix);
-  for (const part of parts) {
-    hash.update("\0");
-    hash.update(part);
-  }
-  return hash.digest("hex");
-}
 
 function shortDigest(prefix: string, parts: string[]): string {
   return digestText(prefix, parts).slice(0, 16);
@@ -189,7 +175,9 @@ export class PendingCompactionCoordinator {
       if (publishPolicy === "publish-ready-only") {
         return { status: "idle", reason: "no active pending summary batch" };
       }
-      const snapshot = await this.buildProjectionSnapshot(input.conversationId);
+      const snapshot = await buildPendingProjectionSnapshot(
+        input.conversationId, this.conversationStore, this.summaryStore, this.config,
+      );
       if (snapshot.compactableStartOrdinal == null || snapshot.compactableEndOrdinal == null) {
         return { status: "idle", reason: "no compactable context outside fresh tail" };
       }
@@ -222,6 +210,7 @@ export class PendingCompactionCoordinator {
           depth: node.kind === "condensed" ? node.depth : undefined,
         }),
       estimateTokens,
+      isLifecycleFailure: (error) => error instanceof LcmRuntimeLifecycleError,
       isAuthFailure: (error) => error instanceof LcmProviderAuthError,
       isSpendLimitFailure: (error) => error instanceof LcmSummarySpendLimitError,
     });
@@ -236,6 +225,14 @@ export class PendingCompactionCoordinator {
     }
     if (prepared.status === "spend-limited") {
       return { status: "idle", reason: "summary spend backoff open" };
+    }
+    if (prepared.status === "interrupted") {
+      return {
+        status: "failed",
+        batchId: batch.batchId,
+        nodeId: prepared.nodeId,
+        failureSummary: prepared.failureSummary,
+      };
     }
     if (prepared.status === "failed") {
       // A transient failure leaves the node claimable again after its backoff
@@ -259,7 +256,9 @@ export class PendingCompactionCoordinator {
       };
     }
 
-    const snapshot = await this.buildProjectionSnapshot(input.conversationId);
+    const snapshot = await buildPendingProjectionSnapshot(
+        input.conversationId, this.conversationStore, this.summaryStore, this.config,
+      );
     if (snapshot.compactableStartOrdinal == null || snapshot.compactableEndOrdinal == null) {
       return { status: "idle", reason: "no compactable context outside fresh tail" };
     }
@@ -322,8 +321,11 @@ export class PendingCompactionCoordinator {
     // extension planning only creates nodes for newly compactable suffix work
     // and any new condensed parents that can reuse that prefix.
     const existingNodes = await this.pendingSummaryStore.getNodesByBatch(input.batch.batchId);
+    // Finish a rebased batch before planning new suffix work. Its immutable
+    // planning keys and active coordinates describe different projections.
+    if (existingNodes.some((node) => node.status === "promoted")) return null;
     const reusablePendingNodes = existingNodes
-      .filter((node) => node.status === "ready" || node.status === "promoted")
+      .filter((node) => node.status === "ready")
       .map((node) => this.pendingRecordToPlannerNode(node));
     const extensionItems = input.snapshot.items.filter(
       (item) =>
@@ -407,7 +409,7 @@ export class PendingCompactionCoordinator {
     await this.pendingSummaryStore.withTransaction(async () => {
       const updated = await this.pendingSummaryStore.updateBatchPlanningTarget({
         batchId: input.batch.batchId,
-        sourceProjectionFingerprint: this.buildBatchSourceFingerprint({
+        sourceProjectionFingerprint: buildBatchSourceFingerprint({
           conversationId: input.batch.conversationId,
           snapshot: input.snapshot,
           startOrdinal: input.batch.compactableStartOrdinal,
@@ -487,7 +489,7 @@ export class PendingCompactionCoordinator {
         batchId,
         conversationId: input.conversationId,
         sessionKey: input.sessionKey ?? null,
-        sourceProjectionFingerprint: this.buildBatchSourceFingerprint({
+        sourceProjectionFingerprint: buildBatchSourceFingerprint({
           conversationId: input.conversationId,
           snapshot: input.snapshot,
           startOrdinal: input.snapshot.compactableStartOrdinal ?? 0,
@@ -585,7 +587,8 @@ export class PendingCompactionCoordinator {
     return {
       status: "published",
       batchId: input.batch.batchId,
-      ...(this.hasRemainingCompactableWork(input) ? { remainingCompactableWork: true } : {}),
+      ...(published.remainingPreparation || this.hasRemainingCompactableWork(input)
+        ? { remainingCompactableWork: true } : {}),
       frontierSummaryIds: frontier.map((node) => {
         if (typeof node.canonicalSummaryId === "string") {
           return node.canonicalSummaryId;
@@ -615,9 +618,9 @@ export class PendingCompactionCoordinator {
   }): Promise<PublishFrontierSelection | null> {
     const nodes = await this.pendingSummaryStore.getNodesByBatch(input.batch.batchId);
     // A publish frontier may mix already-canonical summaries with ready hidden
-    // pending nodes, but it must exactly cover the batch range.
+    // pending nodes, stopping at the first uncovered ordinal.
     const readyPendingPlannerNodes = nodes
-      .filter((node) => node.status === "ready" || node.status === "promoted")
+      .filter((node) => node.status === "ready")
       .map((node) => this.pendingRecordToPlannerNode(node));
     const canonicalPlannerNodes = this.buildCanonicalSummaryPlannerNodes(input.snapshot);
     const frontier = selectPendingPublishFrontier({
@@ -641,20 +644,24 @@ export class PendingCompactionCoordinator {
   private async publishActiveBatchIfReady(
     conversationId: number,
   ): Promise<PendingCompactionCoordinatorResult | null> {
-    const snapshot = await this.buildProjectionSnapshot(conversationId);
-    const batch = await this.pendingSummaryStore.getActiveBatchForConversation(conversationId);
-    if (!batch) {
-      return null;
-    }
-    const staleReason = await this.getActiveBatchStaleReason({ batch, snapshot });
-    if (staleReason) {
-      await this.pendingSummaryStore.markBatchStale({
-        batchId: batch.batchId,
-        failureSummary: staleReason,
-      });
-      return { status: "stale", batchId: batch.batchId, reason: staleReason };
-    }
-    return this.publishIfReady({ batch, snapshot });
+    return this.summaryStore.withTransaction(async () => {
+      const snapshot = await buildPendingProjectionSnapshot(
+        conversationId, this.conversationStore, this.summaryStore, this.config,
+      );
+      const batch = await this.pendingSummaryStore.getActiveBatchForConversation(conversationId);
+      if (!batch) {
+        return null;
+      }
+      const staleReason = await this.getActiveBatchStaleReason({ batch, snapshot });
+      if (staleReason) {
+        await this.pendingSummaryStore.markBatchStale({
+          batchId: batch.batchId,
+          failureSummary: staleReason,
+        });
+        return { status: "stale", batchId: batch.batchId, reason: staleReason };
+      }
+      return this.publishIfReady({ batch, snapshot });
+    });
   }
 
   private async getActiveBatchStaleReason(input: {
@@ -675,7 +682,7 @@ export class PendingCompactionCoordinator {
       return "pending batch range is no longer compactable";
     }
 
-    const expectedBatchFingerprint = this.buildBatchSourceFingerprint({
+    const expectedBatchFingerprint = buildBatchSourceFingerprint({
       conversationId: input.batch.conversationId,
       snapshot: input.snapshot,
       startOrdinal: input.batch.compactableStartOrdinal,
@@ -708,6 +715,9 @@ export class PendingCompactionCoordinator {
     // Tail growth is safe only when the original prefix still resolves to the
     // same raw leaf source and canonical summary children.
     for (const node of nodes) {
+      // Promoted descendants remain available through canonical lineage. Their
+      // raw source ranges are no longer part of the active projection.
+      if (node.status === "promoted") continue;
       if (node.kind === "leaf") {
         const sourceFingerprints = input.snapshot.items
           .filter(
@@ -770,112 +780,6 @@ export class PendingCompactionCoordinator {
       return false;
     }
     return true;
-  }
-
-  private async buildProjectionSnapshot(conversationId: number): Promise<ProjectionSnapshot> {
-    const contextItems = await this.summaryStore.getContextItems(conversationId);
-    const summaryById = new Map<string, SummaryRecord>();
-    const items: PendingSummaryPlannerSnapshotItem[] = [];
-
-    for (const item of contextItems) {
-      if (item.itemType === "message" && item.messageId != null) {
-        const message = await this.conversationStore.getMessageById(item.messageId);
-        if (!message) {
-          continue;
-        }
-        items.push({
-          ordinal: item.ordinal,
-          itemType: "message",
-          messageId: message.messageId,
-          role: message.role,
-          tokenCount: normalizeNonNegativeInteger(message.tokenCount),
-          sourceFingerprint: digestText("pending-message-item", [
-            String(item.ordinal),
-            String(message.messageId),
-            String(message.seq),
-            message.role,
-            String(message.tokenCount),
-            message.createdAt.toISOString(),
-            digestText("message-content", [message.content]),
-          ]),
-        });
-        continue;
-      }
-
-      if (item.itemType === "summary" && item.summaryId) {
-        const summary = await this.summaryStore.getSummary(item.summaryId);
-        if (!summary) {
-          continue;
-        }
-        summaryById.set(summary.summaryId, summary);
-        items.push({
-          ordinal: item.ordinal,
-          itemType: "summary",
-          summaryId: summary.summaryId,
-          depth: summary.depth,
-          tokenCount: normalizeNonNegativeInteger(summary.tokenCount),
-          sourceFingerprint: digestText("pending-summary-item", [
-            String(item.ordinal),
-            summary.summaryId,
-            String(summary.depth),
-            String(summary.tokenCount),
-            summary.createdAt.toISOString(),
-            digestText("summary-content", [summary.content]),
-          ]),
-        });
-      }
-    }
-
-    const freshTailOrdinal = resolvePendingFreshTailOrdinal({
-      items,
-      freshTailCount: this.config.freshTailCount,
-      freshTailMaxTokens: this.config.freshTailMaxTokens,
-    });
-    const compactableItems = items.filter((item) => item.ordinal < freshTailOrdinal);
-    const compactableStartOrdinal =
-      compactableItems.length > 0
-        ? Math.min(...compactableItems.map((item) => item.ordinal))
-        : null;
-    const compactableEndOrdinal =
-      compactableItems.length > 0
-        ? Math.max(...compactableItems.map((item) => item.ordinal))
-        : null;
-    const sourceProjectionFingerprint = digestText("pending-projection", [
-      String(conversationId),
-      String(freshTailOrdinal),
-      ...compactableItems.map((item) => `${item.ordinal}:${item.sourceFingerprint}`),
-    ]);
-
-    return {
-      items,
-      contextItems,
-      summaryById,
-      sourceProjectionFingerprint,
-      freshTailStartOrdinal: Number.isFinite(freshTailOrdinal) ? freshTailOrdinal : null,
-      compactableStartOrdinal,
-      compactableEndOrdinal,
-    };
-  }
-
-  private buildBatchSourceFingerprint(input: {
-    conversationId: number;
-    snapshot: ProjectionSnapshot;
-    startOrdinal: number;
-    endOrdinal: number;
-  }): string {
-    const compactableItems = input.snapshot.items
-      .filter(
-        (item) =>
-          item.ordinal >= input.startOrdinal &&
-          item.ordinal <= input.endOrdinal,
-      )
-      .sort((a, b) => a.ordinal - b.ordinal);
-    return digestText("pending-projection-range", [
-      String(input.conversationId),
-      String(input.startOrdinal),
-      String(input.endOrdinal),
-      ...compactableItems.map((item) => `${item.ordinal}:${item.sourceFingerprint}`),
-    ]);
   }
 
   private buildCanonicalSummaryPlannerNodes(
@@ -959,7 +863,10 @@ export class PendingCompactionCoordinator {
     const chunks: string[] = [];
     for (const child of children) {
       if (child.childNodeId) {
-        const pendingChild = await this.pendingSummaryStore.getNode(child.childNodeId);
+        const childNode = await this.pendingSummaryStore.getNode(child.childNodeId);
+        const pendingChild = childNode?.canonicalSummaryId
+          ? await this.summaryStore.getSummary(childNode.canonicalSummaryId)
+          : childNode;
         if (!pendingChild?.content) {
           throw new Error(`Pending child summary ${child.childNodeId} is not ready`);
         }

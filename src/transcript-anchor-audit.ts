@@ -56,10 +56,6 @@ function identityKey(role: MessageRole, content: string): string {
   return `${role}\0${content}`;
 }
 
-function hasDuplicate(values: readonly string[]): boolean {
-  return new Set(values).size !== values.length;
-}
-
 function classifyStampedAnchor(
   message: TranscriptAnchorAuditMessage,
   entry: TranscriptAnchorAuditEntry | undefined,
@@ -155,7 +151,17 @@ function inspectSequenceAlignment(params: {
     keys.push(identityKey(message.role, message.content));
   }
 
-  return { aligned: true, uniqueNonEmpty: !hasDuplicate(keys) };
+  // A unique stored prefix is not unique evidence if a later projected turn
+  // repeats one of its identities. Leave those rows to timestamp reconciliation.
+  const projectedCounts = new Map<string, number>();
+  for (const entry of entries) {
+    const key = identityKey(entry.role, entry.content);
+    projectedCounts.set(key, (projectedCounts.get(key) ?? 0) + 1);
+  }
+  return {
+    aligned: true,
+    uniqueNonEmpty: keys.every((key) => projectedCounts.get(key) === 1),
+  };
 }
 
 function buildRepairProposals(params: {

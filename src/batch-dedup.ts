@@ -25,7 +25,7 @@ import {
 } from "./message-content.js";
 import { messageIdentity } from "./message-signatures.js";
 import type { AgentMessage } from "./openclaw-bridge.js";
-import { openClawInboundBodiesMatchWithInjectedContext } from "./openclaw-inbound-metadata.js";
+import { openClawInboundBodiesMatch, openClawInboundBodiesMatchWithInjectedContext } from "./openclaw-inbound-metadata.js";
 import type { ConversationStore, MessageRecord } from "./store/conversation-store.js";
 import { buildMessageIdentityHash } from "./store/message-identity.js";
 import type { LargeFileRecord, SummaryStore } from "./store/summary-store.js";
@@ -34,7 +34,12 @@ import {
   extractToolPairingIdFromRecord,
   extractToolResultIdForPairing,
 } from "./tool-pairing.js";
-import { getTranscriptEntryId } from "./transcript.js";
+import {
+  filterByCreatedAt,
+  getTranscriptEntryId,
+  resolveTranscriptMessageCreatedAt,
+  transcriptTimestampMs,
+} from "./transcript.js";
 import { structuredPartsIdentity } from "./structured-anchor-identity.js";
 import type { LcmDependencies } from "./types.js";
 
@@ -571,55 +576,105 @@ export class BatchDeduplicator {
   }
 
   /**
-   * Stamp an entry id onto a recent tail row whose persisted form matches the
-   * incoming transcript message, including side-effect-free externalized-file
-   * equivalence. Returns true only after an unstamped row was updated.
+   * Plan adoption against one immutable tail snapshot. Content establishes the
+   * possible edges; timestamps may narrow repeats, but only a one-to-one edge
+   * is safe to stamp. Never let earlier adoptions manufacture a unique match.
    */
-  async adoptRecentTranscriptEntryIdForMessage(params: {
+  async planRecentTranscriptEntryAdoptions(params: {
     conversationId: number;
-    message: AgentMessage;
-    transcriptEntryId: string;
+    messages: AgentMessage[];
     tailWindow: number;
-  }): Promise<boolean> {
+    existingEntryIds?: ReadonlySet<string>;
+  }): Promise<Map<number, { messageId: number; decorated: boolean }>> {
     const tailWindow = Math.max(1, Math.floor(params.tailWindow));
     const tail = await this.conversationStore.getLastMessages(params.conversationId, tailWindow);
-    if (tail.every((message) => message.transcriptEntryId)) {
-      return false;
-    }
+    const plan = new Map<number, { messageId: number; decorated: boolean }>();
+    // Preserve the decorated path's role-specific window, which can reach
+    // further back than the mixed-role exact-match tail.
+    const users = await this.conversationStore.listRecentUnstampedMessagesByRole(
+      params.conversationId,
+      "user",
+      tailWindow,
+    );
+    if (users.length === 0 && tail.every((row) => row.transcriptEntryId)) return plan;
     const tailHashes = await this.conversationStore.getRecentMessageIdentityHashes(
       params.conversationId,
       tailWindow,
     );
-    if (tail.length === 0 || tail.length !== tailHashes.length) {
-      return false;
+    if (tail.length !== tailHashes.length) return plan;
+
+    type Candidate = {
+      row: Pick<MessageRecord, "messageId" | "createdAt">;
+      decorated: boolean;
+    };
+    const candidates: Candidate[][] = [];
+    const contentClaims = new Map<number, number>();
+    for (const message of params.messages) {
+      const stored = toStoredMessage(message);
+      const incomingHash = storedMessageIdentityHash(stored);
+      const rawContent = serializeRawPayloadContent(message, stored.content)?.content ?? null;
+      const matches = new Map<number, Candidate>();
+      if (stored.role === "user") {
+        for (const row of users) {
+          if (openClawInboundBodiesMatch(row.content, stored.content)) {
+            matches.set(row.messageId, { row, decorated: true });
+          }
+        }
+      }
+      for (let index = 0; index < tail.length; index += 1) {
+        const row = tail[index]!;
+        if (row.transcriptEntryId || matches.has(row.messageId)) continue;
+        const match = await this.matchStoredMessageToIncoming(
+          row,
+          stored,
+          message,
+          incomingHash,
+          tailHashes[index]!,
+          rawContent,
+        );
+        if (match && match !== "unproven-externalized") {
+          matches.set(row.messageId, { row, decorated: false });
+        }
+      }
+      candidates.push([...matches.values()]);
+      for (const id of matches.keys()) {
+        contentClaims.set(id, (contentClaims.get(id) ?? 0) + 1);
+      }
     }
 
-    const stored = toStoredMessage(params.message);
-    const incomingHash = storedMessageIdentityHash(stored);
-    const incomingRawPayloadContent =
-      serializeRawPayloadContent(params.message, stored.content)?.content ?? null;
-    const candidates: number[] = [];
-    for (let index = tail.length - 1; index >= 0; index -= 1) {
-      if (tail[index]!.transcriptEntryId) continue;
-      const match = await this.matchStoredMessageToIncoming(
-        tail[index]!,
-        stored,
-        params.message,
-        incomingHash,
-        tailHashes[index]!,
-        incomingRawPayloadContent,
-      );
-      if (!match || match === "unproven-externalized") {
-        continue;
+    const eligible = candidates.map((matches, index) => {
+      const entryId = getTranscriptEntryId(params.messages[index]!);
+      // Resolved entries still establish that content repeats, but cannot
+      // compete for an unstamped row: their identity is already assigned.
+      if (entryId && params.existingEntryIds?.has(entryId)) {
+        return { canAdopt: false, matches: [] };
       }
-      candidates.push(tail[index]!.messageId);
+      const unique = matches.length === 1 && contentClaims.get(matches[0]!.row.messageId) === 1;
+      const createdAt = resolveTranscriptMessageCreatedAt(params.messages[index]!);
+      // An unknown time cannot disprove a competing claim. Keep its edges for
+      // ambiguity detection, but never adopt a repeated identity without time.
+      const hasTime = createdAt !== undefined && transcriptTimestampMs(createdAt) !== null;
+      return {
+        canAdopt: unique || hasTime,
+        matches: unique || !hasTime
+          ? matches
+          : matches.filter(({ row }) => filterByCreatedAt([row], createdAt).length === 1),
+      };
+    });
+    const timedClaims = new Map<number, number>();
+    for (const { matches } of eligible) {
+      for (const { row } of matches) {
+        timedClaims.set(row.messageId, (timedClaims.get(row.messageId) ?? 0) + 1);
+      }
     }
-    if (candidates.length !== 1) return false;
-    return this.conversationStore.adoptTranscriptEntryIdForMessage(
-      params.conversationId,
-      candidates[0]!,
-      params.transcriptEntryId,
-    );
+    eligible.forEach(({ canAdopt, matches }, index) => {
+      if (!canAdopt || matches.length !== 1) return;
+      const { row, decorated } = matches[0]!;
+      if (timedClaims.get(row.messageId) === 1) {
+        plan.set(index, { messageId: row.messageId, decorated });
+      }
+    });
+    return plan;
   }
 
   /**

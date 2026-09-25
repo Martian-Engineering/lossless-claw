@@ -47,16 +47,17 @@ describe("reconciliation identity work", () => {
       const dedup = new BatchDeduplicator(store, summaryStore, "/unused", {
         log: { debug: vi.fn(), info: vi.fn(), warn: vi.fn(), error: vi.fn() },
       });
-      const result = await dedup.adoptRecentTranscriptEntryIdForMessage({
+      const plan = await dedup.planRecentTranscriptEntryAdoptions({
         conversationId: conversation.conversationId,
-        message: { role: "user", content: "same body" } as AgentMessage,
-        transcriptEntryId: "new-entry",
+        messages: [{ role: "user", content: "same body" } as AgentMessage],
         tailWindow: 2,
       });
-      expect(result).toBe(mixed);
       if (mixed) {
+        expect(plan.get(0)).toEqual({ messageId: rows[0]!.messageId, decorated: false });
+        await store.adoptTranscriptEntryIdForMessage(conversation.conversationId, plan.get(0)!.messageId, "new-entry");
         expect(adopt).toHaveBeenCalledExactlyOnceWith(conversation.conversationId, rows[0]!.messageId, "new-entry");
       } else {
+        expect(plan.size).toBe(0);
         expect(adopt).not.toHaveBeenCalled();
         expect(hashes).not.toHaveBeenCalled();
       }

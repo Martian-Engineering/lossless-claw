@@ -253,17 +253,12 @@ it("adopts the matching structured call, not the newest blank row", async () => 
     "/tmp",
     { log: { info: () => {}, warn: () => {}, error: () => {}, debug: () => {} } },
   );
-  expect(
-    await dedup.adoptRecentTranscriptEntryIdForMessage({
-      conversationId,
-      message: calls[0]!,
-      transcriptEntryId: "correct",
-      tailWindow: 64,
-    }),
-  ).toBe(true);
-  expect(await store.getTranscriptEntryAnchorCandidate(conversationId, "correct")).toMatchObject({
-    messageId: records[0]!.messageId,
+  const plan = await dedup.planRecentTranscriptEntryAdoptions({
+    conversationId,
+    messages: [calls[0]!],
+    tailWindow: 64,
   });
+  expect(plan.get(0)).toEqual({ messageId: records[0]!.messageId, decorated: false });
   expect(await store.getMessageCount(conversationId)).toBe(2);
   db.close();
 });

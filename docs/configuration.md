@@ -27,6 +27,33 @@ forks continue to require `thread-bootstrap-projection`.
 If you cannot use a beta or upgrade OpenClaw, use a `lossless-claw` release
 compatible with your installed OpenClaw version.
 
+## Settings in OpenClaw
+
+Hosts that support the optional `configGroups` manifest field organize the settings
+into these sections:
+
+| Section | Settings |
+| --- | --- |
+| Session capture | Capture behavior, session retention, heartbeat handling, and replay protection |
+| Context budget | Context thresholds, fresh-tail retention, and prompt assembly limits |
+| Compaction | Summary depth, chunk sizes, fanout, and sweep limits |
+| Summaries | Models, summary sizes, instructions, and injected-context filtering |
+| Summary reliability | Timeouts, call limits, fallback providers, and circuit breakers |
+| Recall | Expansion models, token limits, and delegation timeout |
+| External files | Payload offloading, file summaries, and assembly stubs |
+| Storage and logging | Database location and independent logging |
+| Compatibility | Existing aliases and retired options |
+
+Grouped settings require OpenClaw `2026.9.5` or newer, the first stable release
+with the [`configGroups` settings UI](https://github.com/openclaw/openclaw/pull/149246).
+Earlier supported hosts, including `2026.9.4` and `2026.9.2`, ignore this
+optional metadata and show the complete flat settings form. No upgrade is needed
+to keep configuring or running Lossless on those hosts.
+Groups do not introduce configuration nesting or change any setting's path,
+default, validation, or runtime behavior. The host version requirements above
+remain unchanged. Retired options remain ignored; grouping does not reactivate
+them.
+
 ## Recall tool availability
 
 Lossless declares `lcm_grep`, `lcm_describe`, `lcm_expand`, and
@@ -283,6 +310,8 @@ Lossless-claw writes routine operational JSONL logs by default at `/tmp/openclaw
 
 ### Compaction thresholds and summary sizing
 
+The Settings editor displays fixed defaults from the plugin manifest. Automatic values remain unset: Bootstrap Max Tokens uses the greater of 6000 or 30% of Leaf Chunk Tokens (rounded down), so its input shows **Auto** until you choose an override.
+
 | Key | Type | Default | Env override | Purpose |
 | --- | --- | --- | --- | --- |
 | `contextThreshold` | `number` | `0.75` | `LCM_CONTEXT_THRESHOLD` | Fraction of the active model context window that triggers compaction. |
@@ -376,7 +405,7 @@ Automatic compaction is threshold-only:
 - below threshold, no automatic compaction runs and no leaf debt is recorded
 - at or above threshold, inline mode runs a threshold full sweep immediately
 - deferred mode records one coalesced `"threshold"` maintenance row and normally drains it in the background or host-approved `maintain()`
-- pre-assembly drain is reserved as an emergency safeguard when the live prompt is already over the active token budget
+- pre-assembly recovery publishes prepared summaries before pressure-driven eviction and can perform one bounded preparation pass if generation is permitted
 
 Lossless still records prompt-cache telemetry for status and diagnostics, but cache hotness no longer delays threshold debt. Legacy `cacheAwareCompaction.*` and `dynamicLeafChunkTokens.*` settings remain accepted so existing OpenClaw config continues to load, but they do not change automatic compaction behavior.
 
@@ -471,13 +500,14 @@ This keeps long-term history available while still giving users a real clean-sla
 
 ### Deferred proactive compaction
 
-Lossless-claw now defaults `proactiveThresholdCompactionMode` to `deferred`.
+`proactiveThresholdCompactionMode` defaults to `deferred`.
 
 - deferred mode records a single coalesced maintenance debt row per conversation
-- new deferred compaction debt is only created for `contextThreshold` pressure and uses reason `"threshold"`
+- after-turn threshold pressure records debt with reason `"threshold"`; unresolved pre-assembly pressure uses `"assembly-pressure"`
 - `maintain()` consumes threshold debt when the host explicitly opts in to deferred execution
-- `assemble()` leaves pending threshold debt for after-turn background drain or host-approved `maintain()` while the live prompt is still within budget
-- `assemble()` only consumes pending threshold debt synchronously as an emergency safeguard when the live prompt estimate is already over the active token budget
+- `assemble()` measures the full projection before eviction, including serialized payloads and uncovered volatile live inputs. It tries ready publication above 75% pressure with pending debt, or above the 90% serialized clamp threshold even without debt
+- if publication does not reach the configured `contextThreshold` target (capped at 90%), assembly can wait for one bounded foreground preparation pass and publication. Generation respects `maxSweepIterations`, summarizer timeouts, spend limits, cooldowns, and active background ownership; publication does not require generation permission
+- assembly rebuilds and remeasures after publication. The `assemble: foreground compaction` log distinguishes `reduced`, `reachedTarget`, `pending`, and `reason`. Remaining work retains debt; protected-tail pressure or unavailable generation falls back to bounded context without deleting persisted history
 - old non-threshold debt from earlier builds is revalidated; if the conversation is no longer over threshold, it is cleared as a no-op
 - `/lossless status` (`/lcm status` alias) shows the current maintenance state, including pending/running/last-failure details
 - status output also surfaces the latest API/cache telemetry as diagnostics, not as a deferral gate
