@@ -217,7 +217,7 @@ Add a `lossless-claw` entry under `plugins.entries` in your OpenClaw config:
         },
         "llm": {
           "allowModelOverride": true,
-          "allowedModels": ["openai/gpt-5.4-mini"]
+          "allowedModels": ["openai/gpt-6-luna"]
         },
         "config": {
           "freshTailCount": 64,
@@ -247,8 +247,8 @@ Add a `lossless-claw` entry under `plugins.entries` in your OpenClaw config:
             "agent:*:dreaming-narrative-**"
           ],
           "proactiveThresholdCompactionMode": "deferred",
-          "summaryModel": "openai/gpt-5.4-mini",
-          "expansionModel": "openai/gpt-5.4-mini",
+          "summaryModel": "openai/gpt-6-luna",
+          "expansionModel": "openai/gpt-6-luna",
           "delegationTimeoutMs": 300000,
           "summaryTimeoutMs": 60000,
           "summaryCallWindowMs": 600000,
@@ -291,7 +291,7 @@ The `ignoreSessionPatterns` entries in this example are storage exclusions. Matc
 | `LCM_SUMMARY_MODEL` | `""` | Model override for compaction summarization; falls back to OpenClaw's default model when unset |
 | `LCM_SUMMARY_PROVIDER` | `""` | Provider override for compaction summarization; falls back to `OPENCLAW_PROVIDER` or the provider embedded in the model ref |
 | `LCM_SUMMARY_BASE_URL` | *(from OpenClaw / provider default)* | Base URL override for summarization API calls |
-| `LCM_EXPANSION_MODEL` | *(from OpenClaw)* | Model override for `lcm_expand_query` sub-agent (e.g. `openai/gpt-5.4-mini`) |
+| `LCM_EXPANSION_MODEL` | *(from OpenClaw)* | Model override for `lcm_expand_query` sub-agent (e.g. `openai/gpt-6-luna`) |
 | `LCM_EXPANSION_PROVIDER` | *(from OpenClaw)* | Provider override for `lcm_expand_query` sub-agent |
 | `LCM_DELEGATION_TIMEOUT_MS` | `120000` | Max time to wait for delegated `lcm_expand_query` sub-agent completion |
 | `LCM_SUMMARY_TIMEOUT_MS` | `60000` | Max time to wait for a single model-backed LCM summarizer call |
@@ -308,7 +308,7 @@ Deferred proactive compaction is also the default. Set `proactiveThresholdCompac
 
 If you want `lcm_expand_query` to run on a dedicated model via `expansionModel` or `LCM_EXPANSION_MODEL`, OpenClaw must explicitly trust the plugin to request sub-agent model overrides.
 
-For most setups, `openai/gpt-5.4-mini` is a better starting point than Anthropic Haiku because it is cheap, fast, and does not depend on Anthropic quota remaining.
+For most setups, `openai/gpt-6-luna` is a good starting point for cost-sensitive expansion without depending on Anthropic quota remaining.
 
 Add a `subagent` policy under `plugins.entries.lossless-claw` and allowlist the canonical `provider/model` target you want the plugin to use:
 
@@ -373,8 +373,8 @@ LCM_FRESH_TAIL_COUNT=64
 LCM_LEAF_CHUNK_TOKENS=20000
 LCM_INCREMENTAL_MAX_DEPTH=1
 LCM_CONTEXT_THRESHOLD=0.75
-LCM_SUMMARY_MODEL=openai/gpt-5.4-mini
-LCM_EXPANSION_MODEL=openai/gpt-5.4-mini
+LCM_SUMMARY_MODEL=openai/gpt-6-luna
+LCM_EXPANSION_MODEL=openai/gpt-6-luna
 ```
 
 - **freshTailCount=64** protects the last 64 messages from compaction, expanding through the newest user when needed so its assistant/tool suffix cannot be separated from the active instruction.
