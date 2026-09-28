@@ -1,5 +1,11 @@
 # @martian-engineering/lossless-claw
 
+## 1.1.2
+
+### Patch Changes
+
+- [#1211](https://github.com/Martian-Engineering/lossless-claw/pull/1211) [`e05d8d3`](https://github.com/Martian-Engineering/lossless-claw/commit/e05d8d34b2a44fdef556ce95dd90115b46630200) Thanks [@TheAngryPit](https://github.com/TheAngryPit)! - Exclude archived conversations' historical pending maintenance debt and failure summaries from the actionable totals reported by `lcm status`.
+
 ## 1.1.1
 
 <!-- release-rollback-version: 1.1.0 -->
