@@ -1,4 +1,5 @@
 import { readFileSync } from "node:fs";
+import { spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import { describe, expect, it } from "vitest";
 
@@ -71,6 +72,39 @@ describe("ClawHub publish workflow", () => {
     );
   });
 
+  it.each([
+    ["refs/tags/v1.1.1", "a".repeat(40), 0],
+    ["refs/heads/main", "a".repeat(40), 1],
+    ["refs/tags/v1.1.0", "a".repeat(40), 1],
+    ["refs/tags/v1.1.1", "b".repeat(40), 1],
+    ["a".repeat(40), "a".repeat(40), 1],
+  ])("checks OIDC workflow identity %s at %s", (ref, sha, status) => {
+    // Execute the workflow's guard so rejected identities cannot pass by string matching.
+    const guard = workflow.match(/          if \[ "\$GITHUB_REF"[\s\S]*?          fi/);
+    expect(guard).not.toBeNull();
+    const result = spawnSync("bash", ["-euc", guard![0]], {
+      env: {
+        ...process.env,
+        RELEASE_TAG: "v1.1.1",
+        source_sha: "a".repeat(40),
+        GITHUB_REF: ref,
+        GITHUB_SHA: sha,
+      },
+      encoding: "utf8",
+    });
+    expect(result.error).toBeUndefined();
+    expect(result.status, result.stdout + result.stderr).toBe(status);
+  });
+
+  it("exports the verified workflow ref before publishing", () => {
+    expect(workflow).toContain("source_ref: ${{ steps.identity.outputs.source_ref }}");
+    expect(workflow).toContain('echo "source_ref=$GITHUB_REF" >> "$GITHUB_OUTPUT"');
+    expect(workflow.indexOf('if [ "$GITHUB_REF"')).toBeLessThan(
+      workflow.indexOf('npm view "$package_name@$version"'),
+    );
+    expect(workflow).not.toContain("source_ref: ${{ needs.release-preflight.outputs.source_sha }}");
+  });
+
   it("publishes the exact npm tarball through ClawHub", () => {
     expect(workflow).toContain(
       'npm pack "$package_name@$version" --pack-destination "$RUNNER_TEMP/clawhub-release-package"',
@@ -87,13 +121,18 @@ describe("ClawHub publish workflow", () => {
     ).toHaveLength(2);
   });
 
-  it("binds manual validation and publication to the verified commit", () => {
-    expect(workflow).toMatch(
-      /release-dry-run:\n\s+needs: release-preflight(?:.|\n)*?source: \$\{\{ github\.repository \}\}(?:.|\n)*?ref: \$\{\{ needs\.release-preflight\.outputs\.source_sha \}\}(?:.|\n)*?source_repo: \$\{\{ github\.repository \}\}(?:.|\n)*?source_commit: \$\{\{ needs\.release-preflight\.outputs\.source_sha \}\}(?:.|\n)*?source_ref: \$\{\{ needs\.release-preflight\.outputs\.source_sha \}\}/,
-    );
-    expect(workflow).toMatch(
-      /publish:\n\s+needs: release-preflight(?:.|\n)*?source: \$\{\{ github\.repository \}\}(?:.|\n)*?ref: \$\{\{ needs\.release-preflight\.outputs\.source_sha \}\}(?:.|\n)*?source_repo: \$\{\{ github\.repository \}\}(?:.|\n)*?source_commit: \$\{\{ needs\.release-preflight\.outputs\.source_sha \}\}(?:.|\n)*?source_ref: \$\{\{ needs\.release-preflight\.outputs\.source_sha \}\}/,
-    );
+  it("binds manual validation and publication to the verified commit and workflow ref", () => {
+    for (const jobName of ["release-dry-run", "publish"]) {
+      // Limit assertions to one job so one correct call cannot mask a broken sibling.
+      const job = workflow.split(`\n  ${jobName}:\n`)[1]?.split(/\n  [\w-]+:\n/)[0];
+      expect(job).toBeDefined();
+      expect(job).toContain("needs: release-preflight");
+      expect(job).toContain("source: ${{ github.repository }}");
+      expect(job).toContain("\n      ref: ${{ needs.release-preflight.outputs.source_sha }}");
+      expect(job).toContain("source_repo: ${{ github.repository }}");
+      expect(job).toContain("source_commit: ${{ needs.release-preflight.outputs.source_sha }}");
+      expect(job).toContain("source_ref: ${{ needs.release-preflight.outputs.source_ref }}");
+    }
   });
 
   it("serializes real publishes without cancelling an active release", () => {
