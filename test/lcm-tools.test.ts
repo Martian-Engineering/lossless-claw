@@ -913,6 +913,57 @@ describe("LCM tools session scoping", () => {
     expect(text).not.toContain("foreign summary");
   });
 
+  it("lcm_describe lets a delegated session retrieve a file from its own active conversation", async () => {
+    const delegatedSessionKey = "agent:main:subagent:session-1";
+    const retrieval = {
+      grep: vi.fn(),
+      expand: vi.fn(),
+      describe: vi.fn(async () => ({
+        id: "file_own_output",
+        type: "file" as const,
+        file: {
+          conversationId: 35,
+          fileName: "SKILL.md",
+          mimeType: "text/markdown",
+          byteSize: 80_457,
+          lineCount: 1_077,
+          content: "delegated session instructions",
+          contentTruncated: false,
+          createdAt: new Date("2026-01-02T00:00:00.000Z"),
+        },
+      })),
+    };
+
+    createDelegatedExpansionGrant({
+      delegatedSessionKey,
+      issuerSessionId: "main",
+      allowedConversationIds: [42],
+      tokenCap: 120,
+    });
+
+    const tool = createLcmDescribeTool({
+      deps: makeDeps(),
+      lcm: buildLcmEngine({
+        retrieval,
+        conversationIdBySessionKey: 35,
+      }) as never,
+      sessionKey: delegatedSessionKey,
+    });
+    const result = await tool.execute("call-subagent-own-file", {
+      id: "file_own_output",
+      expandFile: true,
+    });
+
+    expect(retrieval.describe).toHaveBeenCalledWith(
+      "file_own_output",
+      expect.objectContaining({ expandFile: true }),
+    );
+    const text = (result.content[0] as { text: string }).text;
+    expect(text).toContain("LCM File: file_own_output");
+    expect(text).toContain("delegated session instructions");
+    expect(JSON.stringify(result.details)).not.toContain("outside delegated conversation scope");
+  });
+
   it("lcm_grep rejects explicit foreign conversationId outside a delegated grant", async () => {
     const retrieval = {
       grep: vi.fn(async () => ({
