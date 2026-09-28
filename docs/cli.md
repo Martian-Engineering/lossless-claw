@@ -160,7 +160,7 @@ lcm config get freshTailCount
 lcm config set freshTailCount 96
 lcm config set sweepMaxDepth -1
 lcm config set promptAwareEviction true
-lcm config set summaryModel '"openai/gpt-5.4-mini"'
+lcm config set summaryModel '"openai/gpt-6-luna"'
 lcm config set ignoreSessionPatterns '["agent:*:cron:**"]'
 ```
 
