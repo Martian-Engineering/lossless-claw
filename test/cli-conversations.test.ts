@@ -129,6 +129,24 @@ describe("getGlobalStatus", () => {
       { kind: "condensed", depth: 1, count: 1, tokens: 10 },
     ]);
   });
+
+  it("excludes inactive conversations' historical maintenance debt from actionable totals", () => {
+    const db = new DatabaseSync(databasePath);
+    db.exec(`
+      INSERT INTO conversation_compaction_maintenance (
+        conversation_id, pending, requested_at, reason, running,
+        last_failure_summary, updated_at
+      ) VALUES (1, 1, '2026-07-04T00:00:00.000Z', 'threshold', 0,
+        'archived failure', '2026-07-04T00:00:00.000Z');
+    `);
+    db.close();
+
+    const readDb = openReadOnlyDatabase(databasePath);
+    const status = getGlobalStatus(readDb);
+    readDb.close();
+
+    expect(status.maintenance).toEqual({ pending: 1, running: 0, failed: 1 });
+  });
 });
 
 describe("conversation selection and pagination", () => {

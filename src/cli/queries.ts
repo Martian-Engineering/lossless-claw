@@ -232,10 +232,15 @@ export function getGlobalStatus(db: DatabaseSync): GlobalStatus {
           FROM context_items ci JOIN summaries s ON s.summary_id = ci.summary_id
          WHERE ci.item_type = 'summary'
       )) AS contextTokens,
-      (SELECT COUNT(*) FROM conversation_compaction_maintenance WHERE pending = 1) AS maintenancePending,
+      (SELECT COUNT(*) FROM conversation_compaction_maintenance maintenance
+        JOIN conversations conversation ON conversation.conversation_id = maintenance.conversation_id
+        WHERE maintenance.pending = 1 AND conversation.active = 1) AS maintenancePending,
       (SELECT COUNT(*) FROM conversation_compaction_maintenance WHERE running = 1) AS maintenanceRunning,
-      (SELECT COUNT(*) FROM conversation_compaction_maintenance
-        WHERE last_failure_summary IS NOT NULL AND TRIM(last_failure_summary) <> '') AS maintenanceFailed
+      (SELECT COUNT(*) FROM conversation_compaction_maintenance maintenance
+        JOIN conversations conversation ON conversation.conversation_id = maintenance.conversation_id
+        WHERE conversation.active = 1
+          AND maintenance.last_failure_summary IS NOT NULL
+          AND TRIM(maintenance.last_failure_summary) <> '') AS maintenanceFailed
   `).get() as GlobalStatusRow;
 
   return {
