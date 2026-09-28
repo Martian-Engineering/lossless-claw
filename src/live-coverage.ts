@@ -16,6 +16,8 @@ import { estimateAgentMessageTokens } from "./token-accounting.js";
 import { buildToolPairIndexesByAssembledIndex, expandProtectedToolPairIndexes, expandToolPairLiveSortIndexes } from "./tool-pairing.js";
 import { sanitizeToolUseResultPairing } from "./transcript-repair.js";
 import { open } from "node:fs/promises";
+import { estimateSerializedMessageTokens } from "./estimate-tokens.js";
+import { buildVolatileInputEvictionGroups } from "./volatile-input-eviction.js";
 
 export type RepairLogger = { warn: (message: string) => void };
 
@@ -837,7 +839,7 @@ export function appendUncoveredVolatileLiveInputsWithinBudget(params: {
   }
 
   let retained = params.assembledMessages.map((message, index) => ({ message, index }));
-  let appendedEntries = uncovered.entries.slice();
+  const appendedEntries = uncovered.entries.slice();
   const toolPairIndexesByIndex = buildToolPairIndexesByAssembledIndex(params.assembledMessages);
   const exactLiveSortIndexes = resolveExactAssembledLiveSortIndexes({
     assembledMessages: params.assembledMessages,
@@ -863,80 +865,32 @@ export function appendUncoveredVolatileLiveInputsWithinBudget(params: {
   });
   let estimatedTokens = estimateAgentMessageTokens(output);
 
-  while (retained.length > 0 && estimatedTokens > params.tokenBudget) {
-    let bestCandidate:
-      | {
-          evictAssembledIndexes: Set<number>;
-          output: AgentMessage[];
-          estimatedTokens: number;
-          appendedEntries: VolatileLiveInputEntry[];
-        }
-      | undefined;
-    for (let evictIndex = 0; evictIndex < retained.length; evictIndex++) {
-      const entry = retained[evictIndex] as RetainedAssembledEntry;
-      const evictAssembledIndexes = toolPairIndexesByIndex.get(entry.index) ?? new Set([entry.index]);
-      const candidateEvictsExactLiveTurn = Array.from(evictAssembledIndexes).some((index) =>
-        exactLiveProtectedIndexes.has(index)
-      );
-      const candidateEvictsProtectedTurn = Array.from(evictAssembledIndexes).some((index) =>
-        protectedAssembledIndexes.has(index)
-      );
-      if (candidateEvictsExactLiveTurn || candidateEvictsProtectedTurn) {
-        continue;
-      }
-      const restoredCoveredEntries = Array.from(evictAssembledIndexes).flatMap(
-        (index) => uncovered.coveredEntriesByAssembledIndex.get(index) ?? [],
-      );
-      const candidateRetained = retained.filter(
-        (retainedEntry) => !evictAssembledIndexes.has(retainedEntry.index),
-      );
-      const candidateAppendedEntries =
-        restoredCoveredEntries.length > 0
-          ? [...appendedEntries, ...restoredCoveredEntries]
-          : appendedEntries;
-      const candidateOutput = buildVolatileLiveInputMergedOutput({
-        retained: candidateRetained,
-        appendedEntries: candidateAppendedEntries,
-        liveSortIndexes,
-      });
-      const candidateEstimatedTokens = estimateAgentMessageTokens(candidateOutput);
-      const candidateFits = candidateEstimatedTokens <= params.tokenBudget;
-      const bestFits =
-        bestCandidate !== undefined && bestCandidate.estimatedTokens <= params.tokenBudget;
-      if (
-        bestCandidate === undefined ||
-        (candidateFits && !bestFits) ||
-        (candidateFits &&
-          bestFits &&
-          candidateEstimatedTokens > bestCandidate.estimatedTokens) ||
-        (!candidateFits &&
-          !bestFits &&
-          candidateEstimatedTokens < bestCandidate.estimatedTokens)
-      ) {
-        bestCandidate = {
-          evictAssembledIndexes,
-          output: candidateOutput,
-          estimatedTokens: candidateEstimatedTokens,
-          appendedEntries: candidateAppendedEntries,
-        };
+  // Plan oldest-first over unique atomic groups. Local token deltas replace
+  // the repeated full merge/sanitize/estimate for every possible candidate.
+  const groups = buildVolatileInputEvictionGroups(params.assembledMessages, toolPairIndexesByIndex)
+    .filter((group) => !group.some((index) =>
+      protectedAssembledIndexes.has(index) || exactLiveProtectedIndexes.has(index),
+    ));
+  const evictedIndexes = new Set<number>();
+  const evictGroup = (group: number[]) => {
+    for (const index of group) {
+      evictedIndexes.add(index);
+      const message = params.assembledMessages[index]!;
+      estimatedTokens -= estimateSerializedMessageTokens(message);
+      evictedTokens += toStoredMessage(message).tokenCount;
+      // A summary can cover several live occurrences. Restore each exactly
+      // once, retaining its original live index for the final ordered merge.
+      for (const entry of uncovered.coveredEntriesByAssembledIndex.get(index) ?? []) {
+        appendedEntries.push(entry);
+        estimatedTokens += estimateSerializedMessageTokens(entry.message);
       }
     }
-    if (!bestCandidate) {
-      break;
-    }
-    const removedEntries = retained.filter((entry) =>
-      bestCandidate.evictAssembledIndexes.has(entry.index),
-    );
-    retained = retained.filter((entry) => !bestCandidate.evictAssembledIndexes.has(entry.index));
-    appendedEntries = bestCandidate.appendedEntries;
-    for (const removed of removedEntries) {
-      uncovered.coveredEntriesByAssembledIndex.delete(removed.index);
-      evictedTokens += toStoredMessage(removed.message).tokenCount;
-    }
-    evictedMessages += removedEntries.length;
-    output = bestCandidate.output;
-    estimatedTokens = bestCandidate.estimatedTokens;
+  };
+  let nextGroup = 0;
+  while (nextGroup < groups.length && estimatedTokens > params.tokenBudget) {
+    evictGroup(groups[nextGroup++]!);
   }
+  retained = retained.filter((entry) => !evictedIndexes.has(entry.index));
   output = buildVolatileLiveInputMergedOutput({
     retained,
     appendedEntries,
@@ -944,6 +898,17 @@ export function appendUncoveredVolatileLiveInputsWithinBudget(params: {
     log: params.log,
   });
   estimatedTokens = estimateAgentMessageTokens(output);
+  // Normalization can change serialized cost non-additively (e.g. synthetic
+  // tool repair). If the verified plan is still too large, retain only the
+  // protected/live groups in one final pass. Never restart a candidate search
+  // or discard a protected input just to claim that the prompt fits.
+  if (estimatedTokens > params.tokenBudget && nextGroup < groups.length) {
+    while (nextGroup < groups.length) evictGroup(groups[nextGroup++]!);
+    retained = retained.filter((entry) => !evictedIndexes.has(entry.index));
+    output = buildVolatileLiveInputMergedOutput({ retained, appendedEntries, liveSortIndexes, log: params.log });
+    estimatedTokens = estimateAgentMessageTokens(output);
+  }
+  evictedMessages = evictedIndexes.size;
   const appendedMessages = materializeVolatileLiveInputEntries(appendedEntries);
 
   return {
