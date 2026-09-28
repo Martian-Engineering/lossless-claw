@@ -410,6 +410,8 @@ export class CompactionMaintenanceStore {
     nextAttemptAfter?: Date | null;
     /** Canonical publication invalidates observations of the preceding prompt. */
     clearTokenObservations?: boolean;
+    /** A publication-only no-op does not retry model-backed work. */
+    preserveRetryState?: boolean;
   }): Promise<void> {
     const existing = await this.getConversationCompactionMaintenance(input.conversationId);
     const finishedAt = input.finishedAt ?? new Date();
@@ -438,11 +440,11 @@ export class CompactionMaintenanceStore {
         running: false,
         lastFinishedAt: finishedAt,
         lastFailureSummary:
-          input.failureSummary === undefined
+          input.preserveRetryState || input.failureSummary === undefined
             ? existing?.lastFailureSummary ?? null
             : input.failureSummary,
-        retryAttempts,
-        nextAttemptAfter,
+        retryAttempts: input.preserveRetryState ? existing?.retryAttempts ?? 0 : retryAttempts,
+        nextAttemptAfter: input.preserveRetryState ? existing?.nextAttemptAfter ?? null : nextAttemptAfter,
         ...(input.clearTokenObservations ? {
           currentTokenCount: null,
           projectedTokenCount: null,
