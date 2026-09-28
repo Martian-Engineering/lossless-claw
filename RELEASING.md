@@ -86,15 +86,19 @@ tag with `release_tag` set to the same tag and `dry_run` set to `false`.
 The standalone `Publish to ClawHub` workflow remains available for validation
 and recovery. Select the release tag as the workflow ref, set `release_tag` to
 the same tag, and use `dry_run` to choose validation or publication.
-When recovering after the release workflow itself has changed, select the
-default branch as the workflow ref and keep `release_tag` pinned to the release
-being recovered. Preflight still resolves that tag and requires its commit to
-match npm `gitHead` before publication.
+If the release tag predates a required workflow fix, OIDC recovery cannot use
+the default branch to publish that older release. Use an authenticated
+maintainer CLI session to publish the exact npm tarball with an explicit manual
+override reason, or publish a new release containing the workflow fix. Never
+move the release tag.
 
 The workflow refuses to publish unless the selected tag, `package.json`
-version, npm version, npm `gitHead`, and the tag's immutable commit all identify
-the same release. Real ClawHub publishes are serialized. Selecting the release
-tag for both the workflow ref and package source lets ClawHub verify that the
+version, npm version, npm `gitHead`, workflow ref, workflow SHA, and the tag's
+immutable commit all identify the same release. The source metadata uses the
+verified `refs/tags/vX.Y.Z` workflow ref as `source_ref`; checkout and
+`source_commit` remain pinned to the verified commit SHA. Real ClawHub publishes
+are serialized. Selecting the release tag for both the workflow ref and
+package source lets ClawHub verify that the
 trusted workflow commit matches the published package commit. Tags that predate
 this workflow cannot use OIDC trusted publishing.
 

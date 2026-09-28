@@ -78,6 +78,7 @@ jobs:
       contents: read
     outputs:
       source_sha: ${{ steps.identity.outputs.source_sha }}
+      source_ref: ${{ steps.identity.outputs.source_ref }}
       clawhub_tags: ${{ steps.identity.outputs.clawhub_tags }}
     steps:
       - name: Checkout selected release
@@ -117,6 +118,12 @@ jobs:
             exit 1
           fi
 
+          # Ordinary OIDC binds the workflow ref and commit independently.
+          if [ "$GITHUB_REF" != "refs/tags/$RELEASE_TAG" ] || [ "$GITHUB_SHA" != "$source_sha" ]; then
+            echo "Dispatch this workflow from $RELEASE_TAG at $source_sha"
+            exit 1
+          fi
+
           npm_state="$(npm view "$package_name@$version" version gitHead --json)"
           published_version="$(node -e 'const data=JSON.parse(process.argv[1]); process.stdout.write(data.version || "")' "$npm_state")"
           published_sha="$(node -e 'const data=JSON.parse(process.argv[1]); process.stdout.write(data.gitHead || "")' "$npm_state")"
@@ -127,6 +134,7 @@ jobs:
           fi
 
           echo "source_sha=$source_sha" >> "$GITHUB_OUTPUT"
+          echo "source_ref=$GITHUB_REF" >> "$GITHUB_OUTPUT"
           echo "clawhub_tags=$clawhub_tags" >> "$GITHUB_OUTPUT"
 
       - name: Download exact npm package tarball
@@ -167,7 +175,7 @@ jobs:
       ref: ${{ needs.release-preflight.outputs.source_sha }}
       source_repo: ${{ github.repository }}
       source_commit: ${{ needs.release-preflight.outputs.source_sha }}
-      source_ref: ${{ needs.release-preflight.outputs.source_sha }}
+      source_ref: ${{ needs.release-preflight.outputs.source_ref }}
       package_artifact_name: clawhub-release-package
       tags: ${{ needs.release-preflight.outputs.clawhub_tags }}
       dry_run: true
@@ -189,7 +197,7 @@ jobs:
       ref: ${{ needs.release-preflight.outputs.source_sha }}
       source_repo: ${{ github.repository }}
       source_commit: ${{ needs.release-preflight.outputs.source_sha }}
-      source_ref: ${{ needs.release-preflight.outputs.source_sha }}
+      source_ref: ${{ needs.release-preflight.outputs.source_ref }}
       package_artifact_name: clawhub-release-package
       tags: ${{ needs.release-preflight.outputs.clawhub_tags }}
       dry_run: false
