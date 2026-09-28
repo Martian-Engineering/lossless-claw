@@ -2,6 +2,8 @@
 
 ## 1.1.1
 
+<!-- release-rollback-version: 1.1.0 -->
+
 ### Patch Changes
 
 - [#1174](https://github.com/Martian-Engineering/lossless-claw/pull/1174) [`2580af0`](https://github.com/Martian-Engineering/lossless-claw/commit/2580af0c55f4515bb8ce3895b874a1a70b9d1edd) Thanks [@Marvinthebored](https://github.com/Marvinthebored)! - Adopt a projected transcript entry id onto a live-ingested user row by the row's created time when the message body repeats in the projection. Repeated bodies such as restart-recovery prompts were imported as a second row, and assembly then alternated between the two rows across runs, breaking the provider prompt-cache prefix.
