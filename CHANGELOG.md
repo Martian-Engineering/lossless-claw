@@ -1,5 +1,31 @@
 # @martian-engineering/lossless-claw
 
+## 1.1.1
+
+### Patch Changes
+
+- [#1174](https://github.com/Martian-Engineering/lossless-claw/pull/1174) [`2580af0`](https://github.com/Martian-Engineering/lossless-claw/commit/2580af0c55f4515bb8ce3895b874a1a70b9d1edd) Thanks [@Marvinthebored](https://github.com/Marvinthebored)! - Adopt a projected transcript entry id onto a live-ingested user row by the row's created time when the message body repeats in the projection. Repeated bodies such as restart-recovery prompts were imported as a second row, and assembly then alternated between the two rows across runs, breaking the provider prompt-cache prefix.
+
+  Require unambiguous matches in both the stored history and the full projection before assigning entry IDs. Preserve ambiguity across timestamp adoption and anchor audit, including nearby repeats and missing timestamps.
+
+- [#1189](https://github.com/Martian-Engineering/lossless-claw/pull/1189) [`a5ffa90`](https://github.com/Martian-Engineering/lossless-claw/commit/a5ffa9035804bcf90bf18072f94339e49d6fb877) Thanks [@sitanwen](https://github.com/sitanwen)! - Allow delegated sessions to retrieve externalized tool output from their own active LCM conversation while preserving the grant boundary for all other conversations.
+
+- [#1204](https://github.com/Martian-Engineering/lossless-claw/pull/1204) [`8e3050c`](https://github.com/Martian-Engineering/lossless-claw/commit/8e3050c1d5d5e46911b480815884276834ab6080) Thanks [@jalehman](https://github.com/jalehman)! - Try prepared-summary publication and bounded foreground compaction before pressure-driven context eviction. Measure serialized assembly pressure even without recorded maintenance debt, preserve generation cooldowns, and rebuild context after publication. Retain unresolved work and report why bounded fallback remains necessary.
+
+- [#1172](https://github.com/Martian-Engineering/lossless-claw/pull/1172) [`1ce937f`](https://github.com/Martian-Engineering/lossless-claw/commit/1ce937f49112c16898e7aface93513e2ead4f9da) Thanks [@Patrick-Erichsen](https://github.com/Patrick-Erichsen)! - Add author-defined settings groups for OpenClaw `2026.9.5` and newer hosts that support manifest `configGroups`. Older hosts retain the complete flat settings form; configuration paths and runtime behavior are unchanged. Publish fixed runtime defaults for the settings editor and identify automatically calculated values without turning them into fixed overrides.
+
+- [#1210](https://github.com/Martian-Engineering/lossless-claw/pull/1210) [`796e4f9`](https://github.com/Martian-Engineering/lossless-claw/commit/796e4f9696899925e077d48782f9d0a44cc65cbe) Thanks [@jalehman](https://github.com/jalehman)! - Preserve provider retry metadata when a publication-only maintenance check cannot advance. Publishing prepared summaries through manual or forced compaction keeps the generation cooldown intact unless new model-backed preparation is required.
+
+- [#1203](https://github.com/Martian-Engineering/lossless-claw/pull/1203) [`4ac610f`](https://github.com/Martian-Engineering/lossless-claw/commit/4ac610fbde4e80106329b6ae6c6f701638d9bb57) Thanks [@jalehman](https://github.com/jalehman)! - Allow compaction to atomically publish a contiguous ready summary prefix while remaining chunks or condensation are unfinished, including during summarization cooldown. Preserve pending suffix work, canonical lineage, original messages, and the protected fresh tail; report remaining preparation after partial publication.
+
+- [#1208](https://github.com/Martian-Engineering/lossless-claw/pull/1208) [`762f01c`](https://github.com/Martian-Engineering/lossless-claw/commit/762f01c90feaec4fd8ad44f117a4f215a39b68de) Thanks [@jalehman](https://github.com/jalehman)! - Repair outgoing history that begins with an incomplete historical tool turn, including after bounded bootstrap. Keep the initiating user when clamping a complete tool exchange, and preserve stored history and host-owned userless continuations.
+
+- [#1209](https://github.com/Martian-Engineering/lossless-claw/pull/1209) [`17a944f`](https://github.com/Martian-Engineering/lossless-claw/commit/17a944fa48f4b11a144538c740a5e003ec10f730) Thanks [@jalehman](https://github.com/jalehman)! - Keep deferred maintenance pending when explicit compaction commits progress but cannot finish. Preserve retry deadlines and discard stale prompt-size observations after summaries change the context, so later maintenance evaluates the reduced history.
+
+- [#1196](https://github.com/Martian-Engineering/lossless-claw/pull/1196) [`544c6c8`](https://github.com/Martian-Engineering/lossless-claw/commit/544c6c8424f74e0469f9219cf83d9147167d007b) Thanks [@pavonis-martian](https://github.com/pavonis-martian)! - Treat retired OpenClaw plugin inventories as lifecycle interruptions during summarization. Preserve pending work for a fresh maintenance invocation without creating fallback summaries or consuming pending-node retries.
+
+- [#1215](https://github.com/Martian-Engineering/lossless-claw/pull/1215) [`762c9b8`](https://github.com/Martian-Engineering/lossless-claw/commit/762c9b8b4f534f525666ca0ced0160d10acd3b66) Thanks [@jalehman](https://github.com/jalehman)! - Bound prompt-assembly work when internal events require trimming history. Evict the oldest eligible history groups instead of repeatedly comparing every candidate projection. Keep tool exchanges with their initiating user, preserve protected recent and live inputs, and report when those inputs exceed the budget. Stored messages and parts are unchanged.
+
 ## 1.1.0
 
 <!-- release-rollback-version: 1.0.0 -->
