@@ -766,6 +766,82 @@ describe("LCM tools session scoping", () => {
     expect(JSON.stringify(describeResult.details)).not.toContain(summaryContent);
   });
 
+  it("lcm_grep ignores a zero-filled conversationId and honors allConversations", async () => {
+    const retrieval = {
+      grep: vi.fn(async () => ({
+        messages: [],
+        summaries: [],
+        totalMatches: 0,
+      })),
+      expand: vi.fn(),
+      describe: vi.fn(),
+    };
+
+    const tool = createLcmGrepTool({
+      deps: makeDeps(),
+      lcm: buildLcmEngine({
+        retrieval,
+        conversationIdBySessionKey: 42,
+      }) as never,
+      sessionKey: "agent:main:main",
+    });
+    // Some models zero-fill every optional parameter. conversationId: 0 must
+    // not be treated as an explicit scope that shadows allConversations.
+    const result = await tool.execute("call-zero-filled-all", {
+      pattern: "steer",
+      mode: "full_text",
+      conversationId: 0,
+      allConversations: true,
+      since: "",
+      before: "",
+    });
+
+    expect(retrieval.grep).toHaveBeenCalledWith(
+      expect.objectContaining({
+        allConversations: true,
+        conversationId: undefined,
+        conversationIds: undefined,
+      }),
+    );
+    const text = (result.content[0] as { text: string }).text;
+    expect(text).toContain("**Conversation scope:** all conversations");
+  });
+
+  it("lcm_grep falls back to the session family when conversationId is zero-filled", async () => {
+    const retrieval = {
+      grep: vi.fn(async () => ({
+        messages: [],
+        summaries: [],
+        totalMatches: 0,
+      })),
+      expand: vi.fn(),
+      describe: vi.fn(),
+    };
+
+    const tool = createLcmGrepTool({
+      deps: makeDeps(),
+      lcm: buildLcmEngine({
+        retrieval,
+        conversationIdBySessionKey: 42,
+        conversationFamilyIds: [42, 21],
+      }) as never,
+      sessionKey: "agent:main:main",
+    });
+    const result = await tool.execute("call-zero-filled-session", {
+      pattern: "steer",
+      conversationId: -1,
+    });
+
+    expect(retrieval.grep).toHaveBeenCalledWith(
+      expect.objectContaining({
+        conversationId: 42,
+        conversationIds: [42, 21],
+      }),
+    );
+    const text = (result.content[0] as { text: string }).text;
+    expect(text).toContain("session family rooted at 42");
+  });
+
   it("lcm_grep keeps isolated cron sessionKey scope on the active run", async () => {
     const retrieval = {
       grep: vi.fn(async () => ({

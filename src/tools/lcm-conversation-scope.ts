@@ -111,9 +111,18 @@ export async function resolveLcmConversationScope(input: {
   const isolateCurrentSessionFamily = isIsolatedCronSessionKey(normalizedSessionKey);
   let allowedConversationIds: number[] = [];
 
-  const explicitConversationId =
+  // Conversation IDs are SQLite rowids and start at 1. Some models zero-fill
+  // optional tool parameters, sending conversationId: 0 alongside
+  // allConversations: true; accepting 0 as an explicit scope would silently
+  // search a conversation that cannot exist and shadow allConversations. A
+  // non-positive ID therefore means "not provided".
+  const truncatedConversationId =
     typeof params.conversationId === "number" && Number.isFinite(params.conversationId)
       ? Math.trunc(params.conversationId)
+      : undefined;
+  const explicitConversationId =
+    truncatedConversationId != null && truncatedConversationId > 0
+      ? truncatedConversationId
       : undefined;
 
   if (isDelegatedSession) {
