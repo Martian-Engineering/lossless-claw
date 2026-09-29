@@ -151,6 +151,20 @@ describe("LcmContextEngine commitTurn", () => {
     });
   });
 
+  it("reuses the last assembled budget when durable commit omits it", async () => {
+    const engine = createEngine();
+    const params = buildCommitTurnParams();
+    await engine.ingest({
+      sessionId: params.sessionId, sessionKey: params.sessionKey,
+      message: makeMessage({ role: "user", content: "prior question", timestamp: 1_000 }),
+    });
+    await engine.assemble({ sessionId: params.sessionId, sessionKey: params.sessionKey, messages: [], tokenBudget: 500_000 });
+    const privateEngine = engine as unknown as { compaction: { evaluate: (conversationId: number, tokenBudget: number) => Promise<unknown> } };
+    const evaluate = vi.spyOn(privateEngine.compaction, "evaluate");
+    await engine.commitTurn(params);
+    expect(evaluate).toHaveBeenCalledWith(expect.any(Number), 500_000, undefined, expect.anything());
+  });
+
   it("records the receipt without duplicating a turn already ingested from the transcript", async () => {
     const engine = createEngine();
     const params = buildCommitTurnParams();
