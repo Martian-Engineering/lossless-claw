@@ -50,6 +50,7 @@ export function createTestConfig(
     freshTailCount: 8,
     promptAwareEviction: false,
     stubLargeToolPayloads: false,
+    exposeLargeFilePaths: false,
     newSessionRetainDepth: 2,
     leafMinFanout: 8,
     condensedMinFanout: 4,

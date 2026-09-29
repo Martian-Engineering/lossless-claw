@@ -517,18 +517,32 @@ export function formatToolOutputReference(input: {
   toolName?: string;
   byteSize: number;
   summary: string;
+  localPath?: string;
 }): string {
   const toolName = input.toolName?.trim() || "unknown";
   const byteSize = Math.max(0, input.byteSize);
-
-  return [
+  const lines = [
     `[LCM Tool Output: ${input.fileId} | tool=${toolName} | ${byteSize.toLocaleString("en-US")} bytes]`,
     "",
     "Exploration Summary:",
     input.summary.trim() || "(no summary available)",
-    "",
-    "Call lcm_describe(id=\"<file_id above>\", expandFile=true) to fetch the full output content from disk.",
-  ].join("\n");
+  ];
+
+  if (input.localPath) {
+    lines.push(
+      "",
+      `Local path: ${input.localPath}`,
+      "Use bounded search or ranged reads against this path instead of loading the entire file into context.",
+      "If this path is unavailable from the current execution host, use lcm_grep or lcm_describe with the file ID above.",
+    );
+  } else {
+    lines.push(
+      "",
+      "Call lcm_describe(id=\"<file_id above>\", expandFile=true) to fetch the full output content from disk.",
+    );
+  }
+
+  return lines.join("\n");
 }
 
 export function formatRawPayloadReference(input: {
