@@ -148,6 +148,14 @@ export type LcmConfig = {
    * any whole conversation message when the lane is under cap pressure.
    */
   laneReasoningMode?: "inline" | "lowest";
+  /**
+   * Lane split (Step 4) — *why* reasoning is shed inside the conversation lane.
+   * `"always"` (default) sheds the minimum necessary reasoning oldest-first to
+   * meet the cap, exactly as Step 3 did. `"purpose-bound"` only sheds when the
+   * lane's non-reasoning footprint already fits the cap, so the shed can
+   * actually bring the whole lane under it; otherwise it sheds nothing.
+   */
+  laneReasoningShedPolicy?: "always" | "purpose-bound";
   newSessionRetainDepth: number;
   leafMinFanout: number;
   condensedMinFanout: number;
@@ -788,6 +796,14 @@ export function resolveLcmConfigWithDiagnostics(
         env.LCM_LANE_REASONING_MODE !== undefined
           ? (env.LCM_LANE_REASONING_MODE === "lowest" ? "lowest" : "inline")
           : (pc.laneReasoningMode === "lowest" ? "lowest" : "inline"),
+      // Lane split (Step 4) — "always" is the default and reproduces Step 3.
+      // Only an explicit "purpose-bound" (env or plugin config) opts in.
+      laneReasoningShedPolicy:
+        env.LCM_LANE_REASONING_SHED_POLICY !== undefined
+          ? (env.LCM_LANE_REASONING_SHED_POLICY === "purpose-bound"
+              ? "purpose-bound"
+              : "always")
+          : (pc.laneReasoningShedPolicy === "purpose-bound" ? "purpose-bound" : "always"),
       newSessionRetainDepth:
         parseFiniteInt(env.LCM_NEW_SESSION_RETAIN_DEPTH)
           ?? toNumber(pc.newSessionRetainDepth) ?? 2,

@@ -16,6 +16,7 @@ import {
   selectLanesWithinBudgetWithReasoning,
   type ConversationItemTokenSplit,
   type MessageLane,
+  type ReasoningShedPolicy,
   type ReasoningTrimMode,
 } from "./lane-split.js";
 import { formatToolOutputReference } from "./large-files.js";
@@ -264,6 +265,17 @@ export interface AssembleContextInput {
    *     may lose its reasoning while keeping its text.
    */
   laneReasoningMode?: ReasoningTrimMode;
+  /**
+   * Lane split (Step 4) — *why* reasoning is shed inside the conversation lane.
+   *
+   *   "always" (default) — Step 3 behavior, unchanged: shed the minimum
+   *     necessary reasoning oldest-first to meet the cap.
+   *   "purpose-bound" — only shed reasoning when the lane's non-reasoning
+   *     footprint already fits the cap (so the shed can actually make the lane
+   *     fit). When even dropping all reasoning cannot fit the cap, shed nothing
+   *     and degrade to the inline/Step 2 result.
+   */
+  laneReasoningShedPolicy?: ReasoningShedPolicy;
 }
 
 export interface AssembleContextResult {
@@ -317,6 +329,10 @@ export interface AssembleContextResult {
       conversationTextTokens?: number;
       /** True when reasoning was dropped before any whole message. */
       reasoningTrimmed?: boolean;
+      /** Lane split (Step 4) — the shedding policy that was applied. */
+      reasoningShedPolicy?: ReasoningShedPolicy;
+      /** Conversation-lane tokens the lane needs even with all reasoning shed. */
+      conversationNonReasoningTokens?: number;
     };
   };
 }
@@ -1750,6 +1766,8 @@ export class ContextAssembler {
       reasoningTokens?: number;
       conversationTextTokens?: number;
       reasoningTrimmed?: boolean;
+      reasoningShedPolicy?: ReasoningShedPolicy;
+      conversationNonReasoningTokens?: number;
     } | null = null;
     if (input.laneSplitEnabled === true) {
       // Lane split (Step 2) — independent budgets for the two lanes. The
@@ -1769,6 +1787,10 @@ export class ContextAssembler {
       // any whole message. "inline" (the default) is the Step 2 path verbatim.
       const reasoningMode: ReasoningTrimMode =
         input.laneReasoningMode === "lowest" ? "lowest" : "inline";
+      // Step 4 — "always" (default) reproduces Step 3 exactly; "purpose-bound"
+      // sheds reasoning only when the shed can actually make the lane fit.
+      const shedPolicy: ReasoningShedPolicy =
+        input.laneReasoningShedPolicy === "purpose-bound" ? "purpose-bound" : "always";
       if (reasoningMode === "lowest") {
         const splits = conversationItems.map((item) => conversationItemTokenSplit(item));
         const laneSelection = selectLanesWithinBudgetWithReasoning(
@@ -1777,6 +1799,7 @@ export class ContextAssembler {
           remainingBudget,
           conversationCap,
           "lowest",
+          shedPolicy,
         );
         laneSelection.conversationKept.forEach((keep, index) => {
           if (!keep || !laneSelection.reasoningDropped[index]) return;
@@ -1802,6 +1825,8 @@ export class ContextAssembler {
           reasoningTokens: laneSelection.reasoningTokens,
           conversationTextTokens: laneSelection.conversationTextTokens,
           reasoningTrimmed: laneSelection.reasoningTrimmed,
+          reasoningShedPolicy: laneSelection.reasoningShedPolicy,
+          conversationNonReasoningTokens: laneSelection.nonReasoningTotal,
         };
       } else {
         const laneSelection = selectLanesWithinBudget(
