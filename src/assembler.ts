@@ -13,7 +13,10 @@ import {
   classifyMessageLane,
   DEFAULT_CONVERSATION_LANE_TOKEN_CAP,
   selectLanesWithinBudget,
+  selectLanesWithinBudgetWithReasoning,
+  type ConversationItemTokenSplit,
   type MessageLane,
+  type ReasoningTrimMode,
 } from "./lane-split.js";
 import { formatToolOutputReference } from "./large-files.js";
 import { serializeOpenClawSenderMetadata } from "./openclaw-sender-metadata.js";
@@ -251,6 +254,16 @@ export interface AssembleContextInput {
    * Defaults to DEFAULT_CONVERSATION_LANE_TOKEN_CAP when omitted.
    */
   laneConversationTokenCap?: number;
+  /**
+   * Lane split (Step 3) — within-lane priority inside the conversation lane.
+   *
+   *   "inline" (default) — reasoning counts as ordinary conversation tokens;
+   *     identical to Step 2 byte-for-byte.
+   *   "lowest" — when the conversation lane is under cap pressure its
+   *     reasoning blocks are dropped before any whole message, so a message
+   *     may lose its reasoning while keeping its text.
+   */
+  laneReasoningMode?: ReasoningTrimMode;
 }
 
 export interface AssembleContextResult {
@@ -296,6 +309,14 @@ export interface AssembleContextResult {
       longtextTokens: number;
       conversationTrimmed: boolean;
       longtextTrimmed: boolean;
+      /** Lane split (Step 3) — present only when reasoningMode is "lowest". */
+      reasoningMode?: ReasoningTrimMode;
+      /** Conversation-lane tokens retained from reasoning blocks. */
+      reasoningTokens?: number;
+      /** Conversation-lane tokens retained from non-reasoning content. */
+      conversationTextTokens?: number;
+      /** True when reasoning was dropped before any whole message. */
+      reasoningTrimmed?: boolean;
     };
   };
 }
@@ -1315,6 +1336,87 @@ function resolvedItemLane(item: ResolvedItem): MessageLane {
   return "conversation";
 }
 
+// ── Lane split (Step 3) — reasoning split helpers ───────────────────────────
+//
+// Step 3 needs to know how much of a conversation item is model reasoning
+// (sacrificable) versus everything else (kept). The split is derived from the
+// already-resolved AgentMessage, not the stored parts, so it stays correct for
+// both legacy rows and any future part shapes: reasoning is a property of the
+// emitted block type ("thinking"/"reasoning"/"redacted_thinking") plus the
+// top-level `reasoning_content` field.
+
+/** True for a block that will be stripped by the provider layer anyway. */
+function isReasoningBlock(block: unknown): boolean {
+  if (!block || typeof block !== "object") return false;
+  const type = (block as { type?: unknown }).type;
+  return typeof type === "string" && THINKING_LIKE_TYPES.has(type);
+}
+
+/** Serialize a block the same way token estimation sees it. */
+function serializeBlock(block: unknown): string {
+  try {
+    const text = JSON.stringify(block);
+    return typeof text === "string" ? text : "";
+  } catch {
+    return "";
+  }
+}
+
+/**
+ * Split a conversation item's token estimate into its reasoning and
+ * non-reasoning parts. The two always sum to `item.tokens` so lane budgeting
+ * is unaffected; only the attribution is new. Returns reasoningTokens 0 for
+ * messages with no reasoning, and 0 text for reasoning-only messages (which
+ * the empty-content cleaner drops after the reasoning is stripped).
+ */
+function conversationItemTokenSplit(item: ResolvedItem): ConversationItemTokenSplit {
+  const message = item.message as { content?: unknown; reasoning_content?: unknown };
+  const reasoningParts: string[] = [];
+  const content = message?.content;
+  let hasNonReasoningContent = false;
+  if (typeof content === "string") {
+    hasNonReasoningContent = content.trim().length > 0;
+  } else if (Array.isArray(content)) {
+    for (const block of content) {
+      if (isReasoningBlock(block)) {
+        reasoningParts.push(serializeBlock(block));
+      } else {
+        hasNonReasoningContent = true;
+      }
+    }
+  }
+  if (typeof message?.reasoning_content === "string" && message.reasoning_content.length > 0) {
+    reasoningParts.push(message.reasoning_content);
+  }
+  if (reasoningParts.length === 0) {
+    return { reasoningTokens: 0, textTokens: Math.max(0, item.tokens) };
+  }
+  const reasoningTokens = Math.min(Math.max(0, item.tokens), estimateTokens(reasoningParts.join("\n")));
+  return {
+    reasoningTokens,
+    textTokens: hasNonReasoningContent ? Math.max(0, item.tokens - reasoningTokens) : 0,
+  };
+}
+
+/** Remove every reasoning block (and top-level reasoning_content) from an
+ *  emitted message, returning the stripped copy, or null when nothing changed.
+ *  Text, tool_use/tool_result blocks and all other metadata are untouched. */
+function stripReasoningBlocksFromMessage(message: AgentMessage): AgentMessage | null {
+  let changed = false;
+  let next: Record<string, unknown> = message as unknown as Record<string, unknown>;
+  const content = (message as { content?: unknown }).content;
+  if (Array.isArray(content) && content.some(isReasoningBlock)) {
+    next = { ...next, content: content.filter((block) => !isReasoningBlock(block)) };
+    changed = true;
+  }
+  if (typeof (message as { reasoning_content?: unknown }).reasoning_content === "string") {
+    if (!changed) next = { ...next };
+    delete next.reasoning_content;
+    changed = true;
+  }
+  return changed ? (next as AgentMessage) : null;
+}
+
 function topContributors(
   items: ResolvedItem[],
   selectedOrdinals: Set<number>,
@@ -1644,6 +1746,10 @@ export class ContextAssembler {
       longtextTokens: number;
       conversationTrimmed: boolean;
       longtextTrimmed: boolean;
+      reasoningMode?: ReasoningTrimMode;
+      reasoningTokens?: number;
+      conversationTextTokens?: number;
+      reasoningTrimmed?: boolean;
     } | null = null;
     if (input.laneSplitEnabled === true) {
       // Lane split (Step 2) — independent budgets for the two lanes. The
@@ -1657,24 +1763,66 @@ export class ContextAssembler {
       for (const item of evictable) {
         (resolvedItemLane(item) === "longtext" ? longtextItems : conversationItems).push(item);
       }
-      const laneSelection = selectLanesWithinBudget(
-        conversationItems.map((item) => item.tokens),
-        longtextItems.map((item) => item.tokens),
-        remainingBudget,
-        input.laneConversationTokenCap ?? DEFAULT_CONVERSATION_LANE_TOKEN_CAP,
-      );
-      selected.push(
-        ...conversationItems.filter((_item, index) => laneSelection.conversationKept[index]),
-        ...longtextItems.filter((_item, index) => laneSelection.longtextKept[index]),
-      );
-      evictableTokens = laneSelection.conversationTokens + laneSelection.longtextTokens;
-      laneSplitDiagnostics = {
-        conversationTokenCap: laneSelection.conversationTokenCap,
-        conversationTokens: laneSelection.conversationTokens,
-        longtextTokens: laneSelection.longtextTokens,
-        conversationTrimmed: laneSelection.conversationTrimmed,
-        longtextTrimmed: laneSelection.longtextTrimmed,
-      };
+      const conversationCap =
+        input.laneConversationTokenCap ?? DEFAULT_CONVERSATION_LANE_TOKEN_CAP;
+      // Step 3 — "lowest" sheds reasoning inside the conversation lane before
+      // any whole message. "inline" (the default) is the Step 2 path verbatim.
+      const reasoningMode: ReasoningTrimMode =
+        input.laneReasoningMode === "lowest" ? "lowest" : "inline";
+      if (reasoningMode === "lowest") {
+        const splits = conversationItems.map((item) => conversationItemTokenSplit(item));
+        const laneSelection = selectLanesWithinBudgetWithReasoning(
+          splits,
+          longtextItems.map((item) => item.tokens),
+          remainingBudget,
+          conversationCap,
+          "lowest",
+        );
+        laneSelection.conversationKept.forEach((keep, index) => {
+          if (!keep || !laneSelection.reasoningDropped[index]) return;
+          const item = conversationItems[index]!;
+          const stripped = stripReasoningBlocksFromMessage(item.message);
+          if (stripped) {
+            item.message = stripped;
+          }
+          item.tokens = splits[index]!.textTokens;
+        });
+        selected.push(
+          ...conversationItems.filter((_item, index) => laneSelection.conversationKept[index]),
+          ...longtextItems.filter((_item, index) => laneSelection.longtextKept[index]),
+        );
+        evictableTokens = laneSelection.conversationTokens + laneSelection.longtextTokens;
+        laneSplitDiagnostics = {
+          conversationTokenCap: laneSelection.conversationTokenCap,
+          conversationTokens: laneSelection.conversationTokens,
+          longtextTokens: laneSelection.longtextTokens,
+          conversationTrimmed: laneSelection.conversationTrimmed,
+          longtextTrimmed: laneSelection.longtextTrimmed,
+          reasoningMode: "lowest",
+          reasoningTokens: laneSelection.reasoningTokens,
+          conversationTextTokens: laneSelection.conversationTextTokens,
+          reasoningTrimmed: laneSelection.reasoningTrimmed,
+        };
+      } else {
+        const laneSelection = selectLanesWithinBudget(
+          conversationItems.map((item) => item.tokens),
+          longtextItems.map((item) => item.tokens),
+          remainingBudget,
+          conversationCap,
+        );
+        selected.push(
+          ...conversationItems.filter((_item, index) => laneSelection.conversationKept[index]),
+          ...longtextItems.filter((_item, index) => laneSelection.longtextKept[index]),
+        );
+        evictableTokens = laneSelection.conversationTokens + laneSelection.longtextTokens;
+        laneSplitDiagnostics = {
+          conversationTokenCap: laneSelection.conversationTokenCap,
+          conversationTokens: laneSelection.conversationTokens,
+          longtextTokens: laneSelection.longtextTokens,
+          conversationTrimmed: laneSelection.conversationTrimmed,
+          longtextTrimmed: laneSelection.longtextTrimmed,
+        };
+      }
     } else if (evictableTotalTokens <= remainingBudget) {
       // Everything fits
       selected.push(...evictable);

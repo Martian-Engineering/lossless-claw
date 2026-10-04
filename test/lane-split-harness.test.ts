@@ -44,6 +44,10 @@ const CONVERSATION_CAP =
 const FRESH_TAIL_RAW = Number(process.env.LANE_SPLIT_FRESH_TAIL ?? "");
 const FRESH_TAIL_COUNT =
   Number.isFinite(FRESH_TAIL_RAW) && FRESH_TAIL_RAW > 0 ? FRESH_TAIL_RAW : 64;
+// Step 3 — when set to "lowest", additionally assemble each budget with
+// reasoning shedding enabled and report flag-off / flag-on (lowest) side by
+// side. Reporting only: this never changes the existing assertions.
+const REASONING_MODE = process.env.LANE_SPLIT_REASONING_MODE === "lowest" ? "lowest" : undefined;
 
 const REASONING_TYPES = new Set(["reasoning", "thinking", "redacted_thinking"]);
 const TOOL_TYPES = new Set([
@@ -199,6 +203,61 @@ function render(compositions: Composition[]): string {
   return lines.join("\n") + "\n";
 }
 
+function renderReasoningComparison(off: Composition[], lowest: Composition[]): string {
+  const lines: string[] = [];
+  const totalOf = (c: Composition): number =>
+    c.buckets.reasoning.chars + c.buckets.tool.chars + c.buckets.text.chars + c.buckets.other.chars;
+  const referenceIndex = lowest.reduce(
+    (best, candidate, index) => (candidate.budget > lowest[best].budget ? index : best),
+    0,
+  );
+  const reference = lowest[referenceIndex];
+  lines.push("");
+  lines.push("=== flag off vs flag on (lane split, reasoning=lowest) ===");
+  lines.push(
+    "snapshot=" + SNAPSHOT + " conversationId=" + CONVERSATION_ID +
+      " conversationCap=" +
+      (CONVERSATION_CAP === undefined ? "default(65536)" : String(CONVERSATION_CAP)),
+  );
+  lines.push(
+    "text reference (max budget, lowest): blocks=" +
+      (reference ? reference.buckets.text.blocks : 0) +
+      " chars=" +
+      (reference ? reference.buckets.text.chars : 0),
+  );
+  for (let index = 0; index < lowest.length; index++) {
+    const onComposition = lowest[index];
+    const offComposition = off[index];
+    const onTotal = totalOf(onComposition);
+    const offTotal = totalOf(offComposition);
+    lines.push("");
+    lines.push("--- tokenBudget=" + onComposition.budget + " ---");
+    lines.push(
+      "[off   ] chars=" + offTotal +
+        " reasoning=" + pct(offComposition.buckets.reasoning.chars, offTotal) +
+        " tool=" + pct(offComposition.buckets.tool.chars, offTotal) +
+        " text=" + pct(offComposition.buckets.text.chars, offTotal),
+    );
+    lines.push(
+      "[lowest] chars=" + onTotal +
+        " reasoning=" + pct(onComposition.buckets.reasoning.chars, onTotal) +
+        " tool=" + pct(onComposition.buckets.tool.chars, onTotal) +
+        " text=" + pct(onComposition.buckets.text.chars, onTotal),
+    );
+    lines.push(
+      "  text kept vs reference: blocks=" +
+        pct(onComposition.buckets.text.blocks, reference ? reference.buckets.text.blocks : 0) +
+        " chars=" +
+        pct(onComposition.buckets.text.chars, reference ? reference.buckets.text.chars : 0) +
+        " | text chars off->lowest " + offComposition.buckets.text.chars + " -> " + onComposition.buckets.text.chars +
+        " | total chars off->lowest " + offTotal + " -> " + onTotal,
+    );
+  }
+  lines.push("");
+  lines.push("=== end reasoning comparison ===");
+  return lines.join("\n") + "\n";
+}
+
 function renderLaneSplitComparison(off: Composition[], on: Composition[]): string {
   const lines: string[] = [];
   const totalOf = (c: Composition): number =>
@@ -321,6 +380,7 @@ describe.skipIf(!snapshotAvailable)("lane-split offline assembly composition", (
 
         const compositions: Composition[] = [];
         const onCompositions: Composition[] = [];
+        const lowestCompositions: Composition[] = [];
         const onLaneDebug: Array<
           { conversationTrimmed: boolean; longtextTrimmed: boolean } | undefined
         > = [];
@@ -350,10 +410,28 @@ describe.skipIf(!snapshotAvailable)("lane-split offline assembly composition", (
                 }
               : undefined,
           );
+          if (REASONING_MODE === "lowest") {
+            const lowestResult = await assembler.assemble({
+              ...input,
+              laneSplitEnabled: true,
+              laneConversationTokenCap: CONVERSATION_CAP,
+              laneReasoningMode: "lowest",
+            });
+            lowestCompositions.push(
+              analyze(
+                budget,
+                lowestResult.messages as unknown as Array<Record<string, unknown>>,
+              ),
+            );
+          }
         }
 
         const report =
-          render(compositions) + renderLaneSplitComparison(compositions, onCompositions);
+          render(compositions) +
+          renderLaneSplitComparison(compositions, onCompositions) +
+          (REASONING_MODE === "lowest"
+            ? renderReasoningComparison(compositions, lowestCompositions)
+            : "");
         mkdirSync(dirname(REPORT_PATH), { recursive: true });
         writeFileSync(REPORT_PATH, report, "utf8");
         // Keep the vitest output small; the full report is on disk.
