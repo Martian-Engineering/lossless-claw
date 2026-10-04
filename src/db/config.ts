@@ -1,6 +1,7 @@
 import { homedir } from "os";
 import { join } from "path";
 import { MIN_FALLBACK_MAX_TOKENS } from "../summary-fallback.js";
+import { DEFAULT_CONVERSATION_LANE_TOKEN_CAP } from "../lane-split.js";
 
 /**
  * Resolve the active OpenClaw state directory.
@@ -133,6 +134,13 @@ export type LcmConfig = {
   laneTaskChainProtection?: boolean;
   /** Lane split — token threshold above which a longtext segment is externalized. */
   laneExternalizeTokenThreshold?: number;
+  /**
+   * Lane split (Step 2) — absolute token cap for the conversation lane. Only
+   * this cap (never a ratio) may trim the otherwise-protected conversation
+   * lane during lane-split assembly. Prevents a runaway conversation lane from
+   * monopolising the window. Default 65536 (half of a 128K context window).
+   */
+  conversationLaneTokenCap?: number;
   newSessionRetainDepth: number;
   leafMinFanout: number;
   condensedMinFanout: number;
@@ -763,6 +771,10 @@ export function resolveLcmConfigWithDiagnostics(
       laneExternalizeTokenThreshold:
         parseFiniteInt(env.LCM_LANE_EXTERNALIZE_TOKEN_THRESHOLD)
           ?? toNumber(pc.laneExternalizeTokenThreshold) ?? 2000,
+      conversationLaneTokenCap:
+        toPositiveInteger(parseFiniteInt(env.LCM_CONVERSATION_LANE_TOKEN_CAP))
+          ?? toPositiveInteger(toNumber(pc.conversationLaneTokenCap))
+          ?? DEFAULT_CONVERSATION_LANE_TOKEN_CAP,
       newSessionRetainDepth:
         parseFiniteInt(env.LCM_NEW_SESSION_RETAIN_DEPTH)
           ?? toNumber(pc.newSessionRetainDepth) ?? 2,

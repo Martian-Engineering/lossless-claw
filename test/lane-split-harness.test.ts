@@ -34,6 +34,16 @@ const REPORT_PATH = process.env.LANE_SPLIT_OUT ?? join(tmpdir(), "lane-split-har
 const BUDGETS = (process.env.LANE_SPLIT_BUDGETS ?? "118000,9007199254740991")
   .split(",")
   .map((value) => Number(value.trim()));
+const CONVERSATION_CAP_RAW = Number(process.env.LANE_SPLIT_CONV_CAP ?? "");
+const CONVERSATION_CAP =
+  Number.isFinite(CONVERSATION_CAP_RAW) && CONVERSATION_CAP_RAW > 0
+    ? CONVERSATION_CAP_RAW
+    : undefined;
+// Fresh tail is protected from eviction; 64 protects almost any small session,
+// so expose it to force real eviction pressure in the comparison run.
+const FRESH_TAIL_RAW = Number(process.env.LANE_SPLIT_FRESH_TAIL ?? "");
+const FRESH_TAIL_COUNT =
+  Number.isFinite(FRESH_TAIL_RAW) && FRESH_TAIL_RAW > 0 ? FRESH_TAIL_RAW : 64;
 
 const REASONING_TYPES = new Set(["reasoning", "thinking", "redacted_thinking"]);
 const TOOL_TYPES = new Set([
@@ -189,6 +199,96 @@ function render(compositions: Composition[]): string {
   return lines.join("\n") + "\n";
 }
 
+function renderLaneSplitComparison(off: Composition[], on: Composition[]): string {
+  const lines: string[] = [];
+  const totalOf = (c: Composition): number =>
+    c.buckets.reasoning.chars + c.buckets.tool.chars + c.buckets.text.chars + c.buckets.other.chars;
+  const referenceIndex = on.reduce(
+    (best, candidate, index) => (candidate.budget > on[best].budget ? index : best),
+    0,
+  );
+  const reference = on[referenceIndex];
+  lines.push("");
+  lines.push("=== flag off vs flag on (lane split) ===");
+  lines.push(
+    "snapshot=" + SNAPSHOT + " conversationId=" + CONVERSATION_ID +
+      " conversationCap=" +
+      (CONVERSATION_CAP === undefined ? "default(65536)" : String(CONVERSATION_CAP)),
+  );
+  lines.push(
+    "text reference (max budget, flag on): blocks=" +
+      (reference ? reference.buckets.text.blocks : 0) +
+      " chars=" +
+      (reference ? reference.buckets.text.chars : 0),
+  );
+  for (let index = 0; index < on.length; index++) {
+    const onComposition = on[index];
+    const offComposition = off[index];
+    const onTotal = totalOf(onComposition);
+    const offTotal = totalOf(offComposition);
+    lines.push("");
+    lines.push("--- tokenBudget=" + onComposition.budget + " ---");
+    lines.push(
+      "[off] chars=" + offTotal +
+        " reasoning=" + pct(offComposition.buckets.reasoning.chars, offTotal) +
+        " tool=" + pct(offComposition.buckets.tool.chars, offTotal) +
+        " text=" + pct(offComposition.buckets.text.chars, offTotal),
+    );
+    lines.push(
+      "[on ] chars=" + onTotal +
+        " reasoning=" + pct(onComposition.buckets.reasoning.chars, onTotal) +
+        " tool=" + pct(onComposition.buckets.tool.chars, onTotal) +
+        " text=" + pct(onComposition.buckets.text.chars, onTotal),
+    );
+    lines.push(
+      "  text kept vs reference: blocks=" +
+        pct(onComposition.buckets.text.blocks, reference ? reference.buckets.text.blocks : 0) +
+        " chars=" +
+        pct(onComposition.buckets.text.chars, reference ? reference.buckets.text.chars : 0) +
+        " | tool chars off->on " + offComposition.buckets.tool.chars + " -> " + onComposition.buckets.tool.chars,
+    );
+  }
+  lines.push("");
+  lines.push("=== end lane-split comparison ===");
+  return lines.join("\n") + "\n";
+}
+
+/**
+ * Append a synthetic "latest user turn" to the copied snapshot.
+ *
+ * Real assembly runs when a new user message has just been ingested, so the
+ * live conversation always ends with a user turn. These captured snapshots end
+ * with tool/assistant turns and hold a single user message at ordinal 0, which
+ * makes the assembler keep the WHOLE session as a protected fresh tail (nothing
+ * is evictable). Appending this turn restores the assembly-time shape so the
+ * two-budget policy is actually exercised. Opt in with LANE_SPLIT_APPEND_USER=1.
+ */
+function appendSyntheticUserTurn(
+  db: ReturnType<typeof createLcmDatabaseConnection>,
+  conversationId: number,
+): void {
+  const messageRow = db
+    .prepare("SELECT COALESCE(MAX(seq), 0) AS maxSeq FROM messages WHERE conversation_id = ?")
+    .get(conversationId) as { maxSeq: number };
+  const ordinalRow = db
+    .prepare("SELECT COALESCE(MAX(ordinal), -1) AS maxOrdinal FROM context_items WHERE conversation_id = ?")
+    .get(conversationId) as { maxOrdinal: number };
+  const inserted = db
+    .prepare(
+      "INSERT INTO messages (conversation_id, seq, role, content, token_count) VALUES (?, ?, ?, ?, ?) RETURNING message_id",
+    )
+    .get(
+      conversationId,
+      messageRow.maxSeq + 1,
+      "user",
+      "[lane-split harness] synthetic latest user turn",
+      10,
+    ) as { message_id: number };
+  db.prepare(
+    "INSERT INTO context_items (conversation_id, ordinal, item_type, message_id) VALUES (?, ?, ?, ?)",
+  ).run(conversationId, ordinalRow.maxOrdinal + 1, "message", inserted.message_id);
+}
+
 const snapshotAvailable = SNAPSHOT.length > 0 && existsSync(SNAPSHOT);
 
 describe.skipIf(!snapshotAvailable)("lane-split offline assembly composition", () => {
@@ -206,6 +306,9 @@ describe.skipIf(!snapshotAvailable)("lane-split offline assembly composition", (
 
       const db = createLcmDatabaseConnection(dbPath);
       try {
+        if (process.env.LANE_SPLIT_APPEND_USER === "1") {
+          appendSyntheticUserTurn(db, CONVERSATION_ID);
+        }
         const conversationStore = new ConversationStore(db);
         const summaryStore = new SummaryStore(db);
         const assembler = new ContextAssembler(
@@ -217,22 +320,71 @@ describe.skipIf(!snapshotAvailable)("lane-split offline assembly composition", (
         );
 
         const compositions: Composition[] = [];
+        const onCompositions: Composition[] = [];
+        const onLaneDebug: Array<
+          { conversationTrimmed: boolean; longtextTrimmed: boolean } | undefined
+        > = [];
         for (const budget of BUDGETS) {
-          const result = await assembler.assemble({
+          const input = {
             conversationId: CONVERSATION_ID,
             tokenBudget: budget,
-            freshTailCount: 64,
+            freshTailCount: FRESH_TAIL_COUNT,
+          };
+          const offResult = await assembler.assemble(input);
+          const onResult = await assembler.assemble({
+            ...input,
+            laneSplitEnabled: true,
+            laneConversationTokenCap: CONVERSATION_CAP,
           });
           compositions.push(
-            analyze(budget, result.messages as unknown as Array<Record<string, unknown>>),
+            analyze(budget, offResult.messages as unknown as Array<Record<string, unknown>>),
+          );
+          onCompositions.push(
+            analyze(budget, onResult.messages as unknown as Array<Record<string, unknown>>),
+          );
+          onLaneDebug.push(
+            onResult.debug?.laneSplit
+              ? {
+                  conversationTrimmed: onResult.debug.laneSplit.conversationTrimmed,
+                  longtextTrimmed: onResult.debug.laneSplit.longtextTrimmed,
+                }
+              : undefined,
           );
         }
 
-        const report = render(compositions);
+        const report =
+          render(compositions) + renderLaneSplitComparison(compositions, onCompositions);
         mkdirSync(dirname(REPORT_PATH), { recursive: true });
         writeFileSync(REPORT_PATH, report, "utf8");
         // Keep the vitest output small; the full report is on disk.
-        console.log(report.split("\n").slice(0, 24).join("\n"));
+        console.log(report.split("\n").slice(0, 34).join("\n"));
+
+        // Acceptance: the largest budget is the un-evicted reference. At every
+        // tighter budget, flag-on must retain 100% of the reference text while
+        // trimming only tool output.
+        const referenceIndex = onCompositions.reduce(
+          (best, candidate, index) =>
+            candidate.budget > onCompositions[best].budget ? index : best,
+          0,
+        );
+        const reference = onCompositions[referenceIndex];
+        if (!reference) throw new Error("lane-split harness: no budget compositions");
+        for (let index = 0; index < onCompositions.length; index++) {
+          if (index === referenceIndex) continue;
+          const on = onCompositions[index];
+          expect(on.buckets.text.blocks).toBe(reference.buckets.text.blocks);
+          expect(on.buckets.text.chars).toBe(reference.buckets.text.chars);
+          expect(on.buckets.tool.chars).toBeLessThanOrEqual(
+            compositions[index].buckets.tool.chars,
+          );
+          // The lane policy itself never trims conversation; when it trims, the
+          // trimming is attributed to the longtext lane.
+          const lane = onLaneDebug[index];
+          expect(lane?.conversationTrimmed).toBe(false);
+          if (on.buckets.tool.chars < reference.buckets.tool.chars) {
+            expect(lane?.longtextTrimmed).toBe(true);
+          }
+        }
         expect(compositions.length).toBe(BUDGETS.length);
       } finally {
         closeLcmConnection(db);

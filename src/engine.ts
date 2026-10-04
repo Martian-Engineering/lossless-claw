@@ -4904,6 +4904,10 @@ export class LcmContextEngine implements ContextEngine {
         promptAwareEviction: this.config.promptAwareEviction,
         prompt: params.prompt,
         stubLargeToolPayloads: this.config.stubLargeToolPayloads,
+        // Lane split (Step 2) — opt-in two-budget assembly. When the flag is
+        // off these fields are inert and assembly is byte-for-byte unchanged.
+        laneSplitEnabled: this.config.laneSplitEnabled === true,
+        laneConversationTokenCap: this.config.conversationLaneTokenCap,
       };
       const initialContextItems = await this.summaryStore.getContextItems(conversation.conversationId);
       const initiallyRaw = !initialContextItems.some(item => item.itemType === "summary");
@@ -4920,7 +4924,11 @@ export class LcmContextEngine implements ContextEngine {
         contextThreshold: resolvedContextThreshold,
         measure: async () => {
           const projection = await this.assembler.assemble({
-            ...assemblyInput, tokenBudget: Number.MAX_SAFE_INTEGER,
+            ...assemblyInput,
+            tokenBudget: Number.MAX_SAFE_INTEGER,
+            // Measurement must stay eviction-free so it can locate the start of
+            // unpersisted live input; lane split (an eviction policy) is off here.
+            laneSplitEnabled: false,
           });
           // A complete raw prefix proves where unpersisted live input starts.
           // Carry only that suffix across publication, never the summarized
