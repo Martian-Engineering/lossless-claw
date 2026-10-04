@@ -4910,6 +4910,8 @@ export class LcmContextEngine implements ContextEngine {
         laneConversationTokenCap: this.config.conversationLaneTokenCap,
         // Lane split (Step 3) — "inline" (default) reproduces Step 2 exactly.
         laneReasoningMode: this.config.laneReasoningMode,
+        // Lane split (Step 4) — "always" (default) reproduces Step 3 exactly.
+        laneReasoningShedPolicy: this.config.laneReasoningShedPolicy,
       };
       const initialContextItems = await this.summaryStore.getContextItems(conversation.conversationId);
       const initiallyRaw = !initialContextItems.some(item => item.itemType === "summary");

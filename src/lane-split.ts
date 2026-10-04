@@ -343,6 +343,21 @@ export function selectLanesWithinBudget(
 
 export type ReasoningTrimMode = "inline" | "lowest";
 
+/**
+ * Lane split (Step 4) — why reasoning is shed, not just whether.
+ *
+ *   "always" (default) — Step 3 behavior: shed the minimum necessary reasoning
+ *     oldest-first to get the conversation lane under its cap, even when the
+ *     lane's *non-reasoning* footprint alone already exceeds the cap (in which
+ *     case the shed cannot make the lane fit — it only spends tokens that the
+ *     whole-message suffix walk would otherwise have used on text).
+ *   "purpose-bound" — only shed reasoning when doing so has a purpose: when
+ *     the lane's non-reasoning footprint already fits the cap, so shedding can
+ *     actually bring the whole lane under it. When even dropping ALL reasoning
+ *     cannot fit the cap, shed nothing (degrade to the inline/Step 2 result).
+ */
+export type ReasoningShedPolicy = "always" | "purpose-bound";
+
 /** Per conversation-lane item: how its token estimate splits across the two
  *  sub-buckets. `reasoningTokens` is the part that Step 3 may sacrifice;
  *  `textTokens` is the "human" content that always outranks it. */
@@ -360,6 +375,13 @@ export type LaneSplitSelectionWithReasoning = LaneSplitSelection & {
   conversationTextTokens: number;
   /** True when reasoning content was dropped to relieve cap pressure. */
   reasoningTrimmed: boolean;
+  /**
+   * Conversation-lane tokens carried by non-reasoning ("text") content only.
+   * This is the floor the lane needs even after every reasoning block is shed.
+   */
+  nonReasoningTotal: number;
+  /** The shedding policy that was applied (Step 4). */
+  reasoningShedPolicy: ReasoningShedPolicy;
 };
 
 /**
@@ -379,6 +401,7 @@ export function selectLanesWithinBudgetWithReasoning(
   remainingBudget: number,
   conversationTokenCap: number = DEFAULT_CONVERSATION_LANE_TOKEN_CAP,
   reasoningMode: ReasoningTrimMode = "inline",
+  reasoningShedPolicy: ReasoningShedPolicy = "always",
 ): LaneSplitSelectionWithReasoning {
   const reasoningTokens = conversationItems.map((item) => laneTokens(item.reasoningTokens));
   const itemTotals = conversationItems.map(
@@ -392,8 +415,21 @@ export function selectLanesWithinBudgetWithReasoning(
     conversationTokenCap,
   );
 
+  // Step 4 — the non-reasoning footprint: what the lane would weigh if every
+  // reasoning block were shed. Shedding is only worth doing when this already
+  // fits the cap, i.e. when discarding reasoning can actually pull the whole
+  // lane under it. Otherwise (nonReasoningTotal > cap) the lane overflows no
+  // matter what, so shedding reasoning buys nothing and is skipped entirely.
+  const nonReasoningTotal = conversationItems.reduce(
+    (sum, item) => sum + Math.max(0, laneTokens(item.textTokens)),
+    0,
+  );
+  const shedReasoning =
+    reasoningMode === "lowest" &&
+    (reasoningShedPolicy === "always" || nonReasoningTotal <= flat.conversationTokenCap);
+
   const reasoningDropped = new Array<boolean>(conversationItems.length).fill(false);
-  if (reasoningMode === "lowest") {
+  if (shedReasoning) {
     const cap = flat.conversationTokenCap;
     const total = itemTotals.reduce((sum, value) => sum + value, 0);
     let overflow = total - cap;
@@ -443,6 +479,8 @@ export function selectLanesWithinBudgetWithReasoning(
     reasoningTokens: keptReasoningTokens,
     conversationTextTokens: keptTextTokens,
     reasoningTrimmed: reasoningDropped.some(Boolean),
+    nonReasoningTotal,
+    reasoningShedPolicy,
   };
 }
 
