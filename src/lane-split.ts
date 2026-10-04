@@ -277,7 +277,22 @@ export function selectLanesWithinBudget(
   conversationTokenCap: number = DEFAULT_CONVERSATION_LANE_TOKEN_CAP,
 ): LaneSplitSelection {
   const budget = laneTokens(remainingBudget);
-  const cap = Math.max(1, laneTokens(conversationTokenCap) || DEFAULT_CONVERSATION_LANE_TOKEN_CAP);
+  const requestedCap = Math.max(
+    1,
+    laneTokens(conversationTokenCap) || DEFAULT_CONVERSATION_LANE_TOKEN_CAP,
+  );
+  // The conversation cap must never exceed the remaining budget. Otherwise a
+  // protected conversation lane bigger than the budget is emitted in full and
+  // the assembled context overshoots its budget (measured 2026-10-03: an
+  // 8000-token budget produced ~23k tokens of output, ~3x over). Clamping here
+  // keeps the budget a hard ceiling; with cap <= budget (the production
+  // configuration) behaviour is unchanged.
+  // An unusable budget (NaN / non-finite) must not collapse the cap to zero —
+  // fall back to the requested cap, matching this function's existing
+  // tolerance for invalid inputs.
+  const cap = Number.isFinite(remainingBudget)
+    ? Math.min(requestedCap, budget)
+    : requestedCap;
 
   const conversationTotal = sumLaneTokens(conversationTokens);
   // Conversation lane is kept whole; only the absolute cap may trim it.

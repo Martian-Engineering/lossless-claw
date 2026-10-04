@@ -359,9 +359,20 @@ describe.skipIf(!snapshotAvailable)("lane-split offline assembly composition", (
         // Keep the vitest output small; the full report is on disk.
         console.log(report.split("\n").slice(0, 34).join("\n"));
 
-        // Acceptance: the largest budget is the un-evicted reference. At every
-        // tighter budget, flag-on must retain 100% of the reference text while
-        // trimming only tool output.
+        // Acceptance (restated 2026-10-03, after the budget-ceiling fix).
+        //
+        // The original criterion was "retain 100% of the reference conversation
+        // text at every tighter budget". That held only because a conversation
+        // lane larger than the budget was emitted anyway — measured overshoot
+        // was ~3x (an 8000-token budget produced ~23k tokens of output). The
+        // budget must stay a hard ceiling, so the criterion is now:
+        //   (a) flag-on never emits more than flag-off (off already respects
+        //       the budget, so this pins the ceiling);
+        //   (b) the conversation lane has priority: flag-on keeps at least as
+        //       much conversation text as flag-off, and starves the tool lane
+        //       first;
+        //   (c) 100% conversation retention whenever the budget is large
+        //       enough that the conversation lane is not trimmed.
         const referenceIndex = onCompositions.reduce(
           (best, candidate, index) =>
             candidate.budget > onCompositions[best].budget ? index : best,
@@ -372,15 +383,20 @@ describe.skipIf(!snapshotAvailable)("lane-split offline assembly composition", (
         for (let index = 0; index < onCompositions.length; index++) {
           if (index === referenceIndex) continue;
           const on = onCompositions[index];
-          expect(on.buckets.text.blocks).toBe(reference.buckets.text.blocks);
-          expect(on.buckets.text.chars).toBe(reference.buckets.text.chars);
-          expect(on.buckets.tool.chars).toBeLessThanOrEqual(
-            compositions[index].buckets.tool.chars,
-          );
-          // The lane policy itself never trims conversation; when it trims, the
-          // trimming is attributed to the longtext lane.
+          const off = compositions[index];
+          const total = (c: Composition) =>
+            c.buckets.reasoning.chars + c.buckets.tool.chars +
+            c.buckets.text.chars + c.buckets.other.chars;
+          // (a) the budget stays a hard ceiling.
+          expect(total(on)).toBeLessThanOrEqual(total(off));
+          // (b) conversation priority, tool starved first.
+          expect(on.buckets.text.chars).toBeGreaterThanOrEqual(off.buckets.text.chars);
+          expect(on.buckets.tool.chars).toBeLessThanOrEqual(off.buckets.tool.chars);
+          // (c) full retention unless the budget itself forced a trim.
           const lane = onLaneDebug[index];
-          expect(lane?.conversationTrimmed).toBe(false);
+          if (!lane?.conversationTrimmed) {
+            expect(on.buckets.text.chars).toBe(reference.buckets.text.chars);
+          }
           if (on.buckets.tool.chars < reference.buckets.tool.chars) {
             expect(lane?.longtextTrimmed).toBe(true);
           }

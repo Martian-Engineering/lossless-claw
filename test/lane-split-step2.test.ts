@@ -16,6 +16,15 @@ import { SummaryStore } from "../src/store/summary-store.js";
 import { runLcmMigrations } from "../src/db/migration.js";
 
 describe("selectLanesWithinBudget", () => {
+  it("clamps the conversation cap to the remaining budget (no overshoot)", () => {
+    // Regression guard (2026-10-03): a protected conversation lane larger
+    // than the budget used to be emitted in full, overshooting ~3x.
+    const selection = selectLanesWithinBudget([60, 60], [10], 100, 500);
+    expect(selection.conversationTokenCap).toBeLessThanOrEqual(100);
+    expect(selection.conversationTokens).toBeLessThanOrEqual(100);
+    expect(selection.conversationTokens + selection.longtextTokens).toBeLessThanOrEqual(100);
+  });
+
   it("keeps both lanes whole when everything fits", () => {
     const selection = selectLanesWithinBudget([10, 20], [30, 40], 1000, 1000);
     expect(selection.conversationKept).toEqual([true, true]);
@@ -57,7 +66,8 @@ describe("selectLanesWithinBudget", () => {
   });
 
   it("defaults the conversation cap and tolerates invalid inputs", () => {
-    const defaults = selectLanesWithinBudget([], [5], 10);
+    // Non-binding budget, so the default cap stands unclamped.
+    const defaults = selectLanesWithinBudget([], [5], Number.MAX_SAFE_INTEGER);
     expect(defaults.conversationTokenCap).toBe(DEFAULT_CONVERSATION_LANE_TOKEN_CAP);
     const invalid = selectLanesWithinBudget([-5, Number.NaN], [1], Number.NaN, Number.NaN);
     expect(invalid.conversationTokenCap).toBe(DEFAULT_CONVERSATION_LANE_TOKEN_CAP);
