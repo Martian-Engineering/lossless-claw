@@ -9,6 +9,12 @@ import type {
 import type { FocusBriefRecord, FocusBriefStore } from "./store/focus-brief-store.js";
 import type { SummaryStore, ContextItemRecord, SummaryRecord } from "./store/summary-store.js";
 import { estimateTokens } from "./estimate-tokens.js";
+import {
+  classifyMessageLane,
+  DEFAULT_CONVERSATION_LANE_TOKEN_CAP,
+  selectLanesWithinBudget,
+  type MessageLane,
+} from "./lane-split.js";
 import { formatToolOutputReference } from "./large-files.js";
 import { serializeOpenClawSenderMetadata } from "./openclaw-sender-metadata.js";
 import { attachTranscriptEntryMeta } from "./transcript.js";
@@ -232,6 +238,19 @@ export interface AssembleContextInput {
    * Default: false (full v4.1 behavior).
    */
   stubLargeToolPayloads?: boolean;
+  /**
+   * Lane split (Step 2) — when true, assembly budgets the two lanes
+   * independently: conversation-lane items are kept as a whole (subject to
+   * `laneConversationTokenCap`), while longtext (tool-result) items absorb
+   * all eviction. Default false preserves pre-lane behavior byte-for-byte.
+   */
+  laneSplitEnabled?: boolean;
+  /**
+   * Lane split — absolute token cap for the conversation lane. Only this cap
+   * (never a ratio) may trim the otherwise-protected conversation lane.
+   * Defaults to DEFAULT_CONVERSATION_LANE_TOKEN_CAP when omitted.
+   */
+  laneConversationTokenCap?: number;
 }
 
 export interface AssembleContextResult {
@@ -254,7 +273,7 @@ export interface AssembleContextResult {
     tailTokens: number;
     remainingBudget: number;
     evictableTotalTokens: number;
-    selectionMode: "full-fit" | "prompt-aware" | "chronological";
+    selectionMode: "full-fit" | "prompt-aware" | "chronological" | "lane-split";
     promotedToolResultCount: number;
     promotedOrdinals: number[];
     removedToolUseBlockCount: number;
@@ -270,6 +289,14 @@ export interface AssembleContextResult {
     overflowDiagnostics: AssemblyOverflowDiagnostics;
     /** v4.2 §B — number of evictable items rewritten to stubs. */
     stubStats?: { stubbedCount: number; tokensSaved: number };
+    /** Lane split (Step 2) — per-lane selection stats; present only when enabled. */
+    laneSplit?: {
+      conversationTokenCap: number;
+      conversationTokens: number;
+      longtextTokens: number;
+      conversationTrimmed: boolean;
+      longtextTrimmed: boolean;
+    };
   };
 }
 
@@ -1268,6 +1295,26 @@ interface ResolvedItem {
   fileSummary?: string;
 }
 
+/**
+ * Lane split (Step 2) — the lane a resolved item belongs to.
+ *
+ * Deliberately structural (role-based), mirroring Step 1's
+ * `classifyMessageLane`: tool results are the longtext lane, everything else
+ * (including summaries and focus briefs) is the conversation lane. The
+ * persisted `messages.lane` column is NOT read here: Step 1's additive
+ * migration backfills every pre-existing row to 'conversation', so the tag is
+ * only trustworthy for rows written after Step 1. Classification by role is
+ * correct for both legacy and new rows. `sourceRole === "tool"` also catches
+ * legacy tool rows that degrade to an assistant message when they carry no
+ * tool-call id.
+ */
+function resolvedItemLane(item: ResolvedItem): MessageLane {
+  if (item.sourceRole === "tool" || classifyMessageLane(item.message) === "longtext") {
+    return "longtext";
+  }
+  return "conversation";
+}
+
 function topContributors(
   items: ResolvedItem[],
   selectedOrdinals: Set<number>,
@@ -1589,8 +1636,46 @@ export class ContextAssembler {
     // total, then trim from the front.
     const evictableTotalTokens = evictable.reduce((sum, it) => sum + it.tokens, 0);
 
-    let selectionMode: "full-fit" | "prompt-aware" | "chronological" = "full-fit";
-    if (evictableTotalTokens <= remainingBudget) {
+    let selectionMode: "full-fit" | "prompt-aware" | "chronological" | "lane-split" =
+      "full-fit";
+    let laneSplitDiagnostics: {
+      conversationTokenCap: number;
+      conversationTokens: number;
+      longtextTokens: number;
+      conversationTrimmed: boolean;
+      longtextTrimmed: boolean;
+    } | null = null;
+    if (input.laneSplitEnabled === true) {
+      // Lane split (Step 2) — independent budgets for the two lanes. The
+      // conversation lane is kept whole (subject only to an absolute cap); the
+      // longtext lane absorbs all eviction. Items are never reordered: kept
+      // items are re-emitted in their original order, and the chronological
+      // sort below restores the global append order.
+      selectionMode = "lane-split";
+      const conversationItems: ResolvedItem[] = [];
+      const longtextItems: ResolvedItem[] = [];
+      for (const item of evictable) {
+        (resolvedItemLane(item) === "longtext" ? longtextItems : conversationItems).push(item);
+      }
+      const laneSelection = selectLanesWithinBudget(
+        conversationItems.map((item) => item.tokens),
+        longtextItems.map((item) => item.tokens),
+        remainingBudget,
+        input.laneConversationTokenCap ?? DEFAULT_CONVERSATION_LANE_TOKEN_CAP,
+      );
+      selected.push(
+        ...conversationItems.filter((_item, index) => laneSelection.conversationKept[index]),
+        ...longtextItems.filter((_item, index) => laneSelection.longtextKept[index]),
+      );
+      evictableTokens = laneSelection.conversationTokens + laneSelection.longtextTokens;
+      laneSplitDiagnostics = {
+        conversationTokenCap: laneSelection.conversationTokenCap,
+        conversationTokens: laneSelection.conversationTokens,
+        longtextTokens: laneSelection.longtextTokens,
+        conversationTrimmed: laneSelection.conversationTrimmed,
+        longtextTrimmed: laneSelection.longtextTrimmed,
+      };
+    } else if (evictableTotalTokens <= remainingBudget) {
       // Everything fits
       selected.push(...evictable);
       evictableTokens = evictableTotalTokens;
@@ -1751,6 +1836,7 @@ export class ContextAssembler {
         finalMessagesHash: hashMessages(repaired),
         overflowDiagnostics,
         stubStats,
+        ...(laneSplitDiagnostics ? { laneSplit: laneSplitDiagnostics } : {}),
       },
     };
   }

@@ -91,7 +91,8 @@
         "laneSplitTokenThreshold",
         "laneSplitUserMessage",
         "laneTaskChainProtection",
-        "laneExternalizeTokenThreshold"
+        "laneExternalizeTokenThreshold",
+        "conversationLaneTokenCap"
       ]
     },
     {
@@ -519,6 +520,10 @@
     "laneExternalizeTokenThreshold": {
       "label": "Lane Externalize Token Threshold",
       "help": "Token threshold above which a longtext segment is externalized to a stub (default 2000). Not yet consumed in this step."
+    },
+    "conversationLaneTokenCap": {
+      "label": "Conversation Lane Token Cap",
+      "help": "Absolute token cap for the protected conversation lane during lane-split assembly (default 65536). Only this cap may trim the conversation lane; longtext (tool-result) items absorb all other eviction."
     }
   },
   "configSchema": {
@@ -655,6 +660,11 @@
         "type": "integer",
         "minimum": 1,
         "default": 2000
+      },
+      "conversationLaneTokenCap": {
+        "type": "integer",
+        "minimum": 1,
+        "default": 65536
       },
       "leafChunkTokens": {
         "type": "integer",

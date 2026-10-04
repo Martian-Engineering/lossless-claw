@@ -190,3 +190,124 @@ export function formatAssembledComposition(composition: AssembledComposition): s
     `text=${text.blocks}/${text.chars}(${share(text.chars)})`
   );
 }
+
+// ── Step 2 — lane-aware budget selection ─────────────────────────────────────
+//
+// Step 2 gives the two lanes independent budgets, but asymmetric policy:
+//
+//   conversation lane C — protected as a whole. It keeps everything, except
+//     when C alone exceeds an ABSOLUTE token cap (the backstop), in which case
+//     the OLDEST C items are dropped until it fits.
+//   longtext lane L — absorbs all budget pressure. The NEWEST contiguous
+//     suffix of L that fits the remaining budget is kept; older L items are
+//     evicted first.
+//
+// Neither lane is ever reordered: trimming always drops a contiguous oldest
+// prefix, which preserves append order (and therefore the prompt cache). This
+// is a pure function so the policy can be tested without a database.
+
+/**
+ * Default absolute token cap for the conversation lane.
+ *
+ * The conversation lane is otherwise retained as a whole, so this cap is the
+ * only thing that may trim it — a backstop against one lane monopolising the
+ * window. 65536 ≈ half of a 128K context window: ordinary sessions stay well
+ * below it, while a runaway conversation lane can never exceed half the window.
+ */
+export const DEFAULT_CONVERSATION_LANE_TOKEN_CAP = 65_536;
+
+export type LaneSplitSelection = {
+  /** Kept flags for the conversation lane, in input order (oldest → newest). */
+  conversationKept: boolean[];
+  /** Kept flags for the longtext lane, in input order (oldest → newest). */
+  longtextKept: boolean[];
+  /** Tokens retained from the conversation lane. */
+  conversationTokens: number;
+  /** Tokens retained from the longtext lane. */
+  longtextTokens: number;
+  /** True when the conversation cap forced at least one C item to be dropped. */
+  conversationTrimmed: boolean;
+  /** True when the budget forced at least one L item to be dropped. */
+  longtextTrimmed: boolean;
+  /** The absolute conversation cap that was applied. */
+  conversationTokenCap: number;
+  /** Budget available to the evictable pool (after protected items). */
+  remainingBudget: number;
+};
+
+/** Coerce an arbitrary token estimate to a finite, non-negative integer. */
+function laneTokens(value: number): number {
+  return Number.isFinite(value) ? Math.max(0, Math.floor(value)) : 0;
+}
+
+/**
+ * Keep the newest contiguous suffix of `tokens` that fits `budget`, returned
+ * as kept flags. Mirrors the assembler's chronological eviction exactly: walk
+ * from the newest end, stop at the first item that would overflow, and drop
+ * everything older. Never reorders within the lane.
+ */
+function keepNewestSuffixWithin(tokens: readonly number[], budget: number): boolean[] {
+  const kept = new Array<boolean>(tokens.length).fill(false);
+  let accumulated = 0;
+  for (let i = tokens.length - 1; i >= 0; i--) {
+    const tokenCount = laneTokens(tokens[i]);
+    if (accumulated + tokenCount > budget) break;
+    accumulated += tokenCount;
+    kept[i] = true;
+  }
+  return kept;
+}
+
+/** Sum a lane's token estimates. */
+function sumLaneTokens(tokens: readonly number[]): number {
+  return tokens.reduce((sum, value) => sum + laneTokens(value), 0);
+}
+
+/**
+ * Apply the Step 2 lane budgets to a single evictable pool.
+ *
+ * `conversationTokens` and `longtextTokens` are the per-item token estimates
+ * of the two lanes, in append order (oldest → newest). Returns which items
+ * survive; the caller re-assembles them in the original order.
+ */
+export function selectLanesWithinBudget(
+  conversationTokens: readonly number[],
+  longtextTokens: readonly number[],
+  remainingBudget: number,
+  conversationTokenCap: number = DEFAULT_CONVERSATION_LANE_TOKEN_CAP,
+): LaneSplitSelection {
+  const budget = laneTokens(remainingBudget);
+  const cap = Math.max(1, laneTokens(conversationTokenCap) || DEFAULT_CONVERSATION_LANE_TOKEN_CAP);
+
+  const conversationTotal = sumLaneTokens(conversationTokens);
+  // Conversation lane is kept whole; only the absolute cap may trim it.
+  const conversationKept =
+    conversationTotal <= cap
+      ? new Array<boolean>(conversationTokens.length).fill(true)
+      : keepNewestSuffixWithin(conversationTokens, cap);
+  const conversationKeptTokens = conversationKept.reduce(
+    (sum, keep, index) => sum + (keep ? laneTokens(conversationTokens[index]) : 0),
+    0,
+  );
+
+  // Longtext lane absorbs everything else: whatever budget remains after the
+  // (capped) conversation lane, newest-first, dropping the oldest overflow.
+  const longtextBudget = Math.max(0, budget - conversationKeptTokens);
+  const longtextKept = keepNewestSuffixWithin(longtextTokens, longtextBudget);
+  const longtextKeptTokens = longtextKept.reduce(
+    (sum, keep, index) => sum + (keep ? laneTokens(longtextTokens[index]) : 0),
+    0,
+  );
+
+  return {
+    conversationKept,
+    longtextKept,
+    conversationTokens: conversationKeptTokens,
+    longtextTokens: longtextKeptTokens,
+    conversationTrimmed: conversationKept.some((keep) => !keep),
+    longtextTrimmed: longtextKept.some((keep) => !keep),
+    conversationTokenCap: cap,
+    remainingBudget: budget,
+  };
+}
+
