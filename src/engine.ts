@@ -4793,7 +4793,11 @@ export class LcmContextEngine implements ContextEngine {
       // the degraded live fallback (and even normal assemble for
       // current-turn tool results) sends raw content while the DB
       // already has stubbed references.
-      if (this.config.stubLargeToolPayloads) {
+      // Step 5 — the live pre-flight intercept now also opens when
+      // tool-result externalization is enabled, so the current turn's
+      // oversized tool results are stubbed before they reach the model.
+      // With both flags false this block is skipped exactly as before.
+      if (this.config.stubLargeToolPayloads || this.config.toolResultExternalization === true) {
         // Keep the rewritten view local; OpenClaw owns the live message array.
         const rewrittenMessages = liveMessages.slice();
         let interceptedAny = false;
@@ -4822,6 +4826,11 @@ export class LcmContextEngine implements ContextEngine {
                 callId,
                 content,
               }),
+            // Step 5 — only this live pre-flight opts into tool-result
+            // externalization. The afterTurn ingest path deliberately does
+            // not, so persistence stays legacy and externalization happens
+            // lazily, only for content that would otherwise be squeezed.
+            allowToolResultExternalization: this.config.toolResultExternalization === true,
           });
           if (intercepted) {
             rewrittenMessages[i] = intercepted.rewrittenMessage;

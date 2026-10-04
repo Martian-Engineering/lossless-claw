@@ -152,6 +152,8 @@ host policy.
   "freshTailMaxTokens": 24000,
   "promptAwareEviction": false,
   "stubLargeToolPayloads": false,
+  "toolResultExternalization": false,
+  "toolResultExternalizationTokenThreshold": 4000,
   "newSessionRetainDepth": 2,
   "leafMinFanout": 8,
   "condensedMinFanout": 4,
@@ -320,6 +322,8 @@ The Settings editor displays fixed defaults from the plugin manifest. Automatic 
 | `freshTailMaxTokens` | `integer` | unset | `LCM_FRESH_TAIL_MAX_TOKENS` | Optional token cap for the protected fresh tail. Routine compaction preserves the newest user turn even above the cap. Forced overflow recovery keeps its user and complete recent tool groups. |
 | `promptAwareEviction` | `boolean` | `false` | `LCM_PROMPT_AWARE_EVICTION_ENABLED` | When enabled, budget-constrained assembly keeps older evictable items by prompt relevance instead of pure chronology. This improves retrieval under tight budgets, but it can reduce prompt-cache hit rates because the preserved prefix changes as prompts change. |
 | `stubLargeToolPayloads` | `boolean` | `false` | `LCM_STUB_LARGE_TOOL_PAYLOADS` | When enabled, evictable tool-result rows backfilled with `messages.large_content` are assembled as `[LCM Tool Output: file_xxx ...]` stubs while the fresh tail stays inline. Requires `scripts/lcm-blob-migrate.mjs`, which defaults to the same large-files root as runtime LCM (`LCM_LARGE_FILES_DIR` or `${OPENCLAW_STATE_DIR}/lcm-files`). |
+| `toolResultExternalization` | `boolean` | `false` | `LCM_TOOL_RESULT_EXTERNALIZATION` | Step 5 — externalize oversized one-shot tool results (exec output, log dumps, …) in the live assemble pre-flight only — deliberately not at ingest: the full payload is written under `largeFilesDir` and replaced with a self-describing `[LCM Tool Output: …]` stub that records the tool, originating command, byte/line counts, the on-disk path, and how to read it back. Default `false`: the legacy `largeFileThresholdTokens` ingest threshold and the `stubLargeToolPayloads` path are unchanged. The stored row keeps its full text, so a payload is only moved to disk when assembly needs the space. If the write fails, the full result is inlined rather than lost. |
+| `toolResultExternalizationTokenThreshold` | `integer` | `4000` | `LCM_TOOL_RESULT_EXTERNALIZATION_THRESHOLD` | Token threshold above which a tool result is externalized in the live assemble pre-flight. Only consulted when `toolResultExternalization` is `true`; ignored otherwise. Default 4000 because the stub is ~460 tokens (~9x cheaper than what it replaces); below that the pointer starts eating the budget it is meant to save. |
 | `leafMinFanout` | `integer` | `8` | `LCM_LEAF_MIN_FANOUT` | Minimum number of raw messages required before a leaf pass runs. |
 | `condensedMinFanout` | `integer` | `4` | `LCM_CONDENSED_MIN_FANOUT` | Number of same-depth summaries needed before condensation is attempted. |
 | `condensedMinFanoutHard` | `integer` | `2` | `LCM_CONDENSED_MIN_FANOUT_HARD` | Hard floor for condensation grouping during maintenance and repair flows. |
