@@ -78,6 +78,9 @@ describe("selectLanesWithinBudgetWithReasoning", () => {
 
   it("drops whole messages only after all reasoning is gone", () => {
     // 3 items: reasoning 10 + text 30 = 40 each → 120 total, cap 50.
+    // Step 3 semantics are requested explicitly ("always"): the Step 4 default
+    // is "purpose-bound", which sheds nothing here because the lane's
+    // non-reasoning footprint (90) already exceeds the cap (50).
     const selection = selectLanesWithinBudgetWithReasoning(
       [
         { reasoningTokens: 10, textTokens: 30 },
@@ -88,6 +91,7 @@ describe("selectLanesWithinBudgetWithReasoning", () => {
       50,
       65536,
       "lowest",
+      "always",
     );
     // All reasoning shed (30) still leaves 90 text > 50; the newest single
     // 30-token text item is all that fits.

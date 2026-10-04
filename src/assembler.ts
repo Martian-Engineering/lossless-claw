@@ -268,9 +268,9 @@ export interface AssembleContextInput {
   /**
    * Lane split (Step 4) — *why* reasoning is shed inside the conversation lane.
    *
-   *   "always" (default) — Step 3 behavior, unchanged: shed the minimum
-   *     necessary reasoning oldest-first to meet the cap.
-   *   "purpose-bound" — only shed reasoning when the lane's non-reasoning
+   *   "always" — Step 3 behavior, unchanged: shed the minimum necessary
+   *     reasoning oldest-first to meet the cap.
+   *   "purpose-bound" (default) — only shed reasoning when the lane's non-reasoning
    *     footprint already fits the cap (so the shed can actually make the lane
    *     fit). When even dropping all reasoning cannot fit the cap, shed nothing
    *     and degrade to the inline/Step 2 result.
@@ -1787,10 +1787,10 @@ export class ContextAssembler {
       // any whole message. "inline" (the default) is the Step 2 path verbatim.
       const reasoningMode: ReasoningTrimMode =
         input.laneReasoningMode === "lowest" ? "lowest" : "inline";
-      // Step 4 — "always" (default) reproduces Step 3 exactly; "purpose-bound"
-      // sheds reasoning only when the shed can actually make the lane fit.
+      // Step 4 — "purpose-bound" (default) sheds reasoning only when the shed
+      // can actually make the lane fit; "always" reproduces Step 3 exactly.
       const shedPolicy: ReasoningShedPolicy =
-        input.laneReasoningShedPolicy === "purpose-bound" ? "purpose-bound" : "always";
+        input.laneReasoningShedPolicy === "always" ? "always" : "purpose-bound";
       if (reasoningMode === "lowest") {
         const splits = conversationItems.map((item) => conversationItemTokenSplit(item));
         const laneSelection = selectLanesWithinBudgetWithReasoning(

@@ -346,12 +346,12 @@ export type ReasoningTrimMode = "inline" | "lowest";
 /**
  * Lane split (Step 4) — why reasoning is shed, not just whether.
  *
- *   "always" (default) — Step 3 behavior: shed the minimum necessary reasoning
+ *   "always" — Step 3 behavior: shed the minimum necessary reasoning
  *     oldest-first to get the conversation lane under its cap, even when the
  *     lane's *non-reasoning* footprint alone already exceeds the cap (in which
  *     case the shed cannot make the lane fit — it only spends tokens that the
  *     whole-message suffix walk would otherwise have used on text).
- *   "purpose-bound" — only shed reasoning when doing so has a purpose: when
+ *   "purpose-bound" (default) — only shed reasoning when doing so has a purpose: when
  *     the lane's non-reasoning footprint already fits the cap, so shedding can
  *     actually bring the whole lane under it. When even dropping ALL reasoning
  *     cannot fit the cap, shed nothing (degrade to the inline/Step 2 result).
@@ -401,7 +401,7 @@ export function selectLanesWithinBudgetWithReasoning(
   remainingBudget: number,
   conversationTokenCap: number = DEFAULT_CONVERSATION_LANE_TOKEN_CAP,
   reasoningMode: ReasoningTrimMode = "inline",
-  reasoningShedPolicy: ReasoningShedPolicy = "always",
+  reasoningShedPolicy: ReasoningShedPolicy = "purpose-bound",
 ): LaneSplitSelectionWithReasoning {
   const reasoningTokens = conversationItems.map((item) => laneTokens(item.reasoningTokens));
   const itemTotals = conversationItems.map(
