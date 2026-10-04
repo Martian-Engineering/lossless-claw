@@ -24,15 +24,15 @@ describe("selectLanesWithinBudgetWithReasoning — Step 4 shed policy", () => {
     { reasoningTokens: 100, textTokens: 20 },
   ];
 
-  it("defaults to \"always\" (the policy argument is optional)", () => {
+  it("defaults to \"purpose-bound\" (the policy argument is optional)", () => {
     const withDefault = selectLanesWithinBudgetWithReasoning(
       reasonFitsItems, [], 1000, 100, "lowest",
     );
-    const explicitAlways = selectLanesWithinBudgetWithReasoning(
-      reasonFitsItems, [], 1000, 100, "lowest", "always",
+    const explicitPurposeBound = selectLanesWithinBudgetWithReasoning(
+      reasonFitsItems, [], 1000, 100, "lowest", "purpose-bound",
     );
-    expect(withDefault).toEqual(explicitAlways);
-    expect(withDefault.reasoningShedPolicy).toBe("always");
+    expect(withDefault).toEqual(explicitPurposeBound);
+    expect(withDefault.reasoningShedPolicy).toBe("purpose-bound");
   });
 
   it("purpose-bound sheds like always when the non-reasoning footprint fits the cap", () => {
@@ -210,7 +210,7 @@ describe("lane-split step 4 behind the flag", () => {
     expect(purposeBound.debug?.laneSplit?.reasoningTrimmed).toBe(false);
   });
 
-  it("default and explicit \"always\" reproduce Step 3 (identical messages)", async () => {
+  it("default and explicit \"purpose-bound\" agree (identical messages)", async () => {
     const db = createAssemblerDb();
     const { conversationId } = seedReasoningConversation(db, 12, 1200, 400, 4000);
     const assembler = newAssembler(db);
@@ -225,12 +225,12 @@ describe("lane-split step 4 behind the flag", () => {
       ...input,
       laneSplitEnabled: true,
       laneReasoningMode: "lowest",
-      laneReasoningShedPolicy: "always",
+      laneReasoningShedPolicy: "purpose-bound",
     });
 
     expect(JSON.stringify(omitted.messages)).toBe(JSON.stringify(explicit.messages));
-    expect(omitted.debug?.laneSplit?.reasoningShedPolicy).toBe("always");
-    expect(explicit.debug?.laneSplit?.reasoningShedPolicy).toBe("always");
+    expect(omitted.debug?.laneSplit?.reasoningShedPolicy).toBe("purpose-bound");
+    expect(explicit.debug?.laneSplit?.reasoningShedPolicy).toBe("purpose-bound");
   });
 
   it("flag off ignores laneReasoningShedPolicy entirely", async () => {
