@@ -88,7 +88,21 @@ import {
   type TranscriptAnchorAuditEntry,
   type TranscriptAnchorAuditMessage,
 } from "./transcript-anchor-audit.js";
-import { estimateTokens, estimateSerializedMessagesTokens } from "./estimate-tokens.js";
+import {
+  estimateTokens,
+  estimateSerializedMessageTokens,
+  estimateSerializedMessagesTokens,
+} from "./estimate-tokens.js";
+import {
+  classifyMessageLane,
+  formatAssembledComposition,
+  formatLaneDistribution,
+  formatPartTypeDistribution,
+  summarizeAssembledComposition,
+  summarizeLaneDistribution,
+  summarizePartTypeDistribution,
+  type LaneDistributionEntry,
+} from "./lane-split.js";
 import { hashAgentMessageForAssemblyProtection, messagesHaveSameLiveCoverageSignature } from "./message-signatures.js";
 import {
   buildDeterministicFallbackSummary,
@@ -3878,6 +3892,11 @@ export class LcmContextEngine implements ContextEngine {
       stored = rawPayloadIntercepted.stored;
     }
 
+    // Lane split (Step 1) — structural lane tag. Tool results are machine
+    // payloads (longtext); everything else stays on the conversation lane.
+    // The tag is persisted for later budgeting steps; assembly is unchanged.
+    const lane = classifyMessageLane(message);
+
     // Determine next sequence number
     const maxSeq = await this.conversationStore.getMaxSeq(conversationId);
     const seq = maxSeq + 1;
@@ -3889,6 +3908,7 @@ export class LcmContextEngine implements ContextEngine {
       role: stored.role,
       content: stored.content,
       tokenCount: stored.tokenCount,
+      lane,
       openClawSenderMetadata,
       transcriptEntryId,
       stableEventKey,
@@ -3906,17 +3926,27 @@ export class LcmContextEngine implements ContextEngine {
         verifiedAt: new Date(),
       });
     }
-    await this.conversationStore.createMessageParts(
-      msgRecord.messageId,
-      buildMessageParts({
-        sessionId,
-        message: messageForParts,
-        fallbackContent: stored.content,
-      }),
-    );
+    // Lane split (Step 1) — hoisted so the part_type distribution below can be
+    // observed without rebuilding the parts. Same value, same ordering.
+    const laneSplitParts = buildMessageParts({
+      sessionId,
+      message: messageForParts,
+      fallbackContent: stored.content,
+    });
+    await this.conversationStore.createMessageParts(msgRecord.messageId, laneSplitParts);
 
     // Append to context items so assembler can see it
     await this.summaryStore.appendContextMessage(conversationId, msgRecord.messageId);
+
+    // Lane split (Step 1) — opt-in observability only. Gated on the master
+    // flag and routed through debug() so it never pollutes normal logs.
+    // Granularity is per part_type (not per role): one message can carry text,
+    // reasoning and tool parts, and role-level counts cannot express that.
+    if (this.config.laneSplitEnabled === true) {
+      this.deps.log.debug(
+        `[lcm] lane-split ingest: lane=${lane} parts=${formatPartTypeDistribution(summarizePartTypeDistribution(laneSplitParts.map((part) => String(part.partType))))} tokens=${stored.tokenCount} conversation=${conversationId}`,
+      );
+    }
 
     return { ingested: true };
   }
@@ -3989,7 +4019,9 @@ export class LcmContextEngine implements ContextEngine {
             });
           }
           let ingestedCount = 0;
+          const laneEntries: LaneDistributionEntry[] = [];
           for (const message of messages) {
+            const lane = classifyMessageLane(message);
             const result = await this.ingestSingle({
               sessionId: params.sessionId,
               sessionKey: params.sessionKey,
@@ -3999,7 +4031,16 @@ export class LcmContextEngine implements ContextEngine {
             });
             if (result.ingested) {
               ingestedCount += 1;
+              if (this.config.laneSplitEnabled === true) {
+                laneEntries.push({ lane, tokenCount: estimateSerializedMessageTokens(message) });
+              }
             }
+          }
+          // Lane split (Step 1) — opt-in per-batch distribution observability.
+          if (this.config.laneSplitEnabled === true && laneEntries.length > 0) {
+            this.deps.log.debug(
+              `[lcm] lane-split batch distribution: session=${params.sessionId} messages=${laneEntries.length} ${formatLaneDistribution(summarizeLaneDistribution(laneEntries))}`,
+            );
           }
           return { ingestedCount };
         });
@@ -4986,6 +5027,15 @@ export class LcmContextEngine implements ContextEngine {
 
       const preRecallMessages = [...assembled.messages, ...unpersistedLiveSuffix];
       const preRecallEstimatedTokens = assembled.estimatedTokens + estimateAgentMessageTokens(unpersistedLiveSuffix);
+
+      // Lane split (Step 1) — observe what assembly actually emits, bucketed by
+      // emitted block type (reasoning/tool/text/other). Opt-in, debug-only, and
+      // computed lazily so it is a no-op unless lane splitting is enabled.
+      if (this.config.laneSplitEnabled === true && preRecallMessages.length > 0) {
+        this.deps.log.debug(
+          `[lcm] lane-split assembly composition: conversation=${conversation.conversationId} ${formatAssembledComposition(summarizeAssembledComposition(preRecallMessages))}`,
+        );
+      }
 
       // If assembly produced no messages for a non-empty live session,
       // fail safe to the live context.

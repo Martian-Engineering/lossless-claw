@@ -98,6 +98,7 @@ export function createMockConversationStore() {
           role: input.role,
           content: input.content,
           tokenCount: input.tokenCount,
+          lane: "conversation",
           openClawSenderMetadata: input.openClawSenderMetadata ?? null,
           createdAt: new Date(),
           largeContent: null,

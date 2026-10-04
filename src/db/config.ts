@@ -114,6 +114,25 @@ export type LcmConfig = {
    * Default false; flag-flip is reversible at runtime.
    */
   stubLargeToolPayloads: boolean;
+  /**
+   * Lane split (Step 1) — master switch for lane-based assembly. Default
+   * false: lane tags are still recorded at ingest, but assembly behaves
+   * exactly as before. The remaining laneSplit* keys below are registered
+   * for the upcoming steps and are not yet consumed by the engine.
+   */
+  laneSplitEnabled?: boolean;
+  /** Lane split — minimum share of the evictable budget reserved for the conversation lane. */
+  conversationFloorRatio?: number;
+  /** Lane split — soft token cap for the longtext lane; null = no cap. */
+  longTextLaneSoftCap?: number | null;
+  /** Lane split — minimum token size for a message to be treated as long-form. */
+  laneSplitTokenThreshold?: number;
+  /** Lane split — whether user messages may be split into intent/body segments. */
+  laneSplitUserMessage?: boolean;
+  /** Lane split — extend the protected tail across the current task chain. */
+  laneTaskChainProtection?: boolean;
+  /** Lane split — token threshold above which a longtext segment is externalized. */
+  laneExternalizeTokenThreshold?: number;
   newSessionRetainDepth: number;
   leafMinFanout: number;
   condensedMinFanout: number;
@@ -710,6 +729,40 @@ export function resolveLcmConfigWithDiagnostics(
         env.LCM_STUB_LARGE_TOOL_PAYLOADS !== undefined
           ? env.LCM_STUB_LARGE_TOOL_PAYLOADS === "true"
           : toBool(pc.stubLargeToolPayloads) ?? false,
+      // Lane split (Step 1) — flag plumbing only. Only laneSplitEnabled is
+      // read by the engine; the rest are registered so a later step can
+      // consume them without another config migration.
+      laneSplitEnabled:
+        env.LCM_LANE_SPLIT_ENABLED !== undefined
+          ? env.LCM_LANE_SPLIT_ENABLED === "true"
+          : toBool(pc.laneSplitEnabled) ?? false,
+      conversationFloorRatio: Math.min(
+        1,
+        Math.max(
+          0,
+          parseFiniteNumber(env.LCM_CONVERSATION_FLOOR_RATIO)
+            ?? toNumber(pc.conversationFloorRatio)
+            ?? 0.4,
+        ),
+      ),
+      longTextLaneSoftCap:
+        parseFiniteInt(env.LCM_LONG_TEXT_LANE_SOFT_CAP)
+          ?? toNumber(pc.longTextLaneSoftCap)
+          ?? null,
+      laneSplitTokenThreshold:
+        parseFiniteInt(env.LCM_LANE_SPLIT_TOKEN_THRESHOLD)
+          ?? toNumber(pc.laneSplitTokenThreshold) ?? 2000,
+      laneSplitUserMessage:
+        env.LCM_LANE_SPLIT_USER_MESSAGE !== undefined
+          ? env.LCM_LANE_SPLIT_USER_MESSAGE === "true"
+          : toBool(pc.laneSplitUserMessage) ?? true,
+      laneTaskChainProtection:
+        env.LCM_LANE_TASK_CHAIN_PROTECTION !== undefined
+          ? env.LCM_LANE_TASK_CHAIN_PROTECTION === "true"
+          : toBool(pc.laneTaskChainProtection) ?? true,
+      laneExternalizeTokenThreshold:
+        parseFiniteInt(env.LCM_LANE_EXTERNALIZE_TOKEN_THRESHOLD)
+          ?? toNumber(pc.laneExternalizeTokenThreshold) ?? 2000,
       newSessionRetainDepth:
         parseFiniteInt(env.LCM_NEW_SESSION_RETAIN_DEPTH)
           ?? toNumber(pc.newSessionRetainDepth) ?? 2,

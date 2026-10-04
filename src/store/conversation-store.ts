@@ -9,6 +9,7 @@ import { parseUtcTimestamp, parseUtcTimestampOrNull } from "./parse-utc-timestam
 import { buildFtsOrderBy, type SearchSort } from "./full-text-sort.js";
 import { compileSafeSearchRegex } from "./search-regex.js";
 import type { TranscriptAnchorAuditMessage } from "../transcript-anchor-audit.js";
+import type { MessageLane } from "../lane-split.js";
 import {
   parseOpenClawSenderMetadata,
   serializeOpenClawSenderMetadata,
@@ -50,6 +51,12 @@ export type CreateMessageInput = {
   role: MessageRole;
   content: string;
   tokenCount: number;
+  /**
+   * Lane split (Step 1) — lane tag for this message. Defaults to
+   * 'conversation' when omitted, which matches the DB column default and
+   * preserves pre-lane behavior for every existing caller.
+   */
+  lane?: MessageLane;
   /** Allowlisted OpenClaw sender identity for group-message replay. */
   openClawSenderMetadata?: OpenClawSenderMetadata | null;
   identityHash?: string;
@@ -77,6 +84,7 @@ export type CreateMessageInput = {
 };
 
 type PreparedMessageInsert = CreateMessageInput & {
+  lane: MessageLane;
   createdAt: string;
   identityHash: string;
   stableEventKey: string | null;
@@ -126,6 +134,8 @@ export type MessageRecord = {
    * required before collapse.
    */
   transcriptEntryId: string | null;
+  /** Lane split (Step 1) — lane tag persisted for this message. */
+  lane: MessageLane;
   /** Allowlisted OpenClaw sender identity, or null for legacy/direct messages. */
   openClawSenderMetadata: OpenClawSenderMetadata | null;
 };
@@ -300,6 +310,9 @@ interface MessageRow {
   transcript_entry_id?: string | null;
   // Allowlisted OpenClaw sender envelope fields, serialized as JSON.
   openclaw_sender_metadata?: string | null;
+  // Lane split (Step 1) — optional projection, same tolerance as the other
+  // sidecar columns; a missing value maps back to 'conversation'.
+  lane?: string | null;
 }
 
 interface MessageTranscriptAnchorTrustRow {
@@ -406,8 +419,14 @@ function formatMessageCreatedAt(value: Date | string | undefined): string | unde
   return undefined;
 }
 
+/** Normalize a persisted lane value; unknown/legacy values fall back to the default lane. */
+function normalizeMessageLane(value: string | null | undefined): MessageLane {
+  return value === "longtext" ? "longtext" : "conversation";
+}
+
 function toMessageRecord(row: MessageRow): MessageRecord {
   return {
+    lane: normalizeMessageLane(row.lane),
     largeContent: row.large_content ?? null,
     transcriptEntryId: row.transcript_entry_id ?? null,
     openClawSenderMetadata: parseOpenClawSenderMetadata(row.openclaw_sender_metadata),
@@ -890,8 +909,8 @@ export class ConversationStore {
     const insert = (stableEventKey: string | null): number => {
       const result = this.db
         .prepare(
-          `INSERT INTO messages (conversation_id, seq, role, content, token_count, identity_hash, openclaw_sender_metadata, transcript_entry_id, stable_event_key, created_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+          `INSERT INTO messages (conversation_id, seq, role, content, token_count, identity_hash, openclaw_sender_metadata, transcript_entry_id, stable_event_key, lane, created_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
         )
         .run(
           prepared.conversationId,
@@ -903,6 +922,7 @@ export class ConversationStore {
           serializeOpenClawSenderMetadata(prepared.openClawSenderMetadata),
           prepared.transcriptEntryId ?? null,
           stableEventKey,
+          prepared.lane,
           prepared.createdAt,
         );
       return Number(result.lastInsertRowid);
@@ -943,7 +963,7 @@ export class ConversationStore {
 
     const row = this.db
       .prepare(
-        `SELECT message_id, conversation_id, seq, role, content, token_count, created_at, large_content, transcript_entry_id, openclaw_sender_metadata
+        `SELECT message_id, conversation_id, seq, role, content, token_count, created_at, large_content, transcript_entry_id, openclaw_sender_metadata, lane
        FROM messages WHERE message_id = ?`,
       )
       .get(messageId) as unknown as MessageRow;
@@ -962,7 +982,7 @@ export class ConversationStore {
     );
 
     const selectStmt = this.db.prepare(
-      `SELECT message_id, conversation_id, seq, role, content, token_count, created_at, large_content, transcript_entry_id, openclaw_sender_metadata
+      `SELECT message_id, conversation_id, seq, role, content, token_count, created_at, large_content, transcript_entry_id, openclaw_sender_metadata, lane
        FROM messages WHERE message_id = ?`,
     );
 
@@ -987,7 +1007,7 @@ export class ConversationStore {
     if (limit != null) {
       const rows = this.db
         .prepare(
-          `SELECT message_id, conversation_id, seq, role, content, token_count, created_at, large_content, transcript_entry_id, openclaw_sender_metadata
+          `SELECT message_id, conversation_id, seq, role, content, token_count, created_at, large_content, transcript_entry_id, openclaw_sender_metadata, lane
          FROM messages
          WHERE conversation_id = ? AND seq > ?
          ORDER BY seq
@@ -999,7 +1019,7 @@ export class ConversationStore {
 
     const rows = this.db
       .prepare(
-        `SELECT message_id, conversation_id, seq, role, content, token_count, created_at, large_content, transcript_entry_id, openclaw_sender_metadata
+        `SELECT message_id, conversation_id, seq, role, content, token_count, created_at, large_content, transcript_entry_id, openclaw_sender_metadata, lane
        FROM messages
        WHERE conversation_id = ? AND seq > ?
        ORDER BY seq`,
@@ -1054,7 +1074,7 @@ export class ConversationStore {
     }
     const rows = this.db
       .prepare(
-        `SELECT message_id, conversation_id, seq, role, content, token_count, created_at, large_content, transcript_entry_id, openclaw_sender_metadata
+        `SELECT message_id, conversation_id, seq, role, content, token_count, created_at, large_content, transcript_entry_id, openclaw_sender_metadata, lane
        FROM messages
        WHERE conversation_id = ?
        ORDER BY seq DESC
@@ -1067,7 +1087,7 @@ export class ConversationStore {
   async getLastMessage(conversationId: ConversationId): Promise<MessageRecord | null> {
     const row = this.db
       .prepare(
-        `SELECT message_id, conversation_id, seq, role, content, token_count, created_at, large_content, transcript_entry_id, openclaw_sender_metadata
+        `SELECT message_id, conversation_id, seq, role, content, token_count, created_at, large_content, transcript_entry_id, openclaw_sender_metadata, lane
        FROM messages
        WHERE conversation_id = ?
        ORDER BY seq DESC
@@ -1849,7 +1869,7 @@ export class ConversationStore {
   async getMessageById(messageId: MessageId): Promise<MessageRecord | null> {
     const row = this.db
       .prepare(
-        `SELECT message_id, conversation_id, seq, role, content, token_count, created_at, large_content, transcript_entry_id, openclaw_sender_metadata
+        `SELECT message_id, conversation_id, seq, role, content, token_count, created_at, large_content, transcript_entry_id, openclaw_sender_metadata, lane
        FROM messages WHERE message_id = ?`,
       )
       .get(messageId) as unknown as MessageRow | undefined;
@@ -1860,7 +1880,7 @@ export class ConversationStore {
   async getMessageByLargeContent(fileId: string): Promise<MessageRecord | null> {
     const row = this.db
       .prepare(
-        `SELECT message_id, conversation_id, seq, role, content, token_count, created_at, large_content, transcript_entry_id, openclaw_sender_metadata
+        `SELECT message_id, conversation_id, seq, role, content, token_count, created_at, large_content, transcript_entry_id, openclaw_sender_metadata, lane
        FROM messages
        WHERE large_content = ?
        ORDER BY seq DESC
@@ -2081,6 +2101,7 @@ export class ConversationStore {
   ): PreparedMessageInsert {
     return {
       ...input,
+      lane: input.lane ?? "conversation",
       createdAt: formatMessageCreatedAt(input.createdAt) ?? createdAt,
       identityHash: input.identityHash ?? buildMessageIdentityHash(input.role, input.content),
       openClawSenderMetadata: input.role === "user" ? input.openClawSenderMetadata : null,
@@ -2352,7 +2373,7 @@ export class ConversationStore {
     const whereClause = where.length > 0 ? `WHERE ${where.join(" AND ")}` : "";
     const rows = this.db
       .prepare(
-        `SELECT message_id, conversation_id, seq, role, content, token_count, created_at, large_content, transcript_entry_id, openclaw_sender_metadata
+        `SELECT message_id, conversation_id, seq, role, content, token_count, created_at, large_content, transcript_entry_id, openclaw_sender_metadata, lane
          FROM messages
          ${whereClause}
          ORDER BY created_at DESC
@@ -2414,7 +2435,7 @@ export class ConversationStore {
     const whereClause = where.length > 0 ? `WHERE ${where.join(" AND ")}` : "";
     const rows = this.db
       .prepare(
-        `SELECT message_id, conversation_id, seq, role, content, token_count, created_at, large_content, transcript_entry_id, openclaw_sender_metadata
+        `SELECT message_id, conversation_id, seq, role, content, token_count, created_at, large_content, transcript_entry_id, openclaw_sender_metadata, lane
          FROM messages
          ${whereClause}
          ORDER BY created_at DESC`,
