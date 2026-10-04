@@ -1,6 +1,7 @@
 import { homedir } from "os";
 import { join } from "path";
 import { MIN_FALLBACK_MAX_TOKENS } from "../summary-fallback.js";
+import { DEFAULT_CONVERSATION_LANE_TOKEN_CAP } from "../lane-split.js";
 
 /**
  * Resolve the active OpenClaw state directory.
@@ -114,6 +115,48 @@ export type LcmConfig = {
    * Default false; flag-flip is reversible at runtime.
    */
   stubLargeToolPayloads: boolean;
+  /**
+   * Lane split (Step 1) — master switch for lane-based assembly. Default
+   * false: lane tags are still recorded at ingest, but assembly behaves
+   * exactly as before. The remaining laneSplit* keys below are registered
+   * for the upcoming steps and are not yet consumed by the engine.
+   */
+  laneSplitEnabled?: boolean;
+  /** Lane split — minimum share of the evictable budget reserved for the conversation lane. */
+  conversationFloorRatio?: number;
+  /** Lane split — soft token cap for the longtext lane; null = no cap. */
+  longTextLaneSoftCap?: number | null;
+  /** Lane split — minimum token size for a message to be treated as long-form. */
+  laneSplitTokenThreshold?: number;
+  /** Lane split — whether user messages may be split into intent/body segments. */
+  laneSplitUserMessage?: boolean;
+  /** Lane split — extend the protected tail across the current task chain. */
+  laneTaskChainProtection?: boolean;
+  /** Lane split — token threshold above which a longtext segment is externalized. */
+  laneExternalizeTokenThreshold?: number;
+  /**
+   * Lane split (Step 2) — absolute token cap for the conversation lane. Only
+   * this cap (never a ratio) may trim the otherwise-protected conversation
+   * lane during lane-split assembly. Prevents a runaway conversation lane from
+   * monopolising the window. Default 65536 (half of a 128K context window).
+   */
+  conversationLaneTokenCap?: number;
+  /**
+   * Lane split (Step 3) — within-lane priority inside the conversation lane.
+   * `"inline"` (default) counts reasoning as ordinary conversation tokens and
+   * reproduces Step 2 byte-for-byte; `"lowest"` drops reasoning blocks before
+   * any whole conversation message when the lane is under cap pressure.
+   */
+  laneReasoningMode?: "inline" | "lowest";
+  /**
+   * Lane split (Step 4) — *why* reasoning is shed inside the conversation lane.
+   * `"purpose-bound"` (default) only sheds when the lane's non-reasoning
+   * footprint already fits the cap, so the shed can actually bring the whole
+   * lane under it; otherwise it sheds nothing. `"always"` sheds the minimum
+   * necessary reasoning oldest-first to meet the cap, exactly as Step 3 did —
+   * that can spend replayed reasoning the suffix walk would not have used.
+   */
+  laneReasoningShedPolicy?: "always" | "purpose-bound";
   newSessionRetainDepth: number;
   leafMinFanout: number;
   condensedMinFanout: number;
@@ -710,6 +753,60 @@ export function resolveLcmConfigWithDiagnostics(
         env.LCM_STUB_LARGE_TOOL_PAYLOADS !== undefined
           ? env.LCM_STUB_LARGE_TOOL_PAYLOADS === "true"
           : toBool(pc.stubLargeToolPayloads) ?? false,
+      // Lane split (Step 1) — flag plumbing only. Only laneSplitEnabled is
+      // read by the engine; the rest are registered so a later step can
+      // consume them without another config migration.
+      laneSplitEnabled:
+        env.LCM_LANE_SPLIT_ENABLED !== undefined
+          ? env.LCM_LANE_SPLIT_ENABLED === "true"
+          : toBool(pc.laneSplitEnabled) ?? false,
+      conversationFloorRatio: Math.min(
+        1,
+        Math.max(
+          0,
+          parseFiniteNumber(env.LCM_CONVERSATION_FLOOR_RATIO)
+            ?? toNumber(pc.conversationFloorRatio)
+            ?? 0.4,
+        ),
+      ),
+      longTextLaneSoftCap:
+        parseFiniteInt(env.LCM_LONG_TEXT_LANE_SOFT_CAP)
+          ?? toNumber(pc.longTextLaneSoftCap)
+          ?? null,
+      laneSplitTokenThreshold:
+        parseFiniteInt(env.LCM_LANE_SPLIT_TOKEN_THRESHOLD)
+          ?? toNumber(pc.laneSplitTokenThreshold) ?? 2000,
+      laneSplitUserMessage:
+        env.LCM_LANE_SPLIT_USER_MESSAGE !== undefined
+          ? env.LCM_LANE_SPLIT_USER_MESSAGE === "true"
+          : toBool(pc.laneSplitUserMessage) ?? true,
+      laneTaskChainProtection:
+        env.LCM_LANE_TASK_CHAIN_PROTECTION !== undefined
+          ? env.LCM_LANE_TASK_CHAIN_PROTECTION === "true"
+          : toBool(pc.laneTaskChainProtection) ?? true,
+      laneExternalizeTokenThreshold:
+        parseFiniteInt(env.LCM_LANE_EXTERNALIZE_TOKEN_THRESHOLD)
+          ?? toNumber(pc.laneExternalizeTokenThreshold) ?? 2000,
+      conversationLaneTokenCap:
+        toPositiveInteger(parseFiniteInt(env.LCM_CONVERSATION_LANE_TOKEN_CAP))
+          ?? toPositiveInteger(toNumber(pc.conversationLaneTokenCap))
+          ?? DEFAULT_CONVERSATION_LANE_TOKEN_CAP,
+      // Lane split (Step 3) — "inline" is the default and reproduces Step 2.
+      // Only an explicit "lowest" (env or plugin config) opts in.
+      laneReasoningMode:
+        env.LCM_LANE_REASONING_MODE !== undefined
+          ? (env.LCM_LANE_REASONING_MODE === "lowest" ? "lowest" : "inline")
+          : (pc.laneReasoningMode === "lowest" ? "lowest" : "inline"),
+      // Lane split (Step 4) — "purpose-bound" is the default: only shed
+      // reasoning when the shed can actually bring the lane under its cap.
+      // Reasoning is replayed to the provider, so spending it for no gain is a
+      // real loss. An explicit "always" (env or plugin config) restores Step 3.
+      laneReasoningShedPolicy:
+        env.LCM_LANE_REASONING_SHED_POLICY !== undefined
+          ? (env.LCM_LANE_REASONING_SHED_POLICY === "always"
+              ? "always"
+              : "purpose-bound")
+          : (pc.laneReasoningShedPolicy === "always" ? "always" : "purpose-bound"),
       newSessionRetainDepth:
         parseFiniteInt(env.LCM_NEW_SESSION_RETAIN_DEPTH)
           ?? toNumber(pc.newSessionRetainDepth) ?? 2,

@@ -195,7 +195,7 @@ function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
-function isToolResultMessage(message: unknown): message is Record<string, unknown> {
+export function isToolResultMessage(message: unknown): message is Record<string, unknown> {
   if (!isRecord(message)) {
     return false;
   }

@@ -460,6 +460,23 @@ function ensureMessageTranscriptEntryIdColumn(db: DatabaseSync): void {
 }
 
 /**
+ * Lane split (Step 1) — the messages.lane tag.
+ *
+ * Every message carries a lane so a later step can budget the conversation
+ * lane and the longtext lane independently. Step 1 only records the tag;
+ * assembly behavior is unchanged. Additive ALTER with a NOT NULL default so
+ * existing rows (and any INSERT that omits the column) classify as
+ * 'conversation', matching pre-lane behavior.
+ */
+function ensureMessageLaneColumn(db: DatabaseSync): void {
+  const messageColumns = db.prepare(`PRAGMA table_info(messages)`).all() as SummaryColumnInfo[];
+  const hasLane = messageColumns.some((column) => column.name === "lane");
+  if (!hasLane) {
+    db.exec(`ALTER TABLE messages ADD COLUMN lane TEXT NOT NULL DEFAULT 'conversation'`);
+  }
+}
+
+/**
  * Stable event-key deduplication: a stable identity for a message that survives
  * across representations (e.g., transcript redacted vs. runtime unredacted).
  * NULL for legacy rows; populated by `extractStableEventKey` at ingest time.
@@ -1173,6 +1190,7 @@ export function runLcmMigrations(
       role TEXT NOT NULL CHECK (role IN ('system', 'user', 'assistant', 'tool')),
       content TEXT NOT NULL,
       token_count INTEGER NOT NULL,
+      lane TEXT NOT NULL DEFAULT 'conversation',
       identity_hash TEXT,
       openclaw_sender_metadata TEXT,
       transcript_entry_id TEXT,
@@ -1589,6 +1607,7 @@ export function runLcmMigrations(
         `CREATE INDEX IF NOT EXISTS messages_conv_identity_hash_idx ON messages (conversation_id, identity_hash)`,
       ),
     );
+    runMigrationStep("ensureMessageLaneColumn", log, () => ensureMessageLaneColumn(db));
     runMigrationStep("ensureMessageTranscriptEntryIdColumn", log, () =>
       ensureMessageTranscriptEntryIdColumn(db),
     );

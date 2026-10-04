@@ -81,6 +81,21 @@
       ]
     },
     {
+      "id": "lane-split",
+      "title": "Lane split",
+      "order": 25,
+      "properties": [
+        "laneSplitEnabled",
+        "conversationFloorRatio",
+        "longTextLaneSoftCap",
+        "laneSplitTokenThreshold",
+        "laneSplitUserMessage",
+        "laneTaskChainProtection",
+        "laneExternalizeTokenThreshold",
+        "conversationLaneTokenCap"
+      ]
+    },
+    {
       "id": "compaction",
       "title": "Compaction",
       "order": 30,
@@ -477,6 +492,38 @@
     "stripInjectedContextTags": {
       "label": "Strip Injected Context Tags",
       "help": "XML tag names whose blocks are stripped from messages before summarization. Covers memory/context plugin prepended blocks (active-memory, memory-lancedb, hindsight-openclaw). Set to [] to disable."
+    },
+    "laneSplitEnabled": {
+      "label": "Lane Split",
+      "help": "Master switch for lane-based assembly. Default off: lane tags are still recorded at ingest (observation only), but assembly is unchanged. Later steps split the conversation and longtext lanes' budgets behind this flag."
+    },
+    "conversationFloorRatio": {
+      "label": "Conversation Floor Ratio",
+      "help": "Minimum share of the evictable budget reserved for the conversation lane (default 0.40). Not yet consumed in this step."
+    },
+    "longTextLaneSoftCap": {
+      "label": "Longtext Lane Soft Cap",
+      "help": "Optional soft token cap for the longtext lane; leave empty for no cap. Not yet consumed in this step."
+    },
+    "laneSplitTokenThreshold": {
+      "label": "Lane Split Token Threshold",
+      "help": "Minimum token size for a message/segment to be treated as long-form (default 2000). Not yet consumed in this step."
+    },
+    "laneSplitUserMessage": {
+      "label": "Lane Split User Messages",
+      "help": "Whether user messages may be split into intent/body segments (default true). Not yet consumed in this step."
+    },
+    "laneTaskChainProtection": {
+      "label": "Lane Task Chain Protection",
+      "help": "Extend the protected fresh tail across the current task chain (default true). Not yet consumed in this step."
+    },
+    "laneExternalizeTokenThreshold": {
+      "label": "Lane Externalize Token Threshold",
+      "help": "Token threshold above which a longtext segment is externalized to a stub (default 2000). Not yet consumed in this step."
+    },
+    "conversationLaneTokenCap": {
+      "label": "Conversation Lane Token Cap",
+      "help": "Absolute token cap for the protected conversation lane during lane-split assembly (default 65536). Only this cap may trim the conversation lane; longtext (tool-result) items absorb all other eviction."
     }
   },
   "configSchema": {
@@ -578,6 +625,46 @@
       "stubLargeToolPayloads": {
         "type": "boolean",
         "default": false
+      },
+      "laneSplitEnabled": {
+        "type": "boolean",
+        "default": false
+      },
+      "conversationFloorRatio": {
+        "type": "number",
+        "minimum": 0,
+        "maximum": 1,
+        "default": 0.4
+      },
+      "longTextLaneSoftCap": {
+        "type": [
+          "number",
+          "null"
+        ],
+        "default": null
+      },
+      "laneSplitTokenThreshold": {
+        "type": "integer",
+        "minimum": 1,
+        "default": 2000
+      },
+      "laneSplitUserMessage": {
+        "type": "boolean",
+        "default": true
+      },
+      "laneTaskChainProtection": {
+        "type": "boolean",
+        "default": true
+      },
+      "laneExternalizeTokenThreshold": {
+        "type": "integer",
+        "minimum": 1,
+        "default": 2000
+      },
+      "conversationLaneTokenCap": {
+        "type": "integer",
+        "minimum": 1,
+        "default": 65536
       },
       "leafChunkTokens": {
         "type": "integer",
