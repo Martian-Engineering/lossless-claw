@@ -326,3 +326,124 @@ export function selectLanesWithinBudget(
   };
 }
 
+// ── Step 3 — reasoning yields first inside the conversation lane ─────────────
+//
+// Step 2 protects the conversation lane as a whole. But a large share of that
+// lane can be model-internal reasoning — process, not information. Measured
+// 2026-10-03 on a coding session (fresh tail 6, budget 8000, lane split on):
+// reasoning was 57.1% of the emitted prompt while real text was only 27.2%.
+// Victor's goal is "remember more of what is useful, not everything", so the
+// priority inside the lane is: text (highest) > reasoning (lowest).
+//
+// Step 3 adds exactly one thing: when the conversation lane is under cap
+// pressure, its reasoning blocks are dropped BEFORE any whole message is.
+// A message may lose its reasoning while keeping its text. The lane budgets
+// themselves (Step 2) are untouched, and the "inline" mode reproduces Step 2
+// byte-for-byte (reasoning simply counts as ordinary conversation tokens).
+
+export type ReasoningTrimMode = "inline" | "lowest";
+
+/** Per conversation-lane item: how its token estimate splits across the two
+ *  sub-buckets. `reasoningTokens` is the part that Step 3 may sacrifice;
+ *  `textTokens` is the "human" content that always outranks it. */
+export type ConversationItemTokenSplit = {
+  reasoningTokens: number;
+  textTokens: number;
+};
+
+export type LaneSplitSelectionWithReasoning = LaneSplitSelection & {
+  /** Per conversation item, in input order: its reasoning blocks were dropped. */
+  reasoningDropped: boolean[];
+  /** Conversation-lane tokens retained from reasoning blocks. */
+  reasoningTokens: number;
+  /** Conversation-lane tokens retained from non-reasoning ("text") content. */
+  conversationTextTokens: number;
+  /** True when reasoning content was dropped to relieve cap pressure. */
+  reasoningTrimmed: boolean;
+};
+
+/**
+ * Step 3 selection: Step 2's two-lane budgets plus a within-lane reasoning
+ * priority. `inline` delegates to `selectLanesWithinBudget` unchanged;
+ * `lowest` sheds reasoning (oldest-first, whole-item) before dropping any
+ * whole conversation message.
+ *
+ * Determinism/caching: both lanes are still trimmed only as a contiguous
+ * oldest prefix, and items are never reordered. Reasoning is dropped from the
+ * OLDEST items first, mirroring chronological eviction, so the newest suffix
+ * (the part that matters for the prompt cache) is the last thing to change.
+ */
+export function selectLanesWithinBudgetWithReasoning(
+  conversationItems: readonly ConversationItemTokenSplit[],
+  longtextTokens: readonly number[],
+  remainingBudget: number,
+  conversationTokenCap: number = DEFAULT_CONVERSATION_LANE_TOKEN_CAP,
+  reasoningMode: ReasoningTrimMode = "inline",
+): LaneSplitSelectionWithReasoning {
+  const reasoningTokens = conversationItems.map((item) => laneTokens(item.reasoningTokens));
+  const itemTotals = conversationItems.map(
+    (item, index) => reasoningTokens[index] + Math.max(0, laneTokens(item.textTokens)),
+  );
+
+  const flat = selectLanesWithinBudget(
+    itemTotals,
+    longtextTokens,
+    remainingBudget,
+    conversationTokenCap,
+  );
+
+  const reasoningDropped = new Array<boolean>(conversationItems.length).fill(false);
+  if (reasoningMode === "lowest") {
+    const cap = flat.conversationTokenCap;
+    const total = itemTotals.reduce((sum, value) => sum + value, 0);
+    let overflow = total - cap;
+    // Sacrifice whole-item reasoning oldest-first until the overflow is
+    // covered. Only reasoning of an item is ever dropped here as a unit; the
+    // message's text is left for the suffix walk below, which is the only
+    // thing that may drop a whole message.
+    for (let index = 0; index < conversationItems.length && overflow > 0; index++) {
+      const part = reasoningTokens[index];
+      if (part <= 0) continue;
+      reasoningDropped[index] = true;
+      overflow -= part;
+    }
+  }
+
+  const effectiveTotals = itemTotals.map(
+    (total, index) => total - (reasoningDropped[index] ? reasoningTokens[index] : 0),
+  );
+  const conversationKept = keepNewestSuffixWithin(effectiveTotals, flat.conversationTokenCap);
+
+  let keptReasoningTokens = 0;
+  let keptTextTokens = 0;
+  conversationKept.forEach((keep, index) => {
+    if (!keep) return;
+    const retainedReasoning = reasoningDropped[index] ? 0 : reasoningTokens[index];
+    keptReasoningTokens += retainedReasoning;
+    keptTextTokens += effectiveTotals[index] - retainedReasoning;
+  });
+
+  const longtextBudget = Math.max(0, flat.remainingBudget - (keptReasoningTokens + keptTextTokens));
+  const longtextKept = keepNewestSuffixWithin(longtextTokens, longtextBudget);
+  const longtextKeptTokens = longtextKept.reduce(
+    (sum, keep, index) => sum + (keep ? laneTokens(longtextTokens[index]) : 0),
+    0,
+  );
+
+  return {
+    conversationKept,
+    longtextKept,
+    conversationTokens: keptReasoningTokens + keptTextTokens,
+    longtextTokens: longtextKeptTokens,
+    conversationTrimmed: conversationKept.some((keep) => !keep),
+    longtextTrimmed: longtextKept.some((keep) => !keep),
+    conversationTokenCap: flat.conversationTokenCap,
+    remainingBudget: flat.remainingBudget,
+    reasoningDropped,
+    reasoningTokens: keptReasoningTokens,
+    conversationTextTokens: keptTextTokens,
+    reasoningTrimmed: reasoningDropped.some(Boolean),
+  };
+}
+
+

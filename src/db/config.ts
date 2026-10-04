@@ -141,6 +141,13 @@ export type LcmConfig = {
    * monopolising the window. Default 65536 (half of a 128K context window).
    */
   conversationLaneTokenCap?: number;
+  /**
+   * Lane split (Step 3) — within-lane priority inside the conversation lane.
+   * `"inline"` (default) counts reasoning as ordinary conversation tokens and
+   * reproduces Step 2 byte-for-byte; `"lowest"` drops reasoning blocks before
+   * any whole conversation message when the lane is under cap pressure.
+   */
+  laneReasoningMode?: "inline" | "lowest";
   newSessionRetainDepth: number;
   leafMinFanout: number;
   condensedMinFanout: number;
@@ -775,6 +782,12 @@ export function resolveLcmConfigWithDiagnostics(
         toPositiveInteger(parseFiniteInt(env.LCM_CONVERSATION_LANE_TOKEN_CAP))
           ?? toPositiveInteger(toNumber(pc.conversationLaneTokenCap))
           ?? DEFAULT_CONVERSATION_LANE_TOKEN_CAP,
+      // Lane split (Step 3) — "inline" is the default and reproduces Step 2.
+      // Only an explicit "lowest" (env or plugin config) opts in.
+      laneReasoningMode:
+        env.LCM_LANE_REASONING_MODE !== undefined
+          ? (env.LCM_LANE_REASONING_MODE === "lowest" ? "lowest" : "inline")
+          : (pc.laneReasoningMode === "lowest" ? "lowest" : "inline"),
       newSessionRetainDepth:
         parseFiniteInt(env.LCM_NEW_SESSION_RETAIN_DEPTH)
           ?? toNumber(pc.newSessionRetainDepth) ?? 2,

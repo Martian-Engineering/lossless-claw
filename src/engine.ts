@@ -4908,6 +4908,8 @@ export class LcmContextEngine implements ContextEngine {
         // off these fields are inert and assembly is byte-for-byte unchanged.
         laneSplitEnabled: this.config.laneSplitEnabled === true,
         laneConversationTokenCap: this.config.conversationLaneTokenCap,
+        // Lane split (Step 3) — "inline" (default) reproduces Step 2 exactly.
+        laneReasoningMode: this.config.laneReasoningMode,
       };
       const initialContextItems = await this.summaryStore.getContextItems(conversation.conversationId);
       const initiallyRaw = !initialContextItems.some(item => item.itemType === "summary");
