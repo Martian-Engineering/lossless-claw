@@ -602,6 +602,9 @@ export class BatchDeduplicator {
       tailWindow,
     );
     if (tail.length !== tailHashes.length) return plan;
+    // Externalized references are case-insensitive. Cache the conservative
+    // marker check once per tail row instead of scanning it for every entry.
+    const mayBeExternalized = tail.map((row) => /\[LCM |LCM file:/i.test(row.content));
 
     type Candidate = {
       row: Pick<MessageRecord, "messageId" | "createdAt">;
@@ -612,6 +615,7 @@ export class BatchDeduplicator {
     for (const message of params.messages) {
       const stored = toStoredMessage(message);
       const incomingHash = storedMessageIdentityHash(stored);
+      const hasToolCallIds = incomingToolCallIds(message).size > 0;
       const rawContent = serializeRawPayloadContent(message, stored.content)?.content ?? null;
       const matches = new Map<number, Candidate>();
       if (stored.role === "user") {
@@ -624,6 +628,17 @@ export class BatchDeduplicator {
       for (let index = 0; index < tail.length; index += 1) {
         const row = tail[index]!;
         if (row.transcriptEntryId || matches.has(row.messageId)) continue;
+        // All match paths require the same role. A differing text identity can
+        // only match through a stored externalization reference or the
+        // provenance-gated tool-call redaction path. Reject other pairs before
+        // reading message parts from SQLite. Keep resolved incoming entries in
+        // this scan: their claims make repeated legacy content ambiguous.
+        if (row.role !== stored.role) continue;
+        if (
+          tailHashes[index] !== incomingHash &&
+          !mayBeExternalized[index] &&
+          !hasToolCallIds
+        ) continue;
         const match = await this.matchStoredMessageToIncoming(
           row,
           stored,
