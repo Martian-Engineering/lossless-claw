@@ -1,5 +1,6 @@
 import { describe, expect, it, vi } from "vitest";
 import { BatchDeduplicator } from "../src/batch-dedup.js";
+import { formatFileReference } from "../src/large-files.js";
 import type { AgentMessage } from "../src/openclaw-bridge.js";
 import type {
   ConversationStore,
@@ -8,7 +9,22 @@ import type {
 } from "../src/store/conversation-store.js";
 import { buildMessageIdentityHash } from "../src/store/message-identity.js";
 import type { SummaryStore } from "../src/store/summary-store.js";
-import { makeMessage } from "./helpers.js";
+
+function makeMessage(params: {
+  role?: string;
+  content: unknown;
+  timestamp?: number;
+  responseId?: string;
+  toolCallId?: string;
+}): AgentMessage {
+  return {
+    role: params.role ?? "assistant",
+    content: params.content,
+    timestamp: params.timestamp ?? Date.now(),
+    ...(params.responseId !== undefined ? { responseId: params.responseId } : {}),
+    ...(params.toolCallId !== undefined ? { toolCallId: params.toolCallId } : {}),
+  } as AgentMessage;
+}
 
 function makeLog() {
   return { info: vi.fn(), warn: vi.fn(), error: vi.fn(), debug: vi.fn() };
@@ -50,6 +66,9 @@ function makeConversationStore(initial: FakeConversationStore): ConversationStor
         .slice(-limit)
         .map((m) => buildMessageIdentityHash(m.role, m.content));
     }),
+    listRecentUnstampedMessagesByRole: vi.fn(async (_conversationId: number, role: string, limit: number) =>
+      initial.messages.filter((message) => message.role === role && !message.transcriptEntryId).slice(-limit),
+    ),
     hasMessage: vi.fn(async (conversationId: number, role: string, content: string) => {
       expect(conversationId).toBe(initial.conversationId);
       const identityHash = buildMessageIdentityHash(role, content);
@@ -139,6 +158,96 @@ function metadataWrappedWithInjectedContext(body: string): string {
     body,
   ].join("\n");
 }
+
+describe("BatchDeduplicator.planRecentTranscriptEntryAdoptions", () => {
+  it("keeps provenance-backed externalized file content eligible across a hash mismatch", async () => {
+    const fileId = "file_1234567890abcdef";
+    const body = "original file payload";
+    const incoming = `<file name="sample.txt" mime="text/plain">${body}</file>`;
+    const reference = formatFileReference({
+      fileId,
+      fileName: "sample.txt",
+      mimeType: "text/plain",
+      byteSize: Buffer.byteLength(body),
+      summary: "sample summary",
+    });
+    const row = { ...storedMessage("user", reference, 1), largeContent: fileId };
+    const store = makeConversationStore({ conversationId: 1, messages: [row] });
+    const largeFile = {
+      fileId,
+      fileName: "sample.txt",
+      mimeType: "text/plain",
+      byteSize: Buffer.byteLength(body),
+      explorationSummary: "sample summary",
+    };
+    const summaryStore = {
+      getLargeFile: vi.fn(async () => largeFile),
+      largeFileContentEquals: vi.fn(async (_fileId: string, content: string) => content === body),
+    } as unknown as SummaryStore;
+    const dedup = new BatchDeduplicator(store, summaryStore, "/unused", { log: makeLog() });
+
+    const plan = await dedup.planRecentTranscriptEntryAdoptions({
+      conversationId: 1,
+      messages: [makeMessage({ role: "user", content: incoming })],
+      tailWindow: 1,
+    });
+
+    expect(plan.get(0)).toEqual({ messageId: row.messageId, decorated: false });
+    expect(summaryStore.largeFileContentEquals).toHaveBeenCalled();
+  });
+
+  it("keeps provenance-backed native image content eligible across a hash mismatch", async () => {
+    const fileId = "file_1234567890abcdef";
+    const image = Buffer.from([1, 2, 3, 4]);
+    const reference = `[User image: screenshot.png (image/png, 4 bytes) | LCM file: ${fileId}]`;
+    const row = { ...storedMessage("user", reference, 1), largeContent: fileId };
+    const store = makeConversationStore({ conversationId: 1, messages: [row] });
+    const summaryStore = {
+      getLargeFile: vi.fn(async () => ({ fileId, mimeType: "image/png" })),
+      largeFileBufferEquals: vi.fn(async (_fileId: string, content: Buffer) => content.equals(image)),
+    } as unknown as SummaryStore;
+    const dedup = new BatchDeduplicator(store, summaryStore, "/unused", { log: makeLog() });
+
+    const plan = await dedup.planRecentTranscriptEntryAdoptions({
+      conversationId: 1,
+      messages: [makeMessage({ role: "user", content: [{ type: "image", data: image.toString("base64"), mimeType: "image/png" }] })],
+      tailWindow: 1,
+    });
+
+    expect(plan.get(0)).toEqual({ messageId: row.messageId, decorated: false });
+    expect(summaryStore.largeFileBufferEquals).toHaveBeenCalled();
+  });
+
+  it("keeps host-redacted tool content eligible only with matching call provenance", async () => {
+    const row = storedMessage("tool", "tool output ***", 1);
+    const store = makeConversationStore({
+      conversationId: 1,
+      messages: [row],
+      toolCallIdsByMessageId: { 1: ["call-secret"] },
+    });
+    const dedup = new BatchDeduplicator(
+      store,
+      {} as SummaryStore,
+      "/unused",
+      { log: makeLog() },
+      redactTenantSecret,
+    );
+
+    const matching = await dedup.planRecentTranscriptEntryAdoptions({
+      conversationId: 1,
+      messages: [toolResultMessage("tool output tenant-secret-alpha", "call-secret")],
+      tailWindow: 1,
+    });
+    const wrongCall = await dedup.planRecentTranscriptEntryAdoptions({
+      conversationId: 1,
+      messages: [toolResultMessage("tool output tenant-secret-alpha", "other-call")],
+      tailWindow: 1,
+    });
+
+    expect(matching.get(0)).toEqual({ messageId: row.messageId, decorated: false });
+    expect(wrongCall.size).toBe(0);
+  });
+});
 
 describe("BatchDeduplicator.deduplicateAfterTurnBatch", () => {
   it("returns an empty batch unchanged", async () => {
