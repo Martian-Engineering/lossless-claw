@@ -2874,6 +2874,12 @@ export class LcmContextEngine implements ContextEngine {
       existingEntryIds,
     });
 
+    if (params.completeRecoverySnapshot) {
+      this.deps.log.warn(`[lcm] overflow reconciliation plan: visible=${params.historicalMessages.length}` +
+        ` current=${recoveryTurnLength} existingAnchors=${existingEntryIds.size} adoptions=${adoptionPlan.size}` +
+        ` legacyPrefix=${Boolean(params.legacyPrefixAnchorEntryId)} requireOverlap=${Boolean(params.requireOverlap)}`);
+    }
+
     for (let index = 0; index < params.historicalMessages.length; index += 1) {
       const message = params.historicalMessages[index]!;
       const entryId = getTranscriptEntryId(message);
