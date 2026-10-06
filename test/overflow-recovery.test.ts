@@ -73,7 +73,7 @@ function transcript(pairs = 12): VisibleSessionTranscriptMessageEntry[] {
 /** Exercise the same compacted-result retry gate as supported OpenClaw overflow recovery. */
 async function recover(
   entries: VisibleSessionTranscriptMessageEntry[],
-  warm: boolean | "committed" = false,
+  warm: boolean | "committed" | "committed-timed" = false,
   settings = config
 ) {
   const complete = vi.fn(async () => ({
@@ -91,7 +91,7 @@ async function recover(
     readVisibleSessionTranscriptMessageEntries: read,
     log: { info, debug: vi.fn(), warn: info, error: info },
   });
-  if (warm === "committed") {
+  if (warm === "committed" || warm === "committed-timed") {
     const first = entries[0]!;
     const last = entries.at(-1)!;
     await engine.commitTurn({
@@ -106,7 +106,9 @@ async function recover(
         generation: "g1", rawSeq: entries.length,
         activeMessagePosition: entries.length - 1,
       },
-      messages: entries.map((entry) => entry.message),
+      messages: entries.map((entry) => warm === "committed-timed"
+        ? { ...entry.message, timestamp: Date.parse(entry.createdAt!) }
+        : entry.message),
     });
   } else if (warm) {
     await engine.ingest({
@@ -234,7 +236,7 @@ describe("authoritative forced overflow recovery", () => {
       expect(rows.find((row) => row.content.includes("FILE_0"))).toBeTruthy();
     });
 
-  for (const warm of [false, true, "committed"] as const)
+  for (const warm of [false, true, "committed", "committed-timed"] as const)
     it(`recovers nested-tool display rows without losing persisted history (existing prefix=${warm})`, async () => {
       const source = transcript();
       const entries = source.flatMap((entry) => {
@@ -271,6 +273,51 @@ describe("authoritative forced overflow recovery", () => {
       const results = retry.messages.map(extractToolResultIdForPairing).filter(Boolean);
       expect(results).toEqual(calls);
       expect(results).toContain("call_11");
+    });
+
+  it.each(["partial", "reordered", "stale suffix"])(
+    "does not adopt a bare legacy turn with an unproven ordered tail: %s", async (kind) => {
+      const entries = transcript();
+      const complete = vi.fn();
+      const engine = createEngineWithDeps(config, {
+        complete,
+        readVisibleSessionTranscriptMessageEntries: async () => entries,
+      });
+      const stored = [...entries];
+      if (kind === "partial") stored.splice(2, 1);
+      if (kind === "reordered") [stored[1], stored[2]] = [stored[2]!, stored[1]!];
+      const first = entries[0]!, last = entries.at(-1)!;
+      const messages = stored.map((entry) => ({
+        ...entry.message, timestamp: Date.parse(entry.createdAt!),
+      }));
+      if (kind === "stale suffix") messages.push({
+        role: "assistant", content: "unrepresented later evidence",
+        timestamp: Date.parse(last.createdAt!) + 1,
+      } as AgentMessage & { timestamp: number });
+      await engine.commitTurn({
+        sessionId, sessionKey, sessionTarget, advancementKey: "unproven-bare-turn",
+        admission: {
+          ...sessionTarget, entryId: first.entryId, effectiveParentId: null,
+          generation: "g1", logicalTurnId: "unproven-bare-turn", rawSeq: 1,
+          activeMessagePosition: 0, role: "user",
+        },
+        terminal: {
+          ...sessionTarget, entryId: last.entryId, effectiveParentId: last.parentId,
+          generation: "g1", rawSeq: messages.length,
+          activeMessagePosition: messages.length - 1,
+        },
+        messages,
+      });
+      const store = engine.getConversationStore();
+      const conversation = await store.getConversationForSession({ sessionId, sessionKey });
+      const before = await store.getMessages(conversation!.conversationId);
+      const result = await engine.compact({
+        sessionId, sessionKey, sessionTarget, sessionFile: "",
+        force: true, compactionTarget: "budget", tokenBudget: 8000, runtimeSettings,
+      });
+      expect(result.compacted).toBe(false);
+      expect(complete).not.toHaveBeenCalled();
+      expect(await store.getMessages(conversation!.conversationId)).toEqual(before);
     });
 
   it("retains the initiating user when the configured fresh tail is disabled", async () => {

@@ -2873,11 +2873,29 @@ export class LcmContextEngine implements ContextEngine {
       tailWindow: Math.max(this.config.freshTailCount, recoveryTurnLength),
       existingEntryIds,
     });
+    // Legacy-prefix fencing is deliberately conservative for ordinary replay.
+    // Forced recovery can prove a bare durable commit without an initial anchor
+    // only when every persistable current-turn entry uniquely matches the entire
+    // stored tail, in order. A partial, reordered, ambiguous or stale match is
+    // not sufficient. The planner still validates structured content and time.
+    const recoveryTurn = recoveryUserIndex < 0 ? [] : params.historicalMessages
+      .map((message, index) => ({ message, index }))
+      .slice(recoveryUserIndex)
+      .filter(({ message }) => hasPersistableMessageRole(message));
+    const recoveryTail = recoveryTurn.length > 0
+      ? await this.conversationStore.getLastMessages(params.conversationId, recoveryTurn.length)
+      : [];
+    const fullyMatchedCurrentTurn = recoveryTurn.length > 0 &&
+      recoveryTail.length === recoveryTurn.length &&
+      recoveryTail[0]?.role === "user" &&
+      recoveryTurn.every(({ index }, offset) =>
+        adoptionPlan.get(index)?.messageId === recoveryTail[offset]?.messageId);
 
     if (params.completeRecoverySnapshot) {
       this.deps.log.warn(`[lcm] overflow reconciliation plan: visible=${params.historicalMessages.length}` +
         ` current=${recoveryTurnLength} existingAnchors=${existingEntryIds.size} adoptions=${adoptionPlan.size}` +
-        ` legacyPrefix=${Boolean(params.legacyPrefixAnchorEntryId)} requireOverlap=${Boolean(params.requireOverlap)}`);
+        ` legacyPrefix=${Boolean(params.legacyPrefixAnchorEntryId)} requireOverlap=${Boolean(params.requireOverlap)}` +
+        ` orderedTurnMatch=${fullyMatchedCurrentTurn}`);
     }
 
     for (let index = 0; index < params.historicalMessages.length; index += 1) {
@@ -2952,7 +2970,8 @@ export class LcmContextEngine implements ContextEngine {
 
       const stored = toStoredMessageIdentity(message);
       const canUseWeakIdentityAdoption =
-        (!params.legacyPrefixAnchorEntryId || hasOverlap) && !establishedEpochBoundary;
+        (!params.legacyPrefixAnchorEntryId || hasOverlap || fullyMatchedCurrentTurn) &&
+        !establishedEpochBoundary;
       const adoption = adoptionPlan.get(index);
       if (
         entryId &&
