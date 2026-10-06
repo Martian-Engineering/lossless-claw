@@ -2858,10 +2858,19 @@ export class LcmContextEngine implements ContextEngine {
             entryIds,
           )
         : new Set<string>();
+    // Durable host commits can contain bare messages without per-entry metadata.
+    // A complete recovery snapshot may match the entire current turn, rather
+    // than only the configured fresh tail. The planner still requires unique
+    // structured matches; normal reconciliation retains its bounded window.
+    const recoveryUserIndex = params.completeRecoverySnapshot
+      ? params.historicalMessages.findLastIndex((message) => message.role === "user")
+      : -1;
+    const recoveryTurnLength = recoveryUserIndex < 0 ? 0
+      : params.historicalMessages.slice(recoveryUserIndex).filter(hasPersistableMessageRole).length;
     const adoptionPlan = await this.batchDeduplicator.planRecentTranscriptEntryAdoptions({
       conversationId: params.conversationId,
       messages: params.historicalMessages,
-      tailWindow: this.config.freshTailCount,
+      tailWindow: Math.max(this.config.freshTailCount, recoveryTurnLength),
       existingEntryIds,
     });
 
@@ -5285,7 +5294,12 @@ export class LcmContextEngine implements ContextEngine {
       }
       // Reconciliation may deliberately skip uncertain history. Only a fully
       // represented current turn may authorize the recovery-only tail exception.
-      const turnIds = new Set(ids.slice(latestUserIndex));
+      // Host display-only rows (for example nested-tool diagnostics) are not
+      // persisted. Require complete coverage of the same message roles that
+      // reconciliation accepts, without relaxing identity or raw-tail checks.
+      const turnIds = new Set(entries.slice(latestUserIndex)
+        .filter((entry) => hasPersistableMessageRole(entry.message))
+        .map((entry) => entry.entryId));
       const storedIds = await this.conversationStore.filterExistingTranscriptEntryIds(conversationId, [...turnIds]);
       const context = await this.summaryStore.getContextItems(conversationId);
       const raw = await Promise.all(context.filter((item) => item.messageId != null)

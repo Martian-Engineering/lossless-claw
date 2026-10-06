@@ -73,7 +73,7 @@ function transcript(pairs = 12): VisibleSessionTranscriptMessageEntry[] {
 /** Exercise the same compacted-result retry gate as supported OpenClaw overflow recovery. */
 async function recover(
   entries: VisibleSessionTranscriptMessageEntry[],
-  warm = false,
+  warm: boolean | "committed" = false,
   settings = config
 ) {
   const complete = vi.fn(async () => ({
@@ -91,7 +91,24 @@ async function recover(
     readVisibleSessionTranscriptMessageEntries: read,
     log: { info, debug: vi.fn(), warn: info, error: info },
   });
-  if (warm) {
+  if (warm === "committed") {
+    const first = entries[0]!;
+    const last = entries.at(-1)!;
+    await engine.commitTurn({
+      sessionId, sessionKey, sessionTarget, advancementKey: "bare-host-turn",
+      admission: {
+        ...sessionTarget, entryId: first.entryId, effectiveParentId: null,
+        generation: "g1", logicalTurnId: "bare-host-turn", rawSeq: 1,
+        activeMessagePosition: 0, role: "user",
+      },
+      terminal: {
+        ...sessionTarget, entryId: last.entryId, effectiveParentId: last.parentId,
+        generation: "g1", rawSeq: entries.length,
+        activeMessagePosition: entries.length - 1,
+      },
+      messages: entries.map((entry) => entry.message),
+    });
+  } else if (warm) {
     await engine.ingest({
       sessionId,
       sessionKey,
@@ -215,6 +232,45 @@ describe("authoritative forced overflow recovery", () => {
       expect(rows.filter((row) => row.role === "tool")).toHaveLength(12);
       expect(rows.at(-1)!.content).toContain("FILE_11");
       expect(rows.find((row) => row.content.includes("FILE_0"))).toBeTruthy();
+    });
+
+  for (const warm of [false, true, "committed"] as const)
+    it(`recovers nested-tool display rows without losing persisted history (existing prefix=${warm})`, async () => {
+      const source = transcript();
+      const entries = source.flatMap((entry) => {
+        if (entry.message.role !== "toolResult") return [entry];
+        const message = {
+          role: "custom",
+          customType: "openclaw.nested-tool.v1",
+          display: true,
+          excludeFromContext: true,
+          content: "",
+          details: {
+            parentToolCallId: (entry.message as { toolCallId?: string }).toolCallId,
+          },
+        } as unknown as AgentMessage;
+        return [entry, {
+          ...entry,
+          entryId: `display-${entry.entryId}`,
+          parentId: entry.entryId,
+          role: message.role,
+          message,
+        }];
+      });
+      const { engine, retry, complete, provider } = await recover(entries, warm);
+      await expect(provider(retry.messages)).resolves.toMatchObject({ role: "assistant" });
+      expect(complete).toHaveBeenCalled();
+      expect(retry.messages[0]).toMatchObject(source[0]!.message);
+      const conversation = await engine.getConversationStore()
+        .getConversationForSession({ sessionId, sessionKey });
+      const rows = await engine.getConversationStore()
+        .getMessages(conversation!.conversationId);
+      expect(rows.map((row) => row.transcriptEntryId)).toEqual(source.map((entry) => entry.entryId));
+      expect(rows.at(-1)!.content).toContain("FILE_11");
+      const calls = retry.messages.flatMap(extractAssistantToolCallIdsForPairing);
+      const results = retry.messages.map(extractToolResultIdForPairing).filter(Boolean);
+      expect(results).toEqual(calls);
+      expect(results).toContain("call_11");
     });
 
   it("retains the initiating user when the configured fresh tail is disabled", async () => {
