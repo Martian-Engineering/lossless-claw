@@ -5308,6 +5308,13 @@ export class LcmContextEngine implements ContextEngine {
       if (storedIds.size !== turnIds.size || userIndex < 0 ||
           raw[userIndex]?.transcriptEntryId !== ids[latestUserIndex] ||
           raw.slice(userIndex).some((message) => !message?.transcriptEntryId || !turnIds.has(message.transcriptEntryId))) {
+        // Counts only: make a refusal diagnosable without exposing transcript
+        // text, identifiers, tool payloads or externalized-file capabilities.
+        const currentRaw = userIndex < 0 ? [] : raw.slice(userIndex);
+        this.deps.log.warn(`[lcm] overflow coverage refused: visible=${turnIds.size} anchored=${storedIds.size}` +
+          ` raw=${currentRaw.length} unanchored=${currentRaw.filter((message) => !message?.transcriptEntryId).length}` +
+          ` outsideTurn=${currentRaw.filter((message) => message?.transcriptEntryId && !turnIds.has(message.transcriptEntryId)).length}` +
+          ` initiatingUserMatches=${userIndex >= 0 && raw[userIndex]?.transcriptEntryId === ids[latestUserIndex]}`);
         throw new Error("overflow transcript has incomplete current-turn coverage");
       }
       await this.conversationStore.markConversationBootstrapped(conversationId);
