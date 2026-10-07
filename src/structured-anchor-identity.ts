@@ -27,8 +27,9 @@ function json(value: string | null | undefined): unknown {
 /** Structured provenance, not the parent's lossy plain-text index key. */
 export function structuredPartsIdentity(
   parts: readonly Omit<CreateMessagePartInput, "sessionId">[],
+  includeTextOnly = false,
 ): string | null {
-  if (!parts.some((part) => part.partType !== "text" || part.toolCallId)) return null;
+  if (!includeTextOnly && !parts.some((part) => part.partType !== "text" || part.toolCallId)) return null;
   return JSON.stringify(
     canonical(
       parts.map((part) => {

@@ -56,6 +56,14 @@ them.
 
 ## Recall tool availability
 
+OpenClaw 2026.9.8 may consume terminal assistant `MEDIA:` directives when
+delivering attachments, leaving canonical model text plus host-recorded delivery
+facts. Recovery can anchor that representation to its original stored response
+only when provider identity, the consumed URL sequence, and the remaining
+structured payload all match. Original stored bytes are retained. Missing
+delivery facts or unrelated changes remain unproven; this does not relax coverage
+or add a required host capability on older supported releases.
+
 Lossless declares `lcm_grep`, `lcm_describe`, `lcm_expand`, and
 `lcm_expand_query` for OpenClaw's `coding`, `messaging`, and `full` tool
 profiles. It also marks these read-only recall operations as safe to replay

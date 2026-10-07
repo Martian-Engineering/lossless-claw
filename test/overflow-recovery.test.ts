@@ -5,6 +5,7 @@ import type { VisibleSessionTranscriptMessageEntry } from "../src/types.js";
 import { estimateSerializedMessagesTokens } from "../src/estimate-tokens.js";
 import { ContextAssembler } from "../src/assembler.js";
 import { attachTranscriptEntryMeta } from "../src/transcript.js";
+import { BatchDeduplicator } from "../src/batch-dedup.js";
 import {
   extractAssistantToolCallIdsForPairing,
   extractToolResultIdForPairing,
@@ -74,7 +75,8 @@ function transcript(pairs = 12): VisibleSessionTranscriptMessageEntry[] {
 async function recover(
   entries: VisibleSessionTranscriptMessageEntry[],
   warm: boolean | "committed" | "committed-timed" = false,
-  settings = config
+  settings = config,
+  committedMessages?: AgentMessage[],
 ) {
   const complete = vi.fn(async () => ({
     content: [
@@ -106,7 +108,7 @@ async function recover(
         generation: "g1", rawSeq: entries.length,
         activeMessagePosition: entries.length - 1,
       },
-      messages: entries.map((entry) => warm === "committed-timed"
+      messages: committedMessages ?? entries.map((entry) => warm === "committed-timed"
         ? { ...entry.message, timestamp: Date.parse(entry.createdAt!) }
         : entry.message),
     });
@@ -170,6 +172,81 @@ async function recover(
 }
 
 describe("authoritative forced overflow recovery", () => {
+  it.each(["valid", "missing-facts", "different-urls", "reordered-urls", "different-text", "different-reasoning", "different-response", "no-host-entry"])(
+    "requires complete host delivery and structured provenance: %s", async (variant) => {
+      const engine = createEngineWithDeps(config);
+      const mediaUrls = ["/tmp/front.png", "/tmp/iso.png"];
+      const original = {
+        role: "assistant", responseId: "response-preview-proof",
+        content: [
+          { type: "thinking", thinking: "Reviewed the saved previews.", thinkingSignature: "reasoning_content" },
+          { type: "text", text: `\n\nHere are the previews.\n\nMEDIA:${mediaUrls[0]}\nMEDIA:${mediaUrls[1]}` },
+        ],
+      } as AgentMessage;
+      await engine.ingest({ sessionId, sessionKey, message: original });
+      const store = engine.getConversationStore();
+      const conversation = await store.getConversationForSession({ sessionId, sessionKey });
+      const persisted = await store.getLastMessage(conversation!.conversationId);
+      const incoming = {
+        ...original,
+        responseId: variant === "different-response" ? "response-unrelated" : "response-preview-proof",
+        content: [
+          { ...original.content[0], thinking: variant === "different-reasoning" ? "Unrelated reasoning." : "Reviewed the saved previews." },
+          { type: "text", text: variant === "different-text" ? "These previews differ." : "Here are the previews." },
+        ],
+        ...(variant === "missing-facts" ? {} : {
+          openclawDelivery: { textPhaseRequiresTerminal: true,
+            mediaUrls: variant === "different-urls" ? ["/tmp/other.png", mediaUrls[1]]
+              : variant === "reordered-urls" ? [...mediaUrls].reverse() : mediaUrls },
+        }),
+      } as AgentMessage;
+      const hosted = variant === "no-host-entry" ? incoming : attachTranscriptEntryMeta(incoming, {
+        entryId: "entry-proof-final", parentId: null, timestamp: null,
+      });
+      const dedup = new BatchDeduplicator(store, engine.getSummaryStore(), "/tmp/lcm-delivery-proof", {
+        log: { info: vi.fn(), debug: vi.fn(), warn: vi.fn(), error: vi.fn() },
+      });
+      expect(await dedup.matchesPersistedAnchor(persisted!.messageId, hosted)).toBe(variant === "valid");
+      expect((await store.getLastMessage(conversation!.conversationId))?.content).toBe(persisted!.content);
+      expect(await store.getMessageCount(conversation!.conversationId)).toBe(1);
+    },
+  );
+
+  it("anchors an assistant whose terminal media directives were consumed by host delivery", async () => {
+    const entries = transcript();
+    const timestamp = Date.parse(entries.at(-1)!.createdAt!) + 1;
+    const body = "Here are the independently rendered previews.";
+    const mediaUrls = ["/tmp/front.png", "/tmp/iso.png"];
+    const original = {
+      role: "assistant",
+      responseId: "response-delivered-preview",
+      timestamp,
+      content: [
+        { type: "thinking", thinking: "I reviewed both previews.", thinkingSignature: "reasoning_content" },
+        { type: "text", text: `${body}\n\n${mediaUrls.map((url) => `MEDIA:${url}`).join("\n")}` },
+      ],
+    } as AgentMessage;
+    entries.push({
+      entryId: "entry-delivered-preview", parentId: entries.at(-1)!.entryId,
+      seq: entries.length + 1, role: "assistant", createdAt: new Date(timestamp).toISOString(),
+      message: {
+        ...original,
+        content: [original.content[0], { type: "text", text: body }],
+        openclawDelivery: { textPhaseRequiresTerminal: true, mediaUrls },
+      } as AgentMessage,
+    });
+    const committed: AgentMessage[] = entries.map((entry) => ({ ...entry.message, timestamp: Date.parse(entry.createdAt!) }));
+    committed[committed.length - 1] = original;
+    const { engine, complete } = await recover(entries, "committed-timed", config, committed);
+    const store = engine.getConversationStore();
+    const conversation = await store.getConversationForSession({ sessionId, sessionKey });
+    const persisted = await store.getLastMessage(conversation!.conversationId);
+    expect(persisted?.transcriptEntryId).toBe("entry-delivered-preview");
+    expect(persisted?.content).toContain("MEDIA:/tmp/front.png");
+    expect(await store.getMessageCount(conversation!.conversationId)).toBe(entries.length);
+    expect(complete).toHaveBeenCalled();
+  });
+
   for (const warm of [false, true])
     it(`reduces the retry prompt and preserves raw history (existing prefix=${warm})`, async () => {
       const entries = transcript();
