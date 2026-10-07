@@ -5,6 +5,7 @@ import type { VisibleSessionTranscriptMessageEntry } from "../src/types.js";
 import { estimateSerializedMessagesTokens } from "../src/estimate-tokens.js";
 import { ContextAssembler } from "../src/assembler.js";
 import { attachTranscriptEntryMeta } from "../src/transcript.js";
+import { BatchDeduplicator } from "../src/batch-dedup.js";
 import {
   extractAssistantToolCallIdsForPairing,
   extractToolResultIdForPairing,
@@ -73,8 +74,9 @@ function transcript(pairs = 12): VisibleSessionTranscriptMessageEntry[] {
 /** Exercise the same compacted-result retry gate as supported OpenClaw overflow recovery. */
 async function recover(
   entries: VisibleSessionTranscriptMessageEntry[],
-  warm = false,
-  settings = config
+  warm: boolean | "committed" | "committed-timed" = false,
+  settings = config,
+  committedMessages?: AgentMessage[],
 ) {
   const complete = vi.fn(async () => ({
     content: [
@@ -91,7 +93,26 @@ async function recover(
     readVisibleSessionTranscriptMessageEntries: read,
     log: { info, debug: vi.fn(), warn: info, error: info },
   });
-  if (warm) {
+  if (warm === "committed" || warm === "committed-timed") {
+    const first = entries[0]!;
+    const last = entries.at(-1)!;
+    await engine.commitTurn({
+      sessionId, sessionKey, sessionTarget, advancementKey: "bare-host-turn",
+      admission: {
+        ...sessionTarget, entryId: first.entryId, effectiveParentId: null,
+        generation: "g1", logicalTurnId: "bare-host-turn", rawSeq: 1,
+        activeMessagePosition: 0, role: "user",
+      },
+      terminal: {
+        ...sessionTarget, entryId: last.entryId, effectiveParentId: last.parentId,
+        generation: "g1", rawSeq: entries.length,
+        activeMessagePosition: entries.length - 1,
+      },
+      messages: committedMessages ?? entries.map((entry) => warm === "committed-timed"
+        ? { ...entry.message, timestamp: Date.parse(entry.createdAt!) }
+        : entry.message),
+    });
+  } else if (warm) {
     await engine.ingest({
       sessionId,
       sessionKey,
@@ -151,6 +172,81 @@ async function recover(
 }
 
 describe("authoritative forced overflow recovery", () => {
+  it.each(["valid", "missing-facts", "different-urls", "reordered-urls", "different-text", "different-reasoning", "different-response", "no-host-entry"])(
+    "requires complete host delivery and structured provenance: %s", async (variant) => {
+      const engine = createEngineWithDeps(config);
+      const mediaUrls = ["/tmp/front.png", "/tmp/iso.png"];
+      const original = {
+        role: "assistant", responseId: "response-preview-proof",
+        content: [
+          { type: "thinking", thinking: "Reviewed the saved previews.", thinkingSignature: "reasoning_content" },
+          { type: "text", text: `\n\nHere are the previews.\n\nMEDIA:${mediaUrls[0]}\nMEDIA:${mediaUrls[1]}` },
+        ],
+      } as AgentMessage;
+      await engine.ingest({ sessionId, sessionKey, message: original });
+      const store = engine.getConversationStore();
+      const conversation = await store.getConversationForSession({ sessionId, sessionKey });
+      const persisted = await store.getLastMessage(conversation!.conversationId);
+      const incoming = {
+        ...original,
+        responseId: variant === "different-response" ? "response-unrelated" : "response-preview-proof",
+        content: [
+          { ...original.content[0], thinking: variant === "different-reasoning" ? "Unrelated reasoning." : "Reviewed the saved previews." },
+          { type: "text", text: variant === "different-text" ? "These previews differ." : "Here are the previews." },
+        ],
+        ...(variant === "missing-facts" ? {} : {
+          openclawDelivery: { textPhaseRequiresTerminal: true,
+            mediaUrls: variant === "different-urls" ? ["/tmp/other.png", mediaUrls[1]]
+              : variant === "reordered-urls" ? [...mediaUrls].reverse() : mediaUrls },
+        }),
+      } as AgentMessage;
+      const hosted = variant === "no-host-entry" ? incoming : attachTranscriptEntryMeta(incoming, {
+        entryId: "entry-proof-final", parentId: null, timestamp: null,
+      });
+      const dedup = new BatchDeduplicator(store, engine.getSummaryStore(), "/tmp/lcm-delivery-proof", {
+        log: { info: vi.fn(), debug: vi.fn(), warn: vi.fn(), error: vi.fn() },
+      });
+      expect(await dedup.matchesPersistedAnchor(persisted!.messageId, hosted)).toBe(variant === "valid");
+      expect((await store.getLastMessage(conversation!.conversationId))?.content).toBe(persisted!.content);
+      expect(await store.getMessageCount(conversation!.conversationId)).toBe(1);
+    },
+  );
+
+  it("anchors an assistant whose terminal media directives were consumed by host delivery", async () => {
+    const entries = transcript();
+    const timestamp = Date.parse(entries.at(-1)!.createdAt!) + 1;
+    const body = "Here are the independently rendered previews.";
+    const mediaUrls = ["/tmp/front.png", "/tmp/iso.png"];
+    const original = {
+      role: "assistant",
+      responseId: "response-delivered-preview",
+      timestamp,
+      content: [
+        { type: "thinking", thinking: "I reviewed both previews.", thinkingSignature: "reasoning_content" },
+        { type: "text", text: `${body}\n\n${mediaUrls.map((url) => `MEDIA:${url}`).join("\n")}` },
+      ],
+    } as AgentMessage;
+    entries.push({
+      entryId: "entry-delivered-preview", parentId: entries.at(-1)!.entryId,
+      seq: entries.length + 1, role: "assistant", createdAt: new Date(timestamp).toISOString(),
+      message: {
+        ...original,
+        content: [original.content[0], { type: "text", text: body }],
+        openclawDelivery: { textPhaseRequiresTerminal: true, mediaUrls },
+      } as AgentMessage,
+    });
+    const committed: AgentMessage[] = entries.map((entry) => ({ ...entry.message, timestamp: Date.parse(entry.createdAt!) }));
+    committed[committed.length - 1] = original;
+    const { engine, complete } = await recover(entries, "committed-timed", config, committed);
+    const store = engine.getConversationStore();
+    const conversation = await store.getConversationForSession({ sessionId, sessionKey });
+    const persisted = await store.getLastMessage(conversation!.conversationId);
+    expect(persisted?.transcriptEntryId).toBe("entry-delivered-preview");
+    expect(persisted?.content).toContain("MEDIA:/tmp/front.png");
+    expect(await store.getMessageCount(conversation!.conversationId)).toBe(entries.length);
+    expect(complete).toHaveBeenCalled();
+  });
+
   for (const warm of [false, true])
     it(`reduces the retry prompt and preserves raw history (existing prefix=${warm})`, async () => {
       const entries = transcript();
@@ -215,6 +311,90 @@ describe("authoritative forced overflow recovery", () => {
       expect(rows.filter((row) => row.role === "tool")).toHaveLength(12);
       expect(rows.at(-1)!.content).toContain("FILE_11");
       expect(rows.find((row) => row.content.includes("FILE_0"))).toBeTruthy();
+    });
+
+  for (const warm of [false, true, "committed", "committed-timed"] as const)
+    it(`recovers nested-tool display rows without losing persisted history (existing prefix=${warm})`, async () => {
+      const source = transcript();
+      const entries = source.flatMap((entry) => {
+        if (entry.message.role !== "toolResult") return [entry];
+        const message = {
+          role: "custom",
+          customType: "openclaw.nested-tool.v1",
+          display: true,
+          excludeFromContext: true,
+          content: "",
+          details: {
+            parentToolCallId: (entry.message as { toolCallId?: string }).toolCallId,
+          },
+        } as unknown as AgentMessage;
+        return [entry, {
+          ...entry,
+          entryId: `display-${entry.entryId}`,
+          parentId: entry.entryId,
+          role: message.role,
+          message,
+        }];
+      });
+      const { engine, retry, complete, provider } = await recover(entries, warm);
+      await expect(provider(retry.messages)).resolves.toMatchObject({ role: "assistant" });
+      expect(complete).toHaveBeenCalled();
+      expect(retry.messages[0]).toMatchObject(source[0]!.message);
+      const conversation = await engine.getConversationStore()
+        .getConversationForSession({ sessionId, sessionKey });
+      const rows = await engine.getConversationStore()
+        .getMessages(conversation!.conversationId);
+      expect(rows.map((row) => row.transcriptEntryId)).toEqual(source.map((entry) => entry.entryId));
+      expect(rows.at(-1)!.content).toContain("FILE_11");
+      const calls = retry.messages.flatMap(extractAssistantToolCallIdsForPairing);
+      const results = retry.messages.map(extractToolResultIdForPairing).filter(Boolean);
+      expect(results).toEqual(calls);
+      expect(results).toContain("call_11");
+    });
+
+  it.each(["partial", "reordered", "stale suffix"])(
+    "does not adopt a bare legacy turn with an unproven ordered tail: %s", async (kind) => {
+      const entries = transcript();
+      const complete = vi.fn();
+      const engine = createEngineWithDeps(config, {
+        complete,
+        readVisibleSessionTranscriptMessageEntries: async () => entries,
+      });
+      const stored = [...entries];
+      if (kind === "partial") stored.splice(2, 1);
+      if (kind === "reordered") [stored[1], stored[2]] = [stored[2]!, stored[1]!];
+      const first = entries[0]!, last = entries.at(-1)!;
+      const messages = stored.map((entry) => ({
+        ...entry.message, timestamp: Date.parse(entry.createdAt!),
+      }));
+      if (kind === "stale suffix") messages.push({
+        role: "assistant", content: "unrepresented later evidence",
+        timestamp: Date.parse(last.createdAt!) + 1,
+      } as AgentMessage & { timestamp: number });
+      await engine.commitTurn({
+        sessionId, sessionKey, sessionTarget, advancementKey: "unproven-bare-turn",
+        admission: {
+          ...sessionTarget, entryId: first.entryId, effectiveParentId: null,
+          generation: "g1", logicalTurnId: "unproven-bare-turn", rawSeq: 1,
+          activeMessagePosition: 0, role: "user",
+        },
+        terminal: {
+          ...sessionTarget, entryId: last.entryId, effectiveParentId: last.parentId,
+          generation: "g1", rawSeq: messages.length,
+          activeMessagePosition: messages.length - 1,
+        },
+        messages,
+      });
+      const store = engine.getConversationStore();
+      const conversation = await store.getConversationForSession({ sessionId, sessionKey });
+      const before = await store.getMessages(conversation!.conversationId);
+      const result = await engine.compact({
+        sessionId, sessionKey, sessionTarget, sessionFile: "",
+        force: true, compactionTarget: "budget", tokenBudget: 8000, runtimeSettings,
+      });
+      expect(result.compacted).toBe(false);
+      expect(complete).not.toHaveBeenCalled();
+      expect(await store.getMessages(conversation!.conversationId)).toEqual(before);
     });
 
   it("retains the initiating user when the configured fresh tail is disabled", async () => {

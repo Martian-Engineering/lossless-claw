@@ -41,6 +41,7 @@ import {
   transcriptTimestampMs,
 } from "./transcript.js";
 import { structuredPartsIdentity } from "./structured-anchor-identity.js";
+import { extractStableEventKey } from "./stable-event-key.js";
 import type { LcmDependencies } from "./types.js";
 
 type RedactSensitiveText = (content: string) => string;
@@ -48,6 +49,7 @@ type StoredIncomingMatch =
   | "exact"
   | "externalized"
   | "unproven-externalized"
+  | "delivered"
   | "redacted";
 type CoveredStoredIncomingMatch = StoredIncomingMatch | "decorated";
 type AlignmentMatch = CoveredStoredIncomingMatch | "unanchored-inbound";
@@ -113,6 +115,53 @@ export class BatchDeduplicator {
     private readonly deps: Pick<LcmDependencies, "log">,
     private readonly redactSensitiveText: RedactSensitiveText | undefined = loadOpenClawRedactor(),
   ) {}
+
+  /**
+   * OpenClaw's terminal display rewrite consumes MEDIA footers and trims text.
+   * Match only the host-recorded consumed URLs on the same provider response,
+   * with identical remaining structured payload. Persisted bytes stay intact.
+   */
+  private async matchesHostDeliveredAssistant(
+    persisted: MessageRecord,
+    incoming: StoredMessage,
+    message: AgentMessage,
+    parts: Awaited<ReturnType<ConversationStore["getMessageParts"]>>,
+  ): Promise<boolean> {
+    if (persisted.role !== "assistant" || incoming.role !== "assistant" || !getTranscriptEntryId(message)) return false;
+    const delivery = (message as Record<string, unknown>).openclawDelivery;
+    if (!delivery || typeof delivery !== "object" || Array.isArray(delivery)) return false;
+    const facts = delivery as Record<string, unknown>;
+    const urls = facts.mediaUrls;
+    if (facts.textPhaseRequiresTerminal !== true || !Array.isArray(urls) || urls.length === 0 ||
+        !urls.every((url): url is string => typeof url === "string" && url.length > 0 && !/[\r\n]/.test(url))) return false;
+    const key = extractStableEventKey(message);
+    if (!key?.startsWith("assistant-response:") ||
+        await this.conversationStore.getMessageIdByStableEventKey(persisted.conversationId, key) !== persisted.messageId) return false;
+    const consume = (text: string): string | null => {
+      const lines = text.split("\n");
+      const first = lines.findIndex((line) => line.startsWith("MEDIA:"));
+      if (first < 0) return null;
+      const footer = lines.slice(first).filter((line) => line.trim().length > 0);
+      if (footer.length !== urls.length || !footer.every((line, index) => line === `MEDIA:${urls[index]}`)) return null;
+      return lines.slice(0, first).join("\n").trim();
+    };
+    if (consume(persisted.content) !== incoming.content) return false;
+    let consumedParts = 0;
+    const normalized = parts.map((part) => {
+      if (part.partType !== "text" || !part.textContent) return part;
+      const text = consume(part.textContent);
+      if (text === null) return part;
+      consumedParts += 1;
+      const metadata = parsePartMetadata(part.metadata);
+      if (!metadata || !metadata.raw || typeof metadata.raw !== "object" || Array.isArray(metadata.raw)) return part;
+      const raw = metadata.raw as Record<string, unknown>;
+      if (raw.type !== "text" || raw.text !== part.textContent) return part;
+      return { ...part, textContent: text, metadata: JSON.stringify({ ...metadata, raw: { ...raw, text } }) };
+    });
+    if (consumedParts !== 1) return false;
+    const expected = buildMessageParts({ sessionId: "", message, fallbackContent: incoming.content });
+    return structuredPartsIdentity(normalized, true) === structuredPartsIdentity(expected, true);
+  }
 
   /**
    * Accept host redaction only when both faces carry the same complete set of
@@ -903,6 +952,9 @@ export class BatchDeduplicator {
     incomingRawPayloadContent?: string | null,
   ): Promise<StoredIncomingMatch | null> {
     const storedParts = await this.conversationStore.getMessageParts(storedMessage.messageId);
+    if (await this.matchesHostDeliveredAssistant(storedMessage, incoming, incomingMessage, storedParts)) {
+      return "delivered";
+    }
     const storedStructured = structuredPartsIdentity(storedParts);
     const incomingStructured = structuredPartsIdentity(
       buildMessageParts({

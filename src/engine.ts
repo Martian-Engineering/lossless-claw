@@ -2858,12 +2858,45 @@ export class LcmContextEngine implements ContextEngine {
             entryIds,
           )
         : new Set<string>();
+    // Durable host commits can contain bare messages without per-entry metadata.
+    // A complete recovery snapshot may match the entire current turn, rather
+    // than only the configured fresh tail. The planner still requires unique
+    // structured matches; normal reconciliation retains its bounded window.
+    const recoveryUserIndex = params.completeRecoverySnapshot
+      ? params.historicalMessages.findLastIndex((message) => message.role === "user")
+      : -1;
+    const recoveryTurnLength = recoveryUserIndex < 0 ? 0
+      : params.historicalMessages.slice(recoveryUserIndex).filter(hasPersistableMessageRole).length;
     const adoptionPlan = await this.batchDeduplicator.planRecentTranscriptEntryAdoptions({
       conversationId: params.conversationId,
       messages: params.historicalMessages,
-      tailWindow: this.config.freshTailCount,
+      tailWindow: Math.max(this.config.freshTailCount, recoveryTurnLength),
       existingEntryIds,
     });
+    // Legacy-prefix fencing is deliberately conservative for ordinary replay.
+    // Forced recovery can prove a bare durable commit without an initial anchor
+    // only when every persistable current-turn entry uniquely matches the entire
+    // stored tail, in order. A partial, reordered, ambiguous or stale match is
+    // not sufficient. The planner still validates structured content and time.
+    const recoveryTurn = recoveryUserIndex < 0 ? [] : params.historicalMessages
+      .map((message, index) => ({ message, index }))
+      .slice(recoveryUserIndex)
+      .filter(({ message }) => hasPersistableMessageRole(message));
+    const recoveryTail = recoveryTurn.length > 0
+      ? await this.conversationStore.getLastMessages(params.conversationId, recoveryTurn.length)
+      : [];
+    const fullyMatchedCurrentTurn = recoveryTurn.length > 0 &&
+      recoveryTail.length === recoveryTurn.length &&
+      recoveryTail[0]?.role === "user" &&
+      recoveryTurn.every(({ index }, offset) =>
+        adoptionPlan.get(index)?.messageId === recoveryTail[offset]?.messageId);
+
+    if (params.completeRecoverySnapshot) {
+      this.deps.log.warn(`[lcm] overflow reconciliation plan: visible=${params.historicalMessages.length}` +
+        ` current=${recoveryTurnLength} existingAnchors=${existingEntryIds.size} adoptions=${adoptionPlan.size}` +
+        ` legacyPrefix=${Boolean(params.legacyPrefixAnchorEntryId)} requireOverlap=${Boolean(params.requireOverlap)}` +
+        ` orderedTurnMatch=${fullyMatchedCurrentTurn}`);
+    }
 
     for (let index = 0; index < params.historicalMessages.length; index += 1) {
       const message = params.historicalMessages[index]!;
@@ -2937,7 +2970,8 @@ export class LcmContextEngine implements ContextEngine {
 
       const stored = toStoredMessageIdentity(message);
       const canUseWeakIdentityAdoption =
-        (!params.legacyPrefixAnchorEntryId || hasOverlap) && !establishedEpochBoundary;
+        (!params.legacyPrefixAnchorEntryId || hasOverlap || fullyMatchedCurrentTurn) &&
+        !establishedEpochBoundary;
       const adoption = adoptionPlan.get(index);
       if (
         entryId &&
@@ -5285,7 +5319,12 @@ export class LcmContextEngine implements ContextEngine {
       }
       // Reconciliation may deliberately skip uncertain history. Only a fully
       // represented current turn may authorize the recovery-only tail exception.
-      const turnIds = new Set(ids.slice(latestUserIndex));
+      // Host display-only rows (for example nested-tool diagnostics) are not
+      // persisted. Require complete coverage of the same message roles that
+      // reconciliation accepts, without relaxing identity or raw-tail checks.
+      const turnIds = new Set(entries.slice(latestUserIndex)
+        .filter((entry) => hasPersistableMessageRole(entry.message))
+        .map((entry) => entry.entryId));
       const storedIds = await this.conversationStore.filterExistingTranscriptEntryIds(conversationId, [...turnIds]);
       const context = await this.summaryStore.getContextItems(conversationId);
       const raw = await Promise.all(context.filter((item) => item.messageId != null)
@@ -5294,6 +5333,13 @@ export class LcmContextEngine implements ContextEngine {
       if (storedIds.size !== turnIds.size || userIndex < 0 ||
           raw[userIndex]?.transcriptEntryId !== ids[latestUserIndex] ||
           raw.slice(userIndex).some((message) => !message?.transcriptEntryId || !turnIds.has(message.transcriptEntryId))) {
+        // Counts only: make a refusal diagnosable without exposing transcript
+        // text, identifiers, tool payloads or externalized-file capabilities.
+        const currentRaw = userIndex < 0 ? [] : raw.slice(userIndex);
+        this.deps.log.warn(`[lcm] overflow coverage refused: visible=${turnIds.size} anchored=${storedIds.size}` +
+          ` raw=${currentRaw.length} unanchored=${currentRaw.filter((message) => !message?.transcriptEntryId).length}` +
+          ` outsideTurn=${currentRaw.filter((message) => message?.transcriptEntryId && !turnIds.has(message.transcriptEntryId)).length}` +
+          ` initiatingUserMatches=${userIndex >= 0 && raw[userIndex]?.transcriptEntryId === ids[latestUserIndex]}`);
         throw new Error("overflow transcript has incomplete current-turn coverage");
       }
       await this.conversationStore.markConversationBootstrapped(conversationId);

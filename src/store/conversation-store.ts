@@ -1202,6 +1202,17 @@ export class ConversationStore {
     return row?.count === 1;
   }
 
+  /** Provider identity is a candidate, not proof that two payloads are equal. */
+  async getMessageIdByStableEventKey(
+    conversationId: ConversationId,
+    stableEventKey: string,
+  ): Promise<MessageId | null> {
+    const row = this.db.prepare(
+      "SELECT message_id FROM messages WHERE conversation_id = ? AND stable_event_key = ? LIMIT 1",
+    ).get(conversationId, stableEventKey) as { message_id: number } | undefined;
+    return row?.message_id ?? null;
+  }
+
   /**
    * Tier-1 replay-twin gate for the append-only reconcile path: does this
    * conversation already hold a row with the same role, identity hash, and
