@@ -87,6 +87,13 @@ function createRuntimeCompactionDelegate(log: LcmDependencies["log"]): RuntimeCo
     const core = await loadPluginSdkCore(log);
     const delegate = core?.delegateCompactionToRuntime;
     if (!delegate) {
+      if (params.runtimeContext?.preflightCompactionTrigger === "transcript_bytes") {
+        return {
+          ok: false,
+          compacted: false,
+          reason: "canonical transcript byte compaction requires the OpenClaw runtime delegate",
+        };
+      }
       log.debug(
         `[lcm] runtime compaction delegate unavailable for ignored session=${params.sessionId}${params.sessionKey?.trim() ? ` sessionKey=${params.sessionKey.trim()}` : ""}`,
       );

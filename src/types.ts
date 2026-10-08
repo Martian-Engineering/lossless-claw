@@ -152,7 +152,7 @@ export interface LcmDependencies {
   /** LLM completion function for summarization */
   complete: CompleteFn;
 
-  /** Optional OpenClaw runtime compaction delegate for sessions LCM intentionally ignores */
+  /** OpenClaw-owned transcript compaction for excluded sessions and canonical byte pressure. */
   delegateCompactionToRuntime?: RuntimeCompactionDelegateFn;
 
   /** Gateway RPC call function (for subagent spawning, session ops) */
