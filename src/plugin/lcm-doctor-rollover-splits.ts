@@ -101,6 +101,7 @@ const HANDLED_CONVERSATION_ID_TABLES = new Set([
   "focus_briefs",
   "message_transcript_anchor_trust",
   "conversation_transcript_epochs",
+  "conversation_transcript_cursors",
   "pending_compaction_batches",
   "pending_summary_nodes",
 ]);
@@ -615,10 +616,13 @@ function deleteInvalidatedPendingCompactionState(db: DatabaseSync, group: SafeGr
 
 function clearSourceStateAndMarkTarget(db: DatabaseSync, group: SafeGroup): void {
   const sourcePlaceholders = placeholders(group.sourceConversationIds);
+  // The target keeps its own transcript cursor; source watermarks describe
+  // lanes that no longer exist after the merge.
   for (const table of [
     "conversation_bootstrap_state",
     "conversation_compaction_maintenance",
     "conversation_compaction_telemetry",
+    "conversation_transcript_cursors",
   ]) {
     if (!hasTable(db, table)) {
       continue;
