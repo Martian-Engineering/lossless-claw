@@ -1,7 +1,9 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { cleanupEngineTestState, createEngineWithDepsOverridesAndDb } from "./helpers.js";
+import { cleanupEngineTestState, createEngineWithDepsOverridesAndDb, useLegacyTranscriptPath } from "./helpers.js";
 import type { AgentMessage } from "../src/openclaw-bridge.js";
 
+// Legacy unstamped-row adoption now runs only during one-time cursor migration.
+useLegacyTranscriptPath();
 afterEach(cleanupEngineTestState);
 
 const baseTime = Date.parse("2026-06-21T10:19:00.000Z");

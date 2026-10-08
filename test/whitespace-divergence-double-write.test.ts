@@ -8,8 +8,12 @@ import type { LcmDependencies, VisibleSessionTranscriptMessageEntry } from "../s
 import {
   cleanupEngineTestState,
   createEngineWithDepsOverridesAndDb,
+  useLegacyTranscriptPath,
 } from "./helpers.js";
 
+// Covered-frontier runtime-batch alignment applies only to engines without a
+// visible-delta reader; cursor mode never persists runtime arrays.
+useLegacyTranscriptPath();
 afterEach(cleanupEngineTestState);
 
 const LABEL = "tool policy update; the disabled tools are listed below:";

@@ -1,9 +1,13 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { cleanupEngineTestState, createEngineWithDepsOverridesAndDb } from "./helpers.js";
+import { cleanupEngineTestState, createEngineWithDepsOverridesAndDb, useLegacyTranscriptPath } from "./helpers.js";
 import type { AgentMessage } from "../src/openclaw-bridge.js";
 import type { LcmDependencies, VisibleSessionTranscriptMessageEntry } from "../src/types.js";
 import { attachTranscriptEntryMeta } from "../src/transcript.js";
 
+// These tests pin the legacy full-projection reconcile (adoption, legacy-prefix
+// epochs, stale-id restamps, import caps) that now runs only as the one-time
+// cursor migration step, and build legacy state through runtime ingest.
+useLegacyTranscriptPath();
 afterEach(cleanupEngineTestState);
 
 function decoratedRoomEvent(body: string): string {

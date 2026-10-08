@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { cleanupEngineTestState, createEngineWithDeps } from "./helpers.js";
+import { cleanupEngineTestState, createEngineWithDeps, seedStoredMessage } from "./helpers.js";
 import { attachTranscriptEntryMeta } from "../src/transcript.js";
 import type { AgentMessage, CompactResult } from "../src/openclaw-bridge.js";
 import type { CompactionEngine } from "../src/compaction.js";
@@ -15,7 +15,7 @@ type PendingResult = CompactResult & { pending?: boolean };
 /** Seed real SQLite debt while substituting only the compaction outcome. */
 async function outcomeFixture(result: PendingResult, withDebt = true) {
   const engine = createEngineWithDeps({});
-  await engine.ingest({ sessionId, sessionKey, message: { role: "user", content: "Retained message" } });
+  await seedStoredMessage(engine, { sessionId, sessionKey, message: { role: "user", content: "Retained message" } });
   const conversationId = (await engine.getConversationStore().getConversationForSession({ sessionId, sessionKey }))!.conversationId;
   const store = engine.getCompactionMaintenanceStore();
   if (withDebt) await store.requestProactiveCompactionDebt({
@@ -109,7 +109,7 @@ async function partialRecovery(withDebt: boolean) {
   { complete, readVisibleSessionTranscriptMessageEntries: async () => entries });
   // An anchored prefix lets overflow reconcile the host transcript without
   // treating the already stored initiating user as another message.
-  await engine.ingest({ sessionId, sessionKey, message: attachTranscriptEntryMeta(entries[0]!.message,
+  await seedStoredMessage(engine, { sessionId, sessionKey, message: attachTranscriptEntryMeta(entries[0]!.message,
     { entryId: entries[0]!.entryId, parentId: null, timestamp: entries[0]!.createdAt }) });
   const conversationId = (await engine.getConversationStore().getConversationForSession({ sessionId, sessionKey }))!.conversationId;
   const store = engine.getCompactionMaintenanceStore();

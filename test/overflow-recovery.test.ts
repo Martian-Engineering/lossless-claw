@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { cleanupEngineTestState, createEngineWithDeps } from "./helpers.js";
+import { cleanupEngineTestState, createEngineWithDeps, seedStoredMessage } from "./helpers.js";
 import type { AgentMessage } from "../src/openclaw-bridge.js";
 import type { VisibleSessionTranscriptMessageEntry } from "../src/types.js";
 import { estimateSerializedMessagesTokens } from "../src/estimate-tokens.js";
@@ -92,7 +92,7 @@ async function recover(
     log: { info, debug: vi.fn(), warn: info, error: info },
   });
   if (warm) {
-    await engine.ingest({
+    await seedStoredMessage(engine, {
       sessionId,
       sessionKey,
       message: attachTranscriptEntryMeta(entries[0]!.message, {
@@ -265,7 +265,7 @@ describe("authoritative forced overflow recovery", () => {
       readVisibleSessionTranscriptMessageEntries: read,
     });
     for (const entry of entries)
-      await engine.ingest({ sessionId, sessionKey, message: entry.message });
+      await seedStoredMessage(engine, { sessionId, sessionKey, message: entry.message });
     const result = await engine.compact({
       sessionId,
       sessionKey,
@@ -292,7 +292,7 @@ describe("authoritative forced overflow recovery", () => {
         } as AgentMessage,
       ];
       for (const message of messages)
-        await engine.ingest({ sessionId, sessionKey, message });
+        await seedStoredMessage(engine, { sessionId, sessionKey, message });
       const store = engine.getConversationStore();
       const summaries = engine.getSummaryStore();
       const conversation = await store.getConversationForSession({
@@ -464,7 +464,7 @@ describe("authoritative forced overflow recovery", () => {
     });
     if (kind === "stale raw suffix") {
       for (const entry of entries)
-        await engine.ingest({
+        await seedStoredMessage(engine, {
           sessionId,
           sessionKey,
           message: attachTranscriptEntryMeta(entry.message, {
@@ -473,14 +473,14 @@ describe("authoritative forced overflow recovery", () => {
             timestamp: null,
           }),
         });
-      await engine.ingest({
+      await seedStoredMessage(engine, {
         sessionId,
         sessionKey,
         message: { role: "assistant", content: "stale epoch suffix" },
       });
     }
     if (kind === "unrelated projection") {
-      await engine.ingest({
+      await seedStoredMessage(engine, {
         sessionId,
         sessionKey,
         message: attachTranscriptEntryMeta(
@@ -592,7 +592,7 @@ it.each([1, 2])(
       { role: "user", content: "Another historical question." },
       { role: "assistant", content: "Another historical answer." },
     ])
-      await engine.ingest({
+      await seedStoredMessage(engine, {
         sessionId,
         sessionKey,
         message: message as AgentMessage,
@@ -652,7 +652,7 @@ it.each([1, 2])(
       });
     }
     // Existing old prefix has no projection identity, so explicitly ingest the shared anchor.
-    await engine.ingest({
+    await seedStoredMessage(engine, {
       sessionId,
       sessionKey,
       message: attachTranscriptEntryMeta(entries[0]!.message, {

@@ -121,7 +121,76 @@ export function parseAgentSessionKey(sessionKey: string): { agentId: string; suf
   };
 }
 
+let legacyTranscriptPath = false;
+
+/**
+ * Opt the calling test file into the legacy full-projection reconcile path by
+ * not deriving a visible-delta reader. Only suites that pin the legacy
+ * reconcile (now reached by one-time cursor migration) or runtime-batch
+ * persistence use this; vitest isolates this flag per test file.
+ */
+export function useLegacyTranscriptPath(): void {
+  legacyTranscriptPath = true;
+}
+
+/**
+ * Mirror production wiring: when a test supplies the full visible-projection
+ * reader, also supply a visible-delta reader derived from it, so engine entry
+ * points take the same single-writer cursor path that the plugin wires.
+ */
+export function withProductionTranscriptRouting(deps: LcmDependencies): LcmDependencies {
+  const read = deps.readVisibleSessionTranscriptMessageEntries;
+  if (legacyTranscriptPath || !read || "readSessionTranscriptVisibleMessageDelta" in deps) {
+    return deps;
+  }
+  return {
+    ...deps,
+    readSessionTranscriptVisibleMessageDelta: async (params) => {
+      const { cursor, maxBytes: _maxBytes, maxMessages, ...target } = params;
+      const entries = await read(target);
+      const initial = Buffer.from(JSON.stringify({ pos: -1, id: null })).toString("base64url");
+      const parsed = cursor
+        ? (JSON.parse(Buffer.from(cursor, "base64url").toString("utf8")) as { pos: number; id: string | null })
+        : { pos: -1, id: null };
+      if (parsed.id !== null) {
+        const position = entries.findIndex((entry) => entry.entryId === parsed.id);
+        if (position !== parsed.pos) {
+          return { kind: "reset", cursor: initial, reason: position < 0 ? "anchor_missing" : "anchor_moved" };
+        }
+      }
+      const page = entries.slice(parsed.pos + 1, parsed.pos + 1 + (maxMessages ?? 1000));
+      const last = page.at(-1);
+      const next = last ? { pos: parsed.pos + page.length, id: last.entryId } : parsed;
+      return {
+        kind: "page",
+        cursor: Buffer.from(JSON.stringify(next)).toString("base64url"),
+        entries: page,
+        hasMore: parsed.pos + 1 + page.length < entries.length,
+        serializedBytes: 0,
+      };
+    },
+  };
+}
+
+/**
+ * Persist one message through the engine's storage policy without the
+ * transcript-delta writer. Fixtures use it to seed rows (stamped when the
+ * message carries transcript meta) the way pre-cursor runtime ingest did.
+ */
+export async function seedStoredMessage(
+  engine: LcmContextEngine,
+  params: { sessionId: string; sessionKey?: string; message: AgentMessage; isHeartbeat?: boolean },
+): Promise<{ ingested: boolean }> {
+  const ingestSingle = Reflect.get(engine, "ingestSingle") as (
+    input: typeof params,
+  ) => Promise<{ ingested: boolean }>;
+  return ingestSingle.call(engine, params);
+}
+
 export class TestLcmContextEngine extends LcmContextEngine {
+  constructor(deps: LcmDependencies, database: ConstructorParameters<typeof LcmContextEngine>[1]) {
+    super(withProductionTranscriptRouting(deps), database);
+  }
 }
 
 export function createTestDeps(
