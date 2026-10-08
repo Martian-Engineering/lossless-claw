@@ -58,7 +58,11 @@ The OpenClaw transcript is the log; LCM stores a projection of it plus a per-con
 2. **commitTurn** / **afterTurn** — Drain the delta (which now includes the finished turn), then evaluate whether `contextThreshold` requires compaction. `commitTurn` records its idempotency receipt in the transaction that stores the final cursor. Runtime message arrays are never persisted.
 3. **ingest** / **ingestBatch** — Drain the delta for transcript-backed sessions instead of persisting their payloads.
 
-When OpenClaw invalidates a cursor (for example after an in-place rewrite rotates the transcript generation), LCM resyncs in bulk: one query for the stored transcript entry ids, a payload-free scan of the visible projection, and imports only after the last known entry. Re-issued entries are restamped onto their existing rows instead of being imported again. Conversations created before cursor mode run the legacy reconcile once, then switch to the cursor.
+When OpenClaw invalidates a cursor (for example after an in-place rewrite rotates the transcript generation), LCM resyncs in bulk: one query for the stored transcript entry ids, a payload-free scan of the visible projection, and imports only after the last known entry. Re-issued entries are restamped onto their existing rows instead of being imported again. Resync only adds or re-issues transcript entry ids; it never clears an id or deletes a row.
+
+A conversation created before cursor mode migrates on its first sync with the same bulk resync: it anchors on the last stored entry id that is still visible, stamps unstamped rows after that anchor when their content matches in order, imports only entries after the anchor, and records the frontier cursor. History before the anchor that was never stored stays unimported, so nothing is appended out of order. After `/reset`, the replacement conversation imports only messages after the reset boundary.
+
+lossless-claw requires OpenClaw's `readSessionTranscriptVisibleMessageDelta`. Every supported OpenClaw release ships it; if a host lacks it, lossless-claw logs a capability error and skips transcript ingestion rather than falling back to full-transcript reconciliation.
 
 ### Leaf compaction
 
