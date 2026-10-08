@@ -2936,13 +2936,19 @@ export class LcmContextEngine implements ContextEngine {
       }
 
       const stored = toStoredMessageIdentity(message);
+      // A later trusted anchor restores continuity after the latest suspect entry.
+      const canAdoptAfterEpochBoundary =
+        !establishedEpochBoundary || overlapAnchorIndex > epochBoundaryIndex;
       const canUseWeakIdentityAdoption =
-        (!params.legacyPrefixAnchorEntryId || hasOverlap) && !establishedEpochBoundary;
+        (!params.legacyPrefixAnchorEntryId || hasOverlap) && canAdoptAfterEpochBoundary;
       const adoption = adoptionPlan.get(index);
       if (
         entryId &&
         !existingEntryIds.has(entryId) &&
-        !establishedEpochBoundary &&
+        canAdoptAfterEpochBoundary &&
+        // Promoting a live row must not skip a missing entry in the recovered tail.
+        (!establishedEpochBoundary ||
+          !importableMessages.some((candidate) => candidate.index > overlapAnchorIndex)) &&
         adoption &&
         (adoption.decorated || canUseWeakIdentityAdoption) &&
         (await this.conversationStore.adoptTranscriptEntryIdForMessage(
