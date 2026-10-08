@@ -58,6 +58,8 @@ When OpenClaw processes a turn, it calls the context engine's lifecycle hooks:
 2. **ingest** / **ingestBatch** — Persists new messages to the database and appends them to context_items.
 3. **afterTurn** — After the model responds, ingests new messages, then evaluates whether `contextThreshold` requires compaction.
 
+Projection reconciliation stops adopting live rows at a suspect transcript anchor. A later verified anchor restores adoption for the following tail without upgrading the earlier suspect anchor. Existing identity, uniqueness, and structured-content checks still apply. If adopting a row would skip a missing projection entry after that verified anchor, reconciliation retains the conservative import behavior instead.
+
 ### Leaf compaction
 
 The **leaf pass** converts raw messages into leaf summaries:
