@@ -24,7 +24,7 @@ import {
 } from "../src/assemble-fallback.js";
 import type { AgentMessage } from "../src/openclaw-bridge.js";
 import type { LcmDependencies } from "../src/types.js";
-import { createTestConfig as createSharedTestConfig, createTestDeps as createSharedTestDeps } from "./helpers.js";
+import { createTestConfig as createSharedTestConfig, createTestDeps as createSharedTestDeps, TestLcmContextEngine } from "./helpers.js";
 
 const tempDirs: string[] = [];
 const engines: LcmContextEngine[] = [];
@@ -73,7 +73,7 @@ function createEngine(): LcmContextEngine {
   const config = createTestConfig(join(tempDir, "lcm.db"));
   const db = createLcmDatabaseConnection(config.databasePath);
   dbs.push(db);
-  const engine = new LcmContextEngine(createTestDeps(config), db);
+  const engine = new TestLcmContextEngine(createTestDeps(config), db);
   engines.push(engine);
   return engine;
 }
@@ -369,7 +369,7 @@ describe("bounded assemble output", () => {
     };
     const db = createLcmDatabaseConnection(config.databasePath);
     dbs.push(db);
-    const engine = new LcmContextEngine(createTestDeps(config), db);
+    const engine = new TestLcmContextEngine(createTestDeps(config), db);
     engines.push(engine);
 
     const liveMessages = makeHeavyLiveTranscript(20, 4_000);

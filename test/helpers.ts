@@ -16,6 +16,8 @@ import { LcmContextEngine } from "../src/engine.js";
 import type { AgentMessage } from "../src/openclaw-bridge.js";
 import { resetDelegatedExpansionGrantsForTests } from "../src/expansion-auth.js";
 import type { LcmDependencies } from "../src/types.js";
+import { RuntimeEchoTranscripts } from "./runtime-echo-transcript.js";
+import type { FakeTranscriptHost } from "./transcript-delta-fake-host.js";
 
 export const tempDirs: string[] = [];
 
@@ -121,18 +123,6 @@ export function parseAgentSessionKey(sessionKey: string): { agentId: string; suf
   };
 }
 
-let legacyTranscriptPath = false;
-
-/**
- * Opt the calling test file into the legacy full-projection reconcile path by
- * not deriving a visible-delta reader. Only suites that pin the legacy
- * reconcile (now reached by one-time cursor migration) or runtime-batch
- * persistence use this; vitest isolates this flag per test file.
- */
-export function useLegacyTranscriptPath(): void {
-  legacyTranscriptPath = true;
-}
-
 /**
  * Mirror production wiring: when a test supplies the full visible-projection
  * reader, also supply a visible-delta reader derived from it, so engine entry
@@ -140,7 +130,7 @@ export function useLegacyTranscriptPath(): void {
  */
 export function withProductionTranscriptRouting(deps: LcmDependencies): LcmDependencies {
   const read = deps.readVisibleSessionTranscriptMessageEntries;
-  if (legacyTranscriptPath || !read || "readSessionTranscriptVisibleMessageDelta" in deps) {
+  if (!read || "readSessionTranscriptVisibleMessageDelta" in deps) {
     return deps;
   }
   return {
@@ -187,9 +177,64 @@ export async function seedStoredMessage(
   return ingestSingle.call(engine, params);
 }
 
+/** Session identity a host would key the transcript write for these engine params. */
+function transcriptSession(params: {
+  sessionId: string;
+  sessionKey?: string;
+  sessionTarget?: { sessionId?: string; sessionKey?: string };
+  runtimeContext?: { sessionTarget?: { sessionId?: string; sessionKey?: string } };
+}): { sessionId: string; sessionKey?: string } {
+  const target = params.sessionTarget ?? params.runtimeContext?.sessionTarget;
+  return {
+    sessionId: target?.sessionId ?? params.sessionId,
+    sessionKey: target?.sessionKey ?? params.sessionKey,
+  };
+}
+
+/**
+ * Test engine wired like production. Without an injected transcript reader it
+ * records runtime turn payloads on per-session fake transcripts first, exactly
+ * as OpenClaw persists a turn before notifying the engine.
+ */
 export class TestLcmContextEngine extends LcmContextEngine {
+  private readonly echo: RuntimeEchoTranscripts | null;
+
   constructor(deps: LcmDependencies, database: ConstructorParameters<typeof LcmContextEngine>[1]) {
-    super(withProductionTranscriptRouting(deps), database);
+    const echo =
+      !deps.readVisibleSessionTranscriptMessageEntries &&
+      !("readSessionTranscriptVisibleMessageDelta" in deps)
+        ? new RuntimeEchoTranscripts()
+        : null;
+    super(echo ? { ...deps, ...echo.deps() } : withProductionTranscriptRouting(deps), database);
+    this.echo = echo;
+  }
+
+  /** Fake transcript for one session id; only for engines without an injected reader. */
+  echoTranscript(sessionId: string, sessionKey?: string): FakeTranscriptHost | undefined {
+    return this.echo?.host(sessionId, sessionKey);
+  }
+
+  override async ingest(params: Parameters<LcmContextEngine["ingest"]>[0]) {
+    this.echo?.record(params, [params.message]);
+    return super.ingest(params);
+  }
+
+  override async ingestBatch(params: Parameters<LcmContextEngine["ingestBatch"]>[0]) {
+    this.echo?.record(params, params.messages);
+    return super.ingestBatch(params);
+  }
+
+  override async afterTurn(params: Parameters<LcmContextEngine["afterTurn"]>[0]) {
+    this.echo?.record(
+      transcriptSession(params as Parameters<typeof transcriptSession>[0]),
+      params.messages.slice(params.prePromptMessageCount),
+    );
+    return super.afterTurn(params);
+  }
+
+  override async commitTurn(params: Parameters<LcmContextEngine["commitTurn"]>[0]) {
+    this.echo?.recordTurn(params.admission, params.terminal, params.messages);
+    return super.commitTurn(params);
   }
 }
 

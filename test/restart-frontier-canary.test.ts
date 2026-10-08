@@ -11,6 +11,7 @@ import {
   createTestConfig,
   createTestDeps,
   tempDirs,
+  TestLcmContextEngine,
 } from "./helpers.js";
 
 afterEach(cleanupEngineTestState);
@@ -43,7 +44,7 @@ describe("gateway restart transcript frontier", () => {
     const readVisibleSessionTranscriptMessageEntries = vi.fn(async () => visibleEntries);
     const openEngine = () => {
       const config = createTestConfig(databasePath);
-      return new LcmContextEngine(
+      return new TestLcmContextEngine(
         createTestDeps(config, { readVisibleSessionTranscriptMessageEntries }),
         createLcmDatabaseConnection(databasePath),
       );
@@ -66,8 +67,8 @@ describe("gateway restart transcript frontier", () => {
     ).resolves.toMatchObject({ bootstrapped: true, importedMessages: 2 });
     await firstEngine.dispose();
 
-    // The host-visible transcript has flushed the new user row but not the
-    // assistant response when the first post-restart afterTurn callback fires.
+    // OpenClaw's SQLite transcript holds the whole turn before the first
+    // post-restart afterTurn callback fires.
     visibleEntries = [
       ...visibleEntries,
       {
@@ -77,6 +78,14 @@ describe("gateway restart transcript frontier", () => {
         role: "user",
         message: { role: "user", content: "first question after restart" },
         createdAt: "2026-08-17T12:01:00.000Z",
+      },
+      {
+        entryId: "entry-assistant-after-restart",
+        parentId: "entry-user-after-restart",
+        seq: 4,
+        role: "assistant",
+        message: { role: "assistant", content: "first answer after restart" },
+        createdAt: "2026-08-17T12:01:01.000Z",
       },
     ];
     const restartedEngine = openEngine();
@@ -95,8 +104,7 @@ describe("gateway restart transcript frontier", () => {
       }),
     ).resolves.toBeUndefined();
 
-    // Reconcile should import the flushed user frontier and afterTurn should
-    // append only the still-unflushed assistant suffix.
+    // afterTurn drains the turn from the transcript cursor left before restart.
     const conversation = await restartedEngine
       .getConversationStore()
       .getConversationForSession({ sessionId, sessionKey });
