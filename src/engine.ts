@@ -5326,6 +5326,20 @@ export class LcmContextEngine implements ContextEngine {
     if (recoveryTarget) {
       params = { ...params, sessionId: recoveryTarget.sessionId, sessionKey: recoveryTarget.sessionKey };
     }
+    if (params.runtimeContext?.preflightCompactionTrigger === "transcript_bytes") {
+      // LCM summaries bound assembled model context, not OpenClaw's canonical
+      // active transcript. Its owner must commit the history-preserving boundary,
+      // including for sessions excluded from LCM tracking.
+      if (!this.deps.delegateCompactionToRuntime) {
+        return {
+          ok: false,
+          compacted: false,
+          reason: "canonical transcript byte compaction requires the OpenClaw runtime delegate",
+        };
+      }
+      this.deps.log.info(`[lcm] compact: delegating canonical transcript byte pressure to OpenClaw`);
+      return await this.deps.delegateCompactionToRuntime(params);
+    }
     if (this.shouldIgnoreSession({ sessionId: params.sessionId, sessionKey: params.sessionKey })) {
       if (this.deps.delegateCompactionToRuntime) {
         // Excluded sessions get no LCM tracking, so delegate to OpenClaw's

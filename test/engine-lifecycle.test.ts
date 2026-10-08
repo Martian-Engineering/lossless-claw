@@ -130,6 +130,80 @@ describe("LcmContextEngine metadata", () => {
   });
 });
 
+describe("LcmContextEngine canonical transcript byte pressure", () => {
+  it("delegates byte pressure without replacing LCM history or losing host authority", async () => {
+    const nativeResult = {
+      ok: true,
+      compacted: true,
+      result: { summary: "native summary", firstKeptEntryId: "kept-user", tokensBefore: 50_000, tokensAfter: 2_000 },
+    };
+    const delegateCompactionToRuntime = vi.fn(async () => nativeResult);
+    const engine = createEngineWithDeps({}, { delegateCompactionToRuntime });
+    await engine.ingest({ sessionId: "byte-session", sessionKey: "agent:main:main", message: makeMessage({ role: "user", content: "retained original" }) });
+    const before = await engine.getConversationStore().getConversationBySessionId("byte-session");
+    const params = {
+      sessionId: "byte-session",
+      sessionKey: "agent:main:main",
+      sessionTarget: { sessionId: "byte-session", sessionKey: "agent:main:main", agentId: "main" },
+      sessionFile: "agent:main:main",
+      force: true,
+      compactionTarget: "budget" as const,
+      runtimeContext: { preflightCompactionTrigger: "transcript_bytes", forceReason: "preflight_required" },
+      abortSignal: new AbortController().signal,
+    };
+
+    expect(await engine.compact(params)).toBe(nativeResult);
+    expect(delegateCompactionToRuntime).toHaveBeenCalledExactlyOnceWith(params);
+    expect(await engine.getConversationStore().getConversationBySessionId("byte-session")).toEqual(before);
+    expect(await engine.getConversationStore().getMessageCount(before!.conversationId)).toBe(1);
+  });
+
+  it("surfaces unavailable native byte compaction instead of reporting semantic success", async () => {
+    const engine = createEngine();
+    expect(await engine.compact({ sessionId: "byte-session", sessionKey: "agent:main:main", sessionFile: "agent:main:main", runtimeContext: { preflightCompactionTrigger: "transcript_bytes" } })).toEqual({
+      ok: false,
+      compacted: false,
+      reason: "canonical transcript byte compaction requires the OpenClaw runtime delegate",
+    });
+  });
+
+  it("does not substitute LCM success when native byte compaction fails", async () => {
+    const failure = { ok: false, compacted: false, reason: "native summary unavailable" };
+    const delegateCompactionToRuntime = vi.fn(async () => failure);
+    const engine = createEngineWithDeps({}, { delegateCompactionToRuntime });
+    expect(await engine.compact({ sessionId: "byte-session", sessionKey: "agent:main:main", sessionFile: "agent:main:main", runtimeContext: { preflightCompactionTrigger: "transcript_bytes" } })).toBe(failure);
+    expect(delegateCompactionToRuntime).toHaveBeenCalledOnce();
+  });
+
+  it.each([
+    { ignoreSessionPatterns: ["agent:*:cron:**"] },
+    { statelessSessionPatterns: ["agent:*:cron:**"] },
+  ])("preserves the host byte safeguard for excluded sessions: %j", async (config) => {
+    const nativeResult = { ok: true, compacted: true };
+    const delegateCompactionToRuntime = vi.fn(async () => nativeResult);
+    const engine = createEngineWithDeps(config, { delegateCompactionToRuntime });
+    const params = {
+      sessionId: "excluded-byte-session",
+      sessionKey: "agent:main:cron:nightly",
+      sessionFile: "agent:main:cron:nightly",
+      runtimeContext: { preflightCompactionTrigger: "transcript_bytes" },
+    };
+
+    expect(await engine.compact(params)).toBe(nativeResult);
+    expect(delegateCompactionToRuntime).toHaveBeenCalledExactlyOnceWith(params);
+    expect(await engine.getConversationStore().getConversationBySessionId(params.sessionId)).toBeNull();
+  });
+
+  it("leaves token-pressure and manual semantic compaction with LCM", async () => {
+    const delegateCompactionToRuntime = vi.fn();
+    const engine = createEngineWithDeps({}, { delegateCompactionToRuntime });
+    for (const runtimeContext of [{ preflightCompactionTrigger: "tokens" }, undefined]) {
+      await engine.compact({ sessionId: "semantic-session", sessionKey: "agent:main:main", sessionFile: "agent:main:main", runtimeContext });
+    }
+    expect(delegateCompactionToRuntime).not.toHaveBeenCalled();
+  });
+});
+
 describe("LcmContextEngine ignored sessions", () => {
   const ignoredSessionId = "runtime-ignored-session";
   const ignoredSessionKey = "agent:main:cron:nightly:run:run-123";

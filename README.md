@@ -394,6 +394,8 @@ Lossless-claw distinguishes OpenClaw's two session-reset commands:
 
 Lossless-claw no longer rewrites active OpenClaw transcripts for GC or session rotation. SQLite-backed OpenClaw owns active transcript storage; Lossless keeps durable conversation, summary, and recall data in its own SQLite database. If you want an LCM database snapshot before maintenance, run `/lossless backup`.
 
+When OpenClaw marks compaction as canonical transcript byte pressure (`agents.defaults.compaction.maxActiveTranscriptBytes`), Lossless delegates to OpenClaw's stock runtime compactor. This commits a semantic compaction boundary that reduces active transcript replay without deleting older transcript entries or LCM recall data. Token-pressure and ordinary manual LCM compaction still use LCM's own summaries. If the host runtime delegate is unavailable, required byte compaction fails visibly instead of reporting token-only success. The byte setting is a compaction trigger, not a guarantee that a protected recent turn fits below that size; check OpenClaw's post-compaction byte accounting before treating an oversized session as recovered.
+
 `newSessionRetainDepth` (or `LCM_NEW_SESSION_RETAIN_DEPTH`) controls how much summary structure survives `/new`:
 
 - `-1`: keep all existing context items

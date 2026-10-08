@@ -203,6 +203,25 @@ describe("createLcmDependencies.complete runtime.llm bridge", () => {
     }
   });
 
+  it("fails required canonical byte compaction when the host SDK delegate is unavailable", async () => {
+    const { api, getFactory, dbPath } = buildApi();
+    const engine = getRegisteredEngine(api, getFactory);
+    try {
+      expect(await engine.deps.delegateCompactionToRuntime?.({
+        sessionId: "byte-pressure-session",
+        sessionKey: "agent:main:main",
+        sessionFile: "agent:main:main",
+        runtimeContext: { preflightCompactionTrigger: "transcript_bytes" },
+      })).toEqual({
+        ok: false,
+        compacted: false,
+        reason: "canonical transcript byte compaction requires the OpenClaw runtime delegate",
+      });
+    } finally {
+      closeLcmConnection(dbPath);
+    }
+  });
+
   it("resolves configured fallback provider candidates instead of the primary summary model", async () => {
     const { api, getFactory, dbPath } = buildApi({
       pluginConfig: {
