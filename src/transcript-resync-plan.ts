@@ -4,6 +4,7 @@
  * No IO and no logging, so every decision is unit-testable.
  */
 import type { ContentMatchCandidate, StoredTranscriptRow } from "./store/transcript-cursor-store.js";
+import type { UserReplayIdentity } from "./user-replay.js";
 
 /** Payload-free facts about one visible entry gathered during the scan pass. */
 export type ScannedVisibleEntry = {
@@ -13,6 +14,8 @@ export type ScannedVisibleEntry = {
   supersedesEntryId?: string;
   /** Storage token estimate; 0 for entries LCM does not persist. */
   tokens: number;
+  /** Host replay identity of a user entry; absent for other roles. */
+  userReplay?: UserReplayIdentity;
 };
 
 /** Result of reconciling the visible id set against stored ids. */

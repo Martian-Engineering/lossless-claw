@@ -540,6 +540,26 @@ function ensureTranscriptCursorTable(db: DatabaseSync): void {
   `);
 }
 
+/**
+ * Replay keys observed on visible transcript user entries, keyed by entry id.
+ * `idempotency_key` is '' when the entry carried no key or was not visible
+ * when observed; `entry_signature` digests the entry's live-coverage
+ * signature. A missing row means the entry was never observed, so assembly
+ * reads the transcript once to fill it.
+ */
+function ensureTranscriptUserReplayKeyTable(db: DatabaseSync): void {
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS transcript_user_replay_keys (
+      conversation_id INTEGER NOT NULL REFERENCES conversations(conversation_id) ON DELETE CASCADE,
+      transcript_entry_id TEXT NOT NULL,
+      idempotency_key TEXT NOT NULL,
+      entry_signature TEXT NOT NULL,
+      updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+      PRIMARY KEY (conversation_id, transcript_entry_id)
+    );
+  `);
+}
+
 function backfillMessageIdentityHashes(
   db: DatabaseSync,
   options?: { managesOwnTransaction?: boolean },
@@ -1629,6 +1649,9 @@ export function runLcmMigrations(
       ensureMessageStableEventKeyColumn(db),
     );
     runMigrationStep("ensureTranscriptCursorTable", log, () => ensureTranscriptCursorTable(db));
+    runMigrationStep("ensureTranscriptUserReplayKeyTable", log, () =>
+      ensureTranscriptUserReplayKeyTable(db),
+    );
     // Partial unique index: NULL stable event keys (legacy rows, messages
     // without a stable identity) are exempt, so this only enforces idempotency
     // for messages that carry a computed key.

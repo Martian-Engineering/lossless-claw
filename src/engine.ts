@@ -76,6 +76,7 @@ import { FocusBriefStore, type FocusBriefRecord } from "./store/focus-brief-stor
 import { buildToolCallInputMap } from "./tool-pairing.js";
 import { PendingSummaryStore } from "./store/pending-summary-store.js";
 import { TranscriptCursorStore } from "./store/transcript-cursor-store.js";
+import { UserReplayKeyStore } from "./store/user-replay-key-store.js";
 import {
   TranscriptDeltaSync,
   type TranscriptSyncFinalizeFacts,
@@ -107,7 +108,11 @@ import {
   getTranscriptEntryId,
   resolveTranscriptMessageCreatedAt,
 } from "./transcript.js";
-import { restoreRawUserReplay } from "./user-replay.js";
+import {
+  observeUserReplayIdentity,
+  restoreRawUserReplay,
+  type UserReplayIdentity,
+} from "./user-replay.js";
 import { extractStableEventKey } from "./stable-event-key.js";
 import { structuredPartsIdentity } from "./structured-anchor-identity.js";
 import { transcriptImportCap, type TranscriptReconcileResult } from "./reconcile-plan.js";
@@ -569,6 +574,7 @@ export class LcmContextEngine implements ContextEngine {
   private compactionTelemetryStore: CompactionTelemetryStore;
   private compactionMaintenanceStore: CompactionMaintenanceStore;
   private transcriptCursorStore: TranscriptCursorStore;
+  private userReplayKeyStore: UserReplayKeyStore;
   /** Single transcript writer; null when the host exposes no visible-delta reader. */
   private transcriptDeltaSync: TranscriptDeltaSync | null;
   private missingTranscriptDeltaReaderReported = false;
@@ -736,12 +742,14 @@ export class LcmContextEngine implements ContextEngine {
     this.compactionTelemetryStore = new CompactionTelemetryStore(this.db);
     this.compactionMaintenanceStore = new CompactionMaintenanceStore(this.db);
     this.transcriptCursorStore = new TranscriptCursorStore(this.db);
+    this.userReplayKeyStore = new UserReplayKeyStore(this.db);
     this.transcriptDeltaSync = this.deps.readSessionTranscriptVisibleMessageDelta
       ? new TranscriptDeltaSync({
           readVisibleDelta: this.deps.readSessionTranscriptVisibleMessageDelta,
           readRawDelta: this.deps.readSessionTranscriptRawDelta,
           cursorStore: this.transcriptCursorStore,
           conversationStore: this.conversationStore,
+          replayKeyStore: this.userReplayKeyStore,
           log: this.deps.log,
         })
       : null;
@@ -5281,6 +5289,62 @@ export class LcmContextEngine implements ContextEngine {
     };
   }
 
+  /**
+   * Replay identities of the raw user context items, served from the
+   * observations recorded at transcript ingestion. Only entries never
+   * observed (rows stored before observation existed) need one full visible
+   * read, whose results are recorded so later turns stay storage-only.
+   */
+  private async loadRawUserReplayIdentities(params: {
+    conversationId: number;
+    target: SessionTranscriptReadTarget | undefined;
+    sessionLabel: string;
+  }): Promise<Map<string, UserReplayIdentity>> {
+    // Split stored observations into restorable identities and unobserved ids.
+    const identities = new Map<string, UserReplayIdentity>();
+    const unobserved: string[] = [];
+    for (const state of this.userReplayKeyStore.listRawUserContextKeys(params.conversationId)) {
+      if (!state.observed) {
+        unobserved.push(state.entryId);
+      } else if (state.observed.idempotencyKey) {
+        identities.set(state.entryId, state.observed);
+      }
+    }
+    const readFullProjection = this.deps.readVisibleSessionTranscriptMessageEntries;
+    if (unobserved.length === 0 || !params.target || !readFullProjection) {
+      return identities;
+    }
+
+    // Fill unobserved ids from the visible projection; ids that are not
+    // visible user entries observe no key, so they are never restored.
+    let entries: VisibleSessionTranscriptMessageEntry[];
+    try {
+      entries = await readFullProjection(params.target);
+    } catch (error) {
+      this.deps.log.warn(`[lcm] assemble: user replay metadata unavailable for ${params.sessionLabel}: ${describeLogError(error)}`);
+      return identities;
+    }
+    const entriesById = new Map(entries.map(entry => [entry.entryId, entry]));
+    const observed = unobserved.map(entryId => {
+      const message = entriesById.get(entryId)?.message;
+      return {
+        entryId,
+        ...(message?.role === "user"
+          ? observeUserReplayIdentity(message)
+          : { idempotencyKey: "", signature: "" }),
+      };
+    });
+    await this.conversationStore.withTransaction(() =>
+      this.userReplayKeyStore.record(params.conversationId, observed),
+    );
+    for (const { entryId, ...identity } of observed) {
+      if (identity.idempotencyKey) {
+        identities.set(entryId, identity);
+      }
+    }
+    return identities;
+  }
+
   async assemble(params: {
     sessionId: string;
     sessionKey?: string;
@@ -5414,16 +5478,15 @@ export class LcmContextEngine implements ContextEngine {
       });
       const assembledFreshTailCount =
         resolvedContextThreshold.freshTailCount ?? this.config.freshTailCount;
-      const replayTarget = resolveSessionTranscriptReadTarget(params);
-      let replayEntries: VisibleSessionTranscriptMessageEntry[] = [];
-      if (replayTarget && this.deps.readVisibleSessionTranscriptMessageEntries &&
-          liveMessages.some(message => message.role === "user" && typeof Reflect.get(message, "idempotencyKey") === "string")) {
-        try {
-          replayEntries = await this.deps.readVisibleSessionTranscriptMessageEntries(replayTarget);
-        } catch (error) {
-          this.deps.log.warn(`[lcm] assemble: user replay metadata unavailable for ${sessionLabel}: ${describeLogError(error)}`);
-        }
-      }
+      const replayIdentities = liveMessages.some(
+        message => message.role === "user" && typeof Reflect.get(message, "idempotencyKey") === "string",
+      )
+        ? await this.loadRawUserReplayIdentities({
+            conversationId: conversation.conversationId,
+            target: resolveSessionTranscriptReadTarget(params),
+            sessionLabel,
+          })
+        : new Map<string, UserReplayIdentity>();
       const assemblyInput = {
         conversationId: conversation.conversationId,
         freshTailCount: assembledFreshTailCount,
@@ -5468,7 +5531,7 @@ export class LcmContextEngine implements ContextEngine {
             protectedAssembledIndexes: new Set<number>(),
             tokenBudget: Number.MAX_SAFE_INTEGER,
           });
-          const replay = restoreRawUserReplay(withLiveInputs.messages, liveMessages, replayEntries);
+          const replay = restoreRawUserReplay(withLiveInputs.messages, liveMessages, replayIdentities);
           return Math.max(
             await this.summaryStore.getContextTokenCount(conversation.conversationId),
             estimateSerializedMessagesTokens(replay.messages),
@@ -5660,7 +5723,7 @@ export class LcmContextEngine implements ContextEngine {
       // budget math above runs on stored-content token counts, which undercount
       // live messages that carry structured tool payloads; this is the last
       // line of defense that keeps assembled output deliverable to the model.
-      const replay = restoreRawUserReplay(volatileLiveInputAppend.messages, liveMessages, replayEntries);
+      const replay = restoreRawUserReplay(volatileLiveInputAppend.messages, liveMessages, replayIdentities);
       let serializedClamp = clampMessagesToSerializedBudget({
         messages: replay.messages,
         tokenBudget,
