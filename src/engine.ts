@@ -511,12 +511,12 @@ type TranscriptProjectionSyncParams = {
   sessionKey?: string;
   sessionLabel: string;
   freshStartBudgetTokens: number | null;
-  freshStartIncludeFromSeq?: number;
+  importFromEntryId?: string;
   finalize?: (facts: TranscriptSyncFinalizeFacts) => void | Promise<void>;
 };
 
-/** Legacy reconcile passes allowed while migrating one conversation to cursor mode. */
-const MAX_LEGACY_MIGRATION_PASSES = 50;
+/** Capability error reported when a transcript-backed session has no visible-delta reader. */
+const TRANSCRIPT_DELTA_READER_UNAVAILABLE = "transcript delta reader unavailable";
 
 /** Human-readable bootstrap reason for one transcript-delta sync outcome. */
 function describeTranscriptSyncOutcome(outcome: TranscriptSyncOutcome): string {
@@ -571,6 +571,7 @@ export class LcmContextEngine implements ContextEngine {
   private transcriptCursorStore: TranscriptCursorStore;
   /** Single transcript writer; null when the host exposes no visible-delta reader. */
   private transcriptDeltaSync: TranscriptDeltaSync | null;
+  private missingTranscriptDeltaReaderReported = false;
   private assembler: ContextAssembler;
   private compaction: CompactionEngine;
   private retrieval: RetrievalEngine;
@@ -3413,6 +3414,21 @@ export class LcmContextEngine implements ContextEngine {
     return this.migrateLegacyConversation(params);
   }
 
+  /**
+   * Report that the host exposes no visible-delta reader. Every supported
+   * OpenClaw release ships it, so this is a capability error, not a fallback:
+   * the first occurrence logs an error with the upgrade hint.
+   */
+  private reportMissingTranscriptDeltaReader(phase: string, sessionLabel: string): void {
+    const message = `[lcm] ${phase}: ${TRANSCRIPT_DELTA_READER_UNAVAILABLE} for ${sessionLabel}; OpenClaw readSessionTranscriptVisibleMessageDelta is required (install OpenClaw >=${packageJson.peerDependencies.openclaw.replace(/^>=/, "")}). Transcript ingestion is skipped.`;
+    if (this.missingTranscriptDeltaReaderReported) {
+      this.deps.log.debug(message);
+      return;
+    }
+    this.missingTranscriptDeltaReaderReported = true;
+    this.deps.log.error(message);
+  }
+
   /** Return the delta writer; callers check availability before routing here. */
   private requireTranscriptDeltaSync(): TranscriptDeltaSync {
     if (!this.transcriptDeltaSync) {
@@ -3429,8 +3445,8 @@ export class LcmContextEngine implements ContextEngine {
       conversationId: params.conversationId,
       target: params.target,
       freshStartBudgetTokens: params.freshStartBudgetTokens,
-      ...(params.freshStartIncludeFromSeq !== undefined
-        ? { freshStartIncludeFromSeq: params.freshStartIncludeFromSeq }
+      ...(params.importFromEntryId !== undefined
+        ? { importFromEntryId: params.importFromEntryId }
         : {}),
       ...(params.finalize ? { finalize: params.finalize } : {}),
       label: params.sessionLabel,
@@ -3449,64 +3465,28 @@ export class LcmContextEngine implements ContextEngine {
   }
 
   /**
-   * One-time entry into cursor mode for a conversation that already has rows.
-   * The legacy full-projection reconcile runs until it is no longer
-   * import-capped (it is the only path that adopts legacy rows without
-   * transcript entry ids); an anchored bulk resync then records the frontier
-   * cursor. After this the legacy reconcile never runs for the conversation.
+   * One-time entry into cursor mode for a conversation that already has rows
+   * but no cursor. A bulk resync anchors on the last stamped id that is still
+   * visible, content-matches the suffix in order against unstamped or
+   * off-projection rows, imports only after the last anchor or match, and
+   * records the frontier cursor. It never clears an id or deletes a row.
    */
   private async migrateLegacyConversation(params: TranscriptProjectionSyncParams): Promise<{
     conversationId: number;
     outcome: TranscriptSyncOutcome;
   }> {
     const startedAt = Date.now();
-    let conversationId = params.conversation.conversationId;
-    let legacyPasses = 0;
-    let legacyImported = 0;
-    let legacyOutcome = "skipped";
-    const readFullProjection = this.deps.readVisibleSessionTranscriptMessageEntries;
-    // Repeat the legacy pass while it reports an import cap with progress.
-    while (readFullProjection && legacyPasses < MAX_LEGACY_MIGRATION_PASSES) {
-      legacyPasses += 1;
-      const pass = await this.conversationStore.withTransaction(async () => {
-        const conversation = await this.conversationStore.getConversation(conversationId);
-        if (!conversation) {
-          return null;
-        }
-        const entries = await readFullProjection(params.target);
-        return this.runLegacyProjectionReconcile({
-          sessionId: params.sessionId,
-          sessionKey: params.sessionKey,
-          conversation,
-          entries,
-          startedAt,
-          sessionLabel: params.sessionLabel,
-        });
-      });
-      if (!pass) {
-        break;
-      }
-      conversationId = pass.conversationId;
-      legacyImported += pass.result.importedMessages ?? 0;
-      legacyOutcome = pass.reconcile.blockedReason ?? pass.result.reason ?? "covered";
-      if (pass.reconcile.blockedReason !== "import-cap" || pass.reconcile.importedMessages === 0) {
-        break;
-      }
-      await new Promise<void>((resolve) => setImmediate(resolve));
-    }
-
+    const conversationId = params.conversation.conversationId;
     const outcome = await this.requireTranscriptDeltaSync().resync(
       this.buildTranscriptSyncRequest({ ...params, conversationId }),
       undefined,
-      { allowUnanchoredImport: false, origin: "legacy-migration", reason: "legacy-migration" },
+      { unanchored: "match-only", origin: "legacy-migration", reason: "legacy-migration" },
     );
+    const summary = outcome.resync;
     this.deps.log.info(
-      `[lcm] transcript cursor migration conversation=${conversationId} ${params.sessionLabel} status=${outcome.status} legacyPasses=${legacyPasses} legacyImported=${legacyImported} legacyOutcome=${legacyOutcome} deltaImported=${outcome.importedMessages} restamped=${outcome.restampedMessages} duration=${formatDurationMs(Date.now() - startedAt)}`,
+      `[lcm] transcript cursor migration conversation=${conversationId} ${params.sessionLabel} status=${outcome.status} imported=${outcome.importedMessages} restamped=${outcome.restampedMessages} anchorIndex=${summary?.anchorIndex ?? "n/a"} contentMatches=${summary?.contentMatches ?? 0} unimportedBeforeAnchor=${summary?.unimportedBeforeAnchor ?? 0} unstampedRowsBeforeAnchor=${summary?.unstampedRowsBeforeAnchor ?? 0} duration=${formatDurationMs(Date.now() - startedAt)}`,
     );
-    return {
-      conversationId,
-      outcome: { ...outcome, importedMessages: outcome.importedMessages + legacyImported },
-    };
+    return { conversationId, outcome };
   }
 
   /** Prune heartbeat acknowledgement turns when the opt-in policy applies. */
@@ -3742,7 +3722,7 @@ export class LcmContextEngine implements ContextEngine {
           sessionKey,
           sessionLabel,
           freshStartBudgetTokens: resolveBootstrapMaxTokens(this.config),
-          freshStartIncludeFromSeq: params.admission.activeMessagePosition + 1,
+          importFromEntryId: params.admission.entryId,
           finalize: writeReceipt,
         });
         if (synced.outcome.status === "missing") {
@@ -4082,25 +4062,22 @@ export class LcmContextEngine implements ContextEngine {
     this.ensureMigrated();
     const startedAt = Date.now();
     const sessionLabel = formatSessionLabel(sessionId, sessionKey);
-    if (transcriptReadTarget && this.transcriptDeltaSync) {
-      return this.bootstrapFromTranscriptDelta({
-        sessionId,
-        sessionKey,
-        target: transcriptReadTarget,
-        startedAt,
-        sessionLabel,
-      });
-    }
-    if (!transcriptReadTarget || !this.deps.readVisibleSessionTranscriptMessageEntries) {
+    if (!transcriptReadTarget) {
       return {
         bootstrapped: false,
         importedMessages: 0,
         reason: "visible transcript projection unavailable",
       };
     }
-
-    return this.bootstrapFromVisibleTranscriptProjection({
-
+    if (!this.transcriptDeltaSync) {
+      this.reportMissingTranscriptDeltaReader("bootstrap", sessionLabel);
+      return {
+        bootstrapped: false,
+        importedMessages: 0,
+        reason: TRANSCRIPT_DELTA_READER_UNAVAILABLE,
+      };
+    }
+    return this.bootstrapFromTranscriptDelta({
       sessionId,
       sessionKey,
       target: transcriptReadTarget,
@@ -4451,6 +4428,10 @@ export class LcmContextEngine implements ContextEngine {
     }
     this.ensureMigrated();
     const transcriptReadTarget = resolveSessionTranscriptReadTarget(params);
+    if (transcriptReadTarget && !this.transcriptDeltaSync) {
+      this.reportMissingTranscriptDeltaReader("ingest", formatSessionLabel(params.sessionId, params.sessionKey));
+      return { ingested: false };
+    }
     if (transcriptReadTarget && this.transcriptDeltaSync) {
       const imported = await this.syncForRuntimeIngest({
         ...params,
@@ -4489,6 +4470,10 @@ export class LcmContextEngine implements ContextEngine {
       return { ingestedCount: 0 };
     }
     const transcriptReadTarget = resolveSessionTranscriptReadTarget(params);
+    if (transcriptReadTarget && !this.transcriptDeltaSync) {
+      this.reportMissingTranscriptDeltaReader("ingestBatch", formatSessionLabel(params.sessionId, params.sessionKey));
+      return { ingestedCount: 0 };
+    }
     if (transcriptReadTarget && this.transcriptDeltaSync) {
       const ingestedCount = await this.syncForRuntimeIngest({
         ...params,
@@ -4856,6 +4841,10 @@ export class LcmContextEngine implements ContextEngine {
       },
     });
 
+    if (transcriptReadTarget && !this.transcriptDeltaSync) {
+      this.reportMissingTranscriptDeltaReader("commitTurn", formatSessionLabel(sessionId, sessionKey));
+      throw new Error(`context-engine turn not committed: ${TRANSCRIPT_DELTA_READER_UNAVAILABLE}`);
+    }
     const result = transcriptReadTarget && this.transcriptDeltaSync
       ? await this.commitTurnFromTranscriptDelta(params, payloadHash, transcriptReadTarget)
       : await this.withSessionQueue(
@@ -4985,6 +4974,10 @@ export class LcmContextEngine implements ContextEngine {
     this.ensureMigrated();
     const startedAt = Date.now();
     const sessionLabel = formatSessionLabel(sessionId, sessionKey);
+    if (transcriptReadTarget && !this.transcriptDeltaSync) {
+      this.reportMissingTranscriptDeltaReader("afterTurn", sessionLabel);
+      return;
+    }
     if (transcriptReadTarget && this.transcriptDeltaSync) {
       await this.afterTurnFromTranscriptDelta({
         ...params,
@@ -5837,51 +5830,30 @@ export class LcmContextEngine implements ContextEngine {
 
     // Retain every source row before changing context projection. Bootstrap's
     // suffix budget is inappropriate here: the omitted tool groups need summaries.
-    if (this.transcriptDeltaSync) {
-      const conversation = await this.conversationStore.withTransaction(async () => {
-        await this.archiveSupersededIsolatedCronConversation(target);
-        return this.conversationStore.getOrCreateConversation(target.sessionId, {
-          sessionKey: target.sessionKey,
-        });
-      });
-      const synced = await this.syncTranscriptProjection({
-        conversation,
-        target,
-        sessionId: target.sessionId,
-        sessionKey: target.sessionKey,
-        sessionLabel: formatSessionLabel(target.sessionId, target.sessionKey),
-        freshStartBudgetTokens: null,
-      });
-      if (synced.outcome.status !== "synced") {
-        throw new Error(`overflow transcript sync ${synced.outcome.status}${synced.outcome.detail ? `: ${synced.outcome.detail}` : ""}`);
-      }
-      return this.conversationStore.withTransaction(() =>
-        this.verifyOverflowTurnCoverage(synced.conversationId, ids, latestUserIndex),
-      );
+    if (!this.transcriptDeltaSync) {
+      this.reportMissingTranscriptDeltaReader("compact", formatSessionLabel(target.sessionId, target.sessionKey));
+      return TRANSCRIPT_DELTA_READER_UNAVAILABLE;
     }
-    return this.conversationStore.withTransaction(async () => {
+    const conversation = await this.conversationStore.withTransaction(async () => {
       await this.archiveSupersededIsolatedCronConversation(target);
-      const conversation = await this.conversationStore.getOrCreateConversation(target.sessionId, {
+      return this.conversationStore.getOrCreateConversation(target.sessionId, {
         sessionKey: target.sessionKey,
       });
-      const conversationId = conversation.conversationId;
-      const existingCount = await this.conversationStore.getMessageCount(conversationId);
-      const audit = existingCount > 0
-        ? await this.auditTranscriptAnchorsForProjection({ ...target, conversationId, entries })
-        : undefined;
-      const reconcile = await this.reconcileProjectedTranscriptMessages({
-        ...target,
-        conversationId,
-        historicalMessages: entries.map(messageFromVisibleTranscriptEntry),
-        requireOverlap: existingCount > 0 && !audit?.allowsUnanchoredLegacyPrefixImport,
-        legacyPrefixAnchorEntryId: audit?.legacyPrefixAnchorEntryId,
-        completeRecoverySnapshot: true,
-      });
-      if (reconcile.blockedByImportCap) {
-        throw new Error(`overflow transcript reconciliation blocked: ${reconcile.blockedReason ?? "incomplete coverage"}`);
-      }
-      return this.verifyOverflowTurnCoverage(conversationId, ids, latestUserIndex);
     });
+    const synced = await this.syncTranscriptProjection({
+      conversation,
+      target,
+      sessionId: target.sessionId,
+      sessionKey: target.sessionKey,
+      sessionLabel: formatSessionLabel(target.sessionId, target.sessionKey),
+      freshStartBudgetTokens: null,
+    });
+    if (synced.outcome.status !== "synced") {
+      throw new Error(`overflow transcript sync ${synced.outcome.status}${synced.outcome.detail ? `: ${synced.outcome.detail}` : ""}`);
+    }
+    return this.conversationStore.withTransaction(() =>
+      this.verifyOverflowTurnCoverage(synced.conversationId, ids, latestUserIndex),
+    );
   }
 
   /**

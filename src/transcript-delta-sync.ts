@@ -78,7 +78,30 @@ export type TranscriptSyncOutcome = {
   importedHeartbeatAck: boolean;
   resetReason?: string;
   detail?: string;
+  /** Bulk reconciliation facts of a resync, for migration and resync logs. */
+  resync?: ResyncSummary;
 };
+
+/** What one bulk resync decided. */
+export type ResyncSummary = {
+  visibleEntries: number;
+  /** Visible index of the last stored (or supersedes-restamped) entry; -1 when unanchored. */
+  anchorIndex: number;
+  contentMatches: number;
+  supersedesRestamps: number;
+  /** Unknown visible entries before the anchor that were deliberately not imported. */
+  unimportedBeforeAnchor: number;
+  /** Stored rows at or before the anchor row that still carry no transcript entry id. */
+  unstampedRowsBeforeAnchor: number;
+};
+
+/**
+ * How a resync treats a projection with no stored id to anchor on:
+ * - `skip`: import nothing and only record the frontier cursor.
+ * - `match-only`: content-match the post-reset window; import only after the last match.
+ * - `match-or-fresh`: like `match-only`, but with no match import the fresh-start budget suffix.
+ */
+export type UnanchoredResyncPolicy = "skip" | "match-only" | "match-or-fresh";
 
 /** Facts passed to the in-transaction finalizer of a successful sync. */
 export type TranscriptSyncFinalizeFacts = {
@@ -92,8 +115,12 @@ export type TranscriptSyncRequest = {
   target: SessionTranscriptReadTarget;
   /** Fresh-start import budget; null imports the whole post-reset window. */
   freshStartBudgetTokens: number | null;
-  /** Fresh start always imports entries at or after this visible ordinal (e.g. a committed turn). */
-  freshStartIncludeFromSeq?: number;
+  /**
+   * Entry from which the transcript is known to be new (a committed turn's
+   * admission): fresh start and resync import it and everything after it
+   * unless already stored.
+   */
+  importFromEntryId?: string;
   /** Persist one entry through the engine's storage policy; true when a row was created. */
   ingest: (message: AgentMessage) => Promise<boolean>;
   /** Runs inside the transaction that persists the final cursor of a successful sync. */
@@ -145,7 +172,8 @@ type EntryHandler = (
 
 /** Convert one visible entry into an agent message that carries its transcript meta. */
 export function messageFromVisibleEntry(entry: VisibleSessionTranscriptMessageEntry): AgentMessage {
-  return attachTranscriptEntryMeta(entry.message, {
+  // Copy so the host-owned payload object is never mutated.
+  return attachTranscriptEntryMeta({ ...entry.message } as AgentMessage, {
     entryId: entry.entryId,
     parentId: entry.parentId,
     timestamp: entry.createdAt ?? null,
@@ -159,6 +187,15 @@ function identityHashForEntry(entry: VisibleSessionTranscriptMessageEntry): stri
   }
   const stored = toStoredMessage(entry.message);
   return buildMessageIdentityHash(stored.role, stored.content);
+}
+
+/** Scanned index of `request.importFromEntryId`, or -1 when absent or not visible. */
+function importFromIndex(
+  request: TranscriptSyncRequest,
+  entries: readonly ScannedVisibleEntry[],
+): number {
+  const entryId = request.importFromEntryId;
+  return entryId === undefined ? -1 : entries.findIndex((entry) => entry.entryId === entryId);
 }
 
 /** Recognize OpenClaw's current-turn read fence by its stable error name. */
@@ -194,7 +231,7 @@ export class TranscriptDeltaSync {
           `[lcm] transcript cursor reset conversation=${request.conversationId} ${request.label} reason=${page.reason}; resyncing`,
         );
         const outcome = await this.resync(request, page.cursor, {
-          allowUnanchoredImport: true,
+          unanchored: "match-or-fresh",
           origin: state.origin,
           reason: page.reason,
         });
@@ -249,9 +286,7 @@ export class TranscriptDeltaSync {
         request.freshStartBudgetTokens === null
           ? resetStart
           : budgetStartIndex(scan.entries, resetStart, request.freshStartBudgetTokens);
-      const includeFromSeq = request.freshStartIncludeFromSeq;
-      const includeIndex =
-        includeFromSeq === undefined ? -1 : scan.entries.findIndex((entry) => entry.seq >= includeFromSeq);
+      const includeIndex = importFromIndex(request, scan.entries);
       if (includeIndex >= 0) {
         start = Math.min(start, Math.max(includeIndex, resetStart));
       }
@@ -284,17 +319,17 @@ export class TranscriptDeltaSync {
    *
    * One stored-id query plus a payload-free scan decides the import window:
    * entries after the last known (or supersedes-restamped) visible id, or,
-   * with no anchor, the post-reset window (`allowUnanchoredImport=false`, used
-   * by legacy migration, imports nothing instead). Window entries are then
-   * content-matched in order against stored rows whose ids left the
-   * projection: matches restamp, only entries after the last match import,
-   * so history is never appended out of order. An unanchored window with no
-   * match is treated like a fresh start (bootstrap budget).
+   * with no anchor, the post-reset window handled per `UnanchoredResyncPolicy`.
+   * Window entries are content-matched in order against stored rows whose
+   * ids left the projection or were never stamped: matches restamp, and only
+   * entries after the last match import, so history is never appended out of
+   * order. Resync only adds or re-issues ids; it never clears an id or
+   * deletes a row.
    */
   async resync(
     request: TranscriptSyncRequest,
     startCursor: string | undefined,
-    options: { allowUnanchoredImport: boolean; origin: TranscriptCursorOrigin; reason: string },
+    options: { unanchored: UnanchoredResyncPolicy; origin: TranscriptCursorOrigin; reason: string },
   ): Promise<TranscriptSyncOutcome> {
     const counters: Counters = { imported: 0, restamped: 0, heartbeatAck: false };
     let cursor = startCursor;
@@ -317,7 +352,7 @@ export class TranscriptDeltaSync {
       const anchored = plan.lastKnownIndex >= 0;
       const windowStart = anchored
         ? plan.lastKnownIndex + 1
-        : options.allowUnanchoredImport
+        : options.unanchored !== "skip"
           ? await this.resolveResetStart(request, scan.entries)
           : scan.entries.length;
       const rows =
@@ -344,11 +379,25 @@ export class TranscriptDeltaSync {
       const start =
         lastMatch >= 0
           ? firstMatch
-          : needsTokens && request.freshStartBudgetTokens !== null
-            ? budgetStartIndex(scan.entries, windowStart, request.freshStartBudgetTokens)
-            : windowStart;
+          : !anchored && options.unanchored === "match-only"
+            ? scan.entries.length
+            : needsTokens && request.freshStartBudgetTokens !== null
+              ? budgetStartIndex(scan.entries, windowStart, request.freshStartBudgetTokens)
+              : windowStart;
+      // A known-new committed range imports even before the last match, but
+      // never before the window: nothing imports ahead of the anchor.
+      const requestedIndex = importFromIndex(request, scan.entries);
+      const includeIndex = requestedIndex >= 0 ? Math.max(requestedIndex, windowStart) : -1;
+      const importStart = includeIndex >= 0 ? Math.min(start, includeIndex) : start;
       const handle: EntryHandler = (entry, index, pageCounters) =>
-        this.applyWindowEntry({ request, entry, index, lastMatch, matches: matched.matches, counters: pageCounters });
+        this.applyWindowEntry({
+          request,
+          entry,
+          index,
+          importAfter: includeIndex >= 0 ? Math.min(lastMatch, includeIndex - 1) : lastMatch,
+          matches: matched.matches,
+          counters: pageCounters,
+        });
       const matchSummary = () =>
         `windowStart=${windowStart} contentMatches=${matchIndexes.length} multiCandidateMatches=${matched.multiCandidateClaims}`;
 
@@ -356,7 +405,7 @@ export class TranscriptDeltaSync {
         request,
         origin: options.origin,
         scan,
-        startIndex: start,
+        startIndex: importStart,
         counters,
         beforeFirstPage: (pageCounters) =>
           this.applyPlannedRestamps(scan.entries, plan.restamps, pageCounters),
@@ -369,10 +418,25 @@ export class TranscriptDeltaSync {
       if (written.kind === "stop") {
         return this.stopped("resync", written.status, counters, null, written.detail, options.reason);
       }
+      const summary: ResyncSummary = {
+        visibleEntries: scan.entries.length,
+        anchorIndex: plan.lastKnownIndex,
+        contentMatches: matchIndexes.length,
+        supersedesRestamps: plan.restamps.size,
+        unimportedBeforeAnchor: plan.unimportedBeforeAnchor,
+        unstampedRowsBeforeAnchor:
+          plan.anchorRowSeq === null
+            ? 0
+            : this.deps.cursorStore.countUnstampedRowsThroughSeq(request.conversationId, plan.anchorRowSeq),
+      };
       this.deps.log.info(
-        `[lcm] transcript resync conversation=${request.conversationId} ${request.label} reason=${options.reason} visible=${scan.entries.length} anchorIndex=${plan.lastKnownIndex} importStart=${start} imported=${counters.imported} restamped=${counters.restamped} supersedesRestamps=${plan.restamps.size} unimportedBeforeAnchor=${plan.unimportedBeforeAnchor} ${matchSummary()}`,
+        `[lcm] transcript resync conversation=${request.conversationId} ${request.label} reason=${options.reason} visible=${scan.entries.length} anchorIndex=${plan.lastKnownIndex} importStart=${importStart} imported=${counters.imported} restamped=${counters.restamped} supersedesRestamps=${plan.restamps.size} unimportedBeforeAnchor=${plan.unimportedBeforeAnchor} unstampedRowsBeforeAnchor=${summary.unstampedRowsBeforeAnchor} ${matchSummary()}`,
       );
-      return { ...this.synced("resync", counters, written.frontierSeq), resetReason: options.reason };
+      return {
+        ...this.synced("resync", counters, written.frontierSeq),
+        resetReason: options.reason,
+        resync: summary,
+      };
     }
     return this.stopped("resync", "blocked", counters, null, "transcript kept changing during resync", options.reason);
   }
@@ -722,7 +786,8 @@ export class TranscriptDeltaSync {
     request: TranscriptSyncRequest;
     entry: VisibleSessionTranscriptMessageEntry;
     index: number;
-    lastMatch: number;
+    /** Unmatched entries import only after this index. */
+    importAfter: number;
     matches: ReadonlyMap<number, StoredTranscriptRow>;
     counters: Counters;
   }): Promise<void> {
@@ -739,7 +804,7 @@ export class TranscriptDeltaSync {
       }
       return;
     }
-    if (params.index > params.lastMatch) {
+    if (params.index > params.importAfter) {
       await this.applyAppendedEntry(params.request, params.entry, params.counters);
     }
   }

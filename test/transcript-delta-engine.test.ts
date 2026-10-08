@@ -350,77 +350,125 @@ describe("transcript delta reset window", () => {
 });
 
 describe("one-time legacy migration", () => {
-  it("runs the legacy reconcile once, then drains incrementally", async () => {
-    const host = new FakeTranscriptHost(sessionId);
-    const ids = [host.append(user("legacy one")), host.append(assistant("legacy two"))];
+  /** Engine over `host` plus a legacy conversation seeded directly in the store. */
+  async function legacyConversation(
+    host: FakeTranscriptHost,
+    seed: Array<{ role: "user" | "assistant"; content: string; entryId?: string }>,
+  ) {
     const readVisibleSessionTranscriptMessageEntries = vi.fn(host.readVisibleEntries);
     const { engine, db } = createEngineWithDepsOverridesAndDb({
       readSessionTranscriptVisibleMessageDelta: host.readVisibleDelta,
       readSessionTranscriptRawDelta: host.readRawDelta,
       readVisibleSessionTranscriptMessageEntries,
     });
-    // Legacy state: rows persisted from a runtime array without entry ids.
     const store = engine.getConversationStore();
     const conversation = await store.getOrCreateConversation(sessionId, { sessionKey });
     await store.markConversationBootstrapped(conversation.conversationId);
-    for (const [index, content] of ["legacy one", "legacy two"].entries()) {
-      await store.createMessage({
+    for (const [index, row] of seed.entries()) {
+      const message = await store.createMessage({
         conversationId: conversation.conversationId,
         seq: index + 1,
-        role: index === 0 ? "user" : "assistant",
-        content,
+        role: row.role,
+        content: row.content,
         tokenCount: 3,
+        ...(row.entryId ? { transcriptEntryId: row.entryId } : {}),
       });
+      await engine.getSummaryStore().appendContextMessage(conversation.conversationId, message.messageId);
     }
+    return { engine, db, readVisibleSessionTranscriptMessageEntries };
+  }
+
+  it("stamps legacy rows by in-order content match, then drains incrementally", async () => {
+    const host = new FakeTranscriptHost(sessionId);
+    const ids = [host.append(user("legacy one")), host.append(assistant("legacy two"))];
+    const { engine, db, readVisibleSessionTranscriptMessageEntries } = await legacyConversation(host, [
+      { role: "user", content: "legacy one" },
+      { role: "assistant", content: "legacy two" },
+    ]);
     host.append(user("new after upgrade"));
 
-    await bootstrap(engine);
-    expect(readVisibleSessionTranscriptMessageEntries).toHaveBeenCalledTimes(1);
+    await expect(bootstrap(engine)).resolves.toMatchObject({ importedMessages: 1 });
+    expect(readVisibleSessionTranscriptMessageEntries).not.toHaveBeenCalled();
     expect(cursorRow(db)).toMatchObject({ mode: "cursor_v1", origin: "legacy-migration" });
-    const afterMigration = rows(db);
-    expect(afterMigration.map((row) => row.content)).toEqual([
-      "legacy one",
-      "legacy two",
-      "new after upgrade",
-    ]);
-    expect(afterMigration.slice(0, 2).map((row) => row.entryId)).toEqual(ids);
+    const migrated = rows(db);
+    expect(migrated.map((row) => row.content)).toEqual(["legacy one", "legacy two", "new after upgrade"]);
+    expect(migrated.slice(0, 2).map((row) => row.entryId)).toEqual(ids);
 
     host.append(assistant("steady"));
+    host.visibleReads = 0;
     await bootstrap(engine);
-    await afterTurn(engine, []);
-    expect(readVisibleSessionTranscriptMessageEntries).toHaveBeenCalledTimes(1);
+    expect(host.visibleReads).toBe(1);
     expect(rows(db).map((row) => row.content).at(-1)).toBe("steady");
   });
 
-  it("repeats an import-capped legacy reconcile before switching to cursor mode", async () => {
+  it("anchors on the last visible stamped id and imports the whole suffix without a cap", async () => {
     const host = new FakeTranscriptHost(sessionId);
-    const readVisibleSessionTranscriptMessageEntries = vi.fn(host.readVisibleEntries);
-    const { engine, db } = createEngineWithDepsOverridesAndDb({
-      readSessionTranscriptVisibleMessageDelta: host.readVisibleDelta,
-      readSessionTranscriptRawDelta: host.readRawDelta,
-      readVisibleSessionTranscriptMessageEntries,
-    });
-    // A legacy conversation that stamped its first row, then fell far behind.
-    host.append(user("first"));
-    const store = engine.getConversationStore();
-    const conversation = await store.getOrCreateConversation(sessionId, { sessionKey });
-    await store.markConversationBootstrapped(conversation.conversationId);
-    await store.createMessage({
-      conversationId: conversation.conversationId,
-      seq: 1,
-      role: "user",
-      content: "first",
-      tokenCount: 2,
-      transcriptEntryId: host.visibleMessages()[0]!.id,
-    });
+    const first = host.append(user("first"));
+    const { engine, db } = await legacyConversation(host, [{ role: "user", content: "first", entryId: first }]);
     for (let index = 0; index < 120; index += 1) {
       host.append(index % 2 === 0 ? assistant(`answer ${index}`) : user(`question ${index}`));
     }
-
-    await bootstrap(engine);
-    expect(readVisibleSessionTranscriptMessageEntries.mock.calls.length).toBeGreaterThan(1);
+    await expect(bootstrap(engine)).resolves.toMatchObject({ importedMessages: 120 });
     expect(rows(db)).toHaveLength(121);
     expect(cursorRow(db)).toMatchObject({ origin: "legacy-migration", frontierSeq: 121 });
+  });
+
+  it("never deletes rows, clears ids, or imports before the anchor", async () => {
+    const host = new FakeTranscriptHost(sessionId);
+    const kept = host.append(user("kept question"));
+    host.append(assistant("visible but never stored"));
+    const anchor = host.append(user("anchor question"));
+    const { engine, db } = await legacyConversation(host, [
+      // A stamped row whose stored content no longer matches its entry.
+      { role: "user", content: "content drifted from the transcript", entryId: kept },
+      { role: "assistant", content: "unstamped legacy row" },
+      { role: "user", content: "anchor question", entryId: anchor },
+    ]);
+    host.append(assistant("after anchor"));
+    const before = rows(db);
+
+    await bootstrap(engine);
+    const after = rows(db);
+    expect(after.slice(0, before.length)).toEqual(before);
+    expect(after.map((row) => row.content).slice(before.length)).toEqual(["after anchor"]);
+  });
+
+  it("imports nothing without an anchor or content match, keeping every legacy row", async () => {
+    const host = new FakeTranscriptHost(sessionId);
+    host.append(user("decorated transcript text"));
+    const { engine, db } = await legacyConversation(host, [{ role: "user", content: "legacy runtime text" }]);
+    await expect(bootstrap(engine)).resolves.toMatchObject({ importedMessages: 0 });
+    expect(rows(db).map((row) => [row.content, row.entryId])).toEqual([["legacy runtime text", null]]);
+    host.append(assistant("next turn"));
+    await bootstrap(engine);
+    expect(rows(db).map((row) => row.content)).toEqual(["legacy runtime text", "next turn"]);
+  });
+});
+
+describe("missing visible-delta reader", () => {
+  it("is a logged capability error, never a fallback to the legacy reconcile", async () => {
+    const host = new FakeTranscriptHost(sessionId);
+    host.append(user("hello"));
+    const readVisibleSessionTranscriptMessageEntries = vi.fn(host.readVisibleEntries);
+    const { engine, db } = createEngineWithDepsOverridesAndDb({
+      readSessionTranscriptVisibleMessageDelta: undefined,
+      readVisibleSessionTranscriptMessageEntries,
+    });
+    const error = Reflect.get(engine, "deps").log.error as ReturnType<typeof vi.fn>;
+
+    await expect(bootstrap(engine)).resolves.toMatchObject({
+      importedMessages: 0,
+      reason: "transcript delta reader unavailable",
+    });
+    await afterTurn(engine, [user("hello")]);
+    const admission = host.visibleMessages()[0]!.id;
+    await expect(engine.commitTurn(commitParams(host, admission, admission))).rejects.toThrow(
+      /transcript delta reader unavailable/,
+    );
+    expect(readVisibleSessionTranscriptMessageEntries).not.toHaveBeenCalled();
+    expect(rows(db)).toEqual([]);
+    expect(error).toHaveBeenCalledTimes(1);
+    expect(String(error.mock.calls[0]?.[0])).toContain("readSessionTranscriptVisibleMessageDelta is required");
   });
 });
 

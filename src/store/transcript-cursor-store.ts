@@ -121,6 +121,18 @@ export class TranscriptCursorStore {
     return byEntryId;
   }
 
+  /** Count rows at or before `seq` that carry no transcript entry id. */
+  countUnstampedRowsThroughSeq(conversationId: number, seq: number): number {
+    const row = this.db
+      .prepare(
+        `SELECT COUNT(*) AS n
+         FROM messages
+         WHERE conversation_id = ? AND seq <= ? AND transcript_entry_id IS NULL`,
+      )
+      .get(conversationId, seq) as { n: number };
+    return row.n;
+  }
+
   /** List rows after `afterSeq` in conversation order, for suffix content matching. */
   listRowsAfterSeq(conversationId: number, afterSeq: number): StoredTranscriptRow[] {
     const rows = this.db

@@ -38,6 +38,9 @@ export class SessionTranscriptReadFenceError extends Error {
   }
 }
 
+/** Entry ids are unique across every fake transcript, like host UUIDs. */
+let nextGlobalId = 1;
+
 function encode(value: unknown): string {
   return Buffer.from(JSON.stringify(value), "utf8").toString("base64url");
 }
@@ -64,7 +67,6 @@ export class FakeTranscriptHost {
   visibleReads = 0;
   visibleEntriesReturned = 0;
   rawReads = 0;
-  private nextId = 1;
   private clock = Date.parse("2026-10-08T12:00:00.000Z");
 
   constructor(sessionId: string) {
@@ -72,8 +74,8 @@ export class FakeTranscriptHost {
   }
 
   private mint(prefix: string): string {
-    const id = `${prefix}-${this.nextId}`;
-    this.nextId += 1;
+    const id = `${prefix}-${nextGlobalId}`;
+    nextGlobalId += 1;
     return id;
   }
 
@@ -88,8 +90,8 @@ export class FakeTranscriptHost {
   }
 
   /** Append one message on the active path; returns its entry id. */
-  append(message: AgentMessage, options?: { supersedesEntryId?: string }): string {
-    const id = this.mint("e");
+  append(message: AgentMessage, options?: { supersedesEntryId?: string; entryId?: string }): string {
+    const id = options?.entryId ?? this.mint("e");
     this.push({
       type: "message",
       id,
