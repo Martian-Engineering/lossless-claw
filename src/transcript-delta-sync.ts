@@ -339,10 +339,11 @@ export class TranscriptDeltaSync {
 
       // Matched entries restamp; only entries after the last match import.
       const matchIndexes = [...matched.matches.keys()];
-      const lastMatch = matchIndexes.length > 0 ? Math.max(...matchIndexes) : -1;
+      const lastMatch = matchIndexes.reduce((max, index) => Math.max(max, index), -1);
+      const firstMatch = matchIndexes.reduce((min, index) => Math.min(min, index), scan.entries.length);
       const start =
         lastMatch >= 0
-          ? Math.min(...matchIndexes)
+          ? firstMatch
           : needsTokens && request.freshStartBudgetTokens !== null
             ? budgetStartIndex(scan.entries, windowStart, request.freshStartBudgetTokens)
             : windowStart;
