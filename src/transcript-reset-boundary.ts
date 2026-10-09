@@ -9,6 +9,9 @@
  * visible entry's `parentId` is the previous active event, so walking back
  * through non-message raw events from a "gap" (an entry whose parent is not
  * the previous visible message) finds any reset event on the active path.
+ * A reset can also trail the last visible message, which is the normal shape
+ * right after `/reset`: the next turn bootstraps before its user message is
+ * visible. Walking back from the raw tip to the last visible entry finds it.
  */
 import type {
   SessionTranscriptRawDeltaParams,
@@ -26,6 +29,13 @@ export type VisibleEntrySkeleton = {
 export type NonMessageTranscriptEvent = {
   type: string;
   parentId: string | null;
+};
+
+/** Raw facts the boundary walk needs: non-message events plus the raw tip. */
+export type RawTranscriptNavigation = {
+  nonMessageEvents: Map<string, NonMessageTranscriptEvent>;
+  /** Id and parent of the last raw event, when the stream is non-empty. */
+  tip: { id: string; parentId: string | null; type: string } | null;
 };
 
 type RawDeltaReader = (
@@ -52,16 +62,36 @@ export function findVisibleGapIndexes(entries: readonly VisibleEntrySkeleton[]):
 
 /**
  * Return the index of the first visible entry after the latest on-path reset,
- * or 0 when no reset precedes any visible entry.
+ * `entries.length` when a reset trails the last visible entry (an empty
+ * post-reset window), or 0 when no reset precedes any visible entry.
  *
- * Gaps are visited newest first; for each gap the chain of non-message parents
- * is followed until it reaches the previous visible message, an unknown event,
- * or a reset. The first reset found is the latest one on the active path.
+ * The trailing chain from the raw tip back to the last visible entry is
+ * checked first; then gaps are visited newest first, following each chain of
+ * non-message parents until it reaches the previous visible message, an
+ * unknown event, or a reset. The first reset found is the latest one on the
+ * active path.
  */
 export function resolvePostResetStartIndex(
   entries: readonly VisibleEntrySkeleton[],
-  nonMessageEvents: ReadonlyMap<string, NonMessageTranscriptEvent>,
+  navigation: RawTranscriptNavigation,
 ): number {
+  const lastEntryId = entries.at(-1)?.entryId ?? null;
+  if (navigation.tip && navigation.tip.id !== lastEntryId) {
+    // Walk the run of non-message events after the last visible message.
+    let event: NonMessageTranscriptEvent | undefined =
+      navigation.tip.type === "message"
+        ? undefined
+        : { type: navigation.tip.type, parentId: navigation.tip.parentId };
+    for (let steps = 0; event && steps < MAX_NON_MESSAGE_CHAIN; steps += 1) {
+      if (event.type === "reset") {
+        return entries.length;
+      }
+      if (!event.parentId || event.parentId === lastEntryId) {
+        break;
+      }
+      event = navigation.nonMessageEvents.get(event.parentId);
+    }
+  }
   const gaps = findVisibleGapIndexes(entries);
   for (let gapIndex = gaps.length - 1; gapIndex >= 0; gapIndex -= 1) {
     const index = gaps[gapIndex]!;
@@ -69,7 +99,7 @@ export function resolvePostResetStartIndex(
     let node = entries[index]!.parentId;
     // Walk the run of non-message events between two visible messages.
     for (let steps = 0; node && node !== previousEntryId && steps < MAX_NON_MESSAGE_CHAIN; steps += 1) {
-      const event = nonMessageEvents.get(node);
+      const event = navigation.nonMessageEvents.get(node);
       if (!event) {
         break;
       }
@@ -102,18 +132,35 @@ function readNonMessageEvent(
   };
 }
 
+/** Id, parent and type of one raw event, when it carries an id. */
+function readEventTip(event: unknown): RawTranscriptNavigation["tip"] {
+  if (!event || typeof event !== "object") {
+    return null;
+  }
+  const record = event as { id?: unknown; parentId?: unknown; type?: unknown };
+  if (typeof record.id !== "string" || typeof record.type !== "string") {
+    return null;
+  }
+  return {
+    id: record.id,
+    parentId: typeof record.parentId === "string" ? record.parentId : null,
+    type: record.type,
+  };
+}
+
 /**
- * Scan the raw transcript once and collect every non-message event. Returns
- * null when the raw stream cannot be read completely; callers must then treat
- * the reset boundary as unknown.
+ * Scan the raw transcript once and collect every non-message event plus the
+ * raw tip. Returns null when the raw stream cannot be read completely; callers
+ * must then treat the reset boundary as unknown.
  */
-export async function collectNonMessageTranscriptEvents(params: {
+export async function collectRawTranscriptNavigation(params: {
   read: RawDeltaReader;
   target: SessionTranscriptReadTarget;
   yieldToEventLoop: () => Promise<void>;
-}): Promise<Map<string, NonMessageTranscriptEvent> | null> {
+}): Promise<RawTranscriptNavigation | null> {
   for (let attempt = 0; attempt <= MAX_RAW_SCAN_RESTARTS; attempt += 1) {
     const events = new Map<string, NonMessageTranscriptEvent>();
+    let tip: RawTranscriptNavigation["tip"] = null;
     let cursor: string | undefined;
     let maxBytes = RAW_PAGE_MAX_BYTES;
     let restart = false;
@@ -126,7 +173,7 @@ export async function collectNonMessageTranscriptEvents(params: {
         maxEvents: RAW_PAGE_MAX_EVENTS,
       });
       if (result.kind === "missing") {
-        return events;
+        return { nonMessageEvents: events, tip };
       }
       if (result.kind === "reset") {
         restart = true;
@@ -146,11 +193,12 @@ export async function collectNonMessageTranscriptEvents(params: {
         if (parsed) {
           events.set(parsed.id, parsed.value);
         }
+        tip = readEventTip(row.event) ?? tip;
       }
       cursor = result.cursor;
       maxBytes = RAW_PAGE_MAX_BYTES;
       if (!result.hasMore) {
-        return events;
+        return { nonMessageEvents: events, tip };
       }
       await params.yieldToEventLoop();
     }

@@ -150,7 +150,7 @@ describe("reset boundary", () => {
       ["reset-1", { type: "reset", parentId: "m2" }],
       ["model", { type: "model_change", parentId: "reset-1" }],
     ]);
-    expect(resolvePostResetStartIndex(visible, events)).toBe(2);
+    expect(resolvePostResetStartIndex(visible, { nonMessageEvents: events, tip: { id: "m4", parentId: "m3", type: "message" } })).toBe(2);
   });
 
   it("returns 0 when no reset sits on the visible path", () => {
@@ -158,6 +158,41 @@ describe("reset boundary", () => {
       ["hdr", { type: "model_change", parentId: null }],
       ["model", { type: "model_change", parentId: "m2" }],
     ]);
-    expect(resolvePostResetStartIndex(visible, events)).toBe(0);
+    expect(resolvePostResetStartIndex(visible, { nonMessageEvents: events, tip: { id: "m4", parentId: "m3", type: "message" } })).toBe(0);
+  });
+
+  it("returns an empty window when a reset trails the last visible message (#1244)", () => {
+    // Live shape right after /reset: the next turn bootstraps before its user message is visible.
+    const beforeReset = [
+      { entryId: "u-1", parentId: null },
+      { entryId: "749c6a81", parentId: "u-1" },
+    ];
+    const events = new Map<string, NonMessageTranscriptEvent>([
+      ["e0f0ebc7", { type: "reset", parentId: "749c6a81" }],
+      ["85a10b6a", { type: "model_change", parentId: "e0f0ebc7" }],
+      ["ab154112", { type: "thinking_level_change", parentId: "85a10b6a" }],
+    ]);
+    const tip = { id: "ab154112", parentId: "85a10b6a", type: "thinking_level_change" };
+    expect(resolvePostResetStartIndex(beforeReset, { nonMessageEvents: events, tip })).toBe(2);
+
+    const afterFirstMessage = [...beforeReset, { entryId: "4dcd79b0", parentId: "ab154112" }];
+    expect(
+      resolvePostResetStartIndex(afterFirstMessage, {
+        nonMessageEvents: events,
+        tip: { id: "4dcd79b0", parentId: "ab154112", type: "message" },
+      }),
+    ).toBe(2);
+  });
+
+  it("ignores trailing control events without a reset", () => {
+    const events = new Map<string, NonMessageTranscriptEvent>([
+      ["model", { type: "model_change", parentId: "m4" }],
+    ]);
+    expect(
+      resolvePostResetStartIndex(visible, {
+        nonMessageEvents: new Map([...events, ["hdr", { type: "model_change", parentId: null }]]),
+        tip: { id: "model", parentId: "m4", type: "model_change" },
+      }),
+    ).toBe(0);
   });
 });

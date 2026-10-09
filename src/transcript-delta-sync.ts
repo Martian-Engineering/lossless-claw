@@ -28,8 +28,7 @@ import type {
 } from "./store/transcript-cursor-store.js";
 import { attachTranscriptEntryMeta } from "./transcript.js";
 import {
-  collectNonMessageTranscriptEvents,
-  findVisibleGapIndexes,
+  collectRawTranscriptNavigation,
   resolvePostResetStartIndex,
 } from "./transcript-reset-boundary.js";
 import {
@@ -847,7 +846,8 @@ export class TranscriptDeltaSync {
     request: TranscriptSyncRequest,
     entries: readonly ScannedVisibleEntry[],
   ): Promise<number> {
-    if (entries.length === 0 || findVisibleGapIndexes(entries).length === 0) {
+    // A reset can trail a gapless visible list, so only an empty list skips the scan.
+    if (entries.length === 0) {
       return 0;
     }
     if (!this.deps.readRawDelta) {
@@ -856,18 +856,18 @@ export class TranscriptDeltaSync {
       );
       return 0;
     }
-    const events = await collectNonMessageTranscriptEvents({
+    const navigation = await collectRawTranscriptNavigation({
       read: this.deps.readRawDelta,
       target: request.target,
       yieldToEventLoop: this.yieldToEventLoop,
     });
-    if (!events) {
+    if (!navigation) {
       this.deps.log.warn(
         `[lcm] transcript reset boundary unknown conversation=${request.conversationId} ${request.label}: raw transcript scan incomplete`,
       );
       return 0;
     }
-    return resolvePostResetStartIndex(entries, events);
+    return resolvePostResetStartIndex(entries, navigation);
   }
 
   private synced(

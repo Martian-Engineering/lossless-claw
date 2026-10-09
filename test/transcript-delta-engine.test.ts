@@ -353,6 +353,44 @@ describe("transcript delta reset window", () => {
     expect(archived.n).toBe(1);
   });
 
+  it("imports nothing when bootstrap runs between /reset and the first post-reset message (#1244)", async () => {
+    const { host, engine, db } = setup();
+    host.append(user("before reset"));
+    host.append(assistant("old answer"));
+    await bootstrap(engine);
+
+    // Live shape: the reset and its control rows trail the last visible message.
+    host.appendControl("reset");
+    host.appendControl("model_change");
+    host.appendControl("thinking_level_change");
+    await engine.handleBeforeReset({ reason: "reset", sessionId, sessionKey });
+    await expect(bootstrap(engine)).resolves.toMatchObject({ importedMessages: 0 });
+    expect(rows(db)).toEqual([]);
+
+    // The admitted user message is fenced from this bootstrap, then committed.
+    const admission = host.append(user("after reset"));
+    host.fencePosition = host.positionOf(admission);
+    await expect(bootstrap(engine)).resolves.toMatchObject({ importedMessages: 0 });
+    host.fencePosition = null;
+    const terminal = host.append(assistant("new answer"));
+    await engine.commitTurn(commitParams(host, admission, terminal));
+    expect(rows(db).map((row) => row.content)).toEqual(["after reset", "new answer"]);
+  });
+
+  it("keeps an empty post-reset window empty through a generation_mismatch resync", async () => {
+    const { host, engine, db } = setup();
+    host.append(user("before reset"));
+    host.appendControl("reset");
+    await engine.handleBeforeReset({ reason: "reset", sessionId, sessionKey });
+    await bootstrap(engine);
+    host.rotate();
+    await expect(bootstrap(engine)).resolves.toMatchObject({ importedMessages: 0 });
+    expect(rows(db)).toEqual([]);
+    host.append(user("after reset"));
+    await bootstrap(engine);
+    expect(rows(db).map((row) => row.content)).toEqual(["after reset"]);
+  });
+
   it("does not back-fill pre-reset history when a post-reset conversation resyncs", async () => {
     const { host, engine, db } = setup();
     host.append(user("before reset"));

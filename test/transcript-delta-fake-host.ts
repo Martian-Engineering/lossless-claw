@@ -267,7 +267,11 @@ export class FakeTranscriptHost {
     }
     const maxEvents = params.maxEvents ?? 1000;
     const start = cursor.idx + 1;
-    const events = this.raw.slice(start, start + maxEvents).map((event, offset) => ({
+    // The current-turn fence also hides the admission and later raw events.
+    const fenced = this.fencePosition === null ? undefined : this.visibleMessages()[this.fencePosition];
+    const fenceIndex = fenced ? this.raw.indexOf(fenced) : this.raw.length;
+    const end = Math.min(start + maxEvents, fenceIndex);
+    const events = this.raw.slice(start, end).map((event, offset) => ({
       event: structuredClone(event),
       seq: start + offset,
     }));
@@ -276,7 +280,7 @@ export class FakeTranscriptHost {
       kind: "page",
       cursor: encode({ ...cursor, idx: events.length > 0 ? lastIdx : cursor.idx }),
       events,
-      hasMore: lastIdx + 1 < this.raw.length,
+      hasMore: lastIdx + 1 < fenceIndex,
       serializedBytes: 0,
     };
   };
