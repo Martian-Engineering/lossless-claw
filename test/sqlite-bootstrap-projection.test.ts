@@ -2,24 +2,8 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { cleanupEngineTestState, createEngineWithDepsOverridesAndDb } from "./helpers.js";
 import type { AgentMessage } from "../src/openclaw-bridge.js";
 import type { LcmDependencies, VisibleSessionTranscriptMessageEntry } from "../src/types.js";
-import { attachTranscriptEntryMeta } from "../src/transcript.js";
 
 afterEach(cleanupEngineTestState);
-
-function decoratedRoomEvent(body: string): string {
-  return [
-    "Conversation info (untrusted metadata):",
-    "```json",
-    JSON.stringify({
-      chat_id: "telegram:10000000x",
-      inbound_event_kind: "room_event",
-      sender: "sam.rivera",
-    }),
-    "```",
-    "",
-    `[Sun 2026-06-21 13:19 GMT+3] ${body}`,
-  ].join("\n");
-}
 
 describe("LcmContextEngine.bootstrap sqlite transcript projection", () => {
   it("imports visible transcript entries from runtimeContext.sessionTarget without a session file", async () => {

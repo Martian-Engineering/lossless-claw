@@ -1,10 +1,7 @@
 /**
- * After-turn batch deduplication: guards ingest against gateway replays of
- * full history by aligning the runtime turn delta with the persisted
- * conversation tail (exact frontier alignment after a covered transcript
- * reconcile, heuristic overlap dedup otherwise).
- *
- * Extracted from engine.ts (Phase 2 of the engine decomposition).
+ * Persisted-anchor matching: decides whether an incoming message is a replay
+ * of one stored row, accepting exact content, proven large-file
+ * externalization, and provenance-gated host redaction.
  */
 import { createRequire } from "node:module";
 import {

@@ -4082,7 +4082,7 @@ export class LcmContextEngine implements ContextEngine {
       );
     }
 
-    // The visible projection may already contain the turn, leaving ingestBatch empty.
+    // Earlier ingestion may already hold heartbeat acks for this turn.
     if (
       this.config.pruneHeartbeatOk &&
       (params.isHeartbeat || batchLooksLikeHeartbeatAckTurn(newMessages))
