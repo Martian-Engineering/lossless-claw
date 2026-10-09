@@ -103,6 +103,7 @@ const HANDLED_CONVERSATION_ID_TABLES = new Set([
   "conversation_transcript_epochs",
   "conversation_transcript_cursors",
   "transcript_user_replay_keys",
+  "conversation_transcript_gaps",
   "pending_compaction_batches",
   "pending_summary_nodes",
 ]);
@@ -527,6 +528,16 @@ function reparentTranscriptAnchorState(db: DatabaseSync, group: SafeGroup): void
       `UPDATE OR IGNORE transcript_user_replay_keys
        SET conversation_id = ?,
            updated_at = datetime('now')
+       WHERE conversation_id IN (${sourcePlaceholders})`,
+    ).run(group.targetConversationId, ...group.sourceConversationIds);
+  }
+  if (hasTable(db, "conversation_transcript_gaps")) {
+    // Gap markers describe entries missing from the merged lane, so they move
+    // with their rows; a target marker for the same run wins and the source
+    // copy stays on the archived lane.
+    db.prepare(
+      `UPDATE OR IGNORE conversation_transcript_gaps
+       SET conversation_id = ?
        WHERE conversation_id IN (${sourcePlaceholders})`,
     ).run(group.targetConversationId, ...group.sourceConversationIds);
   }

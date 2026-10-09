@@ -26,8 +26,10 @@ import type {
   TranscriptCursorRecord,
   TranscriptCursorStore,
 } from "./store/transcript-cursor-store.js";
+import type { TranscriptGapStore, TranscriptHistoryGap } from "./store/transcript-gap-store.js";
 import type { TranscriptUserReplayKey, UserReplayKeyStore } from "./store/user-replay-key-store.js";
 import { attachTranscriptEntryMeta } from "./transcript.js";
+import { isGapEligibleMessage } from "./transcript-gap-eligibility.js";
 import {
   collectRawTranscriptNavigation,
   resolvePostResetStartIndex,
@@ -35,6 +37,7 @@ import {
 import {
   budgetStartIndex,
   contentMatchKey,
+  findHistoryGaps,
   planResync,
   SuffixContentMatcher,
   type ScannedVisibleEntry,
@@ -96,6 +99,12 @@ export type ResyncSummary = {
   unimportedBeforeAnchor: number;
   /** Stored rows at or before the anchor row that still carry no transcript entry id. */
   unstampedRowsBeforeAnchor: number;
+  /** History gaps found before the anchor (see `findHistoryGaps`). */
+  historyGaps: number;
+  /** Storable entries across those gaps. */
+  historyGapEntries: number;
+  /** Gap markers this resync recorded for the first time. */
+  newHistoryGaps: number;
 };
 
 /**
@@ -140,6 +149,7 @@ export type TranscriptDeltaSyncDeps = {
   cursorStore: TranscriptCursorStore;
   conversationStore: ConversationStore;
   replayKeyStore: UserReplayKeyStore;
+  gapStore: TranscriptGapStore;
   log: LcmDependencies["log"];
   yieldToEventLoop?: () => Promise<void>;
 };
@@ -364,6 +374,10 @@ export class TranscriptDeltaSync {
       }
       const stored = this.deps.cursorStore.listStampedRows(request.conversationId);
       const plan = planResync(scan.entries, stored);
+      const gaps = findHistoryGaps(scan.entries, plan.knownRows, (lowSeq, highSeq) =>
+        this.deps.cursorStore.countRowsBetweenSeq(request.conversationId, lowSeq, highSeq),
+      );
+      let newGaps = 0;
       const visibleIds = new Set(scan.entries.map((entry) => entry.entryId));
       const claimed = new Set([...plan.restamps.values()].map((row) => row.messageId));
 
@@ -428,6 +442,7 @@ export class TranscriptDeltaSync {
         startIndex: importStart,
         counters,
         beforeFirstPage: async (pageCounters) => {
+          newGaps += this.deps.gapStore.record(request.conversationId, gaps, options.reason);
           this.recordScannedReplayKeys(request.conversationId, scan.entries, stored, visibleIds);
           await this.applyPlannedRestamps(scan.entries, plan.restamps, pageCounters);
         },
@@ -450,10 +465,16 @@ export class TranscriptDeltaSync {
           plan.anchorRowSeq === null
             ? 0
             : this.deps.cursorStore.countUnstampedRowsThroughSeq(request.conversationId, plan.anchorRowSeq),
+        historyGaps: gaps.length,
+        historyGapEntries: gaps.reduce((total, gap) => total + gap.entryCount, 0),
+        newHistoryGaps: newGaps,
       };
       this.deps.log.info(
-        `[lcm] transcript resync conversation=${request.conversationId} ${request.label} reason=${options.reason} visible=${scan.entries.length} anchorIndex=${plan.lastKnownIndex} importStart=${importStart} imported=${counters.imported} restamped=${counters.restamped} supersedesRestamps=${plan.restamps.size} unimportedBeforeAnchor=${plan.unimportedBeforeAnchor} unstampedRowsBeforeAnchor=${summary.unstampedRowsBeforeAnchor} ${matchSummary()}`,
+        `[lcm] transcript resync conversation=${request.conversationId} ${request.label} reason=${options.reason} visible=${scan.entries.length} anchorIndex=${plan.lastKnownIndex} importStart=${importStart} imported=${counters.imported} restamped=${counters.restamped} supersedesRestamps=${plan.restamps.size} unimportedBeforeAnchor=${plan.unimportedBeforeAnchor} unstampedRowsBeforeAnchor=${summary.unstampedRowsBeforeAnchor} historyGaps=${gaps.length} ${matchSummary()}`,
       );
+      if (newGaps > 0) {
+        this.warnHistoryGaps(request, options.reason, gaps, newGaps);
+      }
       return {
         ...this.synced("resync", counters, written.frontierSeq),
         resetReason: options.reason,
@@ -461,6 +482,24 @@ export class TranscriptDeltaSync {
       };
     }
     return this.stopped("resync", "blocked", counters, null, "transcript kept changing during resync", options.reason);
+  }
+
+  /**
+   * Warn once when a resync records new history-gap markers: those entries
+   * were never stored, sit before the anchor, and are never imported
+   * automatically, so recall and summaries do not cover them.
+   */
+  private warnHistoryGaps(
+    request: TranscriptSyncRequest,
+    reason: string,
+    gaps: readonly TranscriptHistoryGap[],
+    newGaps: number,
+  ): void {
+    const entries = gaps.reduce((total, gap) => total + gap.entryCount, 0);
+    const largest = gaps.reduce((max, gap) => Math.max(max, gap.entryCount), 0);
+    this.deps.log.warn(
+      `[lcm] transcript history gaps recorded conversation=${request.conversationId} ${request.label} reason=${reason} newGaps=${newGaps} gaps=${gaps.length} entries=${entries} largestGap=${largest}; these transcript entries were never stored and are not imported automatically (see /lcm doctor)`,
+    );
   }
 
   /**
@@ -616,6 +655,7 @@ export class TranscriptDeltaSync {
               ? Math.max(1, toStoredMessage(entry.message).tokenCount)
               : 0,
           ...(userReplay ? { userReplay } : {}),
+          gapEligible: isGapEligibleMessage(entry.message),
         });
       }
       cursor = page.cursor;

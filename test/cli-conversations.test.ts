@@ -149,6 +149,55 @@ describe("getGlobalStatus", () => {
   });
 });
 
+describe("transcript history gaps", () => {
+  it("reports gap totals in status and each gap in conversation detail", () => {
+    const db = new DatabaseSync(databasePath);
+    db.exec(`
+      INSERT INTO conversation_transcript_gaps (
+        conversation_id, first_entry_id, last_entry_id, first_visible_seq, last_visible_seq,
+        entry_count, prev_message_id, next_message_id, source, detected_at
+      ) VALUES
+        (2, 'e-5', 'e-9', 5, 9, 5, 10, 11, 'legacy-migration', '2026-07-04T00:00:00.000Z'),
+        (3, 'x-2', 'x-3', 2, 3, 2, NULL, 12, 'generation_mismatch', '2026-07-04T00:00:00.000Z');
+    `);
+    db.close();
+
+    const readDb = openReadOnlyDatabase(databasePath);
+    const status = getGlobalStatus(readDb);
+    const detail = getConversationDiagnostics(readDb, { kind: "conversationId", value: 2 }, { freshTailCount: 8 });
+    readDb.close();
+
+    expect(status.transcriptGaps).toEqual({ conversations: 2, gaps: 2, entries: 7, largestGap: 5 });
+    expect(detail.transcriptGaps).toEqual([
+      {
+        gapId: expect.any(Number),
+        conversationId: 2,
+        firstEntryId: "e-5",
+        lastEntryId: "e-9",
+        firstVisibleSeq: 5,
+        lastVisibleSeq: 9,
+        entryCount: 5,
+        prevMessageId: 10,
+        nextMessageId: 11,
+        source: "legacy-migration",
+        detectedAt: "2026-07-04T00:00:00.000Z",
+      },
+    ]);
+  });
+
+  it("reports no gaps for a database that predates the gap table", () => {
+    const db = new DatabaseSync(databasePath);
+    db.exec(`DROP TABLE conversation_transcript_gaps`);
+    db.close();
+    const readDb = openReadOnlyDatabase(databasePath);
+    expect(getGlobalStatus(readDb).transcriptGaps).toEqual({ conversations: 0, gaps: 0, entries: 0, largestGap: 0 });
+    expect(
+      getConversationDiagnostics(readDb, { kind: "conversationId", value: 2 }, { freshTailCount: 8 }).transcriptGaps,
+    ).toEqual([]);
+    readDb.close();
+  });
+});
+
 describe("conversation selection and pagination", () => {
   it("prefers the active conversation for a reused session key", () => {
     const db = openReadOnlyDatabase(databasePath);

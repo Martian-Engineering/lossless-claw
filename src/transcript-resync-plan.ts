@@ -4,6 +4,7 @@
  * No IO and no logging, so every decision is unit-testable.
  */
 import type { ContentMatchCandidate, StoredTranscriptRow } from "./store/transcript-cursor-store.js";
+import type { TranscriptHistoryGap } from "./store/transcript-gap-store.js";
 import type { UserReplayIdentity } from "./user-replay.js";
 
 /** Payload-free facts about one visible entry gathered during the scan pass. */
@@ -16,6 +17,8 @@ export type ScannedVisibleEntry = {
   tokens: number;
   /** Host replay identity of a user entry; absent for other roles. */
   userReplay?: UserReplayIdentity;
+  /** True when LCM's storage policy would have stored this entry. */
+  gapEligible?: boolean;
 };
 
 /** Result of reconciling the visible id set against stored ids. */
@@ -28,6 +31,8 @@ export type ResyncPlan = {
   anchorRowSeq: number | null;
   /** Unknown visible entries before the anchor that resync leaves unimported. */
   unimportedBeforeAnchor: number;
+  /** Every known visible index with the row it maps to, in visible order. */
+  knownRows: Array<{ index: number; row: StoredTranscriptRow }>;
 };
 
 const MAX_SUPERSEDES_CHAIN = 64;
@@ -79,7 +84,7 @@ export function planResync(
   const claimed = new Set<number>();
   let lastKnownIndex = -1;
   let anchorRowSeq: number | null = null;
-  const knownIndexes: number[] = [];
+  const knownRows: ResyncPlan["knownRows"] = [];
   for (let index = 0; index < entries.length; index += 1) {
     const entry = entries[index]!;
     const direct = stored.get(entry.entryId);
@@ -99,22 +104,67 @@ export function planResync(
       restamps.set(index, row);
       claimed.add(row.messageId);
     }
-    knownIndexes.push(index);
+    knownRows.push({ index, row });
     lastKnownIndex = index;
     anchorRowSeq = row.seq;
   }
 
   // Count unknown entries that sit between the first and last known entry.
   let unimportedBeforeAnchor = 0;
-  if (knownIndexes.length > 0) {
-    const known = new Set(knownIndexes);
-    for (let index = knownIndexes[0]!; index < lastKnownIndex; index += 1) {
+  if (knownRows.length > 0) {
+    const known = new Set(knownRows.map((entry) => entry.index));
+    for (let index = knownRows[0]!.index; index < lastKnownIndex; index += 1) {
       if (!known.has(index)) {
         unimportedBeforeAnchor += 1;
       }
     }
   }
-  return { restamps, lastKnownIndex, anchorRowSeq, unimportedBeforeAnchor };
+  return { restamps, lastKnownIndex, anchorRowSeq, unimportedBeforeAnchor, knownRows };
+}
+
+/**
+ * Find history gaps before the anchor: runs of gap-eligible unknown entries
+ * between two consecutive known entries whose rows are adjacent in storage.
+ *
+ * A run counts only when the neighbors' rows are in order and no stored row
+ * sits between them (`rowsBetween` returns 0); otherwise legacy unstamped
+ * rows may already cover it and coverage cannot be proven by id, so it is
+ * not reported. Entries before the first known entry are pre-start history,
+ * not gaps.
+ */
+export function findHistoryGaps(
+  entries: readonly ScannedVisibleEntry[],
+  knownRows: ResyncPlan["knownRows"],
+  rowsBetween: (lowSeq: number, highSeq: number) => number,
+): TranscriptHistoryGap[] {
+  const gaps: TranscriptHistoryGap[] = [];
+  for (let pair = 1; pair < knownRows.length; pair += 1) {
+    const before = knownRows[pair - 1]!;
+    const after = knownRows[pair]!;
+    // Collect the eligible unknown entries strictly between the two known ones.
+    const run: ScannedVisibleEntry[] = [];
+    for (let index = before.index + 1; index < after.index; index += 1) {
+      if (entries[index]!.gapEligible) {
+        run.push(entries[index]!);
+      }
+    }
+    if (run.length === 0 || after.row.seq <= before.row.seq) {
+      continue;
+    }
+    if (rowsBetween(before.row.seq, after.row.seq) > 0) {
+      continue;
+    }
+    gaps.push({
+      firstEntryId: run[0]!.entryId,
+      lastEntryId: run.at(-1)!.entryId,
+      firstVisibleSeq: run[0]!.seq,
+      lastVisibleSeq: run.at(-1)!.seq,
+      entryCount: run.length,
+      prevMessageId: before.row.messageId,
+      nextMessageId: after.row.messageId,
+    });
+  }
+  return gaps;
 }
 
 /**

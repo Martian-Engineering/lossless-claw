@@ -560,6 +560,33 @@ function ensureTranscriptUserReplayKeyTable(db: DatabaseSync): void {
   `);
 }
 
+/**
+ * Durable markers for runs of visible transcript entries that LCM never
+ * stored and that cursor resync deliberately leaves unimported because they
+ * sit before the anchor. Each row names the run by its first/last entry id and
+ * visible seq, plus the stored rows on either side, so an operator-invoked
+ * backfill can find the position later. Markers are diagnostics only: they
+ * never change ingestion or assembly.
+ */
+function ensureTranscriptGapTable(db: DatabaseSync): void {
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS conversation_transcript_gaps (
+      gap_id INTEGER PRIMARY KEY,
+      conversation_id INTEGER NOT NULL REFERENCES conversations(conversation_id) ON DELETE CASCADE,
+      first_entry_id TEXT NOT NULL,
+      last_entry_id TEXT NOT NULL,
+      first_visible_seq INTEGER NOT NULL,
+      last_visible_seq INTEGER NOT NULL,
+      entry_count INTEGER NOT NULL,
+      prev_message_id INTEGER REFERENCES messages(message_id) ON DELETE SET NULL,
+      next_message_id INTEGER REFERENCES messages(message_id) ON DELETE SET NULL,
+      source TEXT NOT NULL,
+      detected_at TEXT NOT NULL DEFAULT (datetime('now')),
+      UNIQUE (conversation_id, first_entry_id, last_entry_id)
+    );
+  `);
+}
+
 function backfillMessageIdentityHashes(
   db: DatabaseSync,
   options?: { managesOwnTransaction?: boolean },
@@ -1652,6 +1679,7 @@ export function runLcmMigrations(
     runMigrationStep("ensureTranscriptUserReplayKeyTable", log, () =>
       ensureTranscriptUserReplayKeyTable(db),
     );
+    runMigrationStep("ensureTranscriptGapTable", log, () => ensureTranscriptGapTable(db));
     // Partial unique index: NULL stable event keys (legacy rows, messages
     // without a stable identity) are exempt, so this only enforces idempotency
     // for messages that carry a computed key.

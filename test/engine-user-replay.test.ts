@@ -80,6 +80,10 @@ it("keeps retained user replay identity and carriers across user turns, not summ
   }
   // Rows seeded without transcript ingestion were each observed by one full read.
   expect(readVisibleSessionTranscriptMessageEntries).toHaveBeenCalledTimes(users.length - 1);
+  const info = Reflect.get(engine, "deps").log.info as ReturnType<typeof vi.fn>;
+  const fullReadLogs = info.mock.calls.map(([line]) => String(line)).filter(line => line.includes("read full visible transcript"));
+  expect(fullReadLogs).toHaveLength(users.length - 1);
+  expect(fullReadLogs[0]).toMatch(/replay keys unobserved for 1 raw user item\(s\) conversation=\d+ .* entries=3 duration=/);
   const full = await engine.assemble({ sessionId, sessionKey, messages: live, tokenBudget: 100_000, availableTools: new Set(), prompt: "next" });
   expect(readVisibleSessionTranscriptMessageEntries).toHaveBeenCalledTimes(users.length - 1);
   // Fit the suffix beginning at the first carrier, but not its parent user.

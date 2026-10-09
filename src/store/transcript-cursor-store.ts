@@ -141,6 +141,18 @@ export class TranscriptCursorStore {
     return row.n;
   }
 
+  /** Count rows strictly between two conversation seqs, stamped or not. */
+  countRowsBetweenSeq(conversationId: number, lowSeq: number, highSeq: number): number {
+    const row = this.db
+      .prepare(
+        `SELECT COUNT(*) AS n
+         FROM messages
+         WHERE conversation_id = ? AND seq > ? AND seq < ?`,
+      )
+      .get(conversationId, lowSeq, highSeq) as { n: number };
+    return row.n;
+  }
+
   /**
    * List rows after `afterSeq` in conversation order for suffix content
    * matching, each with its stored tool-call ids and whether it has text.

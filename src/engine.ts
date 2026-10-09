@@ -77,6 +77,7 @@ import { buildToolCallInputMap } from "./tool-pairing.js";
 import { PendingSummaryStore } from "./store/pending-summary-store.js";
 import { TranscriptCursorStore } from "./store/transcript-cursor-store.js";
 import { UserReplayKeyStore } from "./store/user-replay-key-store.js";
+import { TranscriptGapStore } from "./store/transcript-gap-store.js";
 import {
   TranscriptDeltaSync,
   type TranscriptSyncFinalizeFacts,
@@ -578,6 +579,8 @@ export class LcmContextEngine implements ContextEngine {
   /** Single transcript writer; null when the host exposes no visible-delta reader. */
   private transcriptDeltaSync: TranscriptDeltaSync | null;
   private missingTranscriptDeltaReaderReported = false;
+  /** Conversations whose missing host transcript was already logged by this process. */
+  private readonly missingTranscriptReported = new Set<number>();
   private assembler: ContextAssembler;
   private compaction: CompactionEngine;
   private retrieval: RetrievalEngine;
@@ -750,6 +753,7 @@ export class LcmContextEngine implements ContextEngine {
           cursorStore: this.transcriptCursorStore,
           conversationStore: this.conversationStore,
           replayKeyStore: this.userReplayKeyStore,
+          gapStore: new TranscriptGapStore(this.db),
           log: this.deps.log,
         })
       : null;
@@ -3418,13 +3422,46 @@ export class LcmContextEngine implements ContextEngine {
     const conversationId = params.conversation.conversationId;
     const request = this.buildTranscriptSyncRequest({ ...params, conversationId });
     const state = this.transcriptCursorStore.get(conversationId);
+    let outcome: TranscriptSyncOutcome;
     if (state) {
-      return { conversationId, outcome: await sync.drain(request, state) };
+      const startedAt = Date.now();
+      outcome = await sync.drain(request, state);
+      if (outcome.status === "synced" && outcome.path === "incremental") {
+        this.deps.log.debug(
+          `[lcm] transcript drain conversation=${conversationId} ${params.sessionLabel} imported=${outcome.importedMessages} restamped=${outcome.restampedMessages} frontierSeq=${outcome.frontierSeq ?? "n/a"} duration=${formatDurationMs(Date.now() - startedAt)}`,
+        );
+      }
+    } else if ((await this.conversationStore.getMessageCount(conversationId)) === 0) {
+      outcome = await sync.freshStart(request);
+    } else {
+      outcome = (await this.migrateLegacyConversation(params)).outcome;
     }
-    if ((await this.conversationStore.getMessageCount(conversationId)) === 0) {
-      return { conversationId, outcome: await sync.freshStart(request) };
+    this.noteTranscriptMissing(conversationId, params.sessionLabel, outcome);
+    return { conversationId, outcome };
+  }
+
+  /**
+   * Log a missing host transcript once per conversation per process. Internal
+   * sessions (for example skill-workshop reviews) never have a transcript, so
+   * repeating the line on every turn is noise; a later successful sync clears
+   * the note so a transcript that disappears again is reported again.
+   */
+  private noteTranscriptMissing(
+    conversationId: number,
+    sessionLabel: string,
+    outcome: TranscriptSyncOutcome,
+  ): void {
+    if (outcome.status === "synced") {
+      this.missingTranscriptReported.delete(conversationId);
+      return;
     }
-    return this.migrateLegacyConversation(params);
+    if (outcome.status !== "missing" || this.missingTranscriptReported.has(conversationId)) {
+      return;
+    }
+    this.missingTranscriptReported.add(conversationId);
+    this.deps.log.info(
+      `[lcm] transcript missing conversation=${conversationId} ${sessionLabel}: the host has no visible transcript for this session; nothing is ingested and further missing results for this conversation are not logged`,
+    );
   }
 
   /**
@@ -3497,7 +3534,7 @@ export class LcmContextEngine implements ContextEngine {
     );
     const summary = outcome.resync;
     this.deps.log.info(
-      `[lcm] transcript cursor migration conversation=${conversationId} ${params.sessionLabel} status=${outcome.status} imported=${outcome.importedMessages} restamped=${outcome.restampedMessages} anchorIndex=${summary?.anchorIndex ?? "n/a"} contentMatches=${summary?.contentMatches ?? 0} unimportedBeforeAnchor=${summary?.unimportedBeforeAnchor ?? 0} unstampedRowsBeforeAnchor=${summary?.unstampedRowsBeforeAnchor ?? 0} duration=${formatDurationMs(Date.now() - startedAt)}`,
+      `[lcm] transcript cursor migration conversation=${conversationId} ${params.sessionLabel} status=${outcome.status} imported=${outcome.importedMessages} restamped=${outcome.restampedMessages} anchorIndex=${summary?.anchorIndex ?? "n/a"} contentMatches=${summary?.contentMatches ?? 0} unimportedBeforeAnchor=${summary?.unimportedBeforeAnchor ?? 0} unstampedRowsBeforeAnchor=${summary?.unstampedRowsBeforeAnchor ?? 0} historyGaps=${summary?.historyGaps ?? 0} historyGapEntries=${summary?.historyGapEntries ?? 0} duration=${formatDurationMs(Date.now() - startedAt)}`,
     );
     return { conversationId, outcome };
   }
@@ -3629,7 +3666,7 @@ export class LcmContextEngine implements ContextEngine {
         }
         importedHeartbeatAck = synced.outcome.importedHeartbeatAck;
         importedMessages = synced.outcome.importedMessages;
-        if (synced.outcome.status !== "synced") {
+        if (synced.outcome.status !== "synced" && synced.outcome.status !== "missing") {
           this.deps.log.debug(
             `[lcm] afterTurn: transcript delta ${synced.outcome.status} ${params.sessionLabel}${synced.outcome.detail ? ` detail=${synced.outcome.detail}` : ""}; continuing with stored state`,
           );
@@ -3739,9 +3776,6 @@ export class LcmContextEngine implements ContextEngine {
           finalize: writeReceipt,
         });
         if (synced.outcome.status === "missing") {
-          this.deps.log.warn(
-            `[lcm] commitTurn: visible transcript missing ${sessionLabel}; recording receipt without rows`,
-          );
           await this.conversationStore.withTransaction(() =>
             writeReceipt({ frontierSeq: null, importedMessages: 0 }),
           );
@@ -5323,8 +5357,12 @@ export class LcmContextEngine implements ContextEngine {
     // Fill unobserved ids from the visible projection; ids that are not
     // visible user entries observe no key, so they are never restored.
     let entries: VisibleSessionTranscriptMessageEntry[];
+    const startedAt = Date.now();
     try {
       entries = await readFullProjection(params.target);
+      this.deps.log.info(
+        `[lcm] assemble: replay keys unobserved for ${unobserved.length} raw user item(s) conversation=${params.conversationId} ${params.sessionLabel}; read full visible transcript entries=${entries.length} duration=${formatDurationMs(Date.now() - startedAt)}`,
+      );
     } catch (error) {
       this.deps.log.warn(`[lcm] assemble: user replay metadata unavailable for ${params.sessionLabel}: ${describeLogError(error)}`);
       return identities;

@@ -8,6 +8,7 @@ import {
 import {
   budgetStartIndex,
   contentMatchKey,
+  findHistoryGaps,
   planResync,
   SuffixContentMatcher,
   type ScannedVisibleEntry,
@@ -64,6 +65,61 @@ describe("planResync", () => {
 
   it("reports no anchor when nothing is stored", () => {
     expect(planResync([entry("a")], new Map())).toMatchObject({ lastKnownIndex: -1, anchorRowSeq: null });
+  });
+});
+
+describe("findHistoryGaps", () => {
+  /** Visible entries a..f with seq = position + 1; every unknown entry is storable unless listed. */
+  function visible(ineligible: string[] = []): ScannedVisibleEntry[] {
+    return ["a", "b", "c", "d", "e", "f"].map((id, index) =>
+      entry(id, { seq: index + 1, gapEligible: !ineligible.includes(id) }),
+    );
+  }
+
+  it("reports a run of storable unknown entries between adjacent stored rows", () => {
+    const entries = visible();
+    const plan = planResync(entries, new Map([["a", row(10, 1, "a")], ["e", row(11, 2, "e")]]));
+    expect(findHistoryGaps(entries, plan.knownRows, () => 0)).toEqual([
+      {
+        firstEntryId: "b",
+        lastEntryId: "d",
+        firstVisibleSeq: 2,
+        lastVisibleSeq: 4,
+        entryCount: 3,
+        prevMessageId: 10,
+        nextMessageId: 11,
+      },
+    ]);
+  });
+
+  it("counts only entries the storage policy would have kept", () => {
+    const entries = visible(["b", "d"]);
+    const plan = planResync(entries, new Map([["a", row(10, 1, "a")], ["e", row(11, 2, "e")]]));
+    expect(findHistoryGaps(entries, plan.knownRows, () => 0)).toMatchObject([
+      { firstEntryId: "c", lastEntryId: "c", entryCount: 1 },
+    ]);
+    const allSkipped = visible(["b", "c", "d"]);
+    expect(findHistoryGaps(allSkipped, plan.knownRows, () => 0)).toEqual([]);
+  });
+
+  it("does not report a run when stored rows sit between the neighbors", () => {
+    const entries = visible();
+    const plan = planResync(entries, new Map([["a", row(10, 1, "a")], ["e", row(11, 5, "e")]]));
+    const asked: Array<[number, number]> = [];
+    const gaps = findHistoryGaps(entries, plan.knownRows, (low, high) => {
+      asked.push([low, high]);
+      return 3;
+    });
+    expect(gaps).toEqual([]);
+    expect(asked).toEqual([[1, 5]]);
+  });
+
+  it("ignores neighbors stored out of order and history before the first known entry", () => {
+    const entries = visible();
+    const outOfOrder = planResync(entries, new Map([["c", row(10, 9, "c")], ["f", row(11, 2, "f")]]));
+    expect(findHistoryGaps(entries, outOfOrder.knownRows, () => 0)).toEqual([]);
+    const lateStart = planResync(entries, new Map([["d", row(10, 1, "d")]]));
+    expect(findHistoryGaps(entries, lateStart.knownRows, () => 0)).toEqual([]);
   });
 });
 
