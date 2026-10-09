@@ -1,12 +1,6 @@
-import { DatabaseSync } from "node:sqlite";
 import { describe, expect, it, vi } from "vitest";
-import { BatchDeduplicator } from "../src/batch-dedup.js";
-import { getLcmDbFeatures } from "../src/db/features.js";
-import { runLcmMigrations } from "../src/db/migration.js";
 import { toStoredMessage, toStoredMessageIdentity } from "../src/message-content.js";
 import type { AgentMessage } from "../src/openclaw-bridge.js";
-import { ConversationStore } from "../src/store/conversation-store.js";
-import { SummaryStore } from "../src/store/summary-store.js";
 import * as tokenAccounting from "../src/token-accounting.js";
 
 describe("reconciliation identity work", () => {
@@ -27,43 +21,6 @@ describe("reconciliation identity work", () => {
       expect(estimate).not.toHaveBeenCalled();
     } finally {
       estimate.mockRestore();
-    }
-  });
-
-  it.each([false, true])("does not retry already anchored rows (mixed tail: %s)", async (mixed) => {
-    const db = new DatabaseSync(":memory:");
-    try {
-      const { fts5Available } = getLcmDbFeatures(db);
-      runLcmMigrations(db, { fts5Available });
-      const store = new ConversationStore(db, { fts5Available });
-      const summaryStore = new SummaryStore(db, { fts5Available });
-      const conversation = await store.createConversation({ sessionId: "identity-work" });
-      const rows = await store.createMessagesBulk([
-        { conversationId: conversation.conversationId, seq: 1, role: "user", content: "same body", tokenCount: 2, ...(mixed ? {} : { transcriptEntryId: "existing-1" }) },
-        { conversationId: conversation.conversationId, seq: 2, role: "user", content: "same body", tokenCount: 2, transcriptEntryId: "existing-2" },
-      ]);
-      const adopt = vi.spyOn(store, "adoptTranscriptEntryIdForMessage");
-      const hashes = vi.spyOn(store, "getRecentMessageIdentityHashes");
-      const dedup = new BatchDeduplicator(store, summaryStore, "/unused", {
-        log: { debug: vi.fn(), info: vi.fn(), warn: vi.fn(), error: vi.fn() },
-      });
-      const plan = await dedup.planRecentTranscriptEntryAdoptions({
-        conversationId: conversation.conversationId,
-        messages: [{ role: "user", content: "same body" } as AgentMessage],
-        tailWindow: 2,
-      });
-      if (mixed) {
-        expect(plan.get(0)).toEqual({ messageId: rows[0]!.messageId, decorated: false });
-        await store.adoptTranscriptEntryIdForMessage(conversation.conversationId, plan.get(0)!.messageId, "new-entry");
-        expect(adopt).toHaveBeenCalledExactlyOnceWith(conversation.conversationId, rows[0]!.messageId, "new-entry");
-      } else {
-        expect(plan.size).toBe(0);
-        expect(adopt).not.toHaveBeenCalled();
-        expect(hashes).not.toHaveBeenCalled();
-      }
-      expect((await store.getMessages(conversation.conversationId)).map((row) => row.transcriptEntryId)).toEqual(mixed ? ["new-entry", "existing-2"] : ["existing-1", "existing-2"]);
-    } finally {
-      db.close();
     }
   });
 });

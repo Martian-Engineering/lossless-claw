@@ -1,3 +1,4 @@
+import type { DatabaseSync } from "node:sqlite";
 import { afterEach, describe, expect, it } from "vitest";
 import type { AgentMessage } from "../src/openclaw-bridge.js";
 import { attachTranscriptEntryMeta } from "../src/transcript.js";
@@ -9,6 +10,13 @@ import {
 } from "./helpers.js";
 
 afterEach(cleanupEngineTestState);
+
+/** Read one message's persisted anchor-trust state directly from SQLite. */
+function readTrustState(engine: ReturnType<typeof createEngine>, messageId: number) {
+  return (engine as unknown as { db: DatabaseSync })
+    .db.prepare("SELECT trust_state FROM message_transcript_anchor_trust WHERE message_id = ?")
+    .get(messageId);
+}
 
 // Both provider result ids and assistant response ids reach global replay dedup.
 const stableEventMessages: AgentMessage[] = [
@@ -61,16 +69,12 @@ describe("transcript anchor replay", () => {
       expect((await store.getMessageParts(rows[1]!.messageId))[0]?.textContent).toBe(
         "corrected result",
       );
-      expect(await store.getMessageTranscriptAnchorTrust(rows[0]!.messageId)).toMatchObject({
-        trustState: "suspect",
-      });
-      expect(await store.getMessageTranscriptAnchorTrust(rows[1]!.messageId)).toMatchObject({
-        trustState: "verified",
-      });
+      expect(readTrustState(engine, rows[0]!.messageId)).toEqual({ trust_state: "suspect" });
+      expect(readTrustState(engine, rows[1]!.messageId)).toEqual({ trust_state: "verified" });
     },
   );
 
-  it("deduplicates externalized checkpoint replays only when their payload matches", async () => {
+  it("matches an externalized persisted anchor only when the replay payload matches", async () => {
     await withTempHome(async () => {
       const engine = createEngineWithConfig({ largeFileTokenThreshold: 20 });
       const sessionId = "externalized-checkpoint-replay";
@@ -89,12 +93,8 @@ describe("transcript anchor replay", () => {
       const rows = await store.getMessages(conversation!.conversationId);
       expect(rows[0]!.content).toContain("[LCM Raw Payload:");
       const dedup = engine.getBatchDeduplicator();
-      await expect(
-        dedup.deduplicateAfterTurnBatchAgainstPreservedCheckpoint(sessionId, undefined, [original]),
-      ).resolves.toEqual([]);
-      await expect(
-        dedup.deduplicateAfterTurnBatchAgainstPreservedCheckpoint(sessionId, undefined, [changed]),
-      ).resolves.toEqual([changed]);
+      await expect(dedup.matchesPersistedAnchor(rows[0]!.messageId, original)).resolves.toBe(true);
+      await expect(dedup.matchesPersistedAnchor(rows[0]!.messageId, changed)).resolves.toBe(false);
       expect(await store.getMessageCount(conversation!.conversationId)).toBe(1);
     });
   });

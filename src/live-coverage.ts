@@ -25,55 +25,6 @@ export function normalizeSummaryOverlapText(value: string): string {
   return value.replace(/\s+/g, " ").trim().toLowerCase();
 }
 
-export function messageContentCoveredBySummary(params: {
-  message: AgentMessage;
-  summary: string;
-}): boolean {
-  const content = normalizeSummaryOverlapText(toStoredMessage(params.message).content);
-  if (content.length < 24) {
-    return false;
-  }
-  const summary = normalizeSummaryOverlapText(params.summary);
-  if (!summary.includes(content)) {
-    return false;
-  }
-  // Bare substring match is too loose: a 24+ char user instruction can
-  // coincidentally appear inside a long narrative summary and get silently
-  // dropped. Require one of:
-  //   1. content appears at the very start or end of the summary, OR
-  //   2. content appears inside a quoted block — double quotes ("..."),
-  //      single quotes ('...'), or backticks (`...`). All three quote
-  //      styles survive normalization and are emitted by the summarizer
-  //      when it embeds verbatim user text.
-  // Otherwise treat it as a coincidental collision and keep the message.
-  if (summary.startsWith(content) || summary.endsWith(content)) {
-    return true;
-  }
-  // Walk each quote-delimited span (cheap; summaries are bounded) and check
-  // membership. Use double-quoted literals to match the rest of the file.
-  for (const quoteChar of ["\"", "'", "`"]) {
-    let cursor = 0;
-    while (cursor < summary.length) {
-      const open = summary.indexOf(quoteChar, cursor);
-      if (open < 0) break;
-      const close = summary.indexOf(quoteChar, open + 1);
-      if (close < 0) {
-        // Unmatched opening quote: don't break out of the entire scan —
-        // a later well-formed quoted span may still contain the content.
-        // Skip past this lone opener and continue.
-        cursor = open + 1;
-        continue;
-      }
-      const span = summary.slice(open + 1, close);
-      if (span.includes(content)) {
-        return true;
-      }
-      cursor = close + 1;
-    }
-  }
-  return false;
-}
-
 export const INTER_SESSION_MESSAGE_MARKER = "[Inter-session message]";
 
 export const INTERNAL_CONTEXT_BEGIN_MARKER = "<<<BEGIN_OPENCLAW_INTERNAL_CONTEXT>>>";
