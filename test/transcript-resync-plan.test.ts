@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import type { StoredTranscriptRow } from "../src/store/transcript-cursor-store.js";
+import type { ContentMatchCandidate } from "../src/store/transcript-cursor-store.js";
 import {
   findVisibleGapIndexes,
   resolvePostResetStartIndex,
@@ -7,6 +7,7 @@ import {
 } from "../src/transcript-reset-boundary.js";
 import {
   budgetStartIndex,
+  contentMatchKey,
   planResync,
   SuffixContentMatcher,
   type ScannedVisibleEntry,
@@ -16,8 +17,19 @@ function entry(entryId: string, extra: Partial<ScannedVisibleEntry> = {}): Scann
   return { entryId, parentId: null, seq: 0, tokens: 0, ...extra };
 }
 
-function row(messageId: number, seq: number, transcriptEntryId: string | null, identityHash = `h${messageId}`): StoredTranscriptRow {
-  return { messageId, seq, identityHash, transcriptEntryId };
+function row(
+  messageId: number,
+  seq: number,
+  transcriptEntryId: string | null,
+  identityHash = `h${messageId}`,
+  extra: Partial<ContentMatchCandidate> = {},
+): ContentMatchCandidate {
+  return { messageId, seq, identityHash, transcriptEntryId, toolCallIds: [], hasContent: true, ...extra };
+}
+
+/** Candidate for a tool-call-only assistant row: empty text, calls kept in parts. */
+function toolCallOnlyRow(messageId: number, seq: number, toolCallIds: string[]): ContentMatchCandidate {
+  return row(messageId, seq, null, "empty-assistant", { toolCallIds, hasContent: false });
 }
 
 describe("planResync", () => {
@@ -83,6 +95,40 @@ describe("SuffixContentMatcher", () => {
     const matcher = new SuffixContentMatcher([row(1, 10, null, "x"), row(2, 20, null, "y")]);
     expect(matcher.claim("y")?.messageId).toBe(2);
     expect(matcher.claim("x")).toBeNull();
+  });
+  it("pairs tool-call-only rows by their tool-call ids, never by the shared empty-content hash", () => {
+    const matcher = new SuffixContentMatcher([toolCallOnlyRow(1, 10, ["call-new-1"]), toolCallOnlyRow(2, 20, ["call-new-2"])]);
+    const key = (ids: string[]) => contentMatchKey({ identityHash: "empty-assistant", toolCallIds: ids, hasContent: false })!;
+    // An older entry from a hole carries different calls and must not take a newer row.
+    expect(matcher.claim(key(["call-hole-1"]))).toBeNull();
+    expect(matcher.claim(key(["call-new-1"]))?.messageId).toBe(1);
+    expect(matcher.claim(key(["call-new-2"]))?.messageId).toBe(2);
+    expect(matcher.multiCandidateClaims).toBe(0);
+  });
+
+  it("never offers rows with neither text nor tool-call ids", () => {
+    const matcher = new SuffixContentMatcher([row(1, 10, null, "empty", { hasContent: false })]);
+    expect(matcher.isEmpty).toBe(true);
+  });
+});
+
+describe("contentMatchKey", () => {
+  it("is the identity hash alone for text-only messages", () => {
+    expect(contentMatchKey({ identityHash: "h", toolCallIds: [], hasContent: true })).toBe("h");
+  });
+
+  it("adds sorted, de-duplicated tool-call ids", () => {
+    expect(contentMatchKey({ identityHash: "h", toolCallIds: ["b", "a", "b"], hasContent: false })).toBe(
+      contentMatchKey({ identityHash: "h", toolCallIds: ["a", "b"], hasContent: true }),
+    );
+    expect(contentMatchKey({ identityHash: "h", toolCallIds: ["a"], hasContent: false })).not.toBe(
+      contentMatchKey({ identityHash: "h", toolCallIds: ["b"], hasContent: false }),
+    );
+  });
+
+  it("is null when nothing distinguishes the message", () => {
+    expect(contentMatchKey({ identityHash: "h", toolCallIds: [], hasContent: false })).toBeNull();
+    expect(contentMatchKey({ identityHash: null, toolCallIds: ["a"], hasContent: true })).toBeNull();
   });
 });
 

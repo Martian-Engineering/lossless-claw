@@ -27,6 +27,14 @@ export type StoredTranscriptRow = {
   transcriptEntryId: string | null;
 };
 
+/** Stored row offered to suffix content matching, with what distinguishes it. */
+export type ContentMatchCandidate = StoredTranscriptRow & {
+  /** Tool-call ids recorded in the row's stored parts. */
+  toolCallIds: string[];
+  /** False when the stored text content is empty or whitespace only. */
+  hasContent: boolean;
+};
+
 type CursorRow = {
   conversation_id: number;
   mode: typeof TRANSCRIPT_CURSOR_MODE;
@@ -133,17 +141,28 @@ export class TranscriptCursorStore {
     return row.n;
   }
 
-  /** List rows after `afterSeq` in conversation order, for suffix content matching. */
-  listRowsAfterSeq(conversationId: number, afterSeq: number): StoredTranscriptRow[] {
+  /**
+   * List rows after `afterSeq` in conversation order for suffix content
+   * matching, each with its stored tool-call ids and whether it has text.
+   */
+  listContentMatchCandidatesAfterSeq(conversationId: number, afterSeq: number): ContentMatchCandidate[] {
     const rows = this.db
       .prepare(
-        `SELECT message_id, seq, identity_hash, transcript_entry_id
-         FROM messages
-         WHERE conversation_id = ? AND seq > ?
-         ORDER BY seq`,
+        `SELECT m.message_id, m.seq, m.identity_hash, m.transcript_entry_id,
+                length(trim(m.content, ' ' || char(9, 10, 13))) > 0 AS has_content,
+                (SELECT group_concat(p.tool_call_id, char(31))
+                 FROM message_parts p
+                 WHERE p.message_id = m.message_id AND p.tool_call_id IS NOT NULL) AS tool_call_ids
+         FROM messages m
+         WHERE m.conversation_id = ? AND m.seq > ?
+         ORDER BY m.seq`,
       )
-      .all(conversationId, afterSeq) as StoredRow[];
-    return rows.map(toStoredTranscriptRow);
+      .all(conversationId, afterSeq) as Array<StoredRow & { has_content: number; tool_call_ids: string | null }>;
+    return rows.map((row) => ({
+      ...toStoredTranscriptRow(row),
+      toolCallIds: row.tool_call_ids ? row.tool_call_ids.split("\u001f") : [],
+      hasContent: row.has_content === 1,
+    }));
   }
 }
 

@@ -3,7 +3,7 @@
  * restamps, in-order suffix content matching, and the fresh-start budget.
  * No IO and no logging, so every decision is unit-testable.
  */
-import type { StoredTranscriptRow } from "./store/transcript-cursor-store.js";
+import type { ContentMatchCandidate, StoredTranscriptRow } from "./store/transcript-cursor-store.js";
 
 /** Payload-free facts about one visible entry gathered during the scan pass. */
 export type ScannedVisibleEntry = {
@@ -149,55 +149,81 @@ export function budgetStartIndex(
 }
 
 /**
+ * Key a stored row or visible entry for suffix content matching, or return
+ * null when nothing distinguishes it. Tool-call ids join the content hash, so
+ * tool-call-only messages (empty text, calls kept in parts) only pair with the
+ * same calls. A message with no text and no tool-call ids has no key and is
+ * never content-matched: leaving it unstamped beats stamping a guess.
+ */
+export function contentMatchKey(input: {
+  identityHash: string | null;
+  toolCallIds: readonly string[];
+  hasContent: boolean;
+}): string | null {
+  if (!input.identityHash) {
+    return null;
+  }
+  const toolCallIds = [...new Set(input.toolCallIds)].sort();
+  if (!input.hasContent && toolCallIds.length === 0) {
+    return null;
+  }
+  return toolCallIds.length === 0
+    ? input.identityHash
+    : [input.identityHash, ...toolCallIds].join("\u0000");
+}
+
+/**
  * In-order content matcher for rewritten suffixes. Candidate rows are stored
  * rows after the anchor whose ids left the projection (or were never
- * stamped). Each claim takes the earliest unclaimed row with the same identity
- * hash that follows the previous claim, so a copy-on-write re-append maps
- * back onto the original rows in order.
+ * stamped). Each claim takes the earliest unclaimed row with the same
+ * `contentMatchKey` that follows the previous claim, so a copy-on-write
+ * re-append maps back onto the original rows in order. Rows without a key
+ * are never offered.
  */
 export class SuffixContentMatcher {
-  private readonly byHash = new Map<string, StoredTranscriptRow[]>();
+  private readonly byKey = new Map<string, ContentMatchCandidate[]>();
   private readonly pointers = new Map<string, number>();
   private lastClaimedSeq = Number.NEGATIVE_INFINITY;
-  /** Claims made while more than one in-order candidate shared the hash. */
+  /** Claims made while more than one in-order candidate shared the key. */
   multiCandidateClaims = 0;
 
-  constructor(rows: readonly StoredTranscriptRow[]) {
+  constructor(rows: readonly ContentMatchCandidate[]) {
     const ordered = [...rows].sort((left, right) => left.seq - right.seq);
     for (const row of ordered) {
-      if (!row.identityHash) {
+      const key = contentMatchKey(row);
+      if (!key) {
         continue;
       }
-      const group = this.byHash.get(row.identityHash) ?? [];
+      const group = this.byKey.get(key) ?? [];
       group.push(row);
-      this.byHash.set(row.identityHash, group);
+      this.byKey.set(key, group);
     }
   }
 
   /** True when no candidate rows exist. */
   get isEmpty(): boolean {
-    return this.byHash.size === 0;
+    return this.byKey.size === 0;
   }
 
-  /** Claim the next in-order row for `identityHash`, or null when none remains. */
-  claim(identityHash: string): StoredTranscriptRow | null {
-    const group = this.byHash.get(identityHash);
+  /** Claim the next in-order row for a `contentMatchKey`, or null when none remains. */
+  claim(key: string): ContentMatchCandidate | null {
+    const group = this.byKey.get(key);
     if (!group) {
       return null;
     }
-    let pointer = this.pointers.get(identityHash) ?? 0;
+    let pointer = this.pointers.get(key) ?? 0;
     while (pointer < group.length && group[pointer]!.seq <= this.lastClaimedSeq) {
       pointer += 1;
     }
     if (pointer >= group.length) {
-      this.pointers.set(identityHash, pointer);
+      this.pointers.set(key, pointer);
       return null;
     }
     if (group.length - pointer > 1) {
       this.multiCandidateClaims += 1;
     }
     const row = group[pointer]!;
-    this.pointers.set(identityHash, pointer + 1);
+    this.pointers.set(key, pointer + 1);
     this.lastClaimedSeq = row.seq;
     return row;
   }

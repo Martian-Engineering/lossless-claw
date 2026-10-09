@@ -3,6 +3,7 @@ import type { DatabaseSync } from "node:sqlite";
 import type { AgentMessage } from "../src/openclaw-bridge.js";
 import type { LcmConfig } from "../src/db/config.js";
 import type { LcmContextEngine } from "../src/engine.js";
+import { buildMessageParts, toStoredMessage } from "../src/message-content.js";
 import { cleanupEngineTestState, createEngineWithDepsOverridesAndDb } from "./helpers.js";
 import { FakeTranscriptHost } from "./transcript-delta-fake-host.js";
 
@@ -18,6 +19,23 @@ function user(content: string): AgentMessage {
 
 function assistant(content: string): AgentMessage {
   return { role: "assistant", content: [{ type: "text", text: content }] } as unknown as AgentMessage;
+}
+
+/** Assistant message carrying only a tool call; stores empty text content. */
+function toolCallOnly(toolCallId: string): AgentMessage {
+  return {
+    role: "assistant",
+    content: [{ type: "toolCall", id: toolCallId, name: "exec", arguments: { command: "true" } }],
+  } as unknown as AgentMessage;
+}
+
+function toolResult(toolCallId: string, text: string): AgentMessage {
+  return {
+    role: "toolResult",
+    toolCallId,
+    toolName: "exec",
+    content: [{ type: "text", text }],
+  } as unknown as AgentMessage;
 }
 
 function setup(configOverrides: Partial<LcmConfig> = {}) {
@@ -378,6 +396,38 @@ describe("one-time legacy migration", () => {
     return { engine, db, readVisibleSessionTranscriptMessageEntries };
   }
 
+  /** Like `legacyConversation`, but stores full messages with their parts as ingestion does. */
+  async function legacyConversationFromMessages(
+    host: FakeTranscriptHost,
+    seed: Array<{ message: AgentMessage; entryId?: string }>,
+  ) {
+    const { engine, db } = createEngineWithDepsOverridesAndDb({
+      readSessionTranscriptVisibleMessageDelta: host.readVisibleDelta,
+      readSessionTranscriptRawDelta: host.readRawDelta,
+      readVisibleSessionTranscriptMessageEntries: vi.fn(host.readVisibleEntries),
+    });
+    const store = engine.getConversationStore();
+    const conversation = await store.getOrCreateConversation(sessionId, { sessionKey });
+    await store.markConversationBootstrapped(conversation.conversationId);
+    for (const [index, { message, entryId }] of seed.entries()) {
+      const stored = toStoredMessage(message);
+      const record = await store.createMessage({
+        conversationId: conversation.conversationId,
+        seq: index + 1,
+        role: stored.role,
+        content: stored.content,
+        tokenCount: stored.tokenCount,
+        ...(entryId ? { transcriptEntryId: entryId } : {}),
+      });
+      await store.createMessageParts(
+        record.messageId,
+        buildMessageParts({ sessionId, message, fallbackContent: stored.content }),
+      );
+      await engine.getSummaryStore().appendContextMessage(conversation.conversationId, record.messageId);
+    }
+    return { engine, db };
+  }
+
   it("stamps legacy rows by in-order content match, then drains incrementally", async () => {
     const host = new FakeTranscriptHost(sessionId);
     const ids = [host.append(user("legacy one")), host.append(assistant("legacy two"))];
@@ -431,6 +481,37 @@ describe("one-time legacy migration", () => {
     const after = rows(db);
     expect(after.slice(0, before.length)).toEqual(before);
     expect(after.map((row) => row.content).slice(before.length)).toEqual(["after anchor"]);
+  });
+
+  it("matches tool-call-only rows by tool-call id, not into an older unstored hole", async () => {
+    // Legacy shape: rows stop at an anchor, the old code never stored the next
+    // stretch (the hole), then appended the newest turn without ids. Every
+    // tool-call-only assistant message stores empty content, so they all share
+    // one identity hash; only their tool-call ids tell them apart.
+    const host = new FakeTranscriptHost(sessionId);
+    const anchor = host.append(user("anchor question"));
+    host.append(toolCallOnly("call-hole-1"));
+    host.append(toolResult("call-hole-1", "hole output 1"));
+    host.append(toolCallOnly("call-hole-2"));
+    host.append(toolResult("call-hole-2", "hole output 2"));
+    const newerTurn = [
+      user("newest question"),
+      toolCallOnly("call-new-1"),
+      toolResult("call-new-1", "new output 1"),
+      toolCallOnly("call-new-2"),
+      toolResult("call-new-2", "new output 2"),
+      assistant("newest answer"),
+    ];
+    const newerIds = newerTurn.map((message) => host.append(message));
+    const { engine, db } = await legacyConversationFromMessages(host, [
+      { message: user("anchor question"), entryId: anchor },
+      ...newerTurn.map((message) => ({ message })),
+    ]);
+
+    await expect(bootstrap(engine)).resolves.toMatchObject({ importedMessages: 0 });
+    const migrated = rows(db);
+    expect(migrated).toHaveLength(7);
+    expect(migrated.map((row) => row.entryId)).toEqual([anchor, ...newerIds]);
   });
 
   it("imports nothing without an anchor or content match, keeping every legacy row", async () => {

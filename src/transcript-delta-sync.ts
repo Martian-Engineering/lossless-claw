@@ -15,11 +15,12 @@
  */
 import type { AgentMessage } from "./openclaw-bridge.js";
 import { batchLooksLikeHeartbeatAckTurn } from "./heartbeat-filter.js";
-import { hasPersistableMessageRole, toStoredMessage } from "./message-content.js";
+import { buildMessageParts, hasPersistableMessageRole, toStoredMessage, toStoredMessageIdentity } from "./message-content.js";
 import { extractOpenClawSenderMetadata } from "./openclaw-sender-metadata.js";
 import type { ConversationStore } from "./store/conversation-store.js";
 import { buildMessageIdentityHash } from "./store/message-identity.js";
 import type {
+  ContentMatchCandidate,
   StoredTranscriptRow,
   TranscriptCursorOrigin,
   TranscriptCursorRecord,
@@ -33,6 +34,7 @@ import {
 } from "./transcript-reset-boundary.js";
 import {
   budgetStartIndex,
+  contentMatchKey,
   planResync,
   SuffixContentMatcher,
   type ScannedVisibleEntry,
@@ -180,13 +182,24 @@ export function messageFromVisibleEntry(entry: VisibleSessionTranscriptMessageEn
   });
 }
 
-/** Identity hash the store would compute for this entry's stored role/content. */
-function identityHashForEntry(entry: VisibleSessionTranscriptMessageEntry): string | null {
+/**
+ * Suffix content-match key for an entry: the identity hash the store would
+ * compute for its stored role/content plus the tool-call ids its stored parts
+ * would carry. Null for non-persisted roles and non-distinguishing entries.
+ */
+function contentMatchKeyForEntry(entry: VisibleSessionTranscriptMessageEntry): string | null {
   if (!hasPersistableMessageRole(entry.message)) {
     return null;
   }
-  const stored = toStoredMessage(entry.message);
-  return buildMessageIdentityHash(stored.role, stored.content);
+  const { role, content } = toStoredMessageIdentity(entry.message);
+  const toolCallIds = buildMessageParts({ sessionId: "", message: entry.message, fallbackContent: content }).flatMap(
+    (part) => (part.toolCallId ? [part.toolCallId] : []),
+  );
+  return contentMatchKey({
+    identityHash: buildMessageIdentityHash(role, content),
+    toolCallIds,
+    hasContent: content.trim().length > 0,
+  });
 }
 
 /** Scanned index of `request.importFromEntryId`, or -1 when absent or not visible. */
@@ -483,8 +496,8 @@ export class TranscriptDeltaSync {
             ? Math.max(1, toStoredMessage(entry.message).tokenCount)
             : 0;
         }
-        const hash = matcher.isEmpty ? null : identityHashForEntry(entry);
-        const row = hash ? matcher.claim(hash) : null;
+        const key = matcher.isEmpty ? null : contentMatchKeyForEntry(entry);
+        const row = key ? matcher.claim(key) : null;
         if (row) {
           matches.set(index, row);
         }
@@ -815,9 +828,9 @@ export class TranscriptDeltaSync {
     afterSeq: number,
     visibleIds: ReadonlySet<string>,
     claimed: ReadonlySet<number>,
-  ): StoredTranscriptRow[] {
+  ): ContentMatchCandidate[] {
     return this.deps.cursorStore
-      .listRowsAfterSeq(request.conversationId, afterSeq)
+      .listContentMatchCandidatesAfterSeq(request.conversationId, afterSeq)
       .filter(
         (row) =>
           !claimed.has(row.messageId) &&
