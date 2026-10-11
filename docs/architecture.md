@@ -52,11 +52,17 @@ When compaction creates a summary from a range of messages (or summaries), the s
 
 ### Ingestion
 
-When OpenClaw processes a turn, it calls the context engine's lifecycle hooks:
+The OpenClaw transcript is the log; LCM stores a projection of it plus a per-conversation watermark, the opaque cursor returned by OpenClaw's visible-message delta reader. Every lifecycle hook that ingests reads only the delta after that cursor and commits the new rows together with the advanced cursor in one SQLite transaction:
 
-1. **bootstrap** — On session start, imports the host-provided visible transcript projection into the LCM database. On current SQLite hosts this is keyed by the runtime session target instead of Lossless resolving an active transcript file.
-2. **ingest** / **ingestBatch** — Persists new messages to the database and appends them to context_items.
-3. **afterTurn** — After the model responds, ingests new messages, then evaluates whether `contextThreshold` requires compaction.
+1. **bootstrap** — Drains the delta up to OpenClaw's current-turn fence, so the turn being prepared is not stored early. A conversation with no rows imports the newest `bootstrapMaxTokens` of history after the latest same-session `/reset`.
+2. **commitTurn** / **afterTurn** — Drain the delta (which now includes the finished turn), then evaluate whether `contextThreshold` requires compaction. `commitTurn` records its idempotency receipt in the transaction that stores the final cursor. Runtime message arrays are never persisted.
+3. **ingest** / **ingestBatch** — Drain the delta for transcript-backed sessions instead of persisting their payloads.
+
+When OpenClaw invalidates a cursor (for example after an in-place rewrite rotates the transcript generation), LCM resyncs in bulk: one query for the stored transcript entry ids, a payload-free scan of the visible projection, and imports only after the last known entry. Re-issued entries are restamped onto their existing rows instead of being imported again. Resync only adds or re-issues transcript entry ids; it never clears an id or deletes a row.
+
+A conversation created before cursor mode migrates on its first sync with the same bulk resync: it anchors on the last stored entry id that is still visible, stamps unstamped rows after that anchor when their content matches in order, imports only entries after the anchor, and records the frontier cursor. History before the anchor that was never stored stays unimported, so nothing is appended out of order. After `/reset`, the replacement conversation imports only messages after the reset boundary.
+
+lossless-claw requires OpenClaw's `readSessionTranscriptVisibleMessageDelta`. Every supported OpenClaw release ships it; if a host lacks it, lossless-claw logs a capability error and skips transcript ingestion rather than falling back to full-transcript reconciliation.
 
 ### Leaf compaction
 

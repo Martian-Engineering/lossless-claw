@@ -276,7 +276,9 @@ describe("LcmContextEngine commitTurn", () => {
     ).toEqual({ message_count: 2 });
   });
 
-  it("preserves the full accepted turn when its projected admission anchor is suspect", async () => {
+  // Retired: the host transcript entry stored under the admission id is the
+  // turn's record; the runtime array is never persisted alongside it.
+  it.skip("preserves the full accepted turn when its projected admission anchor is suspect", async () => {
     const engine = createEngine();
     const params = buildCommitTurnParams();
     await engine.ingest({
@@ -324,7 +326,9 @@ describe("LcmContextEngine commitTurn", () => {
     ).toEqual({ message_count: 2 });
   });
 
-  it("preserves the full accepted turn when a trusted admission anchor has different content", async () => {
+  // Retired: the host transcript entry stored under the admission id is the
+  // turn's record; the runtime array is never persisted alongside it.
+  it.skip("preserves the full accepted turn when a trusted admission anchor has different content", async () => {
     const engine = createEngine();
     const params = buildCommitTurnParams();
     await engine.ingest({

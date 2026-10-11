@@ -25,6 +25,7 @@ import {
   createEngineWithDeps,
   makeMessage,
   tempDirs,
+  TestLcmContextEngine,
 } from "./helpers.js";
 
 afterEach(() => {
@@ -1203,7 +1204,7 @@ describe("LcmContextEngine delegated session continuity", () => {
     const config = createTestConfig(join(tempDir, "lcm.db"));
     const db = createLcmDatabaseConnection(config.databasePath);
     const deps = createTestDeps(config);
-    const engine = new LcmContextEngine(deps, db);
+    const engine = new TestLcmContextEngine(deps, db);
 
     (engine as unknown as { ensureMigrated(): void }).ensureMigrated();
     await engine

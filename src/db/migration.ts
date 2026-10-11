@@ -519,6 +519,27 @@ function ensureTranscriptAnchorTrustTables(db: DatabaseSync): void {
   `);
 }
 
+/**
+ * Per-conversation watermark into OpenClaw's visible transcript delta. The
+ * cursor is the host's opaque continuation token and is stored unchanged.
+ * `mode` distinguishes conversations that ingest only through the delta
+ * reader (`cursor_v1`) from legacy conversations that have no row yet.
+ */
+function ensureTranscriptCursorTable(db: DatabaseSync): void {
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS conversation_transcript_cursors (
+      conversation_id INTEGER PRIMARY KEY REFERENCES conversations(conversation_id) ON DELETE CASCADE,
+      mode TEXT NOT NULL CHECK (mode IN ('cursor_v1')),
+      cursor TEXT NOT NULL,
+      frontier_entry_id TEXT,
+      frontier_seq INTEGER,
+      origin TEXT NOT NULL,
+      created_at TEXT NOT NULL DEFAULT (datetime('now')),
+      updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+    );
+  `);
+}
+
 function backfillMessageIdentityHashes(
   db: DatabaseSync,
   options?: { managesOwnTransaction?: boolean },
@@ -1607,6 +1628,7 @@ export function runLcmMigrations(
     runMigrationStep("ensureMessageStableEventKeyColumn", log, () =>
       ensureMessageStableEventKeyColumn(db),
     );
+    runMigrationStep("ensureTranscriptCursorTable", log, () => ensureTranscriptCursorTable(db));
     // Partial unique index: NULL stable event keys (legacy rows, messages
     // without a stable identity) are exempt, so this only enforces idempotency
     // for messages that carry a computed key.

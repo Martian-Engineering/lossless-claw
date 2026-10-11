@@ -3,7 +3,7 @@ import type { AgentMessage } from "../src/openclaw-bridge.js";
 import { attachTranscriptEntryMeta } from "../src/transcript.js";
 import { restoreRawUserReplay } from "../src/user-replay.js";
 import { estimateSerializedMessagesTokens } from "../src/estimate-tokens.js";
-import { cleanupEngineTestState, createEngineWithDepsOverrides } from "./helpers.js";
+import { cleanupEngineTestState, createEngineWithDepsOverrides, seedStoredMessage } from "./helpers.js";
 
 afterEach(cleanupEngineTestState);
 
@@ -33,7 +33,7 @@ it("keeps retained user replay identity and carriers across user turns, not summ
   const live: AgentMessage[] = [];
   let previous: AgentMessage[] = [];
   for (let index = 0; index < users.length; index++) {
-    await engine.ingest({ sessionId, sessionKey, message: users[index]! });
+    await seedStoredMessage(engine, { sessionId, sessionKey, message: users[index]! });
     live.push(users[index]!);
     if (index === 0) {
       const conversation = await engine.getConversationStore().getConversationForSession({ sessionId, sessionKey });
@@ -60,7 +60,7 @@ it("keeps retained user replay identity and carriers across user turns, not summ
     expect(result.messages.slice(0, previous.length)).toEqual(previous);
     previous = result.messages;
     const assistant = { role: "assistant", content: `reply ${index}` } as AgentMessage;
-    await engine.ingest({ sessionId, sessionKey, message: assistant });
+    await seedStoredMessage(engine, { sessionId, sessionKey, message: assistant });
     live.push(carriers[index]!, assistant);
   }
   const full = await engine.assemble({ sessionId, sessionKey, messages: live, tokenBudget: 100_000, availableTools: new Set(), prompt: "next" });

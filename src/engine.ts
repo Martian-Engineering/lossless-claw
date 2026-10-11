@@ -75,6 +75,13 @@ import {
 import { FocusBriefStore, type FocusBriefRecord } from "./store/focus-brief-store.js";
 import { buildToolCallInputMap } from "./tool-pairing.js";
 import { PendingSummaryStore } from "./store/pending-summary-store.js";
+import { TranscriptCursorStore } from "./store/transcript-cursor-store.js";
+import {
+  TranscriptDeltaSync,
+  type TranscriptSyncFinalizeFacts,
+  type TranscriptSyncOutcome,
+  type TranscriptSyncRequest,
+} from "./transcript-delta-sync.js";
 import { parseUtcTimestampOrNull } from "./store/parse-utc-timestamp.js";
 import { SummaryStore, type ContextItemRecord } from "./store/summary-store.js";
 import { createLcmSummarizeFromLegacyParams, FALLBACK_SUMMARY_MARKER, LcmProviderAuthError, LcmRuntimeLifecycleError, LcmRuntimeLlmPolicyError, LcmRuntimeLlmUnavailableError, LcmSummarySpendLimitError, type LcmSummarizeFn } from "./summarize.js";
@@ -495,6 +502,40 @@ function selectLegacyPrefixFrontier(params: {
 
 
 
+
+/** Inputs shared by every transcript-delta sync entry point. */
+type TranscriptProjectionSyncParams = {
+  conversation: ConversationRecord;
+  target: SessionTranscriptReadTarget;
+  sessionId: string;
+  sessionKey?: string;
+  sessionLabel: string;
+  freshStartBudgetTokens: number | null;
+  importFromEntryId?: string;
+  finalize?: (facts: TranscriptSyncFinalizeFacts) => void | Promise<void>;
+};
+
+/** Capability error reported when a transcript-backed session has no visible-delta reader. */
+const TRANSCRIPT_DELTA_READER_UNAVAILABLE = "transcript delta reader unavailable";
+
+/** Human-readable bootstrap reason for one transcript-delta sync outcome. */
+function describeTranscriptSyncOutcome(outcome: TranscriptSyncOutcome): string {
+  switch (outcome.status) {
+    case "synced":
+      return outcome.importedMessages > 0
+        ? `imported transcript delta (${outcome.path})`
+        : "conversation already up to date";
+    case "unavailable":
+      return "transcript projection rebuilding";
+    case "missing":
+      return "no visible transcript";
+    case "fenced":
+      return "transcript read fenced at current turn";
+    case "blocked":
+      return `transcript delta blocked${outcome.detail ? `: ${outcome.detail}` : ""}`;
+  }
+}
+
 // ── LcmContextEngine ────────────────────────────────────────────────────────
 
 
@@ -527,6 +568,10 @@ export class LcmContextEngine implements ContextEngine {
   private focusBriefStore: FocusBriefStore;
   private compactionTelemetryStore: CompactionTelemetryStore;
   private compactionMaintenanceStore: CompactionMaintenanceStore;
+  private transcriptCursorStore: TranscriptCursorStore;
+  /** Single transcript writer; null when the host exposes no visible-delta reader. */
+  private transcriptDeltaSync: TranscriptDeltaSync | null;
+  private missingTranscriptDeltaReaderReported = false;
   private assembler: ContextAssembler;
   private compaction: CompactionEngine;
   private retrieval: RetrievalEngine;
@@ -690,6 +735,16 @@ export class LcmContextEngine implements ContextEngine {
     this.focusBriefStore = new FocusBriefStore(this.db);
     this.compactionTelemetryStore = new CompactionTelemetryStore(this.db);
     this.compactionMaintenanceStore = new CompactionMaintenanceStore(this.db);
+    this.transcriptCursorStore = new TranscriptCursorStore(this.db);
+    this.transcriptDeltaSync = this.deps.readSessionTranscriptVisibleMessageDelta
+      ? new TranscriptDeltaSync({
+          readVisibleDelta: this.deps.readSessionTranscriptVisibleMessageDelta,
+          readRawDelta: this.deps.readSessionTranscriptRawDelta,
+          cursorStore: this.transcriptCursorStore,
+          conversationStore: this.conversationStore,
+          log: this.deps.log,
+        })
+      : null;
     this.telemetryRecorder = new CompactionTelemetryRecorder(
       this.compactionTelemetryStore,
       this.compactionMaintenanceStore,
@@ -3203,6 +3258,528 @@ export class LcmContextEngine implements ContextEngine {
     };
   }
 
+  /**
+   * One pass of the legacy full-projection reconcile for a conversation that
+   * already has rows. Cursor-mode migration runs it until it is no longer
+   * import-capped, because only this path can adopt legacy rows that carry no
+   * transcript entry id. The caller owns the session queue and transaction.
+   */
+  private async runLegacyProjectionReconcile(params: {
+    sessionId: string;
+    sessionKey?: string;
+    conversation: ConversationRecord;
+    entries: VisibleSessionTranscriptMessageEntry[];
+    startedAt: number;
+    sessionLabel: string;
+  }): Promise<{ result: BootstrapResult; reconcile: TranscriptReconcileResult; conversationId: number }> {
+    const { conversation, entries } = params;
+    const conversationId = conversation.conversationId;
+    const historicalMessages = entries.map(messageFromVisibleTranscriptEntry);
+    const anchorAudit = await this.auditTranscriptAnchorsForProjection({
+      conversationId,
+      sessionId: params.sessionId,
+      sessionKey: params.sessionKey,
+      entries,
+    });
+    const reconcile = await this.reconcileProjectedTranscriptMessages({
+      sessionId: params.sessionId,
+      sessionKey: params.sessionKey,
+      conversationId,
+      historicalMessages,
+      requireOverlap: !anchorAudit.allowsUnanchoredLegacyPrefixImport,
+      legacyPrefixAnchorEntryId: anchorAudit.legacyPrefixAnchorEntryId,
+    });
+    const done = (result: BootstrapResult) => ({ result, reconcile, conversationId });
+    this.deps.log.debug(
+      `[lcm] bootstrap: sqlite projection reconcile finished conversation=${conversationId} ${params.sessionLabel} importedMessages=${reconcile.importedMessages} overlap=${reconcile.hasOverlap} blockedByImportCap=${reconcile.blockedByImportCap} duration=${formatDurationMs(Date.now() - params.startedAt)}`,
+    );
+
+    if (reconcile.blockedReason === "no-overlap-projection" && conversation.bootstrappedAt) {
+      await this.conversationStore.archiveConversation(conversationId, "rollover-fallback");
+      const freshConversation = await this.conversationStore.createConversation({
+        sessionId: params.sessionId,
+        ...(params.sessionKey ? { sessionKey: params.sessionKey } : {}),
+      });
+      const bootstrapMessages = trimBootstrapMessagesToBudget(
+        historicalMessages,
+        resolveBootstrapMaxTokens(this.config),
+      );
+      let importedMessages = 0;
+      for (const message of bootstrapMessages) {
+        const result = await this.ingestSingle({
+          sessionId: params.sessionId,
+          sessionKey: params.sessionKey,
+          message,
+          createdAt: resolveTranscriptMessageCreatedAt(message),
+          skipReplayTimestampFloodGuard: true,
+        });
+        if (result.ingested) {
+          importedMessages += 1;
+        }
+      }
+      await this.conversationStore.markConversationBootstrapped(
+        freshConversation.conversationId,
+      );
+      if (this.config.pruneHeartbeatOk) {
+        await pruneHeartbeatOkTurns(this.conversationStore, freshConversation.conversationId, {
+          keepPoll: this.config.preserveHeartbeatPoll,
+        });
+      }
+      this.deps.log.info(
+        `[lcm] bootstrap: sqlite projection started fresh conversation=${freshConversation.conversationId} archivedConversation=${conversationId} ${params.sessionLabel} importedMessages=${importedMessages} sourceMessages=${historicalMessages.length}`,
+      );
+      return done({
+        bootstrapped: importedMessages > 0,
+        importedMessages,
+        reason: "fresh sqlite transcript projection",
+      });
+    }
+
+    if (reconcile.blockedByImportCap) {
+      return done({
+        bootstrapped: false,
+        importedMessages: reconcile.importedMessages,
+        reason:
+          reconcile.blockedReason === "cross-conversation-raw-id"
+            ? "reconcile duplicate raw ids"
+            : reconcile.blockedReason === "duplicate-transcript-replay"
+              ? "reconcile duplicate transcript replay"
+              : reconcile.blockedReason === "no-overlap-projection"
+                ? "reconcile projection has no overlap"
+                : reconcile.blockedReason === "stale-transcript-id-gap"
+                  ? "reconcile stale transcript id gap"
+                  : reconcile.blockedReason === "stale-transcript-id-ambiguous"
+                    ? "reconcile stale transcript id ambiguous"
+                    : "reconcile import capped",
+      });
+    }
+
+    if (!conversation.bootstrappedAt) {
+      await this.conversationStore.markConversationBootstrapped(conversationId);
+    }
+
+    // Reconcile can restore host transcript acknowledgements that LCM previously pruned.
+    if (this.config.pruneHeartbeatOk) {
+      await pruneHeartbeatOkTurns(this.conversationStore, conversationId, {
+        keepPoll: this.config.preserveHeartbeatPoll,
+      });
+    }
+
+    if (reconcile.importedMessages > 0) {
+      return done({
+        bootstrapped: true,
+        importedMessages: reconcile.importedMessages,
+        reason: "reconciled missing session messages",
+      });
+    }
+
+    if (conversation.bootstrappedAt) {
+      return done({
+        bootstrapped: false,
+        importedMessages: 0,
+        reason: "already bootstrapped",
+      });
+    }
+
+    return done({
+      bootstrapped: false,
+      importedMessages: 0,
+      reason: reconcile.hasOverlap
+        ? "conversation already up to date"
+        : "conversation already has messages",
+    });
+  }
+
+
+  /**
+   * Bring one conversation up to the host transcript frontier through the
+   * single transcript writer. A conversation with a cursor drains
+   * incrementally, an empty conversation starts fresh, and a conversation with
+   * legacy rows but no cursor migrates once. The caller holds the session queue.
+   */
+  private async syncTranscriptProjection(params: TranscriptProjectionSyncParams): Promise<{
+    conversationId: number;
+    outcome: TranscriptSyncOutcome;
+  }> {
+    const sync = this.requireTranscriptDeltaSync();
+    const conversationId = params.conversation.conversationId;
+    const request = this.buildTranscriptSyncRequest({ ...params, conversationId });
+    const state = this.transcriptCursorStore.get(conversationId);
+    if (state) {
+      return { conversationId, outcome: await sync.drain(request, state) };
+    }
+    if ((await this.conversationStore.getMessageCount(conversationId)) === 0) {
+      return { conversationId, outcome: await sync.freshStart(request) };
+    }
+    return this.migrateLegacyConversation(params);
+  }
+
+  /**
+   * Report that the host exposes no visible-delta reader. Every supported
+   * OpenClaw release ships it, so this is a capability error, not a fallback:
+   * the first occurrence logs an error with the upgrade hint.
+   */
+  private reportMissingTranscriptDeltaReader(phase: string, sessionLabel: string): void {
+    const message = `[lcm] ${phase}: ${TRANSCRIPT_DELTA_READER_UNAVAILABLE} for ${sessionLabel}; OpenClaw readSessionTranscriptVisibleMessageDelta is required (install OpenClaw >=${packageJson.peerDependencies.openclaw.replace(/^>=/, "")}). Transcript ingestion is skipped.`;
+    if (this.missingTranscriptDeltaReaderReported) {
+      this.deps.log.debug(message);
+      return;
+    }
+    this.missingTranscriptDeltaReaderReported = true;
+    this.deps.log.error(message);
+  }
+
+  /** Return the delta writer; callers check availability before routing here. */
+  private requireTranscriptDeltaSync(): TranscriptDeltaSync {
+    if (!this.transcriptDeltaSync) {
+      throw new Error("transcript delta reader unavailable");
+    }
+    return this.transcriptDeltaSync;
+  }
+
+  /** Build a sync request whose ingest path applies the normal storage policy. */
+  private buildTranscriptSyncRequest(
+    params: TranscriptProjectionSyncParams & { conversationId: number },
+  ): TranscriptSyncRequest {
+    return {
+      conversationId: params.conversationId,
+      target: params.target,
+      freshStartBudgetTokens: params.freshStartBudgetTokens,
+      ...(params.importFromEntryId !== undefined
+        ? { importFromEntryId: params.importFromEntryId }
+        : {}),
+      ...(params.finalize ? { finalize: params.finalize } : {}),
+      label: params.sessionLabel,
+      ingest: async (message) =>
+        (
+          await this.ingestSingle({
+            sessionId: params.sessionId,
+            sessionKey: params.sessionKey,
+            message,
+            createdAt: resolveTranscriptMessageCreatedAt(message),
+            skipReplayTimestampFloodGuard: true,
+            conversationId: params.conversationId,
+          })
+        ).ingested,
+    };
+  }
+
+  /**
+   * One-time entry into cursor mode for a conversation that already has rows
+   * but no cursor. A bulk resync anchors on the last stamped id that is still
+   * visible, content-matches the suffix in order against unstamped or
+   * off-projection rows, imports only after the last anchor or match, and
+   * records the frontier cursor. It never clears an id or deletes a row.
+   */
+  private async migrateLegacyConversation(params: TranscriptProjectionSyncParams): Promise<{
+    conversationId: number;
+    outcome: TranscriptSyncOutcome;
+  }> {
+    const startedAt = Date.now();
+    const conversationId = params.conversation.conversationId;
+    const outcome = await this.requireTranscriptDeltaSync().resync(
+      this.buildTranscriptSyncRequest({ ...params, conversationId }),
+      undefined,
+      { unanchored: "match-only", origin: "legacy-migration", reason: "legacy-migration" },
+    );
+    const summary = outcome.resync;
+    this.deps.log.info(
+      `[lcm] transcript cursor migration conversation=${conversationId} ${params.sessionLabel} status=${outcome.status} imported=${outcome.importedMessages} restamped=${outcome.restampedMessages} anchorIndex=${summary?.anchorIndex ?? "n/a"} contentMatches=${summary?.contentMatches ?? 0} unimportedBeforeAnchor=${summary?.unimportedBeforeAnchor ?? 0} unstampedRowsBeforeAnchor=${summary?.unstampedRowsBeforeAnchor ?? 0} duration=${formatDurationMs(Date.now() - startedAt)}`,
+    );
+    return { conversationId, outcome };
+  }
+
+  /** Prune heartbeat acknowledgement turns when the opt-in policy applies. */
+  private async pruneHeartbeatTurnsIfNeeded(
+    conversationId: number,
+    looksLikeHeartbeat: boolean,
+    phase: string,
+  ): Promise<void> {
+    if (!this.config.pruneHeartbeatOk || !looksLikeHeartbeat) {
+      return;
+    }
+    const pruned = await pruneHeartbeatOkTurns(this.conversationStore, conversationId, {
+      keepPoll: this.config.preserveHeartbeatPoll,
+    });
+    if (pruned > 0) {
+      this.deps.log.info(
+        `[lcm] ${phase}: pruned ${pruned} heartbeat ack messages from conversation ${conversationId}`,
+      );
+    }
+  }
+
+  /** Bootstrap through the transcript delta: resolve the conversation, then sync it. */
+  private async bootstrapFromTranscriptDelta(params: {
+    sessionId: string;
+    sessionKey?: string;
+    target: SessionTranscriptReadTarget;
+    startedAt: number;
+    sessionLabel: string;
+  }): Promise<BootstrapResult> {
+    const synced = await this.withSessionQueue(
+      this.resolveSessionQueueKey(params.sessionId, params.sessionKey),
+      async () => {
+        const conversation = await this.conversationStore.withTransaction(async () => {
+          await this.archiveSupersededIsolatedCronConversation({
+            sessionId: params.sessionId,
+            sessionKey: params.sessionKey,
+          });
+          return this.conversationStore.getOrCreateConversation(params.sessionId, {
+            sessionKey: params.sessionKey,
+          });
+        });
+        const result = await this.syncTranscriptProjection({
+          conversation,
+          target: params.target,
+          sessionId: params.sessionId,
+          sessionKey: params.sessionKey,
+          sessionLabel: params.sessionLabel,
+          freshStartBudgetTokens: resolveBootstrapMaxTokens(this.config),
+        });
+        if (result.outcome.status === "synced" && !conversation.bootstrappedAt) {
+          await this.conversationStore.markConversationBootstrapped(result.conversationId);
+        }
+        await this.pruneHeartbeatTurnsIfNeeded(
+          result.conversationId,
+          result.outcome.importedHeartbeatAck,
+          "bootstrap",
+        );
+        return result;
+      },
+      { operationName: "bootstrap", context: params.sessionLabel },
+    );
+    const reason = describeTranscriptSyncOutcome(synced.outcome);
+    this.recordRecentBootstrapImport(synced.conversationId, synced.outcome.importedMessages, reason);
+    this.deps.log.debug(
+      `[lcm] bootstrap: transcript delta ${synced.outcome.path} conversation=${synced.conversationId} ${params.sessionLabel} status=${synced.outcome.status} importedMessages=${synced.outcome.importedMessages} restamped=${synced.outcome.restampedMessages} duration=${formatDurationMs(Date.now() - params.startedAt)}`,
+    );
+    return {
+      bootstrapped: synced.outcome.importedMessages > 0,
+      importedMessages: synced.outcome.importedMessages,
+      reason,
+    };
+  }
+
+  /**
+   * Finish a turn through the transcript delta. Runtime arrays are never
+   * persisted: they only feed heartbeat detection. The host's
+   * `autoCompactionSummary` is ignored because no current host sends it and a
+   * synthetic row would be the only row without a transcript entry id.
+   */
+  private async afterTurnFromTranscriptDelta(params: {
+    sessionId: string;
+    sessionKey?: string;
+    target: SessionTranscriptReadTarget;
+    sessionFile: string;
+    messages: AgentMessage[];
+    prePromptMessageCount: number;
+    autoCompactionSummary?: string;
+    isHeartbeat?: boolean;
+    tokenBudget?: number;
+    currentTokenCount?: number;
+    runtimeContext?: Record<string, unknown>;
+    runtimeSettings?: ContextEngineRuntimeSettings;
+    legacyCompactionParams?: Record<string, unknown>;
+    startedAt: number;
+    sessionLabel: string;
+  }): Promise<void> {
+    const runtimeTurnMessages = filterPersistableMessages(
+      params.messages.slice(params.prePromptMessageCount),
+    );
+    let importedHeartbeatAck = false;
+    let importedMessages = 0;
+    if (!(params.isHeartbeat === true && !this.config.preserveHeartbeatPoll)) {
+      try {
+        const synced = await this.withSessionQueue(
+          this.resolveSessionQueueKey(params.sessionId, params.sessionKey),
+          async () => {
+            const resolved = await this.resolveProjectionConversationForAfterTurn(params);
+            if (resolved.staleIsolatedCron || !resolved.conversation) {
+              return null;
+            }
+            return this.syncTranscriptProjection({
+              conversation: resolved.conversation,
+              target: params.target,
+              sessionId: params.sessionId,
+              sessionKey: params.sessionKey,
+              sessionLabel: params.sessionLabel,
+              freshStartBudgetTokens: resolveBootstrapMaxTokens(this.config),
+            });
+          },
+          { operationName: "afterTurn", context: params.sessionLabel },
+        );
+        if (!synced) {
+          this.deps.log.warn(
+            `[lcm] afterTurn: stale isolated cron callback skipped before persistence and compaction maintenance ${params.sessionLabel}`,
+          );
+          return;
+        }
+        importedHeartbeatAck = synced.outcome.importedHeartbeatAck;
+        importedMessages = synced.outcome.importedMessages;
+        if (synced.outcome.status !== "synced") {
+          this.deps.log.debug(
+            `[lcm] afterTurn: transcript delta ${synced.outcome.status} ${params.sessionLabel}${synced.outcome.detail ? ` detail=${synced.outcome.detail}` : ""}; continuing with stored state`,
+          );
+        }
+      } catch (err) {
+        this.deps.log.warn(
+          `[lcm] afterTurn: transcript delta sync failed for ${params.sessionLabel}: ${describeLogError(err)}`,
+        );
+      }
+    }
+    if (params.autoCompactionSummary) {
+      this.deps.log.debug(
+        `[lcm] afterTurn: ignored autoCompactionSummary; the host transcript is the only ingestion source ${params.sessionLabel}`,
+      );
+    }
+
+    try {
+      const conversation = await this.conversationStore.getConversationForSession(params);
+      if (conversation) {
+        await this.pruneHeartbeatTurnsIfNeeded(
+          conversation.conversationId,
+          params.isHeartbeat === true ||
+            importedHeartbeatAck ||
+            batchLooksLikeHeartbeatAckTurn(runtimeTurnMessages),
+          "afterTurn",
+        );
+      }
+    } catch (err) {
+      this.deps.log.warn(`[lcm] afterTurn: heartbeat pruning failed: ${describeLogError(err)}`);
+    }
+
+    const conversationId = await this.evaluatePostTurnCompaction({
+      phase: "afterTurn",
+      sessionId: params.sessionId,
+      sessionKey: params.sessionKey,
+      sessionFile: params.sessionFile,
+      tokenBudget: params.tokenBudget,
+      currentTokenCount: params.currentTokenCount,
+      runtimeContext: params.runtimeContext,
+      runtimeSettings: params.runtimeSettings,
+      legacyCompactionParams: params.legacyCompactionParams,
+    });
+    if (conversationId !== undefined) {
+      this.deps.log.debug(
+        `[lcm] afterTurn: done conversation=${conversationId} ${params.sessionLabel} importedMessages=${importedMessages} duration=${formatDurationMs(Date.now() - params.startedAt)}`,
+      );
+    }
+  }
+
+  /**
+   * Commit an accepted turn through the transcript delta. The idempotency
+   * receipt is written inside the transaction that persists the final cursor,
+   * so a committed receipt implies the transcript was drained to its frontier.
+   * Non-terminal delta states throw so the host outbox retries the turn.
+   */
+  private async commitTurnFromTranscriptDelta(
+    params: CommitTurnParams,
+    payloadHash: string,
+    target: SessionTranscriptReadTarget,
+  ): Promise<{ status: "committed" | "duplicate" }> {
+    const sessionId = params.admission.sessionId;
+    const sessionKey = params.admission.sessionKey;
+    const sessionLabel = formatSessionLabel(sessionId, sessionKey);
+    return this.withSessionQueue(
+      this.resolveSessionQueueKey(sessionId, sessionKey),
+      async () => {
+        if (this.findTurnAdvancementReceipt(params, payloadHash)) {
+          return { status: "duplicate" as const };
+        }
+        const conversation = await this.conversationStore.getOrCreateConversation(sessionId, {
+          sessionKey,
+        });
+        const writeReceipt = async (facts: TranscriptSyncFinalizeFacts): Promise<void> => {
+          await this.pruneHeartbeatTurnsIfNeeded(
+            conversation.conversationId,
+            params.isHeartbeat === true || batchLooksLikeHeartbeatAckTurn(params.messages),
+            "commitTurn",
+          );
+          if (
+            facts.frontierSeq !== null &&
+            facts.frontierSeq < params.terminal.activeMessagePosition + 1 &&
+            !(await this.conversationStore.hasMessageByTranscriptEntryId(
+              conversation.conversationId,
+              params.terminal.entryId,
+            ))
+          ) {
+            this.deps.log.warn(
+              `[lcm] commitTurn: transcript frontier seq=${facts.frontierSeq} precedes terminal position=${params.terminal.activeMessagePosition} ${sessionLabel}; committing the drained frontier`,
+            );
+          }
+          this.insertTurnAdvancementReceipt(params, payloadHash, facts.importedMessages);
+        };
+        if (params.isHeartbeat === true && !this.config.preserveHeartbeatPoll) {
+          await this.conversationStore.withTransaction(() =>
+            writeReceipt({ frontierSeq: null, importedMessages: 0 }),
+          );
+          return { status: "committed" as const };
+        }
+        const synced = await this.syncTranscriptProjection({
+          conversation,
+          target,
+          sessionId,
+          sessionKey,
+          sessionLabel,
+          freshStartBudgetTokens: resolveBootstrapMaxTokens(this.config),
+          importFromEntryId: params.admission.entryId,
+          finalize: writeReceipt,
+        });
+        if (synced.outcome.status === "missing") {
+          this.deps.log.warn(
+            `[lcm] commitTurn: visible transcript missing ${sessionLabel}; recording receipt without rows`,
+          );
+          await this.conversationStore.withTransaction(() =>
+            writeReceipt({ frontierSeq: null, importedMessages: 0 }),
+          );
+          return { status: "committed" as const };
+        }
+        if (synced.outcome.status !== "synced") {
+          throw new Error(
+            `context-engine turn not committed: transcript delta ${synced.outcome.status}${synced.outcome.detail ? ` (${synced.outcome.detail})` : ""}`,
+          );
+        }
+        return { status: "committed" as const };
+      },
+      {
+        operationName: "commitTurn",
+        context: `session=${sessionId} sessionKey=${sessionKey} advancementKey=${params.advancementKey}`,
+      },
+    );
+  }
+
+  /** Drain the delta for runtime ingest calls instead of persisting their payloads. */
+  private async syncForRuntimeIngest(params: {
+    sessionId: string;
+    sessionKey?: string;
+    target: SessionTranscriptReadTarget;
+    isHeartbeat?: boolean;
+    operationName: string;
+  }): Promise<number> {
+    if (params.isHeartbeat === true && !this.config.preserveHeartbeatPoll) {
+      return 0;
+    }
+    const sessionLabel = formatSessionLabel(params.sessionId, params.sessionKey);
+    return this.withSessionQueue(
+      this.resolveSessionQueueKey(params.sessionId, params.sessionKey),
+      async () => {
+        const conversation = await this.conversationStore.getOrCreateConversation(params.sessionId, {
+          sessionKey: params.sessionKey,
+        });
+        const synced = await this.syncTranscriptProjection({
+          conversation,
+          target: params.target,
+          sessionId: params.sessionId,
+          sessionKey: params.sessionKey,
+          sessionLabel,
+          freshStartBudgetTokens: resolveBootstrapMaxTokens(this.config),
+        });
+        return synced.outcome.importedMessages;
+      },
+      { operationName: params.operationName, context: sessionLabel },
+    );
+  }
+
   private async bootstrapFromVisibleTranscriptProjection(params: {
     sessionId: string;
     sessionKey?: string;
@@ -3285,118 +3862,23 @@ export class LcmContextEngine implements ContextEngine {
             };
           }
 
-          const anchorAudit = await this.auditTranscriptAnchorsForProjection({
-            conversationId,
-            sessionId: params.sessionId,
-            sessionKey: params.sessionKey,
-            entries,
-          });
-          const reconcile = await this.reconcileProjectedTranscriptMessages({
-            sessionId: params.sessionId,
-            sessionKey: params.sessionKey,
-            conversationId,
-            historicalMessages,
-            requireOverlap: !anchorAudit.allowsUnanchoredLegacyPrefixImport,
-            legacyPrefixAnchorEntryId: anchorAudit.legacyPrefixAnchorEntryId,
-          });
-          this.deps.log.debug(
-            `[lcm] bootstrap: sqlite projection reconcile finished conversation=${conversationId} ${params.sessionLabel} importedMessages=${reconcile.importedMessages} overlap=${reconcile.hasOverlap} blockedByImportCap=${reconcile.blockedByImportCap} duration=${formatDurationMs(Date.now() - params.startedAt)}`,
-          );
-
-          if (reconcile.blockedReason === "no-overlap-projection" && conversation.bootstrappedAt) {
-            await this.conversationStore.archiveConversation(conversationId, "rollover-fallback");
-            const freshConversation = await this.conversationStore.createConversation({
-              sessionId: params.sessionId,
-              ...(params.sessionKey ? { sessionKey: params.sessionKey } : {}),
-            });
-            const bootstrapMessages = trimBootstrapMessagesToBudget(
-              historicalMessages,
-              resolveBootstrapMaxTokens(this.config),
-            );
-            let importedMessages = 0;
-            for (const message of bootstrapMessages) {
-              const result = await this.ingestSingle({
-                sessionId: params.sessionId,
-                sessionKey: params.sessionKey,
-                message,
-                createdAt: resolveTranscriptMessageCreatedAt(message),
-                skipReplayTimestampFloodGuard: true,
-              });
-              if (result.ingested) {
-                importedMessages += 1;
-              }
-            }
-            await this.conversationStore.markConversationBootstrapped(
-              freshConversation.conversationId,
-            );
-            if (this.config.pruneHeartbeatOk) {
-              await pruneHeartbeatOkTurns(this.conversationStore, freshConversation.conversationId, {
-                keepPoll: this.config.preserveHeartbeatPoll,
-              });
-            }
-            this.deps.log.info(
-              `[lcm] bootstrap: sqlite projection started fresh conversation=${freshConversation.conversationId} archivedConversation=${conversationId} ${params.sessionLabel} importedMessages=${importedMessages} sourceMessages=${historicalMessages.length}`,
-            );
-            return {
-              bootstrapped: importedMessages > 0,
-              importedMessages,
-              reason: "fresh sqlite transcript projection",
-            };
-          }
-
-          if (reconcile.blockedByImportCap) {
-            return {
-              bootstrapped: false,
-              importedMessages: reconcile.importedMessages,
-              reason:
-                reconcile.blockedReason === "cross-conversation-raw-id"
-                  ? "reconcile duplicate raw ids"
-                  : reconcile.blockedReason === "duplicate-transcript-replay"
-                    ? "reconcile duplicate transcript replay"
-                    : reconcile.blockedReason === "no-overlap-projection"
-                      ? "reconcile projection has no overlap"
-                      : reconcile.blockedReason === "stale-transcript-id-gap"
-                        ? "reconcile stale transcript id gap"
-                        : reconcile.blockedReason === "stale-transcript-id-ambiguous"
-                          ? "reconcile stale transcript id ambiguous"
-                          : "reconcile import capped",
-            };
-          }
-
-          if (!conversation.bootstrappedAt) {
-            await this.conversationStore.markConversationBootstrapped(conversationId);
-          }
-
-          // Reconcile can restore host transcript acknowledgements that LCM previously pruned.
-          if (this.config.pruneHeartbeatOk) {
-            await pruneHeartbeatOkTurns(this.conversationStore, conversationId, {
-              keepPoll: this.config.preserveHeartbeatPoll,
-            });
-          }
-
-          if (reconcile.importedMessages > 0) {
-            return {
-              bootstrapped: true,
-              importedMessages: reconcile.importedMessages,
-              reason: "reconciled missing session messages",
-            };
-          }
-
-          if (conversation.bootstrappedAt) {
+          if (this.transcriptCursorStore.get(conversationId)) {
             return {
               bootstrapped: false,
               importedMessages: 0,
-              reason: "already bootstrapped",
+              reason: "transcript delta reader unavailable for cursor-mode conversation",
             };
           }
-
-          return {
-            bootstrapped: false,
-            importedMessages: 0,
-            reason: reconcile.hasOverlap
-              ? "conversation already up to date"
-              : "conversation already has messages",
-          };
+          return (
+            await this.runLegacyProjectionReconcile({
+              sessionId: params.sessionId,
+              sessionKey: params.sessionKey,
+              conversation,
+              entries,
+              startedAt: params.startedAt,
+              sessionLabel: params.sessionLabel,
+            })
+          ).result;
         }),
       { operationName: "bootstrap", context: params.sessionLabel },
     );
@@ -3580,16 +4062,22 @@ export class LcmContextEngine implements ContextEngine {
     this.ensureMigrated();
     const startedAt = Date.now();
     const sessionLabel = formatSessionLabel(sessionId, sessionKey);
-    if (!transcriptReadTarget || !this.deps.readVisibleSessionTranscriptMessageEntries) {
+    if (!transcriptReadTarget) {
       return {
         bootstrapped: false,
         importedMessages: 0,
         reason: "visible transcript projection unavailable",
       };
     }
-
-    return this.bootstrapFromVisibleTranscriptProjection({
-
+    if (!this.transcriptDeltaSync) {
+      this.reportMissingTranscriptDeltaReader("bootstrap", sessionLabel);
+      return {
+        bootstrapped: false,
+        importedMessages: 0,
+        reason: TRANSCRIPT_DELTA_READER_UNAVAILABLE,
+      };
+    }
+    return this.bootstrapFromTranscriptDelta({
       sessionId,
       sessionKey,
       target: transcriptReadTarget,
@@ -3675,6 +4163,8 @@ export class LcmContextEngine implements ContextEngine {
     isHeartbeat?: boolean;
     createdAt?: Date | string;
     skipReplayTimestampFloodGuard?: boolean;
+    /** Already-resolved target conversation; skips session-based resolution. */
+    conversationId?: number;
   }): Promise<IngestResult> {
     const { sessionId, sessionKey, message, isHeartbeat, createdAt, skipReplayTimestampFloodGuard } = params;
     if (isHeartbeat && !this.config.preserveHeartbeatPoll) {
@@ -3718,10 +4208,13 @@ export class LcmContextEngine implements ContextEngine {
     }
 
     // Get or create conversation for this session
-    const conversation = await this.conversationStore.getOrCreateConversation(sessionId, {
-      sessionKey,
-    });
-    const conversationId = conversation.conversationId;
+    const conversationId =
+      params.conversationId ??
+      (
+        await this.conversationStore.getOrCreateConversation(sessionId, {
+          sessionKey,
+        })
+      ).conversationId;
 
     // A historical anchor can be corrupt. The id alone is not replay proof.
     const transcriptEntryId = getTranscriptEntryId(message);
@@ -3934,6 +4427,19 @@ export class LcmContextEngine implements ContextEngine {
       return { ingested: false };
     }
     this.ensureMigrated();
+    const transcriptReadTarget = resolveSessionTranscriptReadTarget(params);
+    if (transcriptReadTarget && !this.transcriptDeltaSync) {
+      this.reportMissingTranscriptDeltaReader("ingest", formatSessionLabel(params.sessionId, params.sessionKey));
+      return { ingested: false };
+    }
+    if (transcriptReadTarget && this.transcriptDeltaSync) {
+      const imported = await this.syncForRuntimeIngest({
+        ...params,
+        target: transcriptReadTarget,
+        operationName: "ingest",
+      });
+      return { ingested: imported > 0 };
+    }
     return this.withSessionQueue(
       this.resolveSessionQueueKey(params.sessionId, params.sessionKey),
       () => this.ingestSingle(params),
@@ -3962,6 +4468,19 @@ export class LcmContextEngine implements ContextEngine {
     this.ensureMigrated();
     if (params.messages.length === 0) {
       return { ingestedCount: 0 };
+    }
+    const transcriptReadTarget = resolveSessionTranscriptReadTarget(params);
+    if (transcriptReadTarget && !this.transcriptDeltaSync) {
+      this.reportMissingTranscriptDeltaReader("ingestBatch", formatSessionLabel(params.sessionId, params.sessionKey));
+      return { ingestedCount: 0 };
+    }
+    if (transcriptReadTarget && this.transcriptDeltaSync) {
+      const ingestedCount = await this.syncForRuntimeIngest({
+        ...params,
+        target: transcriptReadTarget,
+        operationName: "ingestBatch",
+      });
+      return { ingestedCount };
     }
     return this.withSessionQueue(
       this.resolveSessionQueueKey(params.sessionId, params.sessionKey),
@@ -4240,6 +4759,60 @@ export class LcmContextEngine implements ContextEngine {
   }
 
   /**
+   * Return true when this advancement key already has a receipt for the same
+   * payload (current or beta.1 hash); throw on a key reused with a different payload.
+   */
+  private findTurnAdvancementReceipt(params: CommitTurnParams, payloadHash: string): boolean {
+    const existing = this.db
+      .prepare(
+        `SELECT payload_hash
+         FROM turn_advancements
+         WHERE advancement_key = ?`,
+      )
+      .get(params.advancementKey) as { payload_hash: string } | undefined;
+    if (!existing) {
+      return false;
+    }
+    if (
+      existing.payload_hash !== payloadHash &&
+      existing.payload_hash !==
+        buildTurnAdvancementPayloadHash(params, params.admission.activeMessagePosition)
+    ) {
+      throw new Error(`context-engine advancement key collision: ${params.advancementKey}`);
+    }
+    return true;
+  }
+
+  /** Record the idempotency receipt for one committed turn. */
+  private insertTurnAdvancementReceipt(
+    params: CommitTurnParams,
+    payloadHash: string,
+    messageCount: number,
+  ): void {
+    this.db
+      .prepare(
+        `INSERT INTO turn_advancements (
+           advancement_key,
+           payload_hash,
+           session_id,
+           session_key,
+           admission_entry_id,
+           terminal_entry_id,
+           message_count
+         ) VALUES (?, ?, ?, ?, ?, ?, ?)`,
+      )
+      .run(
+        params.advancementKey,
+        payloadHash,
+        params.admission.sessionId,
+        params.admission.sessionKey,
+        params.admission.entryId,
+        params.terminal.entryId,
+        messageCount,
+      );
+  }
+
+  /**
    * Persist one host-accepted transcript turn and its advancement receipt in
    * the same SQLite transaction. The host may safely retry after losing the
    * response; a reused key with a different payload fails closed. Sessions
@@ -4257,28 +4830,28 @@ export class LcmContextEngine implements ContextEngine {
     }
     this.ensureMigrated();
     const payloadHash = buildTurnAdvancementPayloadHash(params);
+    const transcriptReadTarget = resolveSessionTranscriptReadTarget({
+      sessionId,
+      sessionKey,
+      sessionTarget: params.sessionTarget ?? {
+        agentId: params.admission.agentId,
+        sessionId,
+        sessionKey,
+        storePath: params.admission.storePath,
+      },
+    });
 
-    const result = await this.withSessionQueue(
+    if (transcriptReadTarget && !this.transcriptDeltaSync) {
+      this.reportMissingTranscriptDeltaReader("commitTurn", formatSessionLabel(sessionId, sessionKey));
+      throw new Error(`context-engine turn not committed: ${TRANSCRIPT_DELTA_READER_UNAVAILABLE}`);
+    }
+    const result = transcriptReadTarget && this.transcriptDeltaSync
+      ? await this.commitTurnFromTranscriptDelta(params, payloadHash, transcriptReadTarget)
+      : await this.withSessionQueue(
       this.resolveSessionQueueKey(sessionId, sessionKey),
       async () =>
         this.conversationStore.withTransaction(async () => {
-          const existing = this.db
-            .prepare(
-              `SELECT payload_hash
-               FROM turn_advancements
-               WHERE advancement_key = ?`,
-            )
-            .get(params.advancementKey) as { payload_hash: string } | undefined;
-          if (existing) {
-            if (
-              existing.payload_hash !== payloadHash &&
-              existing.payload_hash !==
-                buildTurnAdvancementPayloadHash(params, params.admission.activeMessagePosition)
-            ) {
-              throw new Error(
-                `context-engine advancement key collision: ${params.advancementKey}`,
-              );
-            }
+          if (this.findTurnAdvancementReceipt(params, payloadHash)) {
             return { status: "duplicate" as const };
           }
 
@@ -4352,27 +4925,7 @@ export class LcmContextEngine implements ContextEngine {
             }
           }
 
-          this.db
-            .prepare(
-              `INSERT INTO turn_advancements (
-                 advancement_key,
-                 payload_hash,
-                 session_id,
-                 session_key,
-                 admission_entry_id,
-                 terminal_entry_id,
-                 message_count
-               ) VALUES (?, ?, ?, ?, ?, ?, ?)`,
-            )
-            .run(
-              params.advancementKey,
-              payloadHash,
-              sessionId,
-              sessionKey,
-              params.admission.entryId,
-              params.terminal.entryId,
-              ingestedCount,
-            );
+          this.insertTurnAdvancementReceipt(params, payloadHash, ingestedCount);
           return { status: "committed" as const };
         }),
       {
@@ -4421,6 +4974,21 @@ export class LcmContextEngine implements ContextEngine {
     this.ensureMigrated();
     const startedAt = Date.now();
     const sessionLabel = formatSessionLabel(sessionId, sessionKey);
+    if (transcriptReadTarget && !this.transcriptDeltaSync) {
+      this.reportMissingTranscriptDeltaReader("afterTurn", sessionLabel);
+      return;
+    }
+    if (transcriptReadTarget && this.transcriptDeltaSync) {
+      await this.afterTurnFromTranscriptDelta({
+        ...params,
+        sessionId,
+        sessionKey,
+        target: transcriptReadTarget,
+        startedAt,
+        sessionLabel,
+      });
+      return;
+    }
 
     // Dedup guard: prevent duplicate ingestion when gateway restart replays
     // full history. Run on newMessages BEFORE prepending autoCompactionSummary
@@ -5262,43 +5830,57 @@ export class LcmContextEngine implements ContextEngine {
 
     // Retain every source row before changing context projection. Bootstrap's
     // suffix budget is inappropriate here: the omitted tool groups need summaries.
-    return this.conversationStore.withTransaction(async () => {
+    if (!this.transcriptDeltaSync) {
+      this.reportMissingTranscriptDeltaReader("compact", formatSessionLabel(target.sessionId, target.sessionKey));
+      return TRANSCRIPT_DELTA_READER_UNAVAILABLE;
+    }
+    const conversation = await this.conversationStore.withTransaction(async () => {
       await this.archiveSupersededIsolatedCronConversation(target);
-      const conversation = await this.conversationStore.getOrCreateConversation(target.sessionId, {
+      return this.conversationStore.getOrCreateConversation(target.sessionId, {
         sessionKey: target.sessionKey,
       });
-      const conversationId = conversation.conversationId;
-      const existingCount = await this.conversationStore.getMessageCount(conversationId);
-      const audit = existingCount > 0
-        ? await this.auditTranscriptAnchorsForProjection({ ...target, conversationId, entries })
-        : undefined;
-      const reconcile = await this.reconcileProjectedTranscriptMessages({
-        ...target,
-        conversationId,
-        historicalMessages: entries.map(messageFromVisibleTranscriptEntry),
-        requireOverlap: existingCount > 0 && !audit?.allowsUnanchoredLegacyPrefixImport,
-        legacyPrefixAnchorEntryId: audit?.legacyPrefixAnchorEntryId,
-        completeRecoverySnapshot: true,
-      });
-      if (reconcile.blockedByImportCap) {
-        throw new Error(`overflow transcript reconciliation blocked: ${reconcile.blockedReason ?? "incomplete coverage"}`);
-      }
-      // Reconciliation may deliberately skip uncertain history. Only a fully
-      // represented current turn may authorize the recovery-only tail exception.
-      const turnIds = new Set(ids.slice(latestUserIndex));
-      const storedIds = await this.conversationStore.filterExistingTranscriptEntryIds(conversationId, [...turnIds]);
-      const context = await this.summaryStore.getContextItems(conversationId);
-      const raw = await Promise.all(context.filter((item) => item.messageId != null)
-        .map((item) => this.conversationStore.getMessageById(item.messageId!)));
-      const userIndex = raw.findLastIndex((message) => message?.role === "user");
-      if (storedIds.size !== turnIds.size || userIndex < 0 ||
-          raw[userIndex]?.transcriptEntryId !== ids[latestUserIndex] ||
-          raw.slice(userIndex).some((message) => !message?.transcriptEntryId || !turnIds.has(message.transcriptEntryId))) {
-        throw new Error("overflow transcript has incomplete current-turn coverage");
-      }
-      await this.conversationStore.markConversationBootstrapped(conversationId);
-      return undefined;
     });
+    const synced = await this.syncTranscriptProjection({
+      conversation,
+      target,
+      sessionId: target.sessionId,
+      sessionKey: target.sessionKey,
+      sessionLabel: formatSessionLabel(target.sessionId, target.sessionKey),
+      freshStartBudgetTokens: null,
+    });
+    if (synced.outcome.status !== "synced") {
+      throw new Error(`overflow transcript sync ${synced.outcome.status}${synced.outcome.detail ? `: ${synced.outcome.detail}` : ""}`);
+    }
+    return this.conversationStore.withTransaction(() =>
+      this.verifyOverflowTurnCoverage(synced.conversationId, ids, latestUserIndex),
+    );
+  }
+
+  /**
+   * Overflow recovery may compact only a fully represented current turn:
+   * every visible entry from the latest user message on must be stored, in
+   * order, as the raw tail of the context projection.
+   */
+  private async verifyOverflowTurnCoverage(
+    conversationId: number,
+    ids: string[],
+    latestUserIndex: number,
+  ): Promise<undefined> {
+    // Reconciliation may deliberately skip uncertain history. Only a fully
+    // represented current turn may authorize the recovery-only tail exception.
+    const turnIds = new Set(ids.slice(latestUserIndex));
+    const storedIds = await this.conversationStore.filterExistingTranscriptEntryIds(conversationId, [...turnIds]);
+    const context = await this.summaryStore.getContextItems(conversationId);
+    const raw = await Promise.all(context.filter((item) => item.messageId != null)
+      .map((item) => this.conversationStore.getMessageById(item.messageId!)));
+    const userIndex = raw.findLastIndex((message) => message?.role === "user");
+    if (storedIds.size !== turnIds.size || userIndex < 0 ||
+        raw[userIndex]?.transcriptEntryId !== ids[latestUserIndex] ||
+        raw.slice(userIndex).some((message) => !message?.transcriptEntryId || !turnIds.has(message.transcriptEntryId))) {
+      throw new Error("overflow transcript has incomplete current-turn coverage");
+    }
+    await this.conversationStore.markConversationBootstrapped(conversationId);
+    return undefined;
   }
 
   async compact(params: {

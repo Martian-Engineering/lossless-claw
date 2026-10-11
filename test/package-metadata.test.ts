@@ -30,7 +30,7 @@ describe("package OpenClaw compatibility metadata", () => {
       `requires OpenClaw \`${requiredOpenClawVersion}\` or newer`,
     );
     expect(readProjectFile("docs/architecture.md")).toContain(
-      "host-provided visible transcript projection",
+      "OpenClaw's visible-message delta reader",
     );
     expect(readProjectFile("docs/tui.md")).toContain("Shows runtime sessions");
   });

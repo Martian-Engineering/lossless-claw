@@ -412,8 +412,8 @@ Env overrides:
   value disables and overrides the plugin setting.
 
 OpenClaw heartbeat polls arrive as synthetic system events. By default Lossless
-short-circuits them out of ingest and out of the after-turn visible-transcript
-reconcile, so a session whose only traffic is heartbeats can look as if nothing
+short-circuits them out of ingest and out of the after-turn transcript-delta
+sync, so a session whose only traffic is heartbeats can look as if nothing
 ever happened.
 
 Set this to `true` to keep heartbeat poll events in LCM storage and in assembled

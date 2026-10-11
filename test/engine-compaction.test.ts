@@ -27,6 +27,7 @@ import {
   createEngineWithDeps,
   makeMessage,
   tempDirs,
+  TestLcmContextEngine,
 } from "./helpers.js";
 
 afterEach(cleanupEngineTestState);
@@ -234,7 +235,7 @@ describe("LcmContextEngine compaction telemetry", () => {
     tempDirs.push(tempDir);
     const config = createTestConfig(join(tempDir, "lcm.db"));
     const db = createLcmDatabaseConnection(config.databasePath);
-    const engine = new LcmContextEngine(
+    const engine = new TestLcmContextEngine(
       createTestDeps(
         {
           ...config,
