@@ -64,6 +64,8 @@ A conversation created before cursor mode migrates on its first sync with the sa
 
 lossless-claw requires OpenClaw's `readSessionTranscriptVisibleMessageDelta`. Every supported OpenClaw release ships it; if a host lacks it, lossless-claw logs a capability error and skips transcript ingestion rather than falling back to full-transcript reconciliation.
 
+Each drained page also records the host replay key (`idempotencyKey`) and a signature digest of every visible user entry in `transcript_user_replay_keys`. A resync refreshes those records from its scan, and records no key for stored entries that left the projection. Assembly restores raw user replay identity from these records, so it does not read the whole visible transcript on every turn. Only entries that were never recorded, such as rows stored before this table existed, are filled from one full visible read.
+
 ### Leaf compaction
 
 The **leaf pass** converts raw messages into leaf summaries:

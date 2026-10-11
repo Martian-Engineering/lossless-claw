@@ -102,6 +102,7 @@ const HANDLED_CONVERSATION_ID_TABLES = new Set([
   "message_transcript_anchor_trust",
   "conversation_transcript_epochs",
   "conversation_transcript_cursors",
+  "transcript_user_replay_keys",
   "pending_compaction_batches",
   "pending_summary_nodes",
 ]);
@@ -514,6 +515,16 @@ function reparentTranscriptAnchorState(db: DatabaseSync, group: SafeGroup): void
   if (hasTable(db, "message_transcript_anchor_trust")) {
     db.prepare(
       `UPDATE message_transcript_anchor_trust
+       SET conversation_id = ?,
+           updated_at = datetime('now')
+       WHERE conversation_id IN (${sourcePlaceholders})`,
+    ).run(group.targetConversationId, ...group.sourceConversationIds);
+  }
+  if (hasTable(db, "transcript_user_replay_keys")) {
+    // Replay observations follow their entries; the target's own observation
+    // of the same entry id wins, leaving the source copy on the archived lane.
+    db.prepare(
+      `UPDATE OR IGNORE transcript_user_replay_keys
        SET conversation_id = ?,
            updated_at = datetime('now')
        WHERE conversation_id IN (${sourcePlaceholders})`,

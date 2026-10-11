@@ -26,6 +26,7 @@ import type {
   TranscriptCursorRecord,
   TranscriptCursorStore,
 } from "./store/transcript-cursor-store.js";
+import type { TranscriptUserReplayKey, UserReplayKeyStore } from "./store/user-replay-key-store.js";
 import { attachTranscriptEntryMeta } from "./transcript.js";
 import {
   collectRawTranscriptNavigation,
@@ -38,6 +39,7 @@ import {
   SuffixContentMatcher,
   type ScannedVisibleEntry,
 } from "./transcript-resync-plan.js";
+import { observeUserReplayIdentity, type UserReplayIdentity } from "./user-replay.js";
 import type {
   LcmDependencies,
   SessionTranscriptRawDeltaParams,
@@ -137,6 +139,7 @@ export type TranscriptDeltaSyncDeps = {
   readRawDelta?: (params: SessionTranscriptRawDeltaParams) => Promise<SessionTranscriptRawDeltaResult>;
   cursorStore: TranscriptCursorStore;
   conversationStore: ConversationStore;
+  replayKeyStore: UserReplayKeyStore;
   log: LcmDependencies["log"];
   yieldToEventLoop?: () => Promise<void>;
 };
@@ -208,6 +211,11 @@ function importFromIndex(
 ): number {
   const entryId = request.importFromEntryId;
   return entryId === undefined ? -1 : entries.findIndex((entry) => entry.entryId === entryId);
+}
+
+/** Replay identity of a user entry, or undefined for other roles. */
+function userReplayForEntry(entry: VisibleSessionTranscriptMessageEntry): UserReplayIdentity | undefined {
+  return entry.message.role === "user" ? observeUserReplayIdentity(entry.message) : undefined;
 }
 
 /** Recognize OpenClaw's current-turn read fence by its stable error name. */
@@ -419,8 +427,10 @@ export class TranscriptDeltaSync {
         scan,
         startIndex: importStart,
         counters,
-        beforeFirstPage: (pageCounters) =>
-          this.applyPlannedRestamps(scan.entries, plan.restamps, pageCounters),
+        beforeFirstPage: async (pageCounters) => {
+          this.recordScannedReplayKeys(request.conversationId, scan.entries, stored, visibleIds);
+          await this.applyPlannedRestamps(scan.entries, plan.restamps, pageCounters);
+        },
         handle,
       });
       if (written.kind === "reset") {
@@ -451,6 +461,31 @@ export class TranscriptDeltaSync {
       };
     }
     return this.stopped("resync", "blocked", counters, null, "transcript kept changing during resync", options.reason);
+  }
+
+  /**
+   * Refresh the stored replay keys from a complete scan: every visible user
+   * entry records its current key, and stored ids that left the projection
+   * record '' so assembly never restores replay identity for them.
+   */
+  private recordScannedReplayKeys(
+    conversationId: number,
+    entries: readonly ScannedVisibleEntry[],
+    stored: ReadonlyMap<string, StoredTranscriptRow>,
+    visibleIds: ReadonlySet<string>,
+  ): void {
+    const keys: TranscriptUserReplayKey[] = [];
+    for (const entry of entries) {
+      if (entry.userReplay) {
+        keys.push({ entryId: entry.entryId, ...entry.userReplay });
+      }
+    }
+    for (const entryId of stored.keys()) {
+      if (!visibleIds.has(entryId)) {
+        keys.push({ entryId, idempotencyKey: "", signature: "" });
+      }
+    }
+    this.deps.replayKeyStore.record(conversationId, keys);
   }
 
   /** Restamp rows whose stored id a visible entry declares it supersedes. */
@@ -568,6 +603,7 @@ export class TranscriptDeltaSync {
       }
       pages.push({ cursorBefore: cursor, startIndex: entries.length });
       for (const entry of page.entries) {
+        const userReplay = userReplayForEntry(entry);
         entries.push({
           entryId: entry.entryId,
           parentId: entry.parentId,
@@ -579,6 +615,7 @@ export class TranscriptDeltaSync {
             collectTokens && hasPersistableMessageRole(entry.message)
               ? Math.max(1, toStoredMessage(entry.message).tokenCount)
               : 0,
+          ...(userReplay ? { userReplay } : {}),
         });
       }
       cursor = page.cursor;
@@ -725,6 +762,7 @@ export class TranscriptDeltaSync {
       const pageCounters: Counters = { imported: 0, restamped: 0, heartbeatAck: false };
       await params.beforeEntries?.(pageCounters);
       const importedMessages: AgentMessage[] = [];
+      const replayKeys: TranscriptUserReplayKey[] = [];
       for (let offset = params.skipBefore ?? 0; offset < params.entries.length; offset += 1) {
         const before = pageCounters.imported;
         const entry = params.entries[offset]!;
@@ -732,7 +770,12 @@ export class TranscriptDeltaSync {
         if (pageCounters.imported > before) {
           importedMessages.push(entry.message);
         }
+        const userReplay = userReplayForEntry(entry);
+        if (userReplay) {
+          replayKeys.push({ entryId: entry.entryId, ...userReplay });
+        }
       }
+      this.deps.replayKeyStore.record(params.request.conversationId, replayKeys);
       pageCounters.heartbeatAck = batchLooksLikeHeartbeatAckTurn(importedMessages);
       this.deps.cursorStore.upsert({
         conversationId: params.request.conversationId,
