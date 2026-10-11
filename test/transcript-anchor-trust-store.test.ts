@@ -15,9 +15,20 @@ function createStoreFixture() {
   };
 }
 
+/** Read one message's persisted anchor-trust row directly from SQLite. */
+function readAnchorTrust(db: DatabaseSync, messageId: number) {
+  return db
+    .prepare(
+      `SELECT conversation_id, transcript_entry_id, trust_state, source, reason, verified_at
+       FROM message_transcript_anchor_trust
+       WHERE message_id = ?`,
+    )
+    .get(messageId);
+}
+
 describe("ConversationStore transcript anchor trust", () => {
   it("persists explicit message trust separately from transcript_entry_id", async () => {
-    const { store } = createStoreFixture();
+    const { db, store } = createStoreFixture();
     const conversation = await store.createConversation({
       sessionId: "session-trust",
       sessionKey: "agent:main:session-trust",
@@ -36,7 +47,7 @@ describe("ConversationStore transcript anchor trust", () => {
     await expect(
       store.isTrustedTranscriptAnchor(conversation.conversationId, "entry-suspect"),
     ).resolves.toBe(false);
-    await expect(store.getMessageTranscriptAnchorTrust(legacyMessage.messageId)).resolves.toBeNull();
+    expect(readAnchorTrust(db, legacyMessage.messageId)).toBeUndefined();
 
     await store.upsertMessageTranscriptAnchorTrust({
       messageId: legacyMessage.messageId,
@@ -46,20 +57,18 @@ describe("ConversationStore transcript anchor trust", () => {
       source: "audit",
       reason: "blank assistant content",
     });
-    await expect(store.getMessageTranscriptAnchorTrust(legacyMessage.messageId)).resolves.toMatchObject({
-      messageId: legacyMessage.messageId,
-      conversationId: conversation.conversationId,
-      transcriptEntryId: "entry-suspect",
-      trustState: "suspect",
+    expect(readAnchorTrust(db, legacyMessage.messageId)).toEqual({
+      conversation_id: conversation.conversationId,
+      transcript_entry_id: "entry-suspect",
+      trust_state: "suspect",
       source: "audit",
       reason: "blank assistant content",
-      verifiedAt: null,
+      verified_at: null,
     });
     await expect(
       store.isTrustedTranscriptAnchor(conversation.conversationId, "entry-suspect"),
     ).resolves.toBe(false);
 
-    const verifiedAt = new Date("2026-07-08T12:00:00.000Z");
     await store.upsertMessageTranscriptAnchorTrust({
       messageId: legacyMessage.messageId,
       conversationId: conversation.conversationId,
@@ -67,234 +76,16 @@ describe("ConversationStore transcript anchor trust", () => {
       trustState: "repaired",
       source: "audit",
       reason: "unique sequence alignment",
-      verifiedAt,
+      verifiedAt: new Date("2026-07-08T12:00:00.000Z"),
     });
 
-    await expect(store.getMessageTranscriptAnchorTrust(legacyMessage.messageId)).resolves.toMatchObject({
-      trustState: "repaired",
+    expect(readAnchorTrust(db, legacyMessage.messageId)).toMatchObject({
+      trust_state: "repaired",
       reason: "unique sequence alignment",
-      verifiedAt,
     });
     await expect(
       store.isTrustedTranscriptAnchor(conversation.conversationId, "entry-suspect"),
     ).resolves.toBe(true);
-    await expect(
-      store.listTranscriptAnchorAuditMessages(conversation.conversationId),
-    ).resolves.toEqual([
-      {
-        messageId: legacyMessage.messageId,
-        seq: 1,
-        role: "assistant",
-        content: "",
-        transcriptEntryId: "entry-suspect",
-        anchorTrustState: "repaired",
-        createdAt: legacyMessage.createdAt.toISOString().slice(0, 19).replace("T", " "),
-      },
-    ]);
-  });
-
-  it("persists a conversation transcript epoch frontier idempotently", async () => {
-    const { store } = createStoreFixture();
-    const conversation = await store.createConversation({
-      sessionId: "session-epoch",
-      sessionKey: "agent:main:session-epoch",
-    });
-
-    await expect(
-      store.getConversationTranscriptEpoch(conversation.conversationId),
-    ).resolves.toBeNull();
-
-    await store.upsertConversationTranscriptEpoch({
-      conversationId: conversation.conversationId,
-      sessionId: "session-epoch",
-      sessionKey: "agent:main:session-epoch",
-      frontierEntryId: "entry-frontier-a",
-      frontierSeq: 12,
-      frontierCreatedAt: new Date("2026-07-08T12:01:00.000Z"),
-      migrationMode: "legacy_prefix",
-      metadata: { classification: "unproven" },
-    });
-
-    await expect(
-      store.getConversationTranscriptEpoch(conversation.conversationId),
-    ).resolves.toMatchObject({
-      conversationId: conversation.conversationId,
-      sessionId: "session-epoch",
-      sessionKey: "agent:main:session-epoch",
-      frontierEntryId: "entry-frontier-a",
-      frontierSeq: 12,
-      frontierCreatedAt: new Date("2026-07-08T12:01:00.000Z"),
-      migrationMode: "legacy_prefix",
-      metadata: { classification: "unproven" },
-    });
-
-    await store.upsertConversationTranscriptEpoch({
-      conversationId: conversation.conversationId,
-      sessionId: "session-epoch",
-      sessionKey: "agent:main:session-epoch",
-      frontierEntryId: "entry-frontier-b",
-      frontierSeq: 13,
-      frontierCreatedAt: new Date("2026-07-08T12:02:00.000Z"),
-      migrationMode: "verified",
-      metadata: { classification: "verified" },
-    });
-
-    await expect(
-      store.getConversationTranscriptEpoch(conversation.conversationId),
-    ).resolves.toMatchObject({
-      frontierEntryId: "entry-frontier-b",
-      frontierSeq: 13,
-      migrationMode: "verified",
-      metadata: { classification: "verified" },
-    });
-  });
-});
-
-describe("weak anchor adoption", () => {
-  it("ignores repeated text outside the recent adoption window", async () => {
-    const { store, db } = createStoreFixture();
-    const { conversationId } = await store.createConversation({ sessionId: "tail-window" });
-    const rows = await store.createMessagesBulk(
-      ["repeated", "intervening", "repeated"].map((content, seq) => ({
-        conversationId,
-        seq,
-        role: "assistant" as const,
-        content,
-        tokenCount: 1,
-      })),
-    );
-
-    // The same rows are ambiguous in a wider window but unique in the tail.
-    expect(
-      await store.adoptRecentTranscriptEntryId(
-        conversationId, "assistant", "repeated", "tail-anchor", 3,
-      ),
-    ).toBe(false);
-    expect(
-      await store.adoptRecentTranscriptEntryId(
-        conversationId, "assistant", "repeated", "tail-anchor", 2,
-      ),
-    ).toBe(true);
-    expect(
-      await store.getTranscriptEntryAnchorCandidate(conversationId, "tail-anchor"),
-    ).toMatchObject({ messageId: rows[2]!.messageId });
-    expect((await store.getMessageById(rows[0]!.messageId))?.transcriptEntryId).toBeNull();
-    expect(await store.getMessageCount(conversationId)).toBe(3);
     db.close();
   });
-
-  it("never stamps blank parent messages or ambiguous repeated text", async () => {
-    const { store, db } = createStoreFixture();
-    const { conversationId } = await store.createConversation({ sessionId: "weak" });
-    await store.createMessagesBulk(
-      [1, 2].map((seq) => ({
-        conversationId,
-        seq,
-        role: "assistant" as const,
-        content: "",
-        tokenCount: 1,
-      })),
-    );
-    expect(await store.adoptTranscriptEntryId(conversationId, "assistant", "", "wrong")).toBe(
-      false,
-    );
-    expect(
-      await store.adoptRecentTranscriptEntryId(conversationId, "assistant", "", "wrong", 64),
-    ).toBe(false);
-    await store.createMessagesBulk(
-      [3, 4].map((seq) => ({
-        conversationId,
-        seq,
-        role: "user" as const,
-        content: "repeated",
-        tokenCount: 1,
-      })),
-    );
-    expect(await store.adoptTranscriptEntryId(conversationId, "user", "repeated", "wrong")).toBe(
-      false,
-    );
-    expect(
-      await store.adoptRecentTranscriptEntryId(conversationId, "user", "repeated", "wrong", 64),
-    ).toBe(false);
-    expect(await store.getMessageCount(conversationId)).toBe(4);
-    db.close();
-  });
-});
-
-it("adopts the matching structured call, not the newest blank row", async () => {
-  const { store, db } = createStoreFixture();
-  const { BatchDeduplicator } = await import("../src/batch-dedup.js");
-  const { buildMessageParts } = await import("../src/message-content.js");
-  const { conversationId } = await store.createConversation({ sessionId: "structured" });
-  const calls = ["wanted", "unrelated"].map(
-    (id) =>
-      ({
-        role: "assistant",
-        content: [{ type: "toolCall", id, name: "bash", arguments: { command: id } }],
-      }) as import("../src/openclaw-bridge.js").AgentMessage,
-  );
-  const records = await store.createMessagesBulk(
-    calls.map((_, seq) => ({
-      conversationId,
-      seq,
-      role: "assistant" as const,
-      content: "",
-      tokenCount: 1,
-    })),
-  );
-  for (let i = 0; i < calls.length; i++)
-    await store.createMessageParts(
-      records[i]!.messageId,
-      buildMessageParts({ sessionId: "structured", message: calls[i]!, fallbackContent: "" }),
-    );
-  const dedup = new BatchDeduplicator(
-    store,
-    {} as import("../src/store/summary-store.js").SummaryStore,
-    "/tmp",
-    { log: { info: () => {}, warn: () => {}, error: () => {}, debug: () => {} } },
-  );
-  const plan = await dedup.planRecentTranscriptEntryAdoptions({
-    conversationId,
-    messages: [calls[0]!],
-    tailWindow: 64,
-  });
-  expect(plan.get(0)).toEqual({ messageId: records[0]!.messageId, decorated: false });
-  expect(await store.getMessageCount(conversationId)).toBe(2);
-  db.close();
-});
-
-it("does not substitute a structured row for a proven plain-text candidate", async () => {
-  const { store, db } = createStoreFixture();
-  const { conversationId } = await store.createConversation({ sessionId: "mixed-tail" });
-  const records = await store.createMessagesBulk(
-    [1, 2].map((seq) => ({
-      conversationId,
-      seq,
-      role: "assistant" as const,
-      content: "same text",
-      tokenCount: 2,
-    })),
-  );
-  await store.createMessageParts(records[1]!.messageId, [
-    {
-      sessionId: "mixed-tail",
-      partType: "tool",
-      ordinal: 0,
-      toolCallId: "unrelated",
-      textContent: "same text",
-    },
-  ]);
-  expect(
-    await store.adoptRecentTranscriptEntryId(
-      conversationId,
-      "assistant",
-      "same text",
-      "plain-anchor",
-      64,
-    ),
-  ).toBe(true);
-  expect(
-    await store.getTranscriptEntryAnchorCandidate(conversationId, "plain-anchor"),
-  ).toMatchObject({ messageId: records[0]!.messageId });
-  db.close();
 });

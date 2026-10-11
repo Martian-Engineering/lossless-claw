@@ -171,59 +171,6 @@ describe("OpenClaw sender metadata", () => {
     });
   });
 
-  it("does not overwrite sender identity while adopting transcript provenance", async () => {
-    const engine = createEngine();
-    const store = engine.getConversationStore();
-    const conversation = await store.getOrCreateConversation(randomUUID());
-    const message = await store.createMessage({
-      conversationId: conversation.conversationId,
-      seq: 1,
-      role: "user",
-      content: "already attributed",
-      tokenCount: 2,
-      openClawSenderMetadata: { senderId: "runtime-user", senderName: "Runtime Sender" },
-    });
-
-    const adopted = await store.adoptTranscriptEntryId(
-      conversation.conversationId,
-      "user",
-      "already attributed",
-      "entry-adopted-1",
-      { senderId: "transcript-user", senderName: "Transcript Sender" },
-    );
-
-    expect(adopted).toBe(true);
-    expect(await store.getMessageById(message.messageId)).toMatchObject({
-      transcriptEntryId: "entry-adopted-1",
-      openClawSenderMetadata: {
-        senderId: "runtime-user",
-        senderName: "Runtime Sender",
-      },
-    });
-
-    const staleMessage = await store.createMessage({
-      conversationId: conversation.conversationId,
-      seq: 2,
-      role: "user",
-      content: "stale attribution",
-      tokenCount: 2,
-      transcriptEntryId: "entry-stale-old",
-    });
-    const restamped = await store.restampTranscriptEntryId(
-      staleMessage.messageId,
-      "entry-stale-new",
-      { senderId: "restamped-user", senderName: "Restamped Sender" },
-    );
-    expect(restamped).toBe(true);
-    expect(await store.getMessageById(staleMessage.messageId)).toMatchObject({
-      transcriptEntryId: "entry-stale-new",
-      openClawSenderMetadata: {
-        senderId: "restamped-user",
-        senderName: "Restamped Sender",
-      },
-    });
-  });
-
   it("counts losslessly preserved sender identity against the replay budget", async () => {
     const engine = createEngine();
     const sessionId = randomUUID();

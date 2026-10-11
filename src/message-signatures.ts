@@ -28,10 +28,6 @@ export function createBootstrapEntryHash(message: StoredMessage | null): string 
     .digest("hex");
 }
 
-export function messageIdentity(role: string, content: string): string {
-  return `${role}\u0000${content}`;
-}
-
 export function isBootstrapReplayCandidateMessage(message: AgentMessage): boolean {
   const role = toStoredMessage(message).role;
   return role === "assistant" || role === "tool";

@@ -195,6 +195,40 @@ function setConversationTimes(
     .run(createdAt, archivedAt ?? null, archivedAt ?? createdAt, conversationId);
 }
 
+/** Seed a legacy-prefix transcript epoch row as older releases wrote it. */
+function insertLegacyPrefixEpoch(
+  fixture: CommandFixture,
+  conversation: { conversationId: number; sessionId: string; sessionKey: string | null },
+  metadata: Record<string, unknown>,
+): void {
+  fixture.db
+    .prepare(
+      `INSERT INTO conversation_transcript_epochs (
+         conversation_id, session_id, session_key, migration_mode, metadata_json
+       ) VALUES (?, ?, ?, 'legacy_prefix', ?)`,
+    )
+    .run(
+      conversation.conversationId,
+      conversation.sessionId,
+      conversation.sessionKey,
+      JSON.stringify(metadata),
+    );
+}
+
+/** Read one conversation's transcript epoch row, if any. */
+function readTranscriptEpoch(
+  fixture: CommandFixture,
+  conversationId: number,
+): { migration_mode: string; metadata_json: string | null } | undefined {
+  return fixture.db
+    .prepare(
+      `SELECT migration_mode, metadata_json
+       FROM conversation_transcript_epochs
+       WHERE conversation_id = ?`,
+    )
+    .get(conversationId) as { migration_mode: string; metadata_json: string | null } | undefined;
+}
+
 function insertRolloverStateRows(fixture: CommandFixture, sourceId: number, targetId: number): void {
   fixture.db
     .prepare(
@@ -1976,13 +2010,7 @@ describe("lcm command", () => {
       source: "test",
       reason: "source rollover anchor",
     });
-    await fixture.conversationStore.upsertConversationTranscriptEpoch({
-      conversationId: firstArchived.conversationId,
-      sessionId: firstArchived.sessionId,
-      sessionKey: firstArchived.sessionKey,
-      migrationMode: "legacy_prefix",
-      metadata: { reason: "source rollover epoch" },
-    });
+    insertLegacyPrefixEpoch(fixture, firstArchived, { reason: "source rollover epoch" });
     for (const [batchId, conversationId] of [
       ["pcb_rollover_source", firstArchived.conversationId],
       ["pcb_rollover_target", active.conversationId],
@@ -2042,26 +2070,26 @@ describe("lcm command", () => {
       { seq: 2, content: "oldtwo message" },
       { seq: 3, content: "active message" },
     ]);
-    await expect(
-      fixture.conversationStore.getMessageTranscriptAnchorTrust(sourceMessage.message_id),
-    ).resolves.toMatchObject({
-      conversationId: active.conversationId,
-      transcriptEntryId: "entry_oldone",
-      trustState: "verified",
+    expect(
+      fixture.db
+        .prepare(
+          `SELECT conversation_id, transcript_entry_id, trust_state
+           FROM message_transcript_anchor_trust
+           WHERE message_id = ?`,
+        )
+        .get(sourceMessage.message_id),
+    ).toEqual({
+      conversation_id: active.conversationId,
+      transcript_entry_id: "entry_oldone",
+      trust_state: "verified",
     });
-    await expect(
-      fixture.conversationStore.getConversationTranscriptEpoch(active.conversationId),
-    ).resolves.toMatchObject({
-      conversationId: active.conversationId,
-      migrationMode: "legacy_prefix",
-      metadata: {
-        reason: "rollover split repair merged transcript epoch state",
-        sourceConversationIds: [firstArchived.conversationId, secondArchived.conversationId],
-      },
+    const targetEpoch = readTranscriptEpoch(fixture, active.conversationId);
+    expect(targetEpoch?.migration_mode).toBe("legacy_prefix");
+    expect(JSON.parse(targetEpoch?.metadata_json ?? "null")).toMatchObject({
+      reason: "rollover split repair merged transcript epoch state",
+      sourceConversationIds: [firstArchived.conversationId, secondArchived.conversationId],
     });
-    await expect(
-      fixture.conversationStore.getConversationTranscriptEpoch(firstArchived.conversationId),
-    ).resolves.toBeNull();
+    expect(readTranscriptEpoch(fixture, firstArchived.conversationId)).toBeUndefined();
 
     const targetContext = fixture.db
       .prepare(
@@ -3820,13 +3848,7 @@ describe("lcm command", () => {
       source: "test",
       reason: "suspect test anchor",
     });
-    await fixture.conversationStore.upsertConversationTranscriptEpoch({
-      conversationId: conversation.conversationId,
-      sessionId: conversation.sessionId,
-      sessionKey: conversation.sessionKey,
-      migrationMode: "legacy_prefix",
-      metadata: { reason: "test legacy prefix" },
-    });
+    insertLegacyPrefixEpoch(fixture, conversation, { reason: "test legacy prefix" });
 
     const result = await fixture.command.handler(createCommandContext("doctor anchors"));
 
