@@ -118,6 +118,25 @@ function unstampedRowCount(db: DatabaseSync): number {
   }).n;
 }
 
+/** Lines logged at one level by the engine's mocked logger. */
+function logLines(engine: LcmContextEngine, level: "debug" | "info" | "warn"): string[] {
+  const log = Reflect.get(engine, "deps").log[level] as ReturnType<typeof vi.fn>;
+  return log.mock.calls.map(([line]) => String(line));
+}
+
+function gapRows(db: DatabaseSync) {
+  return db
+    .prepare(
+      `SELECT g.first_entry_id AS firstEntryId, g.last_entry_id AS lastEntryId,
+              g.first_visible_seq AS firstVisibleSeq, g.last_visible_seq AS lastVisibleSeq,
+              g.entry_count AS entryCount, g.source
+       FROM conversation_transcript_gaps g JOIN conversations c ON c.conversation_id = g.conversation_id
+       WHERE c.active = 1 AND c.session_key = ?
+       ORDER BY g.first_visible_seq`,
+    )
+    .all(sessionKey);
+}
+
 function cursorRow(db: DatabaseSync) {
   return db
     .prepare(
@@ -241,6 +260,42 @@ describe("transcript delta single writer through engine entry points", () => {
       reason: "transcript read fenced at current turn",
     });
     expect(rows(db)).toHaveLength(2);
+  });
+
+  it("logs each incremental drain at debug with its counts", async () => {
+    const { host, engine } = setup();
+    host.append(user("one"));
+    await bootstrap(engine);
+    host.append(assistant("two"));
+    await bootstrap(engine);
+    const drains = logLines(engine, "debug").filter((line) => line.includes("transcript drain"));
+    expect(drains).toHaveLength(1);
+    expect(drains[0]).toMatch(/conversation=\d+ .* imported=1 restamped=0 frontierSeq=2 duration=/);
+  });
+
+  it("logs a missing transcript once per conversation, not on every turn", async () => {
+    const { host, engine, db } = setup();
+    host.missing = true;
+    await bootstrap(engine);
+    await afterTurn(engine, [user("internal")]);
+    await afterTurn(engine, [user("internal")]);
+    const admission = host.append(user("q"));
+    await expect(engine.commitTurn(commitParams(host, admission, admission))).resolves.toEqual({
+      status: "committed",
+    });
+    const missing = [...logLines(engine, "info"), ...logLines(engine, "warn"), ...logLines(engine, "debug")].filter(
+      (line) => /transcript (delta )?missing|visible transcript missing/.test(line),
+    );
+    expect(missing).toHaveLength(1);
+    expect(missing[0]).toContain("further missing results for this conversation are not logged");
+    expect(rows(db)).toEqual([]);
+
+    // A transcript that appears and then disappears again is reported again.
+    host.missing = false;
+    await bootstrap(engine);
+    host.missing = true;
+    await afterTurn(engine, []);
+    expect(logLines(engine, "info").filter((line) => line.includes("transcript missing"))).toHaveLength(2);
   });
 
   it("does not drain heartbeat turns that are not preserved", async () => {
@@ -550,6 +605,66 @@ describe("one-time legacy migration", () => {
     const migrated = rows(db);
     expect(migrated).toHaveLength(7);
     expect(migrated.map((row) => row.entryId)).toEqual([anchor, ...newerIds]);
+  });
+
+  it("records a durable gap marker and warns once for a sealed history hole", async () => {
+    // The old reconcile stored an anchor, never stored the next stretch, then
+    // stored a later turn right after it: the hole has no rows between its neighbors.
+    const host = new FakeTranscriptHost(sessionId);
+    const first = host.append(user("first question"));
+    const hole = [
+      host.append(assistant("never stored 1")),
+      host.append(assistant("never stored 2")),
+      // Storage policy skips delivery mirrors, so this one is not part of the gap.
+      host.append({ ...assistant("never stored 2"), model: "delivery-mirror" } as AgentMessage),
+      host.append(assistant("never stored 3")),
+    ];
+    const later = host.append(user("later question"));
+    const { engine, db } = await legacyConversation(host, [
+      { role: "user", content: "first question", entryId: first },
+      { role: "user", content: "later question", entryId: later },
+    ]);
+    host.append(assistant("after upgrade"));
+
+    await expect(bootstrap(engine)).resolves.toMatchObject({ importedMessages: 1 });
+    expect(rows(db).map((row) => row.content)).toEqual(["first question", "later question", "after upgrade"]);
+    expect(gapRows(db)).toEqual([
+      {
+        firstEntryId: hole[0],
+        lastEntryId: hole[3],
+        firstVisibleSeq: 2,
+        lastVisibleSeq: 5,
+        entryCount: 3,
+        source: "legacy-migration",
+      },
+    ]);
+    const warnings = () => logLines(engine, "warn").filter((line) => line.includes("transcript history gaps"));
+    expect(warnings()).toHaveLength(1);
+    expect(warnings()[0]).toMatch(/newGaps=1 gaps=1 entries=3 largestGap=3/);
+    expect(logLines(engine, "info").find((line) => line.includes("transcript cursor migration"))).toContain(
+      "historyGaps=1 historyGapEntries=3",
+    );
+
+    // A later cursor reset re-finds the same hole: no duplicate marker, no second warning.
+    host.rotate();
+    await bootstrap(engine);
+    expect(gapRows(db)).toHaveLength(1);
+    expect(warnings()).toHaveLength(1);
+  });
+
+  it("records no gap where legacy unstamped rows may already cover the run", async () => {
+    const host = new FakeTranscriptHost(sessionId);
+    const first = host.append(user("first question"));
+    host.append(assistant("answer with drifted stored text"));
+    const later = host.append(user("later question"));
+    const { engine, db } = await legacyConversation(host, [
+      { role: "user", content: "first question", entryId: first },
+      { role: "assistant", content: "legacy runtime rendering" },
+      { role: "user", content: "later question", entryId: later },
+    ]);
+    await bootstrap(engine);
+    expect(gapRows(db)).toEqual([]);
+    expect(logLines(engine, "warn").filter((line) => line.includes("transcript history gaps"))).toEqual([]);
   });
 
   it("imports nothing without an anchor or content match, keeping every legacy row", async () => {
