@@ -1400,7 +1400,8 @@ function createLcmDependencies(
           ...requestMetadata,
         };
       } catch (err) {
-        log.error(`[lcm] runtime.llm.complete error: ${describeLogError(err)}`);
+        // Host lifecycle rejections are classified, not logged: the summarizer
+        // caller reports them once with the retained-work context.
         if (
           describeLogError(err) === "Async work scope is closed" ||
           describeLogError(err) === "Plugin inventory has retired; begin a new plugin operation."
@@ -1411,6 +1412,7 @@ function createLcmDependencies(
             ...requestMetadata,
           };
         }
+        log.error(`[lcm] runtime.llm.complete error: ${describeLogError(err)}`);
         if (runtimeModelOverride && isRuntimeLlmModelPolicyDenial(err)) {
           return {
             content: [],

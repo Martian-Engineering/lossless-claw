@@ -1805,6 +1805,11 @@ export class LcmContextEngine implements ContextEngine {
         };
       }
       if (lastResult.status === "failed") {
+        if (lastResult.lifecycleInterrupted) {
+          this.deps.log.warn(
+            `[lcm] summarization interrupted by host runtime lifecycle conversation=${params.conversationId} ${formatSessionLabel(params.sessionId, params.sessionKey)} cause="${lastResult.failureSummary}"; pending summaries and compaction debt kept for the next drain`,
+          );
+        }
         if (lastResult.authFailure && resolvedSummarizer.breakerKey) {
           this.compactionGuards.recordCompactionAuthFailure(resolvedSummarizer.breakerKey);
         }
