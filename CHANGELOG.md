@@ -1,5 +1,31 @@
 # @martian-engineering/lossless-claw
 
+## 1.2.0
+
+### Minor Changes
+
+- [#1238](https://github.com/Martian-Engineering/lossless-claw/pull/1238) [`99dfe43`](https://github.com/Martian-Engineering/lossless-claw/commit/99dfe435203e304a66fc582148cf0e2ed9a1bf55) Thanks [@jalehman](https://github.com/jalehman)! - Ingest the OpenClaw transcript through a persisted per-conversation visible-delta cursor instead of re-reading and reconciling the whole transcript on every `bootstrap` and `afterTurn`. Steady-state turns now read only new transcript entries (about 2–5 ms with no main-thread SQLite work, down from 0.3–28.5 s on large sessions).
+
+  - `commitTurn`, `afterTurn`, `ingest` and `ingestBatch` no longer persist runtime message arrays for transcript-backed sessions, so every new row carries its transcript entry id. `commitTurn` records its idempotency receipt in the same transaction as the drained rows.
+  - When OpenClaw invalidates a cursor, lossless-claw resyncs in bulk and restamps re-issued entries onto their existing rows instead of importing duplicates.
+  - Existing conversations migrate to cursor mode once, on first use, with the same bulk resync. Migration never deletes rows or clears transcript entry ids, and never imports history before the last stored entry that is still visible.
+  - A conversation created by `/reset` no longer imports pre-reset history ([#1199](https://github.com/Martian-Engineering/lossless-claw/issues/1199)).
+  - A host without OpenClaw's visible-delta reader now gets a logged capability error instead of the full-transcript reconcile. Every supported OpenClaw release ships the reader. The legacy reconcile code is now unreachable and will be removed in a follow-up release.
+
+- [#1242](https://github.com/Martian-Engineering/lossless-claw/pull/1242) [`924571a`](https://github.com/Martian-Engineering/lossless-claw/commit/924571aa8186f6f452cd739940e4f18d6ef14761) Thanks [@jalehman](https://github.com/jalehman)! - Record transcript history gaps. When a conversation enters cursor mode or resyncs, each run of storable transcript entries that Lossless Claw never stored and that sits before the anchor is saved as a marker in the new `conversation_transcript_gaps` table, and one warning reports the counts. `/lcm status`, `/lcm doctor`, `lcm status`, and `lcm conversations show` report the gaps. Markers are diagnostics only; nothing is imported or deleted.
+
+  Log quality: each incremental transcript drain logs one debug line with imported/restamped counts and duration; `assemble` logs when it reads the full visible transcript to fill missing replay keys; a session with no host transcript logs "transcript missing" once per conversation per process instead of on every turn.
+
+### Patch Changes
+
+- [#1239](https://github.com/Martian-Engineering/lossless-claw/pull/1239) [`6d2fedc`](https://github.com/Martian-Engineering/lossless-claw/commit/6d2fedc72d3107eb49b1d364a9560c2ecad4f98f) Thanks [@jalehman](https://github.com/jalehman)! - Restore raw user replay identity during `assemble` from replay keys recorded at transcript ingestion, instead of reading the whole visible transcript on every turn where live user messages carry an `idempotencyKey`. Rows stored before replay keys were recorded are filled from one full visible read, then served from storage.
+
+- [#1211](https://github.com/Martian-Engineering/lossless-claw/pull/1211) [`e05d8d3`](https://github.com/Martian-Engineering/lossless-claw/commit/e05d8d34b2a44fdef556ce95dd90115b46630200) Thanks [@TheAngryPit](https://github.com/TheAngryPit)! - Exclude archived conversations' historical pending maintenance debt and failure summaries from the actionable totals reported by `lcm status`.
+
+- [#1243](https://github.com/Martian-Engineering/lossless-claw/pull/1243) [`13a9b6a`](https://github.com/Martian-Engineering/lossless-claw/commit/13a9b6af3197e4fd787eac3969e97929ab39ccce) Thanks [@jalehman](https://github.com/jalehman)! - Remove the legacy full-transcript reconcile path, which no supported OpenClaw release reaches since transcript ingestion moved to the visible-delta cursor. Existing anchor-trust and transcript-epoch rows are left in place.
+
+- [#1245](https://github.com/Martian-Engineering/lossless-claw/pull/1245) [`6a5915f`](https://github.com/Martian-Engineering/lossless-claw/commit/6a5915f7420835ac5beaa409975234dcfa284890) Thanks [@jalehman](https://github.com/jalehman)! - Report summarization interrupted by host runtime retirement ("Plugin inventory has retired", "Async work scope is closed") as a single warning instead of two error lines; pending summaries and compaction debt stay queued for the next drain.
+
 ## 1.1.1
 
 <!-- release-rollback-version: 1.1.0 -->
