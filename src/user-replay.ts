@@ -1,17 +1,43 @@
+import { createHash } from "node:crypto";
 import type { AgentMessage } from "./openclaw-bridge.js";
-import type { VisibleSessionTranscriptMessageEntry } from "./types.js";
 import { getTranscriptEntryId } from "./transcript.js";
-import { messagesHaveSameLiveCoverageSignature } from "./message-signatures.js";
+import { createLiveCoverageSignature } from "./message-signatures.js";
 
-/** Restore host replay metadata only for retained, canonically identified raw users. */
+/** Replay identity of one visible transcript user entry, as persisted by the host. */
+export type UserReplayIdentity = {
+  idempotencyKey: string;
+  /** Digest of the entry's live-coverage signature. */
+  signature: string;
+};
+
+/** Digest of a message's live-coverage signature, comparable across stored and live copies. */
+function replaySignatureOf(message: AgentMessage): string {
+  return createHash("sha256").update(createLiveCoverageSignature(message)).digest("hex");
+}
+
+/**
+ * Observe the replay identity carried by a transcript user message. Entries
+ * without a key observe '' for both fields so they are never restored.
+ */
+export function observeUserReplayIdentity(message: AgentMessage): UserReplayIdentity {
+  const key = Reflect.get(message, "idempotencyKey");
+  return typeof key === "string" && key
+    ? { idempotencyKey: key, signature: replaySignatureOf(message) }
+    : { idempotencyKey: "", signature: "" };
+}
+
+/**
+ * Restore host replay metadata only for retained, canonically identified raw
+ * users. `identities` maps visible transcript entry ids to the replay identity
+ * observed on that user entry.
+ */
 export function restoreRawUserReplay(
   assembled: AgentMessage[],
   live: AgentMessage[],
-  entries: VisibleSessionTranscriptMessageEntry[],
+  identities: ReadonlyMap<string, UserReplayIdentity>,
 ): { messages: AgentMessage[]; carrierParents: Map<AgentMessage, AgentMessage> } {
   const carrierParents = new Map<AgentMessage, AgentMessage>();
-  if (entries.length === 0) return { messages: assembled, carrierParents };
-  const entriesById = new Map(entries.map(entry => [entry.entryId, entry]));
+  if (identities.size === 0) return { messages: assembled, carrierParents };
   const liveByKey = new Map<string, number>();
   const duplicateKeys = new Set<string>();
   for (const [index, message] of live.entries()) {
@@ -23,14 +49,14 @@ export function restoreRawUserReplay(
   const messages = assembled.flatMap(message => {
     if (message.role !== "user") return [message];
     const entryId = getTranscriptEntryId(message);
-    const entry = entryId ? entriesById.get(entryId) : undefined;
-    const key = entry && Reflect.get(entry.message, "idempotencyKey");
-    if (!entry || entry.message.role !== "user" || typeof key !== "string" || duplicateKeys.has(key)) return [message];
+    const identity = entryId ? identities.get(entryId) : undefined;
+    const key = identity?.idempotencyKey;
+    if (!identity || !key || duplicateKeys.has(key)) return [message];
     const index = liveByKey.get(key);
     const source = index !== undefined ? live[index] : undefined;
     // Never graft replay identity by matching text alone, nor undo externalization.
-    if (!source || !messagesHaveSameLiveCoverageSignature(message, entry.message) ||
-        !messagesHaveSameLiveCoverageSignature(source, entry.message)) return [message];
+    if (!source || replaySignatureOf(message) !== identity.signature ||
+        replaySignatureOf(source) !== identity.signature) return [message];
     const restored = { ...message, timestamp: source.timestamp, idempotencyKey: key } as AgentMessage;
     const replay = [restored];
     for (let next = index! + 1; next < live.length; next++) {

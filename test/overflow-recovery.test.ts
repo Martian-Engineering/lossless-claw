@@ -1,11 +1,11 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { cleanupEngineTestState, createEngineWithDeps } from "./helpers.js";
+import { cleanupEngineTestState, createEngineWithDeps, seedStoredMessage } from "./helpers.js";
 import type { AgentMessage } from "../src/openclaw-bridge.js";
 import type { VisibleSessionTranscriptMessageEntry } from "../src/types.js";
 import { estimateSerializedMessagesTokens } from "../src/estimate-tokens.js";
 import { ContextAssembler } from "../src/assembler.js";
-import { attachTranscriptEntryMeta } from "../src/transcript.js";
 import { BatchDeduplicator } from "../src/batch-dedup.js";
+import { attachTranscriptEntryMeta } from "../src/transcript.js";
 import {
   extractAssistantToolCallIdsForPairing,
   extractToolResultIdForPairing,
@@ -74,9 +74,8 @@ function transcript(pairs = 12): VisibleSessionTranscriptMessageEntry[] {
 /** Exercise the same compacted-result retry gate as supported OpenClaw overflow recovery. */
 async function recover(
   entries: VisibleSessionTranscriptMessageEntry[],
-  warm: boolean | "committed" | "committed-timed" = false,
-  settings = config,
-  committedMessages?: AgentMessage[],
+  warm: boolean | AgentMessage[] = false,
+  settings = config
 ) {
   const complete = vi.fn(async () => ({
     content: [
@@ -93,27 +92,10 @@ async function recover(
     readVisibleSessionTranscriptMessageEntries: read,
     log: { info, debug: vi.fn(), warn: info, error: info },
   });
-  if (warm === "committed" || warm === "committed-timed") {
-    const first = entries[0]!;
-    const last = entries.at(-1)!;
-    await engine.commitTurn({
-      sessionId, sessionKey, sessionTarget, advancementKey: "bare-host-turn",
-      admission: {
-        ...sessionTarget, entryId: first.entryId, effectiveParentId: null,
-        generation: "g1", logicalTurnId: "bare-host-turn", rawSeq: 1,
-        activeMessagePosition: 0, role: "user",
-      },
-      terminal: {
-        ...sessionTarget, entryId: last.entryId, effectiveParentId: last.parentId,
-        generation: "g1", rawSeq: entries.length,
-        activeMessagePosition: entries.length - 1,
-      },
-      messages: committedMessages ?? entries.map((entry) => warm === "committed-timed"
-        ? { ...entry.message, timestamp: Date.parse(entry.createdAt!) }
-        : entry.message),
-    });
+  if (Array.isArray(warm)) {
+    for (const message of warm) await seedStoredMessage(engine, { sessionId, sessionKey, message });
   } else if (warm) {
-    await engine.ingest({
+    await seedStoredMessage(engine, {
       sessionId,
       sessionKey,
       message: attachTranscriptEntryMeta(entries[0]!.message, {
@@ -183,7 +165,7 @@ describe("authoritative forced overflow recovery", () => {
           { type: "text", text: `\n\nHere are the previews.\n\nMEDIA:${mediaUrls[0]}\nMEDIA:${mediaUrls[1]}` },
         ],
       } as AgentMessage;
-      await engine.ingest({ sessionId, sessionKey, message: original });
+      await seedStoredMessage(engine, { sessionId, sessionKey, message: original });
       const store = engine.getConversationStore();
       const conversation = await store.getConversationForSession({ sessionId, sessionKey });
       const persisted = await store.getLastMessage(conversation!.conversationId);
@@ -203,9 +185,7 @@ describe("authoritative forced overflow recovery", () => {
       const hosted = variant === "no-host-entry" ? incoming : attachTranscriptEntryMeta(incoming, {
         entryId: "entry-proof-final", parentId: null, timestamp: null,
       });
-      const dedup = new BatchDeduplicator(store, engine.getSummaryStore(), "/tmp/lcm-delivery-proof", {
-        log: { info: vi.fn(), debug: vi.fn(), warn: vi.fn(), error: vi.fn() },
-      });
+      const dedup = new BatchDeduplicator(store, engine.getSummaryStore(), "/tmp/lcm-delivery-proof");
       expect(await dedup.matchesPersistedAnchor(persisted!.messageId, hosted)).toBe(variant === "valid");
       expect((await store.getLastMessage(conversation!.conversationId))?.content).toBe(persisted!.content);
       expect(await store.getMessageCount(conversation!.conversationId)).toBe(1);
@@ -237,7 +217,7 @@ describe("authoritative forced overflow recovery", () => {
     });
     const committed: AgentMessage[] = entries.map((entry) => ({ ...entry.message, timestamp: Date.parse(entry.createdAt!) }));
     committed[committed.length - 1] = original;
-    const { engine, complete } = await recover(entries, "committed-timed", config, committed);
+    const { engine, complete } = await recover(entries, committed);
     const store = engine.getConversationStore();
     const conversation = await store.getConversationForSession({ sessionId, sessionKey });
     const persisted = await store.getLastMessage(conversation!.conversationId);
@@ -246,6 +226,7 @@ describe("authoritative forced overflow recovery", () => {
     expect(await store.getMessageCount(conversation!.conversationId)).toBe(entries.length);
     expect(complete).toHaveBeenCalled();
   });
+
 
   for (const warm of [false, true])
     it(`reduces the retry prompt and preserves raw history (existing prefix=${warm})`, async () => {
@@ -313,7 +294,7 @@ describe("authoritative forced overflow recovery", () => {
       expect(rows.find((row) => row.content.includes("FILE_0"))).toBeTruthy();
     });
 
-  for (const warm of [false, true, "committed", "committed-timed"] as const)
+  for (const warm of [false, true])
     it(`recovers nested-tool display rows without losing persisted history (existing prefix=${warm})`, async () => {
       const source = transcript();
       const entries = source.flatMap((entry) => {
@@ -350,51 +331,6 @@ describe("authoritative forced overflow recovery", () => {
       const results = retry.messages.map(extractToolResultIdForPairing).filter(Boolean);
       expect(results).toEqual(calls);
       expect(results).toContain("call_11");
-    });
-
-  it.each(["partial", "reordered", "stale suffix"])(
-    "does not adopt a bare legacy turn with an unproven ordered tail: %s", async (kind) => {
-      const entries = transcript();
-      const complete = vi.fn();
-      const engine = createEngineWithDeps(config, {
-        complete,
-        readVisibleSessionTranscriptMessageEntries: async () => entries,
-      });
-      const stored = [...entries];
-      if (kind === "partial") stored.splice(2, 1);
-      if (kind === "reordered") [stored[1], stored[2]] = [stored[2]!, stored[1]!];
-      const first = entries[0]!, last = entries.at(-1)!;
-      const messages = stored.map((entry) => ({
-        ...entry.message, timestamp: Date.parse(entry.createdAt!),
-      }));
-      if (kind === "stale suffix") messages.push({
-        role: "assistant", content: "unrepresented later evidence",
-        timestamp: Date.parse(last.createdAt!) + 1,
-      } as AgentMessage & { timestamp: number });
-      await engine.commitTurn({
-        sessionId, sessionKey, sessionTarget, advancementKey: "unproven-bare-turn",
-        admission: {
-          ...sessionTarget, entryId: first.entryId, effectiveParentId: null,
-          generation: "g1", logicalTurnId: "unproven-bare-turn", rawSeq: 1,
-          activeMessagePosition: 0, role: "user",
-        },
-        terminal: {
-          ...sessionTarget, entryId: last.entryId, effectiveParentId: last.parentId,
-          generation: "g1", rawSeq: messages.length,
-          activeMessagePosition: messages.length - 1,
-        },
-        messages,
-      });
-      const store = engine.getConversationStore();
-      const conversation = await store.getConversationForSession({ sessionId, sessionKey });
-      const before = await store.getMessages(conversation!.conversationId);
-      const result = await engine.compact({
-        sessionId, sessionKey, sessionTarget, sessionFile: "",
-        force: true, compactionTarget: "budget", tokenBudget: 8000, runtimeSettings,
-      });
-      expect(result.compacted).toBe(false);
-      expect(complete).not.toHaveBeenCalled();
-      expect(await store.getMessages(conversation!.conversationId)).toEqual(before);
     });
 
   it("retains the initiating user when the configured fresh tail is disabled", async () => {
@@ -445,7 +381,7 @@ describe("authoritative forced overflow recovery", () => {
       readVisibleSessionTranscriptMessageEntries: read,
     });
     for (const entry of entries)
-      await engine.ingest({ sessionId, sessionKey, message: entry.message });
+      await seedStoredMessage(engine, { sessionId, sessionKey, message: entry.message });
     const result = await engine.compact({
       sessionId,
       sessionKey,
@@ -472,7 +408,7 @@ describe("authoritative forced overflow recovery", () => {
         } as AgentMessage,
       ];
       for (const message of messages)
-        await engine.ingest({ sessionId, sessionKey, message });
+        await seedStoredMessage(engine, { sessionId, sessionKey, message });
       const store = engine.getConversationStore();
       const summaries = engine.getSummaryStore();
       const conversation = await store.getConversationForSession({
@@ -644,7 +580,7 @@ describe("authoritative forced overflow recovery", () => {
     });
     if (kind === "stale raw suffix") {
       for (const entry of entries)
-        await engine.ingest({
+        await seedStoredMessage(engine, {
           sessionId,
           sessionKey,
           message: attachTranscriptEntryMeta(entry.message, {
@@ -653,14 +589,14 @@ describe("authoritative forced overflow recovery", () => {
             timestamp: null,
           }),
         });
-      await engine.ingest({
+      await seedStoredMessage(engine, {
         sessionId,
         sessionKey,
         message: { role: "assistant", content: "stale epoch suffix" },
       });
     }
     if (kind === "unrelated projection") {
-      await engine.ingest({
+      await seedStoredMessage(engine, {
         sessionId,
         sessionKey,
         message: attachTranscriptEntryMeta(
@@ -772,7 +708,7 @@ it.each([1, 2])(
       { role: "user", content: "Another historical question." },
       { role: "assistant", content: "Another historical answer." },
     ])
-      await engine.ingest({
+      await seedStoredMessage(engine, {
         sessionId,
         sessionKey,
         message: message as AgentMessage,
@@ -832,7 +768,7 @@ it.each([1, 2])(
       });
     }
     // Existing old prefix has no projection identity, so explicitly ingest the shared anchor.
-    await engine.ingest({
+    await seedStoredMessage(engine, {
       sessionId,
       sessionKey,
       message: attachTranscriptEntryMeta(entries[0]!.message, {

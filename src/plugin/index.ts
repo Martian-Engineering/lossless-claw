@@ -34,7 +34,11 @@ import type {
   RuntimeLlmCompleteFn,
   RuntimeLlmModelOverride,
   RuntimeCompactionDelegateFn,
+  SessionTranscriptRawDeltaParams,
+  SessionTranscriptRawDeltaResult,
   SessionTranscriptReadTarget,
+  SessionTranscriptVisibleMessageDeltaParams,
+  SessionTranscriptVisibleMessageDeltaResult,
   VisibleSessionTranscriptMessageEntry,
 } from "../types.js";
 import { listConfiguredAgentIds, normalizeAgentId } from "./openclaw-agent-ids.js";
@@ -119,19 +123,25 @@ type MemorySupplementModule = {
   buildMemorySystemPromptAddition?: unknown;
 };
 
-type ReadVisibleSessionTranscriptMessageEntries = (
-  target: SessionTranscriptReadTarget,
-) => Promise<VisibleSessionTranscriptMessageEntry[]>;
-
-type SessionTranscriptRuntimeModule = {
-  readVisibleSessionTranscriptMessageEntries?: unknown;
+type SessionTranscriptRuntimeFunctions = {
+  readVisibleSessionTranscriptMessageEntries: (
+    target: SessionTranscriptReadTarget,
+  ) => Promise<VisibleSessionTranscriptMessageEntry[]>;
+  readSessionTranscriptVisibleMessageDelta: (
+    params: SessionTranscriptVisibleMessageDeltaParams,
+  ) => Promise<SessionTranscriptVisibleMessageDeltaResult>;
+  readSessionTranscriptRawDelta: (
+    params: SessionTranscriptRawDeltaParams,
+  ) => Promise<SessionTranscriptRawDeltaResult>;
 };
+
+type SessionTranscriptRuntimeFunctionName = keyof SessionTranscriptRuntimeFunctions;
 
 let buildMemorySystemPromptAdditionPromise:
   | Promise<BuildMemorySystemPromptAddition>
   | undefined;
-let readVisibleSessionTranscriptMessageEntriesPromise:
-  | Promise<ReadVisibleSessionTranscriptMessageEntries>
+let sessionTranscriptRuntimeModulePromise:
+  | Promise<Partial<Record<SessionTranscriptRuntimeFunctionName, unknown>>>
   | undefined;
 
 /** Return the OpenClaw helper that renders active memory supplements for context engines. */
@@ -159,21 +169,18 @@ async function loadBuildMemorySystemPromptAdditionModule(): Promise<BuildMemoryS
   );
 }
 
-/** Return OpenClaw's branch-safe visible transcript projection helper. */
-async function loadReadVisibleSessionTranscriptMessageEntries(): Promise<ReadVisibleSessionTranscriptMessageEntries> {
-  readVisibleSessionTranscriptMessageEntriesPromise ??=
-    loadReadVisibleSessionTranscriptMessageEntriesModule();
-  return readVisibleSessionTranscriptMessageEntriesPromise;
-}
-
-/** Import the transcript projection helper from the supported OpenClaw SDK surface. */
-async function loadReadVisibleSessionTranscriptMessageEntriesModule(): Promise<ReadVisibleSessionTranscriptMessageEntries> {
-  const mod = (await import("openclaw/plugin-sdk/session-transcript-runtime")) as SessionTranscriptRuntimeModule;
-  if (typeof mod.readVisibleSessionTranscriptMessageEntries === "function") {
-    return mod.readVisibleSessionTranscriptMessageEntries as ReadVisibleSessionTranscriptMessageEntries;
+/** Return one transcript reader from OpenClaw's session-transcript runtime SDK surface. */
+async function loadSessionTranscriptRuntimeFunction<Name extends SessionTranscriptRuntimeFunctionName>(
+  name: Name,
+): Promise<SessionTranscriptRuntimeFunctions[Name]> {
+  sessionTranscriptRuntimeModulePromise ??= import("openclaw/plugin-sdk/session-transcript-runtime");
+  const mod = await sessionTranscriptRuntimeModulePromise;
+  const candidate = mod[name];
+  if (typeof candidate === "function") {
+    return candidate as SessionTranscriptRuntimeFunctions[Name];
   }
   throw new Error(
-    `[lcm] OpenClaw readVisibleSessionTranscriptMessageEntries is unavailable; install OpenClaw >=${MIN_CONTEXT_ENGINE_OPENCLAW_VERSION}.`,
+    `[lcm] OpenClaw ${name} is unavailable; install OpenClaw >=${MIN_CONTEXT_ENGINE_OPENCLAW_VERSION}.`,
   );
 }
 
@@ -1393,7 +1400,8 @@ function createLcmDependencies(
           ...requestMetadata,
         };
       } catch (err) {
-        log.error(`[lcm] runtime.llm.complete error: ${describeLogError(err)}`);
+        // Host lifecycle rejections are classified, not logged: the summarizer
+        // caller reports them once with the retained-work context.
         if (
           describeLogError(err) === "Async work scope is closed" ||
           describeLogError(err) === "Plugin inventory has retired; begin a new plugin operation."
@@ -1404,6 +1412,7 @@ function createLcmDependencies(
             ...requestMetadata,
           };
         }
+        log.error(`[lcm] runtime.llm.complete error: ${describeLogError(err)}`);
         if (runtimeModelOverride && isRuntimeLlmModelPolicyDenial(err)) {
           return {
             content: [],
@@ -1495,9 +1504,20 @@ function createLcmDependencies(
     resolveAgentDir: () => api.resolvePath("."),
 
     readVisibleSessionTranscriptMessageEntries: async (target) => {
-      const readVisibleSessionTranscriptMessageEntries =
-        await loadReadVisibleSessionTranscriptMessageEntries();
-      return readVisibleSessionTranscriptMessageEntries(target);
+      const read = await loadSessionTranscriptRuntimeFunction(
+        "readVisibleSessionTranscriptMessageEntries",
+      );
+      return read(target);
+    },
+    readSessionTranscriptVisibleMessageDelta: async (params) => {
+      const read = await loadSessionTranscriptRuntimeFunction(
+        "readSessionTranscriptVisibleMessageDelta",
+      );
+      return read(params);
+    },
+    readSessionTranscriptRawDelta: async (params) => {
+      const read = await loadSessionTranscriptRuntimeFunction("readSessionTranscriptRawDelta");
+      return read(params);
     },
     agentLaneSubagent: "subagent",
     log,

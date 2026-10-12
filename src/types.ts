@@ -136,7 +136,63 @@ export type VisibleSessionTranscriptMessageEntry = {
   role: AgentMessage["role"];
   createdAt?: string;
   idempotencyKey?: string;
+  /** Host-declared predecessor id when a rewrite re-issued this entry; may be absent. */
+  supersedesEntryId?: string;
 };
+
+/** Page bounds and opaque continuation cursor for one visible-delta read. */
+export type SessionTranscriptVisibleMessageDeltaParams = SessionTranscriptReadTarget & {
+  cursor?: string;
+  maxBytes?: number;
+  maxMessages?: number;
+};
+
+/** Generation-aware outcome of one OpenClaw visible-message delta read. */
+export type SessionTranscriptVisibleMessageDeltaResult =
+  | {
+      kind: "page";
+      cursor: string;
+      entries: VisibleSessionTranscriptMessageEntry[];
+      hasMore: boolean;
+      requiredBytes?: number;
+      serializedBytes: number;
+    }
+  | {
+      kind: "reset";
+      cursor: string;
+      reason:
+        | "anchor_missing"
+        | "anchor_moved"
+        | "generation_mismatch"
+        | "invalid_cursor"
+        | "scope_mismatch";
+    }
+  | { kind: "unavailable"; reason: "projection_rebuilding" }
+  | { kind: "missing" };
+
+/** Page bounds and opaque continuation cursor for one raw-delta read. */
+export type SessionTranscriptRawDeltaParams = SessionTranscriptReadTarget & {
+  cursor?: string;
+  maxBytes?: number;
+  maxEvents?: number;
+};
+
+/** Generation-aware outcome of one OpenClaw raw transcript delta read. */
+export type SessionTranscriptRawDeltaResult =
+  | {
+      kind: "page";
+      cursor: string;
+      events: Array<{ event: unknown; seq: number }>;
+      hasMore: boolean;
+      requiredBytes?: number;
+      serializedBytes: number;
+    }
+  | {
+      kind: "reset";
+      cursor: string;
+      reason: "generation_mismatch" | "invalid_cursor" | "scope_mismatch";
+    }
+  | { kind: "missing" };
 
 /**
  * Dependencies injected into the LCM engine at registration time.
@@ -191,6 +247,16 @@ export interface LcmDependencies {
   readVisibleSessionTranscriptMessageEntries?: (
     target: SessionTranscriptReadTarget,
   ) => Promise<VisibleSessionTranscriptMessageEntry[]>;
+
+  /** Read one bounded page of OpenClaw's visible-message delta after an opaque cursor. */
+  readSessionTranscriptVisibleMessageDelta?: (
+    params: SessionTranscriptVisibleMessageDeltaParams,
+  ) => Promise<SessionTranscriptVisibleMessageDeltaResult>;
+
+  /** Read one bounded page of OpenClaw's raw transcript events after an opaque cursor. */
+  readSessionTranscriptRawDelta?: (
+    params: SessionTranscriptRawDeltaParams,
+  ) => Promise<SessionTranscriptRawDeltaResult>;
 
   /** Agent lane constant for subagents */
   agentLaneSubagent: string;

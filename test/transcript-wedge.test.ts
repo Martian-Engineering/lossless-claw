@@ -18,7 +18,7 @@ import { closeLcmConnection, createLcmDatabaseConnection } from "../src/db/conne
 import { LcmContextEngine } from "../src/engine.js";
 import type { AgentMessage } from "../src/openclaw-bridge.js";
 import type { LcmDependencies } from "../src/types.js";
-import { createTestConfig as createSharedTestConfig, createTestDeps as createSharedTestDeps } from "./helpers.js";
+import { createTestConfig as createSharedTestConfig, createTestDeps as createSharedTestDeps, TestLcmContextEngine } from "./helpers.js";
 
 const tempDirs: string[] = [];
 const engines: LcmContextEngine[] = [];
@@ -77,7 +77,7 @@ function createEngine(configOverrides?: Partial<LcmConfig>): { engine: LcmContex
     error: vi.fn<(msg: string) => void>(),
     debug: vi.fn<(msg: string) => void>(),
   };
-  const engine = new LcmContextEngine(createTestDeps(config, log), db);
+  const engine = new TestLcmContextEngine(createTestDeps(config, log), db);
   engines.push(engine);
   return { engine, log };
 }

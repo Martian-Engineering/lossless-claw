@@ -8,6 +8,11 @@ import {
   type TimeFilter,
 } from "./args.js";
 import { CliError, type PaginationMetadata } from "./output.js";
+import {
+  TranscriptGapStore,
+  type TranscriptGapRecord,
+  type TranscriptGapTotals,
+} from "../store/transcript-gap-store.js";
 
 const LIST_PREVIEW_SOURCE_CHARACTERS = 1024;
 
@@ -40,6 +45,8 @@ export type GlobalStatus = {
   };
   context: { items: number; tokens: number };
   maintenance: { pending: number; running: number; failed: number };
+  /** Runs of transcript entries LCM never stored and will not import automatically. */
+  transcriptGaps: TranscriptGapTotals;
 };
 
 export type ConversationIdentity = {
@@ -183,6 +190,7 @@ export type ConversationDiagnostics = {
   bootstrap: (Omit<BootstrapRow, "forkBounded"> & { forkBounded: boolean }) | null;
   focusBriefs: { count: number; activeBrief: ActiveFocusBriefRow | null };
   largeFiles: LargeFileStatsRow;
+  transcriptGaps: TranscriptGapRecord[];
 };
 
 // Map SQLite integer booleans to the stable JSON representation.
@@ -265,6 +273,7 @@ export function getGlobalStatus(db: DatabaseSync): GlobalStatus {
       running: row.maintenanceRunning,
       failed: row.maintenanceFailed,
     },
+    transcriptGaps: new TranscriptGapStore(db).totals(),
   };
 }
 
@@ -599,6 +608,7 @@ export function getConversationDiagnostics(
     bootstrap: getBootstrap(db, identity.conversationId),
     focusBriefs: getFocusBriefStats(db, identity.conversationId),
     largeFiles: getLargeFileStats(db, identity.conversationId),
+    transcriptGaps: new TranscriptGapStore(db).listForConversation(identity.conversationId),
   };
 }
 

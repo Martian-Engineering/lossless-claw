@@ -519,6 +519,74 @@ function ensureTranscriptAnchorTrustTables(db: DatabaseSync): void {
   `);
 }
 
+/**
+ * Per-conversation watermark into OpenClaw's visible transcript delta. The
+ * cursor is the host's opaque continuation token and is stored unchanged.
+ * `mode` distinguishes conversations that ingest only through the delta
+ * reader (`cursor_v1`) from legacy conversations that have no row yet.
+ */
+function ensureTranscriptCursorTable(db: DatabaseSync): void {
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS conversation_transcript_cursors (
+      conversation_id INTEGER PRIMARY KEY REFERENCES conversations(conversation_id) ON DELETE CASCADE,
+      mode TEXT NOT NULL CHECK (mode IN ('cursor_v1')),
+      cursor TEXT NOT NULL,
+      frontier_entry_id TEXT,
+      frontier_seq INTEGER,
+      origin TEXT NOT NULL,
+      created_at TEXT NOT NULL DEFAULT (datetime('now')),
+      updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+    );
+  `);
+}
+
+/**
+ * Replay keys observed on visible transcript user entries, keyed by entry id.
+ * `idempotency_key` is '' when the entry carried no key or was not visible
+ * when observed; `entry_signature` digests the entry's live-coverage
+ * signature. A missing row means the entry was never observed, so assembly
+ * reads the transcript once to fill it.
+ */
+function ensureTranscriptUserReplayKeyTable(db: DatabaseSync): void {
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS transcript_user_replay_keys (
+      conversation_id INTEGER NOT NULL REFERENCES conversations(conversation_id) ON DELETE CASCADE,
+      transcript_entry_id TEXT NOT NULL,
+      idempotency_key TEXT NOT NULL,
+      entry_signature TEXT NOT NULL,
+      updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+      PRIMARY KEY (conversation_id, transcript_entry_id)
+    );
+  `);
+}
+
+/**
+ * Durable markers for runs of visible transcript entries that LCM never
+ * stored and that cursor resync deliberately leaves unimported because they
+ * sit before the anchor. Each row names the run by its first/last entry id and
+ * visible seq, plus the stored rows on either side, so an operator-invoked
+ * backfill can find the position later. Markers are diagnostics only: they
+ * never change ingestion or assembly.
+ */
+function ensureTranscriptGapTable(db: DatabaseSync): void {
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS conversation_transcript_gaps (
+      gap_id INTEGER PRIMARY KEY,
+      conversation_id INTEGER NOT NULL REFERENCES conversations(conversation_id) ON DELETE CASCADE,
+      first_entry_id TEXT NOT NULL,
+      last_entry_id TEXT NOT NULL,
+      first_visible_seq INTEGER NOT NULL,
+      last_visible_seq INTEGER NOT NULL,
+      entry_count INTEGER NOT NULL,
+      prev_message_id INTEGER REFERENCES messages(message_id) ON DELETE SET NULL,
+      next_message_id INTEGER REFERENCES messages(message_id) ON DELETE SET NULL,
+      source TEXT NOT NULL,
+      detected_at TEXT NOT NULL DEFAULT (datetime('now')),
+      UNIQUE (conversation_id, first_entry_id, last_entry_id)
+    );
+  `);
+}
+
 function backfillMessageIdentityHashes(
   db: DatabaseSync,
   options?: { managesOwnTransaction?: boolean },
@@ -1607,6 +1675,11 @@ export function runLcmMigrations(
     runMigrationStep("ensureMessageStableEventKeyColumn", log, () =>
       ensureMessageStableEventKeyColumn(db),
     );
+    runMigrationStep("ensureTranscriptCursorTable", log, () => ensureTranscriptCursorTable(db));
+    runMigrationStep("ensureTranscriptUserReplayKeyTable", log, () =>
+      ensureTranscriptUserReplayKeyTable(db),
+    );
+    runMigrationStep("ensureTranscriptGapTable", log, () => ensureTranscriptGapTable(db));
     // Partial unique index: NULL stable event keys (legacy rows, messages
     // without a stable identity) are exempt, so this only enforces idempotency
     // for messages that carry a computed key.

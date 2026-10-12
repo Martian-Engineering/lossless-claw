@@ -419,6 +419,8 @@ describe("lcm plugin registration", () => {
     const logDir = mkdtempSync(join(tmpdir(), "lossless-claw-plugin-log-"));
     tempDirs.add(logDir);
     const logFile = join(logDir, "lcm.log");
+    // The vitest sandbox env redirects logs; this test exercises the plugin-config path.
+    vi.stubEnv("LCM_LOG_FILE", undefined);
 
     const { api, getFactory, debugLog, infoLog, sessionInfoLog } = buildApi(
       {
@@ -1133,6 +1135,8 @@ describe("lcm plugin registration", () => {
     const logDir = mkdtempSync(join(tmpdir(), "lossless-claw-plugin-log-"));
     tempDirs.add(logDir);
     const logFile = join(logDir, "lcm.log");
+    // The vitest sandbox env redirects logs; this test exercises the plugin-config path.
+    vi.stubEnv("LCM_LOG_FILE", undefined);
 
     const pluginConfig = {
       enabled: true,

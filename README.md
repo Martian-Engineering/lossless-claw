@@ -120,7 +120,7 @@ The command defaults to `${OPENCLAW_STATE_DIR:-~/.openclaw}` and `${OPENCLAW_STA
 - Node.js 22+
 - An LLM provider configured in OpenClaw (used for summarization)
 
-> **Compatibility:** `lossless-claw` requires OpenClaw `2026.9.2` or newer, the first stable release with native plugin session panels. The Context explorer requires **Settings → Labs → Custom plugin UI**. If you cannot upgrade, keep your earlier compatible Lossless release and use `lcm-tui` to inspect context. See [Context explorer](docs/context-explorer.md).
+> **Compatibility:** `lossless-claw` requires OpenClaw `2026.9.2` or newer, the first stable release with native plugin session panels. Transcript ingestion also relies on OpenClaw's visible-transcript delta reader and current-turn read fence, which every release from `2026.8.1` ships. The Context explorer requires **Settings → Labs → Custom plugin UI**. If you cannot upgrade, keep your earlier compatible Lossless release and use `lcm-tui` to inspect context. See [Context explorer](docs/context-explorer.md).
 
 On OpenClaw hosts that advertise the durable context-engine turn contract,
 LosslessClaw declares current-turn transcript fencing and commits each accepted

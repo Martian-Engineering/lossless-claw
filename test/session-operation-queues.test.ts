@@ -12,7 +12,7 @@ import type { LcmConfig } from "../src/db/config.js";
 import { closeLcmConnection, createLcmDatabaseConnection } from "../src/db/connection.js";
 import { LcmContextEngine } from "../src/engine.js";
 import type { LcmDependencies } from "../src/types.js";
-import { createTestConfig, createTestDeps as createSharedTestDeps } from "./helpers.js";
+import { createTestConfig, createTestDeps as createSharedTestDeps, TestLcmContextEngine } from "./helpers.js";
 
 type SessionQueueEntry = { promise: Promise<void>; refCount: number };
 type QueueTestEngine = {
@@ -38,7 +38,7 @@ function createQueueTestEngine(): QueueTestEngine {
   const config = createTestConfig(join(tempDir, "lcm.db"));
   const db = createLcmDatabaseConnection(config.databasePath);
   dbs.push(db);
-  return new LcmContextEngine(createTestDeps(config), db) as unknown as QueueTestEngine;
+  return new TestLcmContextEngine(createTestDeps(config), db) as unknown as QueueTestEngine;
 }
 
 afterEach(() => {

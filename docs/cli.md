@@ -54,7 +54,7 @@ All response metadata uses absolute paths.
 
 ## Status and conversations
 
-`lcm status` returns database size, conversation/message/summary counts, token totals, coverage timestamps, context totals, summary depth distribution, maintenance state, and the effective fresh-tail limits.
+`lcm status` returns database size, conversation/message/summary counts, token totals, coverage timestamps, context totals, summary depth distribution, maintenance state, transcript history-gap totals, and the effective fresh-tail limits.
 
 ```bash
 lcm status --pretty
@@ -75,7 +75,9 @@ lcm conversations show --conversation-id 42
 lcm conversations show --session-key 'agent:main:telegram:direct:1234'
 ```
 
-The detail response includes aggregate messages, summaries, active context, protected fresh tail, compaction telemetry, deferred maintenance, bootstrap frontier, focus briefs, and large-file storage.
+The detail response includes aggregate messages, summaries, active context, protected fresh tail, compaction telemetry, deferred maintenance, bootstrap frontier, focus briefs, large-file storage, and transcript history gaps.
+
+A transcript history gap (`transcriptGaps`) is a run of host transcript entries that Lossless Claw never stored, found when a conversation enters cursor mode or resyncs. Each gap lists its first and last entry ids, visible seq range, entry count, the stored messages on either side, the detecting `source`, and `detectedAt`. Gap entries sit before the conversation's anchor, so Lossless Claw never imports them automatically: appending them would put history out of order. The host transcript still holds them.
 
 ## Messages and fresh tail
 

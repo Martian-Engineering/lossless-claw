@@ -91,6 +91,8 @@ export type PendingCompactionCoordinatorResult =
       nodeId: string;
       failureSummary: string;
       authFailure?: boolean;
+      /** The host ended the runtime invocation; the node claim was released untouched. */
+      lifecycleInterrupted?: true;
     };
 
 type PublishFrontierSelection = {
@@ -232,6 +234,7 @@ export class PendingCompactionCoordinator {
         batchId: batch.batchId,
         nodeId: prepared.nodeId,
         failureSummary: prepared.failureSummary,
+        lifecycleInterrupted: true,
       };
     }
     if (prepared.status === "failed") {

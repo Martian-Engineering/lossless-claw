@@ -37,7 +37,7 @@ import { runLcmMigrations } from "../src/db/migration.js";
 import { LcmContextEngine } from "../src/engine.js";
 import { ConversationStore } from "../src/store/conversation-store.js";
 import type { CreateMessageInput, MessageRole } from "../src/store/conversation-store.js";
-import { createTestConfig, createTestDeps as createSharedTestDeps } from "./helpers.js";
+import { createTestConfig, createTestDeps as createSharedTestDeps, TestLcmContextEngine } from "./helpers.js";
 
 let __seqCounter = 0;
 function msg(
@@ -76,7 +76,7 @@ function createEngine(configOverrides?: Partial<LcmConfig>): LcmContextEngine {
   tempDirs.push(dir);
   const config = { ...createTestConfig(join(dir, "lcm.db")), ...configOverrides };
   const db = createLcmDatabaseConnection(config.databasePath);
-  return new LcmContextEngine(createTestDeps(config), db);
+  return new TestLcmContextEngine(createTestDeps(config), db);
 }
 
 async function ensureConversation(

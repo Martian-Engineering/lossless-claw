@@ -48,6 +48,11 @@ import {
   type ConversationCompactionMaintenanceRecord,
 } from "../store/compaction-maintenance-store.js";
 import { FocusBriefStore, hashFocusSourceContext } from "../store/focus-brief-store.js";
+import {
+  TranscriptGapStore,
+  type TranscriptGapRecord,
+  type TranscriptGapTotals,
+} from "../store/transcript-gap-store.js";
 
 const VISIBLE_COMMAND = "/lossless";
 const HIDDEN_ALIAS = "/lcm";
@@ -448,6 +453,61 @@ function buildVersionDoctorSection(scan: LcmVersionDoctorScan): string {
     );
   }
   return buildSection(scan.split ? "⚠️ Version split" : "🧩 Installed copies", lines);
+}
+
+const TRANSCRIPT_GAP_EXAMPLE_LIMIT = 5;
+
+/** One-line summary of database-wide transcript history-gap markers. */
+function formatTranscriptGapTotals(totals: TranscriptGapTotals): string {
+  return `${formatNumber(totals.gaps)} gap(s) in ${formatNumber(totals.conversations)} conversation(s) · ${formatNumber(totals.entries)} unstored entries · largest ${formatNumber(totals.largestGap)}`;
+}
+
+/** One-line summary of one conversation's transcript history-gap markers. */
+function formatConversationTranscriptGaps(gaps: readonly TranscriptGapRecord[]): string {
+  const entries = gaps.reduce((total, gap) => total + gap.entryCount, 0);
+  const largest = gaps.reduce((max, gap) => Math.max(max, gap.entryCount), 0);
+  return `${formatNumber(gaps.length)} gap(s) · ${formatNumber(entries)} unstored entries · largest ${formatNumber(largest)}`;
+}
+
+/**
+ * Doctor section for transcript history gaps: database totals plus the
+ * current conversation's largest runs. Null when no marker exists.
+ */
+function buildTranscriptGapSection(
+  totals: TranscriptGapTotals,
+  conversationGaps: readonly TranscriptGapRecord[] | null,
+): string | null {
+  if (totals.gaps === 0) {
+    return null;
+  }
+  const lines = [buildStatLine("all conversations", formatTranscriptGapTotals(totals))];
+  if (conversationGaps) {
+    lines.push(
+      buildStatLine(
+        "this conversation",
+        conversationGaps.length > 0 ? formatConversationTranscriptGaps(conversationGaps) : "none",
+      ),
+    );
+    // List the largest runs first so the worst holes are visible without paging.
+    const largest = [...conversationGaps]
+      .sort((left, right) => right.entryCount - left.entryCount)
+      .slice(0, TRANSCRIPT_GAP_EXAMPLE_LIMIT);
+    for (const gap of largest) {
+      lines.push(
+        `- visible seq ${formatNumber(gap.firstVisibleSeq)}–${formatNumber(gap.lastVisibleSeq)}: ${formatNumber(gap.entryCount)} entries (source ${gap.source}, detected ${gap.detectedAt})`,
+      );
+    }
+    if (conversationGaps.length > largest.length) {
+      lines.push(`- ... ${formatNumber(conversationGaps.length - largest.length)} more gap(s)`);
+    }
+  }
+  lines.push(
+    buildStatLine(
+      "impact",
+      "These transcript entries were never stored, so recall and summaries do not cover them. The host transcript still holds them; Lossless Claw never imports them automatically.",
+    ),
+  );
+  return buildSection("🕳️ Transcript history gaps", lines);
 }
 
 function getAnchorTrustAuditStats(db: DatabaseSync): AnchorTrustAuditStats {
@@ -1494,6 +1554,8 @@ async function buildStatusText(params: {
   const status = getLcmStatusStats(params.db);
   const doctor = getDoctorSummaryStats(params.db);
   const rolloverSplits = scanRolloverSplits(params.db);
+  const gapStore = new TranscriptGapStore(params.db);
+  const gapTotals = gapStore.totals();
   const enabled = resolvePluginEnabled(params.ctx.config);
   const selected = resolvePluginSelected(params.ctx.config);
   const slot = resolveContextEngineSlot(params.ctx.config);
@@ -1532,6 +1594,9 @@ async function buildStatusText(params: {
       ),
       buildStatLine("stored summary tokens", formatNumber(status.storedSummaryTokens)),
       buildStatLine("summarized source tokens", formatNumber(status.summarizedSourceTokens)),
+      ...(gapTotals.gaps > 0
+        ? [buildStatLine("transcript gaps", formatTranscriptGapTotals(gapTotals))]
+        : []),
     ]),
     "",
   );
@@ -1565,6 +1630,7 @@ async function buildStatusText(params: {
     });
     const formatMaintenanceTime = (value: Date | null): string =>
       value ? formatTimestamp(value, params.config.timezone) : "never";
+    const conversationGaps = gapStore.listForConversation(current.stats.conversationId);
     lines.push(
       buildSection("📍 Current conversation", [
         buildStatLine("conversation id", formatNumber(current.stats.conversationId)),
@@ -1593,6 +1659,9 @@ async function buildStatusText(params: {
             ? `${formatNumber(conversationDoctor.total)} issue(s) in this conversation`
             : "clean",
         ),
+        ...(conversationGaps.length > 0
+          ? [buildStatLine("transcript gaps", formatConversationTranscriptGaps(conversationGaps))]
+          : []),
       ]),
     );
     lines.push("", buildSection("🎯 Focus", focusLines));
@@ -1628,6 +1697,8 @@ async function buildDoctorText(params: {
     fallbackConfig: params.openClawConfig,
   });
   const current = await resolveCurrentConversation(params);
+  const gapStore = new TranscriptGapStore(params.db);
+  const gapTotals = gapStore.totals();
   const versionScan = params.activeSourcePath
     ? scanLcmVersionCopies({
         activeSourcePath: params.activeSourcePath,
@@ -1658,6 +1729,10 @@ async function buildDoctorText(params: {
       "",
       buildRolloverSplitScanSection(rolloverSplits),
     );
+    const gapSection = buildTranscriptGapSection(gapTotals, null);
+    if (gapSection) {
+      lines.push("", gapSection);
+    }
     return lines.join("\n");
   }
 
@@ -1695,6 +1770,13 @@ async function buildDoctorText(params: {
     "",
     buildRolloverSplitScanSection(rolloverSplits),
   );
+  const gapSection = buildTranscriptGapSection(
+    gapTotals,
+    gapStore.listForConversation(current.stats.conversationId),
+  );
+  if (gapSection) {
+    lines.push("", gapSection);
+  }
 
   if (stats.total > 0) {
     const summaryList = stats.candidates

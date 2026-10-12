@@ -171,48 +171,46 @@ describe("pruneHeartbeatOkTurns with keepPoll", () => {
 });
 
 describe("heartbeat preservation through afterTurn", () => {
-  for (const projected of [false, true]) {
-    it.each([false, true])(`honours pruneHeartbeatOk=%s with projected=${projected}`, async (pruneHeartbeatOk) => {
-      const sessionId = `heartbeat-after-turn-${projected}-${pruneHeartbeatOk}`;
-      const sessionKey = `agent:main:${sessionId}`;
-      const messages = heartbeatTurnMessages().map(({ role, content }) =>
-        makeMessage({ role: role as "user" | "assistant", content }),
-      );
-      // Keep a visible prefix so runtime-only and fully flushed turns both have coverage proof.
-      const prefix = makeMessage({ role: "user", content: "Earlier ordinary conversation" });
-      const visible = projected ? [prefix, ...messages] : [prefix];
-      const { engine } = createEngineWithDepsOverridesAndDb({
-        readVisibleSessionTranscriptMessageEntries: async () => visible.map((message, index) => ({
-          entryId: `heartbeat-${index}`,
-          parentId: index === 0 ? null : `heartbeat-${index - 1}`,
-          seq: index + 1,
-          role: message.role,
-          message,
-          createdAt: `2026-09-14T12:00:0${index}.000Z`,
-        })),
-      }, { preserveHeartbeatPoll: true, pruneHeartbeatOk });
-      await engine.afterTurn({
-        sessionId,
-        sessionKey,
-        sessionFile: "",
-        sessionTarget: { agentId: "main", sessionId, sessionKey, storePath: "/tmp/heartbeat-host.sqlite" },
-        messages,
-        prePromptMessageCount: 0,
-        isHeartbeat: true,
-        tokenBudget: 100_000,
-      });
-
-      const conversation = await engine.getConversationStore().getConversationBySessionId(sessionId);
-      const stored = await engine.getConversationStore().getMessages(conversation!.conversationId);
-      const expectedTurn = pruneHeartbeatOk
-        ? [messages[0]!.content]
-        : messages.map((message) => message.content);
-      const expected = [prefix.content, ...expectedTurn];
-      expect(stored.map((message) => message.content)).toEqual(expected);
-      const assembled = await engine.assemble({ sessionId, messages: [], tokenBudget: 10_000 });
-      expect(JSON.stringify(assembled.messages)).toContain(OPENCLAW_HEARTBEAT_POLL);
+  // afterTurn persists the heartbeat turn from the host transcript, never from the runtime array.
+  it.each([false, true])("honours pruneHeartbeatOk=%s for a transcript-backed turn", async (pruneHeartbeatOk) => {
+    const sessionId = `heartbeat-after-turn-${pruneHeartbeatOk}`;
+    const sessionKey = `agent:main:${sessionId}`;
+    const messages = heartbeatTurnMessages().map(({ role, content }) =>
+      makeMessage({ role: role as "user" | "assistant", content }),
+    );
+    const prefix = makeMessage({ role: "user", content: "Earlier ordinary conversation" });
+    const visible = [prefix, ...messages];
+    const { engine } = createEngineWithDepsOverridesAndDb({
+      readVisibleSessionTranscriptMessageEntries: async () => visible.map((message, index) => ({
+        entryId: `heartbeat-${index}`,
+        parentId: index === 0 ? null : `heartbeat-${index - 1}`,
+        seq: index + 1,
+        role: message.role,
+        message,
+        createdAt: `2026-09-14T12:00:0${index}.000Z`,
+      })),
+    }, { preserveHeartbeatPoll: true, pruneHeartbeatOk });
+    await engine.afterTurn({
+      sessionId,
+      sessionKey,
+      sessionFile: "",
+      sessionTarget: { agentId: "main", sessionId, sessionKey, storePath: "/tmp/heartbeat-host.sqlite" },
+      messages,
+      prePromptMessageCount: 0,
+      isHeartbeat: true,
+      tokenBudget: 100_000,
     });
-  }
+
+    const conversation = await engine.getConversationStore().getConversationBySessionId(sessionId);
+    const stored = await engine.getConversationStore().getMessages(conversation!.conversationId);
+    const expectedTurn = pruneHeartbeatOk
+      ? [messages[0]!.content]
+      : messages.map((message) => message.content);
+    const expected = [prefix.content, ...expectedTurn];
+    expect(stored.map((message) => message.content)).toEqual(expected);
+    const assembled = await engine.assemble({ sessionId, messages: [], tokenBudget: 10_000 });
+    expect(JSON.stringify(assembled.messages)).toContain(OPENCLAW_HEARTBEAT_POLL);
+  });
 });
 
 describe("heartbeat preservation through bootstrap", () => {

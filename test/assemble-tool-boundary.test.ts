@@ -1,5 +1,5 @@
 import { afterEach, expect, it } from "vitest";
-import { cleanupEngineTestState, createEngineWithDepsOverridesAndDb } from "./helpers.js";
+import { cleanupEngineTestState, createEngineWithDepsOverridesAndDb, seedStoredMessage } from "./helpers.js";
 import { buildDegradedLiveAssembleResult, buildForkBoundedLiveFallback, clampMessagesToSerializedBudget } from "../src/assemble-fallback.js";
 import { estimateSerializedMessagesTokens } from "../src/estimate-tokens.js";
 import type { AgentMessage } from "../src/openclaw-bridge.js";
@@ -25,7 +25,7 @@ it("omits an incomplete bootstrap tool turn from assembly without changing store
   const { engine } = createEngineWithDepsOverridesAndDb({
     readVisibleSessionTranscriptMessageEntries: async () => entries,
   }, { bootstrapMaxTokens: 500 });
-  await engine.ingest({ sessionId, sessionKey, message: { role: "user", content: "persisted sentinel" } });
+  await seedStoredMessage(engine, { sessionId, sessionKey, message: { role: "user", content: "persisted sentinel" } });
   const oldConversation = await engine.getConversationStore().getConversationForSession({ sessionId, sessionKey });
   await engine.handleBeforeReset({ sessionId, sessionKey, reason: "reset" });
   const bootstrap = await engine.bootstrap({ sessionId, sessionKey, runtimeContext: {
@@ -125,7 +125,7 @@ it("preserves the admitted tool turn when the host submits the next prompt separ
   const sessionId = "separate-prompt-tool-turn";
   const messages = history.slice(0, 3);
   for (const message of messages) {
-    await engine.ingest({ sessionId, message });
+    await seedStoredMessage(engine, { sessionId, message });
   }
   // The host adopts this prior history before appending the next user prompt.
   const result = await engine.assemble({
@@ -141,7 +141,7 @@ it("preserves a pending admitted call for prompt-separate host pairing repair", 
   const sessionId = "separate-prompt-pending-call";
   const messages = history.slice(0, 2);
   for (const message of messages) {
-    await engine.ingest({ sessionId, message });
+    await seedStoredMessage(engine, { sessionId, message });
   }
   const result = await engine.assemble({
     sessionId, messages, tokenBudget: 1, availableTools: new Set(["exec"]), prompt: "next question",

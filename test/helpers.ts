@@ -16,6 +16,8 @@ import { LcmContextEngine } from "../src/engine.js";
 import type { AgentMessage } from "../src/openclaw-bridge.js";
 import { resetDelegatedExpansionGrantsForTests } from "../src/expansion-auth.js";
 import type { LcmDependencies } from "../src/types.js";
+import { RuntimeEchoTranscripts } from "./runtime-echo-transcript.js";
+import type { FakeTranscriptHost } from "./transcript-delta-fake-host.js";
 
 export const tempDirs: string[] = [];
 
@@ -121,7 +123,119 @@ export function parseAgentSessionKey(sessionKey: string): { agentId: string; suf
   };
 }
 
+/**
+ * Mirror production wiring: when a test supplies the full visible-projection
+ * reader, also supply a visible-delta reader derived from it, so engine entry
+ * points take the same single-writer cursor path that the plugin wires.
+ */
+export function withProductionTranscriptRouting(deps: LcmDependencies): LcmDependencies {
+  const read = deps.readVisibleSessionTranscriptMessageEntries;
+  if (!read || "readSessionTranscriptVisibleMessageDelta" in deps) {
+    return deps;
+  }
+  return {
+    ...deps,
+    readSessionTranscriptVisibleMessageDelta: async (params) => {
+      const { cursor, maxBytes: _maxBytes, maxMessages, ...target } = params;
+      const entries = await read(target);
+      const initial = Buffer.from(JSON.stringify({ pos: -1, id: null })).toString("base64url");
+      const parsed = cursor
+        ? (JSON.parse(Buffer.from(cursor, "base64url").toString("utf8")) as { pos: number; id: string | null })
+        : { pos: -1, id: null };
+      if (parsed.id !== null) {
+        const position = entries.findIndex((entry) => entry.entryId === parsed.id);
+        if (position !== parsed.pos) {
+          return { kind: "reset", cursor: initial, reason: position < 0 ? "anchor_missing" : "anchor_moved" };
+        }
+      }
+      const page = entries.slice(parsed.pos + 1, parsed.pos + 1 + (maxMessages ?? 1000));
+      const last = page.at(-1);
+      const next = last ? { pos: parsed.pos + page.length, id: last.entryId } : parsed;
+      return {
+        kind: "page",
+        cursor: Buffer.from(JSON.stringify(next)).toString("base64url"),
+        entries: page,
+        hasMore: parsed.pos + 1 + page.length < entries.length,
+        serializedBytes: 0,
+      };
+    },
+  };
+}
+
+/**
+ * Persist one message through the engine's storage policy without the
+ * transcript-delta writer. Fixtures use it to seed rows (stamped when the
+ * message carries transcript meta) the way pre-cursor runtime ingest did.
+ */
+export async function seedStoredMessage(
+  engine: LcmContextEngine,
+  params: { sessionId: string; sessionKey?: string; message: AgentMessage; isHeartbeat?: boolean },
+): Promise<{ ingested: boolean }> {
+  const ingestSingle = Reflect.get(engine, "ingestSingle") as (
+    input: typeof params,
+  ) => Promise<{ ingested: boolean }>;
+  return ingestSingle.call(engine, params);
+}
+
+/** Session identity a host would key the transcript write for these engine params. */
+function transcriptSession(params: {
+  sessionId: string;
+  sessionKey?: string;
+  sessionTarget?: { sessionId?: string; sessionKey?: string };
+  runtimeContext?: { sessionTarget?: { sessionId?: string; sessionKey?: string } };
+}): { sessionId: string; sessionKey?: string } {
+  const target = params.sessionTarget ?? params.runtimeContext?.sessionTarget;
+  return {
+    sessionId: target?.sessionId ?? params.sessionId,
+    sessionKey: target?.sessionKey ?? params.sessionKey,
+  };
+}
+
+/**
+ * Test engine wired like production. Without an injected transcript reader it
+ * records runtime turn payloads on per-session fake transcripts first, exactly
+ * as OpenClaw persists a turn before notifying the engine.
+ */
 export class TestLcmContextEngine extends LcmContextEngine {
+  private readonly echo: RuntimeEchoTranscripts | null;
+
+  constructor(deps: LcmDependencies, database: ConstructorParameters<typeof LcmContextEngine>[1]) {
+    const echo =
+      !deps.readVisibleSessionTranscriptMessageEntries &&
+      !("readSessionTranscriptVisibleMessageDelta" in deps)
+        ? new RuntimeEchoTranscripts()
+        : null;
+    super(echo ? { ...deps, ...echo.deps() } : withProductionTranscriptRouting(deps), database);
+    this.echo = echo;
+  }
+
+  /** Fake transcript for one session id; only for engines without an injected reader. */
+  echoTranscript(sessionId: string, sessionKey?: string): FakeTranscriptHost | undefined {
+    return this.echo?.host(sessionId, sessionKey);
+  }
+
+  override async ingest(params: Parameters<LcmContextEngine["ingest"]>[0]) {
+    this.echo?.record(params, [params.message]);
+    return super.ingest(params);
+  }
+
+  override async ingestBatch(params: Parameters<LcmContextEngine["ingestBatch"]>[0]) {
+    this.echo?.record(params, params.messages);
+    return super.ingestBatch(params);
+  }
+
+  override async afterTurn(params: Parameters<LcmContextEngine["afterTurn"]>[0]) {
+    this.echo?.record(
+      transcriptSession(params as Parameters<typeof transcriptSession>[0]),
+      params.messages.slice(params.prePromptMessageCount),
+    );
+    return super.afterTurn(params);
+  }
+
+  override async commitTurn(params: Parameters<LcmContextEngine["commitTurn"]>[0]) {
+    this.echo?.recordTurn(params.admission, params.terminal, params.messages);
+    return super.commitTurn(params);
+  }
 }
 
 export function createTestDeps(

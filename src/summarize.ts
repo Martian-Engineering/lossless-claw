@@ -1716,7 +1716,11 @@ export async function createLcmSummarizeFromLegacyParams(params: {
           params.deps.log.error(err.message);
           throw err;
         }
-        if (err instanceof LcmRuntimeLlmUnavailableError || err instanceof LcmRuntimeLifecycleError) {
+        if (err instanceof LcmRuntimeLifecycleError) {
+          // Host retirement is not a summarizer fault; the caller reports it once.
+          throw err;
+        }
+        if (err instanceof LcmRuntimeLlmUnavailableError) {
           params.deps.log.error(err.message);
           throw err;
         }
@@ -1937,7 +1941,10 @@ export async function createLcmSummarizeFromLegacyParams(params: {
             params.deps.log.error(retryErr.message);
             throw retryErr;
           }
-          if (retryErr instanceof LcmRuntimeLlmUnavailableError || retryErr instanceof LcmRuntimeLifecycleError) {
+          if (retryErr instanceof LcmRuntimeLifecycleError) {
+            throw retryErr;
+          }
+          if (retryErr instanceof LcmRuntimeLlmUnavailableError) {
             params.deps.log.error(retryErr.message);
             throw retryErr;
           }

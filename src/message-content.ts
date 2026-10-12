@@ -872,7 +872,7 @@ export function isLikelyInjectedDeliveryMessage(message: AgentMessage): boolean 
   return stored.role === "system" && INJECTED_DELIVERY_TRANSCRIPT_PATTERN.test(stored.content);
 }
 
-export function isOpenClawRuntimeContextLeak(stored: StoredMessage): boolean {
+export function isOpenClawRuntimeContextLeak(stored: Pick<StoredMessage, "role" | "content">): boolean {
   return (
     stored.role === "assistant" &&
     stored.content.trimStart().startsWith(OPENCLAW_RUNTIME_CONTEXT_SENTINEL)

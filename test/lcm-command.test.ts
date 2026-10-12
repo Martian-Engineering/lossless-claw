@@ -12,6 +12,7 @@ import { ConversationStore } from "../src/store/conversation-store.js";
 import { FocusBriefStore } from "../src/store/focus-brief-store.js";
 import { SummaryStore } from "../src/store/summary-store.js";
 import { CompactionMaintenanceStore } from "../src/store/compaction-maintenance-store.js";
+import { TranscriptGapStore } from "../src/store/transcript-gap-store.js";
 import { createLcmCommand, __testing } from "../src/plugin/lcm-command.js";
 import { FALLBACK_DIRECTIVE_SUMMARY_MARKER } from "../src/summary-fallback.js";
 import type { LcmSummarizeFn } from "../src/summarize.js";
@@ -192,6 +193,40 @@ function setConversationTimes(
        WHERE conversation_id = ?`,
     )
     .run(createdAt, archivedAt ?? null, archivedAt ?? createdAt, conversationId);
+}
+
+/** Seed a legacy-prefix transcript epoch row as older releases wrote it. */
+function insertLegacyPrefixEpoch(
+  fixture: CommandFixture,
+  conversation: { conversationId: number; sessionId: string; sessionKey: string | null },
+  metadata: Record<string, unknown>,
+): void {
+  fixture.db
+    .prepare(
+      `INSERT INTO conversation_transcript_epochs (
+         conversation_id, session_id, session_key, migration_mode, metadata_json
+       ) VALUES (?, ?, ?, 'legacy_prefix', ?)`,
+    )
+    .run(
+      conversation.conversationId,
+      conversation.sessionId,
+      conversation.sessionKey,
+      JSON.stringify(metadata),
+    );
+}
+
+/** Read one conversation's transcript epoch row, if any. */
+function readTranscriptEpoch(
+  fixture: CommandFixture,
+  conversationId: number,
+): { migration_mode: string; metadata_json: string | null } | undefined {
+  return fixture.db
+    .prepare(
+      `SELECT migration_mode, metadata_json
+       FROM conversation_transcript_epochs
+       WHERE conversation_id = ?`,
+    )
+    .get(conversationId) as { migration_mode: string; metadata_json: string | null } | undefined;
 }
 
 function insertRolloverStateRows(fixture: CommandFixture, sourceId: number, targetId: number): void {
@@ -1815,6 +1850,61 @@ describe("lcm command", () => {
     expect(result.text).not.toContain("sum_unknown_clean");
   });
 
+  it("reports transcript history gaps in status and doctor", async () => {
+    const fixture = createCommandFixture();
+    tempDirs.add(fixture.tempDir);
+    dbPaths.add(fixture.dbPath);
+
+    const sessionKey = "agent:main:telegram:direct:gapped";
+    const conversation = await fixture.conversationStore.createConversation({
+      sessionId: "gapped",
+      sessionKey,
+    });
+    const [before, after] = await fixture.conversationStore.createMessagesBulk([
+      { conversationId: conversation.conversationId, seq: 0, role: "user", content: "before", tokenCount: 1 },
+      { conversationId: conversation.conversationId, seq: 1, role: "user", content: "after", tokenCount: 1 },
+    ]);
+    const gap = (first: number, count: number) => ({
+      firstEntryId: `e-${first}`,
+      lastEntryId: `e-${first + count - 1}`,
+      firstVisibleSeq: first,
+      lastVisibleSeq: first + count - 1,
+      entryCount: count,
+      prevMessageId: before!.messageId,
+      nextMessageId: after!.messageId,
+    });
+    new TranscriptGapStore(fixture.db).record(
+      conversation.conversationId,
+      [gap(10, 280), gap(400, 7)],
+      "legacy-migration",
+    );
+
+    const status = await fixture.command.handler(createCommandContext("status", { sessionKey }));
+    expect(status.text).toContain("transcript gaps: 2 gap(s) in 1 conversation(s) · 287 unstored entries · largest 280");
+    expect(status.text).toContain("transcript gaps: 2 gap(s) · 287 unstored entries · largest 280");
+
+    const doctor = await fixture.command.handler(createCommandContext("doctor", { sessionKey }));
+    expect(doctor.text).toContain("**🕳️ Transcript history gaps**");
+    expect(doctor.text).toContain("this conversation: 2 gap(s) · 287 unstored entries · largest 280");
+    expect(doctor.text).toMatch(/- visible seq 10–289: 280 entries \(source legacy-migration, detected [^)]+\)\n\s+- visible seq 400–406: 7 entries/);
+
+    const unresolved = await fixture.command.handler(createCommandContext("doctor"));
+    expect(unresolved.text).toContain("all conversations: 2 gap(s) in 1 conversation(s)");
+    expect(unresolved.text).not.toContain("this conversation:");
+  });
+
+  it("omits transcript history gaps from status and doctor when none are recorded", async () => {
+    const fixture = createCommandFixture();
+    tempDirs.add(fixture.tempDir);
+    dbPaths.add(fixture.dbPath);
+    const sessionKey = "agent:main:telegram:direct:no-gaps";
+    await fixture.conversationStore.createConversation({ sessionId: "no-gaps", sessionKey });
+    const status = await fixture.command.handler(createCommandContext("status", { sessionKey }));
+    const doctor = await fixture.command.handler(createCommandContext("doctor", { sessionKey }));
+    expect(status.text).not.toContain("transcript gaps");
+    expect(doctor.text).not.toContain("Transcript history gaps");
+  });
+
   it("reports whole-DB rollover split memory even when no current conversation is resolved", async () => {
     const fixture = createCommandFixture();
     tempDirs.add(fixture.tempDir);
@@ -1920,13 +2010,7 @@ describe("lcm command", () => {
       source: "test",
       reason: "source rollover anchor",
     });
-    await fixture.conversationStore.upsertConversationTranscriptEpoch({
-      conversationId: firstArchived.conversationId,
-      sessionId: firstArchived.sessionId,
-      sessionKey: firstArchived.sessionKey,
-      migrationMode: "legacy_prefix",
-      metadata: { reason: "source rollover epoch" },
-    });
+    insertLegacyPrefixEpoch(fixture, firstArchived, { reason: "source rollover epoch" });
     for (const [batchId, conversationId] of [
       ["pcb_rollover_source", firstArchived.conversationId],
       ["pcb_rollover_target", active.conversationId],
@@ -1986,26 +2070,26 @@ describe("lcm command", () => {
       { seq: 2, content: "oldtwo message" },
       { seq: 3, content: "active message" },
     ]);
-    await expect(
-      fixture.conversationStore.getMessageTranscriptAnchorTrust(sourceMessage.message_id),
-    ).resolves.toMatchObject({
-      conversationId: active.conversationId,
-      transcriptEntryId: "entry_oldone",
-      trustState: "verified",
+    expect(
+      fixture.db
+        .prepare(
+          `SELECT conversation_id, transcript_entry_id, trust_state
+           FROM message_transcript_anchor_trust
+           WHERE message_id = ?`,
+        )
+        .get(sourceMessage.message_id),
+    ).toEqual({
+      conversation_id: active.conversationId,
+      transcript_entry_id: "entry_oldone",
+      trust_state: "verified",
     });
-    await expect(
-      fixture.conversationStore.getConversationTranscriptEpoch(active.conversationId),
-    ).resolves.toMatchObject({
-      conversationId: active.conversationId,
-      migrationMode: "legacy_prefix",
-      metadata: {
-        reason: "rollover split repair merged transcript epoch state",
-        sourceConversationIds: [firstArchived.conversationId, secondArchived.conversationId],
-      },
+    const targetEpoch = readTranscriptEpoch(fixture, active.conversationId);
+    expect(targetEpoch?.migration_mode).toBe("legacy_prefix");
+    expect(JSON.parse(targetEpoch?.metadata_json ?? "null")).toMatchObject({
+      reason: "rollover split repair merged transcript epoch state",
+      sourceConversationIds: [firstArchived.conversationId, secondArchived.conversationId],
     });
-    await expect(
-      fixture.conversationStore.getConversationTranscriptEpoch(firstArchived.conversationId),
-    ).resolves.toBeNull();
+    expect(readTranscriptEpoch(fixture, firstArchived.conversationId)).toBeUndefined();
 
     const targetContext = fixture.db
       .prepare(
@@ -2153,6 +2237,15 @@ describe("lcm command", () => {
       .run();
     fixture.db.exec(`PRAGMA foreign_keys = ON`);
 
+    fixture.db
+      .prepare(
+        `INSERT INTO conversation_transcript_gaps (
+           conversation_id, first_entry_id, last_entry_id, first_visible_seq,
+           last_visible_seq, entry_count, source
+         ) VALUES (?, 'gap-first', 'gap-last', 3, 9, 7, 'legacy-migration')`,
+      )
+      .run(archived.conversationId);
+
     const beforeIssues = fixture.db.prepare(`PRAGMA foreign_key_check`).all();
     expect(beforeIssues).toHaveLength(1);
 
@@ -2174,6 +2267,10 @@ describe("lcm command", () => {
       .all(active.conversationId) as Array<{ content: string }>;
     expect(targetMessages.map((row) => row.content)).toEqual(["oldfk message", "activefk message"]);
     expect(fixture.db.prepare(`PRAGMA foreign_key_check`).all()).toEqual(beforeIssues);
+    // Gap markers follow their lane into the merged conversation.
+    expect(
+      fixture.db.prepare(`SELECT conversation_id AS conversationId, entry_count AS entryCount FROM conversation_transcript_gaps`).all(),
+    ).toEqual([{ conversationId: active.conversationId, entryCount: 7 }]);
   });
 
   it("skips rollover split repair when transcript entry ids collide", async () => {
@@ -3751,13 +3848,7 @@ describe("lcm command", () => {
       source: "test",
       reason: "suspect test anchor",
     });
-    await fixture.conversationStore.upsertConversationTranscriptEpoch({
-      conversationId: conversation.conversationId,
-      sessionId: conversation.sessionId,
-      sessionKey: conversation.sessionKey,
-      migrationMode: "legacy_prefix",
-      metadata: { reason: "test legacy prefix" },
-    });
+    insertLegacyPrefixEpoch(fixture, conversation, { reason: "test legacy prefix" });
 
     const result = await fixture.command.handler(createCommandContext("doctor anchors"));
 

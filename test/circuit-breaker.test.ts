@@ -17,6 +17,7 @@ function makeAuthError(): LcmProviderAuthError {
 import type { LcmConfig } from "../src/db/config.js";
 import type { AgentMessage } from "../src/openclaw-bridge.js";
 import type { LcmDependencies } from "../src/types.js";
+import { TestLcmContextEngine } from "./helpers.js";
 
 function createTestConfig(overrides: Partial<LcmConfig> = {}): LcmConfig {
   return {
@@ -168,7 +169,7 @@ describe("Circuit Breaker", () => {
     const config = createTestConfig();
     const deps = createTestDeps(config);
     db = new DatabaseSync(":memory:");
-    engine = new LcmContextEngine(deps, db);
+    engine = new TestLcmContextEngine(deps, db);
     await engine.ingestBatch({ sessionId, sessionKey, messages: sessionMessages });
   });
 
@@ -235,7 +236,7 @@ describe("Circuit Breaker", () => {
       summarySpendBackoffMs: 30 * 60 * 1000,
     });
     const authDb = new DatabaseSync(":memory:");
-    const authEngine = new LcmContextEngine(createTestDeps(authConfig), authDb);
+    const authEngine = new TestLcmContextEngine(createTestDeps(authConfig), authDb);
     const authSessionFile = join(tmpDir, `auth-spend-${randomUUID()}.jsonl`);
     await authEngine.ingestBatch({
       sessionId: "auth-spend-session",
@@ -407,7 +408,7 @@ describe("Circuit Breaker", () => {
     };
 
     const scopedDb = new DatabaseSync(":memory:");
-    const scopedEngine = new LcmContextEngine(providerDeps, scopedDb);
+    const scopedEngine = new TestLcmContextEngine(providerDeps, scopedDb);
     const brokenSession = seedSessionFile(tmpDir, "broken-provider");
     const healthySession = seedSessionFile(tmpDir, "healthy-provider");
 
@@ -439,7 +440,7 @@ describe("Circuit Breaker", () => {
     const config = createTestConfig({ circuitBreakerThreshold: 1 });
     const deps = createTestDeps(config);
     const sweepDb = new DatabaseSync(":memory:");
-    const sweepEngine = new LcmContextEngine(deps, sweepDb);
+    const sweepEngine = new TestLcmContextEngine(deps, sweepDb);
     const sweepSession = seedSessionFile(tmpDir, "full-sweep");
 
     try {

@@ -1,6 +1,6 @@
 # Transcript Reconciliation by Entry ID
 
-**Status:** In progress
+**Status:** Superseded. Transcript ingestion now drains OpenClaw's visible-message delta through a persisted per-conversation cursor (see "Ingestion" in [docs/architecture.md](../docs/architecture.md)). The full-projection reconcile, anchor audit, and runtime-batch dedup described here have been removed; this document is kept for history.
 **Date:** 2026-06-10
 **Scope:** `lossless-claw` plugin (no OpenClaw runtime changes required)
 **Priority:** High

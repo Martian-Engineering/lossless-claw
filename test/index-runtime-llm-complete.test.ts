@@ -477,6 +477,64 @@ describe("createLcmDependencies.complete runtime.llm bridge", () => {
     }
   });
 
+  it.each([
+    "Async work scope is closed",
+    "Plugin inventory has retired; begin a new plugin operation.",
+  ])("keeps pending work and logs one warning when background summarization hits: %s", async (message) => {
+    const retired = vi.fn().mockRejectedValue(new Error(message));
+    const { api, getFactory, dbPath } = buildApi({
+      runtimeLlmComplete: retired,
+      pluginConfig: {
+        freshTailCount: 1, leafChunkTokens: 120, maxSweepIterations: 8,
+        summaryProvider: "anthropic", summaryModel: "claude-opus-4-5",
+      },
+    });
+    const engine = getRegisteredEngine(api, getFactory) as unknown as Pick<
+      LcmContextEngine, "maintain" | "getConversationStore" | "getSummaryStore"
+    > & { inner: LcmContextEngine };
+    try {
+      const sessionId = "host-lifecycle-background";
+      await seedBacklogContext(engine.inner, sessionId, [120, 120, 120, 120]);
+      const conversation = await engine.getConversationStore().getConversationBySessionId(sessionId);
+      const conversationId = conversation!.conversationId;
+      const sources = await engine.getConversationStore().getMessages(conversationId);
+      const context = await engine.getSummaryStore().getContextItems(conversationId);
+      const maintenanceStore = engine.inner.getCompactionMaintenanceStore();
+      await maintenanceStore.requestProactiveCompactionDebt({
+        conversationId, reason: "threshold", tokenBudget: 300, currentTokenCount: 480,
+      });
+
+      // A background drain carries no call-bound llm, so it uses the plugin-wide runtime.
+      await engine.maintain({
+        sessionId,
+        sessionFile: "/tmp/host-lifecycle-unused.jsonl",
+        runtimeContext: { allowDeferredCompactionExecution: true, tokenBudget: 300 },
+      });
+
+      expect(retired).toHaveBeenCalled();
+      const warnings = vi.mocked(api.logger.warn).mock.calls.flat().map(String)
+        .filter((line: string) => line.includes(message));
+      expect(warnings).toHaveLength(1);
+      expect(warnings[0]).toContain("summarization interrupted by host runtime lifecycle");
+      expect(warnings[0]).toContain("pending summaries and compaction debt kept for the next drain");
+      expect(vi.mocked(api.logger.error).mock.calls.flat().join(" ")).not.toContain(message);
+
+      const debt = await maintenanceStore.getConversationCompactionMaintenance(conversationId);
+      expect(debt?.pending).toBe(true);
+      const batch = await engine.inner.getPendingSummaryStore().getActiveBatchForConversation(conversationId);
+      expect(batch).not.toBeNull();
+      const nodes = await engine.inner.getPendingSummaryStore().getNodesByBatch(batch!.batchId);
+      expect(nodes.length).toBeGreaterThan(0);
+      expect(nodes.every((node) => node.status === "planned")).toBe(true);
+      expect(nodes.every((node) => node.retryCount === 0 && node.leaseOwner === null)).toBe(true);
+      expect(await engine.getSummaryStore().getSummariesByConversation(conversationId)).toEqual([]);
+      expect(await engine.getSummaryStore().getContextItems(conversationId)).toEqual(context);
+      expect(await engine.getConversationStore().getMessages(conversationId)).toEqual(sources);
+    } finally {
+      closeLcmConnection(dbPath);
+    }
+  });
+
   it("fails clearly when runtime.llm is unavailable", async () => {
     const { api, getFactory, dbPath } = buildApi();
     const engine = getRegisteredEngine(api, getFactory);

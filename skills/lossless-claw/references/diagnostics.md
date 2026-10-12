@@ -138,6 +138,16 @@ Usually means one of:
 - the wrong DB path is configured
 - the plugin is enabled but not selected
 
+### Transcript history gaps
+
+`/lossless status` and `/lossless doctor` show a "transcript gaps" line or a "Transcript history gaps" section when Lossless Claw found host transcript entries it never stored. Older releases sometimes skipped a stretch of a long conversation and then stored later turns after it. When the conversation enters cursor mode or resyncs, Lossless Claw records each such run as a gap marker and logs one warning.
+
+What to tell the user:
+
+- The entries still exist in the host transcript; only Lossless Claw recall and summaries do not cover them.
+- Lossless Claw never imports gap entries automatically, because appending them would put history out of order.
+- The markers are read-only diagnostics. They do not change ingestion, assembly, or stored messages.
+
 ### Broken or truncated summaries detected
 
 Treat this as a signal to inspect summary health before trusting compacted context heavily.

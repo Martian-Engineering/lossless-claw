@@ -9,4 +9,11 @@ describe("vitest sandbox", () => {
     const config = resolveLcmConfig(process.env, {});
     expect(config.databasePath).toBe(join(process.env.HOME!, ".openclaw", "lcm.db"));
   });
+
+  it("keeps the independent plugin log out of the production /tmp/openclaw log", () => {
+    const config = resolveLcmConfig(process.env, {});
+    expect(config.independentLogFile.file).toBe(
+      join(process.env.HOME!, "logs", "lossless-claw-test.log"),
+    );
+  });
 });
