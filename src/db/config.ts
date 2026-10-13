@@ -1,7 +1,6 @@
 import { homedir } from "os";
 import { join } from "path";
 import { MIN_FALLBACK_MAX_TOKENS } from "../summary-fallback.js";
-import { DEFAULT_CONVERSATION_LANE_TOKEN_CAP } from "../lane-split.js";
 
 /**
  * Resolve the active OpenClaw state directory.
@@ -126,19 +125,18 @@ export type LcmConfig = {
   conversationFloorRatio?: number;
   /** Lane split — soft token cap for the longtext lane; null = no cap. */
   longTextLaneSoftCap?: number | null;
-  /** Lane split — minimum token size for a message to be treated as long-form. */
-  laneSplitTokenThreshold?: number;
-  /** Lane split — whether user messages may be split into intent/body segments. */
-  laneSplitUserMessage?: boolean;
   /** Lane split — extend the protected tail across the current task chain. */
   laneTaskChainProtection?: boolean;
   /** Lane split — token threshold above which a longtext segment is externalized. */
   laneExternalizeTokenThreshold?: number;
   /**
-   * Lane split (Step 2) — absolute token cap for the conversation lane. Only
-   * this cap (never a ratio) may trim the otherwise-protected conversation
-   * lane during lane-split assembly. Prevents a runaway conversation lane from
-   * monopolising the window. Default 65536 (half of a 128K context window).
+   * Lane split (Step 2) — token cap for the conversation lane. Only this cap
+   * may trim the otherwise-protected conversation lane during lane-split
+   * assembly; it is the only brake on the lane that carries human text. When
+   * unset, the assembler derives the cap from the assembly budget
+   * (`DEFAULT_CONVERSATION_LANE_BUDGET_RATIO` = 0.85 x budget), so the cap
+   * scales with the window instead of sitting at a fixed absolute value. An
+   * explicit value always wins.
    */
   conversationLaneTokenCap?: number;
   /**
@@ -773,13 +771,6 @@ export function resolveLcmConfigWithDiagnostics(
         parseFiniteInt(env.LCM_LONG_TEXT_LANE_SOFT_CAP)
           ?? toNumber(pc.longTextLaneSoftCap)
           ?? null,
-      laneSplitTokenThreshold:
-        parseFiniteInt(env.LCM_LANE_SPLIT_TOKEN_THRESHOLD)
-          ?? toNumber(pc.laneSplitTokenThreshold) ?? 2000,
-      laneSplitUserMessage:
-        env.LCM_LANE_SPLIT_USER_MESSAGE !== undefined
-          ? env.LCM_LANE_SPLIT_USER_MESSAGE === "true"
-          : toBool(pc.laneSplitUserMessage) ?? true,
       laneTaskChainProtection:
         env.LCM_LANE_TASK_CHAIN_PROTECTION !== undefined
           ? env.LCM_LANE_TASK_CHAIN_PROTECTION === "true"
@@ -789,8 +780,7 @@ export function resolveLcmConfigWithDiagnostics(
           ?? toNumber(pc.laneExternalizeTokenThreshold) ?? 2000,
       conversationLaneTokenCap:
         toPositiveInteger(parseFiniteInt(env.LCM_CONVERSATION_LANE_TOKEN_CAP))
-          ?? toPositiveInteger(toNumber(pc.conversationLaneTokenCap))
-          ?? DEFAULT_CONVERSATION_LANE_TOKEN_CAP,
+          ?? toPositiveInteger(toNumber(pc.conversationLaneTokenCap)),
       // Lane split (Step 3) — "inline" is the default and reproduces Step 2.
       // Only an explicit "lowest" (env or plugin config) opts in.
       laneReasoningMode:

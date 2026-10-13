@@ -7,7 +7,7 @@
 import { describe, expect, it } from "vitest";
 import { DatabaseSync } from "node:sqlite";
 import {
-  DEFAULT_CONVERSATION_LANE_TOKEN_CAP,
+  deriveConversationLaneTokenCap,
   selectLanesWithinBudget,
   selectLanesWithinBudgetWithReasoning,
 } from "../src/lane-split.js";
@@ -269,7 +269,7 @@ describe("lane-split step 3 behind the flag", () => {
     const omitted = await assembler.assemble({
       ...input,
       laneSplitEnabled: true,
-      laneConversationTokenCap: DEFAULT_CONVERSATION_LANE_TOKEN_CAP,
+      laneConversationTokenCap: deriveConversationLaneTokenCap(input.tokenBudget),
     });
     const explicitInline = await assembler.assemble({
       ...input,

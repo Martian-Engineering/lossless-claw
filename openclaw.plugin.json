@@ -88,8 +88,6 @@
         "laneSplitEnabled",
         "conversationFloorRatio",
         "longTextLaneSoftCap",
-        "laneSplitTokenThreshold",
-        "laneSplitUserMessage",
         "laneTaskChainProtection",
         "laneExternalizeTokenThreshold",
         "conversationLaneTokenCap"
@@ -505,14 +503,6 @@
       "label": "Longtext Lane Soft Cap",
       "help": "Optional soft token cap for the longtext lane; leave empty for no cap. Not yet consumed in this step."
     },
-    "laneSplitTokenThreshold": {
-      "label": "Lane Split Token Threshold",
-      "help": "Minimum token size for a message/segment to be treated as long-form (default 2000). Not yet consumed in this step."
-    },
-    "laneSplitUserMessage": {
-      "label": "Lane Split User Messages",
-      "help": "Whether user messages may be split into intent/body segments (default true). Not yet consumed in this step."
-    },
     "laneTaskChainProtection": {
       "label": "Lane Task Chain Protection",
       "help": "Extend the protected fresh tail across the current task chain (default true). Not yet consumed in this step."
@@ -523,7 +513,7 @@
     },
     "conversationLaneTokenCap": {
       "label": "Conversation Lane Token Cap",
-      "help": "Absolute token cap for the protected conversation lane during lane-split assembly (default 65536). Only this cap may trim the conversation lane; longtext (tool-result) items absorb all other eviction."
+      "help": "Token cap for the conversation lane during lane-split assembly. Leave empty to derive it from the assembly budget (85% of the budget), reserving the remaining 15% as a floor for tool output; set a value to override. Only this cap may trim the conversation lane; longtext (tool-result) items absorb all other eviction."
     }
   },
   "configSchema": {
@@ -643,15 +633,6 @@
         ],
         "default": null
       },
-      "laneSplitTokenThreshold": {
-        "type": "integer",
-        "minimum": 1,
-        "default": 2000
-      },
-      "laneSplitUserMessage": {
-        "type": "boolean",
-        "default": true
-      },
       "laneTaskChainProtection": {
         "type": "boolean",
         "default": true
@@ -663,8 +644,7 @@
       },
       "conversationLaneTokenCap": {
         "type": "integer",
-        "minimum": 1,
-        "default": 65536
+        "minimum": 1
       },
       "leafChunkTokens": {
         "type": "integer",

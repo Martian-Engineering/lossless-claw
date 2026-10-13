@@ -196,8 +196,9 @@ export function formatAssembledComposition(composition: AssembledComposition): s
 // Step 2 gives the two lanes independent budgets, but asymmetric policy:
 //
 //   conversation lane C — protected as a whole. It keeps everything, except
-//     when C alone exceeds an ABSOLUTE token cap (the backstop), in which case
-//     the OLDEST C items are dropped until it fits.
+//     when C alone exceeds its cap (the backstop; the default cap is derived
+//     from the assembly budget, see DEFAULT_CONVERSATION_LANE_BUDGET_RATIO), in
+//     which case the OLDEST C items are dropped until it fits.
 //   longtext lane L — absorbs all budget pressure. The NEWEST contiguous
 //     suffix of L that fits the remaining budget is kept; older L items are
 //     evicted first.
@@ -207,14 +208,54 @@ export function formatAssembledComposition(composition: AssembledComposition): s
 // is a pure function so the policy can be tested without a database.
 
 /**
- * Default absolute token cap for the conversation lane.
+ * Default share of the assembly budget the conversation lane may occupy when no
+ * explicit cap is configured (`conversationLaneTokenCap` unset).
  *
- * The conversation lane is otherwise retained as a whole, so this cap is the
- * only thing that may trim it — a backstop against one lane monopolising the
- * window. 65536 ≈ half of a 128K context window: ordinary sessions stay well
- * below it, while a runaway conversation lane can never exceed half the window.
+ * Why a ratio and not a fixed token count?
+ * The conversation lane is the only lane that carries human text, and this cap
+ * is the only lever that may trim it. A fixed absolute cap therefore does not
+ * scale with the window, and at large budgets it slips *below* the conversation
+ * pool and starts trimming human text — the exact harm the lane split exists to
+ * prevent. Measured 2026-10-13 on a real lcm.db copy (main session, budget
+ * 118k): lane split off kept 53.2% of the unbounded human text, while lane
+ * split on with the old fixed 65536 cap kept only 37.5% — worse than leaving
+ * the feature off. Raising the cap to 0.85 x budget restored 100% at
+ * 118k/150k, matched the fixed cap at 60k, and was never worse at 30k (where
+ * the cap is clamped to the remaining budget anyway). The 0.85 ratio leaves a
+ * 15% floor for the machine-load (longtext) lane, so the cap remains a real
+ * backstop: with no cap at all the conversation lane consumed 40–78% of the
+ * budget and starved longtext down to ~2.7k tokens.
  */
-export const DEFAULT_CONVERSATION_LANE_TOKEN_CAP = 65_536;
+export const DEFAULT_CONVERSATION_LANE_BUDGET_RATIO = 0.85;
+
+/**
+ * Share of the budget the default conversation-lane cap leaves to the
+ * machine-load (longtext) lane. Lower `DEFAULT_CONVERSATION_LANE_BUDGET_RATIO`
+ * to give the machine lane a thicker floor; raise it to favour conversation
+ * content. Kept as a named constant so the relationship stays explicit.
+ */
+export const DEFAULT_MACHINE_LANE_BUDGET_FLOOR_RATIO =
+  1 - DEFAULT_CONVERSATION_LANE_BUDGET_RATIO;
+
+/**
+ * Derive the default conversation-lane cap for an assembly budget:
+ * `floor(tokenBudget * DEFAULT_CONVERSATION_LANE_BUDGET_RATIO)`.
+ *
+ * Only used when no explicit cap is configured; an explicit
+ * `conversationLaneTokenCap` always wins. A degenerate (non-finite or
+ * non-positive) budget yields an effectively non-binding cap — the
+ * remaining-budget clamp inside `selectLanesWithinBudget` still keeps the
+ * assembled context within budget.
+ */
+export function deriveConversationLaneTokenCap(tokenBudget: number): number {
+  if (!Number.isFinite(tokenBudget) || tokenBudget <= 0) {
+    return Number.MAX_SAFE_INTEGER;
+  }
+  return Math.max(
+    1,
+    Math.floor(tokenBudget * DEFAULT_CONVERSATION_LANE_BUDGET_RATIO),
+  );
+}
 
 export type LaneSplitSelection = {
   /** Kept flags for the conversation lane, in input order (oldest → newest). */
@@ -274,12 +315,12 @@ export function selectLanesWithinBudget(
   conversationTokens: readonly number[],
   longtextTokens: readonly number[],
   remainingBudget: number,
-  conversationTokenCap: number = DEFAULT_CONVERSATION_LANE_TOKEN_CAP,
+  conversationTokenCap: number = deriveConversationLaneTokenCap(remainingBudget),
 ): LaneSplitSelection {
   const budget = laneTokens(remainingBudget);
   const requestedCap = Math.max(
     1,
-    laneTokens(conversationTokenCap) || DEFAULT_CONVERSATION_LANE_TOKEN_CAP,
+    laneTokens(conversationTokenCap) || deriveConversationLaneTokenCap(remainingBudget),
   );
   // The conversation cap must never exceed the remaining budget. Otherwise a
   // protected conversation lane bigger than the budget is emitted in full and
@@ -399,7 +440,7 @@ export function selectLanesWithinBudgetWithReasoning(
   conversationItems: readonly ConversationItemTokenSplit[],
   longtextTokens: readonly number[],
   remainingBudget: number,
-  conversationTokenCap: number = DEFAULT_CONVERSATION_LANE_TOKEN_CAP,
+  conversationTokenCap: number = deriveConversationLaneTokenCap(remainingBudget),
   reasoningMode: ReasoningTrimMode = "inline",
   reasoningShedPolicy: ReasoningShedPolicy = "purpose-bound",
 ): LaneSplitSelectionWithReasoning {

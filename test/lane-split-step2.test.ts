@@ -7,7 +7,7 @@
 import { describe, expect, it } from "vitest";
 import { DatabaseSync } from "node:sqlite";
 import {
-  DEFAULT_CONVERSATION_LANE_TOKEN_CAP,
+  deriveConversationLaneTokenCap,
   selectLanesWithinBudget,
 } from "../src/lane-split.js";
 import { ContextAssembler } from "../src/assembler.js";
@@ -65,13 +65,20 @@ describe("selectLanesWithinBudget", () => {
     expect(selection.longtextTrimmed).toBe(true);
   });
 
-  it("defaults the conversation cap and tolerates invalid inputs", () => {
-    // Non-binding budget, so the default cap stands unclamped.
-    const defaults = selectLanesWithinBudget([], [5], Number.MAX_SAFE_INTEGER);
-    expect(defaults.conversationTokenCap).toBe(DEFAULT_CONVERSATION_LANE_TOKEN_CAP);
+  it("derives the default conversation cap from the budget and tolerates invalid inputs", () => {
+    // No explicit cap: the default is 85% of the budget, not a fixed token count.
+    const budget = 118_000;
+    const derived = selectLanesWithinBudget([], [5], budget);
+    expect(derived.conversationTokenCap).toBe(deriveConversationLaneTokenCap(budget));
+    // It scales past the old fixed 65536, so a large budget no longer trims the
+    // conversation lane below its natural size.
+    expect(derived.conversationTokenCap).toBeGreaterThan(65_536);
+    // An explicit cap still wins over the derived default.
+    const explicit = selectLanesWithinBudget([], [5], budget, 5_000);
+    expect(explicit.conversationTokenCap).toBe(5_000);
+    // Negative / NaN token estimates are floored to 0, so zero-cost items stay;
+    // a NaN budget must not throw.
     const invalid = selectLanesWithinBudget([-5, Number.NaN], [1], Number.NaN, Number.NaN);
-    expect(invalid.conversationTokenCap).toBe(DEFAULT_CONVERSATION_LANE_TOKEN_CAP);
-    // Negative / NaN token estimates are floored to 0, so zero-cost items stay.
     expect(invalid.conversationKept).toEqual([true, true]);
   });
 });
@@ -214,7 +221,7 @@ describe("lane-split assembly behind the flag", () => {
     const on = await assembler.assemble({
       ...input,
       laneSplitEnabled: true,
-      laneConversationTokenCap: DEFAULT_CONVERSATION_LANE_TOKEN_CAP,
+      laneConversationTokenCap: deriveConversationLaneTokenCap(input.tokenBudget),
     });
 
     // Off (pre-Step-2) evicts chronologically and loses the oldest turns.

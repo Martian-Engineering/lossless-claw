@@ -11,7 +11,7 @@ import type { SummaryStore, ContextItemRecord, SummaryRecord } from "./store/sum
 import { estimateTokens } from "./estimate-tokens.js";
 import {
   classifyMessageLane,
-  DEFAULT_CONVERSATION_LANE_TOKEN_CAP,
+  deriveConversationLaneTokenCap,
   selectLanesWithinBudget,
   selectLanesWithinBudgetWithReasoning,
   type ConversationItemTokenSplit,
@@ -250,9 +250,10 @@ export interface AssembleContextInput {
    */
   laneSplitEnabled?: boolean;
   /**
-   * Lane split — absolute token cap for the conversation lane. Only this cap
-   * (never a ratio) may trim the otherwise-protected conversation lane.
-   * Defaults to DEFAULT_CONVERSATION_LANE_TOKEN_CAP when omitted.
+   * Lane split — token cap for the conversation lane. Only this cap may trim
+   * the otherwise-protected conversation lane. When omitted the cap is derived
+   * from `tokenBudget` via `deriveConversationLaneTokenCap` (0.85 x budget),
+   * so it scales with the window; an explicit value always wins.
    */
   laneConversationTokenCap?: number;
   /**
@@ -1781,8 +1782,13 @@ export class ContextAssembler {
       for (const item of evictable) {
         (resolvedItemLane(item) === "longtext" ? longtextItems : conversationItems).push(item);
       }
+      // Default to a budget-derived cap (0.85 x budget) so the cap scales with
+      // the window. A fixed absolute default would slip below the conversation
+      // pool at large budgets and trim the only lane that carries human text —
+      // the opposite of what the lane split is for. An explicit operator cap
+      // always wins.
       const conversationCap =
-        input.laneConversationTokenCap ?? DEFAULT_CONVERSATION_LANE_TOKEN_CAP;
+        input.laneConversationTokenCap ?? deriveConversationLaneTokenCap(tokenBudget);
       // Step 3 — "lowest" sheds reasoning inside the conversation lane before
       // any whole message. "inline" (the default) is the Step 2 path verbatim.
       const reasoningMode: ReasoningTrimMode =
