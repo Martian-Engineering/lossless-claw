@@ -86,10 +86,6 @@
       "order": 25,
       "properties": [
         "laneSplitEnabled",
-        "conversationFloorRatio",
-        "longTextLaneSoftCap",
-        "laneTaskChainProtection",
-        "laneExternalizeTokenThreshold",
         "conversationLaneTokenCap"
       ]
     },
@@ -495,22 +491,6 @@
       "label": "Lane Split",
       "help": "Master switch for lane-based assembly. Default off: lane tags are still recorded at ingest (observation only), but assembly is unchanged. Later steps split the conversation and longtext lanes' budgets behind this flag."
     },
-    "conversationFloorRatio": {
-      "label": "Conversation Floor Ratio",
-      "help": "Minimum share of the evictable budget reserved for the conversation lane (default 0.40). Not yet consumed in this step."
-    },
-    "longTextLaneSoftCap": {
-      "label": "Longtext Lane Soft Cap",
-      "help": "Optional soft token cap for the longtext lane; leave empty for no cap. Not yet consumed in this step."
-    },
-    "laneTaskChainProtection": {
-      "label": "Lane Task Chain Protection",
-      "help": "Extend the protected fresh tail across the current task chain (default true). Not yet consumed in this step."
-    },
-    "laneExternalizeTokenThreshold": {
-      "label": "Lane Externalize Token Threshold",
-      "help": "Token threshold above which a longtext segment is externalized to a stub (default 2000). Not yet consumed in this step."
-    },
     "conversationLaneTokenCap": {
       "label": "Conversation Lane Token Cap",
       "help": "Token cap for the conversation lane during lane-split assembly. Leave empty to derive it from the assembly budget (85% of the budget), reserving the remaining 15% as a floor for tool output; set a value to override. Only this cap may trim the conversation lane; longtext (tool-result) items absorb all other eviction."
@@ -619,28 +599,6 @@
       "laneSplitEnabled": {
         "type": "boolean",
         "default": false
-      },
-      "conversationFloorRatio": {
-        "type": "number",
-        "minimum": 0,
-        "maximum": 1,
-        "default": 0.4
-      },
-      "longTextLaneSoftCap": {
-        "type": [
-          "number",
-          "null"
-        ],
-        "default": null
-      },
-      "laneTaskChainProtection": {
-        "type": "boolean",
-        "default": true
-      },
-      "laneExternalizeTokenThreshold": {
-        "type": "integer",
-        "minimum": 1,
-        "default": 2000
       },
       "conversationLaneTokenCap": {
         "type": "integer",
