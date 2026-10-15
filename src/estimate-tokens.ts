@@ -182,9 +182,20 @@ function estimateBoundaryJsonTokens(value: unknown, charsPerToken: number): numb
     return 0;
   }
   try {
-    const serialized = JSON.stringify(value);
+    let opaqueParts = 0;
+    const serialized = JSON.stringify(value, (key, nestedValue) => {
+      if (typeof nestedValue === "string" && isLikelyOpaqueBinaryString(key, nestedValue)) {
+        opaqueParts += 1;
+        return "[opaque binary payload]";
+      }
+      return nestedValue;
+    });
+    // Match the full-message estimator's binary substitution. Otherwise this
+    // tool-result estimate wins Math.max() by counting image bytes as text.
+    // Apply the text ratio only to the serialized envelope, not the per-part cost.
     return typeof serialized === "string"
-      ? estimateBoundaryStringTokens(serialized, charsPerToken)
+      ? estimateBoundaryStringTokens(serialized, charsPerToken) +
+          opaqueParts * OPAQUE_BINARY_PART_TOKEN_ESTIMATE
       : 1;
   } catch {
     return 256;

@@ -152,6 +152,63 @@ describe("estimateSerializedMessageTokens", () => {
     expect(estimateSerializedMessageTokens(message)).toBeLessThan(2_500);
   });
 
+  it.each([{ role: "tool" }, { role: "toolResult" }, { type: "toolResult" }])(
+    "does not count native image bytes as tool-result text (%j)",
+    (envelope) => {
+      const estimateImage = (data: string) => estimateSerializedMessageTokens({
+        ...envelope,
+        content: [{ type: "image", mimeType: "image/png", data }],
+      });
+      const small = estimateImage("A1b2".repeat(2_048));
+      const large = estimateImage("A1b2".repeat(262_144));
+
+      expect(large).toBe(small);
+      expect(large).toBeGreaterThan(1_500);
+      expect(large).toBeLessThan(2_500);
+    },
+  );
+
+  it("substitutes opaque data in nested structured tool-result content", () => {
+    const estimateImage = (data: string) => estimateSerializedMessageTokens({
+      role: "toolResult",
+      content: {
+        content: [{ type: "image_url", image_url: { url: `data:image/png;base64,${data}` } }],
+      },
+    });
+
+    const small = estimateImage("A".repeat(8_192));
+    const large = estimateImage("A".repeat(1_048_576));
+    expect(large).toBe(small);
+    expect(large).toBeGreaterThan(1_500);
+    expect(large).toBeLessThan(2_500);
+  });
+
+  it("counts every image and retains text pressure in mixed tool results", () => {
+    const image = { type: "image", data: "A1b2".repeat(262_144) };
+    const estimateContent = (content: unknown[]) => estimateSerializedMessageTokens({
+      role: "toolResult",
+      content,
+    });
+    const oneImage = estimateContent([image]);
+    const twoImages = estimateContent([image, image]);
+    const mixed = estimateContent([image, { type: "text", text: "x".repeat(20_000) }]);
+
+    expect(twoImages).toBeGreaterThan(oneImage + 1_500);
+    expect(twoImages).toBeLessThan(5_000);
+    expect(mixed).toBeGreaterThan(oneImage + 11_000);
+    expect(mixed).toBeLessThan(oneImage + 13_000);
+  });
+
+  it("still counts base64 in nested tool-result text fields in full", () => {
+    const text = "A1b2".repeat(20_000);
+    const estimate = estimateSerializedMessageTokens({
+      role: "toolResult",
+      content: { content: [{ type: "text", text }] },
+    });
+
+    expect(estimate).toBeGreaterThan(40_000);
+  });
+
   it("counts base64 embedded in text fields in full (not substituted)", () => {
     // Base64/hex inside tool-result TEXT is tokenized per character at the
     // model boundary; only image/document source fields get the fixed cost.
