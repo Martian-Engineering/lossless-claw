@@ -26,7 +26,7 @@ import (
 const (
 	corruptedSummaryMarker = "[LCM fallback summary; truncated for context management]"
 	defaultLLMProvider     = "anthropic"
-	anthropicModel         = "claude-sonnet-4-20250514"
+	anthropicModel         = "claude-sonnet-4-6"
 	anthropicVersion       = "2023-06-01"
 	miniMaxProviderID      = "minimax"
 	miniMaxCNProviderID    = "minimax-cn"

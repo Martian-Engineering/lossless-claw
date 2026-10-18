@@ -44,6 +44,14 @@ func TestResolveSummaryProviderModel(t *testing.T) {
 	}
 }
 
+func TestResolveSummaryProviderModelDefaultsToActiveAnthropicModel(t *testing.T) {
+	// claude-sonnet-4-20250514 was retired by Anthropic on 2026-06-15 and now returns 404.
+	provider, model := resolveSummaryProviderModel("", "")
+	if provider != "anthropic" || model != "claude-sonnet-4-6" {
+		t.Fatalf("expected anthropic/claude-sonnet-4-6, got %q/%q", provider, model)
+	}
+}
+
 func TestResolveSummaryProviderModelMiniMax(t *testing.T) {
 	provider, model := resolveSummaryProviderModel("", miniMaxModel)
 	if provider != miniMaxProviderID {

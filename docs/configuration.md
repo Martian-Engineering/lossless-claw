@@ -450,7 +450,7 @@ Compaction summarization resolves candidates in this order:
 4. Runtime/session provider and model hints from OpenClaw
 5. `fallbackProviders`
 
-If `summaryModel` already contains a provider prefix such as `anthropic/claude-sonnet-4-20250514`, `summaryProvider` is ignored for that candidate.
+If `summaryModel` already contains a provider prefix such as `anthropic/claude-sonnet-4-6`, `summaryProvider` is ignored for that candidate.
 
 Lossless does not resolve provider credentials directly for compaction summaries. OpenClaw's runtime LLM layer owns provider/model preparation, auth profiles, OAuth refresh, base URLs, and dispatch. Lossless only selects the requested summary target and passes it to the host runtime, where model override policy is enforced.
 
