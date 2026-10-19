@@ -239,6 +239,55 @@ describe("LCM tools session scoping", () => {
     expect(text).toContain("apple");
   });
 
+  it("lcm_grep mirrors the rendered text and typed hits into details for code mode", async () => {
+    const retrieval = {
+      grep: vi.fn(async () => ({
+        messages: [
+          {
+            messageId: 7,
+            conversationId: 42,
+            role: "user",
+            snippet: "the rally driver story",
+            createdAt: new Date("2026-01-02T00:00:00.000Z"),
+            rank: 0,
+          },
+        ],
+        summaries: [],
+        totalMatches: 1,
+      })),
+      expand: vi.fn(),
+      describe: vi.fn(),
+    };
+
+    const tool = createLcmGrepTool({
+      deps: makeDeps(),
+      lcm: buildLcmEngine({ retrieval, conversationId: 42 }) as never,
+      sessionId: "session-1",
+    });
+    const result = await tool.execute("call-details", {
+      pattern: "rally driver",
+      mode: "full_text",
+    });
+
+    const details = result.details as {
+      text?: string;
+      totalMatches?: number;
+      messages?: Array<Record<string, unknown>>;
+    };
+    expect(details.totalMatches).toBe(1);
+    expect(details.text).toContain("**Total matches:** 1");
+    expect(details.text).toContain("the rally driver story");
+    expect(details.messages).toEqual([
+      expect.objectContaining({
+        conversationId: 42,
+        messageId: 7,
+        role: "user",
+        createdAt: "2026-01-02T00:00:00.000Z",
+        snippet: "the rally driver story",
+      }),
+    ]);
+  });
+
   it("lcm_expand query mode infers conversationId from delegated grant", async () => {
     const retrieval = {
       grep: vi.fn(async () => ({
@@ -281,6 +330,7 @@ describe("LCM tools session scoping", () => {
       expect.objectContaining({ conversationId: 42, query: "recent snippet" }),
     );
     expect((result.details as { expansionCount?: number }).expansionCount).toBe(1);
+    expect((result.details as { text?: string }).text).toContain("Expansion Results");
   });
 
   it("lcm_grep forwards since/before and uses the configured timezone in text output", async () => {

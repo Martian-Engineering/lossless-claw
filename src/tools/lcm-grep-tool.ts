@@ -333,8 +333,12 @@ export function createLcmGrepTool(input: {
         lines.push("No matches found.");
       }
 
+      // Code mode and tool search hand the model `details`, not `content`, so the
+      // rendered text and the typed hits are mirrored here (same contract as the
+      // host's pdf tool: content[0].text and details.text carry the same result).
+      const text = lines.join("\n");
       return {
-        content: [{ type: "text", text: lines.join("\n") }],
+        content: [{ type: "text", text }],
         details: {
           messageCount: result.messages.length,
           summaryCount: result.summaries.length,
@@ -343,6 +347,31 @@ export function createLcmGrepTool(input: {
             ? { fileScanByteLimit: DEFAULT_LARGE_FILE_SEARCH_MAX_BYTES }
             : {}),
           totalMatches: result.totalMatches,
+          text,
+          messages: result.messages.map((msg) => ({
+            conversationId: msg.conversationId,
+            messageId: msg.messageId,
+            role: msg.role,
+            createdAt: msg.createdAt.toISOString(),
+            snippet: truncateSnippet(msg.snippet),
+          })),
+          summaries: result.summaries.map((sum) => ({
+            conversationId: sum.conversationId,
+            summaryId: sum.summaryId,
+            kind: sum.kind,
+            createdAt: sum.createdAt.toISOString(),
+            snippet: truncateSnippet(sum.snippet),
+          })),
+          files: files.map((file) => ({
+            conversationId: file.conversationId,
+            fileId: file.fileId,
+            fileName: file.fileName,
+            lineNumber: file.lineNumber,
+            byteOffset: file.byteOffset,
+            matchedText: file.matchedText,
+            snippet: truncateSnippet(file.snippet),
+            scanTruncated: file.scanTruncated,
+          })),
         },
       };
     },
