@@ -4874,7 +4874,7 @@ export class LcmContextEngine implements ContextEngine {
       throw new Error(`overflow transcript sync ${synced.outcome.status}${synced.outcome.detail ? `: ${synced.outcome.detail}` : ""}`);
     }
     return this.conversationStore.withTransaction(() =>
-      this.verifyOverflowTurnCoverage(synced.conversationId, ids, latestUserIndex),
+      this.verifyOverflowTurnCoverage(synced.conversationId, entries, latestUserIndex),
     );
   }
 
@@ -4885,12 +4885,15 @@ export class LcmContextEngine implements ContextEngine {
    */
   private async verifyOverflowTurnCoverage(
     conversationId: number,
-    ids: string[],
+    entries: VisibleSessionTranscriptMessageEntry[],
     latestUserIndex: number,
   ): Promise<undefined> {
     // Reconciliation may deliberately skip uncertain history. Only a fully
     // represented current turn may authorize the recovery-only tail exception.
-    const turnIds = new Set(ids.slice(latestUserIndex));
+    const ids = entries.map((entry) => entry.entryId);
+    const turnIds = new Set(entries.slice(latestUserIndex)
+      .filter((entry) => hasPersistableMessageRole(entry.message))
+      .map((entry) => entry.entryId));
     const storedIds = await this.conversationStore.filterExistingTranscriptEntryIds(conversationId, [...turnIds]);
     const context = await this.summaryStore.getContextItems(conversationId);
     const raw = await Promise.all(context.filter((item) => item.messageId != null)
@@ -4899,6 +4902,11 @@ export class LcmContextEngine implements ContextEngine {
     if (storedIds.size !== turnIds.size || userIndex < 0 ||
         raw[userIndex]?.transcriptEntryId !== ids[latestUserIndex] ||
         raw.slice(userIndex).some((message) => !message?.transcriptEntryId || !turnIds.has(message.transcriptEntryId))) {
+      const currentRaw = userIndex < 0 ? [] : raw.slice(userIndex);
+      this.deps.log.warn(`[lcm] overflow coverage refused: visible=${turnIds.size} anchored=${storedIds.size}` +
+        ` raw=${currentRaw.length} unanchored=${currentRaw.filter((message) => !message?.transcriptEntryId).length}` +
+        ` outsideTurn=${currentRaw.filter((message) => message?.transcriptEntryId && !turnIds.has(message.transcriptEntryId)).length}` +
+        ` initiatingUserMatches=${userIndex >= 0 && raw[userIndex]?.transcriptEntryId === ids[latestUserIndex]}`);
       throw new Error("overflow transcript has incomplete current-turn coverage");
     }
     await this.conversationStore.markConversationBootstrapped(conversationId);
