@@ -209,6 +209,16 @@ describe("estimateSerializedMessageTokens", () => {
     expect(estimate).toBeGreaterThan(40_000);
   });
 
+  it.each(["native", "nested"])("counts literal data URLs in %s tool-result text", (shape) => {
+    const textBlock = { type: "text", text: `data:text/plain,${"x".repeat(80_000)}` };
+    const estimate = estimateSerializedMessageTokens({
+      role: "toolResult",
+      content: shape === "native" ? [textBlock] : { content: [textBlock] },
+    });
+
+    expect(estimate).toBeGreaterThan(40_000);
+  });
+
   it("counts base64 embedded in text fields in full (not substituted)", () => {
     // Base64/hex inside tool-result TEXT is tokenized per character at the
     // model boundary; only image/document source fields get the fixed cost.
