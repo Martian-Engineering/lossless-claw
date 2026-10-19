@@ -642,6 +642,8 @@ Why it matters:
 
 Hard ceiling for assembled LCM token budget.
 
+This is a ceiling, not a fallback or a model-window declaration. Deferred maintenance uses a valid current host `runtimeSettings.limits.promptTokenBudget`, then `runtimeContext.tokenBudget`, before a queued request or the conservative 128,000-token default. A direct lifecycle budget and host settings combine using the smaller current allowance. These optional fields use the existing OpenClaw 2026.9.2 contract, so absent host policy retains conservative behavior. A current allowance supersedes an older debt budget; absent current authority, maintenance retains the stricter recorded/request-or-default budget. Smaller current allowances and this cap still apply. No model-name inference or cross-engine allowance cache is used.
+
 Why it matters:
 
 - useful when the runtime model window is smaller than the surrounding system assumes
