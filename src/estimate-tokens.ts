@@ -82,11 +82,12 @@ const OPAQUE_BINARY_FIELD_KEYS = new Set([
 
 /**
  * Heuristic for embedded binary payloads providers price per item rather
- * than per character: data: URLs anywhere, or base64-shaped blobs under a
+ * than per character: data: URLs outside text fields, or base64-shaped blobs under a
  * known binary field key.
  */
 function isLikelyOpaqueBinaryString(key: string, value: string): boolean {
-  if (value.length < OPAQUE_BINARY_MIN_CHARS) {
+  // Text blocks render data URLs literally rather than as native media.
+  if (key === "text" || value.length < OPAQUE_BINARY_MIN_CHARS) {
     return false;
   }
   if (value.startsWith("data:")) {
@@ -182,9 +183,20 @@ function estimateBoundaryJsonTokens(value: unknown, charsPerToken: number): numb
     return 0;
   }
   try {
-    const serialized = JSON.stringify(value);
+    let opaqueParts = 0;
+    const serialized = JSON.stringify(value, (key, nestedValue) => {
+      if (typeof nestedValue === "string" && isLikelyOpaqueBinaryString(key, nestedValue)) {
+        opaqueParts += 1;
+        return "[opaque binary payload]";
+      }
+      return nestedValue;
+    });
+    // Match the full-message estimator's binary substitution. Otherwise this
+    // tool-result estimate wins Math.max() by counting image bytes as text.
+    // Apply the text ratio only to the serialized envelope, not the per-part cost.
     return typeof serialized === "string"
-      ? estimateBoundaryStringTokens(serialized, charsPerToken)
+      ? estimateBoundaryStringTokens(serialized, charsPerToken) +
+          opaqueParts * OPAQUE_BINARY_PART_TOKEN_ESTIMATE
       : 1;
   } catch {
     return 256;
