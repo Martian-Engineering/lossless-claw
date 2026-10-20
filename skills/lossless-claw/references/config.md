@@ -353,13 +353,14 @@ Why it matters:
 
 ### `enableSummaryThinking`
 
-Controls whether the summarization model receives a low reasoning budget.
+Controls the reasoning effort requested from the summarization host.
 
 Why it matters:
 
-- when `true` (default), summarization calls request `reasoningIfSupported: "low"`, allowing the model to think before producing summaries — this is the current default behavior
-- when `false`, no explicit reasoning budget is requested, which can reduce cost and keep summarization output more concise when reasoning is not needed for faithful summaries
-- set to `false` when you want to minimize token spend on reasoning during compaction, especially with reasoning-capable models
+- when `true` (default), initial and retry calls request low reasoning effort
+- when `false`, initial and retry calls request reasoning off
+- native Ollama omits the effort field in both modes to preserve its provider compatibility behavior
+- these are requests to OpenClaw, not a guarantee that a provider disables thinking. Some OpenClaw releases normalize `off` away for non-Claude models before the transport sees it; see [OpenClaw #169920](https://github.com/openclaw/openclaw/pull/169920). Verify the host/provider behavior, or choose a non-reasoning summary model when reasoning must be disabled
 
 Env override:
 

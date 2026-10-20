@@ -1617,9 +1617,23 @@ export async function createLcmSummarizeFromLegacyParams(params: {
       const model = candidate.model;
       const runtimeModelOverride = buildRuntimeModelOverride(candidate);
       const nextCandidate = index < resolvedCandidates.length - 1 ? resolvedCandidates[index + 1]! : undefined;
-      const shouldRequestSummaryThinking =
-        params.deps.config.enableSummaryThinking !== false &&
-        provider.trim().toLowerCase() !== "ollama";
+      // Keep the two reasons for withholding "low" apart. An operator who set
+      // enableSummaryThinking: false asked for reasoning to be off, and the host
+      // defaults an absent effort to "high", so that request has to be sent
+      // explicitly. The ollama exclusion is ours rather than the operator's, so
+      // it keeps sending nothing in either setting: #944 removed the field for
+      // ollama because sending it at all is what broke there, and "off" is as
+      // much a sent field as "low".
+      const summaryThinkingDisabled = params.deps.config.enableSummaryThinking === false;
+      const isOllamaProvider = provider.trim().toLowerCase() === "ollama";
+      const shouldRequestSummaryThinking = !summaryThinkingDisabled && !isOllamaProvider;
+      // One three-way decision instead of two nested conditions, so the ollama
+      // row cannot be reached through the disabled branch.
+      const summaryReasoningEffort = isOllamaProvider
+        ? ({} as const)
+        : shouldRequestSummaryThinking
+          ? ({ reasoningIfSupported: "low" } as const)
+          : ({ reasoningIfSupported: "off" } as const);
       const runSummarizerCall = async (
         label: string,
         reasoning?: string,
@@ -1640,9 +1654,7 @@ export async function createLcmSummarizeFromLegacyParams(params: {
             },
           ],
           maxTokens: maxTokensOverride ?? initialMaxTokens,
-          ...(shouldRequestSummaryThinking
-            ? ({ reasoningIfSupported: "low" } as const)
-            : {}),
+          ...summaryReasoningEffort,
           ...(reasoning ? { reasoning } : {}),
         }), summarizerTimeoutMs, label);
 

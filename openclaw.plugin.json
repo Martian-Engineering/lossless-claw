@@ -452,7 +452,7 @@
     },
     "enableSummaryThinking": {
       "label": "Enable Summary Thinking",
-      "help": "Request low reasoning budget from the model during summarization calls"
+      "help": "Request low reasoning effort when enabled and off when disabled, subject to host/model support. Native Ollama omits the effort field in either mode."
     },
     "proactiveThresholdCompactionMode": {
       "label": "Proactive Threshold Compaction Mode",
