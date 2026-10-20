@@ -17,6 +17,7 @@ import { createLcmDescribeTool } from "../src/tools/lcm-describe-tool.js";
 import { createLcmExpandQueryTool } from "../src/tools/lcm-expand-query-tool.js";
 import { createLcmExpandTool } from "../src/tools/lcm-expand-tool.js";
 import { createLcmGrepTool } from "../src/tools/lcm-grep-tool.js";
+import { getLcmConversationIds, resolveLcmConversationScope } from "../src/tools/lcm-conversation-scope.js";
 import { resetExpansionDelegationGuardForTests } from "../src/tools/lcm-expansion-recursion-guard.js";
 import type { LcmDependencies } from "../src/types.js";
 
@@ -178,6 +179,45 @@ describe("principal-scoped recall with real SQLite stores", () => {
     const result = await createLcmGrepTool({ deps, lcm, sessionKey: ownKey, sessionId: "otherdm" })
       .execute("stale", { pattern: "policyfact" });
     expect(JSON.stringify(result)).toContain("outside this principal scope");
+  });
+
+  it("denies an unresolved exact topic within a known principal before content access", async () => {
+    const sessionKey = `${ownKey}:topic:uncreated`;
+    expect(await conversations.getConversationIdsForPrincipal(sessionKey)).not.toHaveLength(0);
+    expect(await conversations.getConversationBySessionKey(sessionKey)).toBeNull();
+    const scope = await resolveLcmConversationScope({ deps, lcm, sessionKey, params: {} });
+    expect(scope.error).toContain("No LCM conversation found in this principal scope");
+    expect(getLcmConversationIds(scope)).toBeUndefined();
+    const read = vi.spyOn(retrieval, "describe");
+    const result = await describeItem(sessionKey).execute("new-topic", { id: "file_otherdm", expandFile: true });
+    expect(JSON.stringify(result)).toContain("No LCM conversation found in this principal scope");
+    expect(read).not.toHaveBeenCalled();
+  });
+
+  it.each(["grep", "describe", "expand_query"])("keeps unresolved exact topic %s calls out of retrieval", async (kind) => {
+    const sessionKey = `${ownKey}:topic:uncreated`;
+    const search = vi.spyOn(retrieval, "grep");
+    const read = vi.spyOn(retrieval, "describe");
+    const tool = kind === "grep" ? grep(sessionKey) : kind === "describe" ? describeItem(sessionKey) : expandQuery(sessionKey);
+    const result = await tool.execute("uncreated", {
+      pattern: "policyfact", id: "file_otherdm", summaryIds: ["sum_otherdm"], prompt: "Recall", expandFile: true,
+    });
+    expect(JSON.stringify(result)).toContain("No LCM conversation found");
+    expect(JSON.stringify(result)).not.toContain("policyfact otherdm");
+    expect(search).not.toHaveBeenCalled();
+    expect(read).not.toHaveBeenCalled();
+    expect(deps.callGateway).not.toHaveBeenCalled();
+  });
+
+  it("permits bounded allConversations for a new exact topic within a known principal", async () => {
+    const sessionKey = `${ownKey}:topic:uncreated`;
+    const scope = await resolveLcmConversationScope({ deps, lcm, sessionKey, params: { allConversations: true } });
+    expect(scope.error).toBeUndefined();
+    expect(scope.conversationIds?.sort()).toEqual([ids.own, ids.archive, ids.topic, ids.heartbeat].sort());
+    const own = await describeItem(sessionKey).execute("own", { id: "file_own", expandFile: true, allConversations: true });
+    const foreign = await describeItem(sessionKey).execute("foreign", { id: "file_otherdm", expandFile: true, allConversations: true });
+    expect(JSON.stringify(own)).toContain("policyfact own");
+    expect(JSON.stringify(foreign)).toContain("Not found");
   });
 
   it.each([undefined, "not-an-agent", "agent:service:telegram:direct:missing"])("fails closed on a missing or unknown host identity %s", async (sessionKey) => {
