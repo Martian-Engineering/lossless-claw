@@ -117,6 +117,9 @@ export async function resolveLcmConversationScope(input: {
     return { ...scope, conversationIds: allowedIds };
   }
   const requestedIds = scope.conversationIds ?? (scope.conversationId != null ? [scope.conversationId] : []);
+  if (requestedIds.length === 0) {
+    return denied("No LCM conversation found in this principal scope. Set allConversations=true to search permitted conversations.");
+  }
   if (requestedIds.some((id) => !allowedIds.includes(id))) {
     return denied("Conversation is outside this principal scope.");
   }
