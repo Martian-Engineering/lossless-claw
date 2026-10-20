@@ -1805,6 +1805,13 @@ export async function createLcmSummarizeFromLegacyParams(params: {
         const rawSummaryChars = summary.length;
         const sanitizedSummary = sanitizeReasoningSummaryText(summary);
         if (sanitizedSummary.droppedReasoning) {
+          if (!sanitizedSummary.reasoningOnly) {
+            params.deps.log.warn(
+              `[lcm] stripped reasoning-shaped content from summary; provider=${provider}; ` +
+                `model=${model}; source=${summarySource}; ` +
+                `before_chars=${rawSummaryChars}; after_chars=${sanitizedSummary.summary.length}`,
+            );
+          }
           summary = sanitizedSummary.summary;
         }
         if (sanitizedSummary.reasoningOnly) {
@@ -1890,6 +1897,13 @@ export async function createLcmSummarizeFromLegacyParams(params: {
             const rawRetrySummaryChars = summary.length;
             const sanitizedRetrySummary = sanitizeReasoningSummaryText(summary);
             if (sanitizedRetrySummary.droppedReasoning) {
+              if (!sanitizedRetrySummary.reasoningOnly) {
+                params.deps.log.warn(
+                  `[lcm] stripped reasoning-shaped content from summary; provider=${provider}; ` +
+                    `model=${model}; source=retry; ` +
+                    `before_chars=${rawRetrySummaryChars}; after_chars=${sanitizedRetrySummary.summary.length}`,
+                );
+              }
               summary = sanitizedRetrySummary.summary;
             }
             if (sanitizedRetrySummary.reasoningOnly) {
