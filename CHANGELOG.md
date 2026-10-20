@@ -2,6 +2,8 @@
 
 ## 1.2.0
 
+<!-- release-rollback-version: 1.1.1 -->
+
 ### Minor Changes
 
 - [#1238](https://github.com/Martian-Engineering/lossless-claw/pull/1238) [`99dfe43`](https://github.com/Martian-Engineering/lossless-claw/commit/99dfe435203e304a66fc582148cf0e2ed9a1bf55) Thanks [@jalehman](https://github.com/jalehman)! - Ingest the OpenClaw transcript through a persisted per-conversation visible-delta cursor instead of re-reading and reconciling the whole transcript on every `bootstrap` and `afterTurn`. Steady-state turns now read only new transcript entries (about 2–5 ms with no main-thread SQLite work, down from 0.3–28.5 s on large sessions).
