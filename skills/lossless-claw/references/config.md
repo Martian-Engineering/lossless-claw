@@ -360,7 +360,7 @@ Why it matters:
 - when `true` (default), initial and retry calls request low reasoning effort
 - when `false`, initial and retry calls request reasoning off
 - native Ollama omits the effort field in both modes to preserve its provider compatibility behavior
-- these are requests to OpenClaw, not a guarantee that a provider disables thinking. Some OpenClaw releases normalize `off` away for non-Claude models before the transport sees it; see [OpenClaw #169920](https://github.com/openclaw/openclaw/pull/169920). Verify the host/provider behavior, or choose a non-reasoning summary model when reasoning must be disabled
+- these are requests to OpenClaw, not a guarantee that a provider disables thinking. Older hosts can drop non-Claude `off` before transport; OpenClaw 2026.10.5 already preserves ordinary `off` at this host boundary, subject to provider/model policy. Separately, [OpenClaw #169920](https://github.com/openclaw/openclaw/pull/169920) overrides preconfigured payload thinking flags for explicit `off`; that additional main fix is absent from 2026.10.5. Verify the selected host/provider configuration, or choose a non-reasoning summary model when reasoning must be disabled
 
 Env override:
 

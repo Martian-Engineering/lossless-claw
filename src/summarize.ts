@@ -1618,8 +1618,8 @@ export async function createLcmSummarizeFromLegacyParams(params: {
       const runtimeModelOverride = buildRuntimeModelOverride(candidate);
       const nextCandidate = index < resolvedCandidates.length - 1 ? resolvedCandidates[index + 1]! : undefined;
       // Keep the two reasons for withholding "low" apart. An operator who set
-      // enableSummaryThinking: false asked for reasoning to be off, and the host
-      // defaults an absent effort to "high", so that request has to be sent
+      // enableSummaryThinking: false asked for reasoning to be off. Omitting the
+      // effort leaves host/provider defaults in control, so send that request
       // explicitly. The ollama exclusion is ours rather than the operator's, so
       // it keeps sending nothing in either setting: #944 removed the field for
       // ollama because sending it at all is what broke there, and "off" is as
