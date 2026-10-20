@@ -5,6 +5,7 @@ import {
 } from "../expansion-auth.js";
 import { isIsolatedCronSessionKey } from "../session-patterns.js";
 import type { LcmDependencies } from "../types.js";
+import { resolveSessionPrincipal } from "../session-principal.js";
 
 export type LcmConversationScope = {
   conversationId?: number;
@@ -90,6 +91,43 @@ export function parseIsoTimestampParam(
  * 3. Current session's LCM conversation
  */
 export async function resolveLcmConversationScope(input: {
+  lcm: LcmContextEngine;
+  params: Record<string, unknown>;
+  sessionId?: string;
+  sessionKey?: string;
+  deps?: Pick<LcmDependencies, "isSubagentSessionKey" | "log"> & Partial<Pick<LcmDependencies, "config">>;
+}): Promise<LcmConversationScope> {
+  const scope = await resolveBaseLcmConversationScope(input);
+  // A delegated child is bounded by the parent's grant, including its own exact
+  // active child conversation. An operator exception must never widen that grant.
+  if (scope.error || scope.delegated) return scope;
+  const policy = input.deps?.config?.conversationScopePolicy;
+  if (!policy || policy.mode === "unrestricted") return scope;
+  const sessionKey = input.sessionKey?.trim();
+  const principal = resolveSessionPrincipal(sessionKey);
+  const denied = (error: string): LcmConversationScope => ({
+    allConversations: false, delegated: false, error,
+  });
+  if (!principal) return denied("LCM principal scope requires an agent-scoped host session key.");
+  if (policy.unrestrictedAgents.includes(principal.split(":")[1]!)) return scope;
+  const allowedIds = await input.lcm.getConversationStore().getConversationIdsForPrincipal(sessionKey!);
+  if (allowedIds.length === 0) return denied("No conversations are available in this principal scope.");
+  if (scope.allConversations) {
+    // Retain cross-conversation routing, with a mandatory bounded owner set.
+    return { ...scope, conversationIds: allowedIds };
+  }
+  const requestedIds = scope.conversationIds ?? (scope.conversationId != null ? [scope.conversationId] : []);
+  if (requestedIds.some((id) => !allowedIds.includes(id))) {
+    return denied("Conversation is outside this principal scope.");
+  }
+  return scope;
+}
+
+export function getLcmConversationIds(scope: LcmConversationScope): number[] | undefined {
+  return scope.conversationIds ?? (scope.conversationId != null ? [scope.conversationId] : undefined);
+}
+
+async function resolveBaseLcmConversationScope(input: {
   lcm: LcmContextEngine;
   params: Record<string, unknown>;
   sessionId?: string;
