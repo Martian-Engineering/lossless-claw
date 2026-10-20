@@ -642,6 +642,9 @@ function extractErrorStatusCode(value: unknown, depth = 0): number | undefined {
   return undefined;
 }
 
+/** OpenClaw's stable `runtime.llm.complete` error code for reload/retirement refusals. */
+const HOST_RUNTIME_LIFECYCLE_ERROR_CODE = "LLM_RUNTIME_LIFECYCLE";
+
 const HOST_RUNTIME_LIFECYCLE_MESSAGES = new Set([
   "Async work scope is closed",
   "Plugin inventory has retired; begin a new plugin operation.",
@@ -649,11 +652,15 @@ const HOST_RUNTIME_LIFECYCLE_MESSAGES = new Set([
 ]);
 
 /**
- * Detect host lifecycle rejections that leave retained work retryable. OpenClaw
- * marks model-runtime reload admission refusals with `admissionBlocked`, possibly
- * under a wrapper's cause chain; the exact messages cover serialized errors.
+ * Detect host lifecycle rejections that leave retained work retryable. Hosts that
+ * publish `LLM_RUNTIME_LIFECYCLE` classify their own refusals. Older hosts throw
+ * uncoded errors: model-runtime reload admission refusals carry `admissionBlocked`,
+ * possibly under a wrapper's cause chain, and the exact messages cover the rest.
  */
 function isHostRuntimeLifecycleRejection(error: unknown): boolean {
+  if (isRecord(error) && error.code === HOST_RUNTIME_LIFECYCLE_ERROR_CODE) {
+    return true;
+  }
   if (HOST_RUNTIME_LIFECYCLE_MESSAGES.has(describeLogError(error))) {
     return true;
   }

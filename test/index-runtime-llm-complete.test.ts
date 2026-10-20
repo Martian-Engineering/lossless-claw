@@ -14,6 +14,8 @@ type RegisteredEngineFactory = (() => unknown) | undefined;
 const RELOAD_ADMISSION_MESSAGE =
   "Model runtime replacement is in progress; admitted plugin work cannot wait for the reload. Retry after the plugin reload completes.";
 const RETIRED_INVENTORY_MESSAGE = "Plugin inventory has retired; begin a new plugin operation.";
+/** A lifecycle refusal only recognizable by OpenClaw's stable error code. */
+const CODED_LIFECYCLE_MESSAGE = "Plugin runtime is restarting.";
 
 /** Mirrors OpenClaw's PreparedModelRuntimeOwnerNotPublishedError: plain Error name plus admissionBlocked. */
 class HostAdmissionBlockedError extends Error {
@@ -24,7 +26,16 @@ class HostAdmissionBlockedError extends Error {
   }
 }
 
+/** Mirrors OpenClaw's coded runtime.llm.complete error for hosts that publish lifecycle codes. */
+function codedHostError(code: string, message: string, cause?: unknown): Error {
+  return Object.assign(new Error(message, cause === undefined ? undefined : { cause }), {
+    name: "LlmCompleteError",
+    code,
+  });
+}
+
 function hostRejection(message: string): Error {
+  if (message === CODED_LIFECYCLE_MESSAGE) return codedHostError("LLM_RUNTIME_LIFECYCLE", message);
   return message === RELOAD_ADMISSION_MESSAGE
     ? new HostAdmissionBlockedError(message, { admissionBlocked: true })
     : new Error(message);
@@ -403,6 +414,10 @@ describe("createLcmDependencies.complete runtime.llm bridge", () => {
     },
     { name: "serialized host message", error: () => new Error(RELOAD_ADMISSION_MESSAGE) },
     {
+      name: "host lifecycle code with an unlisted message",
+      error: () => codedHostError("LLM_RUNTIME_LIFECYCLE", CODED_LIFECYCLE_MESSAGE, new Error("retired")),
+    },
+    {
       name: "wrapped admissionBlocked cause",
       error: () => new Error("Plugin LLM completion failed", {
         cause: new HostAdmissionBlockedError("runtime reload pending", { admissionBlocked: true }),
@@ -439,6 +454,11 @@ describe("createLcmDependencies.complete runtime.llm bridge", () => {
       kind: "provider_error",
     },
     {
+      name: "host completion failure code",
+      error: () => codedHostError("LLM_COMPLETION_FAILED", "Plugin LLM completion failed."),
+      kind: "provider_error",
+    },
+    {
       name: "missing runtime owner without admission block",
       error: () => new HostAdmissionBlockedError("prepared model runtime owner is not published"),
       kind: "provider_error",
@@ -457,7 +477,7 @@ describe("createLcmDependencies.complete runtime.llm bridge", () => {
   });
 
   it.each(
-    [RETIRED_INVENTORY_MESSAGE, RELOAD_ADMISSION_MESSAGE].flatMap((message) => [
+    [RETIRED_INVENTORY_MESSAGE, RELOAD_ADMISSION_MESSAGE, CODED_LIFECYCLE_MESSAGE].flatMap((message) => [
       { message, partial: false, tokenBudget: 10_000 },
       { message, partial: true, tokenBudget: 10_000 },
       { message, partial: false, tokenBudget: 300 },
