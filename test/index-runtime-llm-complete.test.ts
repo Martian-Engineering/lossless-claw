@@ -10,6 +10,25 @@ import { closeLcmConnection } from "../src/db/connection.js";
 import type { CompletionResult, RuntimeCompactionDelegateFn } from "../src/types.js";
 
 type RegisteredEngineFactory = (() => unknown) | undefined;
+
+const RELOAD_ADMISSION_MESSAGE =
+  "Model runtime replacement is in progress; admitted plugin work cannot wait for the reload. Retry after the plugin reload completes.";
+const RETIRED_INVENTORY_MESSAGE = "Plugin inventory has retired; begin a new plugin operation.";
+
+/** Mirrors OpenClaw's PreparedModelRuntimeOwnerNotPublishedError: plain Error name plus admissionBlocked. */
+class HostAdmissionBlockedError extends Error {
+  readonly admissionBlocked: boolean;
+  constructor(message: string, options?: ErrorOptions & { admissionBlocked?: boolean }) {
+    super(message, options);
+    this.admissionBlocked = options?.admissionBlocked === true;
+  }
+}
+
+function hostRejection(message: string): Error {
+  return message === RELOAD_ADMISSION_MESSAGE
+    ? new HostAdmissionBlockedError(message, { admissionBlocked: true })
+    : new Error(message);
+}
 type RuntimeLlmComplete = ReturnType<typeof vi.fn>;
 
 function buildApi(params?: {
@@ -364,8 +383,9 @@ describe("createLcmDependencies.complete runtime.llm bridge", () => {
   it.each([
     "Async work scope is closed",
     "Plugin inventory has retired; begin a new plugin operation.",
+    RELOAD_ADMISSION_MESSAGE,
   ])("classifies host lifecycle rejection separately from provider failures: %s", async (message) => {
-    const runtimeLlmComplete = vi.fn().mockRejectedValue(new Error(message));
+    const runtimeLlmComplete = vi.fn().mockRejectedValue(hostRejection(message));
     const { api, getFactory, dbPath } = buildApi({ runtimeLlmComplete });
     try {
       const engine = getRegisteredEngine(api, getFactory);
@@ -377,13 +397,74 @@ describe("createLcmDependencies.complete runtime.llm bridge", () => {
   });
 
   it.each([
-    { partial: false, tokenBudget: 10_000 },
-    { partial: true, tokenBudget: 10_000 },
-    { partial: false, tokenBudget: 300 },
-    { partial: true, tokenBudget: 300 },
-  ])("resumes retired-inventory work with fresh maintenance capabilities ($partial, $tokenBudget)", async ({ partial, tokenBudget }) => {
-    const message = "Plugin inventory has retired; begin a new plugin operation.";
-    const retired = vi.fn().mockRejectedValue(new Error(message));
+    {
+      name: "admissionBlocked host error",
+      error: () => new HostAdmissionBlockedError(RELOAD_ADMISSION_MESSAGE, { admissionBlocked: true }),
+    },
+    { name: "serialized host message", error: () => new Error(RELOAD_ADMISSION_MESSAGE) },
+    {
+      name: "wrapped admissionBlocked cause",
+      error: () => new Error("Plugin LLM completion failed", {
+        cause: new HostAdmissionBlockedError("runtime reload pending", { admissionBlocked: true }),
+      }),
+    },
+  ])("classifies model-runtime reload admission rejection as lifecycle without error logs ($name)", async ({ error }) => {
+    const rejection = error();
+    const runtimeLlmComplete = vi.fn().mockRejectedValue(rejection);
+    const { api, getFactory, dbPath } = buildApi({ runtimeLlmComplete });
+    try {
+      const engine = getRegisteredEngine(api, getFactory);
+      const result = await engine.deps.complete({ model: "test", messages: [], maxTokens: 100 });
+      expect(result.error).toEqual({ kind: "runtime_lifecycle", message: rejection.message });
+      expect(api.logger.error).not.toHaveBeenCalled();
+    } finally {
+      closeLcmConnection(dbPath);
+    }
+  });
+
+  it.each([
+    {
+      name: "rate limit",
+      error: () => Object.assign(new Error("429 Too Many Requests"), { status: 429 }),
+      kind: "provider_error",
+    },
+    {
+      name: "auth failure",
+      error: () => Object.assign(new Error("401 invalid x-api-key"), { status: 401 }),
+      kind: "provider_auth",
+    },
+    {
+      name: "provider body quoting the reload text",
+      error: () => Object.assign(new Error(`upstream 503: ${RELOAD_ADMISSION_MESSAGE}`), { status: 503 }),
+      kind: "provider_error",
+    },
+    {
+      name: "missing runtime owner without admission block",
+      error: () => new HostAdmissionBlockedError("prepared model runtime owner is not published"),
+      kind: "provider_error",
+    },
+  ])("keeps real provider failures out of the lifecycle path ($name)", async ({ error, kind }) => {
+    const runtimeLlmComplete = vi.fn().mockRejectedValue(error());
+    const { api, getFactory, dbPath } = buildApi({ runtimeLlmComplete });
+    try {
+      const engine = getRegisteredEngine(api, getFactory);
+      const result = await engine.deps.complete({ model: "test", messages: [], maxTokens: 100 });
+      expect(result.error?.kind).toBe(kind);
+      expect(api.logger.error).toHaveBeenCalled();
+    } finally {
+      closeLcmConnection(dbPath);
+    }
+  });
+
+  it.each(
+    [RETIRED_INVENTORY_MESSAGE, RELOAD_ADMISSION_MESSAGE].flatMap((message) => [
+      { message, partial: false, tokenBudget: 10_000 },
+      { message, partial: true, tokenBudget: 10_000 },
+      { message, partial: false, tokenBudget: 300 },
+      { message, partial: true, tokenBudget: 300 },
+    ]),
+  )("resumes lifecycle-interrupted work with fresh maintenance capabilities ($partial, $tokenBudget): $message", async ({ message, partial, tokenBudget }) => {
+    const retired = vi.fn().mockImplementation(async () => { throw hostRejection(message); });
     if (partial) retired.mockResolvedValueOnce({ text: "prepared before retirement" });
     const pluginComplete = vi.fn(async () => { throw new Error("must use call-bound capability"); });
     const { api, getFactory, dbPath } = buildApi({
@@ -397,7 +478,7 @@ describe("createLcmDependencies.complete runtime.llm bridge", () => {
       LcmContextEngine, "maintain" | "getConversationStore" | "getSummaryStore"
     > & { inner: LcmContextEngine };
     try {
-      const sessionId = `retirement-${partial}`;
+      const sessionId = `retirement-${partial}-${message.length}`;
       const sessionFile = "/tmp/retirement-unused.jsonl";
       await seedBacklogContext(engine.inner, sessionId, [120, 120, 120, 120]);
       const conversation = await engine.getConversationStore().getConversationBySessionId(sessionId);
@@ -471,6 +552,8 @@ describe("createLcmDependencies.complete runtime.llm bridge", () => {
       const logs = [api.logger.warn, api.logger.error].flatMap(log => vi.mocked(log).mock.calls).flat().join(" ");
       expect(logs).not.toContain("ALL PROVIDERS EXHAUSTED");
       expect(logs).not.toContain("Check provider keys and quotas");
+      expect(logs).not.toContain("provider error response");
+      expect(logs).not.toContain("runtime.llm.complete error");
     } finally {
       vi.useRealTimers();
       closeLcmConnection(dbPath);
@@ -480,8 +563,9 @@ describe("createLcmDependencies.complete runtime.llm bridge", () => {
   it.each([
     "Async work scope is closed",
     "Plugin inventory has retired; begin a new plugin operation.",
+    RELOAD_ADMISSION_MESSAGE,
   ])("keeps pending work and logs one warning when background summarization hits: %s", async (message) => {
-    const retired = vi.fn().mockRejectedValue(new Error(message));
+    const retired = vi.fn().mockImplementation(async () => { throw hostRejection(message); });
     const { api, getFactory, dbPath } = buildApi({
       runtimeLlmComplete: retired,
       pluginConfig: {
@@ -518,6 +602,9 @@ describe("createLcmDependencies.complete runtime.llm bridge", () => {
       expect(warnings[0]).toContain("summarization interrupted by host runtime lifecycle");
       expect(warnings[0]).toContain("pending summaries and compaction debt kept for the next drain");
       expect(vi.mocked(api.logger.error).mock.calls.flat().join(" ")).not.toContain(message);
+      const allLogs = [api.logger.warn, api.logger.error].flatMap(log => vi.mocked(log).mock.calls).flat().join(" ");
+      expect(allLogs).not.toContain("ALL PROVIDERS EXHAUSTED");
+      expect(allLogs).not.toContain("provider error response");
 
       const debt = await maintenanceStore.getConversationCompactionMaintenance(conversationId);
       expect(debt?.pending).toBe(true);

@@ -642,6 +642,31 @@ function extractErrorStatusCode(value: unknown, depth = 0): number | undefined {
   return undefined;
 }
 
+const HOST_RUNTIME_LIFECYCLE_MESSAGES = new Set([
+  "Async work scope is closed",
+  "Plugin inventory has retired; begin a new plugin operation.",
+  "Model runtime replacement is in progress; admitted plugin work cannot wait for the reload. Retry after the plugin reload completes.",
+]);
+
+/**
+ * Detect host lifecycle rejections that leave retained work retryable. OpenClaw
+ * marks model-runtime reload admission refusals with `admissionBlocked`, possibly
+ * under a wrapper's cause chain; the exact messages cover serialized errors.
+ */
+function isHostRuntimeLifecycleRejection(error: unknown): boolean {
+  if (HOST_RUNTIME_LIFECYCLE_MESSAGES.has(describeLogError(error))) {
+    return true;
+  }
+  let current: unknown = error;
+  for (let depth = 0; depth < 5 && isRecord(current); depth++) {
+    if (current.admissionBlocked === true) {
+      return true;
+    }
+    current = current.cause;
+  }
+  return false;
+}
+
 function detectProviderAuthError(error: unknown): CompletionBridgeErrorInfo | undefined {
   const statusCode = extractErrorStatusCode(error);
   const textParts: string[] = [];
@@ -1402,10 +1427,7 @@ function createLcmDependencies(
       } catch (err) {
         // Host lifecycle rejections are classified, not logged: the summarizer
         // caller reports them once with the retained-work context.
-        if (
-          describeLogError(err) === "Async work scope is closed" ||
-          describeLogError(err) === "Plugin inventory has retired; begin a new plugin operation."
-        ) {
+        if (isHostRuntimeLifecycleRejection(err)) {
           return {
             content: [],
             error: { kind: "runtime_lifecycle", message: describeLogError(err) },
