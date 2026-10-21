@@ -642,7 +642,7 @@ If you're running lossless-claw in production, building on OpenClaw, or want
 help bringing agents into your own systems, we'd like to hear from you:
 
 - Email: [clients@martian.engineering](mailto:clients@martian.engineering)
-- Contact: [martian.engineering/hail](https://martian.engineering/hail?utm_source=github&utm_medium=readme&utm_campaign=lossless-claw)
+- Book a call: [30-minute intro](https://calendly.com/drew-tada-martian/30min?utm_source=github&utm_medium=readme&utm_campaign=lossless-claw)
 - More of our open source: [github.com/Martian-Engineering](https://github.com/Martian-Engineering)
 
 Bug reports and feature requests belong in
