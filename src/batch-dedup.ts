@@ -90,7 +90,7 @@ export class BatchDeduplicator {
     if (!delivery || typeof delivery !== "object" || Array.isArray(delivery)) return false;
     const facts = delivery as Record<string, unknown>;
     const urls = facts.mediaUrls;
-    if (facts.textPhaseRequiresTerminal !== true || !Array.isArray(urls) || urls.length === 0 ||
+    if (!Array.isArray(urls) || urls.length === 0 ||
         !urls.every((url): url is string => typeof url === "string" && url.length > 0 && !/[\r\n]/.test(url))) return false;
     const key = extractStableEventKey(message);
     if (!key?.startsWith("assistant-response:") ||
@@ -246,6 +246,10 @@ export class BatchDeduplicator {
 
   async matchHostDeliveredAssistantId(conversationId: number, message: AgentMessage): Promise<number | null> {
     if (message.role !== "assistant") return null;
+    const delivery = (message as Record<string, unknown>).openclawDelivery;
+    if (!delivery || typeof delivery !== "object" || Array.isArray(delivery)) return null;
+    const urls = (delivery as Record<string, unknown>).mediaUrls;
+    if (!Array.isArray(urls) || urls.length === 0) return null;
     const key = extractStableEventKey(message);
     if (!key?.startsWith("assistant-response:")) return null;
     const messageId = await this.conversationStore.getMessageIdByStableEventKey(conversationId, key);

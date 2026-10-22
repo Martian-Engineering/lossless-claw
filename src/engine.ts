@@ -929,19 +929,22 @@ export class LcmContextEngine implements ContextEngine {
     return Math.floor(value);
   }
 
-  /** Resolve token budget from direct params or legacy fallback input. */
+  /** Resolve token budget from direct params, host settings, or legacy input. */
   private resolveTokenBudget(params: {
     tokenBudget?: number;
+    runtimeSettings?: ContextEngineRuntimeSettings;
     runtimeContext?: Record<string, unknown>;
     legacyParams?: Record<string, unknown>;
   }): number | undefined {
     const lp = asRecord(params.runtimeContext) ?? params.legacyParams ?? {};
-    if (
-      typeof params.tokenBudget === "number" &&
-      Number.isFinite(params.tokenBudget) &&
-      params.tokenBudget > 0
-    ) {
-      return Math.floor(params.tokenBudget);
+    const runtimeLimits = asRecord(asRecord(params.runtimeSettings)?.limits);
+    const currentBudgets = [
+      this.normalizeObservedTokenCount(params.tokenBudget),
+      this.normalizeObservedTokenCount(runtimeLimits?.promptTokenBudget),
+    ].filter((budget): budget is number => budget !== undefined && budget > 0);
+    if (currentBudgets.length > 0) {
+      // Neither source may widen the other's smaller current allowance.
+      return Math.min(...currentBudgets);
     }
     if (
       typeof lp.tokenBudget === "number" &&
@@ -951,6 +954,28 @@ export class LcmContextEngine implements ContextEngine {
       return Math.floor(lp.tokenBudget);
     }
     return undefined;
+  }
+
+  /** A fresh host allowance supersedes debt's historical evaluation budget. */
+  private resolveDeferredCompactionTokenBudget(params: {
+    tokenBudget: number;
+    currentTokenBudget?: number;
+    runtimeSettings?: ContextEngineRuntimeSettings;
+    runtimeContext?: Record<string, unknown>;
+  }, recordedTokenBudget: number | null): number {
+    const currentHostBudget = this.resolveTokenBudget({
+      tokenBudget: params.currentTokenBudget,
+      runtimeSettings: params.runtimeSettings,
+      runtimeContext: params.runtimeContext,
+    });
+    // No current host allowance: retain the conservative legacy/debt fallback.
+    // In particular, an engine restart must not turn an old small-model debt
+    // budget into the larger default simply because the in-memory queue is gone.
+    return this.applyAssemblyBudgetCap(currentHostBudget ?? (
+      recordedTokenBudget != null
+        ? Math.min(params.tokenBudget, recordedTokenBudget)
+        : params.tokenBudget
+    ));
   }
 
   /** Cap a resolved token budget against the configured maxAssemblyTokenBudget. */
@@ -983,7 +1008,7 @@ export class LcmContextEngine implements ContextEngine {
 
   /** Give an already-ready frontier a fixed queue position at threshold crossing. */
   private async scheduleThresholdPublicationOpportunity(
-    params: DeferredCompactionDebtDrainParams,
+    params: DeferredCompactionDebtDrainParams & { currentTokenBudget?: number },
   ): Promise<void> {
     const queueKey = this.resolveSessionQueueKey(params.sessionId, params.sessionKey);
     const sessionLabel = formatSessionLabel(params.sessionId, params.sessionKey);
@@ -995,6 +1020,7 @@ export class LcmContextEngine implements ContextEngine {
           sessionId: params.sessionId,
           sessionKey: params.sessionKey,
           tokenBudget: this.applyAssemblyBudgetCap(params.tokenBudget),
+          currentTokenBudget: params.currentTokenBudget,
           currentTokenCount: params.currentTokenCount,
           runtimeSettings: params.runtimeSettings,
           sessionQueueHeld: true,
@@ -1195,6 +1221,8 @@ export class LcmContextEngine implements ContextEngine {
     sessionId: string;
     sessionKey?: string;
     tokenBudget: number;
+    /** Explicit allowance from this immediate call, never an old queued request. */
+    currentTokenBudget?: number;
     currentTokenCount?: number;
     runtimeContext?: ContextEngineMaintenanceRuntimeContext;
     runtimeSettings?: ContextEngineRuntimeSettings;
@@ -1228,11 +1256,7 @@ export class LcmContextEngine implements ContextEngine {
           maintenance.tokenBudget && maintenance.tokenBudget > 0
             ? maintenance.tokenBudget
             : null;
-        const tokenBudget = this.applyAssemblyBudgetCap(
-          recordedTokenBudget != null
-            ? Math.min(params.tokenBudget, recordedTokenBudget)
-            : params.tokenBudget,
-        );
+        const tokenBudget = this.resolveDeferredCompactionTokenBudget(params, recordedTokenBudget);
         const persistedThreshold = persistedContextThresholdOverride(maintenance);
         const storedDecision = await this.compaction.evaluate(
           params.conversationId,
@@ -1313,11 +1337,7 @@ export class LcmContextEngine implements ContextEngine {
         maintenance.tokenBudget && maintenance.tokenBudget > 0
           ? maintenance.tokenBudget
           : null;
-      const resolvedTokenBudget = this.applyAssemblyBudgetCap(
-        recordedTokenBudget != null
-          ? Math.min(params.tokenBudget, recordedTokenBudget)
-          : params.tokenBudget,
-      );
+      const resolvedTokenBudget = this.resolveDeferredCompactionTokenBudget(params, recordedTokenBudget);
       const resolvedCurrentTokenCount = this.normalizeObservedTokenCount(
         params.currentTokenCount ?? maintenance.currentTokenCount ?? undefined,
       );
@@ -3289,6 +3309,7 @@ export class LcmContextEngine implements ContextEngine {
     const queued = this.maintenanceRequests.get(queueKey);
     const request = queued?.conversationId === conversation.conversationId ? queued : undefined;
     const tokenBudget = this.applyAssemblyBudgetCap(this.resolveTokenBudget({
+      runtimeSettings: params.runtimeSettings,
       runtimeContext: params.runtimeContext,
     }) ?? request?.tokenBudget ?? 128_000);
     const currentTokenCount = this.normalizeObservedTokenCount(params.runtimeContext?.currentTokenCount)
@@ -3709,6 +3730,7 @@ export class LcmContextEngine implements ContextEngine {
     const defaultTokenBudget = 128_000;
     const resolvedTokenBudget = this.resolveTokenBudget({
       tokenBudget: params.tokenBudget,
+      runtimeSettings: params.runtimeSettings,
       runtimeContext: params.runtimeContext,
       legacyParams,
     });
@@ -3872,6 +3894,7 @@ export class LcmContextEngine implements ContextEngine {
           sessionId: params.sessionId,
           sessionKey: params.sessionKey,
           tokenBudget,
+          currentTokenBudget: resolvedTokenBudget !== undefined ? tokenBudget : undefined,
           currentTokenCount: observedCurrentTokenCount,
           runtimeSettings: params.runtimeSettings,
           reason: "threshold",

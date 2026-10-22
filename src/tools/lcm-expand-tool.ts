@@ -240,6 +240,7 @@ export function createLcmExpandTool(input: {
             return {
               content: [{ type: "text", text }],
               details: {
+                text,
                 expansionCount: result.expansions.length,
                 citedIds: result.citedIds,
                 totalTokens: result.totalTokens,
@@ -290,6 +291,7 @@ export function createLcmExpandTool(input: {
             return {
               content: [{ type: "text", text: delegated.text }],
               details: {
+                text: delegated.text,
                 expansionCount: delegated.citedIds.length,
                 citedIds: delegated.citedIds,
                 totalTokens: delegated.totalTokens,
@@ -321,6 +323,7 @@ export function createLcmExpandTool(input: {
           return {
             content: [{ type: "text", text }],
             details: {
+              text,
               expansionCount: result.expansions.length,
               citedIds: result.citedIds,
               totalTokens: result.totalTokens,
@@ -400,6 +403,7 @@ export function createLcmExpandTool(input: {
             return {
               content: [{ type: "text", text: delegated.text }],
               details: {
+                text: delegated.text,
                 expansionCount: delegated.citedIds.length,
                 citedIds: delegated.citedIds,
                 totalTokens: delegated.totalTokens,
@@ -427,6 +431,7 @@ export function createLcmExpandTool(input: {
           return {
             content: [{ type: "text", text }],
             details: {
+              text,
               expansionCount: result.expansions.length,
               citedIds: result.citedIds,
               totalTokens: result.totalTokens,

@@ -192,7 +192,7 @@ describe("authoritative forced overflow recovery", () => {
     },
   );
 
-  it("anchors an assistant whose terminal media directives were consumed by host delivery", async () => {
+  it("recovers host-delivered media without a terminal-phase hint", async () => {
     const entries = transcript();
     const timestamp = Date.parse(entries.at(-1)!.createdAt!) + 1;
     const body = "Here are the independently rendered previews.";
@@ -212,7 +212,7 @@ describe("authoritative forced overflow recovery", () => {
       message: {
         ...original,
         content: [original.content[0], { type: "text", text: body }],
-        openclawDelivery: { textPhaseRequiresTerminal: true, mediaUrls },
+        openclawDelivery: { mediaUrls },
       } as AgentMessage,
     });
     const committed: AgentMessage[] = entries.map((entry) => ({ ...entry.message, timestamp: Date.parse(entry.createdAt!) }));
@@ -332,6 +332,7 @@ describe("authoritative forced overflow recovery", () => {
       expect(results).toEqual(calls);
       expect(results).toContain("call_11");
     });
+
 
   it("retains the initiating user when the configured fresh tail is disabled", async () => {
     const entries = transcript();

@@ -362,7 +362,7 @@ For compaction summarization, lossless-claw resolves the model in this order:
 3. OpenClaw's default compaction model/provider
 4. Runtime/session model/provider hints from OpenClaw
 
-If `summaryModel` already includes a provider prefix such as `anthropic/claude-sonnet-4-20250514`, `summaryProvider` is ignored for that choice. Otherwise, the provider falls back to the matching override, then `OPENCLAW_PROVIDER`, then the provider inferred by the caller.
+If `summaryModel` already includes a provider prefix such as `anthropic/claude-sonnet-4-6`, `summaryProvider` is ignored for that choice. Otherwise, the provider falls back to the matching override, then `OPENCLAW_PROVIDER`, then the provider inferred by the caller.
 
 Summary calls are dispatched through OpenClaw's runtime LLM layer, so auth profiles, OAuth refresh, API keys, base URLs, and provider-specific request preparation remain host-owned. Run `openclaw doctor --fix` after adding explicit summary model overrides if you want OpenClaw to add the matching `plugins.entries.lossless-claw.llm` policy.
 

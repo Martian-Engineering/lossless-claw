@@ -458,7 +458,7 @@ Compaction summarization resolves candidates in this order:
 4. Runtime/session provider and model hints from OpenClaw
 5. `fallbackProviders`
 
-If `summaryModel` already contains a provider prefix such as `anthropic/claude-sonnet-4-20250514`, `summaryProvider` is ignored for that candidate.
+If `summaryModel` already contains a provider prefix such as `anthropic/claude-sonnet-4-6`, `summaryProvider` is ignored for that candidate.
 
 Lossless does not resolve provider credentials directly for compaction summaries. OpenClaw's runtime LLM layer owns provider/model preparation, auth profiles, OAuth refresh, base URLs, and dispatch. Lossless only selects the requested summary target and passes it to the host runtime, where model override policy is enforced.
 
@@ -513,6 +513,8 @@ This keeps long-term history available while still giving users a real clean-sla
 - deferred mode records a single coalesced maintenance debt row per conversation
 - after-turn threshold pressure records debt with reason `"threshold"`; unresolved pre-assembly pressure uses `"assembly-pressure"`
 - `maintain()` consumes threshold debt when the host explicitly opts in to deferred execution
+- Maintenance uses a valid current host `runtimeSettings.limits.promptTokenBudget`, then `runtimeContext.tokenBudget`, before a queued request or the conservative 128,000-token fallback. When a lifecycle call also supplies a direct budget, the smaller direct/host-settings allowance wins. These optional settings use the existing OpenClaw 2026.9.2 contract; missing host policy retains conservative behavior. `maxAssemblyTokenBudget` remains a ceiling, not a fallback or model-window declaration.
+- A current host allowance supersedes the historical budget stored with deferred debt, including when a previously published batch is revalidated during backoff. Smaller current allowances remain authoritative. Without a current allowance, maintenance retains the stricter recorded/request-or-default budget; it does not infer capacity from model names or cache an earlier model's allowance across engine recreation.
 - `assemble()` measures the full projection before eviction, including serialized payloads and uncovered volatile live inputs. It tries ready publication above 75% pressure with pending debt, or above the 90% serialized clamp threshold even without debt
 - if publication does not reach the configured `contextThreshold` target (capped at 90%), assembly can wait for one bounded foreground preparation pass and publication. Generation respects `maxSweepIterations`, summarizer timeouts, spend limits, cooldowns, and active background ownership; publication does not require generation permission
 - assembly rebuilds and remeasures after publication. The `assemble: foreground compaction` log distinguishes `reduced`, `reachedTarget`, `pending`, and `reason`. Remaining work retains debt; protected-tail pressure or unavailable generation falls back to bounded context without deleting persisted history
