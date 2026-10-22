@@ -111,6 +111,8 @@ jobs:
         with:
           # OpenClaw 2026.9.4+ requires Node >=24.16.0; keep core tests on Node 22.
           node-version: 24
+          # Latest OpenClaw can require a newer patch than the runner cache.
+          check-latest: true
           cache: npm
 
       - name: Install plugin deps (pinned, for build)
