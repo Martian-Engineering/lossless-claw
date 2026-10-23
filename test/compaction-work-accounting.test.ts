@@ -154,7 +154,8 @@ describe("engine compaction work and spend accounting", () => {
       sessionId: "protected", sessionFile: "/tmp/accounting.jsonl", tokenBudget: 24_000,
       currentTokenCount: 66_000, compactionTarget: "budget", force: true, runtimeSettings,
     });
-    expect(result).toMatchObject({ ok: storedTokens < 16_800, compacted: false, reason: "no compaction progress" });
+    // The host still observes 66k against a 24k budget, so a no-op is never success.
+    expect(result).toMatchObject({ ok: false, compacted: false, reason: "no compaction progress" });
     expect(complete).not.toHaveBeenCalled();
     expect(backoff).not.toHaveBeenCalled();
     expect(success).not.toHaveBeenCalled();
