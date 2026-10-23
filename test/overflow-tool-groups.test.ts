@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import {
+  resolveRecoveryTailMaxTokens,
   selectOverflowToolGroup,
   type OverflowContextItem,
 } from "../src/overflow-tool-groups.js";
@@ -85,6 +86,49 @@ describe("forced recovery tool groups", () => {
         ...tail,
       ])
     ).toEqual([1, 2]);
+  });
+  describe("default recovery tail token cap", () => {
+    // 64 stored messages: one user, 31 exec call/result pairs, one closing reply.
+    const execHeavyTurn = () => {
+      const rows = [row(0, "user")];
+      for (let index = 0; index < 31; index++) {
+        const call = row(2 * index + 1, "assistant", [`exec_${index}`]);
+        const result = row(2 * index + 2, "tool", [`exec_${index}`]);
+        call.message!.tokenCount = 400;
+        result.message!.tokenCount = 5_800;
+        rows.push(call, result);
+      }
+      rows.push(row(63, "assistant"));
+      return rows;
+    };
+    const target = 189_000;
+
+    it("selects groups when an unconfigured count-only tail exceeds the target", () => {
+      const rows = execHeavyTurn();
+      expect(rows).toHaveLength(64);
+      const total = rows.reduce((sum, r) => sum + r.message!.tokenCount, 0);
+      expect(total).toBeGreaterThan(target);
+      expect(selectOverflowToolGroup(rows, 64)).toEqual([]);
+
+      const cap = resolveRecoveryTailMaxTokens(undefined, target);
+      expect(cap).toBe(47_250);
+      const selected = selectOverflowToolGroup(rows, 64, cap);
+      expect(selected.length).toBeGreaterThan(0);
+      expect(selected[0]!.ordinal).toBe(1);
+      // Selection ends on a complete group and leaves at most the cap in raw tail.
+      const lastSelected = selected.at(-1)!.ordinal;
+      expect(rows[lastSelected]!.message!.role).toBe("tool");
+      const tailTokens = rows
+        .filter((r) => r.item.ordinal > lastSelected)
+        .reduce((sum, r) => sum + r.message!.tokenCount, 0);
+      expect(tailTokens).toBeLessThanOrEqual(cap!);
+    });
+
+    it("prefers an explicit freshTailMaxTokens and ignores unusable targets", () => {
+      expect(resolveRecoveryTailMaxTokens(12_000, 189_000)).toBe(12_000);
+      expect(resolveRecoveryTailMaxTokens(undefined, 0)).toBeUndefined();
+      expect(resolveRecoveryTailMaxTokens(undefined, Infinity)).toBeUndefined();
+    });
   });
   it("selects only groups following the most recent user", () => {
     expect(

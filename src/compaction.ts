@@ -1,5 +1,5 @@
 import { createHash, randomUUID } from "node:crypto";
-import { selectOverflowToolGroup } from "./overflow-tool-groups.js";
+import { resolveRecoveryTailMaxTokens, selectOverflowToolGroup } from "./overflow-tool-groups.js";
 import { contentFromParts } from "./assembler.js";
 import type {
   ConversationStore,
@@ -1079,6 +1079,10 @@ export class CompactionEngine {
       input.stopAtTokens > 0
         ? Math.floor(input.stopAtTokens)
         : undefined;
+    // Forced recovery bounds the raw tail by tokens so large tool output cannot pin it above target.
+    const recoveryTailMaxTokens = input.allowCurrentTurnCompaction
+      ? resolveRecoveryTailMaxTokens(this.resolveFreshTailMaxTokens(), stopAtTokens ?? threshold)
+      : undefined;
 
     if (
       !force &&
@@ -1179,10 +1183,12 @@ export class CompactionEngine {
         leafChunkTokensOverride,
         freshTailCountOverride,
         leafScanAfterOrdinal,
+        recoveryTailMaxTokens,
       );
       if (leafChunk.items.length === 0 && input.allowCurrentTurnCompaction) {
         leafChunk = await this.selectOverflowLeafChunk(
           conversationId, freshTailCountOverride, leafScanAfterOrdinal, leafChunkTokensOverride,
+          recoveryTailMaxTokens,
         );
       }
       if (leafChunk.items.length === 0) {
@@ -1602,6 +1608,7 @@ export class CompactionEngine {
     contextItems: ContextItemRecord[],
     freshTailCountOverride?: number,
     messageCache = new Map<number, MessageRecord | null>(),
+    freshTailMaxTokensOverride?: number,
   ): Promise<number> {
     const freshTailCount =
       (freshTailCountOverride !== undefined && freshTailCountOverride > 0
@@ -1610,7 +1617,7 @@ export class CompactionEngine {
     if (freshTailCount <= 0) {
       return Infinity;
     }
-    const freshTailMaxTokens = this.resolveFreshTailMaxTokens();
+    const freshTailMaxTokens = freshTailMaxTokensOverride ?? this.resolveFreshTailMaxTokens();
 
     const rawMessageItems = contextItems.filter(
       (item) => item.itemType === "message" && item.messageId != null,
@@ -1763,9 +1770,15 @@ export class CompactionEngine {
     leafChunkTokensOverride?: number,
     freshTailCountOverride?: number,
     afterOrdinal?: number,
+    freshTailMaxTokensOverride?: number,
   ): Promise<LeafChunkSelection> {
     const contextItems = await this.getContextItemsCached(conversationId);
-    const freshTailOrdinal = await this.resolveFreshTailOrdinal(contextItems, freshTailCountOverride);
+    const freshTailOrdinal = await this.resolveFreshTailOrdinal(
+      contextItems,
+      freshTailCountOverride,
+      undefined,
+      freshTailMaxTokensOverride,
+    );
     const threshold = this.resolveLeafChunkTokens(leafChunkTokensOverride);
 
     let rawTokensOutsideTail = 0;
@@ -1823,6 +1836,7 @@ export class CompactionEngine {
     freshTailCountOverride?: number,
     afterOrdinal?: number,
     leafChunkTokensOverride?: number,
+    freshTailMaxTokensOverride?: number,
   ): Promise<LeafChunkSelection> {
     const chunkTokens = this.resolveLeafChunkTokens(leafChunkTokensOverride);
     const context = [];
@@ -1832,7 +1846,7 @@ export class CompactionEngine {
       context.push({ item, message, parts });
     }
     return {
-      items: selectOverflowToolGroup(context, freshTailCountOverride ?? this.resolveFreshTailCount(), this.resolveFreshTailMaxTokens(), afterOrdinal, chunkTokens),
+      items: selectOverflowToolGroup(context, freshTailCountOverride ?? this.resolveFreshTailCount(), freshTailMaxTokensOverride ?? this.resolveFreshTailMaxTokens(), afterOrdinal, chunkTokens),
       rawTokensOutsideTail: 0,
       threshold: chunkTokens,
     };
