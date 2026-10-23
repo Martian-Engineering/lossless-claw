@@ -1865,11 +1865,11 @@ describe("LcmContextEngine fidelity and token budget", () => {
         success: false,
         actionTaken: true,
         rounds: 1,
-        finalTokens: 3_500,
+        finalTokens: 4_096,
       };
     });
 
-    // The failed force compaction opens the poor-reduction spend backoff.
+    // The no-progress force compaction opens the poor-reduction spend backoff.
     const first = await engine.compact({
       sessionId,
       sessionFile: createSessionFilePath("pending-spend-backoff-block"),
