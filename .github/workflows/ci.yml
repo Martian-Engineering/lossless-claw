@@ -109,8 +109,8 @@ jobs:
       - name: Setup Node
         uses: actions/setup-node@v4
         with:
-          # OpenClaw 2026.9.4+ requires Node >=24.16.0; keep core tests on Node 22.
-          node-version: 24
+          # OpenClaw 2026.10.6+ requires Node >=24.22.1 <25 || >=26.12.1; keep core tests on Node 22.
+          node-version: 24.22.1
           cache: npm
 
       - name: Install plugin deps (pinned, for build)
