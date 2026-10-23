@@ -11,6 +11,25 @@ export type OverflowContextItem = {
   parts: MessagePartRecord[];
 };
 
+/** Share of the forced-recovery target that an unconfigured recovery tail may occupy. */
+export const RECOVERY_TAIL_TARGET_SHARE = 0.25;
+
+/**
+ * Resolve the raw-tail token cap used only by forced overflow recovery.
+ *
+ * An explicit `freshTailMaxTokens` wins. Otherwise the tail is bounded to a
+ * share of the recovery target so a count-only tail full of large tool results
+ * cannot exceed the target and leave nothing compactable.
+ */
+export function resolveRecoveryTailMaxTokens(
+  configuredMaxTokens: number | undefined,
+  targetTokens: number
+): number | undefined {
+  if (typeof configuredMaxTokens === "number") return configuredMaxTokens;
+  if (!Number.isFinite(targetTokens) || targetTokens <= 0) return undefined;
+  return Math.floor(targetTokens * RECOVERY_TAIL_TARGET_SHARE);
+}
+
 /** Select an older contiguous chunk of complete tool groups after the latest raw user. */
 export function selectOverflowToolGroup(
   context: OverflowContextItem[],
