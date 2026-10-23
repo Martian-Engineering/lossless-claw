@@ -2536,11 +2536,22 @@ export class LcmContextEngine implements ContextEngine {
     }
     // Poor reduction is a spend signal only when an allowed summarizer call ran.
     // Guard errors already carry their backoff; never replace it with a new one.
+    // Forced recovery that committed a reduction but stopped at the protected
+    // tail is still working; a backoff would only block foreground relief
+    // while the host overflow persists.
+    const forcedRecoveryProgressed = forceCompaction && didCompact &&
+      compactResult.finalTokens < decision.currentTokens;
     if (!compactResult.success && !compactResult.authFailure && !compactResult.error && summaryAttempts > 0) {
-      this.compactionGuards.openSummarySpendBackoff({
-        scopeKey: summarySpendScopeKey,
-        reason: compactUntilReason,
-      });
+      if (forcedRecoveryProgressed) {
+        this.deps.log.info(
+          `[lcm] compact: spend backoff skipped conversation=${conversationId} ${sessionLabel} scope=${summarySpendScopeKey} reason=forced_recovery_progressed tokensBefore=${decision.currentTokens} tokensAfter=${compactResult.finalTokens}`,
+        );
+      } else {
+        this.compactionGuards.openSummarySpendBackoff({
+          scopeKey: summarySpendScopeKey,
+          reason: compactUntilReason,
+        });
+      }
     }
     this.deps.log.info(
       `[lcm] compact: done conversation=${conversationId} ${sessionLabel} ok=${compactResult.success} compacted=${didCompact} reason=${compactUntilReason.replaceAll(" ", "_")} tokensBefore=${decision.currentTokens} tokensAfter=${compactResult.finalTokens} rounds=${compactResult.rounds} duration=${formatDurationMs(Date.now() - startedAt)}`,

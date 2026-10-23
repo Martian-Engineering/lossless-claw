@@ -237,6 +237,34 @@ describe("foreground compaction before pressure eviction", () => {
     expect(log.info.mock.calls.flat().join("\n")).toContain("reduced=false reachedTarget=false pending=true reason=deferred compaction backoff active");
   });
 
+  it("keeps foreground relief available after forced recovery progresses short of target", async () => {
+    const { engine, complete, log } = fixture({ freshTailCount: 8, summaryMaxCallsPerWindow: 100 });
+    const { messages, conversationId } = await seed(engine);
+    const tokensBefore = await engine.getSummaryStore().getContextTokenCount(conversationId);
+    // Drive the legacy forced-recovery core; the protected tail alone exceeds
+    // this target, so recovery can only progress.
+    const core = (engine as unknown as {
+      executeCompactionCore: (params: Record<string, unknown>) => ReturnType<LcmContextEngine["compact"]>;
+    }).executeCompactionCore.bind(engine);
+    const result = await core({
+      conversationId, sessionId: SESSION, sessionFile: createSessionFilePath(SESSION),
+      tokenBudget: 4_000, compactionTarget: "budget", force: true,
+    });
+    expect(complete).toHaveBeenCalled();
+    expect(result).toMatchObject({ ok: false, compacted: true, reason: "could not reach target" });
+    expect(await engine.getSummaryStore().getContextTokenCount(conversationId)).toBeLessThan(tokensBefore);
+    const guards = (engine as unknown as { compactionGuards: CompactionGuards }).compactionGuards;
+    expect(guards.getSummarySpendBackoffUntil(guards.resolveSummarySpendScope({ kind: "compaction", scope: SESSION }))).toBeNull();
+
+    log.info.mockClear();
+    await assemble(engine, messages, 6_000);
+    await assemble(engine, messages, 6_000);
+    const logged = log.info.mock.calls.flat().join("\n");
+    expect(logged).toContain("foreground compaction");
+    expect(logged).not.toContain("deferred compaction backoff active");
+    expect(logged).not.toContain("summary spend backoff open");
+  });
+
   it("bounds summarizer failure and falls back without reporting recovery", async () => {
     const { engine, complete, log } = fixture();
     const { messages, conversationId } = await seed(engine);
