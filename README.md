@@ -2,6 +2,8 @@
 
 Lossless Context Management plugin for [OpenClaw](https://github.com/openclaw/openclaw), based on the [LCM paper](https://papers.voltropy.com/LCM) from [Voltropy](https://x.com/Voltropy). Replaces OpenClaw's built-in sliding-window compaction with a DAG-based summarization system that preserves every message while keeping active context within model token limits.
 
+Built and maintained by **[Martian Engineering](https://martian.engineering/?utm_source=github&utm_medium=readme&utm_campaign=lossless-claw)**. Need help with agents, memory, or AI in your own stack? [Get in touch](#about-martian-engineering).
+
 ## Table of contents
 
 - [What it does](#what-it-does)
@@ -14,6 +16,7 @@ Lossless Context Management plugin for [OpenClaw](https://github.com/openclaw/op
   - [Line endings](#line-endings)
 - [Security](#security)
 - [License](#license)
+- [About Martian Engineering](#about-martian-engineering)
 
 ## What it does
 
@@ -625,3 +628,22 @@ for the supported disclosure process and response expectations.
 ## License
 
 MIT
+
+## About Martian Engineering
+
+lossless-claw is built, maintained, and funded by
+[Martian Engineering](https://martian.engineering/?utm_source=github&utm_medium=readme&utm_campaign=lossless-claw).
+
+We're a small team of senior engineers who build products, integrations, data
+systems, and agents inside our clients' stacks, and run hands-on AI training for
+engineering teams in their own codebases.
+
+If you're running lossless-claw in production, building on OpenClaw, or want
+help bringing agents into your own systems, we'd like to hear from you:
+
+- Email: [clients@martian.engineering](mailto:clients@martian.engineering)
+- Book a call: [30-minute intro](https://calendly.com/drew-tada-martian/30min?utm_source=github&utm_medium=readme&utm_campaign=lossless-claw)
+- More of our open source: [github.com/Martian-Engineering](https://github.com/Martian-Engineering)
+
+Bug reports and feature requests belong in
+[GitHub Issues](https://github.com/Martian-Engineering/lossless-claw/issues).
