@@ -22,10 +22,14 @@ function assistant(content: string): AgentMessage {
 }
 
 /** Assistant message carrying only a tool call; stores empty text content. */
-function toolCallOnly(toolCallId: string): AgentMessage {
+function toolCallOnly(
+  toolCallId: string,
+  args: Record<string, unknown> = { command: "true" },
+  name = "exec",
+): AgentMessage {
   return {
     role: "assistant",
-    content: [{ type: "toolCall", id: toolCallId, name: "exec", arguments: { command: "true" } }],
+    content: [{ type: "toolCall", id: toolCallId, name, arguments: args }],
   } as unknown as AgentMessage;
 }
 
@@ -384,6 +388,101 @@ describe("transcript delta resync", () => {
       ["u2", ids[2]],
       ["a2", mapping.get(ids[3]!)],
     ]);
+  });
+
+  it.each([
+    {
+      label: "tool arguments",
+      stored: toolCallOnly("exec:101", { command: "old" }),
+      incoming: toolCallOnly("exec:101", { command: "new" }),
+      expectedParts: [{ toolCallId: "exec:101", toolName: "exec", toolInput: '{"command":"new"}' }],
+    },
+    {
+      label: "tool name",
+      stored: toolCallOnly("exec:101", { path: "file.txt" }),
+      incoming: toolCallOnly("exec:101", { path: "file.txt" }, "read"),
+      expectedParts: [{ toolCallId: "exec:101", toolName: "read", toolInput: '{"path":"file.txt"}' }],
+    },
+    {
+      label: "argument array order",
+      stored: toolCallOnly("exec:101", { values: [1, 2] }),
+      incoming: toolCallOnly("exec:101", { values: [2, 1] }),
+      expectedParts: [{ toolCallId: "exec:101", toolName: "exec", toolInput: '{"values":[2,1]}' }],
+    },
+    {
+      label: "tool block order",
+      stored: { role: "assistant", content: [...toolCallOnly("exec:101").content, ...toolCallOnly("read:101").content] },
+      incoming: { role: "assistant", content: [...toolCallOnly("read:101").content, ...toolCallOnly("exec:101").content] },
+      expectedParts: [{ toolCallId: "read:101" }, { toolCallId: "exec:101" }],
+    },
+    {
+      label: "tool result provenance",
+      stored: toolResult("exec:101", "same output"),
+      incoming: { ...toolResult("exec:101", "same output"), toolName: "read" },
+      expectedParts: [{ toolCallId: "exec:101", toolName: "read", textContent: "same output" }],
+    },
+  ])("preserves changed structured suffix messages after a same-session branch: $label", async ({ stored, incoming, expectedParts }) => {
+    const { host, engine, db } = setup();
+    const anchor = host.append(assistant("retained anchor"));
+    const abandonedId = host.append(stored);
+    await bootstrap(engine);
+    const store = engine.getConversationStore();
+    const conversation = await store.getConversationForSession({ sessionId, sessionKey });
+    const before = await store.getMessages(conversation!.conversationId);
+    const originalParts = await store.getMessageParts(before[1]!.messageId);
+
+    // Native tree navigation retains the raw branch and session generation.
+    host.branch(anchor);
+    const incomingId = host.append(incoming);
+    await expect(bootstrap(engine)).resolves.toMatchObject({ importedMessages: 1 });
+    expect(logLines(engine, "info").some((line) => line.includes("reason=anchor_missing"))).toBe(true);
+    const after = await store.getMessages(conversation!.conversationId);
+    expect(after).toHaveLength(3);
+    expect(after.slice(0, before.length)).toEqual(before);
+    expect(after[1]!.transcriptEntryId).toBe(abandonedId);
+    expect(await store.getMessageParts(before[1]!.messageId)).toEqual(originalParts);
+    expect(after[2]!.transcriptEntryId).toBe(incomingId);
+    expect(await store.getMessageParts(after[2]!.messageId)).toMatchObject(expectedParts);
+    expect(cursorRow(db)).toMatchObject({ frontierSeq: 2 });
+    expect(host.raw.some((event) => event.id === abandonedId)).toBe(true);
+
+    await expect(bootstrap(engine)).resolves.toMatchObject({ importedMessages: 0 });
+    expect(await store.getMessages(conversation!.conversationId)).toEqual(after);
+  });
+
+  it("restamps equivalent structured payloads with canonical argument keys", async () => {
+    const { host, engine, db } = setup();
+    const anchor = host.append(assistant("retained anchor"));
+    host.append(toolCallOnly("exec:101", { command: "same", options: { a: 1, b: 2 } }));
+    await bootstrap(engine);
+    const store = engine.getConversationStore();
+    const conversation = await store.getConversationForSession({ sessionId, sessionKey });
+    const before = await store.getMessages(conversation!.conversationId);
+    const originalParts = await store.getMessageParts(before[1]!.messageId);
+    host.branch(anchor);
+    const rewrittenId = host.append(toolCallOnly("exec:101", { options: { b: 2, a: 1 }, command: "same" }));
+
+    await expect(bootstrap(engine)).resolves.toMatchObject({ importedMessages: 0 });
+    const after = await store.getMessages(conversation!.conversationId);
+    expect(after).toHaveLength(2);
+    expect(after[1]).toEqual({ ...before[1], transcriptEntryId: rewrittenId });
+    expect(await store.getMessageParts(before[1]!.messageId)).toEqual(originalParts);
+    expect(cursorRow(db)).toMatchObject({ frontierSeq: 2 });
+  });
+
+  it("does not consume a stored candidate rejected by an earlier same-key entry", async () => {
+    const { host, engine, db } = setup();
+    const anchor = host.append(assistant("retained anchor"));
+    host.append(toolCallOnly("exec:101", { command: "stored" }));
+    await bootstrap(engine);
+    host.branch(anchor);
+    host.append(toolCallOnly("exec:101", { command: "different historical rendering" }));
+    const rewrittenId = host.append(toolCallOnly("exec:101", { command: "stored" }));
+    const newestId = host.append(assistant("new suffix"));
+
+    await expect(bootstrap(engine)).resolves.toMatchObject({ importedMessages: 1 });
+    expect(rows(db).map((row) => row.entryId)).toEqual([anchor, rewrittenId, newestId]);
+    expect(cursorRow(db)).toMatchObject({ frontierSeq: 4 });
   });
 });
 

@@ -138,28 +138,52 @@ describe("budgetStartIndex", () => {
 });
 
 describe("SuffixContentMatcher", () => {
-  it("claims identical content in stored order", () => {
+  const samePayload = async () => true;
+
+  it("claims identical content in stored order", async () => {
     const matcher = new SuffixContentMatcher([row(3, 30, null, "x"), row(1, 10, "old-1", "x"), row(2, 20, "old-2", "y")]);
-    expect(matcher.claim("x")?.messageId).toBe(1);
+    expect((await matcher.claim("x", samePayload))?.messageId).toBe(1);
     expect(matcher.multiCandidateClaims).toBe(1);
-    expect(matcher.claim("y")?.messageId).toBe(2);
-    expect(matcher.claim("x")?.messageId).toBe(3);
-    expect(matcher.claim("x")).toBeNull();
+    expect((await matcher.claim("y", samePayload))?.messageId).toBe(2);
+    expect((await matcher.claim("x", samePayload))?.messageId).toBe(3);
+    expect(await matcher.claim("x", samePayload)).toBeNull();
   });
 
-  it("never claims a row that precedes the previous claim", () => {
+  it("never claims a row that precedes the previous claim", async () => {
     const matcher = new SuffixContentMatcher([row(1, 10, null, "x"), row(2, 20, null, "y")]);
-    expect(matcher.claim("y")?.messageId).toBe(2);
-    expect(matcher.claim("x")).toBeNull();
+    expect((await matcher.claim("y", samePayload))?.messageId).toBe(2);
+    expect(await matcher.claim("x", samePayload)).toBeNull();
   });
-  it("pairs tool-call-only rows by their tool-call ids, never by the shared empty-content hash", () => {
+  it("pairs tool-call-only rows by their tool-call ids, never by the shared empty-content hash", async () => {
     const matcher = new SuffixContentMatcher([toolCallOnlyRow(1, 10, ["call-new-1"]), toolCallOnlyRow(2, 20, ["call-new-2"])]);
     const key = (ids: string[]) => contentMatchKey({ identityHash: "empty-assistant", toolCallIds: ids, hasContent: false })!;
     // An older entry from a hole carries different calls and must not take a newer row.
-    expect(matcher.claim(key(["call-hole-1"]))).toBeNull();
-    expect(matcher.claim(key(["call-new-1"]))?.messageId).toBe(1);
-    expect(matcher.claim(key(["call-new-2"]))?.messageId).toBe(2);
+    expect(await matcher.claim(key(["call-hole-1"]), samePayload)).toBeNull();
+    expect((await matcher.claim(key(["call-new-1"]), samePayload))?.messageId).toBe(1);
+    expect((await matcher.claim(key(["call-new-2"]), samePayload))?.messageId).toBe(2);
     expect(matcher.multiCandidateClaims).toBe(0);
+  });
+
+  it("does not consume rejected candidates or advance the following claim", async () => {
+    const matcher = new SuffixContentMatcher([row(1, 10, null, "x"), row(2, 20, null, "y"), row(3, 30, null, "x")]);
+    expect(await matcher.claim("x", async () => false)).toBeNull();
+    expect(matcher.multiCandidateClaims).toBe(0);
+    expect((await matcher.claim("x", samePayload))?.messageId).toBe(1);
+    expect((await matcher.claim("y", samePayload))?.messageId).toBe(2);
+    expect((await matcher.claim("x", samePayload))?.messageId).toBe(3);
+  });
+
+  it("can prove a later same-key candidate while preserving monotonic order", async () => {
+    const matcher = new SuffixContentMatcher([row(1, 10, null, "x"), row(2, 20, null, "y"), row(3, 30, null, "x")]);
+    expect((await matcher.claim("x", async (candidate) => candidate.messageId === 3))?.messageId).toBe(3);
+    expect(await matcher.claim("y", samePayload)).toBeNull();
+    expect(await matcher.claim("x", samePayload)).toBeNull();
+  });
+
+  it("surfaces proof failures without claiming a row", async () => {
+    const matcher = new SuffixContentMatcher([row(1, 10, null, "x")]);
+    await expect(matcher.claim("x", async () => { throw new Error("proof unavailable"); })).rejects.toThrow("proof unavailable");
+    expect((await matcher.claim("x", samePayload))?.messageId).toBe(1);
   });
 
   it("never offers rows with neither text nor tool-call ids", () => {
