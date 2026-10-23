@@ -1,5 +1,15 @@
 # @martian-engineering/lossless-claw
 
+## 1.2.1
+
+### Patch Changes
+
+- [#1264](https://github.com/Martian-Engineering/lossless-claw/pull/1264) [`150c96f`](https://github.com/Martian-Engineering/lossless-claw/commit/150c96f395227f870b0bdfbb407d3eef3461d171) Thanks [@jalehman](https://github.com/jalehman)! - Bound the forced overflow-recovery raw tail by tokens when `freshTailMaxTokens` is unset. Recovery now caps the protected suffix at 25% of its target, so a default 64-message tail full of large tool results no longer blocks recovery with `no_compaction_progress`. Routine compaction is unchanged.
+
+- [#1263](https://github.com/Martian-Engineering/lossless-claw/pull/1263) [`d4aa0b5`](https://github.com/Martian-Engineering/lossless-claw/commit/d4aa0b5db46dd1c135d20b0197cc3da212d47667) Thanks [@jalehman](https://github.com/jalehman)! - Forced overflow recovery now honors the host-observed prompt size when the host owns prompt framing. Lossless scales the host's observed overflow into a stored-token target, so it no longer reports a successful no-op while the host is still over its budget.
+
+- [#1265](https://github.com/Martian-Engineering/lossless-claw/pull/1265) [`f5a9501`](https://github.com/Martian-Engineering/lossless-claw/commit/f5a95019d0dd5b746b0644e48af5c83d1f5de2eb) Thanks [@jalehman](https://github.com/jalehman)! - Stop opening the summary spend backoff when forced overflow recovery makes real progress but cannot reach its target because of the protected tail. Partial recovery no longer blocks foreground compaction on later assembles with `deferred compaction backoff active`. A forced pass that spends summarizer calls without reducing context still opens the backoff.
+
 ## 1.2.0
 
 <!-- release-rollback-version: 1.1.1 -->
