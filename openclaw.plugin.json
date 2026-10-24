@@ -216,6 +216,10 @@
       "label": "Stub Large Tool Payloads",
       "help": "When enabled, evictable tool-result rows whose payload was externalized via lcm-blob-migrate are replaced with a [LCM Tool Output: file_xxx | …] reference at assemble time. Fresh tail is never stubbed. The agent recovers the original output via lcm_describe(id=file_xxx, expandFile=true). Default off; requires running scripts/lcm-blob-migrate.mjs first to populate messages.large_content."
     },
+    "exposeLargeFilePaths": {
+      "label": "Expose Large File Paths",
+      "help": "When enabled, newly externalized large tool-output references include a validated local path beneath largeFilesDir for bounded search or ranged reads. Default off because remote or sandboxed agents may not share the host filesystem and paths may reveal deployment details. LCM file IDs remain available as a fallback."
+    },
     "leafChunkTokens": {
       "label": "Leaf Chunk Tokens",
       "help": "Maximum source tokens per leaf compaction chunk before summarization (default 20000)"
@@ -578,6 +582,9 @@
       "stubLargeToolPayloads": {
         "type": "boolean",
         "default": false
+      },
+      "exposeLargeFilePaths": {
+        "type": "boolean"
       },
       "leafChunkTokens": {
         "type": "integer",
