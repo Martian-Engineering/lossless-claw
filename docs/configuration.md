@@ -457,8 +457,8 @@ Lossless does not resolve provider credentials directly for compaction summaries
 A practical starting point for cost-sensitive setups is:
 
 ```env
-LCM_SUMMARY_MODEL=openai/gpt-5.4-mini
-LCM_EXPANSION_MODEL=openai/gpt-5.4-mini
+LCM_SUMMARY_MODEL=openai/gpt-6-luna
+LCM_EXPANSION_MODEL=openai/gpt-6-luna
 ```
 
 ### Session pattern matching
