@@ -55,6 +55,7 @@ const LcmExpandSchema = Type.Object({
     Type.Number({
       description:
         "Conversation ID to scope the expansion to. If omitted, uses the current session's conversation.",
+      minimum: 1,
     }),
   ),
   allConversations: Type.Optional(
