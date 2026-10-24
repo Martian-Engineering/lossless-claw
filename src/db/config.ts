@@ -114,6 +114,38 @@ export type LcmConfig = {
    * Default false; flag-flip is reversible at runtime.
    */
   stubLargeToolPayloads: boolean;
+  /**
+   * Lane split (Step 1) — master switch for lane-based assembly. Default
+   * false: lane tags are still recorded at ingest, but assembly behaves
+   * exactly as before.
+   */
+  laneSplitEnabled?: boolean;
+  /**
+   * Lane split (Step 2) — token cap for the conversation lane. Only this cap
+   * may trim the otherwise-protected conversation lane during lane-split
+   * assembly; it is the only brake on the lane that carries human text. When
+   * unset, the assembler derives the cap from the assembly budget
+   * (`DEFAULT_CONVERSATION_LANE_BUDGET_RATIO` = 0.85 x budget), so the cap
+   * scales with the window instead of sitting at a fixed absolute value. An
+   * explicit value always wins.
+   */
+  conversationLaneTokenCap?: number;
+  /**
+   * Lane split (Step 3) — within-lane priority inside the conversation lane.
+   * `"inline"` (default) counts reasoning as ordinary conversation tokens and
+   * reproduces Step 2 byte-for-byte; `"lowest"` drops reasoning blocks before
+   * any whole conversation message when the lane is under cap pressure.
+   */
+  laneReasoningMode?: "inline" | "lowest";
+  /**
+   * Lane split (Step 4) — *why* reasoning is shed inside the conversation lane.
+   * `"purpose-bound"` (default) only sheds when the lane's non-reasoning
+   * footprint already fits the cap, so the shed can actually bring the whole
+   * lane under it; otherwise it sheds nothing. `"always"` sheds the minimum
+   * necessary reasoning oldest-first to meet the cap, exactly as Step 3 did —
+   * that can spend replayed reasoning the suffix walk would not have used.
+   */
+  laneReasoningShedPolicy?: "always" | "purpose-bound";
   newSessionRetainDepth: number;
   leafMinFanout: number;
   condensedMinFanout: number;
@@ -710,6 +742,32 @@ export function resolveLcmConfigWithDiagnostics(
         env.LCM_STUB_LARGE_TOOL_PAYLOADS !== undefined
           ? env.LCM_STUB_LARGE_TOOL_PAYLOADS === "true"
           : toBool(pc.stubLargeToolPayloads) ?? false,
+      // Lane split (Step 1) — master switch for lane-based assembly. The
+      // other Step 1 keys that were registered but never read by the engine
+      // have been dropped.
+      laneSplitEnabled:
+        env.LCM_LANE_SPLIT_ENABLED !== undefined
+          ? env.LCM_LANE_SPLIT_ENABLED === "true"
+          : toBool(pc.laneSplitEnabled) ?? false,
+      conversationLaneTokenCap:
+        toPositiveInteger(parseFiniteInt(env.LCM_CONVERSATION_LANE_TOKEN_CAP))
+          ?? toPositiveInteger(toNumber(pc.conversationLaneTokenCap)),
+      // Lane split (Step 3) — "inline" is the default and reproduces Step 2.
+      // Only an explicit "lowest" (env or plugin config) opts in.
+      laneReasoningMode:
+        env.LCM_LANE_REASONING_MODE !== undefined
+          ? (env.LCM_LANE_REASONING_MODE === "lowest" ? "lowest" : "inline")
+          : (pc.laneReasoningMode === "lowest" ? "lowest" : "inline"),
+      // Lane split (Step 4) — "purpose-bound" is the default: only shed
+      // reasoning when the shed can actually bring the lane under its cap.
+      // Reasoning is replayed to the provider, so spending it for no gain is a
+      // real loss. An explicit "always" (env or plugin config) restores Step 3.
+      laneReasoningShedPolicy:
+        env.LCM_LANE_REASONING_SHED_POLICY !== undefined
+          ? (env.LCM_LANE_REASONING_SHED_POLICY === "always"
+              ? "always"
+              : "purpose-bound")
+          : (pc.laneReasoningShedPolicy === "always" ? "always" : "purpose-bound"),
       newSessionRetainDepth:
         parseFiniteInt(env.LCM_NEW_SESSION_RETAIN_DEPTH)
           ?? toNumber(pc.newSessionRetainDepth) ?? 2,
