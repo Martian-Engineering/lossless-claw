@@ -251,7 +251,9 @@ export function createLcmGrepTool(input: {
       lines.push(`**Pattern:** \`${pattern}\``);
       lines.push(`**Mode:** ${mode} | **Scope:** ${scope} | **Sort:** ${effectiveSort}`);
       if (conversationScope.allConversations) {
-        lines.push("**Conversation scope:** all conversations");
+        lines.push((conversationScope.conversationIds?.length ?? 0) > 0
+          ? `**Conversation scope:** permitted conversations (${conversationScope.conversationIds!.length})`
+          : "**Conversation scope:** all conversations");
       } else if (conversationScope.conversationId != null) {
         const familyCount = conversationScope.conversationIds?.length ?? 0;
         lines.push(
