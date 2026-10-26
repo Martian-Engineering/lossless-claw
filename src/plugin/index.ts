@@ -20,6 +20,7 @@ import { resolveLcmConfigWithDiagnostics, resolveOpenclawStateDir } from "../db/
 import type { LcmConfig } from "../db/config.js";
 import { closeLcmConnection, createLcmDatabaseConnection, normalizePath } from "../db/connection.js";
 import { LcmContextEngine } from "../engine.js";
+import { bindRuntimeExpansionGrantDatabase } from "../expansion-auth.js";
 import { createLcmLogger, describeLogError } from "../lcm-log.js";
 import { logStartupBannerOnce } from "../startup-banner-log.js";
 import { getSharedInit, setSharedInit, removeSharedInit } from "./shared-init.js";
@@ -1727,6 +1728,7 @@ const lcmPlugin = {
     let rejectDeferredInit: ((error: Error) => void) | null = null;
     let stopped = false;
     let shared: SharedLcmInit | null = null;
+    let unbindExpansionGrants: (() => void) | null = null;
 
     /** Normalize unknown failures into stable Error instances. */
     function toInitError(error: unknown): Error {
@@ -1739,6 +1741,7 @@ const lcmPlugin = {
       const nextDatabase = createLcmDatabaseConnection(dbPath);
       try {
         const nextEngine = new LcmContextEngine(deps, nextDatabase);
+        unbindExpansionGrants = bindRuntimeExpansionGrantDatabase(nextDatabase);
         database = nextDatabase;
         lcm = nextEngine;
         initError = null;
@@ -1913,6 +1916,8 @@ const lcmPlugin = {
       if (!lcm && !database) {
         rejectDeferredEngine(new Error("[lcm] Database connection closed after gateway_stop"));
       }
+      unbindExpansionGrants?.();
+      unbindExpansionGrants = null;
       if (database) {
         closeLcmConnection(database);
         database = null;
