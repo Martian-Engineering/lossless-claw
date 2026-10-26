@@ -701,6 +701,9 @@ export function buildMessageParts(params: {
     const metadataRecord = block.metadata.raw as Record<string, unknown> | undefined;
     const rawBlockType = safeString(metadataRecord?.rawType) ?? block.type;
     const partType = toPartType(rawBlockType);
+    // Externalization preserves authored ids on these plain-text tool results.
+    const isTextToolResult =
+      (role === "tool" || role === "toolResult") && isTextBlock(metadataRecord);
     const rawBlock =
       metadataRecord && rawBlockType !== block.type
         ? {
@@ -714,7 +717,7 @@ export function buildMessageParts(params: {
       safeString(metadataRecord?.toolUseId) ??
       safeString(metadataRecord?.tool_use_id) ??
       safeString(metadataRecord?.call_id) ??
-      (partType === "tool" ? safeString(metadataRecord?.id) : undefined) ??
+      (partType === "tool" || isTextToolResult ? safeString(metadataRecord?.id) : undefined) ??
       topLevelToolCallId;
 
     parts.push({
