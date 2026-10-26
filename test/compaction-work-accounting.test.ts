@@ -154,7 +154,8 @@ describe("engine compaction work and spend accounting", () => {
       sessionId: "protected", sessionFile: "/tmp/accounting.jsonl", tokenBudget: 24_000,
       currentTokenCount: 66_000, compactionTarget: "budget", force: true, runtimeSettings,
     });
-    expect(result).toMatchObject({ ok: storedTokens < 16_800, compacted: false, reason: "no compaction progress" });
+    // The host still observes 66k against a 24k budget, so a no-op is never success.
+    expect(result).toMatchObject({ ok: false, compacted: false, reason: "no compaction progress" });
     expect(complete).not.toHaveBeenCalled();
     expect(backoff).not.toHaveBeenCalled();
     expect(success).not.toHaveBeenCalled();
@@ -209,6 +210,42 @@ describe("engine compaction work and spend accounting", () => {
     });
     expect(summarize).toHaveBeenCalledOnce();
     expect(result.compacted).toBe(false);
+    expect(backoff).toHaveBeenCalledOnce();
+  });
+
+  it("does not open spend backoff when forced recovery progressed but could not reach target", async () => {
+    const { engine, compaction, compactionGuards, executeCompactionCore, conversationId, sessionId } = await seedRecovery();
+    const summarize = vi.fn(async () => "unused summary");
+    const tokensBefore = await engine.getSummaryStore().getContextTokenCount(conversationId);
+    vi.spyOn(compaction, "compactUntilUnder").mockImplementation(async (input) => {
+      await input.summarize("eligible source");
+      return { success: false, actionTaken: true, rounds: 1, finalTokens: tokensBefore - 1_000 };
+    });
+    const backoff = vi.spyOn(compactionGuards, "openSummarySpendBackoff");
+    const result = await executeCompactionCore.call(engine, {
+      conversationId, sessionId, sessionFile: "/tmp/accounting.jsonl", tokenBudget: 100,
+      force: true, legacyParams: { summarize },
+    });
+    expect(result).toMatchObject({ ok: false, compacted: true, reason: "could not reach target" });
+    expect(backoff).not.toHaveBeenCalled();
+    expect(compactionGuards.getSummarySpendBackoffUntil(
+      compactionGuards.resolveSummarySpendScope({ kind: "compaction", scope: sessionId }),
+    )).toBeNull();
+  });
+
+  it("still opens spend backoff when forced recovery spent without reducing tokens", async () => {
+    const { engine, compaction, compactionGuards, executeCompactionCore, conversationId, sessionId } = await seedRecovery();
+    const summarize = vi.fn(async () => "unused summary");
+    const tokensBefore = await engine.getSummaryStore().getContextTokenCount(conversationId);
+    vi.spyOn(compaction, "compactUntilUnder").mockImplementation(async (input) => {
+      await input.summarize("eligible source");
+      return { success: false, actionTaken: true, rounds: 1, finalTokens: tokensBefore };
+    });
+    const backoff = vi.spyOn(compactionGuards, "openSummarySpendBackoff");
+    await executeCompactionCore.call(engine, {
+      conversationId, sessionId, sessionFile: "/tmp/accounting.jsonl", tokenBudget: 100,
+      force: true, legacyParams: { summarize },
+    });
     expect(backoff).toHaveBeenCalledOnce();
   });
 

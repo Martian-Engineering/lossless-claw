@@ -74,7 +74,9 @@ function transcript(pairs = 12): VisibleSessionTranscriptMessageEntry[] {
 async function recover(
   entries: VisibleSessionTranscriptMessageEntry[],
   warm = false,
-  settings = config
+  settings: Omit<typeof config, "freshTailMaxTokens"> & {
+    freshTailMaxTokens?: number;
+  } = config
 ) {
   const complete = vi.fn(async () => ({
     content: [
@@ -267,6 +269,22 @@ describe("authoritative forced overflow recovery", () => {
     expect(
       retry.messages.filter((message) => message.role === "user")
     ).toHaveLength(1);
+  });
+
+  it("compacts a count-only default tail that covers the whole tool-heavy turn", async () => {
+    const entries = transcript();
+    const { freshTailMaxTokens: _unset, ...defaults } = config;
+    const { result, retry, before } = await recover(entries, false, {
+      ...defaults,
+      freshTailCount: 64,
+    });
+    expect(result.result!.tokensAfter).toBeLessThan(result.result!.tokensBefore!);
+    expect(estimateSerializedMessagesTokens(retry.messages)).toBeLessThan(before);
+    expect(retry.messages[0]).toMatchObject(entries[0]!.message);
+    const calls = retry.messages.flatMap(extractAssistantToolCallIdsForPairing);
+    const results = retry.messages.map(extractToolResultIdForPairing).filter(Boolean);
+    expect(results).toEqual(calls);
+    expect(results).toContain("call_11");
   });
 
   it("keeps unresolved calls and later raw history behind a recovery barrier", async () => {

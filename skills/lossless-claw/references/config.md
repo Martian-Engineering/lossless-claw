@@ -105,7 +105,7 @@ Debugging:
 
 Keeps the newest messages raw during routine compaction. If the configured count would split the newest user turn, Lossless expands the protected tail to include that user and its following assistant/tool suffix.
 
-Forced budget recovery can summarize older, complete assistant/tool groups after the newest user once the authoritative transcript is fully reconciled. It retains the initiating user and recent raw suffix, never splits a tool group, and stops at incomplete or ambiguous calls. Raw history remains persisted. See [forced recovery details](../../../docs/configuration.md).
+Forced budget recovery can summarize older, complete assistant/tool groups after the newest user once the authoritative transcript is fully reconciled. It retains the initiating user and a recent raw suffix (bounded by `freshTailMaxTokens`, or 25% of the recovery target when that is unset), never splits a tool group, and stops at incomplete or ambiguous calls. Raw history remains persisted. See [forced recovery details](../../../docs/configuration.md).
 
 Why it matters:
 

@@ -1844,6 +1844,137 @@ describe("LcmContextEngine.compact token budget plumbing", () => {
       }),
     );
   });
+
+  it.each(["codex-app-server", "openclaw-embedded"])(
+    "scales %s host-observed overflow into a stored-token forced recovery target",
+    async (executionHostId) => {
+      const infoLog = vi.fn();
+      const engine = createEngineWithDeps(
+        {},
+        {
+          log: { info: infoLog, warn: vi.fn(), error: vi.fn(), debug: vi.fn() },
+        },
+      );
+      const privateEngine = engine as unknown as {
+        compaction: {
+          evaluate: (
+            conversationId: number,
+            tokenBudget: number,
+            observed?: number,
+          ) => Promise<unknown>;
+          compact: (input: unknown) => Promise<unknown>;
+          compactUntilUnder: (input: unknown) => Promise<unknown>;
+        };
+      };
+
+      // Logged decision tuple: stored context fits the 189k stored-unit target
+      // while the host-serialized prompt is 294,981 against a 252,000 budget.
+      vi.spyOn(privateEngine.compaction, "evaluate").mockResolvedValue({
+        shouldCompact: false,
+        reason: "none",
+        storedTokens: 181_340,
+        currentTokens: 181_340,
+        threshold: 189_000,
+      });
+      vi.spyOn(privateEngine.compaction, "compact").mockResolvedValue({
+        actionTaken: false,
+        tokensBefore: 181_340,
+        tokensAfter: 181_340,
+        condensed: false,
+      });
+      const compactUntilUnderSpy = vi.spyOn(privateEngine.compaction, "compactUntilUnder");
+
+      const sessionId = `host-observed-forced-recovery-${executionHostId}`;
+      await engine.ingest({
+        sessionId,
+        message: { role: "user", content: "trigger" } as AgentMessage,
+      });
+
+      const result = await engine.compact({
+        sessionId,
+        sessionFile: "/tmp/session.jsonl",
+        tokenBudget: 252_000,
+        currentTokenCount: 294_981,
+        force: true,
+        compactionTarget: "budget",
+        runtimeSettings: buildRuntimeSettings(executionHostId),
+      });
+
+      const storedTarget = Math.floor((181_340 * 189_000) / 294_981);
+      expect(storedTarget).toBeLessThan(181_340);
+      expect(compactUntilUnderSpy).toHaveBeenCalledWith(
+        expect.objectContaining({
+          tokenBudget: 252_000,
+          targetTokens: storedTarget,
+        }),
+      );
+      expect(result).toMatchObject({
+        ok: false,
+        compacted: false,
+        reason: "no compaction progress",
+        result: { details: { targetTokens: storedTarget } },
+      });
+      expect(
+        infoLog.mock.calls
+          .map((call) => String(call[0]))
+          .some(
+            (message) =>
+              message.includes("[lcm] compact: decision") &&
+              message.includes(`hostObservedStoredTargetTokens=${storedTarget}`) &&
+              message.includes("shouldCompact=true"),
+          ),
+      ).toBe(true);
+    },
+  );
+
+  it("keeps the threshold target when the host-observed prompt is already under it", async () => {
+    const engine = createEngine();
+    const privateEngine = engine as unknown as {
+      compaction: {
+        evaluate: (
+          conversationId: number,
+          tokenBudget: number,
+          observed?: number,
+        ) => Promise<unknown>;
+        compactUntilUnder: (input: unknown) => Promise<unknown>;
+      };
+    };
+
+    vi.spyOn(privateEngine.compaction, "evaluate").mockResolvedValue({
+      shouldCompact: false,
+      reason: "none",
+      storedTokens: 120_000,
+      currentTokens: 120_000,
+      threshold: 189_000,
+    });
+    const compactUntilUnderSpy = vi
+      .spyOn(privateEngine.compaction, "compactUntilUnder")
+      .mockResolvedValue({
+        success: true,
+        actionTaken: false,
+        rounds: 0,
+        finalTokens: 252_000,
+      });
+
+    await engine.ingest({
+      sessionId: "host-observed-under-target",
+      message: { role: "user", content: "trigger" } as AgentMessage,
+    });
+
+    await engine.compact({
+      sessionId: "host-observed-under-target",
+      sessionFile: "/tmp/session.jsonl",
+      tokenBudget: 252_000,
+      currentTokenCount: 180_000,
+      force: true,
+      compactionTarget: "budget",
+      runtimeSettings: buildRuntimeSettings("openclaw-embedded"),
+    });
+
+    expect(compactUntilUnderSpy).toHaveBeenCalledWith(
+      expect.objectContaining({ targetTokens: 189_000, currentTokens: 252_000 }),
+    );
+  });
 });
 
 describe("#639 Mode 2 deferred-compaction wedge (live context exceeds target, no candidates)", () => {

@@ -2143,6 +2143,26 @@ export class LcmContextEngine implements ContextEngine {
       decision.rawTokensOutsideTail >= 0
         ? Math.floor(decision.rawTokensOutsideTail)
         : undefined;
+    // Host-owned framing reports observed tokens in serialized-prompt units,
+    // which can exceed stored tokens by well over the budget headroom on
+    // tool-heavy context. Forced budget recovery scales its target into stored
+    // units with the host's stored/observed ratio so a host that is still
+    // overflowing cannot be answered with an under-target no-op.
+    const hostObservedStoredTargetTokens =
+      forcedBudgetRecovery &&
+      promptFramingOwnedByHost &&
+      observedTokens !== undefined &&
+      observedTokens > forcedBudgetTargetTokens &&
+      decisionStoredTokens > 0
+        ? Math.max(
+            1,
+            Math.min(
+              forcedBudgetTargetTokens,
+              Math.floor((decisionStoredTokens * forcedBudgetTargetTokens) / observedTokens),
+            ),
+          )
+        : undefined;
+    const shouldCompact = decision.shouldCompact || hostObservedStoredTargetTokens !== undefined;
     const observedRuntimeOverhead =
       params.compactionTarget === "threshold" && compactableObservedTokens !== undefined
         ? Math.max(0, compactableObservedTokens - decisionStoredTokens)
@@ -2180,7 +2200,7 @@ export class LcmContextEngine implements ContextEngine {
     });
 
     this.deps.log.info(
-      `[lcm] compact: decision conversation=${conversationId} ${sessionLabel} compactionTarget=${params.compactionTarget ?? "budget"} force=${forceCompaction} tokenBudget=${tokenBudget} targetTokens=${targetTokens} storedTokens=${decisionStoredTokens} currentTokens=${decision.currentTokens} observedTokens=${observedTokens ?? "none"} hostOwnsPromptFraming=${promptFramingOwnedByHost} projectedTokens=${decisionProjectedTokens ?? "none"} rawTokensOutsideTail=${decisionRawTokensOutsideTail ?? "none"} thresholdPressureTokens=${thresholdPressureTokens ?? "none"} observedRuntimeOverhead=${observedRuntimeOverhead} shouldCompact=${decision.shouldCompact}`,
+      `[lcm] compact: decision conversation=${conversationId} ${sessionLabel} compactionTarget=${params.compactionTarget ?? "budget"} force=${forceCompaction} tokenBudget=${tokenBudget} targetTokens=${targetTokens} storedTokens=${decisionStoredTokens} currentTokens=${decision.currentTokens} observedTokens=${observedTokens ?? "none"} hostOwnsPromptFraming=${promptFramingOwnedByHost} projectedTokens=${decisionProjectedTokens ?? "none"} rawTokensOutsideTail=${decisionRawTokensOutsideTail ?? "none"} thresholdPressureTokens=${thresholdPressureTokens ?? "none"} observedRuntimeOverhead=${observedRuntimeOverhead} hostObservedStoredTargetTokens=${hostObservedStoredTargetTokens ?? "none"} shouldCompact=${shouldCompact}`,
     );
 
     if (!forceCompaction && !decision.shouldCompact) {
@@ -2451,7 +2471,7 @@ export class LcmContextEngine implements ContextEngine {
       };
     }
 
-    const convergenceTargetTokens = targetTokens;
+    const convergenceTargetTokens = hostObservedStoredTargetTokens ?? targetTokens;
 
     // When forced (overflow recovery) and the caller did not supply an
     // observed token count, assume we are at least at the token budget so
@@ -2518,11 +2538,22 @@ export class LcmContextEngine implements ContextEngine {
     }
     // Poor reduction is a spend signal only when an allowed summarizer call ran.
     // Guard errors already carry their backoff; never replace it with a new one.
+    // Forced recovery that committed a reduction but stopped at the protected
+    // tail is still working; a backoff would only block foreground relief
+    // while the host overflow persists.
+    const forcedRecoveryProgressed = forceCompaction && didCompact &&
+      compactResult.finalTokens < decision.currentTokens;
     if (!compactResult.success && !compactResult.authFailure && !compactResult.error && summaryAttempts > 0) {
-      this.compactionGuards.openSummarySpendBackoff({
-        scopeKey: summarySpendScopeKey,
-        reason: compactUntilReason,
-      });
+      if (forcedRecoveryProgressed) {
+        this.deps.log.info(
+          `[lcm] compact: spend backoff skipped conversation=${conversationId} ${sessionLabel} scope=${summarySpendScopeKey} reason=forced_recovery_progressed tokensBefore=${decision.currentTokens} tokensAfter=${compactResult.finalTokens}`,
+        );
+      } else {
+        this.compactionGuards.openSummarySpendBackoff({
+          scopeKey: summarySpendScopeKey,
+          reason: compactUntilReason,
+        });
+      }
     }
     this.deps.log.info(
       `[lcm] compact: done conversation=${conversationId} ${sessionLabel} ok=${compactResult.success} compacted=${didCompact} reason=${compactUntilReason.replaceAll(" ", "_")} tokensBefore=${decision.currentTokens} tokensAfter=${compactResult.finalTokens} rounds=${compactResult.rounds} duration=${formatDurationMs(Date.now() - startedAt)}`,
