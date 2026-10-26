@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { structuredPartsIdentity } from "../src/structured-anchor-identity.js";
+import { structuredPartsIdentity, toolProvenanceIdentity } from "../src/structured-anchor-identity.js";
 import { buildMessageParts } from "../src/message-content.js";
 import type { AgentMessage } from "../src/openclaw-bridge.js";
 const parts = (id: string, args: unknown) =>
@@ -94,6 +94,29 @@ describe("structured anchor identity", () => {
     expect(structuredPartsIdentity(build({ ...tool, ...modelIdentity }))).toBe(
       structuredPartsIdentity(build(tool)),
     );
+  });
+
+  it.each([
+    { label: "without an envelope id", envelopeId: undefined },
+    { label: "overriding an envelope id", envelopeId: "envelope-call" },
+  ])("keeps authored text-block call ids $label", ({ envelopeId }) => {
+    const build = (id: string, alias: "tool_call_id" | "toolCallId" = "tool_call_id") =>
+      buildMessageParts({
+        sessionId: "s",
+        fallbackContent: "same output",
+        message: {
+          role: "toolResult",
+          toolCallId: envelopeId,
+          content: [{ type: "text", text: "same output", [alias]: id }],
+        },
+      });
+    const original = build("exec:101");
+    expect(original[0]!.toolCallId).toBe("exec:101");
+    expect(toolProvenanceIdentity(build("exec:101"))).toBe(toolProvenanceIdentity(original));
+    expect(toolProvenanceIdentity(build("exec:101", "toolCallId"))).toBe(
+      toolProvenanceIdentity(original),
+    );
+    expect(toolProvenanceIdentity(build("exec:102"))).not.toBe(toolProvenanceIdentity(original));
   });
 });
 

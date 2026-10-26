@@ -152,4 +152,49 @@ describe("transcript anchor replay", () => {
       expect(await store.getMessages(conversation!.conversationId)).toEqual(before);
     });
   });
+
+  it.each([
+    { label: "without an envelope id", envelopeId: undefined },
+    { label: "overriding an envelope id", envelopeId: "envelope-call" },
+  ])("preserves corrected externalized text-block ids $label", async ({ envelopeId }) => {
+    await withTempHome(async () => {
+      const engine = createEngineWithConfig({ largeFileTokenThreshold: 20 });
+      const sessionId = "externalized-text-block-id";
+      const message = (id: string, alias: "tool_call_id" | "toolCallId" = "tool_call_id") =>
+        attachTranscriptEntryMeta({
+          role: "toolResult",
+          toolCallId: envelopeId,
+          content: [{ type: "text", text: "same large tool output\n".repeat(200), [alias]: id }],
+        }, { entryId: "corrected-text-block-entry", parentId: null, timestamp: null });
+      const original = message("exec:101");
+      await expect(engine.ingest({ sessionId, message: original })).resolves.toEqual({ ingested: true });
+      const store = engine.getConversationStore();
+      const conversation = await store.getConversationBySessionId(sessionId);
+      const [before] = await store.getMessages(conversation!.conversationId);
+      const originalParts = await store.getMessageParts(before!.messageId);
+      expect(before!.content).toContain("[LCM Tool Output:");
+      expect(originalParts[0]!.toolCallId).toBe("exec:101");
+      await expect(engine.ingest({ sessionId, message: original })).resolves.toEqual({ ingested: false });
+      await expect(engine.ingest({ sessionId, message: message("exec:101", "toolCallId") })).resolves.toEqual(
+        { ingested: false },
+      );
+
+      const corrected = message("exec:102");
+      await expect(engine.ingest({ sessionId, message: corrected })).resolves.toEqual({ ingested: true });
+      const after = await store.getMessages(conversation!.conversationId);
+      expect(after).toHaveLength(2);
+      expect(after[0]).toEqual({ ...before, transcriptEntryId: null });
+      expect(await store.getMessageParts(before!.messageId)).toEqual(originalParts);
+      expect(after[1]!.transcriptEntryId).toBe("corrected-text-block-entry");
+      const newParts = await store.getMessageParts(after[1]!.messageId);
+      expect(newParts[0]!.toolCallId).toBe("exec:102");
+      expect(readTrustState(engine, before!.messageId)).toEqual({ trust_state: "suspect" });
+      expect(readTrustState(engine, after[1]!.messageId)).toEqual({ trust_state: "verified" });
+      await expect(engine.ingest({ sessionId, message: corrected })).resolves.toEqual({ ingested: false });
+      await expect(engine.ingest({ sessionId, message: message("exec:102", "toolCallId") })).resolves.toEqual(
+        { ingested: false },
+      );
+      expect(await store.getMessages(conversation!.conversationId)).toEqual(after);
+    });
+  });
 });
