@@ -560,6 +560,17 @@ function hasReadOnlyRuntimeInspectionSignal(api: OpenClawPluginApi): boolean {
 }
 
 /** Runtime DB initialization is disabled for read-only inspection registrations. */
+/** Instance lifecycle exposed by OpenClaw 2026.9.5+ hosts; absent on older hosts. */
+type PluginInstanceLifecycle = {
+  onDispose?: (cleanup: () => void | Promise<void>) => unknown;
+};
+
+/** Read the optional instance lifecycle without depending on newer SDK types. */
+function readPluginLifecycle(api: OpenClawPluginApi): PluginInstanceLifecycle | undefined {
+  const lifecycle = (api as { lifecycle?: unknown }).lifecycle;
+  return lifecycle && typeof lifecycle === "object" ? (lifecycle as PluginInstanceLifecycle) : undefined;
+}
+
 function canInitializeRuntimeDatabase(api: OpenClawPluginApi): boolean {
   if (isReadOnlyRegistrationMode(readPluginRegistrationMode(api))) {
     return false;
@@ -1910,7 +1921,8 @@ const lcmPlugin = {
 
     api.on("gateway_start", reinitializeAfterGatewayStop);
 
-    api.on("gateway_stop", async () => {
+    /** Close this registration's database and drop its process-wide shared init. */
+    async function releaseRuntimeResources(): Promise<void> {
       stopped = true;
       nextShared.stopped = true;
       if (!lcm && !database) {
@@ -1924,8 +1936,16 @@ const lcmPlugin = {
       }
       lcm = null;
       resetInitializationState();
-      removeSharedInit(normalizedDbPath);
-    });
+      // A newer registration may already own this path; leave its entry alone.
+      if (getSharedInit(normalizedDbPath) === nextShared) {
+        removeSharedInit(normalizedDbPath);
+      }
+    }
+
+    api.on("gateway_stop", releaseRuntimeResources);
+    // Hosts that retire plugin instances (plugin reload) await these callbacks.
+    // Teardown is idempotent, so running after gateway_stop is harmless.
+    readPluginLifecycle(api)?.onDispose?.(releaseRuntimeResources);
 
     wirePluginHandlers(api, deps, nextShared, registrationConfig.openClawConfig);
 

@@ -73,14 +73,26 @@ async function loadGeneration(dbPath: string): Promise<PluginGeneration> {
   return { ...generation, auth };
 }
 
+/** Run the instance disposal callbacks the host awaits when it retires a generation. */
+async function disposeGeneration(generation: PluginGeneration): Promise<void> {
+  for (const dispose of generation.disposers) {
+    await dispose();
+  }
+}
+
 /** Retire a generation the way plugin reload does: gateway_stop, then instance disposal. */
 async function retireGeneration(generation: PluginGeneration): Promise<void> {
   for (const stop of generation.hooks.get("gateway_stop") ?? []) {
     await stop({ reason: "plugin replacement" }, {});
   }
-  for (const dispose of generation.disposers) {
-    await dispose();
-  }
+  await disposeGeneration(generation);
+}
+
+/** Build a unique temporary database path and remember it for cleanup. */
+function tempDbPath(dbPaths: string[]): string {
+  const dbPath = join(tmpdir(), `lossless-claw-reload-${Date.now()}-${Math.random().toString(16)}.db`);
+  dbPaths.push(dbPath);
+  return dbPath;
 }
 
 describe("plugin reload across generations", () => {
@@ -96,9 +108,9 @@ describe("plugin reload across generations", () => {
     }
   });
 
+  // Each test loads two full plugin module graphs, which is slow under a loaded runner.
   it("keeps a delegated expansion grant valid for a child that continues on the next generation", async () => {
-    const dbPath = join(tmpdir(), `lossless-claw-reload-${Date.now()}-${Math.random().toString(16)}.db`);
-    dbPaths.push(dbPath);
+    const dbPath = tempDbPath(dbPaths);
 
     const first = await loadGeneration(dbPath);
     const grant = first.auth.createDelegatedExpansionGrant({
@@ -122,5 +134,20 @@ describe("plugin reload across generations", () => {
     const result = JSON.stringify(await expand?.execute("call-1", { summaryIds: ["sum_missing"] }));
     expect(result).not.toContain("requires a valid grant");
     await retireGeneration(second);
-  });
+  }, 30_000);
+
+  it("releases its engine on disposal so the next generation does not reuse it", async () => {
+    const dbPath = tempDbPath(dbPaths);
+    const { getSharedInit } = await import("../src/plugin/shared-init.js");
+    const { normalizePath } = await import("../src/db/connection.js");
+
+    const first = await loadGeneration(dbPath);
+    expect(getSharedInit(normalizePath(dbPath))).toBeDefined();
+    await disposeGeneration(first);
+    expect(getSharedInit(normalizePath(dbPath))).toBeUndefined();
+
+    const second = await loadGeneration(dbPath);
+    expect(second.hooks.get("gateway_stop")).toHaveLength(1);
+    await retireGeneration(second);
+  }, 30_000);
 });
