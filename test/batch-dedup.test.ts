@@ -1,9 +1,9 @@
 import { describe, expect, it, vi } from "vitest";
 import { BatchDeduplicator } from "../src/batch-dedup.js";
+import { buildMessageParts } from "../src/message-content.js";
 import type { AgentMessage } from "../src/openclaw-bridge.js";
 import type {
   ConversationStore,
-  MessagePartRecord,
   MessageRecord,
 } from "../src/store/conversation-store.js";
 import type { SummaryStore } from "../src/store/summary-store.js";
@@ -11,7 +11,7 @@ import { makeMessage } from "./helpers.js";
 
 type FakeConversationStore = {
   messages: MessageRecord[];
-  toolCallIdsByMessageId?: Record<number, string[]>;
+  sourceMessagesById?: Record<number, AgentMessage>;
 };
 
 function makeConversationStore(initial: FakeConversationStore): ConversationStore {
@@ -20,23 +20,10 @@ function makeConversationStore(initial: FakeConversationStore): ConversationStor
       async (messageId: number) =>
         initial.messages.find((message) => message.messageId === messageId) ?? null,
     ),
-    getMessageParts: vi.fn(async (messageId: number) =>
-      (initial.toolCallIdsByMessageId?.[messageId] ?? []).map(
-        (toolCallId, ordinal): MessagePartRecord => ({
-          partId: `${messageId}:${ordinal}`,
-          messageId,
-          sessionId: "s1",
-          partType: "tool",
-          ordinal,
-          textContent: null,
-          toolCallId,
-          toolName: null,
-          toolInput: null,
-          toolOutput: null,
-          metadata: null,
-        }),
-      ),
-    ),
+    getMessageParts: vi.fn(async (messageId: number) => {
+      const message = initial.sourceMessagesById?.[messageId];
+      return message ? buildMessageParts({ sessionId: "s1", message, fallbackContent: "" }) : [];
+    }),
   } as unknown as ConversationStore;
 }
 
@@ -102,7 +89,7 @@ describe("BatchDeduplicator.matchesPersistedAnchor", () => {
     const dedup = makeDedup(
       {
         messages: [storedMessage("tool", "tool output tenant-secret-alpha", 1)],
-        toolCallIdsByMessageId: { 1: ["call-secret"] },
+        sourceMessagesById: { 1: toolResultMessage("tool output tenant-secret-alpha", "call-secret") },
       },
       redactTenantSecret,
     );
@@ -116,7 +103,7 @@ describe("BatchDeduplicator.matchesPersistedAnchor", () => {
     const dedup = makeDedup(
       {
         messages: [storedMessage("tool", "tool output ***", 1)],
-        toolCallIdsByMessageId: { 1: ["call-secret"] },
+        sourceMessagesById: { 1: toolResultMessage("tool output ***", "call-secret") },
       },
       redactTenantSecret,
     );
@@ -133,7 +120,7 @@ describe("BatchDeduplicator.matchesPersistedAnchor", () => {
     const dedup = makeDedup(
       {
         messages: [storedMessage("tool", "tool output tenant-secret-alpha", 1)],
-        toolCallIdsByMessageId: { 1: ["call-secret"] },
+        sourceMessagesById: { 1: toolResultMessage("tool output tenant-secret-alpha", "call-secret") },
       },
       redactTenantSecret,
     );
@@ -150,7 +137,7 @@ describe("BatchDeduplicator.matchesPersistedAnchor", () => {
     const dedup = makeDedup(
       {
         messages: [storedMessage("tool", "tool output ***", 1)],
-        toolCallIdsByMessageId: { 1: ["call-alpha"] },
+        sourceMessagesById: { 1: toolResultMessage("tool output ***", "call-alpha") },
       },
       redactTenantSecret,
     );
@@ -166,7 +153,10 @@ describe("BatchDeduplicator.matchesPersistedAnchor", () => {
   it("does not match a blank-content tool call against an unrelated call", async () => {
     const dedup = makeDedup({
       messages: [storedMessage("assistant", "", 1)],
-      toolCallIdsByMessageId: { 1: ["old-call"] },
+      sourceMessagesById: { 1: {
+        role: "assistant",
+        content: [{ type: "toolCall", id: "old-call", name: "bash", arguments: { command: "old" } }],
+      } },
     });
     const incoming = {
       role: "assistant",
@@ -174,5 +164,41 @@ describe("BatchDeduplicator.matchesPersistedAnchor", () => {
     } as AgentMessage;
 
     await expect(dedup.matchesPersistedAnchor(1, incoming)).resolves.toBe(false);
+  });
+
+  it.each([
+    { label: "tool name", changed: { toolName: "exec" } },
+    { label: "error flag", changed: { isError: true } },
+  ])("rejects changed $label even when host redaction proves the body", async ({ changed }) => {
+    const persisted = { ...toolResultMessage("tool output tenant-secret-alpha", "call-secret"), isError: false };
+    const replay = { ...persisted, content: "tool output ***" };
+    const dedup = makeDedup({
+      messages: [storedMessage("tool", persisted.content, 1)],
+      sourceMessagesById: { 1: persisted },
+    }, redactTenantSecret);
+    await expect(dedup.matchesPersistedAnchor(1, replay)).resolves.toBe(true);
+    await expect(dedup.matchesPersistedAnchor(1, { ...replay, ...changed })).resolves.toBe(false);
+  });
+
+  it("keeps assistant call arguments authoritative across a redacted text replay", async () => {
+    const message = (text: string, args: unknown): AgentMessage => ({
+      role: "assistant",
+      content: [
+        { type: "text", text },
+        { type: "toolCall", id: "call-secret", name: "read", arguments: args },
+      ],
+    });
+    const persisted = message("tenant-secret-alpha", { path: "a.txt", limit: 10 });
+    const dedup = makeDedup({
+      messages: [storedMessage("assistant", "tenant-secret-alpha", 1)],
+      sourceMessagesById: { 1: persisted },
+    }, redactTenantSecret);
+    const replay = {
+      ...message("***", { limit: 10, path: "a.txt" }),
+      provider: "provider", api: "api", model: "model", responseModel: "resolved-model",
+    };
+    await expect(dedup.matchesPersistedAnchor(1, replay)).resolves.toBe(true);
+    await expect(dedup.matchesPersistedAnchor(1, message("***", { path: "b.txt", limit: 10 })))
+      .resolves.toBe(false);
   });
 });

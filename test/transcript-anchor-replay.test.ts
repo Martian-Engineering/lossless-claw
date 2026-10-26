@@ -98,4 +98,58 @@ describe("transcript anchor replay", () => {
       expect(await store.getMessageCount(conversation!.conversationId)).toBe(1);
     });
   });
+
+  it.each([
+    { label: "tool name", changed: { toolName: "read" } },
+    { label: "error flag", changed: { isError: true } },
+  ])("preserves corrected $label despite an externalized body proof", async ({ changed }) => {
+    await withTempHome(async () => {
+      const engine = createEngineWithConfig({ largeFileTokenThreshold: 20 });
+      const sessionId = "externalized-tool-provenance";
+      const original = attachTranscriptEntryMeta({
+        role: "toolResult", toolCallId: "exec:101", toolName: "exec", isError: false,
+        content: "same large tool output\n".repeat(200),
+      }, { entryId: "corrected-tool-entry", parentId: null, timestamp: null });
+      await engine.ingest({ sessionId, message: original });
+      const store = engine.getConversationStore();
+      const conversation = await store.getConversationBySessionId(sessionId);
+      const [before] = await store.getMessages(conversation!.conversationId);
+      const originalParts = await store.getMessageParts(before!.messageId);
+      expect(before!.content).toContain("[LCM Tool Output:");
+      await expect(engine.ingest({ sessionId, message: original })).resolves.toEqual({ ingested: false });
+
+      const corrected = { ...original, ...changed };
+      await expect(engine.ingest({ sessionId, message: corrected })).resolves.toEqual({ ingested: true });
+      const after = await store.getMessages(conversation!.conversationId);
+      expect(after).toHaveLength(2);
+      expect(after[0]).toEqual({ ...before, transcriptEntryId: null });
+      expect(await store.getMessageParts(before!.messageId)).toEqual(originalParts);
+      expect(after[1]!.transcriptEntryId).toBe("corrected-tool-entry");
+      const newParts = await store.getMessageParts(after[1]!.messageId);
+      expect(JSON.parse(newParts[0]!.metadata!)).toMatchObject({
+        toolCallId: "exec:101", toolName: corrected.toolName, isError: corrected.isError,
+      });
+      expect(readTrustState(engine, before!.messageId)).toEqual({ trust_state: "suspect" });
+      expect(readTrustState(engine, after[1]!.messageId)).toEqual({ trust_state: "verified" });
+      await expect(engine.ingest({ sessionId, message: corrected })).resolves.toEqual({ ingested: false });
+      expect(await store.getMessages(conversation!.conversationId)).toEqual(after);
+    });
+  });
+
+  it("keeps externalized string tool replay idempotent without a declared tool name", async () => {
+    await withTempHome(async () => {
+      const engine = createEngineWithConfig({ largeFileTokenThreshold: 20 });
+      const sessionId = "externalized-unnamed-tool";
+      const message = attachTranscriptEntryMeta({
+        role: "toolResult", toolCallId: "exec:101", content: "large output\n".repeat(200),
+      }, { entryId: "unnamed-tool-entry", parentId: null, timestamp: null });
+      await expect(engine.ingest({ sessionId, message })).resolves.toEqual({ ingested: true });
+      const store = engine.getConversationStore();
+      const conversation = await store.getConversationBySessionId(sessionId);
+      const before = await store.getMessages(conversation!.conversationId);
+      expect(before[0]!.content).toContain("[LCM Tool Output:");
+      await expect(engine.ingest({ sessionId, message })).resolves.toEqual({ ingested: false });
+      expect(await store.getMessages(conversation!.conversationId)).toEqual(before);
+    });
+  });
 });

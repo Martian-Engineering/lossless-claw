@@ -421,6 +421,22 @@ describe("transcript delta resync", () => {
       incoming: { ...toolResult("exec:101", "same output"), toolName: "read" },
       expectedParts: [{ toolCallId: "exec:101", toolName: "read", textContent: "same output" }],
     },
+    {
+      label: "string tool result name",
+      stored: { role: "toolResult", content: "same output", toolCallId: "exec:101", toolName: "exec", isError: false },
+      incoming: { role: "toolResult", content: "same output", toolCallId: "exec:101", toolName: "read", isError: false },
+      expectedParts: [{ partType: "text", textContent: "same output", metadata: JSON.stringify({
+        originalRole: "toolResult", toolCallId: "exec:101", toolName: "read", isError: false,
+      }) }],
+    },
+    {
+      label: "string tool result error flag",
+      stored: { role: "toolResult", content: "same output", toolCallId: "exec:101", toolName: "exec", isError: false },
+      incoming: { role: "toolResult", content: "same output", toolCallId: "exec:101", toolName: "exec", isError: true },
+      expectedParts: [{ partType: "text", textContent: "same output", metadata: JSON.stringify({
+        originalRole: "toolResult", toolCallId: "exec:101", toolName: "exec", isError: true,
+      }) }],
+    },
   ])("preserves changed structured suffix messages after a same-session branch: $label", async ({ stored, incoming, expectedParts }) => {
     const { host, engine, db } = setup();
     const anchor = host.append(assistant("retained anchor"));
@@ -450,17 +466,28 @@ describe("transcript delta resync", () => {
     expect(await store.getMessages(conversation!.conversationId)).toEqual(after);
   });
 
-  it("restamps equivalent structured payloads with canonical argument keys", async () => {
+  it.each([
+    {
+      label: "canonical argument keys",
+      stored: toolCallOnly("exec:101", { command: "same", options: { a: 1, b: 2 } }),
+      incoming: toolCallOnly("exec:101", { options: { b: 2, a: 1 }, command: "same" }),
+    },
+    {
+      label: "identical string tool provenance",
+      stored: { role: "toolResult", content: "same output", toolCallId: "exec:101", toolName: "exec", isError: false },
+      incoming: { role: "toolResult", content: "same output", toolCallId: "exec:101", toolName: "exec", isError: false },
+    },
+  ])("restamps equivalent structured payloads with $label", async ({ stored, incoming }) => {
     const { host, engine, db } = setup();
     const anchor = host.append(assistant("retained anchor"));
-    host.append(toolCallOnly("exec:101", { command: "same", options: { a: 1, b: 2 } }));
+    host.append(stored);
     await bootstrap(engine);
     const store = engine.getConversationStore();
     const conversation = await store.getConversationForSession({ sessionId, sessionKey });
     const before = await store.getMessages(conversation!.conversationId);
     const originalParts = await store.getMessageParts(before[1]!.messageId);
     host.branch(anchor);
-    const rewrittenId = host.append(toolCallOnly("exec:101", { options: { b: 2, a: 1 }, command: "same" }));
+    const rewrittenId = host.append(incoming);
 
     await expect(bootstrap(engine)).resolves.toMatchObject({ importedMessages: 0 });
     const after = await store.getMessages(conversation!.conversationId);
@@ -468,6 +495,8 @@ describe("transcript delta resync", () => {
     expect(after[1]).toEqual({ ...before[1], transcriptEntryId: rewrittenId });
     expect(await store.getMessageParts(before[1]!.messageId)).toEqual(originalParts);
     expect(cursorRow(db)).toMatchObject({ frontierSeq: 2 });
+    await expect(bootstrap(engine)).resolves.toMatchObject({ importedMessages: 0 });
+    expect(await store.getMessages(conversation!.conversationId)).toEqual(after);
   });
 
   it("does not consume a stored candidate rejected by an earlier same-key entry", async () => {

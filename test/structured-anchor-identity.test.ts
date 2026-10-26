@@ -49,6 +49,52 @@ describe("structured anchor identity", () => {
     });
     expect(structuredPartsIdentity(replayParts)).toBe(structuredPartsIdentity(legacyParts));
   });
+
+  it.each([
+    { label: "tool name", toolCallId: "call", changed: { toolName: "read" } },
+    { label: "error flag", toolCallId: "call", changed: { isError: true } },
+    { label: "tool name without a call id", toolCallId: undefined, changed: { toolName: "read" } },
+    { label: "error flag without a call id", toolCallId: undefined, changed: { isError: true } },
+  ])("distinguishes string result $label stored only in metadata", ({ toolCallId, changed }) => {
+    const message = {
+      role: "toolResult",
+      content: "same output",
+      toolCallId,
+      toolName: "bash",
+      isError: false,
+    };
+    const stored = buildMessageParts({ sessionId: "s", fallbackContent: "", message });
+    const incoming = buildMessageParts({
+      sessionId: "s", fallbackContent: "", message: { ...message, ...changed },
+    });
+    expect(stored[0]).toMatchObject({ partType: "text", textContent: "same output" });
+    expect(stored[0]!.toolCallId).toBeUndefined();
+    expect(stored[0]!.toolName).toBeUndefined();
+    const metadata = JSON.parse(stored[0]!.metadata!);
+    expect(metadata).toMatchObject({ toolName: "bash", isError: false });
+    expect(metadata.toolCallId).toBe(toolCallId);
+    expect(structuredPartsIdentity(stored)).not.toBeNull();
+    expect(structuredPartsIdentity(incoming)).not.toBe(structuredPartsIdentity(stored));
+    expect(structuredPartsIdentity(buildMessageParts({
+      sessionId: "other", fallbackContent: "", message: { ...message },
+    }))).toBe(structuredPartsIdentity(stored));
+  });
+
+  it("ignores model affinity on metadata-only tool provenance but keeps plain text unstructured", () => {
+    const message = { role: "assistant", content: "same text" };
+    const modelIdentity = {
+      provider: "provider", api: "api", model: "requested-model", responseModel: "resolved-model",
+    };
+    const build = (message: AgentMessage) =>
+      buildMessageParts({ sessionId: "s", fallbackContent: "", message });
+    expect(structuredPartsIdentity(build(message))).toBeNull();
+    expect(structuredPartsIdentity(build({ ...message, ...modelIdentity }))).toBeNull();
+    const tool = { ...message, toolCallId: "call", toolName: "bash", isError: false };
+    expect(structuredPartsIdentity(build(tool))).not.toBeNull();
+    expect(structuredPartsIdentity(build({ ...tool, ...modelIdentity }))).toBe(
+      structuredPartsIdentity(build(tool)),
+    );
+  });
 });
 
 it("distinguishes result payloads with the same call id", () => {
