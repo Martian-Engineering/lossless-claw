@@ -1727,6 +1727,7 @@ const lcmPlugin = {
     if (existingInit && !existingInit.stopped) {
       deps.log.debug(`[lcm] Reusing shared engine init for db=${normalizedDbPath}`);
       wirePluginHandlers(api, deps, existingInit, registrationConfig.openClawConfig);
+      readPluginLifecycle(api)?.onDispose?.(existingInit.retain());
       return;
     }
 
@@ -1908,11 +1909,29 @@ const lcmPlugin = {
       }
     }
 
+    let disposableUsers = 0;
+    /** Count one disposable registration; its release closes the DB after the last one. */
+    function retainForDisposal(): () => Promise<void> {
+      disposableUsers += 1;
+      let released = false;
+      return async () => {
+        if (released) {
+          return;
+        }
+        released = true;
+        disposableUsers -= 1;
+        if (disposableUsers === 0) {
+          await releaseRuntimeResources();
+        }
+      };
+    }
+
     const nextShared: SharedLcmInit = {
       stopped: false,
       getCachedEngine: () => lcm,
       waitForEngine,
       waitForDatabase,
+      retain: retainForDisposal,
     };
     shared = nextShared;
     if (allowRuntimeDatabaseInit) {
@@ -1944,8 +1963,10 @@ const lcmPlugin = {
 
     api.on("gateway_stop", releaseRuntimeResources);
     // Hosts that retire plugin instances (plugin reload) await these callbacks.
-    // Teardown is idempotent, so running after gateway_stop is harmless.
-    readPluginLifecycle(api)?.onDispose?.(releaseRuntimeResources);
+    // Later registrations for other agent contexts reuse this database, so the
+    // last disposed registration closes it. Teardown is idempotent, so running
+    // after gateway_stop is harmless.
+    readPluginLifecycle(api)?.onDispose?.(nextShared.retain());
 
     wirePluginHandlers(api, deps, nextShared, registrationConfig.openClawConfig);
 

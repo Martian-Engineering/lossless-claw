@@ -25,6 +25,11 @@ export type SharedLcmInit = {
   waitForEngine: () => Promise<LcmContextEngine>;
   /** Async accessor for the initialized DB handle (waits for deferred init). */
   waitForDatabase: () => Promise<DatabaseSync>;
+  /**
+   * Count one disposable registration as a user of this init. The returned
+   * release closes the database once every counted registration has released.
+   */
+  retain: () => () => Promise<void>;
 };
 
 const SHARED_KEY = Symbol.for(

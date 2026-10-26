@@ -66,6 +66,11 @@ function buildApi(dbPath: string, generation: Omit<PluginGeneration, "auth">) {
 /** Load a fresh module graph, as OpenClaw does for each plugin generation, and register it. */
 async function loadGeneration(dbPath: string): Promise<PluginGeneration> {
   vi.resetModules();
+  return registerGeneration(dbPath);
+}
+
+/** Register the currently loaded module graph again, as OpenClaw does per agent context. */
+async function registerGeneration(dbPath: string): Promise<PluginGeneration> {
   const plugin = (await import("../index.js")).default;
   const auth = await import("../src/expansion-auth.js");
   const generation = { hooks: new Map(), tools: new Map(), disposers: [] };
@@ -149,5 +154,23 @@ describe("plugin reload across generations", () => {
     const second = await loadGeneration(dbPath);
     expect(second.hooks.get("gateway_stop")).toHaveLength(1);
     await retireGeneration(second);
+  }, 30_000);
+
+  it("keeps the shared database open while another registration still uses it", async () => {
+    const dbPath = tempDbPath(dbPaths);
+    const owner = await loadGeneration(dbPath);
+    const reuser = await registerGeneration(dbPath);
+    const { getSharedInit } = await import("../src/plugin/shared-init.js");
+    const { normalizePath } = await import("../src/db/connection.js");
+    const shared = getSharedInit(normalizePath(dbPath));
+    expect(shared).toBeDefined();
+
+    await disposeGeneration(owner);
+    expect(getSharedInit(normalizePath(dbPath))).toBe(shared);
+    const db = await shared!.waitForDatabase();
+    expect(db.prepare("SELECT 1 AS ok").get()).toEqual({ ok: 1 });
+
+    await disposeGeneration(reuser);
+    expect(getSharedInit(normalizePath(dbPath))).toBeUndefined();
   }, 30_000);
 });

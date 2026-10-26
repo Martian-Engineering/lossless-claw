@@ -256,7 +256,7 @@ OpenClaw can reload lossless-claw while the Gateway keeps running. Each reload s
 
 Some in-memory state is rebuilt after a reload. Losing it degrades behavior but does not break it: queued maintenance hints (the durable debt row stays authoritative), assembly-prefix diagnostics, the auth circuit breaker, and the summary spend limiter. A Gateway restart resets the same state.
 
-Teardown closes the database and drops the process-wide shared engine for this database path. It runs on `gateway_stop` and, on OpenClaw 2026.9.5 or later, from `api.lifecycle.onDispose`. lossless-claw starts no long-lived workers or timers; summarization runs inside host-owned maintenance calls.
+Teardown closes the database and drops the process-wide shared engine for this database path. It runs on `gateway_stop` and, on OpenClaw 2026.9.5 or later, from `api.lifecycle.onDispose` once the last plugin registration that shares the database has been disposed. lossless-claw starts no long-lived workers or timers; summarization runs inside host-owned maintenance calls.
 
 ## Runtime LLM boundary
 
