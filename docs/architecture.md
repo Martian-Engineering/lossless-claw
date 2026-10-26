@@ -205,6 +205,7 @@ Expansion uses a delegation grant system:
 - **Token caps** limit how much content the sub-agent can access
 - **TTL** ensures grants expire even if cleanup fails
 - **Revocation** happens on completion, cancellation, or sweep
+- **Storage**: grants and their child-session bindings live in the LCM database (`lcm_expansion_grants`, `lcm_expansion_grant_bindings`), so a child keeps its grant when a plugin reload moves it to a new plugin generation. Grants are authorization tokens, not conversation data; rows are pruned an hour after they expire
 
 The sub-agent only gets `lcm_expand` (the low-level tool), not `lcm_expand_query` — preventing recursive sub-agent spawning.
 
@@ -244,6 +245,18 @@ history.
 ## Operation serialization
 
 All mutating operations (ingest, compact) are serialized per-session using a promise queue. This prevents races between concurrent afterTurn/compact calls for the same conversation without blocking operations on different conversations.
+
+## Plugin reload
+
+OpenClaw can reload lossless-claw while the Gateway keeps running. Each reload stops and disposes the old plugin instance, then loads a fresh copy of the plugin module. State that a later call depends on therefore lives in SQLite, not in module memory:
+
+- transcript cursors, commit receipts, pending summaries, and compaction debt
+- delegated expansion grants and their child-session bindings
+- the host's input provenance for runtime-authored user turns. OpenClaw marks its continuation prompt with `provenance: { kind: "internal_system" }` and `display: false`. LCM keeps both fields in part metadata and restores them on assembly, so the prompt is not replayed as a message the user typed. These fields are not part of message identity, so rows stored before this change still match.
+
+Some in-memory state is rebuilt after a reload. Losing it degrades behavior but does not break it: queued maintenance hints (the durable debt row stays authoritative), assembly-prefix diagnostics, the auth circuit breaker, and the summary spend limiter. A Gateway restart resets the same state.
+
+Teardown closes the database and drops the process-wide shared engine for this database path. It runs on `gateway_stop` and, on OpenClaw 2026.9.5 or later, from `api.lifecycle.onDispose`. lossless-claw starts no long-lived workers or timers; summarization runs inside host-owned maintenance calls.
 
 ## Runtime LLM boundary
 
