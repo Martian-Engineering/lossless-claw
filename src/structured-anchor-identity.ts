@@ -30,17 +30,16 @@ function toolProvenance(part: Omit<CreateMessagePartInput, "sessionId">) {
   const metadata = asRecord(json(part.metadata));
   const envelope = pickTopLevelReplayMetadata(metadata ?? {});
   const raw = asRecord(metadata?.raw);
-  // Externalized text blocks gain synthetic tool fields. Their original
-  // provenance remains in the envelope; buildMessageParts promotes rawType to
-  // type, but retains the replacement's rawType/externalization markers.
+  // Externalized text blocks gain synthetic names, but only copy call ids.
+  // Keep the normalized id column when ignoring replacement raw fields;
+  // string-message names/errors remain in the original envelope.
   const externalizedText = raw?.toolOutputExternalized === true &&
     raw.externalizationReason === "large_tool_result" && raw.rawType !== undefined;
   const block = raw && !externalizedText && TOOL_RAW_TYPES.has(safeString(raw.type) ?? "")
     ? canonicalizeReplayRawMetadata(raw)
     : undefined;
-  const id = block || (!raw && part.partType === "tool")
-    ? part.toolCallId ?? safeString(block?.tool_use_id) ?? safeString(block?.call_id) ?? safeString(envelope.toolCallId)
-    : safeString(envelope.toolCallId);
+  const id = part.toolCallId ?? safeString(block?.tool_use_id) ?? safeString(block?.call_id)
+    ?? safeString(envelope.toolCallId);
   const name = block || (!raw && part.partType === "tool")
     ? part.toolName ?? safeString(block?.name) ?? safeString(envelope.toolName)
     : safeString(envelope.toolName);
