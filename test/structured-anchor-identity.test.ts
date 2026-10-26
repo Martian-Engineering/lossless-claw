@@ -2,6 +2,11 @@ import { describe, it, expect } from "vitest";
 import { structuredPartsIdentity, toolProvenanceIdentity } from "../src/structured-anchor-identity.js";
 import { buildMessageParts } from "../src/message-content.js";
 import type { AgentMessage } from "../src/openclaw-bridge.js";
+const toolIdAliases = ["toolCallId", "tool_call_id", "toolUseId", "tool_use_id", "call_id", "id"] as const;
+const toolIdCases = [
+  { label: "without an envelope id", envelopeId: undefined },
+  { label: "overriding an envelope id", envelopeId: "envelope-call" },
+].flatMap((row) => toolIdAliases.map((alias) => ({ ...row, alias })));
 const parts = (id: string, args: unknown) =>
   buildMessageParts({
     sessionId: "s",
@@ -96,27 +101,45 @@ describe("structured anchor identity", () => {
     );
   });
 
-  it.each([
-    { label: "without an envelope id", envelopeId: undefined },
-    { label: "overriding an envelope id", envelopeId: "envelope-call" },
-  ])("keeps authored text-block call ids $label", ({ envelopeId }) => {
-    const build = (id: string, alias: "tool_call_id" | "toolCallId" = "tool_call_id") =>
+  it.each(toolIdCases)("keeps authored text-block $alias call ids $label", ({ envelopeId, alias }) => {
+    const build = (id: string, field: (typeof toolIdAliases)[number] = alias, role = "toolResult") =>
       buildMessageParts({
         sessionId: "s",
         fallbackContent: "same output",
         message: {
-          role: "toolResult",
+          role,
           toolCallId: envelopeId,
-          content: [{ type: "text", text: "same output", [alias]: id }],
+          content: [{ type: "text", text: "same output", [field]: id }],
         },
       });
-    const original = build("exec:101");
-    expect(original[0]!.toolCallId).toBe("exec:101");
-    expect(toolProvenanceIdentity(build("exec:101"))).toBe(toolProvenanceIdentity(original));
-    expect(toolProvenanceIdentity(build("exec:101", "toolCallId"))).toBe(
-      toolProvenanceIdentity(original),
-    );
-    expect(toolProvenanceIdentity(build("exec:102"))).not.toBe(toolProvenanceIdentity(original));
+    for (const role of ["tool", "toolResult"]) {
+      const original = build("exec:101", alias, role);
+      expect(original[0]!.toolCallId).toBe("exec:101");
+      expect(toolProvenanceIdentity(build("exec:101", alias, role))).toBe(toolProvenanceIdentity(original));
+      expect(toolProvenanceIdentity(build("exec:101", "toolCallId", role))).toBe(
+        toolProvenanceIdentity(original),
+      );
+      expect(toolProvenanceIdentity(build("exec:102", alias, role))).not.toBe(toolProvenanceIdentity(original));
+    }
+  });
+
+  it.each(["user", "assistant"])("does not promote ordinary %s text ids to tool provenance", (role) => {
+    const original = buildMessageParts({
+      sessionId: "s", fallbackContent: "same text",
+      message: { role, content: [{ type: "text", text: "same text", id: "display-id" }] },
+    });
+    expect(original[0]!.toolCallId).toBeUndefined();
+    expect(structuredPartsIdentity(original)).toBeNull();
+    expect(toolProvenanceIdentity(original)).toBe("[]");
+  });
+
+  it.each(["tool", "toolResult"])("ignores generic ids on %s blocks without string text", (role) => {
+    const original = buildMessageParts({
+      sessionId: "s", fallbackContent: "",
+      message: { role, content: [{ type: "text", text: 42, id: "not-a-tool-id" }] },
+    });
+    expect(original[0]!.toolCallId).toBeUndefined();
+    expect(toolProvenanceIdentity(original)).toBe("[]");
   });
 });
 

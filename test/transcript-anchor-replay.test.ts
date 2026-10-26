@@ -10,6 +10,11 @@ import {
 } from "./helpers.js";
 
 afterEach(cleanupEngineTestState);
+const toolIdAliases = ["toolCallId", "tool_call_id", "toolUseId", "tool_use_id", "call_id", "id"] as const;
+const toolIdCases = [
+  { label: "without an envelope id", envelopeId: undefined },
+  { label: "overriding an envelope id", envelopeId: "envelope-call" },
+].flatMap((row) => toolIdAliases.map((alias) => ({ ...row, alias })));
 
 /** Read one message's persisted anchor-trust state directly from SQLite. */
 function readTrustState(engine: ReturnType<typeof createEngine>, messageId: number) {
@@ -153,18 +158,15 @@ describe("transcript anchor replay", () => {
     });
   });
 
-  it.each([
-    { label: "without an envelope id", envelopeId: undefined },
-    { label: "overriding an envelope id", envelopeId: "envelope-call" },
-  ])("preserves corrected externalized text-block ids $label", async ({ envelopeId }) => {
+  it.each(toolIdCases)("preserves corrected externalized text-block $alias ids $label", async ({ envelopeId, alias }) => {
     await withTempHome(async () => {
       const engine = createEngineWithConfig({ largeFileTokenThreshold: 20 });
       const sessionId = "externalized-text-block-id";
-      const message = (id: string, alias: "tool_call_id" | "toolCallId" = "tool_call_id") =>
+      const message = (id: string, field: (typeof toolIdAliases)[number] = alias) =>
         attachTranscriptEntryMeta({
           role: "toolResult",
           toolCallId: envelopeId,
-          content: [{ type: "text", text: "same large tool output\n".repeat(200), [alias]: id }],
+          content: [{ type: "text", text: "same large tool output\n".repeat(200), [field]: id }],
         }, { entryId: "corrected-text-block-entry", parentId: null, timestamp: null });
       const original = message("exec:101");
       await expect(engine.ingest({ sessionId, message: original })).resolves.toEqual({ ingested: true });
