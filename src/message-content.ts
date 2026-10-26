@@ -98,7 +98,22 @@ export const MODEL_IDENTITY_METADATA_KEYS = [
 ] as const;
 
 /**
- * Remove model-identity keys from a serialized part-metadata JSON object.
+ * Part-metadata keys that persist the host's input provenance for a user
+ * message (written by buildMessageParts on ordinal-0 parts). Like model
+ * identity, they describe where a message came from rather than what it says,
+ * so identity comparisons strip them and rows stored before provenance was
+ * recorded still match.
+ */
+export const INPUT_PROVENANCE_METADATA_KEYS = ["messageProvenance", "messageDisplay"] as const;
+
+const REPLAY_AFFINITY_METADATA_KEYS = [
+  ...MODEL_IDENTITY_METADATA_KEYS,
+  ...INPUT_PROVENANCE_METADATA_KEYS,
+] as const;
+
+/**
+ * Remove model-identity and input-provenance keys from a serialized
+ * part-metadata JSON object.
  *
  * Returns the input byte-identical when no identity keys are present, so
  * pre-upgrade rows keep their exact stored serialization. When keys are
@@ -123,10 +138,10 @@ export function stripModelIdentityFromMetadataJson(
     return metadata;
   }
   const record = parsed as Record<string, unknown>;
-  if (!MODEL_IDENTITY_METADATA_KEYS.some((key) => key in record)) {
+  if (!REPLAY_AFFINITY_METADATA_KEYS.some((key) => key in record)) {
     return metadata;
   }
-  for (const key of MODEL_IDENTITY_METADATA_KEYS) {
+  for (const key of REPLAY_AFFINITY_METADATA_KEYS) {
     delete record[key];
   }
   return JSON.stringify(record);
@@ -171,6 +186,37 @@ export function extractModelIdentityMetadata(
     identity.modelId !== undefined
     ? identity
     : undefined;
+}
+
+/**
+ * Read the host's input provenance from a user message.
+ *
+ * OpenClaw marks runtime-authored user turns, such as the continuation prompt
+ * after a plugin reload, with `provenance: { kind: "internal_system" }` and
+ * `display: false`. Returns the part-metadata fields that keep those facts,
+ * or undefined when the message carries neither.
+ */
+export function extractInputProvenanceMetadata(
+  message: AgentMessage,
+): { messageProvenance?: Record<string, unknown>; messageDisplay?: false } | undefined {
+  if (message.role !== "user") {
+    return undefined;
+  }
+  const topLevel = message as unknown as Record<string, unknown>;
+  const provenance = topLevel.provenance;
+  const hasProvenance =
+    !!provenance &&
+    typeof provenance === "object" &&
+    !Array.isArray(provenance) &&
+    typeof (provenance as { kind?: unknown }).kind === "string";
+  const hidden = topLevel.display === false;
+  if (!hasProvenance && !hidden) {
+    return undefined;
+  }
+  return {
+    ...(hasProvenance ? { messageProvenance: { ...(provenance as Record<string, unknown>) } } : {}),
+    ...(hidden ? { messageDisplay: false as const } : {}),
+  };
 }
 
 /** Return whether an assistant message contains visible text or replayable tool-call structure. */
@@ -596,6 +642,7 @@ export function buildMessageParts(params: {
   // missing identity as a cross-model switch and downgrades thinking blocks to
   // plain text, which corrupts reasoning-native models like Kimi K3).
   const modelIdentityMetadata = extractModelIdentityMetadata(message);
+  const inputProvenanceMetadata = extractInputProvenanceMetadata(message);
   const externalizedFileIds = Array.isArray(topLevel.externalizedFileIds)
     ? topLevel.externalizedFileIds.filter((fileId): fileId is string => typeof fileId === "string")
     : undefined;
@@ -649,6 +696,7 @@ export function buildMessageParts(params: {
         metadata: toJson({
           originalRole: role,
           ...(modelIdentityMetadata ?? {}),
+          ...(inputProvenanceMetadata ?? {}),
           toolCallId: topLevelToolCallId,
           toolName: topLevelToolName,
           isError: topLevelIsError,
@@ -745,6 +793,7 @@ export function buildMessageParts(params: {
       metadata: toJson({
         originalRole: role,
         ...(ordinal === 0 ? (modelIdentityMetadata ?? {}) : {}),
+        ...(ordinal === 0 ? (inputProvenanceMetadata ?? {}) : {}),
         toolCallId: topLevelToolCallId,
         toolName: topLevelToolName,
         isError: topLevelIsError,

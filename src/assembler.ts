@@ -357,6 +357,27 @@ function pickModelIdentity(parts: MessagePartRecord[]): StoredModelIdentity | un
   return undefined;
 }
 
+/**
+ * Read the host input provenance persisted by buildMessageParts, returned as
+ * the message fields OpenClaw reads (`provenance`, `display`).
+ */
+function pickInputProvenance(
+  parts: MessagePartRecord[],
+): { provenance?: Record<string, unknown>; display?: false } {
+  const decoded = parseJson(parts[0]?.metadata ?? null);
+  if (!decoded || typeof decoded !== "object") {
+    return {};
+  }
+  const record = decoded as { messageProvenance?: unknown; messageDisplay?: unknown };
+  const provenance = record.messageProvenance;
+  return {
+    ...(provenance && typeof provenance === "object" && !Array.isArray(provenance)
+      ? { provenance: provenance as Record<string, unknown> }
+      : {}),
+    ...(record.messageDisplay === false ? { display: false as const } : {}),
+  };
+}
+
 /** True when the part's message-level metadata carries a stored model identity. */
 function hasStoredModelIdentity(part: MessagePartRecord): boolean {
   return pickModelIdentity([part]) !== undefined;
@@ -1998,6 +2019,7 @@ export class ContextAssembler {
               ...(role === "user" && msg.openClawSenderMetadata
                 ? { __openclaw: msg.openClawSenderMetadata }
                 : {}),
+              ...(role === "user" ? pickInputProvenance(parts) : {}),
               ...(toolCallId ? { toolCallId } : {}),
               ...(toolName ? { toolName } : {}),
               ...(role === "toolResult" && toolIsError !== undefined ? { isError: toolIsError } : {}),
