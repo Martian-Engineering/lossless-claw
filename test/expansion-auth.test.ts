@@ -967,8 +967,8 @@ describe("distillForSubagent", () => {
           summaryId: "sum_b",
           children: [],
           messages: [
-            { messageId: 5, role: "user", snippet: "user said hello", tokenCount: 10 },
-            { messageId: 6, role: "assistant", snippet: "bot replied", tokenCount: 15 },
+            { messageId: 5, role: "user", content: "user said hello", snippet: "user said hello", tokenCount: 10 },
+            { messageId: 6, role: "assistant", content: "bot replied", snippet: "bot replied", tokenCount: 15 },
           ],
         },
       ],
@@ -992,6 +992,8 @@ describe("distillForSubagent", () => {
     expect(output).toContain("### sum_b (leaf");
     expect(output).toContain("msg#5 (user, 10 tokens)");
     expect(output).toContain("msg#6 (assistant, 15 tokens)");
+    expect(output).toContain("user said hello");
+    expect(output).toContain("bot replied");
 
     // Cited IDs
     expect(output).toContain("Cited IDs for follow-up:");
@@ -1031,7 +1033,7 @@ describe("distillForSubagent", () => {
             { summaryId: "sum_c1", kind: "leaf", snippet: "a", tokenCount: 100 },
             { summaryId: "sum_c2", kind: "leaf", snippet: "b", tokenCount: 200 },
           ],
-          messages: [{ messageId: 1, role: "user", snippet: "c", tokenCount: 50 }],
+          messages: [{ messageId: 1, role: "user", content: "c", snippet: "c", tokenCount: 50 }],
         },
       ],
       totalTokens: 350,
