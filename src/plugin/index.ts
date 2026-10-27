@@ -20,6 +20,7 @@ import { resolveLcmConfigWithDiagnostics, resolveOpenclawStateDir } from "../db/
 import type { LcmConfig } from "../db/config.js";
 import { closeLcmConnection, createLcmDatabaseConnection, normalizePath } from "../db/connection.js";
 import { LcmContextEngine } from "../engine.js";
+import { bindRuntimeExpansionGrantDatabase } from "../expansion-auth.js";
 import { createLcmLogger, describeLogError } from "../lcm-log.js";
 import { logStartupBannerOnce } from "../startup-banner-log.js";
 import { getSharedInit, setSharedInit, removeSharedInit } from "./shared-init.js";
@@ -559,6 +560,17 @@ function hasReadOnlyRuntimeInspectionSignal(api: OpenClawPluginApi): boolean {
 }
 
 /** Runtime DB initialization is disabled for read-only inspection registrations. */
+/** Instance lifecycle exposed by OpenClaw 2026.9.5+ hosts; absent on older hosts. */
+type PluginInstanceLifecycle = {
+  onDispose?: (cleanup: () => void | Promise<void>) => unknown;
+};
+
+/** Read the optional instance lifecycle without depending on newer SDK types. */
+function readPluginLifecycle(api: OpenClawPluginApi): PluginInstanceLifecycle | undefined {
+  const lifecycle = (api as { lifecycle?: unknown }).lifecycle;
+  return lifecycle && typeof lifecycle === "object" ? (lifecycle as PluginInstanceLifecycle) : undefined;
+}
+
 function canInitializeRuntimeDatabase(api: OpenClawPluginApi): boolean {
   if (isReadOnlyRegistrationMode(readPluginRegistrationMode(api))) {
     return false;
@@ -1715,6 +1727,7 @@ const lcmPlugin = {
     if (existingInit && !existingInit.stopped) {
       deps.log.debug(`[lcm] Reusing shared engine init for db=${normalizedDbPath}`);
       wirePluginHandlers(api, deps, existingInit, registrationConfig.openClawConfig);
+      readPluginLifecycle(api)?.onDispose?.(existingInit.retain());
       return;
     }
 
@@ -1727,6 +1740,7 @@ const lcmPlugin = {
     let rejectDeferredInit: ((error: Error) => void) | null = null;
     let stopped = false;
     let shared: SharedLcmInit | null = null;
+    let unbindExpansionGrants: (() => void) | null = null;
 
     /** Normalize unknown failures into stable Error instances. */
     function toInitError(error: unknown): Error {
@@ -1739,6 +1753,7 @@ const lcmPlugin = {
       const nextDatabase = createLcmDatabaseConnection(dbPath);
       try {
         const nextEngine = new LcmContextEngine(deps, nextDatabase);
+        unbindExpansionGrants = bindRuntimeExpansionGrantDatabase(nextDatabase);
         database = nextDatabase;
         lcm = nextEngine;
         initError = null;
@@ -1894,11 +1909,29 @@ const lcmPlugin = {
       }
     }
 
+    let disposableUsers = 0;
+    /** Count one disposable registration; its release closes the DB after the last one. */
+    function retainForDisposal(): () => Promise<void> {
+      disposableUsers += 1;
+      let released = false;
+      return async () => {
+        if (released) {
+          return;
+        }
+        released = true;
+        disposableUsers -= 1;
+        if (disposableUsers === 0) {
+          await releaseRuntimeResources();
+        }
+      };
+    }
+
     const nextShared: SharedLcmInit = {
       stopped: false,
       getCachedEngine: () => lcm,
       waitForEngine,
       waitForDatabase,
+      retain: retainForDisposal,
     };
     shared = nextShared;
     if (allowRuntimeDatabaseInit) {
@@ -1907,20 +1940,33 @@ const lcmPlugin = {
 
     api.on("gateway_start", reinitializeAfterGatewayStop);
 
-    api.on("gateway_stop", async () => {
+    /** Close this registration's database and drop its process-wide shared init. */
+    async function releaseRuntimeResources(): Promise<void> {
       stopped = true;
       nextShared.stopped = true;
       if (!lcm && !database) {
         rejectDeferredEngine(new Error("[lcm] Database connection closed after gateway_stop"));
       }
+      unbindExpansionGrants?.();
+      unbindExpansionGrants = null;
       if (database) {
         closeLcmConnection(database);
         database = null;
       }
       lcm = null;
       resetInitializationState();
-      removeSharedInit(normalizedDbPath);
-    });
+      // A newer registration may already own this path; leave its entry alone.
+      if (getSharedInit(normalizedDbPath) === nextShared) {
+        removeSharedInit(normalizedDbPath);
+      }
+    }
+
+    api.on("gateway_stop", releaseRuntimeResources);
+    // Hosts that retire plugin instances (plugin reload) await these callbacks.
+    // Later registrations for other agent contexts reuse this database, so the
+    // last disposed registration closes it. Teardown is idempotent, so running
+    // after gateway_stop is harmless.
+    readPluginLifecycle(api)?.onDispose?.(nextShared.retain());
 
     wirePluginHandlers(api, deps, nextShared, registrationConfig.openClawConfig);
 
