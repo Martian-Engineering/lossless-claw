@@ -1877,16 +1877,19 @@ export class ConversationStore {
       args.push(before.toISOString());
     }
     const whereClause = where.length > 0 ? `WHERE ${where.join(" AND ")}` : "";
+    const MAX_ROW_SCAN = 10_000;
+    // Bound the read in SQL: the JS loop below stops at MAX_ROW_SCAN anyway, and
+    // node:sqlite reads synchronously, so an unbounded SELECT blocks the host.
     const rows = this.db
       .prepare(
         `SELECT message_id, conversation_id, seq, role, content, token_count, created_at, large_content, transcript_entry_id, openclaw_sender_metadata
          FROM messages
          ${whereClause}
-         ORDER BY created_at DESC`,
+         ORDER BY created_at DESC
+         LIMIT ${MAX_ROW_SCAN}`,
       )
       .all(...args) as unknown as MessageRow[];
 
-    const MAX_ROW_SCAN = 10_000;
     const results: MessageSearchResult[] = [];
     let scanned = 0;
     for (const row of rows) {
