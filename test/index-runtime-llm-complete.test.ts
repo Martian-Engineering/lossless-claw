@@ -139,6 +139,7 @@ function getRegisteredEngine(api: OpenClawPluginApi, getFactory: () => Registere
         messages: Array<{ role: string; content: unknown }>;
         maxTokens: number;
         temperature?: number;
+        reasoning?: string;
         reasoningIfSupported?: string;
       }) => Promise<CompletionResult>;
       resolveModel: (modelRef?: string, providerHint?: string) => {
@@ -157,6 +158,30 @@ describe("createLcmDependencies.complete runtime.llm bridge", () => {
 
   afterEach(() => {
     vi.clearAllMocks();
+  });
+
+  it.each([
+    { requested: { reasoningIfSupported: "off" }, expected: "off" },
+    { requested: { reasoning: "high", reasoningIfSupported: "off" }, expected: "high" },
+    { requested: {}, expected: undefined },
+  ])("forwards the requested effort without overriding explicit reasoning: $expected", async ({ requested, expected }) => {
+    const runtimeLlmComplete = vi.fn(async (_params: Record<string, unknown>) => ({ text: "summary output" }));
+    const { api, getFactory, dbPath } = buildApi({ runtimeLlmComplete });
+    const engine = getRegisteredEngine(api, getFactory);
+    try {
+      await engine.deps.complete({
+        model: "example-model",
+        messages: [{ role: "user", content: "Summarize this." }],
+        maxTokens: 128,
+        ...requested,
+      });
+      expect(runtimeLlmComplete).toHaveBeenCalledTimes(1);
+      const payload = runtimeLlmComplete.mock.calls[0]?.[0] as Record<string, unknown>;
+      expect(payload.reasoning).toBe(expected);
+      if (expected === undefined) expect(payload).not.toHaveProperty("reasoning");
+    } finally {
+      closeLcmConnection(dbPath);
+    }
   });
 
   it("delegates model dispatch and auth to api.runtime.llm.complete without target-agent override", async () => {
@@ -198,6 +223,7 @@ describe("createLcmDependencies.complete runtime.llm bridge", () => {
         systemPrompt: "System summary policy.",
         purpose: "lossless-claw compaction summarization",
         authProfileId: "openai-codex:work",
+        reasoning: "low",
       });
       expect(result).toMatchObject({
         content: [{ type: "text", text: "summary output" }],
