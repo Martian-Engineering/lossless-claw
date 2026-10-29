@@ -151,6 +151,7 @@ export type TranscriptDeltaSyncDeps = {
   replayKeyStore: UserReplayKeyStore;
   gapStore: TranscriptGapStore;
   log: LcmDependencies["log"];
+  matchesPersistedAnchor: (messageId: number, message: AgentMessage) => Promise<boolean>;
   yieldToEventLoop?: () => Promise<void>;
 };
 
@@ -570,7 +571,11 @@ export class TranscriptDeltaSync {
             : 0;
         }
         const key = matcher.isEmpty ? null : contentMatchKeyForEntry(entry);
-        const row = key ? matcher.claim(key) : null;
+        const row = key
+          ? await matcher.claim(key, (candidate) =>
+              this.deps.matchesPersistedAnchor(candidate.messageId, messageFromVisibleEntry(entry)),
+            )
+          : null;
         if (row) {
           matches.set(index, row);
         }

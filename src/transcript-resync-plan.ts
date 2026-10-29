@@ -229,9 +229,9 @@ export function contentMatchKey(input: {
  * In-order content matcher for rewritten suffixes. Candidate rows are stored
  * rows after the anchor whose ids left the projection (or were never
  * stamped). Each claim takes the earliest unclaimed row with the same
- * `contentMatchKey` that follows the previous claim, so a copy-on-write
- * re-append maps back onto the original rows in order. Rows without a key
- * are never offered.
+ * `contentMatchKey` and proven payload equivalence that follows the previous
+ * claim. The key only narrows candidates: model-authored tool ids can recur
+ * with different arguments. Rows without a key are never offered.
  */
 export class SuffixContentMatcher {
   private readonly byKey = new Map<string, ContentMatchCandidate[]>();
@@ -258,8 +258,11 @@ export class SuffixContentMatcher {
     return this.byKey.size === 0;
   }
 
-  /** Claim the next in-order row for a `contentMatchKey`, or null when none remains. */
-  claim(key: string): ContentMatchCandidate | null {
+  /** Verify candidates before claiming: a rejected payload must not consume order. */
+  async claim(
+    key: string,
+    matches: (row: ContentMatchCandidate) => Promise<boolean>,
+  ): Promise<ContentMatchCandidate | null> {
     const group = this.byKey.get(key);
     if (!group) {
       return null;
@@ -268,16 +271,18 @@ export class SuffixContentMatcher {
     while (pointer < group.length && group[pointer]!.seq <= this.lastClaimedSeq) {
       pointer += 1;
     }
-    if (pointer >= group.length) {
-      this.pointers.set(key, pointer);
-      return null;
+    for (let index = pointer; index < group.length; index += 1) {
+      const row = group[index]!;
+      if (!(await matches(row))) {
+        continue;
+      }
+      if (group.length - pointer > 1) {
+        this.multiCandidateClaims += 1;
+      }
+      this.pointers.set(key, index + 1);
+      this.lastClaimedSeq = row.seq;
+      return row;
     }
-    if (group.length - pointer > 1) {
-      this.multiCandidateClaims += 1;
-    }
-    const row = group[pointer]!;
-    this.pointers.set(key, pointer + 1);
-    this.lastClaimedSeq = row.seq;
-    return row;
+    return null;
   }
 }
