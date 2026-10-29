@@ -34,6 +34,7 @@ const LcmDescribeSchema = Type.Object({
     Type.Number({
       description:
         "Physical conversation ID to scope describe lookups to. If omitted, uses the current session family.",
+      minimum: 1,
     }),
   ),
   allConversations: Type.Optional(
