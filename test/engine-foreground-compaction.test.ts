@@ -2,6 +2,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import type { LcmContextEngine } from "../src/engine.js";
 import type { CompactionGuards } from "../src/compaction-guards.js";
 import type { AgentMessage } from "../src/openclaw-bridge.js";
+import type { VisibleSessionTranscriptMessageEntry } from "../src/types.js";
 import { estimateSerializedMessagesTokens } from "../src/estimate-tokens.js";
 import { cleanupEngineTestState, createEngineWithDeps, createSessionFilePath, makeMessage } from "./helpers.js";
 
@@ -115,6 +116,112 @@ async function prepare(engine: LcmContextEngine) {
 }
 
 describe("foreground compaction before pressure eviction", () => {
+  it.each([false, true])("preserves anchored LCM continuity after native byte compaction (new semantic pressure: %s)", async pressure => {
+    const sessionKey = `agent:main:${SESSION}`;
+    const target = { agentId: "main", sessionId: SESSION, sessionKey, storePath: "/tmp/synthetic-host.sqlite" };
+    const projection: VisibleSessionTranscriptMessageEntry[] = [];
+    const messages: AgentMessage[] = [];
+    const readVisibleSessionTranscriptMessageEntries = vi.fn(async () => projection);
+    // Native boundary persistence is proved separately against a real host
+    // snapshot. Here its unchanged raw-message projection crosses the actual
+    // bootstrap, LCM store and pre-prompt assembly boundaries.
+    const nativeResult = {
+      ok: true, compacted: true,
+      result: { summary: "Native checkpoint of prior observations.", firstKeptEntryId: "host-20", tokensBefore: 50_000, tokensAfter: 2_000 },
+    };
+    const delegateCompactionToRuntime = vi.fn(async () => nativeResult);
+    const { engine, complete, log } = fixture({ bootstrapMaxTokens: 100_000 }, { readVisibleSessionTranscriptMessageEntries, delegateCompactionToRuntime });
+    const appendTurn = (turn: number) => {
+      for (const message of turnMessages(turn)) {
+        const index = messages.length;
+        messages.push(message);
+        projection.push({
+          entryId: `host-${index}`, parentId: index ? `host-${index - 1}` : null,
+          seq: index + 1, role: message.role, message,
+          createdAt: new Date(Number(message.timestamp)).toISOString(),
+        });
+      }
+    };
+    const bootstrap = () => engine.bootstrap({ sessionId: SESSION, sessionKey, runtimeContext: { sessionTarget: target, transcriptStorage: { kind: "sqlite" } } });
+    for (let turn = 0; turn < 6; turn += 1) appendTurn(turn);
+    await bootstrap();
+    const conversation = await engine.getConversationStore().getConversationForSession({ sessionId: SESSION, sessionKey });
+    expect(conversation?.bootstrappedAt).not.toBeNull();
+    const conversationId = conversation!.conversationId;
+    const priorOutput = await assemble(engine, messages);
+    const priorSummaries = await engine.getSummaryStore().getSummariesByConversation(conversationId);
+    expect(priorSummaries.length).toBeGreaterThan(0);
+    const priorLineage = () => Promise.all(priorSummaries.map(async summary => ({
+      summaryId: summary.summaryId,
+      messages: await engine.getSummaryStore().getSummaryMessages(summary.summaryId),
+      parents: await engine.getSummaryStore().getSummaryParents(summary.summaryId),
+    })));
+    const lineageBefore = await priorLineage();
+    expect(lineageBefore.some(summary => summary.messages.length > 0)).toBe(true);
+    expect((await persisted(engine, conversationId)).every(entry => entry.message.transcriptEntryId)).toBe(true);
+    if (pressure) {
+      for (let turn = 6; turn < 12; turn += 1) appendTurn(turn);
+      await bootstrap();
+    }
+    const original = await persisted(engine, conversationId);
+    const contextBefore = await engine.getSummaryStore().getContextItems(conversationId);
+    const tokensBefore = await engine.getSummaryStore().getContextTokenCount(conversationId);
+    const callsBefore = complete.mock.calls.length;
+    const params = {
+      sessionId: SESSION, sessionKey, sessionTarget: target, sessionFile: sessionKey,
+      tokenBudget: BUDGET, force: true, compactionTarget: "budget" as const,
+      runtimeContext: { preflightCompactionTrigger: "transcript_bytes", forceReason: "preflight_required" },
+    };
+    expect(await engine.compact(params)).toBe(nativeResult);
+    expect(delegateCompactionToRuntime).toHaveBeenCalledExactlyOnceWith(params);
+    expect(complete).toHaveBeenCalledTimes(callsBefore);
+    expect(await bootstrap()).toMatchObject({ importedMessages: 0 });
+    expect((await engine.getConversationStore().getConversationForSession({ sessionId: SESSION, sessionKey }))?.conversationId).toBe(conversationId);
+    expect(await persisted(engine, conversationId)).toEqual(original);
+    expect(await engine.getSummaryStore().getContextItems(conversationId)).toEqual(contextBefore);
+    expect(await engine.getSummaryStore().getSummariesByConversation(conversationId)).toEqual(priorSummaries);
+    expect(await priorLineage()).toEqual(lineageBefore);
+
+    // A native compaction can leave only a retained turn in the host model
+    // context. LCM must still reconstruct its own summary prefix and ancestry.
+    const retained = messages.slice(-4);
+    const output = await assemble(engine, retained);
+    expect(await persisted(engine, conversationId)).toEqual(original);
+    expect(await priorLineage()).toEqual(lineageBefore);
+    expect(delegateCompactionToRuntime).toHaveBeenCalledOnce();
+    // Stored messages are rehydrated with canonical text blocks and usage
+    // metadata. Compare the model-visible turn and opaque tool/thinking data;
+    // the exact durable originals are checked independently above.
+    const turnContent = (message: AgentMessage) => ({
+      role: message.role,
+      content: typeof message.content === "string" ? [{ type: "text", text: message.content }] : message.content,
+      toolCallId: Reflect.get(message, "toolCallId"),
+      provider: Reflect.get(message, "provider"),
+      api: Reflect.get(message, "api"),
+      model: Reflect.get(message, "model"),
+    });
+    expect(output.messages.slice(-retained.length).map(turnContent)).toEqual(retained.map(turnContent));
+    expect(JSON.stringify(output.messages)).toContain("Foreground summary");
+    const calls = output.messages.flatMap(message => Array.isArray(message.content) ? message.content : [])
+      .filter(block => block.type === "toolCall").map(block => block.id);
+    const results = output.messages.filter(message => message.role === "toolResult").map(message => Reflect.get(message, "toolCallId"));
+    expect(results).toEqual(calls);
+    if (pressure) {
+      expect(complete.mock.calls.length).toBeGreaterThan(callsBefore);
+      expect(await engine.getSummaryStore().getContextTokenCount(conversationId)).toBeLessThan(tokensBefore);
+      expect(output.estimatedTokens).toBeLessThan(BUDGET * 0.65);
+      expect(output.contextProjection?.epoch).not.toBe(priorOutput.contextProjection?.epoch);
+      expect(log.info.mock.calls.flat().join("\n")).toContain("reduced=true reachedTarget=true");
+      const summaries = await engine.getSummaryStore().getSummariesByConversation(conversationId);
+      for (const summary of priorSummaries) expect(summaries).toContainEqual(summary);
+    } else {
+      expect(complete).toHaveBeenCalledTimes(callsBefore);
+      expect(await engine.getSummaryStore().getContextItems(conversationId)).toEqual(contextBefore);
+      expect(output.messages).toEqual(priorOutput.messages);
+      expect(output.contextProjection?.epoch).toBe(priorOutput.contextProjection?.epoch);
+    }
+  });
+
   it("recovers missing maintenance before trimming, preserving history, lineage and the subsequent prefix", async () => {
     const { engine, complete, log } = fixture();
     const { messages, conversationId } = await seed(engine, true);
