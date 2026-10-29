@@ -46,6 +46,12 @@ export type DynamicLeafChunkTokensConfig = {
 
 export type ProactiveThresholdCompactionMode = "deferred" | "inline";
 
+export type ConversationScopePolicy = {
+  mode: "unrestricted" | "principal";
+  /** Operator-controlled exceptions; never populated from tool arguments. */
+  unrestrictedAgents: string[];
+};
+
 export type IndependentLogFileConfig = {
   enabled: boolean;
   file?: string;
@@ -80,6 +86,8 @@ export type LcmConfigDiagnostics = {
 
 export type LcmConfig = {
   enabled: boolean;
+  /** Optional in-process recall scoping for a shared database. */
+  conversationScopePolicy?: ConversationScopePolicy;
   /**
    * How to declare agent-run host requirements. "error" (default): require the full
    * context-engine lifecycle and fail closed on CLI-backed hosts. "capture-only": relax the
@@ -507,6 +515,25 @@ function parseEnvStrArray(value: string | undefined): string[] | undefined {
     .filter(Boolean);
 }
 
+function resolveConversationScopePolicy(value: unknown): ConversationScopePolicy {
+  if (value === undefined) return { mode: "unrestricted", unrestrictedAgents: [] };
+  const record = toRecord(value);
+  if (!record || (record.mode !== undefined && record.mode !== "unrestricted" && record.mode !== "principal")) {
+    throw new Error("conversationScopePolicy.mode must be unrestricted or principal");
+  }
+  if (Object.keys(record).some((key) => !["mode", "unrestrictedAgents"].includes(key))) {
+    throw new Error("conversationScopePolicy contains an unknown option");
+  }
+  const agents = record.unrestrictedAgents ?? [];
+  if (!Array.isArray(agents) || agents.some((agent) => typeof agent !== "string" || !agent.trim() || agent.includes(":"))) {
+    throw new Error("conversationScopePolicy.unrestrictedAgents must contain non-empty agent IDs");
+  }
+  return {
+    mode: record.mode === "principal" ? "principal" : "unrestricted",
+    unrestrictedAgents: [...new Set(agents.map((agent: string) => agent.trim()))],
+  };
+}
+
 function resolvePatternArray(params: {
   envValue: string | undefined;
   pluginValue: unknown;
@@ -666,6 +693,7 @@ export function resolveLcmConfigWithDiagnostics(
 
   return {
     config: {
+      conversationScopePolicy: resolveConversationScopePolicy(pc.conversationScopePolicy),
       enabled:
         env.LCM_ENABLED !== undefined
           ? env.LCM_ENABLED !== "false"

@@ -14,7 +14,7 @@ import {
   type ExpansionResult,
 } from "../expansion.js";
 import { jsonResult } from "./common.js";
-import { resolveLcmConversationScope } from "./lcm-conversation-scope.js";
+import { getLcmConversationIds, resolveLcmConversationScope } from "./lcm-conversation-scope.js";
 import {
   normalizeSummaryIds,
   runDelegatedExpansionLoop,
@@ -356,9 +356,11 @@ export function createLcmExpandTool(input: {
           if (conversationScope.conversationId != null) {
             const outOfScope: string[] = [];
             for (const summaryId of summaryIds) {
-              const described = await retrieval.describe(summaryId);
+              const described = await retrieval.describe(summaryId, {
+                conversationIds: getLcmConversationIds(conversationScope),
+              });
               if (
-                described?.type === "summary" &&
+                described?.type !== "summary" ||
                 described.summary?.conversationId !== conversationScope.conversationId
               ) {
                 outOfScope.push(summaryId);

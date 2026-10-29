@@ -39,6 +39,42 @@ The `hooks` object is host policy beside `config`, not a Lossless config field.
 If it is absent, the context engine can still load while the static recall
 policy is omitted from the system prompt.
 
+## Principal-scoped recall
+
+`conversationScopePolicy` is operator configuration under
+`plugins.entries.lossless-claw.config`:
+
+```json
+{
+  "conversationScopePolicy": {
+    "mode": "principal",
+    "unrestrictedAgents": ["main"]
+  }
+}
+```
+
+- `mode`: `"unrestricted"` (default) or opt-in `"principal"`; no env override.
+- `unrestrictedAgents`: exact agent IDs exempt from top-level confinement (default `[]`).
+- Principal mode confines all four recall tools, including direct summary/file IDs,
+  to the host session's agent, channel, and DM/group/channel identity. A key shaped
+  `agent:<agent>:<channel>:direct|group|channel:<id>` on `telegram`, `discord`, or
+  `line` uses its first five segments; a final `:heartbeat` is removed. Other
+  valid agent-scoped keys, including custom/unknown channels, match exactly.
+- Archived segments remain accessible. `allConversations` requests multiple
+  conversations within the permitted principal; it does not bypass the policy.
+- Missing/non-agent host keys, unknown owners, and an empty permitted set fail closed.
+  Tool arguments cannot choose an identity. Direct-ID ownership is checked before
+  loading content or files and before delegated grants are created.
+- Delegated grants and the child's own exact active conversation keep their current
+  behavior. Exceptions never enlarge grants.
+- This covers recall tools, not automatic context assembly, CLI/DB access, or other
+  host tools. For untrusted tenants use OS-protected separate databases/workspaces.
+  No new OpenClaw API or minimum version is required.
+- Trusts host-provided session keys, stored ownership, and normal per-conversation
+  DAG/message links. It does not defend against DB writers or corrupted cross-owner links.
+
+See [Principal-scoped recall](../../../docs/configuration.md#principal-scoped-recall).
+
 ## High-impact settings
 
 These are the settings most operators should understand first.
