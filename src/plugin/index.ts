@@ -1295,7 +1295,7 @@ function createLcmDependencies(
   const envSnapshot = snapshotPluginEnv();
   const pluginConfig = registrationConfig.pluginConfig;
   const { config, diagnostics } = resolveLcmConfigWithDiagnostics(process.env, pluginConfig);
-  const log = createLcmLogger(api, config);
+  const log = createLcmLogger(api, config, registrationConfig.openClawConfig);
 
   if (diagnostics.ignoreSessionPatternsEnvOverridesPluginConfig) {
     logStartupBannerOnce({
