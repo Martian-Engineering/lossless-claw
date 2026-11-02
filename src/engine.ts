@@ -648,6 +648,8 @@ export class LcmContextEngine implements ContextEngine {
           replayKeyStore: this.userReplayKeyStore,
           gapStore: new TranscriptGapStore(this.db),
           log: this.deps.log,
+          matchesPersistedAnchor: (messageId, message) =>
+            this.batchDeduplicator.matchesPersistedAnchor(messageId, message),
         })
       : null;
     this.telemetryRecorder = new CompactionTelemetryRecorder(
