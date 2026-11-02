@@ -372,6 +372,8 @@ const LOSSLESS_RECALL_POLICY_PROMPT = [
   "3. `lcm_expand_query` — deep recall: spawns bounded sub-agent, expands DAG, and returns answer plus cited summary IDs in tool output for follow-up (~120s, don't ration it)",
   "",
   "**`lcm_grep` routing guidance:**",
+  "- `lcm_grep` requires `pattern`, not `query`, in both search modes; `lcm_expand_query` uses `query` for its search input.",
+  '- Example: `lcm_grep(pattern: "database migration", mode: "full_text")`.',
   '- Prefer `mode: "full_text"` for keyword or topical recall; keep `mode: "regex"` for regular expressions and literal patterns that use regex syntax.',
   '- Full-text queries are not regexes. Alternation (`A|B`), regex wildcards (`.*`), character classes (`[abc]`), and anchors (`^foo`, `foo$`) require `mode: "regex"`.',
   '- Full-text queries use FTS5 semantics, and FTS5 defaults to AND matching, so extra terms make matching stricter rather than broader.',
