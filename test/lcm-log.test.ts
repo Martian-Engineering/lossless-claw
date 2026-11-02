@@ -87,6 +87,24 @@ function baseConfig(file: string, independentLogFileEnabled = true): LcmConfig {
 }
 
 describe("createLcmLogger", () => {
+  it("uses registration redaction before the global runtime config is ready", () => {
+    const file = path.join(tempDir, "registration.log");
+    const current = vi.fn(() => { throw new Error("Runtime config is not prepared"); });
+    const logger = createLcmLogger({
+      runtime: { config: { current } },
+      logger: { info: vi.fn(), warn: vi.fn(), error: vi.fn(), debug: vi.fn() },
+    } as never, baseConfig(file), {
+      logging: { redactSensitive: "tools", redactPatterns: ["registration-secret-[0-9]+"] },
+    });
+
+    logger.info("registration-probe registration-secret-12345");
+
+    const text = fs.readFileSync(file, "utf8");
+    expect(text).not.toContain("registration-secret-12345");
+    expect(text).toContain("registration-probe");
+    expect(current).not.toHaveBeenCalled();
+  });
+
   function createRuntimeLogger(
     file: string,
     options: { shouldLogVerbose?: boolean; runtimeConfig?: Record<string, unknown> } = {},
