@@ -256,6 +256,16 @@ function loadCollisionReasons(db: DatabaseSync, conversationIds: number[]): stri
      HAVING COUNT(*) > 1`,
     conversationIds,
   );
+  const duplicateStableEventKeys = loadDuplicateRows(
+    db,
+    `SELECT stable_event_key AS value, COUNT(*) AS count
+     FROM messages
+     WHERE conversation_id IN (__IDS__)
+       AND stable_event_key IS NOT NULL
+     GROUP BY stable_event_key
+     HAVING COUNT(*) > 1`,
+    conversationIds,
+  );
   const duplicateSummaries = loadDuplicateRows(
     db,
     `SELECT summary_id AS value, COUNT(*) AS count
@@ -277,6 +287,9 @@ function loadCollisionReasons(db: DatabaseSync, conversationIds: number[]): stri
   const reasons: string[] = [];
   if (duplicateTranscriptEntries.length > 0) {
     reasons.push("duplicate transcript_entry_id");
+  }
+  if (duplicateStableEventKeys.length > 0) {
+    reasons.push("duplicate stable_event_key");
   }
   if (duplicateSummaries.length > 0) {
     reasons.push("duplicate summary_id");
