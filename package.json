@@ -6,7 +6,8 @@
   "main": "dist/index.js",
   "bin": {
     "lcm": "dist/cli.js",
-    "lossless-claw-migrate-sessions": "dist/migrate-sessions.js"
+    "lossless-claw-migrate-sessions": "dist/migrate-sessions.js",
+    "lcm-gap-repair": "dist/gap-repair.js"
   },
   "license": "MIT",
   "author": "Josh Lehman <josh@martian.engineering>",
@@ -20,7 +21,7 @@
     "dag"
   ],
   "scripts": {
-    "build": "npm run build:plugin && npm run build:migrate-sessions && npm run build:cli && npm run build:ui",
+    "build": "npm run build:plugin && npm run build:migrate-sessions && npm run build:cli && npm run build:ui && npm run build:gap-repair",
     "build:plugin": "esbuild index.ts --bundle --platform=node --target=node22 --format=esm --outfile=dist/index.js --external:openclaw --external:\"@earendil-works/*\" --minify-whitespace",
     "build:migrate-sessions": "esbuild src/cli/migrate-sessions.ts --bundle --platform=node --target=node22 --format=esm --outfile=dist/migrate-sessions.js --external:openclaw --external:\"@earendil-works/*\" --minify-whitespace",
     "build:cli": "esbuild cli.ts --bundle --platform=node --target=node22 --format=esm --outfile=dist/cli.js --minify-whitespace",
@@ -31,7 +32,8 @@
     "test:tui": "cd tui && go test ./...",
     "typecheck": "tsc --noEmit --pretty false && tsc -p tsconfig.ui.json",
     "version-packages": "changeset version",
-    "build:ui": "esbuild ui/control-ui.ts --bundle --platform=browser --target=es2022 --format=esm --outfile=dist/control-ui/index.js --minify"
+    "build:ui": "esbuild ui/control-ui.ts --bundle --platform=browser --target=es2022 --format=esm --outfile=dist/control-ui/index.js --minify",
+    "build:gap-repair": "esbuild src/cli/gap-repair.ts --bundle --platform=node --target=node22 --format=esm --outfile=dist/gap-repair.js --external:openclaw --external:\"@earendil-works/*\" --minify-whitespace"
   },
   "files": [
     "dist/",

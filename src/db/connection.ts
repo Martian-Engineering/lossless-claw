@@ -1,6 +1,7 @@
 import { mkdirSync } from "node:fs";
 import { dirname, resolve } from "node:path";
 import { DatabaseSync } from "node:sqlite";
+import { acquireDatabaseLease } from "./maintenance-fence.js";
 
 type ConnectionKey = string;
 /**
@@ -11,6 +12,12 @@ type ConnectionKey = string;
 const SQLITE_BUSY_TIMEOUT_MS = 30_000;
 
 const connectionsByPath = new Map<ConnectionKey, Set<DatabaseSync>>();
+const maintenanceConnections = new WeakSet<DatabaseSync>();
+export function assertMaintenanceConnection(db: DatabaseSync): void {
+  if (!maintenanceConnections.has(db))
+    throw new Error("Exclusive maintenance connection required");
+}
+
 const connectionIndex = new Map<DatabaseSync, ConnectionKey>();
 
 function normalizeDbPathInput(dbPath: string): string {
@@ -108,7 +115,11 @@ function closeDatabase(db: DatabaseSync | undefined): void {
   try {
     // Update query planner statistics for tables that changed since last optimize.
     // Separate try so a SQLITE_BUSY/SQLITE_READONLY from optimize doesn't skip close.
-    try { db.exec("PRAGMA optimize"); } catch { /* best-effort */ }
+    try {
+      db.exec("PRAGMA optimize");
+    } catch {
+      /* best-effort */
+    }
     db.close();
   } catch {
     // Ignore close failures; callers are shutting down anyway.
@@ -122,13 +133,37 @@ function closeDatabase(db: DatabaseSync | undefined): void {
  *
  * Connections are tracked so tests can close them by path via closeLcmConnection().
  */
-export function createLcmDatabaseConnection(dbPath: string): DatabaseSync {
+export function createLcmDatabaseConnection(
+  dbPath: string,
+  options?: { maintenance?: boolean }
+): DatabaseSync {
   ensureDbDirectory(dbPath);
-  const db = createDatabaseSync(dbPath);
+  const release = isInMemoryPath(dbPath)
+    ? () => {}
+    : acquireDatabaseLease(dbPath, options?.maintenance);
+  let db: DatabaseSync;
+  try {
+    db = createDatabaseSync(dbPath);
+  } catch (error) {
+    release();
+    throw error;
+  }
+  const close = db.close.bind(db);
+  db.close = () => {
+    close();
+    maintenanceConnections.delete(db);
+    release();
+  };
+  if (options?.maintenance && !isInMemoryPath(dbPath))
+    maintenanceConnections.add(db);
   try {
     configureConnection(db);
   } catch (err) {
-    try { db.close(); } catch { /* ignore cleanup failure */ }
+    try {
+      db.close();
+    } catch {
+      /* ignore cleanup failure */
+    }
     throw err;
   }
   trackConnection(dbPath, db);

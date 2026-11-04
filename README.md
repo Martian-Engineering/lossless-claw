@@ -647,3 +647,8 @@ help bringing agents into your own systems, we'd like to hear from you:
 
 Bug reports and feature requests belong in
 [GitHub Issues](https://github.com/Martian-Engineering/lossless-claw/issues).
+
+### Experimental offline transcript-gap repair
+
+See [the operator contract](docs/gap-repair.md) for the separate `lcm-gap-repair`
+plan/apply/undo surface, cooperative lifetime fence, and live-qualification limits.
