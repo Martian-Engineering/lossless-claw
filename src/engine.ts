@@ -57,7 +57,7 @@ import {
   getLcmProgrammaticControlCapabilities,
   runLcmProgrammaticControl,
 } from "./plugin/lcm-command.js";
-import { describeLcmConfigSource } from "./db/config.js";
+import { describeLcmConfigSource, resolveDefaultTokenBudget } from "./db/config.js";
 import { RetrievalEngine } from "./retrieval.js";
 import {
   compileSessionPatterns,
@@ -3340,7 +3340,7 @@ export class LcmContextEngine implements ContextEngine {
     const tokenBudget = this.applyAssemblyBudgetCap(this.resolveTokenBudget({
       runtimeSettings: params.runtimeSettings,
       runtimeContext: params.runtimeContext,
-    }) ?? request?.tokenBudget ?? 128_000);
+    }) ?? request?.tokenBudget ?? resolveDefaultTokenBudget(this.config));
     const currentTokenCount = this.normalizeObservedTokenCount(params.runtimeContext?.currentTokenCount)
       ?? request?.currentTokenCount;
     const outcome = unchanged("no deferred maintenance work");
@@ -3756,7 +3756,7 @@ export class LcmContextEngine implements ContextEngine {
   ): Promise<number | undefined> {
     const sessionLabel = formatSessionLabel(params.sessionId, params.sessionKey);
     const legacyParams = asRecord(params.runtimeContext) ?? asRecord(params.legacyCompactionParams);
-    const defaultTokenBudget = 128_000;
+    const defaultTokenBudget = resolveDefaultTokenBudget(this.config);
     const resolvedTokenBudget = this.resolveTokenBudget({
       tokenBudget: params.tokenBudget,
       runtimeSettings: params.runtimeSettings,
@@ -4456,11 +4456,11 @@ export class LcmContextEngine implements ContextEngine {
       }
 
       const tokenBudget = this.applyAssemblyBudgetCap(
-        typeof params.tokenBudget === "number" &&
-        Number.isFinite(params.tokenBudget) &&
-        params.tokenBudget > 0
-          ? Math.floor(params.tokenBudget)
-          : 128_000,
+        this.resolveTokenBudget({
+          tokenBudget: params.tokenBudget,
+          runtimeSettings: params.runtimeSettings,
+          runtimeContext: params.runtimeContext,
+        }) ?? resolveDefaultTokenBudget(this.config),
       );
       const resolvedContextThreshold = this.contextThresholdResolver.resolve({
         sessionKey: params.sessionKey,
@@ -4821,11 +4821,11 @@ export class LcmContextEngine implements ContextEngine {
       // exactly how an over-budget prompt reaches the model.
       const fallback = safeFallback();
       const fallbackBudget = this.applyAssemblyBudgetCap(
-        typeof params.tokenBudget === "number" &&
-        Number.isFinite(params.tokenBudget) &&
-        params.tokenBudget > 0
-          ? Math.floor(params.tokenBudget)
-          : 128_000,
+        this.resolveTokenBudget({
+          tokenBudget: params.tokenBudget,
+          runtimeSettings: params.runtimeSettings,
+          runtimeContext: params.runtimeContext,
+        }) ?? resolveDefaultTokenBudget(this.config),
       );
       const clamp = clampMessagesToSerializedBudget({
         messages: fallback.messages,
