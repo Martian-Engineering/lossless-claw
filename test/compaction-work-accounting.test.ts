@@ -5,11 +5,13 @@ import type { CompactionGuards } from "../src/compaction-guards.js";
 import type { CompactionTelemetryRecorder } from "../src/compaction-telemetry.js";
 import type { LcmContextEngine } from "../src/engine.js";
 import type { CompactResult, ContextEngineRuntimeSettings } from "../src/openclaw-bridge.js";
-import { LcmProviderAuthError, LcmRuntimeLifecycleError, LcmRuntimeLlmPolicyError, LcmRuntimeLlmUnavailableError, LcmSummarySpendLimitError } from "../src/summarize.js";
+import { createLcmSummarizeFromLegacyParams, LcmProviderAuthError, LcmRuntimeLifecycleError, LcmRuntimeLlmPolicyError, LcmRuntimeLlmUnavailableError, LcmSummarySpendLimitError } from "../src/summarize.js";
 import {
   cleanupEngineTestState,
   createEngineWithConfig,
   createEngineWithDeps,
+  createTestDeps,
+  getEngineConfig,
   seedBacklogContext,
 } from "./helpers.js";
 
@@ -62,6 +64,29 @@ function authError() {
 }
 
 describe("compactUntilUnder committed work", () => {
+  it("stores the recovered summary rather than punctuation after reasoning removal", async () => {
+    const complete = vi.fn()
+      .mockResolvedValueOnce({ content: [{ type: "text", text: "<think>PRIVATE_REASONING_REMNANT</think>." }] })
+      .mockResolvedValueOnce({ content: [{ type: "text", text: "Recovered conversation details." }] });
+    const engine = createEngineWithDeps({ freshTailCount: 0, leafMinFanout: 2, leafChunkTokens: 1_000 }, { complete });
+    await seedBacklogContext(engine, "punctuation-summary", [150, 150, 150, 150]);
+    const conversation = await engine.getConversationStore().getConversationBySessionId("punctuation-summary");
+    const summarize = await createLcmSummarizeFromLegacyParams({
+      deps: createTestDeps(getEngineConfig(engine), { complete }),
+      legacyParams: {},
+    });
+    const result = await accountingInternals(engine).compaction.compact({
+      conversationId: conversation!.conversationId,
+      tokenBudget: 10_000,
+      summarize: summarize!.fn,
+      force: true,
+    });
+    expect(result.actionTaken).toBe(true);
+    const stored = await engine.getSummaryStore().getSummary(result.createdSummaryId!);
+    expect(stored?.content).toBe("Recovered conversation details.");
+    expect(complete).toHaveBeenCalledTimes(2);
+  });
+
   it.each([10, 30_000])("does not infer work from observed/stored mismatch (stored %i)", async (storedTokens) => {
     const engine = createEngineWithConfig({ freshTailCount: 12 });
     await seedBacklogContext(engine, "protected", [storedTokens]);

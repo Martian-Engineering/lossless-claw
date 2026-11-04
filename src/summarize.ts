@@ -492,7 +492,9 @@ function sanitizeReasoningSummaryText(value: string): {
   const strippedLeading = stripLeadingClosedReasoningBlocks(trimmed);
   const strippedStandalone = stripStandaloneReasoningBlocks(strippedLeading.text);
   const remainder = strippedStandalone.text;
-  if (!remainder) {
+  const droppedReasoning = strippedLeading.dropped || strippedStandalone.dropped;
+  // Punctuation left after reasoning removal is not a visible summary body.
+  if (!remainder || (droppedReasoning && /^[\p{P}\p{Z}\p{C}]*$/u.test(remainder))) {
     // Either the entire body was a closed reasoning block (no summary
     // text after) or the input was empty — both are reasoning-only.
     return { summary: "", droppedReasoning: true, reasoningOnly: true };
@@ -507,7 +509,7 @@ function sanitizeReasoningSummaryText(value: string): {
 
   return {
     summary: remainder,
-    droppedReasoning: strippedLeading.dropped || strippedStandalone.dropped,
+    droppedReasoning,
     reasoningOnly: false,
   };
 }
