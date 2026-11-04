@@ -638,11 +638,17 @@ Why it matters:
 - lower values fail faster under slow sub-agent paths
 - higher values give the bounded recall request more time to finish
 
+### `defaultTokenBudget`
+
+Default: `128000` | Env: `LCM_DEFAULT_TOKEN_BUDGET`
+
+Positive-integer fallback used only when no caller allowance is available. Applies to assembly (including error clamping), post-turn checks, deferred maintenance, and command helpers. Explicit smaller host budgets, queued allowances, stricter recorded debt and `maxAssemblyTokenBudget` still apply. Invalid values fall back to the plugin setting or built-in default. Set only to a budget supported by every affected model; this is not a model-context-window declaration.
+
 ### `maxAssemblyTokenBudget`
 
 Hard ceiling for assembled LCM token budget.
 
-This is a ceiling, not a fallback or a model-window declaration. Deferred maintenance uses a valid current host `runtimeSettings.limits.promptTokenBudget`, then `runtimeContext.tokenBudget`, before a queued request or the conservative 128,000-token default. A direct lifecycle budget and host settings combine using the smaller current allowance. These optional fields use the existing OpenClaw 2026.9.2 contract, so absent host policy retains conservative behavior. A current allowance supersedes an older debt budget; absent current authority, maintenance retains the stricter recorded/request-or-default budget. Smaller current allowances and this cap still apply. No model-name inference or cross-engine allowance cache is used.
+This is a ceiling, not a fallback or a model-window declaration. Deferred maintenance uses a valid current host `runtimeSettings.limits.promptTokenBudget`, then `runtimeContext.tokenBudget`, before a queued request or the configured `defaultTokenBudget` (128,000 tokens by default). A direct lifecycle budget and host settings combine using the smaller current allowance. These optional fields use the existing OpenClaw 2026.9.2 contract, so absent host policy retains conservative behavior. A current allowance supersedes an older debt budget; absent current authority, maintenance retains the stricter recorded/request-or-default budget. Smaller current allowances and this cap still apply. No model-name inference or cross-engine allowance cache is used.
 
 Why it matters:
 

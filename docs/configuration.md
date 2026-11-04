@@ -184,6 +184,7 @@ host policy.
   "preserveHeartbeatPoll": false,
   "enableSummaryThinking": true,
   "maxAssemblyTokenBudget": 30000,
+  "defaultTokenBudget": 128000,
   "summaryMaxOverageFactor": 3,
   "fallbackMaxTokens": 512,
   "customInstructions": "",
@@ -337,6 +338,7 @@ The Settings editor displays fixed defaults from the plugin manifest. Automatic 
 | `fallbackMaxTokens` | `integer` | `512` | `LCM_FALLBACK_MAX_TOKENS` | Maximum token budget for deterministic fallback summaries when the LLM summarizer is unavailable. Values below 64 are ignored. |
 | `largeFileThresholdTokens` | `integer` | `25000` | `LCM_LARGE_FILE_TOKEN_THRESHOLD` | Preferred key for the token threshold that routes text attachments into large-file summarization. |
 | `largeFileTokenThreshold` | `integer` | alias of `largeFileThresholdTokens` | `LCM_LARGE_FILE_TOKEN_THRESHOLD` | Legacy alias accepted by the runtime. Prefer `largeFileThresholdTokens` in new config. |
+| `defaultTokenBudget` | `integer` | `128000` | `LCM_DEFAULT_TOKEN_BUDGET` | Missing-allowance fallback for assembly (including error clamping), post-turn evaluation and deferred maintenance. Does not override explicit host budgets, queued allowances, stricter recorded debt, or the assembly cap. Set only to a budget supported by every affected model; this does not enlarge a model window. |
 | `maxAssemblyTokenBudget` | `integer` | unset | `LCM_MAX_ASSEMBLY_TOKEN_BUDGET` | Optional hard cap for assembly and threshold evaluation, useful with smaller-context models. |
 | `maxExpandTokens` | `integer` | `4000` | `LCM_MAX_EXPAND_TOKENS` | Default token cap for `lcm_expand_query` responses. |
 
@@ -505,7 +507,7 @@ This keeps long-term history available while still giving users a real clean-sla
 - deferred mode records a single coalesced maintenance debt row per conversation
 - after-turn threshold pressure records debt with reason `"threshold"`; unresolved pre-assembly pressure uses `"assembly-pressure"`
 - `maintain()` consumes threshold debt when the host explicitly opts in to deferred execution
-- Maintenance uses a valid current host `runtimeSettings.limits.promptTokenBudget`, then `runtimeContext.tokenBudget`, before a queued request or the conservative 128,000-token fallback. When a lifecycle call also supplies a direct budget, the smaller direct/host-settings allowance wins. These optional settings use the existing OpenClaw 2026.9.2 contract; missing host policy retains conservative behavior. `maxAssemblyTokenBudget` remains a ceiling, not a fallback or model-window declaration.
+- Maintenance uses a valid current host `runtimeSettings.limits.promptTokenBudget`, then `runtimeContext.tokenBudget`, before a queued request or the configured `defaultTokenBudget` (128,000 tokens by default). When a lifecycle call also supplies a direct budget, the smaller direct/host-settings allowance wins. These optional settings use the existing OpenClaw 2026.9.2 contract; missing host policy uses the configured fallback without enlarging stricter recorded debt. `maxAssemblyTokenBudget` remains a ceiling, not a fallback or model-window declaration.
 - A current host allowance supersedes the historical budget stored with deferred debt, including when a previously published batch is revalidated during backoff. Smaller current allowances remain authoritative. Without a current allowance, maintenance retains the stricter recorded/request-or-default budget; it does not infer capacity from model names or cache an earlier model's allowance across engine recreation.
 - `assemble()` measures the full projection before eviction, including serialized payloads and uncovered volatile live inputs. It tries ready publication above 75% pressure with pending debt, or above the 90% serialized clamp threshold even without debt
 - if publication does not reach the configured `contextThreshold` target (capped at 90%), assembly can wait for one bounded foreground preparation pass and publication. Generation respects `maxSweepIterations`, summarizer timeouts, spend limits, cooldowns, and active background ownership; publication does not require generation permission

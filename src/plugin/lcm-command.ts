@@ -3,7 +3,7 @@ import { join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import packageJson from "../../package.json" with { type: "json" };
 import { formatTimestamp } from "../compaction.js";
-import { resolveOpenclawStateDir, type LcmConfig } from "../db/config.js";
+import { resolveDefaultTokenBudget, resolveOpenclawStateDir, type LcmConfig } from "../db/config.js";
 import { runDelegatedFocusBrief, runDelegatedRefocusBrief } from "../focus-briefs.js";
 import type { LcmSummarizeFn } from "../summarize.js";
 import type { LcmDependencies } from "../types.js";
@@ -1120,7 +1120,7 @@ function normalizePositiveInteger(value: number | null | undefined): number | nu
 }
 
 function resolveLifecycleCompactionTokenBudget(config: LcmConfig): number {
-  return normalizePositiveInteger(config.maxAssemblyTokenBudget) ?? 128_000;
+  return normalizePositiveInteger(config.maxAssemblyTokenBudget) ?? resolveDefaultTokenBudget(config);
 }
 
 function resolveStatusAssemblyTokenBudget(
@@ -1130,7 +1130,7 @@ function resolveStatusAssemblyTokenBudget(
   return (
     normalizePositiveInteger(config.maxAssemblyTokenBudget)
     ?? normalizePositiveInteger(maintenance?.tokenBudget)
-    ?? 128_000
+    ?? resolveDefaultTokenBudget(config)
   );
 }
 
