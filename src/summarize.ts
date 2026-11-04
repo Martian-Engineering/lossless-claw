@@ -1775,6 +1775,18 @@ export async function createLcmSummarizeFromLegacyParams(params: {
         break;
       }
 
+      const sanitizeSummaryWithDiagnostics = (value: string, source: string) => {
+        const sanitized = sanitizeReasoningSummaryText(value);
+        if (sanitized.droppedReasoning && !sanitized.reasoningOnly) {
+          params.deps.log.warn(
+            `[lcm] stripped reasoning-shaped content from summary; provider=${provider}; ` +
+              `model=${model}; source=${source}; ` +
+              `before_chars=${value.length}; after_chars=${sanitized.summary.length}`,
+          );
+        }
+        return sanitized;
+      };
+
       const normalized = normalizeCompletionSummary(result.content);
       let summary = normalized.summary;
       let summarySource: "content" | "envelope" | "retry" | "fallback" = "content";
@@ -1803,15 +1815,8 @@ export async function createLcmSummarizeFromLegacyParams(params: {
       // output is treated as empty so the retry/fallback chain runs.
       if (summary) {
         const rawSummaryChars = summary.length;
-        const sanitizedSummary = sanitizeReasoningSummaryText(summary);
+        const sanitizedSummary = sanitizeSummaryWithDiagnostics(summary, summarySource);
         if (sanitizedSummary.droppedReasoning) {
-          if (!sanitizedSummary.reasoningOnly) {
-            params.deps.log.warn(
-              `[lcm] stripped reasoning-shaped content from summary; provider=${provider}; ` +
-                `model=${model}; source=${summarySource}; ` +
-                `before_chars=${rawSummaryChars}; after_chars=${sanitizedSummary.summary.length}`,
-            );
-          }
           summary = sanitizedSummary.summary;
         }
         if (sanitizedSummary.reasoningOnly) {
@@ -1830,7 +1835,7 @@ export async function createLcmSummarizeFromLegacyParams(params: {
               `summary_shape=reasoning-only; summary_chars=${rawSummaryChars}`,
           );
           const recoveryNormalized = envelopeNormalized ?? normalizeCompletionEnvelope(result);
-          const recoveredSummary = sanitizeReasoningSummaryText(recoveryNormalized.summary);
+          const recoveredSummary = sanitizeSummaryWithDiagnostics(recoveryNormalized.summary, "envelope");
           if (recoveredSummary.summary && !recoveredSummary.reasoningOnly) {
             summary = recoveredSummary.summary;
             envelopeNormalized = {
@@ -1895,15 +1900,8 @@ export async function createLcmSummarizeFromLegacyParams(params: {
           // reasoning-only retry output drops to deterministic fallback.
           if (summary) {
             const rawRetrySummaryChars = summary.length;
-            const sanitizedRetrySummary = sanitizeReasoningSummaryText(summary);
+            const sanitizedRetrySummary = sanitizeSummaryWithDiagnostics(summary, "retry");
             if (sanitizedRetrySummary.droppedReasoning) {
-              if (!sanitizedRetrySummary.reasoningOnly) {
-                params.deps.log.warn(
-                  `[lcm] stripped reasoning-shaped content from summary; provider=${provider}; ` +
-                    `model=${model}; source=retry; ` +
-                    `before_chars=${rawRetrySummaryChars}; after_chars=${sanitizedRetrySummary.summary.length}`,
-                );
-              }
               summary = sanitizedRetrySummary.summary;
             }
             if (sanitizedRetrySummary.reasoningOnly) {
@@ -1913,8 +1911,9 @@ export async function createLcmSummarizeFromLegacyParams(params: {
                   `summary_shape=reasoning-only; summary_chars=${rawRetrySummaryChars}`,
               );
               const retryRecoveryNormalized = normalizeCompletionEnvelope(retryResult);
-              const retryRecoveredSummary = sanitizeReasoningSummaryText(
+              const retryRecoveredSummary = sanitizeSummaryWithDiagnostics(
                 retryRecoveryNormalized.summary,
+                "retry",
               );
               summary =
                 retryRecoveredSummary.summary && !retryRecoveredSummary.reasoningOnly

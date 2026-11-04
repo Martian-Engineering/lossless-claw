@@ -2215,6 +2215,26 @@ describe("createLcmSummarizeFromLegacyParams", () => {
       expect(getDepsLogText(deps)).not.toContain("PRIVATE_RETRY_REASONING");
     });
 
+    it.each([false, true])("reports envelope sanitization after reasoning-only content (retry=%s)", async (retry) => {
+      const content = "<think>PRIVATE_CONTENT_REASONING</think>";
+      const envelope = "<think>PRIVATE_ENVELOPE_REASONING</think>.";
+      const response = { content: [{ type: "text", text: content }], output_text: envelope };
+      const complete = vi.fn().mockResolvedValue(response);
+      if (retry) complete.mockResolvedValueOnce({ content: [] });
+      const deps = makeDeps({ complete });
+      const summarize = await createSummarizeFn({ deps, legacyParams: {} });
+
+      expect(await summarize!("Conversation to summarize", false)).toBe(".");
+      expect(complete).toHaveBeenCalledTimes(retry ? 2 : 1);
+      expect(deps.log.warn).toHaveBeenCalledWith(
+        `[lcm] stripped reasoning-shaped content from summary; provider=anthropic; ` +
+          `model=claude-opus-4-5; source=${retry ? "retry" : "envelope"}; ` +
+          `before_chars=${envelope.length}; after_chars=1`,
+      );
+      expect(getDepsLogText(deps)).not.toContain("PRIVATE_CONTENT_REASONING");
+      expect(getDepsLogText(deps)).not.toContain("PRIVATE_ENVELOPE_REASONING");
+    });
+
     it("keeps plain summaries quiet and retains the reasoning-only warning", async () => {
       const plainDeps = makeDeps();
       const plainSummarize = await createSummarizeFn({ deps: plainDeps, legacyParams: {} });
