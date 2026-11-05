@@ -48,6 +48,7 @@ describe("LcmContextEngine metadata", () => {
       "prompt",
       "runtimeContext",
       "runtimeSettings",
+      "onProgress",
     ]);
     expect(engine.info.transcriptSemantics).toEqual({
       currentTurnFence: "before-current-turn-entry-v1",

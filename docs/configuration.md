@@ -423,6 +423,8 @@ A single sweep is bounded by both `maxSweepIterations` (a hard cap on summarizer
 
 Overflow recovery (`compactUntilUnder`) runs up to `maxRounds` sweeps to drive context under a target. Because every sweep re-arms its own `sweepDeadlineMs`, the whole operation is separately bounded by `compactUntilUnderDeadlineMs` (default 300000): the operation deadline is shared into each round's sweep — a sweep stops at whichever deadline is sooner — and is also checked before starting the next round. On hitting it, `compactUntilUnder` returns the consistent partial result and logs a `compactUntilUnder stopped at …` warning, so the worst case is the operation budget rather than `maxRounds × sweepDeadlineMs`.
 
+OpenClaw separately bounds every context-engine compaction with its own safety timeout (`agents.defaults.compaction.timeoutSeconds`, default 180 s), which is shorter than the default `compactUntilUnderDeadlineMs`. Lossless-claw reports each committed summary pass to the host through `onProgress`, which restarts that idle window, so a recovery that keeps making progress is not cut off mid-operation. OpenClaw builds that include #130973 accept `onProgress`; on older hosts the 180 s timeout still applies, so keep `compactUntilUnderDeadlineMs` at or below it there. When the host aborts (run abort or timeout), the sweep stops before starting another pass and keeps every summary already committed.
+
 ### Prompt-aware eviction
 
 When `promptAwareEviction` is enabled:
