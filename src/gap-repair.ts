@@ -25,9 +25,9 @@ export type RepairEvidence = {
     messages: AgentMessage[];
     sha256: string[];
     sourceOrder: {
-      namespace: "gateway-public-seq";
-      before: { id: string; seq: number };
-      after: { id: string; seq: number };
+      namespace: "gateway-public-seq" | "host-visible-seq";
+      before: { id: string; seq: number; sha256?: string };
+      after: { id: string; seq: number; sha256?: string };
       entries: { id: string; seq: number }[];
     };
   }[];
@@ -45,7 +45,7 @@ function check(ok: unknown, reason: string): asserts ok {
 function rows(db: DatabaseSync, sql: string, ...args: SQLInputValue[]): Row[] {
   return db.prepare(sql).all(...args);
 }
-function state(db: DatabaseSync, cid: number) {
+export function repairState(db: DatabaseSync, cid: number) {
   const query = (table: string, order: string) =>
     rows(
       db,
@@ -87,7 +87,7 @@ function prepare(db: DatabaseSync, e: RepairEvidence) {
     Number.isSafeInteger(e.tokenBudget) && e.tokenBudget > 0,
     "Explicit positive token budget required"
   );
-  const s = state(db, e.conversationId);
+  const s = repairState(db, e.conversationId);
   check(
     s.conversation.length === 1 && s.messages.length,
     "Missing conversation/raw evidence"
@@ -122,7 +122,7 @@ function prepare(db: DatabaseSync, e: RepairEvidence) {
     check(!inserts.has(next.message_id), "Overlapping gap boundaries");
     const order = g.sourceOrder;
     check(
-      order?.namespace === "gateway-public-seq" &&
+      (order?.namespace === "gateway-public-seq" || order?.namespace === "host-visible-seq") &&
         order.before.id === prev.transcript_entry_id &&
         order.after.id === next.transcript_entry_id,
       "Source boundary identity mismatch"
@@ -285,7 +285,8 @@ function replaceFrontier(
 export async function applyRepair(
   db: DatabaseSync,
   plan: RepairPlan,
-  failAfter = Infinity
+  failAfter = Infinity,
+  preparationOnly = false
 ) {
   assertMaintenanceConnection(db);
   db.exec("BEGIN IMMEDIATE");
@@ -308,7 +309,7 @@ export async function applyRepair(
       );
       const receipt = JSON.parse(prior[0].evidence_json);
       check(
-        digest(state(db, plan.evidence.conversationId)) === receipt.after,
+        digest(repairState(db, plan.evidence.conversationId)) === receipt.after,
         "Replayed plan poststate changed"
       );
       db.exec("COMMIT");
@@ -405,19 +406,19 @@ export async function applyRepair(
       freshTailMaxTokens: 24000,
     });
     check(
-      assembly.estimatedTokens <= plan.evidence.tokenBudget &&
-        assembly.debug?.selectionMode === "full-fit",
+      preparationOnly || (assembly.estimatedTokens <= plan.evidence.tokenBudget &&
+        assembly.debug?.selectionMode === "full-fit"),
       "Repair frontier does not fully fit explicit budget"
     );
     const receipt = {
       before: s,
-      after: digest(state(db, cid)),
+      after: digest(repairState(db, cid)),
       inserted: added,
       plan,
       assembly: {
         estimatedTokens: assembly.estimatedTokens,
         stats: assembly.stats,
-        selectionMode: assembly.debug.selectionMode,
+        selectionMode: assembly.debug?.selectionMode,
       },
     };
     db.prepare(
@@ -448,7 +449,7 @@ export function undoRepair(db: DatabaseSync, id: string) {
     const r = JSON.parse(audit[0].evidence_json),
       cid = r.plan.evidence.conversationId;
     check(
-      digest(state(db, cid)) === r.after,
+      digest(repairState(db, cid)) === r.after,
       "Poststate changed; undo refused to preserve later writes"
     );
     db.prepare("DELETE FROM context_items WHERE conversation_id=?").run(cid);
@@ -499,12 +500,12 @@ export function undoRepair(db: DatabaseSync, id: string) {
     }
     replaceFrontier(db, cid, r.before.frontier, true);
     check(
-      digest(state(db, cid)) === r.plan.before,
+      digest(repairState(db, cid)) === r.plan.before,
       "Inverse did not restore canonical state"
     );
     db.prepare(
       "INSERT INTO transcript_gap_repair_audit(plan_id,action,evidence_json) VALUES(?,?,?)"
-    ).run(id, "undo", JSON.stringify({ after: digest(state(db, cid)) }));
+    ).run(id, "undo", JSON.stringify({ after: digest(repairState(db, cid)) }));
     db.exec("COMMIT");
     return { id, undone: true };
   } catch (e) {

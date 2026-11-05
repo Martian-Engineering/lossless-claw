@@ -1,3 +1,4 @@
+import { GapRepairError } from "../gap-repair-error.js";
 import { mkdirSync } from "node:fs";
 import { dirname, resolve } from "node:path";
 import { DatabaseSync } from "node:sqlite";
@@ -12,6 +13,7 @@ type ConnectionKey = string;
 const SQLITE_BUSY_TIMEOUT_MS = 30_000;
 
 const connectionsByPath = new Map<ConnectionKey, Set<DatabaseSync>>();
+const leaseSwitches = new WeakMap<DatabaseSync, (exclusive: boolean) => void>();
 const maintenanceConnections = new WeakSet<DatabaseSync>();
 export function assertMaintenanceConnection(db: DatabaseSync): void {
   if (!maintenanceConnections.has(db))
@@ -138,7 +140,7 @@ export function createLcmDatabaseConnection(
   options?: { maintenance?: boolean }
 ): DatabaseSync {
   ensureDbDirectory(dbPath);
-  const release = isInMemoryPath(dbPath)
+  let release = isInMemoryPath(dbPath)
     ? () => {}
     : acquireDatabaseLease(dbPath, options?.maintenance);
   let db: DatabaseSync;
@@ -148,10 +150,23 @@ export function createLcmDatabaseConnection(
     release();
     throw error;
   }
+  leaseSwitches.set(db, (exclusive) => {
+    release();
+    try { release = acquireDatabaseLease(dbPath, exclusive); }
+    catch (error) {
+      // Restore participation before returning failure. A failed downgrade is
+      // fatal to this handle; do not leave an unfenced live engine usable.
+      try { release = acquireDatabaseLease(dbPath, false); }
+      catch { db.close(); }
+      throw error;
+    }
+  });
   const close = db.close.bind(db);
   db.close = () => {
     close();
+    untrackConnection(db);
     maintenanceConnections.delete(db);
+    leaseSwitches.delete(db);
     release();
   };
   if (options?.maintenance && !isInMemoryPath(dbPath))
@@ -205,3 +220,24 @@ export function closeLcmConnection(target?: string | DatabaseSync): void {
 }
 
 export const getLcmConnection = createLcmDatabaseConnection;
+
+/** Temporarily exclude other participating process/connection owners, without
+ * closing the live handle or stopping Gateway. Only one local handle is allowed.
+ * Target admission is fenced separately; unrelated sessions on this handle run.
+ */
+const onlineRepairOwners = new WeakSet<DatabaseSync>();
+export async function withOnlineRepairOwnership<T>(db: DatabaseSync, operation: () => Promise<T>): Promise<T> {
+  if (onlineRepairOwners.has(db)) throw new GapRepairError("Another online repair is running; retry after it finishes.");
+  const path = connectionIndex.get(db);
+  const change = leaseSwitches.get(db);
+  if (!path || isInMemoryPath(path) || !change || connectionsByPath.get(path)?.size !== 1)
+    throw new GapRepairError("Online repair requires one participating file-backed runtime connection.");
+  try { change(true); } catch { throw new GapRepairError("Another database owner is active; no recovery was published."); }
+  onlineRepairOwners.add(db);
+  try { return await operation(); }
+  finally {
+    try { change(false); }
+    catch { throw new GapRepairError("Runtime ownership restoration failed. Recovery may already be committed; inspect the recovery audit before retrying."); }
+    finally { onlineRepairOwners.delete(db); }
+  }
+}

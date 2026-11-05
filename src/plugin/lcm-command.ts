@@ -1,3 +1,5 @@
+import { GapRepairController, type GapRepairRuntime } from "./lcm-gap-repair.js";
+import { resolveDoctorApplySummarize } from "./lcm-doctor-apply.js";
 import { existsSync, statSync } from "node:fs";
 import { join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
@@ -130,6 +132,7 @@ type ParsedLcmCommand =
   | { kind: "refocus" }
   | { kind: "unfocus" }
   | { kind: "doctor"; apply: boolean; applyOptions?: DoctorApplyOptions }
+  | { kind: "doctor_gaps"; conversationId: number; confirmation?: string }
   | { kind: "doctor_anchors" }
   | { kind: "doctor_maintenance"; apply: false }
   | { kind: "doctor_maintenance"; apply: true; conversationId: number; confirmed: boolean }
@@ -150,7 +153,7 @@ type FocusCompactionCommandEngine = {
   }): Promise<CompactResult>;
 };
 
-type RuntimeCommandEngine = Partial<FocusCompactionCommandEngine>;
+type RuntimeCommandEngine = Partial<FocusCompactionCommandEngine & GapRepairRuntime>;
 
 /** Error thrown when a host requests a control operation that cannot run safely. */
 export class LcmProgrammaticControlUnavailableError extends Error {
@@ -459,14 +462,14 @@ const TRANSCRIPT_GAP_EXAMPLE_LIMIT = 5;
 
 /** One-line summary of database-wide transcript history-gap markers. */
 function formatTranscriptGapTotals(totals: TranscriptGapTotals): string {
-  return `${formatNumber(totals.gaps)} gap(s) in ${formatNumber(totals.conversations)} conversation(s) · ${formatNumber(totals.entries)} unstored entries · largest ${formatNumber(totals.largestGap)}`;
+  return `${formatNumber(totals.gaps)} gap(s) in ${formatNumber(totals.conversations)} conversation(s) · ${formatNumber(totals.entries)} historically claimed entries · largest ${formatNumber(totals.largestGap)}`;
 }
 
 /** One-line summary of one conversation's transcript history-gap markers. */
 function formatConversationTranscriptGaps(gaps: readonly TranscriptGapRecord[]): string {
   const entries = gaps.reduce((total, gap) => total + gap.entryCount, 0);
   const largest = gaps.reduce((max, gap) => Math.max(max, gap.entryCount), 0);
-  return `${formatNumber(gaps.length)} gap(s) · ${formatNumber(entries)} unstored entries · largest ${formatNumber(largest)}`;
+  return `${formatNumber(gaps.length)} gap(s) · ${formatNumber(entries)} historically claimed entries · largest ${formatNumber(largest)}`;
 }
 
 /**
@@ -476,6 +479,7 @@ function formatConversationTranscriptGaps(gaps: readonly TranscriptGapRecord[]):
 function buildTranscriptGapSection(
   totals: TranscriptGapTotals,
   conversationGaps: readonly TranscriptGapRecord[] | null,
+  recovery?: { db: DatabaseSync; conversationId: number },
 ): string | null {
   if (totals.gaps === 0) {
     return null;
@@ -504,9 +508,17 @@ function buildTranscriptGapSection(
   lines.push(
     buildStatLine(
       "impact",
-      "These transcript entries were never stored, so recall and summaries do not cover them. The host transcript still holds them; Lossless Claw never imports them automatically.",
+      "These are immutable historical gap claims, not current unique missing-message counts. Exact host-visible spans may be recovered explicitly; unavailable history remains unresolved.",
     ),
   );
+  if (recovery) {
+    lines.push(buildStatLine("preview recovery", `${VISIBLE_COMMAND} doctor gaps ${recovery.conversationId} (run from another session)`));
+    if (recovery.db.prepare("SELECT 1 FROM sqlite_master WHERE name='conversation_gap_recovery_audit'").get()) {
+      const records = recovery.db.prepare("SELECT gap_ids FROM conversation_gap_recovery_audit WHERE conversation_id=?").all(recovery.conversationId) as Array<{ gap_ids: string }>;
+      const recovered = new Set(records.flatMap(r => JSON.parse(r.gap_ids) as number[]));
+      lines.push(buildStatLine("verified recovered spans", `${recovered.size} gap(s); original markers retained, not a completeness claim`));
+    }
+  }
   return buildSection("🕳️ Transcript history gaps", lines);
 }
 
@@ -795,6 +807,14 @@ function parseLcmCommand(rawArgs: string | undefined): ParsedLcmCommand {
             error: `\`${VISIBLE_COMMAND} backup\` does not accept extra arguments.`,
           };
     case "doctor":
+      if (tokens[1]?.toLowerCase() === "gaps" || (tokens[1]?.toLowerCase() === "apply" && tokens[2]?.toLowerCase() === "gaps")) {
+        const apply = tokens[1].toLowerCase() === "apply";
+        const rest = tokens.slice(apply ? 3 : 2);
+        if (!/^[1-9]\d*$/.test(rest[0] ?? "") || !Number.isSafeInteger(Number(rest[0])) ||
+            rest.length !== (apply ? 2 : 1) || (apply && !/^[a-f0-9]{12}$/.test(rest[1])))
+          return { kind: "help", error: "Use doctor gaps <conversation-id> to preview, then doctor apply gaps <conversation-id> <preview-token> from another session." };
+        return { kind: "doctor_gaps", conversationId: Number(rest[0]), ...(apply ? { confirmation: rest[1] } : {}) };
+      }
       if (rest.length === 0) {
         return { kind: "doctor", apply: false };
       }
@@ -1482,6 +1502,8 @@ function buildHelpText(error?: string): string {
         "Deactivate the active focus overlay without deleting focus history.",
       ),
       buildStatLine(formatCommand(`${VISIBLE_COMMAND} doctor`), "Scan for broken or truncated summaries."),
+      buildStatLine(formatCommand(`${VISIBLE_COMMAND} doctor gaps <conversation-id>`), "Preview history recovery from another session."),
+      buildStatLine(formatCommand(`${VISIBLE_COMMAND} doctor apply gaps <conversation-id> <preview-token>`), "Confirm target-locked, backup-first history recovery."),
       buildStatLine(
         formatCommand(`${VISIBLE_COMMAND} doctor anchors`),
         "Report transcript anchor trust and legacy-prefix epoch counts.",
@@ -1773,6 +1795,7 @@ async function buildDoctorText(params: {
   const gapSection = buildTranscriptGapSection(
     gapTotals,
     gapStore.listForConversation(current.stats.conversationId),
+    { db: params.db, conversationId: current.stats.conversationId },
   );
   if (gapSection) {
     lines.push("", gapSection);
@@ -3295,6 +3318,8 @@ async function buildDoctorApplyText(params: {
 }
 
 export function createLcmCommand(params: {
+  /** Internal isolated-test worker override; never a command argument. */
+  gapRepairWorkerUrl?: URL;
   db: DatabaseSync | (() => DatabaseSync | Promise<DatabaseSync>);
   config: LcmConfig;
   openClawConfig?: unknown;
@@ -3305,6 +3330,16 @@ export function createLcmCommand(params: {
 }): OpenClawPluginCommandDefinition {
   const getDb = async (): Promise<DatabaseSync> =>
     typeof params.db === "function" ? await params.db() : params.db;
+
+  const gapRepair = new GapRepairController({
+    db: getDb, config: params.config, deps: params.deps, workerUrl: params.gapRepairWorkerUrl,
+    runtime: async () => {
+      const engine = await params.getLcm?.();
+      return typeof engine?.getGapRepairBudget === "function" ? engine as GapRepairRuntime : undefined;
+    },
+    summarize: (ctx) => resolveDoctorApplySummarize({ config: params.config, deps: params.deps, summarize: params.summarize,
+      runtimeConfig: params.openClawConfig, runtimeContext: readCommandRuntimeContext(ctx), sessionKey: ctx.sessionKey }),
+  });
 
   return {
     name: "lcm",
@@ -3373,6 +3408,8 @@ export function createLcmCommand(params: {
               getLcm: params.getLcm,
             }),
           };
+        case "doctor_gaps":
+          return { text: await gapRepair.run(ctx, parsed.conversationId, parsed.confirmation) };
         case "doctor":
           return parsed.apply
             ? {

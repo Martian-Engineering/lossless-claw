@@ -22,7 +22,7 @@
   ],
   "scripts": {
     "build": "npm run build:plugin && npm run build:migrate-sessions && npm run build:cli && npm run build:ui && npm run build:gap-repair",
-    "build:plugin": "esbuild index.ts --bundle --platform=node --target=node22 --format=esm --outfile=dist/index.js --external:openclaw --external:\"@earendil-works/*\" --minify-whitespace",
+    "build:plugin": "esbuild index.ts --bundle --platform=node --target=node22 --format=esm --outfile=dist/index.js --external:openclaw --external:\"@earendil-works/*\" --minify-whitespace && npm run build:gap-recovery-worker",
     "build:migrate-sessions": "esbuild src/cli/migrate-sessions.ts --bundle --platform=node --target=node22 --format=esm --outfile=dist/migrate-sessions.js --external:openclaw --external:\"@earendil-works/*\" --minify-whitespace",
     "build:cli": "esbuild cli.ts --bundle --platform=node --target=node22 --format=esm --outfile=dist/cli.js --minify-whitespace",
     "changeset": "changeset",
@@ -33,7 +33,8 @@
     "typecheck": "tsc --noEmit --pretty false && tsc -p tsconfig.ui.json",
     "version-packages": "changeset version",
     "build:ui": "esbuild ui/control-ui.ts --bundle --platform=browser --target=es2022 --format=esm --outfile=dist/control-ui/index.js --minify",
-    "build:gap-repair": "esbuild src/cli/gap-repair.ts --bundle --platform=node --target=node22 --format=esm --outfile=dist/gap-repair.js --external:openclaw --external:\"@earendil-works/*\" --minify-whitespace"
+    "build:gap-repair": "esbuild src/cli/gap-repair.ts --bundle --platform=node --target=node22 --format=esm --outfile=dist/gap-repair.js --external:openclaw --external:\"@earendil-works/*\" --minify-whitespace",
+    "build:gap-recovery-worker": "esbuild src/plugin/lcm-gap-prepare.ts --bundle --platform=node --target=node22 --format=esm --outfile=dist/gap-recovery-worker.js --external:openclaw --external:\"@earendil-works/*\" --minify-whitespace"
   },
   "files": [
     "dist/",

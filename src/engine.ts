@@ -1,3 +1,4 @@
+import { sessionMaintenanceGate } from "./session-maintenance.js";
 import { createHash } from "node:crypto";
 import { join } from "node:path";
 import type { DatabaseSync } from "node:sqlite";
@@ -495,6 +496,10 @@ export class LcmContextEngine implements ContextEngine {
   private previousAssembledMessagesByConversation = new Map<number, AssemblePrefixSnapshot>();
   private recentBootstrapImportsByConversation = new Map<number, BootstrapImportObservation>();
   private deps: LcmDependencies;
+  private repairBudgets = new Map<string, number>();
+  getGapRepairBudget(sessionId: string, sessionKey: string): number | undefined {
+    return this.repairBudgets.get(this.resolveSessionQueueKey(sessionId, sessionKey));
+  }
 
   // ── Circuit breaker + summary spend guard ───────────────────────────────
   private readonly compactionGuards: CompactionGuards;
@@ -723,6 +728,26 @@ export class LcmContextEngine implements ContextEngine {
       this.deps.log,
     );
     this.retrieval = new RetrievalEngine(this.conversationStore, this.summaryStore);
+    // Gate the complete public lifecycle, not just transaction entry. Existing
+    // admitted turns may finish while maintenance waits; new assembly waits.
+    const gate = sessionMaintenanceGate(this.db);
+    const engine = this as unknown as Record<string, (...args: any[]) => Promise<any>>;
+    for (const name of ["bootstrap", "maintain", "ingest", "ingestBatch", "assemble", "compact", "afterTurn", "commitTurn", "handleBeforeReset", "handleSessionEnd"]) {
+      const original = engine[name].bind(this);
+      engine[name] = async (params: any) => {
+        const target = params.admission ?? params.sessionTarget ?? params;
+        const sessionId = target.sessionId ?? params.sessionId;
+        const storedKey = !target.sessionKey && sessionId && this.db.prepare("SELECT 1 FROM sqlite_master WHERE name='conversations'").get()
+          ? (this.db.prepare("SELECT session_key FROM conversations WHERE session_id=? ORDER BY active DESC LIMIT 1").get(sessionId) as { session_key?: string } | undefined)?.session_key : undefined;
+        const key = this.resolveSessionQueueKey(sessionId, target.sessionKey ?? params.sessionKey ?? storedKey);
+        if (name === "assemble") {
+          const observed = this.resolveTokenBudget(params);
+          if (observed !== undefined) this.repairBudgets.set(key, this.applyAssemblyBudgetCap(observed));
+        }
+        return gate.operation(key, () => original(params), name === "assemble" ? "begin" :
+          ["afterTurn", "commitTurn", "handleSessionEnd", "handleBeforeReset"].includes(name) ? "end" : undefined);
+      };
+    }
   }
 
   /**
