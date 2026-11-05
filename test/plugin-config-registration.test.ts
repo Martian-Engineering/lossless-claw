@@ -10,6 +10,7 @@ import { LcmContextEngine } from "../src/engine.js";
 import { clearAllSharedInit } from "../src/plugin/shared-init.js";
 import { resetStartupBannerLogsForTests } from "../src/startup-banner-log.js";
 import { runDelegatedExpansionLoop } from "../src/tools/lcm-expand-tool.delegation.js";
+import type { LcmDependencies } from "../src/types.js";
 
 const buildMemorySystemPromptAdditionMock = vi.hoisted(() => vi.fn());
 
@@ -194,6 +195,26 @@ function compactionAndDefaultModelConfig(params: {
 }
 
 describe("lcm plugin registration", () => {
+  it("forwards cancellation and recall purpose through the existing runtime LLM bridge", async () => {
+    const dbPath = join(tmpdir(), `lossless-claw-recall-signal-${Date.now()}.db`);
+    dbPaths.add(dbPath);
+    const { api, getFactory } = buildApi({ enabled: true, dbPath });
+    lcmPlugin.register(api);
+    const engine = await getFactory()!() as { deps: LcmDependencies };
+    const signal = new AbortController().signal;
+    await engine.deps.complete({
+      model: "Qwen", provider: "qwen-local", maxTokens: 50, signal,
+      runtimeModelOverride: { configField: "expansionModel", configPath: "plugins.entries.lossless-claw.config.expansionModel", modelRef: "qwen-local/Qwen" },
+      purpose: "lossless-claw delegated recall synthesis",
+      messages: [{ role: "user", content: "synthetic evidence" }],
+    });
+    const complete = (api.runtime as unknown as { llm: { complete: ReturnType<typeof vi.fn> } }).llm.complete;
+    expect(complete).toHaveBeenCalledWith(expect.objectContaining({
+      model: "qwen-local/Qwen", signal, purpose: "lossless-claw delegated recall synthesis",
+    }));
+    expect(complete.mock.calls[0]?.[0]).not.toHaveProperty("tools");
+  });
+
   const dbPaths = new Set<string>();
   const tempDirs = new Set<string>();
 

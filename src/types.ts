@@ -52,6 +52,7 @@ export type RuntimeLlmCompleteFn = (params: {
   agentId?: string;
   reasoning?: string;
   authProfileId?: string;
+  signal?: AbortSignal;
 }) => Promise<{
   text: string;
   provider: string;
@@ -74,6 +75,8 @@ export type CompleteFn = (params: {
   temperature?: number;
   reasoning?: string;
   reasoningIfSupported?: string;
+  signal?: AbortSignal;
+  purpose?: string;
 }) => Promise<CompletionResult>;
 
 /** Optional bridge to OpenClaw's built-in runtime compaction path. */
