@@ -28,7 +28,10 @@ import {
   serializeRawPayloadContent,
   type StoredMessage,
 } from "./message-content.js";
-import { resolveLiveToolResultExternalization } from "./read-tool-recovery.js";
+import {
+  formatInstructionFileContinuation,
+  resolveLiveToolResultExternalization,
+} from "./read-tool-recovery.js";
 import { buildExternalizedToolResultBlock } from "./tool-result-blocks.js";
 import { asRecord, safeBoolean, safeString } from "./value-utils.js";
 
@@ -867,6 +870,28 @@ export class LargeFileInterceptor {
         extractedText,
         toolCallInputMap: params.toolCallInputMap,
       });
+
+      if (
+        externalizedPayload.instructionFilePath
+        && estimateTokens(externalizedPayload.content) >= threshold
+      ) {
+        const continuation = [
+          formatInstructionFileContinuation(externalizedPayload.instructionFilePath),
+          "The instruction-bearing read result exceeded the inline context budget.",
+        ].join("\n");
+        const instructionBlock = { ...record };
+        if (isPlainTextToolResult) {
+          instructionBlock.text = continuation;
+        } else if ("output" in instructionBlock || !("content" in instructionBlock)) {
+          instructionBlock.output = continuation;
+        } else {
+          instructionBlock.content = continuation;
+        }
+        interceptedAny = true;
+        rewrittenContent.push(instructionBlock);
+        continue;
+      }
+
       if (estimateTokens(externalizedPayload.content) < threshold) {
         if (externalizedPayload.content !== extractedText) {
           const recoveredBlock = { ...record };
