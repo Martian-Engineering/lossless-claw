@@ -94,6 +94,36 @@ describe("createLcmSummarizeFromLegacyParams", () => {
   });
 
   describe("punctuation-only reasoning remnants", () => {
+    const bareResponse = (source: "content" | "envelope", text: string) =>
+      source === "content"
+        ? { content: [{ type: "text", text }] }
+        : { content: [], output_text: text };
+
+    it.each(["content", "envelope"] as const)("retries bare punctuation-only %s summaries", async (source) => {
+      const complete = vi.fn()
+        .mockResolvedValueOnce(bareResponse(source, "..."))
+        .mockResolvedValueOnce({ content: [{ type: "text", text: "Recovered conversation summary." }] });
+      const summarize = await createSummarizeFn({ deps: makeDeps({ complete }), legacyParams: {} });
+      expect(await summarize!("Conversation source details", false)).toBe("Recovered conversation summary.");
+      expect(complete).toHaveBeenCalledTimes(2);
+    });
+
+    it.each(["content", "envelope"] as const)("falls back after bare punctuation-only retry %s summaries", async (source) => {
+      const complete = vi.fn()
+        .mockResolvedValueOnce({ content: [] })
+        .mockResolvedValueOnce(bareResponse(source, "。… \u200b"));
+      const summarize = await createSummarizeFn({ deps: makeDeps({ complete }), legacyParams: {} });
+      expect(await summarize!("Conversation source details", false)).toContain("Conversation source details");
+      expect(complete).toHaveBeenCalledTimes(2);
+    });
+
+    it.each(["短摘要", "I", "42", "✅"])("preserves substantive output without reasoning alongside bare punctuation-only checks: %s", async (text) => {
+      const complete = vi.fn().mockResolvedValue(bareResponse("content", text));
+      const summarize = await createSummarizeFn({ deps: makeDeps({ complete }), legacyParams: {} });
+      expect(await summarize!("Conversation source details", false)).toBe(text);
+      expect(complete).toHaveBeenCalledTimes(1);
+    });
+
     const responseFor = (source: "content" | "envelope", suffix: string) => {
       const body = `<think>PRIVATE_REASONING_REMNANT</think>${suffix}`;
       return source === "content"

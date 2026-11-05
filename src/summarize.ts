@@ -493,8 +493,8 @@ function sanitizeReasoningSummaryText(value: string): {
   const strippedStandalone = stripStandaloneReasoningBlocks(strippedLeading.text);
   const remainder = strippedStandalone.text;
   const droppedReasoning = strippedLeading.dropped || strippedStandalone.dropped;
-  // Punctuation left after reasoning removal is not a visible summary body.
-  if (!remainder || (droppedReasoning && /^[\p{P}\p{Z}\p{C}]*$/u.test(remainder))) {
+  // Punctuation alone is empty output, even when the host already separated reasoning.
+  if (!remainder || /^[\p{P}\p{Z}\p{C}]*$/u.test(remainder)) {
     // Either the entire body was a closed reasoning block (no summary
     // text after) or the input was empty — both are reasoning-only.
     return { summary: "", droppedReasoning: true, reasoningOnly: true };

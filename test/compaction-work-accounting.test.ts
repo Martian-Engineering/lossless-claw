@@ -64,9 +64,12 @@ function authError() {
 }
 
 describe("compactUntilUnder committed work", () => {
-  it("stores the recovered summary rather than punctuation after reasoning removal", async () => {
+  it.each([
+    ["after reasoning removal", "<think>PRIVATE_REASONING_REMNANT</think>."],
+    ["bare punctuation-only", "..."],
+  ])("stores the recovered summary rather than punctuation: %s", async (_label, text) => {
     const complete = vi.fn()
-      .mockResolvedValueOnce({ content: [{ type: "text", text: "<think>PRIVATE_REASONING_REMNANT</think>." }] })
+      .mockResolvedValueOnce({ content: [{ type: "text", text }] })
       .mockResolvedValueOnce({ content: [{ type: "text", text: "Recovered conversation details." }] });
     const engine = createEngineWithDeps({ freshTailCount: 0, leafMinFanout: 2, leafChunkTokens: 1_000 }, { complete });
     await seedBacklogContext(engine, "punctuation-summary", [150, 150, 150, 150]);
