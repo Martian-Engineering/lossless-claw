@@ -438,6 +438,39 @@ Tradeoff:
 
 If Anthropic prompt-cache stability matters more than topical recall under pressure, set `promptAwareEviction: false`.
 
+### Lane-split budgeting
+
+`laneSplitEnabled` (default `false`) splits the assembly budget into two lanes: a
+conversation lane (messages and summaries — the human text) and a machine-load
+lane (tool results and other bulky payloads). When it is on, the conversation lane
+is kept whole and the machine-load lane absorbs eviction first, so tool output can
+no longer crowd conversation content out of the window. With the flag unset (or
+`false`) assembly output is byte-for-byte unchanged.
+
+Because the conversation lane is otherwise protected, a single brake bounds it:
+`conversationLaneTokenCap`. This cap is the **only** thing that may trim the
+conversation lane — it is the only lever that can drop human text. It defaults to
+**85% of the assembly budget** (`DEFAULT_CONVERSATION_LANE_BUDGET_RATIO`), so it
+scales with the model window instead of pinning a fixed token count: at a 118k
+budget the default is ≈100k, at 150k it is ≈127k. The remaining 15% is a floor for
+the machine-load lane, so the cap still stops a runaway conversation lane from
+starving tool output — with no cap at all the conversation lane has been observed
+eating 40–78% of the budget and driving the machine-load lane down to a couple of
+thousand tokens.
+
+A fixed default was tried first and rejected: at large budgets a fixed cap slips
+*below* the conversation pool and trims human text, which is the opposite of what
+the lane split is for. Set `conversationLaneTokenCap` to an explicit integer to
+override the default. Lower the ratio in code if you want a thicker machine-lane
+floor; raise it to favour conversation content.
+
+| Key | Type | Default | Env override | Purpose |
+| --- | --- | --- | --- | --- |
+| `laneSplitEnabled` | `boolean` | `false` | `LCM_LANE_SPLIT_ENABLED` | Master switch for lane-based assembly. Off by default; when off, assembly output is unchanged. |
+| `conversationLaneTokenCap` | `integer` | derived (85% of the budget) | `LCM_CONVERSATION_LANE_TOKEN_CAP` | Cap on the conversation lane. The only thing that may trim human text. Defaults to `0.85 × tokenBudget` and leaves the rest as a floor for the machine-load lane; an explicit value overrides it. |
+| `laneReasoningMode` | `"inline" \| "lowest"` | `inline` | `LCM_LANE_REASONING_MODE` | `lowest` lets reasoning blocks yield before any whole conversation message when the lane is under cap pressure. |
+| `laneReasoningShedPolicy` | `"purpose-bound" \| "always"` | `purpose-bound` | `LCM_LANE_REASONING_SHED_POLICY` | `purpose-bound` sheds reasoning only when doing so actually makes the lane fit; `always` reproduces the earlier behaviour. |
+
 ## Behavior notes
 
 ### Summary model resolution

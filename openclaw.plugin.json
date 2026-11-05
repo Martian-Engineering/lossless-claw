@@ -81,6 +81,15 @@
       ]
     },
     {
+      "id": "lane-split",
+      "title": "Lane split",
+      "order": 25,
+      "properties": [
+        "laneSplitEnabled",
+        "conversationLaneTokenCap"
+      ]
+    },
+    {
       "id": "compaction",
       "title": "Compaction",
       "order": 30,
@@ -477,6 +486,14 @@
     "stripInjectedContextTags": {
       "label": "Strip Injected Context Tags",
       "help": "XML tag names whose blocks are stripped from messages before summarization. Covers memory/context plugin prepended blocks (active-memory, memory-lancedb, hindsight-openclaw). Set to [] to disable."
+    },
+    "laneSplitEnabled": {
+      "label": "Lane Split",
+      "help": "Master switch for lane-based assembly. Default off: lane tags are still recorded at ingest (observation only), but assembly is unchanged. Later steps split the conversation and longtext lanes' budgets behind this flag."
+    },
+    "conversationLaneTokenCap": {
+      "label": "Conversation Lane Token Cap",
+      "help": "Token cap for the conversation lane during lane-split assembly. Leave empty to derive it from the assembly budget (85% of the budget), reserving the remaining 15% as a floor for tool output; set a value to override. Only this cap may trim the conversation lane; longtext (tool-result) items absorb all other eviction."
     }
   },
   "configSchema": {
@@ -578,6 +595,14 @@
       "stubLargeToolPayloads": {
         "type": "boolean",
         "default": false
+      },
+      "laneSplitEnabled": {
+        "type": "boolean",
+        "default": false
+      },
+      "conversationLaneTokenCap": {
+        "type": "integer",
+        "minimum": 1
       },
       "leafChunkTokens": {
         "type": "integer",
