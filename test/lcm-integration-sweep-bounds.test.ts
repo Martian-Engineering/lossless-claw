@@ -327,6 +327,43 @@ describe("LCM integration: compactUntilUnder bounds", () => {
     expect(result.rounds).toBeLessThan(10);
   });
 
+  it("reports every committed pass and stops at the pass boundary after a host abort", async () => {
+    const engine = new CompactionEngine(
+      convStore as any,
+      sumStore as any,
+      multiRoundConfig({ maxRounds: 10 }),
+    );
+    await seedManyMessages();
+
+    const controller = new AbortController();
+    const committed: number[] = [];
+    const summarize = vi.fn(async (text: string) => `S(${text.length})`);
+
+    const result = await engine.compactUntilUnder({
+      conversationId: CONV_ID,
+      tokenBudget: 10_000,
+      targetTokens: 50,
+      summarize,
+      abortSignal: controller.signal,
+      onPassCommitted: (tokensAfter) => {
+        committed.push(tokensAfter);
+        // Host timeout fires after the third committed pass.
+        if (committed.length === 3) controller.abort();
+      },
+    });
+
+    // The in-flight pass commits; no further pass or round starts.
+    expect(summarize).toHaveBeenCalledTimes(3);
+    expect(committed).toHaveLength(3);
+    expect(result.success).toBe(false);
+    expect(result.actionTaken).toBe(true);
+    expect(result.finalTokens).toBe(committed[2]);
+    // Lossless: committed summaries stay, the remainder stays raw.
+    const contextItems = await sumStore.getContextItems(CONV_ID);
+    expect(contextItems.some((ci) => ci.itemType === "summary")).toBe(true);
+    expect(contextItems.some((ci) => ci.itemType === "message")).toBe(true);
+  });
+
   it("returns a consistent partial result when the operation deadline is hit", async () => {
     const engine = new CompactionEngine(
       convStore as any,

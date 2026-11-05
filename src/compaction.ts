@@ -867,6 +867,8 @@ export class CompactionEngine {
     summaryModel?: string;
     /** Optional operation-wide wall-clock deadline shared across rounds. */
     operationDeadlineAt?: number;
+    /** Host cancellation; the sweep stops before starting another pass. */
+    abortSignal?: AbortSignal;
     /** Report each committed pass even if a later pass throws. */
     onPassCommitted?: (tokensAfter: number) => void;
   }): Promise<CompactionResult> {
@@ -1060,6 +1062,11 @@ export class CompactionEngine {
      * the whole operation run `maxRounds × sweepDeadlineMs`.
      */
     operationDeadlineAt?: number;
+    /**
+     * Host cancellation (e.g. its compaction safety timeout). Committed passes
+     * stay persisted; the sweep only declines to start another pass.
+     */
+    abortSignal?: AbortSignal;
     /** Report each committed pass even if a later pass throws. */
     onPassCommitted?: (tokensAfter: number) => void;
   }): Promise<CompactionResult> {
@@ -1148,11 +1155,14 @@ export class CompactionEngine {
       }
       const hitIterationCap = sweepIterations >= maxSweepIterations;
       const hitDeadline = Date.now() >= sweepDeadlineAt;
-      if (hitIterationCap || hitDeadline) {
+      const aborted = input.abortSignal?.aborted === true;
+      if (hitIterationCap || hitDeadline || aborted) {
         stoppedAtBudget = true;
         const clampedByOperation =
           hitDeadline && sweepDeadlineAt < ownSweepDeadlineAt;
-        const limit = hitIterationCap
+        const limit = aborted
+          ? `host abort`
+          : hitIterationCap
           ? `iteration cap ${maxSweepIterations}`
           : clampedByOperation
             ? `compactUntilUnder operation deadline`
@@ -1403,6 +1413,10 @@ export class CompactionEngine {
     currentTokens?: number;
     summarize: CompactionSummarizeFn;
     summaryModel?: string;
+    /** Host cancellation; each sweep stops before starting another pass. */
+    abortSignal?: AbortSignal;
+    /** Report each committed pass, e.g. to refresh a host idle timeout. */
+    onPassCommitted?: (tokensAfter: number) => void;
   }): Promise<CompactUntilUnderResult> {
     return this.withContextCache(() => this._compactUntilUnderImpl(input));
   }
@@ -1421,6 +1435,10 @@ export class CompactionEngine {
     currentTokens?: number;
     summarize: CompactionSummarizeFn;
     summaryModel?: string;
+    /** Host cancellation; each sweep stops before starting another pass. */
+    abortSignal?: AbortSignal;
+    /** Report each committed pass, e.g. to refresh a host idle timeout. */
+    onPassCommitted?: (tokensAfter: number) => void;
   }): Promise<CompactUntilUnderResult> {
     const { conversationId, tokenBudget, summarize } = input;
     const targetTokens =
@@ -1493,9 +1511,11 @@ export class CompactionEngine {
           force: true,
           summaryModel: input.summaryModel,
           operationDeadlineAt,
+          ...(input.abortSignal ? { abortSignal: input.abortSignal } : {}),
           onPassCommitted: (tokensAfter) => {
             actionTaken = true;
             committedTokens = tokensAfter;
+            input.onPassCommitted?.(tokensAfter);
           },
         });
       } catch (error) {

@@ -38,6 +38,7 @@ const OPENCLAW_HOST_PARAM_NAMES = new Set([
   "runtimeSettings",
   "sessionTarget",
   "runtimeContext",
+  "onProgress",
 ]);
 
 /** Apply OpenClaw's accepted-host-parameter projection contract in integration tests. */
@@ -1728,6 +1729,54 @@ describe("LcmContextEngine.compact token budget plumbing", () => {
         summarize: expect.any(Function),
       }),
     );
+  });
+
+  it("forwards host abort and refreshes host progress for each committed recovery pass", async () => {
+    const engine = createEngine();
+    const privateEngine = engine as unknown as {
+      compaction: {
+        evaluate: (conversationId: number, tokenBudget: number, observed?: number) => Promise<unknown>;
+        compactUntilUnder: (input: {
+          abortSignal?: AbortSignal;
+          onPassCommitted?: (tokensAfter: number) => void;
+        }) => Promise<unknown>;
+      };
+    };
+    vi.spyOn(privateEngine.compaction, "evaluate").mockResolvedValue({
+      shouldCompact: true,
+      reason: "threshold",
+      currentTokens: 277_403,
+      threshold: 150_000,
+    });
+    const compactUntilUnderSpy = vi
+      .spyOn(privateEngine.compaction, "compactUntilUnder")
+      .mockImplementation(async (input) => {
+        input.onPassCommitted?.(240_000);
+        input.onPassCommitted?.(190_000);
+        return { success: true, actionTaken: true, rounds: 1, finalTokens: 149_500 };
+      });
+    await engine.ingest({
+      sessionId: "forced-sweep-host-progress",
+      message: { role: "user", content: "trigger" } as AgentMessage,
+    });
+
+    const controller = new AbortController();
+    const onProgress = vi.fn();
+    await engine.compact({
+      sessionId: "forced-sweep-host-progress",
+      sessionFile: "/tmp/session.jsonl",
+      tokenBudget: 200_000,
+      currentTokenCount: 277_403,
+      force: true,
+      compactionTarget: "budget",
+      abortSignal: controller.signal,
+      onProgress,
+    });
+
+    expect(compactUntilUnderSpy).toHaveBeenCalledWith(
+      expect.objectContaining({ abortSignal: controller.signal }),
+    );
+    expect(onProgress).toHaveBeenCalledTimes(2);
   });
 
   it("leaves threshold headroom when forced budget recovery receives a raw host window", async () => {

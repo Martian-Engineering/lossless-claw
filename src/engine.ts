@@ -273,6 +273,10 @@ type CompactionExecutionParams = {
   legacyParams?: Record<string, unknown>;
   /** Force compaction even if below threshold */
   force?: boolean;
+  /** Host cancellation for long compactions; committed passes are kept. */
+  abortSignal?: AbortSignal;
+  /** Refreshes the host compaction idle timeout after each committed pass. */
+  onProgress?: () => void;
 };
 type ContextEngineMaintenanceRuntimeContext = Record<string, unknown> & {
   allowDeferredCompactionExecution?: boolean;
@@ -564,7 +568,14 @@ export class LcmContextEngine implements ContextEngine {
       id: "lossless-claw",
       name: "Lossless Context Management Engine",
       version: packageJson.version,
-      acceptedHostParams: ["sessionKey", "sessionTarget", "prompt", "runtimeContext", "runtimeSettings"],
+      acceptedHostParams: [
+        "sessionKey",
+        "sessionTarget",
+        "prompt",
+        "runtimeContext",
+        "runtimeSettings",
+        "onProgress",
+      ],
       transcriptSemantics: {
         currentTurnFence: "before-current-turn-entry-v1",
         turnAdvancementIdempotency: "atomic-idempotent-v1",
@@ -1572,6 +1583,8 @@ export class LcmContextEngine implements ContextEngine {
     sessionQueueHeld?: boolean;
     maxPendingSteps?: number;
     publishPolicy?: PendingCompactionPublishPolicy;
+    abortSignal?: AbortSignal;
+    onProgress?: () => void;
   }): Promise<CompactResult & { pending?: boolean }> {
     const breakerScope = this.resolveSessionQueueKey(params.sessionId, params.sessionKey);
     const publicationOnly = params.publishPolicy === "publish-ready-only";
@@ -1810,6 +1823,8 @@ export class LcmContextEngine implements ContextEngine {
             customInstructions: params.customInstructions,
             compactionTarget: params.compactionTarget,
             force: params.force === true,
+            abortSignal: params.abortSignal,
+            onProgress: params.onProgress,
           });
           if (params.sessionQueueHeld === true) {
             return runLegacyCompaction();
@@ -2267,6 +2282,8 @@ export class LcmContextEngine implements ContextEngine {
           ...(runtimeAdjustedSweepTargetTokens !== undefined
             ? { stopAtTokens: runtimeAdjustedSweepTargetTokens }
             : {}),
+          ...(params.abortSignal ? { abortSignal: params.abortSignal } : {}),
+          onPassCommitted: () => params.onProgress?.(),
         });
 
       let sweepResult: Awaited<ReturnType<CompactionEngine["compact"]>>;
@@ -2496,6 +2513,8 @@ export class LcmContextEngine implements ContextEngine {
       ...(effectiveCurrentTokens !== undefined ? { currentTokens: effectiveCurrentTokens } : {}),
       summarize,
       summaryModel,
+      ...(params.abortSignal ? { abortSignal: params.abortSignal } : {}),
+      onPassCommitted: () => params.onProgress?.(),
     });
     // Host lifecycle and capability/policy failures must still fail closed.
     if (compactResult.error instanceof LcmRuntimeLifecycleError ||
@@ -4962,6 +4981,10 @@ export class LcmContextEngine implements ContextEngine {
     legacyParams?: Record<string, unknown>;
     /** Force compaction even if below threshold */
     force?: boolean;
+    /** Host cancellation (run abort or compaction safety timeout). */
+    abortSignal?: AbortSignal;
+    /** Host idle-timeout refresh; requires "onProgress" in acceptedHostParams. */
+    onProgress?: () => void;
   }): Promise<CompactResult> {
     const recoveryTarget = params.force === true && params.compactionTarget === "budget"
       ? resolveSessionTranscriptReadTarget(params)
@@ -5047,6 +5070,8 @@ export class LcmContextEngine implements ContextEngine {
           force: params.force,
           sessionQueueHeld: true,
           maxPendingSteps: manualPendingStepCap,
+          abortSignal: params.abortSignal,
+          onProgress: params.onProgress,
         };
         const result: CompactResult & { pending?: boolean } = authoritativeRecovery
           ? await this.executeCompactionCore(execution)
