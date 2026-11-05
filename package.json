@@ -53,7 +53,7 @@
     "@earendil-works/pi-agent-core": "^0.79.8",
     "@earendil-works/pi-ai": "^0.79.8",
     "@earendil-works/pi-coding-agent": "^0.79.8",
-    "dompurify": "^3.4.15",
+    "dompurify": "3.4.16",
     "esbuild": "^0.28.1",
     "marked": "^18.0.13",
     "openclaw": "2026.9.2",
