@@ -1568,6 +1568,8 @@ export class LcmContextEngine implements ContextEngine {
 
   /** Advance issue-807 pending summary compaction without writing canonical rows early. */
   private async executePendingCompactionCore(params: {
+    /** Permit last-resort recovery only after ordinary compaction is exhausted. */
+    allowCurrentTurnCompaction?: boolean;
     conversationId: number;
     sessionId: string;
     sessionKey?: string;
@@ -1674,8 +1676,12 @@ export class LcmContextEngine implements ContextEngine {
                 context: formatSessionLabel(params.sessionId, params.sessionKey),
               },
             );
-    const pendingFreshTailCount =
+    const configuredFreshTailCount =
       params.contextThresholdOverride?.freshTailCount ?? this.config.freshTailCount;
+    // Recovery retains the initiating user even if routine tail protection is off.
+    const pendingFreshTailCount = params.allowCurrentTurnCompaction
+      ? Math.max(1, configuredFreshTailCount)
+      : configuredFreshTailCount;
     const pendingLeafChunkTokens =
       params.contextThresholdOverride?.leafChunkTokens ?? this.config.leafChunkTokens;
     const coordinator = new PendingCompactionCoordinator({
@@ -1811,6 +1817,7 @@ export class LcmContextEngine implements ContextEngine {
             };
           }
           const runLegacyCompaction = () => this.executeCompactionCore({
+            ...(params.allowCurrentTurnCompaction ? { allowCurrentTurnCompaction: true } : {}),
             conversationId: params.conversationId,
             sessionId: params.sessionId,
             sessionKey: params.sessionKey,
@@ -2264,13 +2271,20 @@ export class LcmContextEngine implements ContextEngine {
             ? false
             : !liveContextStillExceedsTarget;
       };
-      const runSweepOnce = (): ReturnType<CompactionEngine["compact"]> =>
+      const sweepChainDeadlineAt = startedAt + this.resolveSweepChainDeadlineMs();
+      const sweepFreshTailCount = params.allowCurrentTurnCompaction
+        ? Math.max(1, resolvedContextThreshold.freshTailCount ?? this.config.freshTailCount)
+        : resolvedContextThreshold.freshTailCount;
+      const runSweepOnce = (
+        allowCurrentTurnCompaction = false,
+      ): ReturnType<CompactionEngine["compact"]> =>
         this.compaction.compact({
+          ...(allowCurrentTurnCompaction ? { allowCurrentTurnCompaction: true } : {}),
           conversationId,
           tokenBudget,
           contextThreshold: resolvedContextThreshold.contextThreshold,
-          ...(resolvedContextThreshold.freshTailCount !== undefined
-            ? { freshTailCount: resolvedContextThreshold.freshTailCount }
+          ...(sweepFreshTailCount !== undefined
+            ? { freshTailCount: sweepFreshTailCount }
             : {}),
           ...(resolvedContextThreshold.leafChunkTokens !== undefined
             ? { leafChunkTokens: resolvedContextThreshold.leafChunkTokens }
@@ -2281,6 +2295,11 @@ export class LcmContextEngine implements ContextEngine {
           summaryModel,
           ...(runtimeAdjustedSweepTargetTokens !== undefined
             ? { stopAtTokens: runtimeAdjustedSweepTargetTokens }
+            : isThresholdSweep && params.allowCurrentTurnCompaction
+              ? { stopAtTokens: targetTokens }
+              : {}),
+          ...(allowCurrentTurnCompaction
+            ? { operationDeadlineAt: sweepChainDeadlineAt }
             : {}),
           ...(params.abortSignal ? { abortSignal: params.abortSignal } : {}),
           onPassCommitted: () => params.onProgress?.(),
@@ -2310,7 +2329,7 @@ export class LcmContextEngine implements ContextEngine {
       // attempt and punishing progress with a spend backoff.
       let chainedSweeps = 1;
       let lastRoundMadeProgress = sweepResult.actionTaken === true;
-      const sweepChainDeadlineAt = startedAt + this.resolveSweepChainDeadlineMs();
+      let normalCompactionExhausted = sweepResult.actionTaken === false;
       const maxChainedSweeps = resolvePositiveInteger(
         this.config.maxSweepIterations,
         12,
@@ -2339,6 +2358,7 @@ export class LcmContextEngine implements ContextEngine {
           throw err;
         }
         chainedSweeps += 1;
+        normalCompactionExhausted = next.actionTaken === false;
         const nextTokensAfter = resolveSweepTokensAfter(next);
         lastRoundMadeProgress =
           next.actionTaken === true &&
@@ -2350,6 +2370,43 @@ export class LcmContextEngine implements ContextEngine {
           createdSummaryId: next.createdSummaryId ?? sweepResult.createdSummaryId,
         };
         previousTokensAfter = nextTokensAfter ?? previousTokensAfter;
+      }
+
+      // Last resort only: an ordinary full sweep (including condensation) must
+      // exhaust eligible history without reaching the target. A budget/deadline
+      // stop is not exhaustion, and neither is a provider or cancellation failure.
+      if (
+        isThresholdSweep &&
+        params.allowCurrentTurnCompaction &&
+        !sweepResult.authFailure &&
+        !sweepResult.stoppedAtBudget &&
+        normalCompactionExhausted &&
+        !isUnderTargetAfter(sweepResult) &&
+        !params.abortSignal?.aborted &&
+        chainedSweeps < maxChainedSweeps &&
+        Date.now() < sweepChainDeadlineAt
+      ) {
+        let recovery: Awaited<ReturnType<CompactionEngine["compact"]>> | undefined;
+        try {
+          recovery = await runSweepOnce(true);
+        } catch (err) {
+          if (!(err instanceof LcmSummarySpendLimitError)) throw err;
+          this.deps.log.warn(
+            `[lcm] compact: spend guard stopped current-turn recovery conversation=${conversationId} ${sessionLabel} scope=${err.scopeKey} chainedSweeps=${chainedSweeps} backoffUntil=${err.backoffUntil.toISOString()}`,
+          );
+        }
+        if (recovery) {
+          chainedSweeps += 1;
+          const recoveryTokensAfter = resolveSweepTokensAfter(recovery);
+          lastRoundMadeProgress = recovery.actionTaken === true &&
+            (previousTokensAfter === undefined ||
+              recoveryTokensAfter !== undefined && recoveryTokensAfter < previousTokensAfter);
+          sweepResult = {
+            ...recovery,
+            actionTaken: sweepResult.actionTaken || recovery.actionTaken,
+            createdSummaryId: recovery.createdSummaryId ?? sweepResult.createdSummaryId,
+          };
+        }
       }
 
       if (sweepResult.authFailure && breakerKey) {
@@ -5052,10 +5109,13 @@ export class LcmContextEngine implements ContextEngine {
           Math.floor(this.config.maxSweepIterations),
           (await this.summaryStore.getContextItems(conversation.conversationId)).length * 2 + 8,
         );
-        // Pending preparation only compacts a prefix. Recovery may instead
-        // summarize completed groups after the retained initiating user.
+        // Pending preparation only compacts a prefix. Explicit threshold
+        // compaction must also recover a tool-heavy latest turn when that prefix
+        // is exhausted, retaining its initiating user and complete tool groups.
+        const allowCurrentTurnCompaction = authoritativeRecovery ||
+          (params.force === true && params.compactionTarget === "threshold");
         const execution = {
-          ...(authoritativeRecovery ? { allowCurrentTurnCompaction: true } : {}),
+          ...(allowCurrentTurnCompaction ? { allowCurrentTurnCompaction: true } : {}),
           conversationId: conversation.conversationId,
           sessionId: params.sessionId,
           sessionKey: params.sessionKey,
