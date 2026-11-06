@@ -584,7 +584,7 @@ describe("LCM tools session scoping", () => {
     );
   });
 
-  it("lcm_grep prefers the active runtime session when the tool sessionKey is stale", async () => {
+  it("lcm_grep prefers the active runtime generation for the same sessionKey", async () => {
     const retrieval = {
       grep: vi.fn(async (input: { conversationIds?: number[] }) => {
         const found = input.conversationIds?.includes(1987) === true;
@@ -613,6 +613,7 @@ describe("LCM tools session scoping", () => {
       lcm: buildLcmEngine({
         retrieval,
         conversationId: 1987,
+        conversationSessionKey: "agent:main:telegram:default:direct:stale-chat",
         conversationIdBySessionKey: 1884,
         conversationFamilyIdsByRoot: {
           1884: [1884],
@@ -638,7 +639,7 @@ describe("LCM tools session scoping", () => {
     );
     expect(deps.log.warn).toHaveBeenCalledWith(
       expect.stringContaining(
-        "alternativeConversation=1987 alternativeSessionKey=agent:main:main alternativeActive=true",
+        "alternativeConversation=1987 alternativeSessionKey=agent:main:telegram:default:direct:stale-chat alternativeActive=true",
       ),
     );
   });
