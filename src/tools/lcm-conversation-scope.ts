@@ -226,8 +226,11 @@ export async function resolveLcmConversationScope(input: {
         !isDelegatedSession && normalizedInputSessionId && !sessionIdAsSessionKey
           ? await store.getConversationBySessionId(normalizedInputSessionId)
           : null;
+      const runtimeSessionKey = byRuntimeSession?.sessionKey?.trim();
       const runtimeSessionOverridesStaleKey =
         byRuntimeSession?.active === true
+        // A reused runtime ID must not override a different stable session identity.
+        && (!runtimeSessionKey || runtimeSessionKey === normalizedSessionKey)
         && byRuntimeSession.conversationId !== bySessionKey.conversationId;
       const conversation = runtimeSessionOverridesStaleKey ? byRuntimeSession : bySessionKey;
       const conversationSessionKey = conversation.sessionKey?.trim();
