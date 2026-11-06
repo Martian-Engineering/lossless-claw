@@ -4,6 +4,7 @@ import { sanitizeToolUseResultPairing } from "./transcript-repair.js";
 import type {
   ConversationStore,
   MessagePartRecord,
+  MessageRecord,
   MessageRole,
 } from "./store/conversation-store.js";
 import type { FocusBriefRecord, FocusBriefStore } from "./store/focus-brief-store.js";
@@ -1848,12 +1849,32 @@ export class ContextAssembler {
    */
   private async resolveItems(contextItems: ContextItemRecord[]): Promise<ResolvedItem[]> {
     const resolved: ResolvedItem[] = [];
-
-    for (const item of contextItems) {
-      const result = await this.resolveItem(item);
-      if (result) {
-        resolved.push(result);
+    for (let offset = 0; offset < contextItems.length;) {
+      const item = contextItems[offset]!;
+      if (item.itemType !== "message" || item.messageId == null) {
+        if (item.itemType === "summary" && item.summaryId != null) {
+          const summary = await this.resolveSummaryItem(item);
+          if (summary) resolved.push(summary);
+        }
+        offset++;
+        continue;
       }
+      // Do not prefetch across summaries or retain source rows across invocations.
+      // The caller's order, not IN-query order, owns duplicate context occurrences.
+      let end = offset;
+      while (end < contextItems.length && end - offset < 256 &&
+             contextItems[end]!.itemType === "message" && contextItems[end]!.messageId != null) end++;
+      const batch = contextItems.slice(offset, end);
+      const sources = await this.conversationStore.getMessagesWithParts(batch.map((entry) => entry.messageId!));
+      for (const entry of batch) {
+        const source = sources.get(entry.messageId!);
+        if (!source) continue;
+        // Legacy block reconstruction backfills part fields in place. Each context
+        // occurrence must get fresh records, as it did with individual SQL reads.
+        const result = await this.resolveMessageItem(entry, source.message, source.parts.map((part) => ({ ...part })));
+        if (result) resolved.push(result);
+      }
+      offset = end;
     }
 
     return resolved;
@@ -1907,32 +1928,9 @@ export class ContextAssembler {
   }
 
   /**
-   * Resolve a single context item.
-   */
-  private async resolveItem(item: ContextItemRecord): Promise<ResolvedItem | null> {
-    if (item.itemType === "message" && item.messageId != null) {
-      return this.resolveMessageItem(item);
-    }
-
-    if (item.itemType === "summary" && item.summaryId != null) {
-      return this.resolveSummaryItem(item);
-    }
-
-    // Malformed item — skip
-    return null;
-  }
-
-  /**
    * Resolve a context item that references a raw message.
    */
-  private async resolveMessageItem(item: ContextItemRecord): Promise<ResolvedItem | null> {
-    const msg = await this.conversationStore.getMessageById(item.messageId!);
-    if (!msg) {
-      return null;
-    }
-
-    const parts = await this.conversationStore.getMessageParts(msg.messageId);
-
+  private async resolveMessageItem(item: ContextItemRecord, msg: MessageRecord, parts: MessagePartRecord[]): Promise<ResolvedItem | null> {
     // Skip empty assistant messages left by error/aborted responses.
     // These waste context tokens and can confuse models that reject
     // consecutive empty assistant turns.  Only skip when both the stored
