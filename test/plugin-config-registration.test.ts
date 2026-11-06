@@ -2,7 +2,7 @@ import { mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import type { OpenClawPluginApi } from "../src/openclaw-bridge.js";
+import type { AgentMessage, OpenClawPluginApi } from "../src/openclaw-bridge.js";
 import lcmPlugin from "../index.js";
 import * as connectionModule from "../src/db/connection.js";
 import { closeLcmConnection } from "../src/db/connection.js";
@@ -10,8 +10,26 @@ import { LcmContextEngine } from "../src/engine.js";
 import { clearAllSharedInit } from "../src/plugin/shared-init.js";
 import { resetStartupBannerLogsForTests } from "../src/startup-banner-log.js";
 import { runDelegatedExpansionLoop } from "../src/tools/lcm-expand-tool.delegation.js";
+import { FakeTranscriptHost } from "./transcript-delta-fake-host.js";
 
 const buildMemorySystemPromptAdditionMock = vi.hoisted(() => vi.fn());
+const transcriptRuntime = vi.hoisted(() => ({
+  modulePath: "openclaw/plugin-sdk/context-engine-transcript-runtime",
+  replay: undefined as unknown,
+  visible: vi.fn(),
+  raw: vi.fn(),
+  entries: vi.fn(),
+}));
+
+vi.mock("openclaw/plugin-sdk/session-transcript-runtime", () => ({
+  readSessionTranscriptVisibleMessageDelta: transcriptRuntime.visible,
+  readSessionTranscriptRawDelta: transcriptRuntime.raw,
+  readVisibleSessionTranscriptMessageEntries: transcriptRuntime.entries,
+}));
+
+vi.mock(transcriptRuntime.modulePath, () => ({
+  get readSessionTranscriptReplayGroups() { return transcriptRuntime.replay; },
+}));
 
 vi.mock("openclaw/plugin-sdk/core", () => ({
   buildMemorySystemPromptAddition: buildMemorySystemPromptAdditionMock,
@@ -205,6 +223,10 @@ describe("lcm plugin registration", () => {
     clearAllSharedInit();
     resetStartupBannerLogsForTests();
     buildMemorySystemPromptAdditionMock.mockReset();
+    transcriptRuntime.replay = undefined;
+    transcriptRuntime.visible.mockReset();
+    transcriptRuntime.raw.mockReset();
+    transcriptRuntime.entries.mockReset();
     vi.restoreAllMocks();
     vi.unstubAllEnvs();
     for (const dir of tempDirs) {
@@ -212,6 +234,78 @@ describe("lcm plugin registration", () => {
     }
     tempDirs.clear();
   });
+
+  it.each(["unsupported", "canonical", "empty", "rejected"] as const)(
+    "assembles retained history through the registered plugin on a %s replay host",
+    async (capability) => {
+      const dir = mkdtempSync(join(tmpdir(), "lcm-replay-host-"));
+      tempDirs.add(dir);
+      const dbPath = join(dir, "lcm.db");
+      dbPaths.add(dbPath);
+      const sessionId = "replay-host";
+      const sessionKey = "agent:main:replay-host";
+      const sessionTarget = { agentId: "main", sessionId, sessionKey };
+      const host = new FakeTranscriptHost(sessionId);
+      const users = Array.from({ length: 3 }, (_, index) => ({
+        role: "user", content: `request ${index}`, timestamp: 1000 + index,
+        idempotencyKey: `turn-${index}`,
+        provenance: { kind: "inter_session", sourceSessionKey: "agent:main:child", sourceTool: "subagent_settle" },
+      } as AgentMessage));
+      const entryIds = users.map(message => host.append(message));
+      const carrier = {
+        role: "custom", customType: "openclaw.runtime-context", display: false,
+        content: "retained runtime context", timestamp: 1001,
+        details: { source: "openclaw-runtime-context", runtimeContextCarrier: true },
+      } as AgentMessage;
+      transcriptRuntime.visible.mockImplementation(host.readVisibleDelta);
+      transcriptRuntime.raw.mockImplementation(host.readRawDelta);
+      transcriptRuntime.entries.mockImplementation(host.readVisibleEntries);
+      const readReplay = vi.fn(async () => {
+        if (capability === "rejected") throw new Error("canonical read unavailable");
+        return capability === "empty" ? [] : [{ entryId: entryIds[1], message: users[1], carriers: [carrier] }];
+      });
+      transcriptRuntime.replay = capability === "unsupported" ? undefined : readReplay;
+      const { api, getFactory, debugLog } = buildApi({
+        enabled: true, dbPath, independentLogFile: { enabled: false },
+      });
+      lcmPlugin.register(api);
+      const engine = getFactory()!() as Pick<LcmContextEngine,
+        "bootstrap" | "assemble" | "getConversationStore" | "getSummaryStore">;
+      await engine.bootstrap({ sessionId, sessionKey, sessionTarget });
+      const conversation = await engine.getConversationStore().getConversationForSession({ sessionId, sessionKey });
+      await engine.getSummaryStore().insertSummary({
+        summaryId: "retained-summary", conversationId: conversation!.conversationId,
+        kind: "leaf", depth: 0, content: "Earlier summarized history", tokenCount: 8,
+      });
+      await engine.getSummaryStore().replaceContextRangeWithSummary({
+        conversationId: conversation!.conversationId, startOrdinal: 0, endOrdinal: 0, summaryId: "retained-summary",
+      });
+      // Supported hosts must restore history outside the live window. The
+      // unsupported path can only restore carriers still in that window.
+      const live = capability === "canonical" ? [users[2]!] : [users[1]!, carrier, users[2]!];
+      const result = await engine.assemble({
+        sessionId, sessionKey, sessionTarget, messages: live, tokenBudget: 100_000,
+      } as Parameters<typeof engine.assemble>[0]);
+      if (capability === "rejected") {
+        expect(result.messages).toEqual(live);
+        expect(debugLog).toHaveBeenCalledWith(expect.stringContaining("canonical read unavailable"));
+        return;
+      }
+      expect(JSON.stringify(result.messages[0])).toContain("Earlier summarized history");
+      if (capability === "empty") {
+        // A valid empty response must not fall back to live carrier replay.
+        expect(result.messages).not.toContainEqual(carrier);
+      } else {
+        const index = result.messages.findIndex(message => Reflect.get(message, "idempotencyKey") === "turn-1");
+        expect(index).toBeGreaterThan(0);
+        expect(result.messages[index + 1]).toEqual(carrier);
+        if (capability === "canonical") expect(result.messages[index]).toMatchObject({ provenance: Reflect.get(users[1]!, "provenance") });
+      }
+      if (capability === "unsupported") expect(readReplay).not.toHaveBeenCalled();
+      else expect(readReplay).toHaveBeenCalledWith(expect.objectContaining({ entryIds: entryIds.slice(1) }));
+      expect(debugLog.mock.calls.flat().join(" ")).not.toContain("assemble: failed");
+    },
+  );
 
   it("registers only the lossless-claw context engine id", () => {
     const { api, getRegisteredContextEngines } = buildApi({ enabled: true });

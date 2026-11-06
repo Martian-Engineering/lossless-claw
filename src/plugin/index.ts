@@ -43,6 +43,7 @@ import type {
   VisibleSessionTranscriptMessageEntry,
 } from "../types.js";
 import { listConfiguredAgentIds, normalizeAgentId } from "./openclaw-agent-ids.js";
+import { loadCanonicalReplayReader } from "./canonical-replay.js";
 
 const MIN_CONTEXT_ENGINE_OPENCLAW_VERSION = "2026.9.2";
 
@@ -1546,6 +1547,10 @@ function createLcmDependencies(
     readLatestAssistantReply,
     resolveAgentDir: () => api.resolvePath("."),
 
+    readSessionTranscriptReplayGroups: async (params) => {
+      const read = await loadCanonicalReplayReader();
+      return read ? await read(params) : undefined;
+    },
     readVisibleSessionTranscriptMessageEntries: async (target) => {
       const read = await loadSessionTranscriptRuntimeFunction(
         "readVisibleSessionTranscriptMessageEntries",
