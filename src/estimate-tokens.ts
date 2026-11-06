@@ -109,11 +109,37 @@ function isLikelyOpaqueBinaryString(key: string, value: string): boolean {
  */
 const serializedEstimateCache = new WeakMap<object, number>();
 
+/** Estimate the host's version-1 user projection without mutating canonical content. */
+function projectUserContentForEstimate(message: unknown): unknown {
+  if (!isRecord(message) || message.role !== "user") return message;
+  const metadata = message.__openclaw;
+  if (!isRecord(metadata) || !Object.hasOwn(metadata, "modelPromptProjection")) return message;
+  const projection = metadata.modelPromptProjection;
+  if (!isRecord(projection) || projection.version !== 1 || typeof projection.text !== "string") {
+    return message;
+  }
+
+  // The recorded text replaces the first text block only; native media and
+  // subsequent blocks remain model-visible. Media-only arrays gain a text block.
+  let content: unknown = projection.text;
+  if (Array.isArray(message.content)) {
+    let replaced = false;
+    const blocks = message.content.map((block: unknown) => {
+      if (!isRecord(block) || block.type !== "text" || replaced) return block;
+      replaced = true;
+      return { ...block, text: projection.text };
+    });
+    content = replaced ? blocks : [{ type: "text", text: projection.text }, ...blocks];
+  }
+  return { ...message, content };
+}
+
 /**
  * Estimate the model-boundary token cost of a full message object by
- * serializing its rendered structure, not just its text blocks. Top-level
- * `__openclaw` metadata belongs to the host persistence boundary and is not
- * rendered into the model prompt.
+ * serializing its rendered structure, not just its text blocks. A valid
+ * recorded user projection replaces visible text before estimation. Top-level
+ * `__openclaw` metadata itself is excluded, so neither private metadata nor
+ * the replaced text is counted a second time.
  *
  * The LLM-boundary prompt renderer serializes structured tool-call payloads
  * (tool inputs, tool result objects, mirrored identifiers) that text-only
@@ -131,6 +157,7 @@ export function estimateSerializedMessageTokens(message: unknown): number {
       return cached;
     }
   }
+  const rendered = projectUserContentForEstimate(message);
   let opaqueParts = 0;
   let serialized = "";
   try {
@@ -138,11 +165,15 @@ export function estimateSerializedMessageTokens(message: unknown): number {
     // not occur in practice; shared (DAG) references serialize in full,
     // which is what the model boundary sees too.
     serialized =
-      JSON.stringify(message, function (this: unknown, key, value) {
-        if (this === message && key === "__openclaw") {
+      JSON.stringify(rendered, function (this: unknown, key, value) {
+        if (this === rendered && key === "__openclaw") {
           return undefined;
         }
-        if (typeof value === "string" && isLikelyOpaqueBinaryString(key, value)) {
+        // User string content, including a recorded projection, is literal
+        // text even when it happens to contain a long data URL.
+        const isUserText = this === rendered && key === "content" &&
+          isRecord(rendered) && rendered.role === "user";
+        if (typeof value === "string" && !isUserText && isLikelyOpaqueBinaryString(key, value)) {
           opaqueParts += 1;
           return "[opaque binary payload]";
         }
@@ -152,7 +183,7 @@ export function estimateSerializedMessageTokens(message: unknown): number {
     // Cyclic or otherwise non-serializable input: fall back to a shallow
     // per-part estimate so the result is never silently near-zero.
     serialized = "";
-    const content = (message as { content?: unknown } | null)?.content;
+    const content = (rendered as { content?: unknown } | null)?.content;
     if (typeof content === "string") {
       serialized = content;
     } else if (Array.isArray(content)) {
@@ -167,7 +198,7 @@ export function estimateSerializedMessageTokens(message: unknown): number {
   }
   const serializedEstimate =
     estimateTokens(serialized) + opaqueParts * OPAQUE_BINARY_PART_TOKEN_ESTIMATE;
-  const estimate = Math.max(serializedEstimate, estimateToolResultBoundaryTokens(message));
+  const estimate = Math.max(serializedEstimate, estimateToolResultBoundaryTokens(rendered));
   if (cacheable) {
     serializedEstimateCache.set(message as object, estimate);
   }

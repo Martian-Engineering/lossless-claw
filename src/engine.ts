@@ -106,6 +106,7 @@ import {
   observeUserReplayIdentity,
   restoreRawUserReplay,
   type UserReplayIdentity,
+  type UserReplaySource,
 } from "./user-replay.js";
 import { extractStableEventKey } from "./stable-event-key.js";
 import { describeAssembledPrefixChange, formatOverflowDiagnosticsForLog, shouldLogOverflowDiagnostics, type AssemblePrefixSnapshot, type BootstrapImportObservation } from "./assemble-debug.js";
@@ -4487,7 +4488,22 @@ export class LcmContextEngine implements ContextEngine {
       });
       const assembledFreshTailCount =
         resolvedContextThreshold.freshTailCount ?? this.config.freshTailCount;
-      const replayIdentities = liveMessages.some(
+      const replayTarget = resolveSessionTranscriptReadTarget(params);
+      // The host's recent hydration window is not the authority for retained
+      // history. Read only the raw users LCM still retains, with their carriers.
+      const replayGroups =
+        replayTarget && this.deps.readSessionTranscriptReplayGroups
+          ? await this.deps.readSessionTranscriptReplayGroups({
+              ...replayTarget,
+              entryIds: this.userReplayKeyStore.listRawUserContextKeys(conversation.conversationId)
+                .map(state => state.entryId),
+            })
+          : undefined;
+      // Undefined means unsupported; an empty canonical result is authoritative.
+      const replaySources: Map<string, UserReplaySource> | undefined = replayGroups === undefined
+        ? undefined
+        : new Map(replayGroups.map(group => [group.entryId, group]));
+      const replayIdentities = !replaySources && liveMessages.some(
         message => message.role === "user" && typeof Reflect.get(message, "idempotencyKey") === "string",
       )
         ? await this.loadRawUserReplayIdentities({
@@ -4540,7 +4556,7 @@ export class LcmContextEngine implements ContextEngine {
             protectedAssembledIndexes: new Set<number>(),
             tokenBudget: Number.MAX_SAFE_INTEGER,
           });
-          const replay = restoreRawUserReplay(withLiveInputs.messages, liveMessages, replayIdentities);
+          const replay = restoreRawUserReplay(withLiveInputs.messages, liveMessages, replayIdentities, replaySources);
           return Math.max(
             await this.summaryStore.getContextTokenCount(conversation.conversationId),
             estimateSerializedMessagesTokens(replay.messages),
@@ -4732,7 +4748,7 @@ export class LcmContextEngine implements ContextEngine {
       // budget math above runs on stored-content token counts, which undercount
       // live messages that carry structured tool payloads; this is the last
       // line of defense that keeps assembled output deliverable to the model.
-      const replay = restoreRawUserReplay(volatileLiveInputAppend.messages, liveMessages, replayIdentities);
+      const replay = restoreRawUserReplay(volatileLiveInputAppend.messages, liveMessages, replayIdentities, replaySources);
       let serializedClamp = clampMessagesToSerializedBudget({
         messages: replay.messages,
         tokenBudget,

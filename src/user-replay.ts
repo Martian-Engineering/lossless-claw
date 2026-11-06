@@ -10,6 +10,12 @@ export type UserReplayIdentity = {
   signature: string;
 };
 
+/** Canonical replay facts supplied by the transcript owner for one retained entry. */
+export type UserReplaySource = {
+  message: AgentMessage;
+  carriers: AgentMessage[];
+};
+
 /** Digest of a message's live-coverage signature, comparable across stored and live copies. */
 function replaySignatureOf(message: AgentMessage): string {
   return createHash("sha256").update(createLiveCoverageSignature(message)).digest("hex");
@@ -35,9 +41,10 @@ export function restoreRawUserReplay(
   assembled: AgentMessage[],
   live: AgentMessage[],
   identities: ReadonlyMap<string, UserReplayIdentity>,
+  sources?: ReadonlyMap<string, UserReplaySource>,
 ): { messages: AgentMessage[]; carrierParents: Map<AgentMessage, AgentMessage> } {
   const carrierParents = new Map<AgentMessage, AgentMessage>();
-  if (identities.size === 0) return { messages: assembled, carrierParents };
+  if (identities.size === 0 && !sources) return { messages: assembled, carrierParents };
   const liveByKey = new Map<string, number>();
   const duplicateKeys = new Set<string>();
   for (const [index, message] of live.entries()) {
@@ -49,6 +56,15 @@ export function restoreRawUserReplay(
   const messages = assembled.flatMap(message => {
     if (message.role !== "user") return [message];
     const entryId = getTranscriptEntryId(message);
+    if (sources) {
+      const source = entryId ? sources.get(entryId) : undefined;
+      // Canonical entry identity is necessary but not sufficient: externalized
+      // content must retain LCM's replacement rather than revive the raw payload.
+      if (!source || replaySignatureOf(message) !== replaySignatureOf(source.message)) return [message];
+      const restored = { ...message, ...source.message, content: message.content } as AgentMessage;
+      for (const carrier of source.carriers) carrierParents.set(carrier, restored);
+      return [restored, ...source.carriers];
+    }
     const identity = entryId ? identities.get(entryId) : undefined;
     const key = identity?.idempotencyKey;
     if (!identity || !key || duplicateKeys.has(key)) return [message];
