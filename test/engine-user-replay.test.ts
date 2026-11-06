@@ -265,12 +265,15 @@ it("logs canonical-reader rejection and returns the intentional bounded live fal
   expect(log.warn).toHaveBeenCalledWith(expect.stringContaining("reason=assemble-error"));
 });
 
-it("evicts canonical carriers with their parent under a tight serialized budget", async () => {
+it.each([false, true])("evicts canonical carriers with their parent under a tight serialized budget (recorded projection: %s)", async (withProjection) => {
   const sessionId = "canonical-carrier-budget";
   const sessionKey = `agent:main:${sessionId}`;
   const users = Array.from({ length: 3 }, (_, index) => attachTranscriptEntryMeta({
     role: "user", content: `request ${index}`, timestamp: 1_800_000_000_000 + index,
     idempotencyKey: `budget-turn-${index}`,
+    ...(withProjection && index === 1 ? {
+      __openclaw: { modelPromptProjection: { version: 1, text: "recorded input ".repeat(2000) } },
+    } : {}),
   } as AgentMessage, { entryId: `budget-entry-${index}`, parentId: null, timestamp: null }));
   const carriers = users.map((_, index) => runtimeCarrier(index));
   const readSessionTranscriptReplayGroups = vi.fn(async ({ entryIds }: { entryIds: string[] }) =>
@@ -294,11 +297,12 @@ it("evicts canonical carriers with their parent under a tight serialized budget"
   expect(full.messages.filter(message => message.role === "custom")).toEqual(carriers.slice(1));
   // The suffix fits its first carrier, but not that carrier's parent user.
   const suffix = full.messages.slice(full.messages.indexOf(carriers[1]!));
-  const tokenBudget = Math.ceil(estimateSerializedMessagesTokens(suffix) / 0.9);
+  const tokenBudget = withProjection ? 512 : Math.ceil(estimateSerializedMessagesTokens(suffix) / 0.9);
   const bounded = await assemble(tokenBudget);
   expect(readSessionTranscriptReplayGroups.mock.calls.at(-1)?.[0].entryIds)
     .toEqual(["budget-entry-1", "budget-entry-2"]);
   expect(bounded.messages).not.toContain(carriers[1]);
+  expect(bounded.messages.some(message => Reflect.get(message, "idempotencyKey") === "budget-turn-1")).toBe(false);
   expect(bounded.messages.filter(message => message.role === "custom")).toEqual([carriers[2]]);
   const carrierIndex = bounded.messages.indexOf(carriers[2]!);
   expect(bounded.messages[carrierIndex - 1]).toMatchObject({ idempotencyKey: "budget-turn-2" });

@@ -31,3 +31,7 @@ or stored conversations. Externalized content remains externalized. Summarized
 users do not regain their old runtime context.
 If budget eviction removes a restored parent user, its attached carriers are
 removed too; the final serialized context remains subject to the existing budget.
+Budget estimates count the rendered version-1 recorded projection once, replacing
+string content or the first text block while retaining native media and later
+blocks. Private metadata is not counted as additional prompt text. Estimation
+does not mutate canonical content or bypass the externalized-content guard.

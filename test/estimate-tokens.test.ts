@@ -112,6 +112,56 @@ describe("estimateSerializedMessageTokens", () => {
     );
   });
 
+  it.each([
+    { name: "string replacement", content: "old input ".repeat(500), text: "recorded input", rendered: "recorded input" },
+    { name: "empty projection", content: "old input ".repeat(500), text: "", rendered: "" },
+    { name: "literal data URL", content: "short", text: `data:text/plain,${"x".repeat(9000)}`, rendered: `data:text/plain,${"x".repeat(9000)}` },
+    {
+      name: "first text block only",
+      content: [{ type: "text", text: "original", marker: "kept" }, { type: "text", text: "later text" }],
+      text: "recorded input",
+      rendered: [{ type: "text", text: "recorded input", marker: "kept" }, { type: "text", text: "later text" }],
+    },
+    {
+      name: "media-only content",
+      content: [{ type: "image", data: "AA==", mimeType: "image/png" }],
+      text: "recorded input",
+      rendered: [{ type: "text", text: "recorded input" }, { type: "image", data: "AA==", mimeType: "image/png" }],
+    },
+  ])("counts rendered model-prompt content once: $name", ({ content, text, rendered }) => {
+    const message = {
+      role: "user", content,
+      __openclaw: { modelPromptProjection: { version: 1, text }, upstreamUserText: "private".repeat(1000) },
+    };
+    const original = structuredClone(message);
+    expect(estimateSerializedMessageTokens(message)).toBe(estimateTokens(JSON.stringify({ role: "user", content: rendered })));
+    expect(message).toEqual(original);
+  });
+
+  it("counts large recorded projections while retaining native media estimates", () => {
+    const text = "recorded input ".repeat(2000);
+    const image = { type: "image", data: "A1b2".repeat(8192), mimeType: "image/png" };
+    const message = {
+      role: "user", content: [image, { type: "text", text: "short" }, { type: "text", text: "later" }],
+      __openclaw: { modelPromptProjection: { version: 1, text } },
+    };
+    const rendered = { role: "user", content: [image, { type: "text", text }, { type: "text", text: "later" }] };
+    const estimated = estimateSerializedMessageTokens(message);
+    expect(estimated).toBe(estimateSerializedMessageTokens(rendered));
+    expect(estimated).toBeGreaterThan(estimateTokens(text) + 1500);
+    expect(estimated).toBeLessThan(estimateTokens(text) + 2000);
+  });
+
+  it.each([
+    { role: "user", projection: { version: 2, text: "ignored".repeat(1000) } },
+    { role: "user", projection: { version: 1, text: 123 } },
+    { role: "assistant", projection: { version: 1, text: "ignored".repeat(1000) } },
+  ])("keeps visible content for non-rendered projection metadata: %j", ({ role, projection }) => {
+    const visible = { role, content: "visible input" };
+    expect(estimateSerializedMessageTokens({ ...visible, __openclaw: { modelPromptProjection: projection } }))
+      .toBe(estimateSerializedMessageTokens(visible));
+  });
+
   it("still counts private-looking keys inside rendered tool payloads", () => {
     const baseline = {
       role: "assistant",
