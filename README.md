@@ -328,6 +328,10 @@ Add a `subagent` policy under `plugins.entries.lossless-claw` and allowlist the 
           "allowModelOverride": true,
           "allowedModels": ["openai/gpt-4.1-mini"]
         },
+        "llm": {
+          "allowModelOverride": true,
+          "allowedModels": ["openai/gpt-4.1-mini"]
+        },
         "config": {
           "expansionModel": "openai/gpt-4.1-mini"
         }
@@ -339,6 +343,7 @@ Add a `subagent` policy under `plugins.entries.lossless-claw` and allowlist the 
 
 - `subagent.allowModelOverride` is required for OpenClaw to honor plugin-requested per-run `provider`/`model` overrides.
 - `subagent.allowedModels` is optional but recommended. Use `"*"` only if you intentionally want to trust any target model.
+- Bounded recall synthesis uses `runtime.llm.complete` after the navigator is stopped. Allow the same target in `llm.allowedModels` with `llm.allowModelOverride: true`; policy denials are returned as typed synthesis failures and are not retried on a different model.
 - The chosen expansion target must also be available in OpenClaw's normal model catalog. If it is not already configured elsewhere, add it under the top-level `models` map as shown above.
 - If you prefer splitting provider and model, set `config.expansionProvider` and use a bare `config.expansionModel`.
 - `openclaw doctor --fix` can add the required `subagent` policy for a configured `expansionModel`. If a host still rejects a stale or unavailable override, `lcm_expand_query` retries once without the override so recall does not fail hard.

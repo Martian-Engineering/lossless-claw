@@ -1323,10 +1323,10 @@ describe("createLcmExpandQueryTool", () => {
     expect(result.details).toMatchObject({
       error: "lcm_expand_query timed out waiting for delegated expansion (300s).",
     });
-    expect(waitCalls).toHaveLength(1);
-    expect(waitCalls[0]?.paramsTimeoutMs).toBe(waitCalls[0]?.timeoutMs);
-    expect(Number(waitCalls[0]?.timeoutMs)).toBeGreaterThanOrEqual(299000);
-    expect(Number(waitCalls[0]?.timeoutMs)).toBeLessThanOrEqual(300000);
+    expect(waitCalls.every((call) => call.paramsTimeoutMs === call.timeoutMs)).toBe(true);
+    const navigationBudget = waitCalls.reduce((sum, call) => sum + Number(call.timeoutMs), 0);
+    expect(navigationBudget).toBeGreaterThanOrEqual(269000);
+    expect(navigationBudget).toBeLessThanOrEqual(270000);
   });
 
   it("caps delegated wait below caller-provided dynamic tool timeout", async () => {
@@ -1382,10 +1382,10 @@ describe("createLcmExpandQueryTool", () => {
     expect(result.details).toMatchObject({
       error: "lcm_expand_query timed out waiting for delegated expansion (30s).",
     });
-    expect(waitCalls).toHaveLength(1);
-    expect(waitCalls[0]?.paramsTimeoutMs).toBe(waitCalls[0]?.timeoutMs);
-    expect(Number(waitCalls[0]?.timeoutMs)).toBeGreaterThanOrEqual(29000);
-    expect(Number(waitCalls[0]?.timeoutMs)).toBeLessThanOrEqual(30000);
+    expect(waitCalls.every((call) => call.paramsTimeoutMs === call.timeoutMs)).toBe(true);
+    const navigationBudget = waitCalls.reduce((sum, call) => sum + Number(call.timeoutMs), 0);
+    expect(navigationBudget).toBeGreaterThanOrEqual(21500);
+    expect(navigationBudget).toBeLessThanOrEqual(22500);
   });
 
   it("does not expand a caller timeout shorter than the cleanup reserve", async () => {

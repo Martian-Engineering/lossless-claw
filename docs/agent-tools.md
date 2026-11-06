@@ -146,6 +146,10 @@ When `allConversations: true` is set, `lcm_expand_query` can synthesize one answ
 
 Successful single-conversation results keep the response shape above. When delegated recall fails, the result keeps the human-readable `error` and adds `errorCode`, empty source counters, and a `conversationBreakdown`. Failed entries identify the conversation, attempted summary IDs, failure phase, elapsed time, and error code. Timed-out child work is cancelled through the host-owned temporary-session cleanup path. Completed conversation buckets still contribute evidence when another bucket times out; timed-out buckets do not contribute guessed answer text or citations.
 
+Navigation is also bounded independently of the source-token grant: 24 model-issued tool calls (a Code Mode invocation counts once), three consecutive empty/repeated/error results, or the retrieval time budget end navigation. Up to 30 seconds (at most one quarter of the remaining work budget) is reserved for an answer. The plugin waits for its owned navigator to be deleted before making one tool-free `runtime.llm.complete` call from the retained evidence; this call shares the original work deadline and never retries through another model on a policy rejection. It requires the expansion model to be allowed by the plugin's `llm` policy as well as its `subagent` policy. `enableSummaryThinking: false` also disables thinking for this bounded answer pass.
+
+Answers produced after navigation is stopped are always marked `truncated: true`; missing evidence is reported explicitly. If cleanup fails, synthesis does not start. Empty source-token results do not consume grant tokens, so a token cap alone is not a navigation stopping rule.
+
 **Examples:**
 
 ```

@@ -1390,6 +1390,8 @@ function createLcmDependencies(
       temperature,
       reasoning,
       reasoningIfSupported,
+      signal,
+      purpose,
     }) => {
       const providerId = provider?.trim();
       const modelId = model.trim();
@@ -1427,7 +1429,8 @@ function createLcmDependencies(
             ? { temperature }
             : {}),
           ...(typeof system === "string" && system.trim() ? { systemPrompt: system.trim() } : {}),
-          purpose: "lossless-claw compaction summarization",
+          purpose: purpose ?? "lossless-claw compaction summarization",
+          ...(signal ? { signal } : {}),
           ...(authProfileId?.trim() ? { authProfileId: authProfileId.trim() } : {}),
           // Only context-engine supplied runtime LLM capabilities may carry an explicit
           // agentId. Plugin-wide api.runtime.llm.complete is gateway-scoped and rejects
