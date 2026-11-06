@@ -28,6 +28,12 @@ func resolveTUISummaryRuntimeSettings(
 		os.Getenv("LCM_SUMMARY_PROVIDER"),
 		defaultProvider,
 	)
+	// Doctor's fallback model belongs to its default provider. An explicit
+	// MiniMax provider must use its own default unless a model was supplied.
+	switch normalizeProviderID(providerHint) {
+	case miniMaxProviderID, miniMaxCNProviderID:
+		defaultModel = ""
+	}
 	modelHint := firstNonEmptyString(
 		cliModel,
 		os.Getenv("LCM_TUI_SUMMARY_MODEL"),
