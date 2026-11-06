@@ -163,3 +163,18 @@ For MVP guidance:
 - Do not guess exact historical details from compacted context alone.
 - When a user wants a fact pattern verified, use recall tools to recover evidence.
 - Prefer changing one configuration knob at a time and then re-checking `/lossless`.
+
+
+### Explicit transcript-gap recovery
+
+From another session, run `/lossless doctor gaps <conversation-id>`, review the
+message/gap counts, unresolved claims and potential summary-model cost, then use
+the exact `/lossless doctor apply gaps <conversation-id> <preview-token>` shown.
+The one-use confirmation expires after ten minutes and belongs to that sender
+and invoking session. The plugin waits for target work to drain, creates a private
+verified backup, prepares repair/compaction on an isolated copy, revalidates and
+publishes atomically. No Gateway stop, console export or `confirm-offline` assertion
+is part of this workflow. Busy/stale/unavailable targets refuse safely; preview
+again when ready. Hidden entries and ambiguous identities are not inferred.
+Original markers remain historical diagnostics, with recovered spans reported
+separately. See `docs/gap-repair.md` for limits and draft qualification status.

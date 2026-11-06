@@ -78,6 +78,7 @@ describe("package OpenClaw compatibility metadata", () => {
     expect(packageJson.bin).toEqual({
       lcm: "dist/cli.js",
       "lossless-claw-migrate-sessions": "dist/migrate-sessions.js",
+      "lcm-gap-repair": "dist/gap-repair.js",
     });
     expect(packageJson.scripts.build).toContain("build:cli");
     expect(packageJson.scripts.build).toContain("build:migrate-sessions");

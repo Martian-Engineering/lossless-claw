@@ -1,3 +1,4 @@
+import { sessionMaintenanceGate } from "../session-maintenance.js";
 import type { DatabaseSync } from "node:sqlite";
 import { DatabaseTransactionTimeoutError, withExclusiveDatabaseLock } from "../transaction-mutex.js";
 import { formatTimestamp } from "../compaction.js";
@@ -63,6 +64,11 @@ export async function applyScopedDoctorRepair(params: {
   targetSummaryIds?: string[];
   beforeCommit?: () => void;
 }): Promise<DoctorApplyResult> {
+  const target = params.db.prepare("SELECT session_key,session_id FROM conversations WHERE conversation_id=?").get(params.conversationId) as { session_key?: string; session_id?: string } | undefined;
+  const key = target?.session_key || target?.session_id || `conversation:${params.conversationId}`;
+  return sessionMaintenanceGate(params.db).operation(key, () => applyScopedDoctorRepairUnlocked(params));
+}
+async function applyScopedDoctorRepairUnlocked(params: Parameters<typeof applyScopedDoctorRepair>[0]): Promise<DoctorApplyResult> {
   const targets = loadDoctorTargets(params.db, params.conversationId)
     .filter(target => !params.targetSummaryIds || params.targetSummaryIds.includes(target.summaryId));
   if (targets.length === 0) {
@@ -229,7 +235,7 @@ export async function applyScopedDoctorRepair(params: {
   };
 }
 
-async function resolveDoctorApplySummarize(params: {
+export async function resolveDoctorApplySummarize(params: {
   config: LcmConfig;
   deps?: LcmDependencies;
   summarize?: LcmSummarizeFn;
