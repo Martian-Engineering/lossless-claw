@@ -1,7 +1,7 @@
 import { describe, expect, it, vi } from "vitest";
 import type { LcmConfig } from "../src/db/config.js";
-import type { ExpansionOrchestrator } from "../src/expansion.js";
-import { buildExpansionToolDefinition } from "../src/expansion.js";
+import { ExpansionOrchestrator, buildExpansionToolDefinition, distillForSubagent } from "../src/expansion.js";
+import type { RetrievalEngine } from "../src/retrieval.js";
 
 const BASE_CONFIG: LcmConfig = {
   enabled: true,
@@ -77,6 +77,37 @@ function makeExpansionResult() {
     truncated: false,
   };
 }
+
+describe("source message expansion", () => {
+  it("preserves full selected bodies separately from display snippets", async () => {
+    const content = `${"Background detail. ".repeat(20)}\nExact reference: ORBIT-739.\n  Keep indentation.\n`;
+    const retrieval = {
+      expand: vi.fn().mockResolvedValue({
+        children: [],
+        messages: [{ messageId: 17, role: "user", content, tokenCount: 120 }],
+        estimatedTokens: 120,
+        truncated: false,
+      }),
+    };
+    const orchestrator = new ExpansionOrchestrator(retrieval as unknown as RetrievalEngine);
+
+    const result = await orchestrator.expand({
+      summaryIds: ["sum_source"],
+      conversationId: 1,
+      includeMessages: true,
+      tokenCap: 120,
+    });
+
+    expect(result.expansions[0].messages[0]).toMatchObject({
+      content,
+      snippet: `${content.slice(0, 200)}...`,
+    });
+    expect(distillForSubagent(result)).toContain(content);
+    expect(distillForSubagent(result)).toContain("msg#17 (user, 120 tokens)");
+    expect(result.totalTokens).toBe(120);
+    expect(result.truncated).toBe(false);
+  });
+});
 
 describe("buildExpansionToolDefinition tokenCap bounds", () => {
   it("defaults omitted tokenCap for summary expansion to config.maxExpandTokens", async () => {
