@@ -165,6 +165,8 @@ export class RetrievalEngine {
   async describe(
     id: string,
     options?: {
+      /** Undefined is unrestricted; an explicit empty list denies every owner. */
+      conversationIds?: number[];
       expandFile?: boolean;
       expandFileMaxBytes?: number;
       startLine?: number;
@@ -172,6 +174,11 @@ export class RetrievalEngine {
       largeFilesDir?: string;
     },
   ): Promise<DescribeResult | null> {
+    if (options?.conversationIds !== undefined) {
+      if (options.conversationIds.length === 0) return null;
+      const owner = await this.summaryStore.getItemConversationId(id);
+      if (owner == null || !options.conversationIds.includes(owner)) return null;
+    }
     if (id.startsWith("sum_")) {
       return this.describeSummary(id);
     }

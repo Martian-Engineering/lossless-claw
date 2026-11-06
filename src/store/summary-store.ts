@@ -580,6 +580,17 @@ export class SummaryStore {
     return toSummaryRecord(row);
   }
 
+  /** Read only ownership before a scoped recall loads content or touches a file. */
+  async getItemConversationId(id: string): Promise<number | null> {
+    const table = id.startsWith("sum_") ? "summaries" : id.startsWith("file_") ? "large_files" : null;
+    if (!table) return null;
+    const column = table === "summaries" ? "summary_id" : "file_id";
+    const row = this.db.prepare(
+      `SELECT conversation_id FROM ${table} WHERE ${column} = ?`,
+    ).get(id) as { conversation_id: number } | undefined;
+    return row?.conversation_id ?? null;
+  }
+
   async getSummary(summaryId: string): Promise<SummaryRecord | null> {
     const row = this.db
       .prepare(
@@ -1641,7 +1652,16 @@ export class SummaryStore {
 
     let files: LargeFileRecord[] = [];
     if (input.fileIds && input.fileIds.length > 0) {
+      const allowedIds = input.conversationIds ??
+        (input.conversationId != null ? [input.conversationId] : undefined);
       for (const fileId of input.fileIds) {
+        // A file record includes its exploration summary. Check its owner
+        // before loading that record, as well as before reading disk content.
+        if (allowedIds !== undefined) {
+          if (allowedIds.length === 0) continue;
+          const owner = await this.getItemConversationId(fileId);
+          if (owner == null || !allowedIds.includes(owner)) continue;
+        }
         const file = await this.getLargeFile(fileId);
         if (file) {
           files.push(file);

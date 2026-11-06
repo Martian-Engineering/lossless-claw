@@ -7,7 +7,7 @@ import {
 import type { LcmDependencies } from "../types.js";
 import type { AnyAgentTool } from "./common.js";
 import { jsonResult } from "./common.js";
-import { resolveLcmConversationScope } from "./lcm-conversation-scope.js";
+import { getLcmConversationIds, resolveLcmConversationScope } from "./lcm-conversation-scope.js";
 import { formatTimestamp } from "../compaction.js";
 import type { DescribeResult } from "../retrieval.js";
 import { extractLcmDescribeId } from "./lcm-describe-id.js";
@@ -200,6 +200,7 @@ export function createLcmDescribeTool(input: {
         return jsonResult({ error: "`endLine` must be greater than or equal to `startLine`." });
       }
       const result = await retrieval.describe(id, {
+        conversationIds: getLcmConversationIds(conversationScope),
         expandFile,
         expandFileMaxBytes,
         startLine,

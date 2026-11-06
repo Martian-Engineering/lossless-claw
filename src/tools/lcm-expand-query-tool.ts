@@ -485,9 +485,11 @@ async function resolveSummaryCandidates(params: {
 }): Promise<SummaryCandidate[]> {
   const retrieval = params.lcm.getRetrieval();
   const candidates = new Map<string, SummaryCandidate>();
+  const allowedIds = params.conversationIds ??
+    (params.conversationId != null ? [params.conversationId] : undefined);
 
   for (const summaryId of params.explicitSummaryIds) {
-    const described = await retrieval.describe(summaryId);
+    const described = await retrieval.describe(summaryId, { conversationIds: allowedIds });
     if (!described || described.type !== "summary" || !described.summary) {
       throw new Error(`Summary not found: ${summaryId}`);
     }
@@ -589,7 +591,13 @@ async function resolveSummaryCandidates(params: {
     }
   }
 
-  return Array.from(candidates.values());
+  const result = Array.from(candidates.values());
+  // Check explicit IDs and search/fallback candidates before building any child
+  // grant. Cross-conversation routing does not mean cross-owner authorization.
+  if (allowedIds !== undefined && result.some((candidate) => !allowedIds.includes(candidate.conversationId))) {
+    throw new Error("Some summaryIds are outside the allowed conversation scope.");
+  }
+  return result;
 }
 
 /**

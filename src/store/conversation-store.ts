@@ -8,6 +8,7 @@ import { buildMessageIdentityHash } from "./message-identity.js";
 import { parseUtcTimestamp, parseUtcTimestampOrNull } from "./parse-utc-timestamp.js";
 import { buildFtsOrderBy, type SearchSort } from "./full-text-sort.js";
 import { compileSafeSearchRegex } from "./search-regex.js";
+import { resolveSessionPrincipal } from "../session-principal.js";
 import {
   parseOpenClawSenderMetadata,
   serializeOpenClawSenderMetadata,
@@ -587,6 +588,20 @@ export class ConversationStore {
       .get(sessionKey) as unknown as ConversationRow | undefined;
 
     return row ? toConversationRecord(row) : null;
+  }
+
+  /** Include archived segments; a principal is an owner, not an active-session flag. */
+  async getConversationIdsForPrincipal(sessionKey: string): Promise<ConversationId[]> {
+    const principal = resolveSessionPrincipal(sessionKey);
+    if (!principal) return [];
+    const escaped = principal.replace(/[\\%_]/g, "\\$&");
+    const rows = this.db.prepare(
+      `SELECT conversation_id, session_key FROM conversations
+       WHERE session_key = ? OR session_key LIKE ? ESCAPE '\\'`,
+    ).all(principal, `${escaped}:%`) as Array<{ conversation_id: number; session_key: string }>;
+    return rows
+      .filter((row) => resolveSessionPrincipal(row.session_key) === principal)
+      .map((row) => row.conversation_id);
   }
 
   async getConversationFamilyIds(input: {
