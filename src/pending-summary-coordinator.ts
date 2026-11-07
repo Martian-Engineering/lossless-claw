@@ -354,6 +354,9 @@ export class PendingCompactionCoordinator {
     ])}`;
     const leafNodes = planPendingLeafNodes({
       items: extensionItems,
+      followingItems: input.snapshot.items.filter(
+        (item) => item.ordinal > input.snapshot.compactableEndOrdinal!,
+      ),
       freshTailCount: 0,
       leafChunkTokens: this.config.leafChunkTokens,
       nodeIdPrefix,

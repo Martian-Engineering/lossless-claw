@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import {
   resolveRecoveryTailMaxTokens,
   selectOverflowToolGroup,
+  toolGroupSafeChunkEnd,
   type OverflowContextItem,
 } from "../src/overflow-tool-groups.js";
 
@@ -140,5 +141,33 @@ describe("forced recovery tool groups", () => {
         ...tail,
       ])
     ).toEqual([]);
+  });
+});
+
+describe("routine leaf chunk tool-group boundary", () => {
+  const u = "user" as const;
+  const a = "assistant" as const;
+  const t = "tool" as const;
+
+  it("shrinks a cut between a call and its result to end before the call", () => {
+    // [u, a] | t, u  -> end before a.
+    expect(toolGroupSafeChunkEnd([u, a, t, u], 2, Infinity, true)).toBe(1);
+  });
+  it("never splits parallel results of one assistant call", () => {
+    // [u, a, t] | t, t, u
+    expect(toolGroupSafeChunkEnd([u, a, t, t, t, u], 3, Infinity, true)).toBe(1);
+    expect(toolGroupSafeChunkEnd([u, a, t, t, t, u], 3, Infinity)).toBe(5);
+  });
+  it("takes a whole group at the chunk start unless it runs into the tail", () => {
+    expect(toolGroupSafeChunkEnd([a, t, t, u], 1, 3, true)).toBe(3);
+    expect(toolGroupSafeChunkEnd([a, t, t], 1, 2, true)).toBe(0);
+  });
+  it("treats a call without results as a closed group", () => {
+    expect(toolGroupSafeChunkEnd([u, a, u], 2, Infinity, true)).toBe(2);
+  });
+  it("leaves a run of orphan results and non-tool cuts unchanged", () => {
+    expect(toolGroupSafeChunkEnd([t, t, t, u], 2, Infinity, true)).toBe(2);
+    expect(toolGroupSafeChunkEnd([u, a, undefined, t], 2, Infinity, true)).toBe(2);
+    expect(toolGroupSafeChunkEnd([u, a, u], 0, Infinity, true)).toBe(0);
   });
 });

@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import {
   planPendingCondensedNodes,
   planPendingLeafNodes,
+  resolvePendingFreshTailOrdinal,
   selectPendingPublishCoverageTarget,
   selectPendingPublishFrontier,
   type PendingSummaryPlannerNode,
@@ -361,3 +362,167 @@ describe("pending summary planner", () => {
     ).toEqual(target?.frontier);
   });
 });
+
+function withRole(
+  item: PendingSummaryPlannerSnapshotItem,
+  role: NonNullable<PendingSummaryPlannerSnapshotItem["role"]>,
+): PendingSummaryPlannerSnapshotItem {
+  return { ...item, role };
+}
+
+describe("pending summary planner tool-group boundaries", () => {
+  it("does not end a leaf node between an assistant call and its results", () => {
+    const nodes = planPendingLeafNodes({
+      items: [
+        withRole(message(0, 10, 5), "user"),
+        withRole(message(1, 11, 5), "assistant"),
+        withRole(message(2, 12, 5), "tool"),
+        withRole(message(3, 13, 5), "tool"),
+        withRole(message(4, 14, 5), "user"),
+        withRole(message(5, 15, 5), "assistant"),
+      ],
+      freshTailCount: 1,
+      leafChunkTokens: 10,
+      nodeIdPrefix: "leaf",
+    });
+
+    expect(nodes.map((node) => [node.ordinalStart, node.ordinalEnd])).toEqual([[0, 3]]);
+  });
+
+  it("leaves out a call whose result is in the fresh tail", () => {
+    const nodes = planPendingLeafNodes({
+      items: [
+        withRole(message(0, 10, 5), "user"),
+        withRole(message(1, 11, 5), "assistant"),
+        withRole(message(2, 12, 5), "assistant"),
+        withRole(message(3, 13, 5), "tool"),
+        withRole(message(4, 14, 5), "user"),
+      ],
+      freshTailCount: 2,
+      leafChunkTokens: 15,
+      nodeIdPrefix: "leaf",
+    });
+
+    expect(nodes).toEqual([]);
+  });
+
+  it("looks past the extension range for results of its last call", () => {
+    const nodes = planPendingLeafNodes({
+      items: [withRole(message(0, 10, 5), "user"), withRole(message(1, 11, 5), "assistant")],
+      followingItems: [withRole(message(2, 12, 5), "tool")],
+      freshTailCount: 0,
+      leafChunkTokens: 10,
+      nodeIdPrefix: "leaf",
+    });
+
+    expect(nodes).toEqual([]);
+  });
+
+  it("plans the same leaf nodes as before for sequences without tool messages", () => {
+    const random = mulberry32(861);
+    const roles = ["user", "assistant", "system"] as const;
+    for (let sample = 0; sample < 40; sample++) {
+      const items: PendingSummaryPlannerSnapshotItem[] = [];
+      const length = 5 + Math.floor(random() * 20);
+      for (let ordinal = 0; ordinal < length; ordinal++) {
+        const tokens = 1 + Math.floor(random() * 30);
+        items.push(
+          random() < 0.15
+            ? summary(ordinal, `sum_${ordinal}`, 0, tokens)
+            : withRole(message(ordinal, 100 + ordinal, tokens), roles[Math.floor(random() * 3)]!),
+        );
+      }
+      const input = {
+        items,
+        freshTailCount: Math.floor(random() * 6),
+        freshTailMaxTokens: random() < 0.3 ? Math.floor(random() * 60) : undefined,
+        leafChunkTokens: 5 + Math.floor(random() * 60),
+        nodeIdPrefix: "leaf",
+      };
+      expect(planPendingLeafNodes(input), `sample ${sample}`).toEqual(referencePlanPendingLeafNodes(input));
+    }
+  });
+});
+
+/** Deterministic PRNG so the generated sequences are reproducible. */
+function mulberry32(seed: number): () => number {
+  let state = seed >>> 0;
+  return () => {
+    state = (state + 0x6d2b79f5) >>> 0;
+    let next = Math.imul(state ^ (state >>> 15), 1 | state);
+    next = (next + Math.imul(next ^ (next >>> 7), 61 | next)) ^ next;
+    return ((next ^ (next >>> 14)) >>> 0) / 4294967296;
+  };
+}
+
+/** Reference copy of planPendingLeafNodes at 51c3c90b, before tool-group boundaries. */
+function referencePlanPendingLeafNodes(
+  input: Parameters<typeof planPendingLeafNodes>[0],
+): PendingSummaryPlannerNode[] {
+  const items = [...input.items].sort((a, b) => a.ordinal - b.ordinal);
+  const freshTailOrdinal = resolvePendingFreshTailOrdinal(input);
+  const budget = Math.floor(input.leafChunkTokens);
+  const tokensOf = (item: PendingSummaryPlannerSnapshotItem) => Math.max(0, Math.floor(item.tokenCount));
+  const toNode = (run: PendingSummaryPlannerSnapshotItem[], tokenCount: number): PendingSummaryPlannerNode => ({
+    nodeId: `${input.nodeIdPrefix}-leaf-${run[0]!.ordinal}-${run.at(-1)!.ordinal}`,
+    canonicalSummaryId: null,
+    kind: "leaf",
+    depth: 0,
+    ordinalStart: run[0]!.ordinal,
+    ordinalEnd: run.at(-1)!.ordinal,
+    tokenCount,
+    sourceFingerprints: run.map((item) => item.sourceFingerprint),
+    sourceMessageIds: run
+      .map((item) => item.messageId)
+      .filter((messageId): messageId is number => typeof messageId === "number"),
+    childNodeIds: [],
+    childSummaryIds: [],
+  });
+  const nodes: PendingSummaryPlannerNode[] = [];
+  let chunk: PendingSummaryPlannerSnapshotItem[] = [];
+  let chunkTokens = 0;
+  const flush = () => {
+    if (chunk.length > 0 && chunkTokens >= budget) nodes.push(toNode(chunk, chunkTokens));
+    chunk = [];
+    chunkTokens = 0;
+  };
+  for (const item of items) {
+    if (item.ordinal >= freshTailOrdinal) break;
+    if (item.itemType !== "message") {
+      flush();
+      continue;
+    }
+    chunk.push(item);
+    chunkTokens += tokensOf(item);
+    if (chunkTokens >= budget) flush();
+  }
+  flush();
+  if (nodes.length === 0) return nodes;
+  const lastEligibleOrdinal = Math.max(...nodes.map((node) => node.ordinalEnd));
+  const bridgeNodes: PendingSummaryPlannerNode[] = [];
+  let bridge: PendingSummaryPlannerSnapshotItem[] = [];
+  let bridgeTokens = 0;
+  const flushBridge = () => {
+    if (bridge.length > 0) bridgeNodes.push(toNode(bridge, bridgeTokens));
+    bridge = [];
+    bridgeTokens = 0;
+  };
+  for (const item of items) {
+    if (item.ordinal > lastEligibleOrdinal) break;
+    const covered = nodes.some((node) => item.ordinal >= node.ordinalStart && item.ordinal <= node.ordinalEnd);
+    if (item.itemType !== "message" || covered) {
+      flushBridge();
+      continue;
+    }
+    bridge.push(item);
+    bridgeTokens += tokensOf(item);
+  }
+  flushBridge();
+  return [...nodes, ...bridgeNodes].sort(
+    (a, b) =>
+      a.depth - b.depth ||
+      a.ordinalStart - b.ordinalStart ||
+      a.ordinalEnd - b.ordinalEnd ||
+      a.nodeId.localeCompare(b.nodeId),
+  );
+}
