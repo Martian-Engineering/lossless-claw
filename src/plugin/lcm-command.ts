@@ -4,6 +4,7 @@ import { DatabaseSync } from "node:sqlite";
 import packageJson from "../../package.json" with { type: "json" };
 import { formatTimestamp } from "../compaction.js";
 import { resolveOpenclawStateDir, type LcmConfig } from "../db/config.js";
+import { configWarningLabel, describeConfigWarning, type LcmConfigWarning } from "../db/config-warnings.js";
 import { runDelegatedFocusBrief, runDelegatedRefocusBrief } from "../focus-briefs.js";
 import type { LcmSummarizeFn } from "../summarize.js";
 import type { LcmDependencies } from "../types.js";
@@ -430,6 +431,17 @@ function buildInstallTrackWarningSection(warning: LcmInstallTrackWarning): strin
       formatCommand(`openclaw plugins update ${LOSSLESS_NPM_PACKAGE}@latest`),
     ),
   ]);
+}
+
+/** Format config values that fell back or were clamped; null when there are none. */
+function buildConfigWarningsSection(warnings: LcmConfigWarning[] | undefined): string | null {
+  if (!warnings || warnings.length === 0) {
+    return null;
+  }
+  return buildSection(
+    "⚠️ Config warnings",
+    warnings.map((warning) => buildStatLine(configWarningLabel(warning), describeConfigWarning(warning))),
+  );
 }
 
 /** Format the active package identity and every distinct copy discovered by doctor. */
@@ -1550,6 +1562,7 @@ async function buildStatusText(params: {
   db: DatabaseSync;
   config: LcmConfig;
   openClawConfig?: unknown;
+  configWarnings?: LcmConfigWarning[];
 }): Promise<string> {
   const status = getLcmStatusStats(params.db);
   const doctor = getDoctorSummaryStats(params.db);
@@ -1583,6 +1596,10 @@ async function buildStatusText(params: {
 
   if (installTrackWarning) {
     lines.push(buildInstallTrackWarningSection(installTrackWarning), "");
+  }
+  const configWarningsSection = buildConfigWarningsSection(params.configWarnings);
+  if (configWarningsSection) {
+    lines.push(configWarningsSection, "");
   }
 
   lines.push(
@@ -1690,8 +1707,10 @@ async function buildDoctorText(params: {
   db: DatabaseSync;
   openClawConfig?: unknown;
   activeSourcePath?: string;
+  configWarnings?: LcmConfigWarning[];
 }): Promise<string> {
   const rolloverSplits = scanRolloverSplits(params.db);
+  const configWarningsSection = buildConfigWarningsSection(params.configWarnings);
   const installTrackWarning = detectLcmInstallTrackWarning({
     ctx: params.ctx,
     fallbackConfig: params.openClawConfig,
@@ -1716,6 +1735,9 @@ async function buildDoctorText(params: {
     ];
     if (installTrackWarning) {
       lines.push(buildInstallTrackWarningSection(installTrackWarning), "");
+    }
+    if (configWarningsSection) {
+      lines.push(configWarningsSection, "");
     }
     if (versionScan) {
       lines.push(buildVersionDoctorSection(versionScan), "");
@@ -1745,6 +1767,9 @@ async function buildDoctorText(params: {
   ];
   if (installTrackWarning) {
     lines.push(buildInstallTrackWarningSection(installTrackWarning), "");
+  }
+  if (configWarningsSection) {
+    lines.push(configWarningsSection, "");
   }
   if (versionScan) {
     lines.push(buildVersionDoctorSection(versionScan), "");
@@ -3331,6 +3356,7 @@ export function createLcmCommand(params: {
               db: await getDb(),
               config: params.config,
               openClawConfig: params.openClawConfig,
+              configWarnings: params.deps?.configDiagnostics?.warnings,
             }),
           };
         case "backup":
@@ -3391,6 +3417,7 @@ export function createLcmCommand(params: {
                   db: await getDb(),
                   openClawConfig: params.openClawConfig,
                   activeSourcePath: params.activeSourcePath,
+                  configWarnings: params.deps?.configDiagnostics?.warnings,
                 }),
               };
         case "doctor_maintenance":

@@ -442,6 +442,10 @@ If Anthropic prompt-cache stability matters more than topical recall under press
 
 ## Behavior notes
 
+### Invalid values
+
+A value that lossless-claw cannot use as written, such as `LCM_FRESH_TAIL_COUNT=abc`, a boolean typo, an unknown choice, or a number below a minimum, keeps today's fallback: the next source, the default, or a clamp. Lossless now reports each one as a config warning in `/lossless status`, in `/lossless doctor`, and once in the startup log. A warning names the setting, the problem, and what was used instead; it never repeats the value.
+
 ### Summary model resolution
 
 Compaction summarization resolves candidates in this order:
