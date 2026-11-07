@@ -32,6 +32,8 @@ export type ConfigWarningSetting = {
   envUnknownUsesDefault?: boolean;
   /** The env value is parsed with Number() rather than parseFloat(). */
   envStrictNumber?: boolean;
+  /** The resolver raises the value to this setting's value, which these checks do not model. */
+  flooredBy?: string;
 };
 
 /** Build a table row whose plugin-config path is the setting name. */
@@ -91,7 +93,7 @@ export const CONFIG_WARNING_SETTINGS: readonly ConfigWarningSetting[] = [
   row("cacheAwareCompaction.coldCacheObservationThreshold", "LCM_COLD_CACHE_OBSERVATION_THRESHOLD", "number-clamp:[1,Infinity]", "3"),
   row("cacheAwareCompaction.criticalBudgetPressureRatio", "LCM_CRITICAL_BUDGET_PRESSURE_RATIO", "number-clamp:[0,1]", "0.9"),
   row("dynamicLeafChunkTokens.enabled", "LCM_DYNAMIC_LEAF_CHUNK_TOKENS_ENABLED", "bool-true-only", "true"),
-  row("dynamicLeafChunkTokens.max", "LCM_DYNAMIC_LEAF_CHUNK_TOKENS_MAX", "int", "automatic"),
+  { ...row("dynamicLeafChunkTokens.max", "LCM_DYNAMIC_LEAF_CHUNK_TOKENS_MAX", "int", "automatic"), flooredBy: "leafChunkTokens" },
   row("transcriptGcEnabled", undefined, "retired"),
   row("autoRotateSessionFiles", undefined, "retired"),
 ];
@@ -152,6 +154,7 @@ function check(entry: ConfigWarningSetting, raw: unknown, fromEnv: boolean): Fin
   // Numeric kinds. A blank env value reads as unset, except where the resolver uses Number(),
   // which reads it as 0, as it does a blank plugin-config string.
   if (fromEnv && blank && !entry.envStrictNumber) return { usable: false };
+  if (blank && entry.flooredBy) return { usable: true }; // read as 0, then raised; not reported
   const exact = typeof raw === "number" ? raw : typeof raw === "string" ? Number(raw) : NaN;
   const integerParse = kind.startsWith("int") || kind === "positive-int-clamp";
   const value = !fromEnv || entry.envStrictNumber ? exact : integerParse ? parseInt(text, 10) : parseFloat(text);
@@ -230,7 +233,7 @@ export function collectConfigWarnings(
         return; // a value with higher precedence is used instead
       } else if (slot.alias && slot.finding.usable) {
         problem = "deprecated";
-        effect = `read as ${entry.setting}`;
+        effect = slot.finding.effect ? `read as ${entry.setting} (${slot.finding.effect})` : `read as ${entry.setting}`;
       } else if (!slot.finding.usable && !effect) {
         const next = slots.find((other, j) => j > i && other.finding.usable);
         effect = next ? (next.alias ? `used ${configWarningLabel(next)}` : "used the plugin config value")

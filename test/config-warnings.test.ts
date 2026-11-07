@@ -299,6 +299,12 @@ describe("collectConfigWarnings effect text", () => {
     ["alias plugin value under a valid setting plugin value", {}, { sweepMaxDepth: 2, incrementalMaxDepth: 3 }, "sweepMaxDepth", 2, [
       warning("incrementalMaxDepth", "plugin-config", "incrementalMaxDepth", "deprecated", "ignored (plugin config sweepMaxDepth is used)"),
     ]],
+    ["blank alias plugin value", {}, { incrementalMaxDepth: "" }, "sweepMaxDepth", 0, [
+      warning("incrementalMaxDepth", "plugin-config", "incrementalMaxDepth", "deprecated", "read as sweepMaxDepth (read as 0)"),
+    ]],
+    ["alias env with trailing text", { LCM_INCREMENTAL_MAX_DEPTH: "3abc" }, {}, "sweepMaxDepth", 3, [
+      warning("incrementalMaxDepth", "env", "LCM_INCREMENTAL_MAX_DEPTH", "deprecated", "read as sweepMaxDepth (read only the leading number)"),
+    ]],
     ["blank strict-number env", { LCM_DELEGATION_TIMEOUT_MS: "" }, {}, "delegationTimeoutMs", 0, [
       warning("delegationTimeoutMs", "env", "LCM_DELEGATION_TIMEOUT_MS", "not-a-number", "read as 0"),
     ]],
@@ -317,5 +323,11 @@ describe("collectConfigWarnings effect text", () => {
   ])("matches the resolved value: %s", (_label, env, pluginConfig, key, resolved, expected) => {
     expect(resolveLcmConfig({ ...BASE_ENV, ...env }, pluginConfig)[key]).toBe(resolved);
     expect(collectConfigWarnings(env, pluginConfig)).toEqual(expected);
+  });
+
+  it("does not claim a blank value that the resolver raises reads as 0", () => {
+    const pluginConfig = { dynamicLeafChunkTokens: { max: "" } };
+    expect(resolveLcmConfig({ ...BASE_ENV }, pluginConfig).dynamicLeafChunkTokens.max).toBe(20000);
+    expect(collectConfigWarnings({}, pluginConfig)).toEqual([]);
   });
 });
