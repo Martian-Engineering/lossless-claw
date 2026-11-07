@@ -7,7 +7,7 @@ import { runLcmMigrations } from "../src/db/migration.js";
 import { getLcmDbFeatures } from "../src/db/features.js";
 import { formatTimestamp } from "../src/compaction.js";
 import { createLcmDatabaseConnection, closeLcmConnection } from "../src/db/connection.js";
-import { resolveLcmConfig } from "../src/db/config.js";
+import { resolveLcmConfig, resolveLcmConfigWithDiagnostics } from "../src/db/config.js";
 import { ConversationStore } from "../src/store/conversation-store.js";
 import { FocusBriefStore } from "../src/store/focus-brief-store.js";
 import { SummaryStore } from "../src/store/summary-store.js";
@@ -472,6 +472,48 @@ describe("lcm command", () => {
 
     expect(result.text).not.toContain("**⚠️ Update track**");
     expect(result.text).not.toContain("status: exact-pinned");
+  });
+
+  it("shows config warnings in status and doctor only when there are any", async () => {
+    const { diagnostics } = resolveLcmConfigWithDiagnostics(
+      { LCM_FRESH_TAIL_COUNT: "abc" },
+      { fallbackMaxTokens: 10 },
+    );
+    const fixture = createCommandFixture({
+      deps: { configDiagnostics: diagnostics } as unknown as LcmDependencies,
+    });
+    tempDirs.add(fixture.tempDir);
+    dbPaths.add(fixture.dbPath);
+    const clean = createCommandFixture({
+      deps: { configDiagnostics: resolveLcmConfigWithDiagnostics({}, {}).diagnostics } as unknown as LcmDependencies,
+    });
+    tempDirs.add(clean.tempDir);
+    dbPaths.add(clean.dbPath);
+    await fixture.conversationStore.createConversation({
+      sessionId: "config-warning-session",
+      sessionKey: "agent:main:telegram:direct:cw",
+    });
+
+    const status = await fixture.command.handler(createCommandContext());
+    const doctor = await fixture.command.handler(createCommandContext("doctor"));
+    const boundDoctor = await fixture.command.handler(
+      createCommandContext("doctor", { sessionKey: "agent:main:telegram:direct:cw" }),
+    );
+    for (const result of [status, doctor, boundDoctor]) {
+      expect(result.text).toContain("**⚠️ Config warnings**");
+      expect(result.text).toContain("env LCM_FRESH_TAIL_COUNT: not a number; used the default (64)");
+      expect(result.text).toContain("plugin config fallbackMaxTokens: below the minimum; used the default (512)");
+    }
+    expect(boundDoctor.text).toContain("conversation id:");
+    expect(status.text.indexOf("**⚠️ Config warnings**")).toBeLessThan(status.text.indexOf("**🌐 Global**"));
+
+    const noDeps = createCommandFixture();
+    tempDirs.add(noDeps.tempDir);
+    dbPaths.add(noDeps.dbPath);
+    for (const args of [undefined, "doctor"]) {
+      expect((await clean.command.handler(createCommandContext(args))).text).not.toContain("Config warnings");
+      expect((await noDeps.command.handler(createCommandContext(args))).text).not.toContain("Config warnings");
+    }
   });
 
   it("warns from doctor when the fallback OpenClaw config has an exact npm install spec", async () => {
