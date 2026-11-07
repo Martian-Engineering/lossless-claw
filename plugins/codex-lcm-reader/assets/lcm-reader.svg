@@ -1,0 +1,7 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" role="img" aria-label="Codex LCM Reader">
+  <rect width="64" height="64" rx="14" fill="#0f172a"/>
+  <path d="M18 18h28a4 4 0 0 1 4 4v20a4 4 0 0 1-4 4H18a4 4 0 0 1-4-4V22a4 4 0 0 1 4-4Z" fill="#1d4ed8"/>
+  <path d="M20 26h24M20 33h18M20 40h10" stroke="#dbeafe" stroke-width="4" stroke-linecap="round"/>
+  <circle cx="45" cy="41" r="7" fill="#38bdf8"/>
+  <path d="m50 46 5 5" stroke="#bae6fd" stroke-width="4" stroke-linecap="round"/>
+</svg>
