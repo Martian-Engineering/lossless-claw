@@ -123,14 +123,13 @@ const PROBLEM_TEXT: Record<LcmConfigWarningProblem, string> = {
 
 type Finding = { problem?: LcmConfigWarningProblem; effect?: string; usable: boolean };
 
-/** Check one raw value the way the resolver reads it; `usable` means the resolver keeps it. */
-function check(entry: ConfigWarningSetting, raw: unknown, fromEnv: boolean, pluginUsable: boolean): Finding {
-  const fallback = fromEnv && pluginUsable ? "used the plugin config value"
-    : fromEnv && !entry.path ? `used the plugin config value or the default (${entry.fallback})`
-    : `used the default (${entry.fallback})`;
+/**
+ * Check one raw value the way the resolver reads it; `usable` means the resolver keeps it.
+ * An unusable value without an `effect` falls through to the next source, which the caller names.
+ */
+function check(entry: ConfigWarningSetting, raw: unknown, fromEnv: boolean): Finding {
   const [kind, arg = ""] = entry.kind.split(/:(.*)/s);
   if (kind === "retired") return { problem: "retired", effect: "ignored", usable: false };
-  if (kind === "deprecated-alias") return { problem: "deprecated", effect: `read as ${arg}`, usable: true };
   if (kind.startsWith("bool")) {
     const valid = kind === "bool-true-or-1" ? ["true", "false", "1", "0"] : ["true", "false"];
     if (fromEnv) {
@@ -138,30 +137,33 @@ function check(entry: ConfigWarningSetting, raw: unknown, fromEnv: boolean, plug
         : { problem: "not-a-boolean", effect: `read as ${kind === "bool-unless-false"}`, usable: true };
     }
     return typeof raw === "boolean" || raw === "true" || raw === "false" ? { usable: true }
-      : { problem: "not-a-boolean", effect: fallback, usable: false };
+      : { problem: "not-a-boolean", usable: false };
   }
   const text = typeof raw === "string" ? raw.trim() : "";
+  const blank = typeof raw === "string" && text === "";
   if (kind === "enum") {
-    if (fromEnv && text === "") return { usable: false };
+    if (fromEnv && blank) return { usable: false };
     const choice = entry.lowercase ? text.toLowerCase() : text;
     if (arg.split("|").includes(choice)) return { usable: true };
-    const strict = fromEnv && entry.envUnknownUsesDefault === true;
-    return { problem: "unknown-choice", effect: strict ? `used the default (${entry.fallback})` : fallback, usable: strict };
+    return fromEnv && entry.envUnknownUsesDefault === true
+      ? { problem: "unknown-choice", effect: `used the default (${entry.fallback})`, usable: true }
+      : { problem: "unknown-choice", usable: false };
   }
-  // Numeric kinds. An empty env value reads as unset.
-  if (fromEnv && text === "") return { usable: false };
+  // Numeric kinds. A blank env value reads as unset, except where the resolver uses Number(),
+  // which reads it as 0, as it does a blank plugin-config string.
+  if (fromEnv && blank && !entry.envStrictNumber) return { usable: false };
   const exact = typeof raw === "number" ? raw : typeof raw === "string" ? Number(raw) : NaN;
   const integerParse = kind.startsWith("int") || kind === "positive-int-clamp";
   const value = !fromEnv || entry.envStrictNumber ? exact : integerParse ? parseInt(text, 10) : parseFloat(text);
-  if (!Number.isFinite(value)) return { problem: "not-a-number", effect: fallback, usable: false };
-  let shape: Finding = { usable: true };
+  if (!Number.isFinite(value)) return { problem: "not-a-number", usable: false };
+  let shape: Finding = blank ? { problem: "not-a-number", effect: "read as 0", usable: true } : { usable: true };
   if (value !== exact) {
     shape = Number.isFinite(exact) && !Number.isInteger(exact)
       ? { problem: "not-an-integer", effect: "used the whole-number part", usable: true }
       : { problem: "trailing-text", effect: "read only the leading number", usable: true };
   }
   if (kind === "int-min" && (!Number.isInteger(value) || value < Number(arg))) {
-    return { problem: Number.isInteger(value) ? "below-minimum" : "not-an-integer", effect: fallback, usable: false };
+    return { problem: Number.isInteger(value) ? "below-minimum" : "not-an-integer", usable: false };
   }
   if (kind === "positive-int-clamp" && value < 1) return { problem: "clamped", effect: "raised to 1", usable: true };
   if (kind === "positive-int-clamp" && !Number.isInteger(value)) {
@@ -186,6 +188,9 @@ function readPath(pluginConfig: Record<string, unknown>, path: string): unknown 
   return value;
 }
 
+/** One place the resolver reads a setting from, with the check of its value. */
+type Slot = { setting: string; source: LcmConfigWarning["source"]; name: string; alias: boolean; finding: Finding };
+
 /**
  * List config values that resolveLcmConfigWithDiagnostics cannot use as written.
  * Pure: reads the raw inputs only and never changes how the config resolves.
@@ -197,25 +202,51 @@ export function collectConfigWarnings(
   const pc = pluginConfig ?? {};
   const warnings: LcmConfigWarning[] = [];
   for (const entry of CONFIG_WARNING_SETTINGS) {
-    const pluginValue = !entry.path ? undefined
-      : entry.kind === "retired" ? (Object.hasOwn(pc, entry.path) ? true : undefined)
-      : readPath(pc, entry.path);
-    const plugin = pluginValue === undefined ? { usable: false } : check(entry, pluginValue, false, false);
-    const envValue = entry.env ? env[entry.env] : undefined;
-    const fromEnv = envValue === undefined ? { usable: false } : check(entry, envValue, true, plugin.usable);
-    if (entry.env && fromEnv.problem && fromEnv.effect) {
-      warnings.push({ setting: entry.setting, source: "env", name: entry.env, problem: fromEnv.problem, effect: fromEnv.effect });
+    if (entry.kind.startsWith("deprecated-alias:")) continue; // checked with the setting it aliases
+    const group = [entry, ...CONFIG_WARNING_SETTINGS.filter((alias) => alias.kind === `deprecated-alias:${entry.setting}`)];
+    // The resolver's order: every env var before any plugin-config path, the setting before its aliases.
+    const slots: Slot[] = [];
+    for (const member of group) {
+      const raw = member.env ? env[member.env] : undefined;
+      if (member.env && raw !== undefined) {
+        slots.push({ setting: member.setting, source: "env", name: member.env, alias: member !== entry, finding: check(entry, raw, true) });
+      }
     }
-    const shadowed = fromEnv.usable && !entry.kind.startsWith("deprecated-alias");
-    if (entry.path && plugin.problem && plugin.effect && !shadowed) {
-      warnings.push({ setting: entry.setting, source: "plugin-config", name: entry.path, problem: plugin.problem, effect: plugin.effect });
+    for (const member of group) {
+      const raw = !member.path ? undefined
+        : member.kind === "retired" ? (Object.hasOwn(pc, member.path) ? true : undefined)
+        : readPath(pc, member.path);
+      if (member.path && raw !== undefined) {
+        slots.push({ setting: member.setting, source: "plugin-config", name: member.path, alias: member !== entry, finding: check(entry, raw, false) });
+      }
     }
+    slots.forEach((slot, i) => {
+      const used = slots.find((other, j) => j < i && other.finding.usable);
+      let { problem, effect } = slot.finding;
+      if (slot.alias && used) {
+        problem = "deprecated";
+        effect = `ignored (${configWarningLabel(used)} is used)`;
+      } else if (used) {
+        return; // a value with higher precedence is used instead
+      } else if (slot.alias && slot.finding.usable) {
+        problem = "deprecated";
+        effect = `read as ${entry.setting}`;
+      } else if (!slot.finding.usable && !effect) {
+        const next = slots.find((other, j) => j > i && other.finding.usable);
+        effect = next ? (next.alias ? `used ${configWarningLabel(next)}` : "used the plugin config value")
+          : slot.source === "env" && !entry.path ? `used the plugin config value or the default (${entry.fallback})`
+          : `used the default (${entry.fallback})`;
+      }
+      if (problem && effect) {
+        warnings.push({ setting: slot.setting, source: slot.source, name: slot.name, problem, effect });
+      }
+    });
   }
   return warnings;
 }
 
 /** Label a warning by where the value came from, e.g. "env LCM_FRESH_TAIL_COUNT". */
-export function configWarningLabel(warning: LcmConfigWarning): string {
+export function configWarningLabel(warning: Pick<LcmConfigWarning, "source" | "name">): string {
   return `${warning.source === "env" ? "env" : "plugin config"} ${warning.name}`;
 }
 

@@ -272,3 +272,50 @@ describe("collectConfigWarnings", () => {
     }
   });
 });
+
+describe("collectConfigWarnings effect text", () => {
+  it.each<[string, Record<string, string>, Record<string, unknown>, keyof ReturnType<typeof resolveLcmConfig>, unknown, LcmConfigWarning[]]>([
+    ["invalid setting env, alias env used", { LCM_SWEEP_MAX_DEPTH: "abc", LCM_INCREMENTAL_MAX_DEPTH: "3" }, {}, "sweepMaxDepth", 3, [
+      warning("sweepMaxDepth", "env", "LCM_SWEEP_MAX_DEPTH", "not-a-number", "used env LCM_INCREMENTAL_MAX_DEPTH"),
+      warning("incrementalMaxDepth", "env", "LCM_INCREMENTAL_MAX_DEPTH", "deprecated", "read as sweepMaxDepth"),
+    ]],
+    ["invalid setting env, alias plugin value used", { LCM_SWEEP_MAX_DEPTH: "abc" }, { incrementalMaxDepth: 3 }, "sweepMaxDepth", 3, [
+      warning("sweepMaxDepth", "env", "LCM_SWEEP_MAX_DEPTH", "not-a-number", "used plugin config incrementalMaxDepth"),
+      warning("incrementalMaxDepth", "plugin-config", "incrementalMaxDepth", "deprecated", "read as sweepMaxDepth"),
+    ]],
+    ["invalid setting plugin value, alias plugin value used", {}, { sweepMaxDepth: "abc", incrementalMaxDepth: 3 }, "sweepMaxDepth", 3, [
+      warning("sweepMaxDepth", "plugin-config", "sweepMaxDepth", "not-a-number", "used plugin config incrementalMaxDepth"),
+      warning("incrementalMaxDepth", "plugin-config", "incrementalMaxDepth", "deprecated", "read as sweepMaxDepth"),
+    ]],
+    ["invalid alias env", { LCM_INCREMENTAL_MAX_DEPTH: "abc" }, {}, "sweepMaxDepth", 1, [
+      warning("incrementalMaxDepth", "env", "LCM_INCREMENTAL_MAX_DEPTH", "not-a-number", "used the default (1)"),
+    ]],
+    ["alias plugin value under a valid setting env", { LCM_SWEEP_MAX_DEPTH: "2" }, { incrementalMaxDepth: 3 }, "sweepMaxDepth", 2, [
+      warning("incrementalMaxDepth", "plugin-config", "incrementalMaxDepth", "deprecated", "ignored (env LCM_SWEEP_MAX_DEPTH is used)"),
+    ]],
+    ["alias env under a valid setting env", { LCM_SWEEP_MAX_DEPTH: "2", LCM_INCREMENTAL_MAX_DEPTH: "3" }, {}, "sweepMaxDepth", 2, [
+      warning("incrementalMaxDepth", "env", "LCM_INCREMENTAL_MAX_DEPTH", "deprecated", "ignored (env LCM_SWEEP_MAX_DEPTH is used)"),
+    ]],
+    ["alias plugin value under a valid setting plugin value", {}, { sweepMaxDepth: 2, incrementalMaxDepth: 3 }, "sweepMaxDepth", 2, [
+      warning("incrementalMaxDepth", "plugin-config", "incrementalMaxDepth", "deprecated", "ignored (plugin config sweepMaxDepth is used)"),
+    ]],
+    ["blank strict-number env", { LCM_DELEGATION_TIMEOUT_MS: "" }, {}, "delegationTimeoutMs", 0, [
+      warning("delegationTimeoutMs", "env", "LCM_DELEGATION_TIMEOUT_MS", "not-a-number", "read as 0"),
+    ]],
+    ["blank strict-number env over an invalid plugin value", { LCM_DELEGATION_TIMEOUT_MS: "  " }, { delegationTimeoutMs: "zz" }, "delegationTimeoutMs", 0, [
+      warning("delegationTimeoutMs", "env", "LCM_DELEGATION_TIMEOUT_MS", "not-a-number", "read as 0"),
+    ]],
+    ["blank plugin number", {}, { contextThreshold: "" }, "contextThreshold", 0, [
+      warning("contextThreshold", "plugin-config", "contextThreshold", "not-a-number", "read as 0"),
+    ]],
+    ["blank plugin positive integer", {}, { maxSweepIterations: "" }, "maxSweepIterations", 1, [
+      warning("maxSweepIterations", "plugin-config", "maxSweepIterations", "clamped", "raised to 1"),
+    ]],
+    ["blank plugin value with a minimum", {}, { fallbackMaxTokens: "" }, "fallbackMaxTokens", 512, [
+      warning("fallbackMaxTokens", "plugin-config", "fallbackMaxTokens", "below-minimum", "used the default (512)"),
+    ]],
+  ])("matches the resolved value: %s", (_label, env, pluginConfig, key, resolved, expected) => {
+    expect(resolveLcmConfig({ ...BASE_ENV, ...env }, pluginConfig)[key]).toBe(resolved);
+    expect(collectConfigWarnings(env, pluginConfig)).toEqual(expected);
+  });
+});
