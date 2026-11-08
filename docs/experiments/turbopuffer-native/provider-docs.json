@@ -1,0 +1,228 @@
+{
+  "retrievedAt": "2026-11-08",
+  "index": "https://turbopuffer.com/llms.txt",
+  "documents": [
+    {
+      "url": "https://turbopuffer.com/docs/api-overview.md",
+      "file": "api-overview.md",
+      "bytes": 7125,
+      "sha256": "aae5b7028867d00494fcb5a9c5972407aa9acdecbae7a60e82d989a612319d52"
+    },
+    {
+      "url": "https://turbopuffer.com/docs/architecture.md",
+      "file": "architecture.md",
+      "bytes": 14973,
+      "sha256": "0fd075213766720dd76f2285c4f4b15367c0849125de9104cd5e7d78e3334572"
+    },
+    {
+      "url": "https://turbopuffer.com/docs/audit-logs.md",
+      "file": "audit-logs.md",
+      "bytes": 4523,
+      "sha256": "4420dfb1f4775c765dbcf4cb25c372ffbae06796c6190560d2ea5a6d6445e607"
+    },
+    {
+      "url": "https://turbopuffer.com/docs/backups.md",
+      "file": "backups.md",
+      "bytes": 35560,
+      "sha256": "13e571bbfe6ecdfadad6648c38b12685d107a40a66a7f24568e3f6f9e0c7a922"
+    },
+    {
+      "url": "https://turbopuffer.com/docs/branching.md",
+      "file": "branching.md",
+      "bytes": 12849,
+      "sha256": "af998c87cd7279701c90a9098aeeb3e35a13bc7d94e0ea4b38eb15a9744419f5"
+    },
+    {
+      "url": "https://turbopuffer.com/docs/chunking.md",
+      "file": "chunking.md",
+      "bytes": 8932,
+      "sha256": "49bc2488151f0c6fac2878c7bb3946927fcbcbdee6e7dc65456413dd49179ec8"
+    },
+    {
+      "url": "https://turbopuffer.com/docs/concepts.md",
+      "file": "concepts.md",
+      "bytes": 14644,
+      "sha256": "b1d5ac9340badf4ab50b09e330c1d5ef25f4f9d8fad44d396c8c99f010962839"
+    },
+    {
+      "url": "https://turbopuffer.com/docs/delete-namespace.md",
+      "file": "delete-namespace.md",
+      "bytes": 3956,
+      "sha256": "29bebb7dd9fa9aa73fc125536dc4dc89b4cf38fbac5b880bc962dde4ada1193e"
+    },
+    {
+      "url": "https://turbopuffer.com/docs/embedding.md",
+      "file": "embedding.md",
+      "bytes": 43210,
+      "sha256": "39924d2ef64861fa767f73ac7463b80271a17eae8f31fb8cd098cf8eeaeef269"
+    },
+    {
+      "url": "https://turbopuffer.com/docs/encryption.md",
+      "file": "encryption.md",
+      "bytes": 8030,
+      "sha256": "0eef03f5a1536f774951a534aac322d63b4b587646e87f6142389b8f0281f141"
+    },
+    {
+      "url": "https://turbopuffer.com/docs/export.md",
+      "file": "export.md",
+      "bytes": 6658,
+      "sha256": "18e84f9f538a21a8377e33fd5986468288cde0a8724db008218f2b9ea7ce8fcd"
+    },
+    {
+      "url": "https://turbopuffer.com/docs/fts.md",
+      "file": "fts.md",
+      "bytes": 80605,
+      "sha256": "70a89488cbf489b1f7cf5978593d841e82fe803e2e719720acb9f14b9a924a4b"
+    },
+    {
+      "url": "https://turbopuffer.com/docs/guarantees.md",
+      "file": "guarantees.md",
+      "bytes": 4856,
+      "sha256": "1aee463bcc9ffc2228864eb1fe0bceeef1a67d443b47e23a0c47038a306ff6e0"
+    },
+    {
+      "url": "https://turbopuffer.com/docs/hybrid.md",
+      "file": "hybrid.md",
+      "bytes": 9997,
+      "sha256": "764d06c2d97d7713dc72e789c7e3a1b32a6cec127d35b67d7cd4b07757126568"
+    },
+    {
+      "url": "https://turbopuffer.com/docs/index.md",
+      "file": "index.md",
+      "bytes": 3615,
+      "sha256": "34d357e464efd737ea7b21d4042a642ed22f043d318142168ff16cefebe242a7"
+    },
+    {
+      "url": "https://turbopuffer.com/docs/ingestion.md",
+      "file": "ingestion.md",
+      "bytes": 19089,
+      "sha256": "52662d59d71ea591e6c4b2cf2a257536e830617487e5c840b3b96af94ae9e743"
+    },
+    {
+      "url": "https://turbopuffer.com/docs/limits.md",
+      "file": "limits.md",
+      "bytes": 9561,
+      "sha256": "6688f67a4aa1beda9b9fd7d46a72ebd972435b0d413041e2c4d00d1e667723e9"
+    },
+    {
+      "url": "https://turbopuffer.com/docs/metadata.md",
+      "file": "metadata.md",
+      "bytes": 10539,
+      "sha256": "80eaf3ae2a9443760acf051aadf86a6538c843bf1a585a41c35fb5583feec98b"
+    },
+    {
+      "url": "https://turbopuffer.com/docs/namespaces.md",
+      "file": "namespaces.md",
+      "bytes": 5103,
+      "sha256": "c60f168d8ec7008ce4073a39a9e31aaecfbd6857a8923d8d77fa0a209694c5f8"
+    },
+    {
+      "url": "https://turbopuffer.com/docs/performance.md",
+      "file": "performance.md",
+      "bytes": 8145,
+      "sha256": "2682267ec5e090863fcf04b52d0c21a3449b205fa2c4432dace56903569deb73"
+    },
+    {
+      "url": "https://turbopuffer.com/docs/permissions.md",
+      "file": "permissions.md",
+      "bytes": 23820,
+      "sha256": "6d681d5e6b6e3a7c8406ca2b4ad772d4dd821b7f4ba7b97150c2e284cdf25ef9"
+    },
+    {
+      "url": "https://turbopuffer.com/docs/pinning.md",
+      "file": "pinning.md",
+      "bytes": 15969,
+      "sha256": "f12e00fe732a68a8b591f0e8f973a2b1454a397c683a99c4c997e58d920a4aee"
+    },
+    {
+      "url": "https://turbopuffer.com/docs/private-networking.md",
+      "file": "private-networking.md",
+      "bytes": 4830,
+      "sha256": "998328d4bb91c8e0f31a1654d84e9f3cc16b591b7aab3323fba9e1965ca6c6e3"
+    },
+    {
+      "url": "https://turbopuffer.com/docs/query.md",
+      "file": "query.md",
+      "bytes": 151046,
+      "sha256": "4014ad5ea9f203ad2a8e6057efa61a71f220e24a6a0be06dbfa3bb39f8324f83"
+    },
+    {
+      "url": "https://turbopuffer.com/docs/quickstart.md",
+      "file": "quickstart.md",
+      "bytes": 201465,
+      "sha256": "43b2cc86dd296a0fd402dbddc079ce0b5088d696b17aae29a04d747658fa5d2f"
+    },
+    {
+      "url": "https://turbopuffer.com/docs/recall.md",
+      "file": "recall.md",
+      "bytes": 10634,
+      "sha256": "0748a6c0f1df6d388f6ba5c053678236f0fb5584a17f8c286613a70ea4b1b592"
+    },
+    {
+      "url": "https://turbopuffer.com/docs/regions.md",
+      "file": "regions.md",
+      "bytes": 7060,
+      "sha256": "70d49acfabfbc1bd42e2cd19ad6abba3602e0bcb838d972e02b9904a10634765"
+    },
+    {
+      "url": "https://turbopuffer.com/docs/reranking.md",
+      "file": "reranking.md",
+      "bytes": 22505,
+      "sha256": "c8aacf332fff32cab9b16a88f913bdb386261e07b8e86ba03ea4cc9c2a0efe9b"
+    },
+    {
+      "url": "https://turbopuffer.com/docs/roadmap.md",
+      "file": "roadmap.md",
+      "bytes": 19918,
+      "sha256": "a03e8e8524f5fc23052e43c804091c11846b271f64d5204068525c6e963565f7"
+    },
+    {
+      "url": "https://turbopuffer.com/docs/security.md",
+      "file": "security.md",
+      "bytes": 6479,
+      "sha256": "a3454a750b53b57c41f6d8723a02c1ff7ee60a89dc1fef7c706a5d724f5137c2"
+    },
+    {
+      "url": "https://turbopuffer.com/docs/sharding.md",
+      "file": "sharding.md",
+      "bytes": 8675,
+      "sha256": "6b963ab6656653b26c96fad15c08141423a5ff9ccbbfeb8647bf6dc9b5505155"
+    },
+    {
+      "url": "https://turbopuffer.com/docs/testing.md",
+      "file": "testing.md",
+      "bytes": 12143,
+      "sha256": "9cf321908441d61ba26a076a1cd6b70241b5aba9d49e801bcb0308a3f5cdb526"
+    },
+    {
+      "url": "https://turbopuffer.com/docs/tradeoffs.md",
+      "file": "tradeoffs.md",
+      "bytes": 6054,
+      "sha256": "349e3a121f5eaea190875dd7b6d8390895918b6f0827d2f35762d8832ec5b4e8"
+    },
+    {
+      "url": "https://turbopuffer.com/docs/vector.md",
+      "file": "vector.md",
+      "bytes": 3892,
+      "sha256": "c042eddf08f078f4a679fb1abea9f62be9129f3ba58f612602d43553ff16731b"
+    },
+    {
+      "url": "https://turbopuffer.com/docs/warm-cache.md",
+      "file": "warm-cache.md",
+      "bytes": 4920,
+      "sha256": "89d878b341e00efa9367c1e1e327f509fdcc6557deba056171af2ca5ff894eae"
+    },
+    {
+      "url": "https://turbopuffer.com/docs/write.md",
+      "file": "write.md",
+      "bytes": 126077,
+      "sha256": "920dbb962cee46900363f86bb62f7d79fff2890b7b29d542a85195d7a2beb3df"
+    },
+    {
+      "url": "https://turbopuffer.com/pricing.md",
+      "file": "pricing.md",
+      "bytes": 7172,
+      "sha256": "c67ae35a90dd720650296bddfc9c27cfc6174da401c257ca17af80d8160e2989"
+    }
+  ]
+}

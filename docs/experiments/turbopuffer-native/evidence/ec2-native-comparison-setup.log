@@ -1,0 +1,60 @@
+node-v26.12.1-linux-x64.tar.xz: OK
+
+added 16 packages in 618ms
+3adda4cae8667598a0653b2f76d7a0eb2a8ce027cde49d1c8849a9d8623f38c2
+v26.12.1
+sha256:e3d24f6906d0760bf4da0dae872415391ededefad23fd471c47dc53b0ddf3c42
+Linux ip-172-31-5-232 7.0.0-1014-aws #14~24.04.1-Ubuntu SMP PREEMPT Fri Sep 18 21:24:59 UTC 2026 x86_64 x86_64 x86_64 GNU/Linux
+npm notice
+npm notice New major version of npm available! 11.20.0 -> 12.2.2
+npm notice Changelog: https://github.com/npm/cli/releases/tag/v12.2.2
+npm notice To update run: npm install -g npm@12.2.2
+npm notice
+Unable to find image 'postgres:18' locally
+18: Pulling from library/postgres
+eac25292b613: Pulling fs layer
+369949eb0229: Pulling fs layer
+7e0f86eb8508: Pulling fs layer
+6d141360b363: Pulling fs layer
+da434b32d480: Pulling fs layer
+fcd0e9514062: Pulling fs layer
+bcc75ab4e010: Pulling fs layer
+cbe0afc9eb7b: Pulling fs layer
+37fb86c2a767: Pulling fs layer
+fc6c21aca07c: Pulling fs layer
+2a59118cca0e: Pulling fs layer
+a28de24f57c0: Pulling fs layer
+e9dd37612d7b: Pulling fs layer
+7e0f86eb8508: Download complete
+6d141360b363: Download complete
+2a59118cca0e: Download complete
+e9dd37612d7b: Download complete
+da434b32d480: Download complete
+bcc75ab4e010: Download complete
+cbe0afc9eb7b: Download complete
+fc6c21aca07c: Download complete
+eac25292b613: Download complete
+a28de24f57c0: Download complete
+369949eb0229: Download complete
+2f3707deb487: Download complete
+37fb86c2a767: Download complete
+a82d2da6710e: Download complete
+37fb86c2a767: Pull complete
+fcd0e9514062: Download complete
+e9dd37612d7b: Pull complete
+7e0f86eb8508: Pull complete
+369949eb0229: Pull complete
+6d141360b363: Pull complete
+da434b32d480: Pull complete
+bcc75ab4e010: Pull complete
+a28de24f57c0: Pull complete
+2a59118cca0e: Pull complete
+cbe0afc9eb7b: Pull complete
+fc6c21aca07c: Pull complete
+2a59118cca0e: Pull complete
+cbe0afc9eb7b: Pull complete
+fc6c21aca07c: Pull complete
+eac25292b613: Pull complete
+fcd0e9514062: Pull complete
+Digest: sha256:e3d24f6906d0760bf4da0dae872415391ededefad23fd471c47dc53b0ddf3c42
+Status: Downloaded newer image for postgres:18

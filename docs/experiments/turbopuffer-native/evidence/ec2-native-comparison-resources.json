@@ -1,0 +1,16 @@
+{
+  "region": "us-east-1",
+  "profile": "vex-dev",
+  "name": "lcm-native-81cbbbb763",
+  "key_name": "lcm-native-81cbbbb763",
+  "security_group": "sg-0366d3e31a3fd8163",
+  "instance_id": "i-008c69074e738138c",
+  "volume_ids": [],
+  "ip": "13.220.6.207",
+  "benchmark_exit": 0,
+  "cleanup": {
+    "instance_terminated": true,
+    "security_group_deleted": true,
+    "key_pair_deleted": true
+  }
+}

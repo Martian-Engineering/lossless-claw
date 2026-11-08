@@ -365,13 +365,13 @@ export class ExpansionAuthManager {
   }
 }
 
-let runtimeExpansionAuthManager = new ExpansionAuthManager();
+let runtimeExpansionAuthManager: ExpansionAuthManager | undefined;
 
 /**
  * Return the singleton auth manager used by runtime delegated expansion flows.
  */
 export function getRuntimeExpansionAuthManager(): ExpansionAuthManager {
-  return runtimeExpansionAuthManager;
+  return runtimeExpansionAuthManager ??= new ExpansionAuthManager();
 }
 
 /**
@@ -383,7 +383,7 @@ export function getRuntimeExpansionAuthManager(): ExpansionAuthManager {
 export function bindRuntimeExpansionGrantDatabase(db: DatabaseSync): () => void {
   runtimeExpansionAuthManager = new ExpansionAuthManager(db);
   return () => {
-    if (runtimeExpansionAuthManager.usesDatabase(db)) {
+    if (getRuntimeExpansionAuthManager().usesDatabase(db)) {
       runtimeExpansionAuthManager = new ExpansionAuthManager();
     }
   };
@@ -400,7 +400,7 @@ export function createDelegatedExpansionGrant(
     throw new Error("delegatedSessionKey is required for delegated expansion grants");
   }
 
-  const grant = runtimeExpansionAuthManager.createGrant({
+  const grant = getRuntimeExpansionAuthManager().createGrant({
     issuerSessionId: input.issuerSessionId,
     allowedConversationIds: input.allowedConversationIds,
     allowedSummaryIds: input.allowedSummaryIds,
@@ -408,7 +408,7 @@ export function createDelegatedExpansionGrant(
     tokenCap: input.tokenCap,
     ttlMs: input.ttlMs,
   });
-  runtimeExpansionAuthManager.bindSession(delegatedSessionKey, grant.grantId);
+  getRuntimeExpansionAuthManager().bindSession(delegatedSessionKey, grant.grantId);
   return grant;
 }
 
@@ -420,7 +420,7 @@ export function resolveDelegatedExpansionGrantId(sessionKey: string): string | n
   if (!key) {
     return null;
   }
-  return runtimeExpansionAuthManager.resolveSessionGrantId(key);
+  return getRuntimeExpansionAuthManager().resolveSessionGrantId(key);
 }
 
 /**
@@ -435,13 +435,13 @@ export function revokeDelegatedExpansionGrantForSession(
   if (!key) {
     return false;
   }
-  const grantId = runtimeExpansionAuthManager.resolveSessionGrantId(key);
+  const grantId = getRuntimeExpansionAuthManager().resolveSessionGrantId(key);
   if (!grantId) {
     return false;
   }
-  const didRevoke = runtimeExpansionAuthManager.revokeGrant(grantId);
+  const didRevoke = getRuntimeExpansionAuthManager().revokeGrant(grantId);
   if (opts?.removeBinding) {
-    runtimeExpansionAuthManager.removeSessionBinding(key);
+    getRuntimeExpansionAuthManager().removeSessionBinding(key);
   }
   return didRevoke;
 }
@@ -454,14 +454,14 @@ export function removeDelegatedExpansionGrantForSession(sessionKey: string): boo
   if (!key) {
     return false;
   }
-  return runtimeExpansionAuthManager.removeSessionBinding(key);
+  return getRuntimeExpansionAuthManager().removeSessionBinding(key);
 }
 
 /**
  * Test-only reset helper for delegated runtime grants.
  */
 export function resetDelegatedExpansionGrantsForTests(): void {
-  runtimeExpansionAuthManager.clearSessionBindings();
+  getRuntimeExpansionAuthManager().clearSessionBindings();
 }
 
 // ── Authorized wrapper ───────────────────────────────────────────────────────
@@ -471,13 +471,22 @@ export function resetDelegatedExpansionGrantsForTests(): void {
  * The wrapper validates the grant before delegating to the underlying
  * orchestrator.
  */
+export type ExpansionAuthorization = {
+  [K in Exclude<
+    keyof ExpansionAuthManager,
+    "usesDatabase"
+  >]: ExpansionAuthManager[K] extends (...args: infer A) => infer R
+    ? (...args: A) => R | Promise<Awaited<R>>
+    : never;
+};
+
 export function wrapWithAuth(
   orchestrator: ExpansionOrchestrator,
-  authManager: ExpansionAuthManager,
+  authManager: ExpansionAuthorization,
 ): AuthorizedExpansionOrchestrator {
   return {
     async expand(grantId: string, request: ExpansionRequest): Promise<ExpansionResult> {
-      const validation = authManager.validateExpansion(grantId, {
+      const validation = await authManager.validateExpansion(grantId, {
         conversationId: request.conversationId,
         summaryIds: request.summaryIds,
         depth: request.maxDepth ?? DEFAULT_MAX_DEPTH,
@@ -488,7 +497,7 @@ export function wrapWithAuth(
         throw new Error(`Expansion authorization failed: ${validation.reason}`);
       }
 
-      const remainingBudget = authManager.getRemainingTokenBudget(grantId);
+      const remainingBudget = await authManager.getRemainingTokenBudget(grantId);
       if (remainingBudget == null) {
         throw new Error("Expansion authorization failed: Grant not found");
       }
@@ -497,7 +506,7 @@ export function wrapWithAuth(
       }
 
       // Clamp depth to grant maxDepth
-      const grant = authManager.getGrant(grantId);
+      const grant = await authManager.getGrant(grantId);
       const grantMaxDepth = grant?.maxDepth ?? DEFAULT_MAX_DEPTH;
       const requestedDepth =
         typeof request.maxDepth === "number" && Number.isFinite(request.maxDepth)
@@ -515,7 +524,7 @@ export function wrapWithAuth(
         maxDepth: effectiveDepth,
         tokenCap: effectiveTokenCap,
       });
-      authManager.consumeTokenBudget(grantId, result.totalTokens);
+      await authManager.consumeTokenBudget(grantId, result.totalTokens);
       return result;
     },
   };

@@ -1,0 +1,1986 @@
+{
+  "format": 1,
+  "seed": 20261104,
+  "region": "aws-us-east-1",
+  "count": 600,
+  "steps": [
+    {
+      "name": "initialize",
+      "ms": 384.2691060000002,
+      "roundTrips": 4
+    },
+    {
+      "name": "bulk immutable messages and commit root",
+      "ms": 735.8694130000003,
+      "roundTrips": 17
+    },
+    {
+      "name": "ordered keyset traversal past provider 10000 result limit",
+      "ms": 347.77230600000075,
+      "roundTrips": 18
+    },
+    {
+      "name": "native BM25 scoped to conversation",
+      "ms": 34.63694200000009,
+      "roundTrips": 2
+    },
+    {
+      "name": "native RE2 regex",
+      "ms": 40.06571299999996,
+      "roundTrips": 2
+    },
+    {
+      "name": "lost CAS response reconciliation",
+      "ms": 513.3684949999997,
+      "roundTrips": 14
+    },
+    {
+      "name": "crash after immutable writes before CAS",
+      "ms": 1052.817199,
+      "roundTrips": 7
+    },
+    {
+      "name": "new writer wins; stale writer compaction rejected",
+      "ms": 769.8644770000001,
+      "roundTrips": 21
+    },
+    {
+      "name": "fresh observer repairs committed index prefix",
+      "ms": 394.09679100000085,
+      "roundTrips": 16
+    },
+    {
+      "name": "separate agent namespace isolation",
+      "ms": 921.0330409999988,
+      "roundTrips": 18
+    }
+  ],
+  "cleanup": [
+    {
+      "namespace": "lcm-n-d1fbc2c8-92d4-4f63-a0e8-9fcf92c18e08-79790e9965acfae947c98063",
+      "deleted": true
+    },
+    {
+      "namespace": "lcm-n-d1fbc2c8-92d4-4f63-a0e8-9fcf92c18e08-e81e1444b98418621a3e66f6",
+      "deleted": true
+    }
+  ],
+  "runtime": "v26.12.1",
+  "fixture": "synthetic native protocol rows; not a full LCM engine benchmark",
+  "passed": true,
+  "requests": [
+    {
+      "namespace": "lcm-n-d1fbc2c8-92d4-4f63-a0e8-9fcf92c18e08-79790e9965acfae947c98063",
+      "method": "POST",
+      "suffix": "/query",
+      "ms": 20.292755000000398,
+      "requestBytes": 127,
+      "status": 404,
+      "responseBytes": 127
+    },
+    {
+      "namespace": "lcm-n-d1fbc2c8-92d4-4f63-a0e8-9fcf92c18e08-79790e9965acfae947c98063",
+      "method": "POST",
+      "suffix": "",
+      "ms": 149.83218099999976,
+      "requestBytes": 995,
+      "status": 200,
+      "responseBytes": 273,
+      "serverMs": 145,
+      "billing": {
+        "billable_logical_bytes_written": 176,
+        "query": {
+          "billable_logical_bytes_queried": 1280000000,
+          "billable_logical_bytes_returned": 0
+        }
+      }
+    },
+    {
+      "namespace": "lcm-n-d1fbc2c8-92d4-4f63-a0e8-9fcf92c18e08-79790e9965acfae947c98063",
+      "method": "POST",
+      "suffix": "/query",
+      "ms": 23.502697999999782,
+      "requestBytes": 127,
+      "status": 200,
+      "responseBytes": 593,
+      "serverMs": 19,
+      "billing": {
+        "billable_logical_bytes_queried": 1280000000,
+        "billable_logical_bytes_returned": 183
+      }
+    },
+    {
+      "namespace": "lcm-n-d1fbc2c8-92d4-4f63-a0e8-9fcf92c18e08-79790e9965acfae947c98063",
+      "method": "POST",
+      "suffix": "",
+      "ms": 190.16589599999998,
+      "requestBytes": 704,
+      "status": 200,
+      "responseBytes": 273,
+      "serverMs": 185,
+      "billing": {
+        "billable_logical_bytes_written": 40,
+        "query": {
+          "billable_logical_bytes_queried": 1280000000,
+          "billable_logical_bytes_returned": 187
+        }
+      }
+    },
+    {
+      "namespace": "lcm-n-d1fbc2c8-92d4-4f63-a0e8-9fcf92c18e08-79790e9965acfae947c98063",
+      "method": "POST",
+      "suffix": "/query",
+      "ms": 30.451324000000113,
+      "requestBytes": 127,
+      "status": 200,
+      "responseBytes": 629,
+      "serverMs": 25,
+      "billing": {
+        "billable_logical_bytes_queried": 1280000000,
+        "billable_logical_bytes_returned": 219
+      }
+    },
+    {
+      "namespace": "lcm-n-d1fbc2c8-92d4-4f63-a0e8-9fcf92c18e08-79790e9965acfae947c98063",
+      "method": "POST",
+      "suffix": "/query",
+      "ms": 16.814848999999867,
+      "requestBytes": 127,
+      "status": 200,
+      "responseBytes": 629,
+      "serverMs": 12,
+      "billing": {
+        "billable_logical_bytes_queried": 1280000000,
+        "billable_logical_bytes_returned": 219
+      }
+    },
+    {
+      "namespace": "lcm-n-d1fbc2c8-92d4-4f63-a0e8-9fcf92c18e08-79790e9965acfae947c98063",
+      "method": "POST",
+      "suffix": "/query",
+      "ms": 19.004112000000077,
+      "requestBytes": 185,
+      "status": 200,
+      "responseBytes": 439,
+      "serverMs": 14,
+      "billing": {
+        "billable_logical_bytes_queried": 1280000000,
+        "billable_logical_bytes_returned": 80
+      }
+    },
+    {
+      "namespace": "lcm-n-d1fbc2c8-92d4-4f63-a0e8-9fcf92c18e08-79790e9965acfae947c98063",
+      "method": "POST",
+      "suffix": "",
+      "ms": 201.82506599999988,
+      "requestBytes": 821238,
+      "status": 200,
+      "responseBytes": 299,
+      "serverMs": 188,
+      "billing": {
+        "billable_logical_bytes_written": 394569,
+        "query": {
+          "billable_logical_bytes_queried": 2560000000,
+          "billable_logical_bytes_returned": 223
+        }
+      }
+    },
+    {
+      "namespace": "lcm-n-d1fbc2c8-92d4-4f63-a0e8-9fcf92c18e08-79790e9965acfae947c98063",
+      "method": "POST",
+      "suffix": "/query",
+      "ms": 19.95982400000048,
+      "requestBytes": 127,
+      "status": 200,
+      "responseBytes": 637,
+      "serverMs": 15,
+      "billing": {
+        "billable_logical_bytes_queried": 1280000000,
+        "billable_logical_bytes_returned": 223
+      }
+    },
+    {
+      "namespace": "lcm-n-d1fbc2c8-92d4-4f63-a0e8-9fcf92c18e08-79790e9965acfae947c98063",
+      "method": "POST",
+      "suffix": "/query",
+      "ms": 19.381427000000258,
+      "requestBytes": 185,
+      "status": 200,
+      "responseBytes": 2749,
+      "serverMs": 15,
+      "billing": {
+        "billable_logical_bytes_queried": 1280000000,
+        "billable_logical_bytes_returned": 2204
+      }
+    },
+    {
+      "namespace": "lcm-n-d1fbc2c8-92d4-4f63-a0e8-9fcf92c18e08-79790e9965acfae947c98063",
+      "method": "POST",
+      "suffix": "/query",
+      "ms": 15.89341500000046,
+      "requestBytes": 185,
+      "status": 200,
+      "responseBytes": 5002,
+      "serverMs": 11,
+      "billing": {
+        "billable_logical_bytes_queried": 1280000000,
+        "billable_logical_bytes_returned": 4333
+      }
+    },
+    {
+      "namespace": "lcm-n-d1fbc2c8-92d4-4f63-a0e8-9fcf92c18e08-79790e9965acfae947c98063",
+      "method": "POST",
+      "suffix": "/query",
+      "ms": 13.564045000000078,
+      "requestBytes": 185,
+      "status": 200,
+      "responseBytes": 814,
+      "serverMs": 9,
+      "billing": {
+        "billable_logical_bytes_queried": 1280000000,
+        "billable_logical_bytes_returned": 330
+      }
+    },
+    {
+      "namespace": "lcm-n-d1fbc2c8-92d4-4f63-a0e8-9fcf92c18e08-79790e9965acfae947c98063",
+      "method": "POST",
+      "suffix": "/query",
+      "ms": 18.775330999999824,
+      "requestBytes": 185,
+      "status": 200,
+      "responseBytes": 46308,
+      "serverMs": 12,
+      "billing": {
+        "billable_logical_bytes_queried": 1280000000,
+        "billable_logical_bytes_returned": 38648
+      }
+    },
+    {
+      "namespace": "lcm-n-d1fbc2c8-92d4-4f63-a0e8-9fcf92c18e08-79790e9965acfae947c98063",
+      "method": "POST",
+      "suffix": "/query",
+      "ms": 21.276318000000174,
+      "requestBytes": 13120,
+      "status": 200,
+      "responseBytes": 201912,
+      "serverMs": 11,
+      "billing": {
+        "billable_logical_bytes_queried": 1280000000,
+        "billable_logical_bytes_returned": 165580
+      }
+    },
+    {
+      "namespace": "lcm-n-d1fbc2c8-92d4-4f63-a0e8-9fcf92c18e08-79790e9965acfae947c98063",
+      "method": "POST",
+      "suffix": "/query",
+      "ms": 18.554855999999745,
+      "requestBytes": 185,
+      "status": 200,
+      "responseBytes": 46308,
+      "serverMs": 12,
+      "billing": {
+        "billable_logical_bytes_queried": 1280000000,
+        "billable_logical_bytes_returned": 38648
+      }
+    },
+    {
+      "namespace": "lcm-n-d1fbc2c8-92d4-4f63-a0e8-9fcf92c18e08-79790e9965acfae947c98063",
+      "method": "POST",
+      "suffix": "/query",
+      "ms": 19.466715999999906,
+      "requestBytes": 13120,
+      "status": 200,
+      "responseBytes": 202130,
+      "serverMs": 9,
+      "billing": {
+        "billable_logical_bytes_queried": 1280000000,
+        "billable_logical_bytes_returned": 165800
+      }
+    },
+    {
+      "namespace": "lcm-n-d1fbc2c8-92d4-4f63-a0e8-9fcf92c18e08-79790e9965acfae947c98063",
+      "method": "POST",
+      "suffix": "/query",
+      "ms": 19.14637000000039,
+      "requestBytes": 185,
+      "status": 200,
+      "responseBytes": 46308,
+      "serverMs": 13,
+      "billing": {
+        "billable_logical_bytes_queried": 1280000000,
+        "billable_logical_bytes_returned": 38648
+      }
+    },
+    {
+      "namespace": "lcm-n-d1fbc2c8-92d4-4f63-a0e8-9fcf92c18e08-79790e9965acfae947c98063",
+      "method": "POST",
+      "suffix": "/query",
+      "ms": 19.89545999999973,
+      "requestBytes": 13120,
+      "status": 200,
+      "responseBytes": 202132,
+      "serverMs": 11,
+      "billing": {
+        "billable_logical_bytes_queried": 1280000000,
+        "billable_logical_bytes_returned": 165800
+      }
+    },
+    {
+      "namespace": "lcm-n-d1fbc2c8-92d4-4f63-a0e8-9fcf92c18e08-79790e9965acfae947c98063",
+      "method": "POST",
+      "suffix": "/query",
+      "ms": 17.074334999999337,
+      "requestBytes": 185,
+      "status": 200,
+      "responseBytes": 978,
+      "serverMs": 12,
+      "billing": {
+        "billable_logical_bytes_queried": 1280000000,
+        "billable_logical_bytes_returned": 484
+      }
+    },
+    {
+      "namespace": "lcm-n-d1fbc2c8-92d4-4f63-a0e8-9fcf92c18e08-79790e9965acfae947c98063",
+      "method": "POST",
+      "suffix": "/query",
+      "ms": 16.087470999999823,
+      "requestBytes": 185,
+      "status": 200,
+      "responseBytes": 880,
+      "serverMs": 11,
+      "billing": {
+        "billable_logical_bytes_queried": 1280000000,
+        "billable_logical_bytes_returned": 402
+      }
+    },
+    {
+      "namespace": "lcm-n-d1fbc2c8-92d4-4f63-a0e8-9fcf92c18e08-79790e9965acfae947c98063",
+      "method": "POST",
+      "suffix": "",
+      "ms": 184.72044199999982,
+      "requestBytes": 532861,
+      "status": 200,
+      "responseBytes": 299,
+      "serverMs": 173,
+      "billing": {
+        "billable_logical_bytes_written": 676592,
+        "query": {
+          "billable_logical_bytes_queried": 2560000000,
+          "billable_logical_bytes_returned": 227
+        }
+      }
+    },
+    {
+      "namespace": "lcm-n-d1fbc2c8-92d4-4f63-a0e8-9fcf92c18e08-79790e9965acfae947c98063",
+      "method": "POST",
+      "suffix": "/query",
+      "ms": 21.553745000000163,
+      "requestBytes": 127,
+      "status": 200,
+      "responseBytes": 639,
+      "serverMs": 17,
+      "billing": {
+        "billable_logical_bytes_queried": 1280000000,
+        "billable_logical_bytes_returned": 223
+      }
+    },
+    {
+      "namespace": "lcm-n-d1fbc2c8-92d4-4f63-a0e8-9fcf92c18e08-79790e9965acfae947c98063",
+      "method": "POST",
+      "suffix": "/query",
+      "ms": 19.832038999999895,
+      "requestBytes": 127,
+      "status": 200,
+      "responseBytes": 639,
+      "serverMs": 15,
+      "billing": {
+        "billable_logical_bytes_queried": 1280000000,
+        "billable_logical_bytes_returned": 223
+      }
+    },
+    {
+      "namespace": "lcm-n-d1fbc2c8-92d4-4f63-a0e8-9fcf92c18e08-79790e9965acfae947c98063",
+      "method": "POST",
+      "suffix": "/query",
+      "ms": 15.404179999999542,
+      "requestBytes": 185,
+      "status": 200,
+      "responseBytes": 4190,
+      "serverMs": 11,
+      "billing": {
+        "billable_logical_bytes_queried": 1280000000,
+        "billable_logical_bytes_returned": 3567
+      }
+    },
+    {
+      "namespace": "lcm-n-d1fbc2c8-92d4-4f63-a0e8-9fcf92c18e08-79790e9965acfae947c98063",
+      "method": "POST",
+      "suffix": "/query",
+      "ms": 14.818420999999944,
+      "requestBytes": 185,
+      "status": 200,
+      "responseBytes": 4190,
+      "serverMs": 10,
+      "billing": {
+        "billable_logical_bytes_queried": 1280000000,
+        "billable_logical_bytes_returned": 3567
+      }
+    },
+    {
+      "namespace": "lcm-n-d1fbc2c8-92d4-4f63-a0e8-9fcf92c18e08-79790e9965acfae947c98063",
+      "method": "POST",
+      "suffix": "/query",
+      "ms": 14.439148000000387,
+      "requestBytes": 185,
+      "status": 200,
+      "responseBytes": 4190,
+      "serverMs": 10,
+      "billing": {
+        "billable_logical_bytes_queried": 1280000000,
+        "billable_logical_bytes_returned": 3567
+      }
+    },
+    {
+      "namespace": "lcm-n-d1fbc2c8-92d4-4f63-a0e8-9fcf92c18e08-79790e9965acfae947c98063",
+      "method": "POST",
+      "suffix": "/query",
+      "ms": 17.425250000000233,
+      "requestBytes": 185,
+      "status": 200,
+      "responseBytes": 4190,
+      "serverMs": 13,
+      "billing": {
+        "billable_logical_bytes_queried": 1280000000,
+        "billable_logical_bytes_returned": 3567
+      }
+    },
+    {
+      "namespace": "lcm-n-d1fbc2c8-92d4-4f63-a0e8-9fcf92c18e08-79790e9965acfae947c98063",
+      "method": "POST",
+      "suffix": "/query",
+      "ms": 51.87368400000014,
+      "requestBytes": 185,
+      "status": 200,
+      "responseBytes": 4190,
+      "serverMs": 47,
+      "billing": {
+        "billable_logical_bytes_queried": 1280000000,
+        "billable_logical_bytes_returned": 3567
+      }
+    },
+    {
+      "namespace": "lcm-n-d1fbc2c8-92d4-4f63-a0e8-9fcf92c18e08-79790e9965acfae947c98063",
+      "method": "POST",
+      "suffix": "/query",
+      "ms": 13.773408000000018,
+      "requestBytes": 185,
+      "status": 200,
+      "responseBytes": 4188,
+      "serverMs": 9,
+      "billing": {
+        "billable_logical_bytes_queried": 1280000000,
+        "billable_logical_bytes_returned": 3567
+      }
+    },
+    {
+      "namespace": "lcm-n-d1fbc2c8-92d4-4f63-a0e8-9fcf92c18e08-79790e9965acfae947c98063",
+      "method": "POST",
+      "suffix": "/query",
+      "ms": 16.984745999999177,
+      "requestBytes": 185,
+      "status": 200,
+      "responseBytes": 4190,
+      "serverMs": 13,
+      "billing": {
+        "billable_logical_bytes_queried": 1280000000,
+        "billable_logical_bytes_returned": 3567
+      }
+    },
+    {
+      "namespace": "lcm-n-d1fbc2c8-92d4-4f63-a0e8-9fcf92c18e08-79790e9965acfae947c98063",
+      "method": "POST",
+      "suffix": "/query",
+      "ms": 18.846270000000004,
+      "requestBytes": 185,
+      "status": 200,
+      "responseBytes": 4190,
+      "serverMs": 14,
+      "billing": {
+        "billable_logical_bytes_queried": 1280000000,
+        "billable_logical_bytes_returned": 3567
+      }
+    },
+    {
+      "namespace": "lcm-n-d1fbc2c8-92d4-4f63-a0e8-9fcf92c18e08-79790e9965acfae947c98063",
+      "method": "POST",
+      "suffix": "/query",
+      "ms": 22.651323000000048,
+      "requestBytes": 185,
+      "status": 200,
+      "responseBytes": 4190,
+      "serverMs": 18,
+      "billing": {
+        "billable_logical_bytes_queried": 1280000000,
+        "billable_logical_bytes_returned": 3567
+      }
+    },
+    {
+      "namespace": "lcm-n-d1fbc2c8-92d4-4f63-a0e8-9fcf92c18e08-79790e9965acfae947c98063",
+      "method": "POST",
+      "suffix": "/query",
+      "ms": 17.274648999999954,
+      "requestBytes": 185,
+      "status": 200,
+      "responseBytes": 4190,
+      "serverMs": 12,
+      "billing": {
+        "billable_logical_bytes_queried": 1280000000,
+        "billable_logical_bytes_returned": 3567
+      }
+    },
+    {
+      "namespace": "lcm-n-d1fbc2c8-92d4-4f63-a0e8-9fcf92c18e08-79790e9965acfae947c98063",
+      "method": "POST",
+      "suffix": "/query",
+      "ms": 16.443929000000026,
+      "requestBytes": 185,
+      "status": 200,
+      "responseBytes": 4190,
+      "serverMs": 12,
+      "billing": {
+        "billable_logical_bytes_queried": 1280000000,
+        "billable_logical_bytes_returned": 3567
+      }
+    },
+    {
+      "namespace": "lcm-n-d1fbc2c8-92d4-4f63-a0e8-9fcf92c18e08-79790e9965acfae947c98063",
+      "method": "POST",
+      "suffix": "/query",
+      "ms": 16.60113900000033,
+      "requestBytes": 185,
+      "status": 200,
+      "responseBytes": 4190,
+      "serverMs": 12,
+      "billing": {
+        "billable_logical_bytes_queried": 1280000000,
+        "billable_logical_bytes_returned": 3567
+      }
+    },
+    {
+      "namespace": "lcm-n-d1fbc2c8-92d4-4f63-a0e8-9fcf92c18e08-79790e9965acfae947c98063",
+      "method": "POST",
+      "suffix": "/query",
+      "ms": 16.8883679999999,
+      "requestBytes": 185,
+      "status": 200,
+      "responseBytes": 4190,
+      "serverMs": 12,
+      "billing": {
+        "billable_logical_bytes_queried": 1280000000,
+        "billable_logical_bytes_returned": 3567
+      }
+    },
+    {
+      "namespace": "lcm-n-d1fbc2c8-92d4-4f63-a0e8-9fcf92c18e08-79790e9965acfae947c98063",
+      "method": "POST",
+      "suffix": "/query",
+      "ms": 16.12124700000004,
+      "requestBytes": 185,
+      "status": 200,
+      "responseBytes": 4190,
+      "serverMs": 11,
+      "billing": {
+        "billable_logical_bytes_queried": 1280000000,
+        "billable_logical_bytes_returned": 3567
+      }
+    },
+    {
+      "namespace": "lcm-n-d1fbc2c8-92d4-4f63-a0e8-9fcf92c18e08-79790e9965acfae947c98063",
+      "method": "POST",
+      "suffix": "/query",
+      "ms": 15.129657999999836,
+      "requestBytes": 185,
+      "status": 200,
+      "responseBytes": 4190,
+      "serverMs": 11,
+      "billing": {
+        "billable_logical_bytes_queried": 1280000000,
+        "billable_logical_bytes_returned": 3567
+      }
+    },
+    {
+      "namespace": "lcm-n-d1fbc2c8-92d4-4f63-a0e8-9fcf92c18e08-79790e9965acfae947c98063",
+      "method": "POST",
+      "suffix": "/query",
+      "ms": 15.37669199999982,
+      "requestBytes": 185,
+      "status": 200,
+      "responseBytes": 4190,
+      "serverMs": 11,
+      "billing": {
+        "billable_logical_bytes_queried": 1280000000,
+        "billable_logical_bytes_returned": 3567
+      }
+    },
+    {
+      "namespace": "lcm-n-d1fbc2c8-92d4-4f63-a0e8-9fcf92c18e08-79790e9965acfae947c98063",
+      "method": "POST",
+      "suffix": "/query",
+      "ms": 19.539866000000075,
+      "requestBytes": 185,
+      "status": 200,
+      "responseBytes": 6998,
+      "serverMs": 15,
+      "billing": {
+        "billable_logical_bytes_queried": 1280000000,
+        "billable_logical_bytes_returned": 6183
+      }
+    },
+    {
+      "namespace": "lcm-n-d1fbc2c8-92d4-4f63-a0e8-9fcf92c18e08-79790e9965acfae947c98063",
+      "method": "POST",
+      "suffix": "/query",
+      "ms": 16.62684200000058,
+      "requestBytes": 127,
+      "status": 200,
+      "responseBytes": 639,
+      "serverMs": 12,
+      "billing": {
+        "billable_logical_bytes_queried": 1280000000,
+        "billable_logical_bytes_returned": 223
+      }
+    },
+    {
+      "namespace": "lcm-n-d1fbc2c8-92d4-4f63-a0e8-9fcf92c18e08-79790e9965acfae947c98063",
+      "method": "POST",
+      "suffix": "/query",
+      "ms": 17.612325000000055,
+      "requestBytes": 414,
+      "status": 200,
+      "responseBytes": 71759,
+      "serverMs": 11,
+      "billing": {
+        "billable_logical_bytes_queried": 1280000000,
+        "billable_logical_bytes_returned": 55986
+      }
+    },
+    {
+      "namespace": "lcm-n-d1fbc2c8-92d4-4f63-a0e8-9fcf92c18e08-79790e9965acfae947c98063",
+      "method": "POST",
+      "suffix": "/query",
+      "ms": 20.256011999999828,
+      "requestBytes": 127,
+      "status": 200,
+      "responseBytes": 639,
+      "serverMs": 14,
+      "billing": {
+        "billable_logical_bytes_queried": 1280000000,
+        "billable_logical_bytes_returned": 223
+      }
+    },
+    {
+      "namespace": "lcm-n-d1fbc2c8-92d4-4f63-a0e8-9fcf92c18e08-79790e9965acfae947c98063",
+      "method": "POST",
+      "suffix": "/query",
+      "ms": 19.667057999999997,
+      "requestBytes": 372,
+      "status": 200,
+      "responseBytes": 1203,
+      "serverMs": 15,
+      "billing": {
+        "billable_logical_bytes_queried": 1280000000,
+        "billable_logical_bytes_returned": 696
+      }
+    },
+    {
+      "namespace": "lcm-n-d1fbc2c8-92d4-4f63-a0e8-9fcf92c18e08-79790e9965acfae947c98063",
+      "method": "POST",
+      "suffix": "/query",
+      "ms": 15.011043000000427,
+      "requestBytes": 127,
+      "status": 200,
+      "responseBytes": 639,
+      "serverMs": 10,
+      "billing": {
+        "billable_logical_bytes_queried": 1280000000,
+        "billable_logical_bytes_returned": 223
+      }
+    },
+    {
+      "namespace": "lcm-n-d1fbc2c8-92d4-4f63-a0e8-9fcf92c18e08-79790e9965acfae947c98063",
+      "method": "POST",
+      "suffix": "",
+      "ms": 147.00802999999996,
+      "requestBytes": 17700,
+      "status": 200,
+      "responseBytes": 293,
+      "serverMs": 142,
+      "billing": {
+        "billable_logical_bytes_written": 8018,
+        "query": {
+          "billable_logical_bytes_queried": 2560000000,
+          "billable_logical_bytes_returned": 227
+        }
+      }
+    },
+    {
+      "namespace": "lcm-n-d1fbc2c8-92d4-4f63-a0e8-9fcf92c18e08-79790e9965acfae947c98063",
+      "method": "POST",
+      "suffix": "/query",
+      "ms": 20.75957500000004,
+      "requestBytes": 127,
+      "status": 200,
+      "responseBytes": 639,
+      "serverMs": 16,
+      "billing": {
+        "billable_logical_bytes_queried": 1280000000,
+        "billable_logical_bytes_returned": 223
+      }
+    },
+    {
+      "namespace": "lcm-n-d1fbc2c8-92d4-4f63-a0e8-9fcf92c18e08-79790e9965acfae947c98063",
+      "method": "POST",
+      "suffix": "/query",
+      "ms": 14.974083000000064,
+      "requestBytes": 185,
+      "status": 200,
+      "responseBytes": 2739,
+      "serverMs": 11,
+      "billing": {
+        "billable_logical_bytes_queried": 1280000000,
+        "billable_logical_bytes_returned": 2192
+      }
+    },
+    {
+      "namespace": "lcm-n-d1fbc2c8-92d4-4f63-a0e8-9fcf92c18e08-79790e9965acfae947c98063",
+      "method": "POST",
+      "suffix": "/query",
+      "ms": 15.95419899999979,
+      "requestBytes": 185,
+      "status": 200,
+      "responseBytes": 5416,
+      "serverMs": 11,
+      "billing": {
+        "billable_logical_bytes_queried": 1280000000,
+        "billable_logical_bytes_returned": 4721
+      }
+    },
+    {
+      "namespace": "lcm-n-d1fbc2c8-92d4-4f63-a0e8-9fcf92c18e08-79790e9965acfae947c98063",
+      "method": "POST",
+      "suffix": "/query",
+      "ms": 18.647165999999743,
+      "requestBytes": 185,
+      "status": 200,
+      "responseBytes": 881,
+      "serverMs": 14,
+      "billing": {
+        "billable_logical_bytes_queried": 1280000000,
+        "billable_logical_bytes_returned": 401
+      }
+    },
+    {
+      "namespace": "lcm-n-d1fbc2c8-92d4-4f63-a0e8-9fcf92c18e08-79790e9965acfae947c98063",
+      "method": "POST",
+      "suffix": "/query",
+      "ms": 22.906340999999884,
+      "requestBytes": 127,
+      "status": 200,
+      "responseBytes": 639,
+      "serverMs": 18,
+      "billing": {
+        "billable_logical_bytes_queried": 1280000000,
+        "billable_logical_bytes_returned": 223
+      }
+    },
+    {
+      "namespace": "lcm-n-d1fbc2c8-92d4-4f63-a0e8-9fcf92c18e08-79790e9965acfae947c98063",
+      "method": "POST",
+      "suffix": "/query",
+      "ms": 13.057616000000053,
+      "requestBytes": 185,
+      "status": 200,
+      "responseBytes": 816,
+      "serverMs": 8,
+      "billing": {
+        "billable_logical_bytes_queried": 1280000000,
+        "billable_logical_bytes_returned": 330
+      }
+    },
+    {
+      "namespace": "lcm-n-d1fbc2c8-92d4-4f63-a0e8-9fcf92c18e08-79790e9965acfae947c98063",
+      "method": "POST",
+      "suffix": "/query",
+      "ms": 20.036629000000175,
+      "requestBytes": 185,
+      "status": 200,
+      "responseBytes": 1196,
+      "serverMs": 15,
+      "billing": {
+        "billable_logical_bytes_queried": 1280000000,
+        "billable_logical_bytes_returned": 664
+      }
+    },
+    {
+      "namespace": "lcm-n-d1fbc2c8-92d4-4f63-a0e8-9fcf92c18e08-79790e9965acfae947c98063",
+      "method": "POST",
+      "suffix": "/query",
+      "ms": 16.572204000000056,
+      "requestBytes": 185,
+      "status": 200,
+      "responseBytes": 912,
+      "serverMs": 12,
+      "billing": {
+        "billable_logical_bytes_queried": 1280000000,
+        "billable_logical_bytes_returned": 401
+      }
+    },
+    {
+      "namespace": "lcm-n-d1fbc2c8-92d4-4f63-a0e8-9fcf92c18e08-79790e9965acfae947c98063",
+      "method": "POST",
+      "suffix": "",
+      "ms": 144.87769200000002,
+      "requestBytes": 1242,
+      "status": 200,
+      "responseBytes": 292,
+      "serverMs": 140,
+      "billing": {
+        "billable_logical_bytes_written": 308,
+        "query": {
+          "billable_logical_bytes_queried": 2560000000,
+          "billable_logical_bytes_returned": 227
+        }
+      }
+    },
+    {
+      "namespace": "lcm-n-d1fbc2c8-92d4-4f63-a0e8-9fcf92c18e08-79790e9965acfae947c98063",
+      "method": "POST",
+      "suffix": "/query",
+      "ms": 20.226928000000044,
+      "requestBytes": 127,
+      "status": 200,
+      "responseBytes": 639,
+      "serverMs": 16,
+      "billing": {
+        "billable_logical_bytes_queried": 1280000000,
+        "billable_logical_bytes_returned": 223
+      }
+    },
+    {
+      "namespace": "lcm-n-d1fbc2c8-92d4-4f63-a0e8-9fcf92c18e08-79790e9965acfae947c98063",
+      "method": "POST",
+      "suffix": "/query",
+      "ms": 19.964536999999837,
+      "requestBytes": 127,
+      "status": 200,
+      "responseBytes": 639,
+      "serverMs": 15,
+      "billing": {
+        "billable_logical_bytes_queried": 1280000000,
+        "billable_logical_bytes_returned": 223
+      }
+    },
+    {
+      "namespace": "lcm-n-d1fbc2c8-92d4-4f63-a0e8-9fcf92c18e08-79790e9965acfae947c98063",
+      "method": "POST",
+      "suffix": "/query",
+      "ms": 20.63942599999973,
+      "requestBytes": 127,
+      "status": 200,
+      "responseBytes": 639,
+      "serverMs": 16,
+      "billing": {
+        "billable_logical_bytes_queried": 1280000000,
+        "billable_logical_bytes_returned": 223
+      }
+    },
+    {
+      "namespace": "lcm-n-d1fbc2c8-92d4-4f63-a0e8-9fcf92c18e08-79790e9965acfae947c98063",
+      "method": "POST",
+      "suffix": "/query",
+      "ms": 19.283173000000716,
+      "requestBytes": 127,
+      "status": 200,
+      "responseBytes": 639,
+      "serverMs": 15,
+      "billing": {
+        "billable_logical_bytes_queried": 1280000000,
+        "billable_logical_bytes_returned": 223
+      }
+    },
+    {
+      "namespace": "lcm-n-d1fbc2c8-92d4-4f63-a0e8-9fcf92c18e08-79790e9965acfae947c98063",
+      "method": "POST",
+      "suffix": "/query",
+      "ms": 14.668447000000015,
+      "requestBytes": 185,
+      "status": 200,
+      "responseBytes": 7103,
+      "serverMs": 10,
+      "billing": {
+        "billable_logical_bytes_queried": 1280000000,
+        "billable_logical_bytes_returned": 6280
+      }
+    },
+    {
+      "namespace": "lcm-n-d1fbc2c8-92d4-4f63-a0e8-9fcf92c18e08-79790e9965acfae947c98063",
+      "method": "POST",
+      "suffix": "",
+      "ms": 278.9722590000001,
+      "requestBytes": 6992849,
+      "status": 200,
+      "responseBytes": 277,
+      "serverMs": 260,
+      "billing": {
+        "billable_logical_bytes_written": 3496207,
+        "query": {
+          "billable_logical_bytes_queried": 1280000000,
+          "billable_logical_bytes_returned": 0
+        }
+      }
+    },
+    {
+      "namespace": "lcm-n-d1fbc2c8-92d4-4f63-a0e8-9fcf92c18e08-79790e9965acfae947c98063",
+      "method": "POST",
+      "suffix": "/query",
+      "ms": 17.71103200000016,
+      "requestBytes": 127,
+      "status": 200,
+      "responseBytes": 639,
+      "serverMs": 13,
+      "billing": {
+        "billable_logical_bytes_queried": 1280000000,
+        "billable_logical_bytes_returned": 223
+      }
+    },
+    {
+      "namespace": "lcm-n-d1fbc2c8-92d4-4f63-a0e8-9fcf92c18e08-79790e9965acfae947c98063",
+      "method": "POST",
+      "suffix": "/query",
+      "ms": 18.124956999999995,
+      "requestBytes": 127,
+      "status": 200,
+      "responseBytes": 639,
+      "serverMs": 13,
+      "billing": {
+        "billable_logical_bytes_queried": 1280000000,
+        "billable_logical_bytes_returned": 223
+      }
+    },
+    {
+      "namespace": "lcm-n-d1fbc2c8-92d4-4f63-a0e8-9fcf92c18e08-79790e9965acfae947c98063",
+      "method": "POST",
+      "suffix": "/query",
+      "ms": 32.68155000000024,
+      "requestBytes": 127,
+      "status": 200,
+      "responseBytes": 639,
+      "serverMs": 28,
+      "billing": {
+        "billable_logical_bytes_queried": 1280000000,
+        "billable_logical_bytes_returned": 223
+      }
+    },
+    {
+      "namespace": "lcm-n-d1fbc2c8-92d4-4f63-a0e8-9fcf92c18e08-79790e9965acfae947c98063",
+      "method": "POST",
+      "suffix": "/query",
+      "ms": 14.15012299999944,
+      "requestBytes": 408,
+      "status": 200,
+      "responseBytes": 329,
+      "serverMs": 10,
+      "billing": {
+        "billable_logical_bytes_queried": 1280000000,
+        "billable_logical_bytes_returned": 0
+      }
+    },
+    {
+      "namespace": "lcm-n-d1fbc2c8-92d4-4f63-a0e8-9fcf92c18e08-79790e9965acfae947c98063",
+      "method": "POST",
+      "suffix": "/query",
+      "ms": 25.503985999999713,
+      "requestBytes": 127,
+      "status": 200,
+      "responseBytes": 639,
+      "serverMs": 21,
+      "billing": {
+        "billable_logical_bytes_queried": 1280000000,
+        "billable_logical_bytes_returned": 223
+      }
+    },
+    {
+      "namespace": "lcm-n-d1fbc2c8-92d4-4f63-a0e8-9fcf92c18e08-79790e9965acfae947c98063",
+      "method": "POST",
+      "suffix": "",
+      "ms": 142.6317229999995,
+      "requestBytes": 18372,
+      "status": 200,
+      "responseBytes": 276,
+      "serverMs": 137,
+      "billing": {
+        "billable_logical_bytes_written": 8295,
+        "query": {
+          "billable_logical_bytes_queried": 2560000000,
+          "billable_logical_bytes_returned": 259
+        }
+      }
+    },
+    {
+      "namespace": "lcm-n-d1fbc2c8-92d4-4f63-a0e8-9fcf92c18e08-79790e9965acfae947c98063",
+      "method": "POST",
+      "suffix": "/query",
+      "ms": 21.905854000000545,
+      "requestBytes": 127,
+      "status": 200,
+      "responseBytes": 671,
+      "serverMs": 17,
+      "billing": {
+        "billable_logical_bytes_queried": 1280000000,
+        "billable_logical_bytes_returned": 255
+      }
+    },
+    {
+      "namespace": "lcm-n-d1fbc2c8-92d4-4f63-a0e8-9fcf92c18e08-79790e9965acfae947c98063",
+      "method": "POST",
+      "suffix": "/query",
+      "ms": 24.882063000000016,
+      "requestBytes": 185,
+      "status": 200,
+      "responseBytes": 2742,
+      "serverMs": 20,
+      "billing": {
+        "billable_logical_bytes_queried": 1280000000,
+        "billable_logical_bytes_returned": 2195
+      }
+    },
+    {
+      "namespace": "lcm-n-d1fbc2c8-92d4-4f63-a0e8-9fcf92c18e08-79790e9965acfae947c98063",
+      "method": "POST",
+      "suffix": "/query",
+      "ms": 28.63683100000071,
+      "requestBytes": 185,
+      "status": 200,
+      "responseBytes": 6037,
+      "serverMs": 24,
+      "billing": {
+        "billable_logical_bytes_queried": 1280000000,
+        "billable_logical_bytes_returned": 5302
+      }
+    },
+    {
+      "namespace": "lcm-n-d1fbc2c8-92d4-4f63-a0e8-9fcf92c18e08-79790e9965acfae947c98063",
+      "method": "POST",
+      "suffix": "/query",
+      "ms": 19.235749999999825,
+      "requestBytes": 127,
+      "status": 200,
+      "responseBytes": 639,
+      "serverMs": 14,
+      "billing": {
+        "billable_logical_bytes_queried": 1280000000,
+        "billable_logical_bytes_returned": 223
+      }
+    },
+    {
+      "namespace": "lcm-n-d1fbc2c8-92d4-4f63-a0e8-9fcf92c18e08-79790e9965acfae947c98063",
+      "method": "POST",
+      "suffix": "/query",
+      "ms": 19.06484999999975,
+      "requestBytes": 127,
+      "status": 200,
+      "responseBytes": 639,
+      "serverMs": 14,
+      "billing": {
+        "billable_logical_bytes_queried": 1280000000,
+        "billable_logical_bytes_returned": 223
+      }
+    },
+    {
+      "namespace": "lcm-n-d1fbc2c8-92d4-4f63-a0e8-9fcf92c18e08-79790e9965acfae947c98063",
+      "method": "POST",
+      "suffix": "",
+      "ms": 130.68621499999972,
+      "requestBytes": 740,
+      "status": 200,
+      "responseBytes": 273,
+      "serverMs": 126,
+      "billing": {
+        "billable_logical_bytes_written": 40,
+        "query": {
+          "billable_logical_bytes_queried": 1280000000,
+          "billable_logical_bytes_returned": 227
+        }
+      }
+    },
+    {
+      "namespace": "lcm-n-d1fbc2c8-92d4-4f63-a0e8-9fcf92c18e08-79790e9965acfae947c98063",
+      "method": "POST",
+      "suffix": "/query",
+      "ms": 22.967415999999503,
+      "requestBytes": 127,
+      "status": 200,
+      "responseBytes": 639,
+      "serverMs": 18,
+      "billing": {
+        "billable_logical_bytes_queried": 1280000000,
+        "billable_logical_bytes_returned": 223
+      }
+    },
+    {
+      "namespace": "lcm-n-d1fbc2c8-92d4-4f63-a0e8-9fcf92c18e08-79790e9965acfae947c98063",
+      "method": "POST",
+      "suffix": "/query",
+      "ms": 22.264188000000104,
+      "requestBytes": 185,
+      "status": 200,
+      "responseBytes": 2739,
+      "serverMs": 17,
+      "billing": {
+        "billable_logical_bytes_queried": 1280000000,
+        "billable_logical_bytes_returned": 2192
+      }
+    },
+    {
+      "namespace": "lcm-n-d1fbc2c8-92d4-4f63-a0e8-9fcf92c18e08-79790e9965acfae947c98063",
+      "method": "POST",
+      "suffix": "/query",
+      "ms": 31.551649999999427,
+      "requestBytes": 185,
+      "status": 200,
+      "responseBytes": 5416,
+      "serverMs": 27,
+      "billing": {
+        "billable_logical_bytes_queried": 1280000000,
+        "billable_logical_bytes_returned": 4721
+      }
+    },
+    {
+      "namespace": "lcm-n-d1fbc2c8-92d4-4f63-a0e8-9fcf92c18e08-79790e9965acfae947c98063",
+      "method": "POST",
+      "suffix": "/query",
+      "ms": 14.897370000000592,
+      "requestBytes": 185,
+      "status": 200,
+      "responseBytes": 7103,
+      "serverMs": 10,
+      "billing": {
+        "billable_logical_bytes_queried": 1280000000,
+        "billable_logical_bytes_returned": 6280
+      }
+    },
+    {
+      "namespace": "lcm-n-d1fbc2c8-92d4-4f63-a0e8-9fcf92c18e08-79790e9965acfae947c98063",
+      "method": "POST",
+      "suffix": "",
+      "ms": 135.85635699999966,
+      "requestBytes": 19860,
+      "status": 200,
+      "responseBytes": 294,
+      "serverMs": 131,
+      "billing": {
+        "billable_logical_bytes_written": 9176,
+        "query": {
+          "billable_logical_bytes_queried": 2560000000,
+          "billable_logical_bytes_returned": 227
+        }
+      }
+    },
+    {
+      "namespace": "lcm-n-d1fbc2c8-92d4-4f63-a0e8-9fcf92c18e08-79790e9965acfae947c98063",
+      "method": "POST",
+      "suffix": "/query",
+      "ms": 19.126179999999295,
+      "requestBytes": 127,
+      "status": 200,
+      "responseBytes": 671,
+      "serverMs": 14,
+      "billing": {
+        "billable_logical_bytes_queried": 1280000000,
+        "billable_logical_bytes_returned": 255
+      }
+    },
+    {
+      "namespace": "lcm-n-d1fbc2c8-92d4-4f63-a0e8-9fcf92c18e08-79790e9965acfae947c98063",
+      "method": "POST",
+      "suffix": "/query",
+      "ms": 15.78505800000039,
+      "requestBytes": 185,
+      "status": 200,
+      "responseBytes": 2742,
+      "serverMs": 11,
+      "billing": {
+        "billable_logical_bytes_queried": 1280000000,
+        "billable_logical_bytes_returned": 2195
+      }
+    },
+    {
+      "namespace": "lcm-n-d1fbc2c8-92d4-4f63-a0e8-9fcf92c18e08-79790e9965acfae947c98063",
+      "method": "POST",
+      "suffix": "/query",
+      "ms": 19.013793000000078,
+      "requestBytes": 185,
+      "status": 200,
+      "responseBytes": 6037,
+      "serverMs": 14,
+      "billing": {
+        "billable_logical_bytes_queried": 1280000000,
+        "billable_logical_bytes_returned": 5302
+      }
+    },
+    {
+      "namespace": "lcm-n-d1fbc2c8-92d4-4f63-a0e8-9fcf92c18e08-79790e9965acfae947c98063",
+      "method": "POST",
+      "suffix": "/query",
+      "ms": 12.949725999999828,
+      "requestBytes": 185,
+      "status": 200,
+      "responseBytes": 880,
+      "serverMs": 9,
+      "billing": {
+        "billable_logical_bytes_queried": 1280000000,
+        "billable_logical_bytes_returned": 394
+      }
+    },
+    {
+      "namespace": "lcm-n-d1fbc2c8-92d4-4f63-a0e8-9fcf92c18e08-79790e9965acfae947c98063",
+      "method": "POST",
+      "suffix": "/query",
+      "ms": 21.598277000000053,
+      "requestBytes": 185,
+      "status": 200,
+      "responseBytes": 1663,
+      "serverMs": 17,
+      "billing": {
+        "billable_logical_bytes_queried": 1280000000,
+        "billable_logical_bytes_returned": 1058
+      }
+    },
+    {
+      "namespace": "lcm-n-d1fbc2c8-92d4-4f63-a0e8-9fcf92c18e08-79790e9965acfae947c98063",
+      "method": "POST",
+      "suffix": "/query",
+      "ms": 13.427683000000798,
+      "requestBytes": 380,
+      "status": 200,
+      "responseBytes": 2327,
+      "serverMs": 9,
+      "billing": {
+        "billable_logical_bytes_queried": 1280000000,
+        "billable_logical_bytes_returned": 1405
+      }
+    },
+    {
+      "namespace": "lcm-n-d1fbc2c8-92d4-4f63-a0e8-9fcf92c18e08-79790e9965acfae947c98063",
+      "method": "POST",
+      "suffix": "",
+      "ms": 125.78622399999949,
+      "requestBytes": 1230,
+      "status": 200,
+      "responseBytes": 292,
+      "serverMs": 121,
+      "billing": {
+        "billable_logical_bytes_written": 293,
+        "query": {
+          "billable_logical_bytes_queried": 2560000000,
+          "billable_logical_bytes_returned": 259
+        }
+      }
+    },
+    {
+      "namespace": "lcm-n-d1fbc2c8-92d4-4f63-a0e8-9fcf92c18e08-79790e9965acfae947c98063",
+      "method": "POST",
+      "suffix": "/query",
+      "ms": 26.60164799999984,
+      "requestBytes": 127,
+      "status": 200,
+      "responseBytes": 671,
+      "serverMs": 22,
+      "billing": {
+        "billable_logical_bytes_queried": 1280000000,
+        "billable_logical_bytes_returned": 255
+      }
+    },
+    {
+      "namespace": "lcm-n-d1fbc2c8-92d4-4f63-a0e8-9fcf92c18e08-79790e9965acfae947c98063",
+      "method": "POST",
+      "suffix": "/query",
+      "ms": 15.719517000000451,
+      "requestBytes": 127,
+      "status": 200,
+      "responseBytes": 671,
+      "serverMs": 11,
+      "billing": {
+        "billable_logical_bytes_queried": 1280000000,
+        "billable_logical_bytes_returned": 255
+      }
+    },
+    {
+      "namespace": "lcm-n-d1fbc2c8-92d4-4f63-a0e8-9fcf92c18e08-79790e9965acfae947c98063",
+      "method": "POST",
+      "suffix": "/query",
+      "ms": 21.986409000000094,
+      "requestBytes": 185,
+      "status": 200,
+      "responseBytes": 7211,
+      "serverMs": 18,
+      "billing": {
+        "billable_logical_bytes_queried": 1280000000,
+        "billable_logical_bytes_returned": 6380
+      }
+    },
+    {
+      "namespace": "lcm-n-d1fbc2c8-92d4-4f63-a0e8-9fcf92c18e08-79790e9965acfae947c98063",
+      "method": "POST",
+      "suffix": "/query",
+      "ms": 15.599575000000186,
+      "requestBytes": 127,
+      "status": 200,
+      "responseBytes": 671,
+      "serverMs": 11,
+      "billing": {
+        "billable_logical_bytes_queried": 1280000000,
+        "billable_logical_bytes_returned": 255
+      }
+    },
+    {
+      "namespace": "lcm-n-d1fbc2c8-92d4-4f63-a0e8-9fcf92c18e08-79790e9965acfae947c98063",
+      "method": "POST",
+      "suffix": "/query",
+      "ms": 13.313571000000593,
+      "requestBytes": 408,
+      "status": 200,
+      "responseBytes": 328,
+      "serverMs": 9,
+      "billing": {
+        "billable_logical_bytes_queried": 1280000000,
+        "billable_logical_bytes_returned": 0
+      }
+    },
+    {
+      "namespace": "lcm-n-d1fbc2c8-92d4-4f63-a0e8-9fcf92c18e08-79790e9965acfae947c98063",
+      "method": "POST",
+      "suffix": "/query",
+      "ms": 16.91429799999969,
+      "requestBytes": 127,
+      "status": 200,
+      "responseBytes": 671,
+      "serverMs": 12,
+      "billing": {
+        "billable_logical_bytes_queried": 1280000000,
+        "billable_logical_bytes_returned": 255
+      }
+    },
+    {
+      "namespace": "lcm-n-d1fbc2c8-92d4-4f63-a0e8-9fcf92c18e08-79790e9965acfae947c98063",
+      "method": "POST",
+      "suffix": "",
+      "ms": 135.54727999999977,
+      "requestBytes": 18975,
+      "status": 200,
+      "responseBytes": 293,
+      "serverMs": 131,
+      "billing": {
+        "billable_logical_bytes_written": 8620,
+        "query": {
+          "billable_logical_bytes_queried": 2560000000,
+          "billable_logical_bytes_returned": 259
+        }
+      }
+    },
+    {
+      "namespace": "lcm-n-d1fbc2c8-92d4-4f63-a0e8-9fcf92c18e08-79790e9965acfae947c98063",
+      "method": "POST",
+      "suffix": "/query",
+      "ms": 20.03063999999995,
+      "requestBytes": 127,
+      "status": 200,
+      "responseBytes": 641,
+      "serverMs": 15,
+      "billing": {
+        "billable_logical_bytes_queried": 1280000000,
+        "billable_logical_bytes_returned": 225
+      }
+    },
+    {
+      "namespace": "lcm-n-d1fbc2c8-92d4-4f63-a0e8-9fcf92c18e08-79790e9965acfae947c98063",
+      "method": "POST",
+      "suffix": "/query",
+      "ms": 14.967603000000054,
+      "requestBytes": 185,
+      "status": 200,
+      "responseBytes": 2742,
+      "serverMs": 11,
+      "billing": {
+        "billable_logical_bytes_queried": 1280000000,
+        "billable_logical_bytes_returned": 2195
+      }
+    },
+    {
+      "namespace": "lcm-n-d1fbc2c8-92d4-4f63-a0e8-9fcf92c18e08-79790e9965acfae947c98063",
+      "method": "POST",
+      "suffix": "/query",
+      "ms": 16.072525999999925,
+      "requestBytes": 185,
+      "status": 200,
+      "responseBytes": 6449,
+      "serverMs": 11,
+      "billing": {
+        "billable_logical_bytes_queried": 1280000000,
+        "billable_logical_bytes_returned": 5690
+      }
+    },
+    {
+      "namespace": "lcm-n-d1fbc2c8-92d4-4f63-a0e8-9fcf92c18e08-79790e9965acfae947c98063",
+      "method": "POST",
+      "suffix": "/query",
+      "ms": 14.979459999999563,
+      "requestBytes": 185,
+      "status": 200,
+      "responseBytes": 822,
+      "serverMs": 11,
+      "billing": {
+        "billable_logical_bytes_queried": 1280000000,
+        "billable_logical_bytes_returned": 334
+      }
+    },
+    {
+      "namespace": "lcm-n-d1fbc2c8-92d4-4f63-a0e8-9fcf92c18e08-79790e9965acfae947c98063",
+      "method": "POST",
+      "suffix": "/query",
+      "ms": 16.95024199999989,
+      "requestBytes": 185,
+      "status": 200,
+      "responseBytes": 1201,
+      "serverMs": 12,
+      "billing": {
+        "billable_logical_bytes_queried": 1280000000,
+        "billable_logical_bytes_returned": 669
+      }
+    },
+    {
+      "namespace": "lcm-n-d1fbc2c8-92d4-4f63-a0e8-9fcf92c18e08-79790e9965acfae947c98063",
+      "method": "POST",
+      "suffix": "/query",
+      "ms": 16.203753999999208,
+      "requestBytes": 250,
+      "status": 200,
+      "responseBytes": 1474,
+      "serverMs": 12,
+      "billing": {
+        "billable_logical_bytes_queried": 1280000000,
+        "billable_logical_bytes_returned": 814
+      }
+    },
+    {
+      "namespace": "lcm-n-d1fbc2c8-92d4-4f63-a0e8-9fcf92c18e08-79790e9965acfae947c98063",
+      "method": "POST",
+      "suffix": "/query",
+      "ms": 13.611601000000519,
+      "requestBytes": 127,
+      "status": 200,
+      "responseBytes": 639,
+      "serverMs": 9,
+      "billing": {
+        "billable_logical_bytes_queried": 1280000000,
+        "billable_logical_bytes_returned": 225
+      }
+    },
+    {
+      "namespace": "lcm-n-d1fbc2c8-92d4-4f63-a0e8-9fcf92c18e08-79790e9965acfae947c98063",
+      "method": "POST",
+      "suffix": "/query",
+      "ms": 18.117347999999765,
+      "requestBytes": 400,
+      "status": 200,
+      "responseBytes": 330,
+      "serverMs": 14,
+      "billing": {
+        "billable_logical_bytes_queried": 1280000000,
+        "billable_logical_bytes_returned": 0
+      }
+    },
+    {
+      "namespace": "lcm-n-d1fbc2c8-92d4-4f63-a0e8-9fcf92c18e08-79790e9965acfae947c98063",
+      "method": "POST",
+      "suffix": "/query",
+      "ms": 17.994934999999714,
+      "requestBytes": 127,
+      "status": 200,
+      "responseBytes": 641,
+      "serverMs": 13,
+      "billing": {
+        "billable_logical_bytes_queried": 1280000000,
+        "billable_logical_bytes_returned": 225
+      }
+    },
+    {
+      "namespace": "lcm-n-d1fbc2c8-92d4-4f63-a0e8-9fcf92c18e08-79790e9965acfae947c98063",
+      "method": "POST",
+      "suffix": "/query",
+      "ms": 15.616609999999127,
+      "requestBytes": 127,
+      "status": 200,
+      "responseBytes": 641,
+      "serverMs": 11,
+      "billing": {
+        "billable_logical_bytes_queried": 1280000000,
+        "billable_logical_bytes_returned": 225
+      }
+    },
+    {
+      "namespace": "lcm-n-d1fbc2c8-92d4-4f63-a0e8-9fcf92c18e08-79790e9965acfae947c98063",
+      "method": "POST",
+      "suffix": "/query",
+      "ms": 15.703074000000015,
+      "requestBytes": 127,
+      "status": 200,
+      "responseBytes": 641,
+      "serverMs": 11,
+      "billing": {
+        "billable_logical_bytes_queried": 1280000000,
+        "billable_logical_bytes_returned": 225
+      }
+    },
+    {
+      "namespace": "lcm-n-d1fbc2c8-92d4-4f63-a0e8-9fcf92c18e08-79790e9965acfae947c98063",
+      "method": "POST",
+      "suffix": "/query",
+      "ms": 16.37293899999986,
+      "requestBytes": 127,
+      "status": 200,
+      "responseBytes": 641,
+      "serverMs": 12,
+      "billing": {
+        "billable_logical_bytes_queried": 1280000000,
+        "billable_logical_bytes_returned": 225
+      }
+    },
+    {
+      "namespace": "lcm-n-d1fbc2c8-92d4-4f63-a0e8-9fcf92c18e08-79790e9965acfae947c98063",
+      "method": "POST",
+      "suffix": "/query",
+      "ms": 18.483439000000544,
+      "requestBytes": 185,
+      "status": 200,
+      "responseBytes": 2742,
+      "serverMs": 14,
+      "billing": {
+        "billable_logical_bytes_queried": 1280000000,
+        "billable_logical_bytes_returned": 2195
+      }
+    },
+    {
+      "namespace": "lcm-n-d1fbc2c8-92d4-4f63-a0e8-9fcf92c18e08-79790e9965acfae947c98063",
+      "method": "POST",
+      "suffix": "/query",
+      "ms": 13.72202500000003,
+      "requestBytes": 185,
+      "status": 200,
+      "responseBytes": 6447,
+      "serverMs": 9,
+      "billing": {
+        "billable_logical_bytes_queried": 1280000000,
+        "billable_logical_bytes_returned": 5690
+      }
+    },
+    {
+      "namespace": "lcm-n-d1fbc2c8-92d4-4f63-a0e8-9fcf92c18e08-79790e9965acfae947c98063",
+      "method": "POST",
+      "suffix": "/query",
+      "ms": 16.170610000000124,
+      "requestBytes": 185,
+      "status": 200,
+      "responseBytes": 822,
+      "serverMs": 11,
+      "billing": {
+        "billable_logical_bytes_queried": 1280000000,
+        "billable_logical_bytes_returned": 334
+      }
+    },
+    {
+      "namespace": "lcm-n-d1fbc2c8-92d4-4f63-a0e8-9fcf92c18e08-79790e9965acfae947c98063",
+      "method": "POST",
+      "suffix": "/query",
+      "ms": 12.545282000000043,
+      "requestBytes": 185,
+      "status": 200,
+      "responseBytes": 1199,
+      "serverMs": 8,
+      "billing": {
+        "billable_logical_bytes_queried": 1280000000,
+        "billable_logical_bytes_returned": 669
+      }
+    },
+    {
+      "namespace": "lcm-n-d1fbc2c8-92d4-4f63-a0e8-9fcf92c18e08-79790e9965acfae947c98063",
+      "method": "POST",
+      "suffix": "/query",
+      "ms": 14.053585000000567,
+      "requestBytes": 250,
+      "status": 200,
+      "responseBytes": 1472,
+      "serverMs": 9,
+      "billing": {
+        "billable_logical_bytes_queried": 1280000000,
+        "billable_logical_bytes_returned": 814
+      }
+    },
+    {
+      "namespace": "lcm-n-d1fbc2c8-92d4-4f63-a0e8-9fcf92c18e08-79790e9965acfae947c98063",
+      "method": "POST",
+      "suffix": "",
+      "ms": 135.8458899999996,
+      "requestBytes": 1247,
+      "status": 200,
+      "responseBytes": 292,
+      "serverMs": 131,
+      "billing": {
+        "billable_logical_bytes_written": 318,
+        "query": {
+          "billable_logical_bytes_queried": 2560000000,
+          "billable_logical_bytes_returned": 229
+        }
+      }
+    },
+    {
+      "namespace": "lcm-n-d1fbc2c8-92d4-4f63-a0e8-9fcf92c18e08-79790e9965acfae947c98063",
+      "method": "POST",
+      "suffix": "/query",
+      "ms": 18.807035999999243,
+      "requestBytes": 127,
+      "status": 200,
+      "responseBytes": 641,
+      "serverMs": 14,
+      "billing": {
+        "billable_logical_bytes_queried": 1280000000,
+        "billable_logical_bytes_returned": 225
+      }
+    },
+    {
+      "namespace": "lcm-n-d1fbc2c8-92d4-4f63-a0e8-9fcf92c18e08-79790e9965acfae947c98063",
+      "method": "POST",
+      "suffix": "/query",
+      "ms": 17.722491999998965,
+      "requestBytes": 402,
+      "status": 200,
+      "responseBytes": 810,
+      "serverMs": 13,
+      "billing": {
+        "billable_logical_bytes_queried": 1280000000,
+        "billable_logical_bytes_returned": 289
+      }
+    },
+    {
+      "namespace": "lcm-n-d1fbc2c8-92d4-4f63-a0e8-9fcf92c18e08-79790e9965acfae947c98063",
+      "method": "POST",
+      "suffix": "/query",
+      "ms": 26.691933000000063,
+      "requestBytes": 127,
+      "status": 200,
+      "responseBytes": 641,
+      "serverMs": 21,
+      "billing": {
+        "billable_logical_bytes_queried": 1280000000,
+        "billable_logical_bytes_returned": 225
+      }
+    },
+    {
+      "namespace": "lcm-n-d1fbc2c8-92d4-4f63-a0e8-9fcf92c18e08-79790e9965acfae947c98063",
+      "method": "POST",
+      "suffix": "/query",
+      "ms": 20.701844000001074,
+      "requestBytes": 127,
+      "status": 200,
+      "responseBytes": 641,
+      "serverMs": 16,
+      "billing": {
+        "billable_logical_bytes_queried": 1280000000,
+        "billable_logical_bytes_returned": 225
+      }
+    },
+    {
+      "namespace": "lcm-n-d1fbc2c8-92d4-4f63-a0e8-9fcf92c18e08-79790e9965acfae947c98063",
+      "method": "POST",
+      "suffix": "/query",
+      "ms": 11.978546000000279,
+      "requestBytes": 185,
+      "status": 200,
+      "responseBytes": 759,
+      "serverMs": 7,
+      "billing": {
+        "billable_logical_bytes_queried": 1280000000,
+        "billable_logical_bytes_returned": 289
+      }
+    },
+    {
+      "namespace": "lcm-n-d1fbc2c8-92d4-4f63-a0e8-9fcf92c18e08-79790e9965acfae947c98063",
+      "method": "POST",
+      "suffix": "/query",
+      "ms": 19.553750999999465,
+      "requestBytes": 185,
+      "status": 200,
+      "responseBytes": 710,
+      "serverMs": 15,
+      "billing": {
+        "billable_logical_bytes_queried": 1280000000,
+        "billable_logical_bytes_returned": 250
+      }
+    },
+    {
+      "namespace": "lcm-n-d1fbc2c8-92d4-4f63-a0e8-9fcf92c18e08-e81e1444b98418621a3e66f6",
+      "method": "POST",
+      "suffix": "/query",
+      "ms": 61.846338999999716,
+      "requestBytes": 127,
+      "status": 404,
+      "responseBytes": 127
+    },
+    {
+      "namespace": "lcm-n-d1fbc2c8-92d4-4f63-a0e8-9fcf92c18e08-e81e1444b98418621a3e66f6",
+      "method": "POST",
+      "suffix": "",
+      "ms": 141.82562599999983,
+      "requestBytes": 995,
+      "status": 200,
+      "responseBytes": 273,
+      "serverMs": 137,
+      "billing": {
+        "billable_logical_bytes_written": 176,
+        "query": {
+          "billable_logical_bytes_queried": 1280000000,
+          "billable_logical_bytes_returned": 0
+        }
+      }
+    },
+    {
+      "namespace": "lcm-n-d1fbc2c8-92d4-4f63-a0e8-9fcf92c18e08-e81e1444b98418621a3e66f6",
+      "method": "POST",
+      "suffix": "/query",
+      "ms": 28.97998000000007,
+      "requestBytes": 127,
+      "status": 200,
+      "responseBytes": 593,
+      "serverMs": 24,
+      "billing": {
+        "billable_logical_bytes_queried": 1280000000,
+        "billable_logical_bytes_returned": 183
+      }
+    },
+    {
+      "namespace": "lcm-n-d1fbc2c8-92d4-4f63-a0e8-9fcf92c18e08-e81e1444b98418621a3e66f6",
+      "method": "POST",
+      "suffix": "",
+      "ms": 143.76065999999992,
+      "requestBytes": 704,
+      "status": 200,
+      "responseBytes": 273,
+      "serverMs": 139,
+      "billing": {
+        "billable_logical_bytes_written": 40,
+        "query": {
+          "billable_logical_bytes_queried": 1280000000,
+          "billable_logical_bytes_returned": 187
+        }
+      }
+    },
+    {
+      "namespace": "lcm-n-d1fbc2c8-92d4-4f63-a0e8-9fcf92c18e08-e81e1444b98418621a3e66f6",
+      "method": "POST",
+      "suffix": "/query",
+      "ms": 17.65986399999929,
+      "requestBytes": 127,
+      "status": 200,
+      "responseBytes": 629,
+      "serverMs": 13,
+      "billing": {
+        "billable_logical_bytes_queried": 1280000000,
+        "billable_logical_bytes_returned": 219
+      }
+    },
+    {
+      "namespace": "lcm-n-d1fbc2c8-92d4-4f63-a0e8-9fcf92c18e08-e81e1444b98418621a3e66f6",
+      "method": "POST",
+      "suffix": "/query",
+      "ms": 17.90654799999902,
+      "requestBytes": 400,
+      "status": 200,
+      "responseBytes": 324,
+      "serverMs": 14,
+      "billing": {
+        "billable_logical_bytes_queried": 1280000000,
+        "billable_logical_bytes_returned": 0
+      }
+    },
+    {
+      "namespace": "lcm-n-d1fbc2c8-92d4-4f63-a0e8-9fcf92c18e08-e81e1444b98418621a3e66f6",
+      "method": "POST",
+      "suffix": "/query",
+      "ms": 15.823875000000044,
+      "requestBytes": 127,
+      "status": 200,
+      "responseBytes": 629,
+      "serverMs": 12,
+      "billing": {
+        "billable_logical_bytes_queried": 1280000000,
+        "billable_logical_bytes_returned": 219
+      }
+    },
+    {
+      "namespace": "lcm-n-d1fbc2c8-92d4-4f63-a0e8-9fcf92c18e08-e81e1444b98418621a3e66f6",
+      "method": "POST",
+      "suffix": "/query",
+      "ms": 15.261833000000479,
+      "requestBytes": 185,
+      "status": 200,
+      "responseBytes": 439,
+      "serverMs": 11,
+      "billing": {
+        "billable_logical_bytes_queried": 1280000000,
+        "billable_logical_bytes_returned": 80
+      }
+    },
+    {
+      "namespace": "lcm-n-d1fbc2c8-92d4-4f63-a0e8-9fcf92c18e08-e81e1444b98418621a3e66f6",
+      "method": "POST",
+      "suffix": "",
+      "ms": 141.89281699999992,
+      "requestBytes": 4254,
+      "status": 200,
+      "responseBytes": 293,
+      "serverMs": 137,
+      "billing": {
+        "billable_logical_bytes_written": 1810,
+        "query": {
+          "billable_logical_bytes_queried": 2560000000,
+          "billable_logical_bytes_returned": 223
+        }
+      }
+    },
+    {
+      "namespace": "lcm-n-d1fbc2c8-92d4-4f63-a0e8-9fcf92c18e08-e81e1444b98418621a3e66f6",
+      "method": "POST",
+      "suffix": "/query",
+      "ms": 18.140331999999034,
+      "requestBytes": 127,
+      "status": 200,
+      "responseBytes": 665,
+      "serverMs": 14,
+      "billing": {
+        "billable_logical_bytes_queried": 1280000000,
+        "billable_logical_bytes_returned": 255
+      }
+    },
+    {
+      "namespace": "lcm-n-d1fbc2c8-92d4-4f63-a0e8-9fcf92c18e08-e81e1444b98418621a3e66f6",
+      "method": "POST",
+      "suffix": "/query",
+      "ms": 22.4957200000008,
+      "requestBytes": 185,
+      "status": 200,
+      "responseBytes": 953,
+      "serverMs": 18,
+      "billing": {
+        "billable_logical_bytes_queried": 1280000000,
+        "billable_logical_bytes_returned": 561
+      }
+    },
+    {
+      "namespace": "lcm-n-d1fbc2c8-92d4-4f63-a0e8-9fcf92c18e08-e81e1444b98418621a3e66f6",
+      "method": "POST",
+      "suffix": "/query",
+      "ms": 15.183371000000989,
+      "requestBytes": 185,
+      "status": 200,
+      "responseBytes": 876,
+      "serverMs": 11,
+      "billing": {
+        "billable_logical_bytes_queried": 1280000000,
+        "billable_logical_bytes_returned": 394
+      }
+    },
+    {
+      "namespace": "lcm-n-d1fbc2c8-92d4-4f63-a0e8-9fcf92c18e08-e81e1444b98418621a3e66f6",
+      "method": "POST",
+      "suffix": "/query",
+      "ms": 14.405509000000166,
+      "requestBytes": 185,
+      "status": 200,
+      "responseBytes": 1219,
+      "serverMs": 10,
+      "billing": {
+        "billable_logical_bytes_queried": 1280000000,
+        "billable_logical_bytes_returned": 693
+      }
+    },
+    {
+      "namespace": "lcm-n-d1fbc2c8-92d4-4f63-a0e8-9fcf92c18e08-e81e1444b98418621a3e66f6",
+      "method": "POST",
+      "suffix": "/query",
+      "ms": 22.566283000000112,
+      "requestBytes": 250,
+      "status": 200,
+      "responseBytes": 1519,
+      "serverMs": 18,
+      "billing": {
+        "billable_logical_bytes_queried": 1280000000,
+        "billable_logical_bytes_returned": 865
+      }
+    },
+    {
+      "namespace": "lcm-n-d1fbc2c8-92d4-4f63-a0e8-9fcf92c18e08-e81e1444b98418621a3e66f6",
+      "method": "POST",
+      "suffix": "",
+      "ms": 191.59539200000108,
+      "requestBytes": 1246,
+      "status": 200,
+      "responseBytes": 292,
+      "serverMs": 187,
+      "billing": {
+        "billable_logical_bytes_written": 316,
+        "query": {
+          "billable_logical_bytes_queried": 2560000000,
+          "billable_logical_bytes_returned": 259
+        }
+      }
+    },
+    {
+      "namespace": "lcm-n-d1fbc2c8-92d4-4f63-a0e8-9fcf92c18e08-e81e1444b98418621a3e66f6",
+      "method": "POST",
+      "suffix": "/query",
+      "ms": 18.100876999998945,
+      "requestBytes": 127,
+      "status": 200,
+      "responseBytes": 667,
+      "serverMs": 14,
+      "billing": {
+        "billable_logical_bytes_queried": 1280000000,
+        "billable_logical_bytes_returned": 255
+      }
+    },
+    {
+      "namespace": "lcm-n-d1fbc2c8-92d4-4f63-a0e8-9fcf92c18e08-79790e9965acfae947c98063",
+      "method": "DELETE",
+      "suffix": "",
+      "ms": 284.21560599999975,
+      "requestBytes": 0,
+      "status": 200,
+      "responseBytes": 15
+    },
+    {
+      "namespace": "lcm-n-d1fbc2c8-92d4-4f63-a0e8-9fcf92c18e08-e81e1444b98418621a3e66f6",
+      "method": "DELETE",
+      "suffix": "",
+      "ms": 284.1521440000015,
+      "requestBytes": 0,
+      "status": 200,
+      "responseBytes": 15
+    }
+  ],
+  "totals": {
+    "requests": 134,
+    "requestBytes": 8494639,
+    "responseBytes": 1032991
+  },
+  "completedAt": "2026-11-08T08:19:03.370Z"
+}

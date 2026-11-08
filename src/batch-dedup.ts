@@ -1,3 +1,7 @@
+import type {
+  ConversationRepository as ConversationStore,
+  SummaryRepository as SummaryStore,
+} from "./store/ports.js";
 /**
  * Persisted-anchor matching: decides whether an incoming message is a replay
  * of one stored row, accepting exact content, proven large-file
@@ -20,9 +24,9 @@ import {
   type StoredMessage,
 } from "./message-content.js";
 import type { AgentMessage } from "./openclaw-bridge.js";
-import type { ConversationStore, MessageRecord } from "./store/conversation-store.js";
+import type { MessageRecord } from "./store/conversation-store.js";
 import { buildMessageIdentityHash } from "./store/message-identity.js";
-import type { LargeFileRecord, SummaryStore } from "./store/summary-store.js";
+import type { LargeFileRecord } from "./store/summary-store.js";
 import {
   extractAssistantToolCallIdsForPairing,
   extractToolPairingIdFromRecord,

@@ -78,7 +78,16 @@ export type LcmConfigDiagnostics = {
   statelessSessionPatternsEnvOverridesPluginConfig: boolean;
 };
 
+export type NativeTurbopufferConfig = {
+  organizationId: string;
+  namespacePrefix: string;
+  region: string;
+  apiKeyEnv: string;
+  numShards?: number;
+};
 export type LcmConfig = {
+  storageBackend?:"sqlite"|"turbopuffer";
+  turbopuffer?:NativeTurbopufferConfig;
   enabled: boolean;
   /**
    * How to declare agent-run host requirements. "error" (default): require the full
@@ -556,6 +565,43 @@ export function resolveLcmConfigWithDiagnostics(
   pluginConfig?: Record<string, unknown>,
 ): { config: LcmConfig; diagnostics: LcmConfigDiagnostics } {
   const pc = pluginConfig ?? {};
+  const storageBackend=env.LCM_STORAGE_BACKEND??pc.storageBackend??"sqlite";
+  if (storageBackend !== "sqlite" && storageBackend !== "turbopuffer")
+    throw new Error("storageBackend must be sqlite or turbopuffer");
+  const tp=toRecord(pc.turbopuffer);
+  let turbopuffer:NativeTurbopufferConfig|undefined;
+  if(storageBackend==="turbopuffer"){
+    const organizationId = toStr(tp?.organizationId)?.trim(),
+      namespacePrefix = toStr(tp?.namespacePrefix)?.trim();
+    const region = toStr(tp?.region) ?? "aws-us-east-1",
+      apiKeyEnv = toStr(tp?.apiKeyEnv) ?? "LCM_TURBOPUFFER_API_KEY";
+    if (
+      !organizationId ||
+      !namespacePrefix ||
+      !/^[A-Za-z0-9_.-]{1,50}$/.test(namespacePrefix) ||
+      !/^[a-z0-9-]+$/.test(region) ||
+      !/^[A-Za-z_][A-Za-z0-9_]*$/.test(apiKeyEnv)
+    )
+      throw new Error(
+        "Explicit valid Turbopuffer organization, namespace prefix, region and credential environment name are required",
+      );
+    const numShards=tp?.numShards;
+    if (
+      numShards !== undefined &&
+      (typeof numShards !== "number" ||
+        !Number.isInteger(numShards) ||
+        numShards < 1 ||
+        numShards > 256)
+    )
+      throw new Error("Native shard count must be 1..256");
+    turbopuffer = {
+      organizationId,
+      namespacePrefix,
+      region,
+      apiKeyEnv,
+      ...(typeof numShards === "number" ? { numShards } : {}),
+    };
+  }
   const cacheAwareCompaction = toRecord(pc.cacheAwareCompaction);
   const dynamicLeafChunkTokens = toRecord(pc.dynamicLeafChunkTokens);
   const independentLogFile = toRecord(pc.independentLogFile);
@@ -666,6 +712,8 @@ export function resolveLcmConfigWithDiagnostics(
 
   return {
     config: {
+      storageBackend,
+      ...(turbopuffer?{turbopuffer}:{}),
       enabled:
         env.LCM_ENABLED !== undefined
           ? env.LCM_ENABLED !== "false"

@@ -1,3 +1,4 @@
+import type { LcmContextEngine } from "../engine.js";
 import crypto from "node:crypto";
 import {
   createDelegatedExpansionGrant,
@@ -62,6 +63,7 @@ type ParsedExpandQueryReply =
   | { ok: false; error: string };
 
 type RunDelegatedExpandQueryParams = {
+  lcm?:LcmContextEngine;
   deps: LcmDependencies;
   callerSessionKey: string;
   requesterAgentId: string;
@@ -333,7 +335,7 @@ async function runDelegatedQueryAttempt(
     }
 
     // Bind the temporary child to this bucket and the preallocated token cap.
-    createDelegatedExpansionGrant({
+    const grantInput = {
       delegatedSessionKey: childSessionKey,
       issuerSessionId: params.callerSessionKey || "main",
       allowedConversationIds: [params.bucket.conversationId],
@@ -342,7 +344,10 @@ async function runDelegatedQueryAttempt(
         1,
         remainingDeadlineMs(params.deadline.totalDeadlineMs, performance.now()),
       ),
-    });
+    };
+    if (params.lcm?.createExpansionGrant)
+      await params.lcm.createExpansionGrant(grantInput);
+    else createDelegatedExpansionGrant(grantInput);
     stampDelegatedExpansionContext({
       sessionKey: childSessionKey,
       requestId: params.requestId,
@@ -499,7 +504,14 @@ async function runDelegatedQueryAttempt(
       }
     }
     if (grantCreated) {
-      revokeDelegatedExpansionGrantForSession(childSessionKey, { removeBinding: true });
+      if (params.lcm?.revokeExpansionGrant)
+        await params.lcm.revokeExpansionGrant(childSessionKey, {
+          removeBinding: true,
+        });
+      else
+        revokeDelegatedExpansionGrantForSession(childSessionKey, {
+          removeBinding: true,
+        });
     }
     clearDelegatedExpansionContext(childSessionKey);
   }

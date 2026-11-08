@@ -1,0 +1,873 @@
+{
+  "passed": true,
+  "sqliteConnectionConstructorBlocked": true,
+  "namespace": "lcm-e2e-e13cbc39-f81e-4e73-844f-2a8971ea4933-7bcecca4ca9c10a00d3ab363",
+  "deleted": true,
+  "requests": [
+    {
+      "method": "POST",
+      "suffix": "/query",
+      "ms": 73.80246399999999,
+      "requestBytes": 127,
+      "status": 404,
+      "responseBytes": 129
+    },
+    {
+      "method": "POST",
+      "suffix": "",
+      "ms": 181.69755499999997,
+      "requestBytes": 995,
+      "status": 200,
+      "responseBytes": 273,
+      "serverMs": 168,
+      "billing": {
+        "billable_logical_bytes_written": 176,
+        "query": {
+          "billable_logical_bytes_queried": 1280000000,
+          "billable_logical_bytes_returned": 0
+        }
+      }
+    },
+    {
+      "method": "POST",
+      "suffix": "/query",
+      "ms": 22.372552999999982,
+      "requestBytes": 127,
+      "status": 200,
+      "responseBytes": 593,
+      "serverMs": 16,
+      "billing": {
+        "billable_logical_bytes_queried": 1280000000,
+        "billable_logical_bytes_returned": 183
+      }
+    },
+    {
+      "method": "POST",
+      "suffix": "",
+      "ms": 152.87010099999998,
+      "requestBytes": 704,
+      "status": 200,
+      "responseBytes": 273,
+      "serverMs": 147,
+      "billing": {
+        "billable_logical_bytes_written": 40,
+        "query": {
+          "billable_logical_bytes_queried": 1280000000,
+          "billable_logical_bytes_returned": 187
+        }
+      }
+    },
+    {
+      "method": "POST",
+      "suffix": "/query",
+      "ms": 27.48020699999995,
+      "requestBytes": 127,
+      "status": 200,
+      "responseBytes": 629,
+      "serverMs": 22,
+      "billing": {
+        "billable_logical_bytes_queried": 1280000000,
+        "billable_logical_bytes_returned": 219
+      }
+    },
+    {
+      "method": "POST",
+      "suffix": "/query",
+      "ms": 20.911315999999943,
+      "requestBytes": 185,
+      "status": 200,
+      "responseBytes": 439,
+      "serverMs": 16,
+      "billing": {
+        "billable_logical_bytes_queried": 1280000000,
+        "billable_logical_bytes_returned": 80
+      }
+    },
+    {
+      "method": "POST",
+      "suffix": "",
+      "ms": 159.52072499999997,
+      "requestBytes": 8586,
+      "status": 200,
+      "responseBytes": 294,
+      "serverMs": 154,
+      "billing": {
+        "billable_logical_bytes_written": 3965,
+        "query": {
+          "billable_logical_bytes_queried": 2560000000,
+          "billable_logical_bytes_returned": 223
+        }
+      }
+    },
+    {
+      "method": "POST",
+      "suffix": "/query",
+      "ms": 33.58809500000007,
+      "requestBytes": 127,
+      "status": 200,
+      "responseBytes": 667,
+      "serverMs": 28,
+      "billing": {
+        "billable_logical_bytes_queried": 1280000000,
+        "billable_logical_bytes_returned": 255
+      }
+    },
+    {
+      "method": "POST",
+      "suffix": "/query",
+      "ms": 23.243641000000025,
+      "requestBytes": 185,
+      "status": 200,
+      "responseBytes": 1619,
+      "serverMs": 17,
+      "billing": {
+        "billable_logical_bytes_queried": 1280000000,
+        "billable_logical_bytes_returned": 1192
+      }
+    },
+    {
+      "method": "POST",
+      "suffix": "/query",
+      "ms": 21.69111399999997,
+      "requestBytes": 127,
+      "status": 200,
+      "responseBytes": 667,
+      "serverMs": 17,
+      "billing": {
+        "billable_logical_bytes_queried": 1280000000,
+        "billable_logical_bytes_returned": 255
+      }
+    },
+    {
+      "method": "POST",
+      "suffix": "/query",
+      "ms": 19.738598000000025,
+      "requestBytes": 127,
+      "status": 200,
+      "responseBytes": 667,
+      "serverMs": 15,
+      "billing": {
+        "billable_logical_bytes_queried": 1280000000,
+        "billable_logical_bytes_returned": 255
+      }
+    },
+    {
+      "method": "POST",
+      "suffix": "/query",
+      "ms": 22.613186999999925,
+      "requestBytes": 185,
+      "status": 200,
+      "responseBytes": 1239,
+      "serverMs": 18,
+      "billing": {
+        "billable_logical_bytes_queried": 1280000000,
+        "billable_logical_bytes_returned": 687
+      }
+    },
+    {
+      "method": "POST",
+      "suffix": "",
+      "ms": 199.38785599999994,
+      "requestBytes": 28005,
+      "status": 200,
+      "responseBytes": 296,
+      "serverMs": 193,
+      "billing": {
+        "billable_logical_bytes_written": 13570,
+        "query": {
+          "billable_logical_bytes_queried": 2560000000,
+          "billable_logical_bytes_returned": 259
+        }
+      }
+    },
+    {
+      "method": "POST",
+      "suffix": "/query",
+      "ms": 26.81637999999998,
+      "requestBytes": 127,
+      "status": 200,
+      "responseBytes": 667,
+      "serverMs": 22,
+      "billing": {
+        "billable_logical_bytes_queried": 1280000000,
+        "billable_logical_bytes_returned": 255
+      }
+    },
+    {
+      "method": "POST",
+      "suffix": "/query",
+      "ms": 28.394026000000167,
+      "requestBytes": 185,
+      "status": 200,
+      "responseBytes": 5211,
+      "serverMs": 23,
+      "billing": {
+        "billable_logical_bytes_queried": 1280000000,
+        "billable_logical_bytes_returned": 4592
+      }
+    },
+    {
+      "method": "POST",
+      "suffix": "/query",
+      "ms": 29.055125999999973,
+      "requestBytes": 185,
+      "status": 200,
+      "responseBytes": 878,
+      "serverMs": 24,
+      "billing": {
+        "billable_logical_bytes_queried": 1280000000,
+        "billable_logical_bytes_returned": 394
+      }
+    },
+    {
+      "method": "POST",
+      "suffix": "/query",
+      "ms": 34.339963000000125,
+      "requestBytes": 185,
+      "status": 200,
+      "responseBytes": 6520,
+      "serverMs": 29,
+      "billing": {
+        "billable_logical_bytes_queried": 1280000000,
+        "billable_logical_bytes_returned": 5271
+      }
+    },
+    {
+      "method": "POST",
+      "suffix": "/query",
+      "ms": 23.70207800000003,
+      "requestBytes": 1550,
+      "status": 200,
+      "responseBytes": 14532,
+      "serverMs": 15,
+      "billing": {
+        "billable_logical_bytes_queried": 1280000000,
+        "billable_logical_bytes_returned": 10423
+      }
+    },
+    {
+      "method": "POST",
+      "suffix": "",
+      "ms": 190.69686699999988,
+      "requestBytes": 1729,
+      "status": 200,
+      "responseBytes": 292,
+      "serverMs": 184,
+      "billing": {
+        "billable_logical_bytes_written": 636,
+        "query": {
+          "billable_logical_bytes_queried": 2560000000,
+          "billable_logical_bytes_returned": 259
+        }
+      }
+    },
+    {
+      "method": "POST",
+      "suffix": "/query",
+      "ms": 55.40254699999991,
+      "requestBytes": 127,
+      "status": 200,
+      "responseBytes": 667,
+      "serverMs": 50,
+      "billing": {
+        "billable_logical_bytes_queried": 1280000000,
+        "billable_logical_bytes_returned": 255
+      }
+    },
+    {
+      "method": "POST",
+      "suffix": "/query",
+      "ms": 26.288109000000077,
+      "requestBytes": 127,
+      "status": 200,
+      "responseBytes": 667,
+      "serverMs": 21,
+      "billing": {
+        "billable_logical_bytes_queried": 1280000000,
+        "billable_logical_bytes_returned": 255
+      }
+    },
+    {
+      "method": "POST",
+      "suffix": "",
+      "ms": 195.53118699999982,
+      "requestBytes": 12091,
+      "status": 200,
+      "responseBytes": 293,
+      "serverMs": 190,
+      "billing": {
+        "billable_logical_bytes_written": 5609,
+        "query": {
+          "billable_logical_bytes_queried": 2560000000,
+          "billable_logical_bytes_returned": 259
+        }
+      }
+    },
+    {
+      "method": "POST",
+      "suffix": "/query",
+      "ms": 26.592133999999987,
+      "requestBytes": 127,
+      "status": 200,
+      "responseBytes": 667,
+      "serverMs": 22,
+      "billing": {
+        "billable_logical_bytes_queried": 1280000000,
+        "billable_logical_bytes_returned": 255
+      }
+    },
+    {
+      "method": "POST",
+      "suffix": "/query",
+      "ms": 26.04619200000002,
+      "requestBytes": 185,
+      "status": 200,
+      "responseBytes": 5714,
+      "serverMs": 21,
+      "billing": {
+        "billable_logical_bytes_queried": 1280000000,
+        "billable_logical_bytes_returned": 5065
+      }
+    },
+    {
+      "method": "POST",
+      "suffix": "/query",
+      "ms": 21.53209700000002,
+      "requestBytes": 127,
+      "status": 200,
+      "responseBytes": 667,
+      "serverMs": 17,
+      "billing": {
+        "billable_logical_bytes_queried": 1280000000,
+        "billable_logical_bytes_returned": 255
+      }
+    },
+    {
+      "method": "POST",
+      "suffix": "/query",
+      "ms": 21.42791699999998,
+      "requestBytes": 185,
+      "status": 200,
+      "responseBytes": 797,
+      "serverMs": 16,
+      "billing": {
+        "billable_logical_bytes_queried": 1280000000,
+        "billable_logical_bytes_returned": 341
+      }
+    },
+    {
+      "method": "POST",
+      "suffix": "/query",
+      "ms": 22.736012000000073,
+      "requestBytes": 185,
+      "status": 200,
+      "responseBytes": 1265,
+      "serverMs": 17,
+      "billing": {
+        "billable_logical_bytes_queried": 1280000000,
+        "billable_logical_bytes_returned": 709
+      }
+    },
+    {
+      "method": "POST",
+      "suffix": "",
+      "ms": 159.06100000000015,
+      "requestBytes": 9109,
+      "status": 200,
+      "responseBytes": 293,
+      "serverMs": 154,
+      "billing": {
+        "billable_logical_bytes_written": 4056,
+        "query": {
+          "billable_logical_bytes_queried": 2560000000,
+          "billable_logical_bytes_returned": 259
+        }
+      }
+    },
+    {
+      "method": "POST",
+      "suffix": "/query",
+      "ms": 23.94573400000013,
+      "requestBytes": 127,
+      "status": 200,
+      "responseBytes": 667,
+      "serverMs": 19,
+      "billing": {
+        "billable_logical_bytes_queried": 1280000000,
+        "billable_logical_bytes_returned": 255
+      }
+    },
+    {
+      "method": "POST",
+      "suffix": "/query",
+      "ms": 18.725018999999975,
+      "requestBytes": 185,
+      "status": 200,
+      "responseBytes": 6126,
+      "serverMs": 14,
+      "billing": {
+        "billable_logical_bytes_queried": 1280000000,
+        "billable_logical_bytes_returned": 5453
+      }
+    },
+    {
+      "method": "POST",
+      "suffix": "/query",
+      "ms": 58.24808700000017,
+      "requestBytes": 127,
+      "status": 200,
+      "responseBytes": 667,
+      "serverMs": 53,
+      "billing": {
+        "billable_logical_bytes_queried": 1280000000,
+        "billable_logical_bytes_returned": 255
+      }
+    },
+    {
+      "method": "POST",
+      "suffix": "",
+      "ms": 149.66956600000003,
+      "requestBytes": 11300,
+      "status": 200,
+      "responseBytes": 293,
+      "serverMs": 144,
+      "billing": {
+        "billable_logical_bytes_written": 5141,
+        "query": {
+          "billable_logical_bytes_queried": 2560000000,
+          "billable_logical_bytes_returned": 259
+        }
+      }
+    },
+    {
+      "method": "POST",
+      "suffix": "/query",
+      "ms": 19.871914999999717,
+      "requestBytes": 127,
+      "status": 200,
+      "responseBytes": 667,
+      "serverMs": 14,
+      "billing": {
+        "billable_logical_bytes_queried": 1280000000,
+        "billable_logical_bytes_returned": 255
+      }
+    },
+    {
+      "method": "POST",
+      "suffix": "/query",
+      "ms": 17.946117999999842,
+      "requestBytes": 185,
+      "status": 200,
+      "responseBytes": 6696,
+      "serverMs": 13,
+      "billing": {
+        "billable_logical_bytes_queried": 1280000000,
+        "billable_logical_bytes_returned": 5991
+      }
+    },
+    {
+      "method": "POST",
+      "suffix": "/query",
+      "ms": 20.02823699999999,
+      "requestBytes": 127,
+      "status": 200,
+      "responseBytes": 667,
+      "serverMs": 15,
+      "billing": {
+        "billable_logical_bytes_queried": 1280000000,
+        "billable_logical_bytes_returned": 255
+      }
+    },
+    {
+      "method": "POST",
+      "suffix": "/query",
+      "ms": 21.963766000000305,
+      "requestBytes": 127,
+      "status": 200,
+      "responseBytes": 667,
+      "serverMs": 17,
+      "billing": {
+        "billable_logical_bytes_queried": 1280000000,
+        "billable_logical_bytes_returned": 255
+      }
+    },
+    {
+      "method": "POST",
+      "suffix": "/query",
+      "ms": 21.12196099999983,
+      "requestBytes": 127,
+      "status": 200,
+      "responseBytes": 667,
+      "serverMs": 16,
+      "billing": {
+        "billable_logical_bytes_queried": 1280000000,
+        "billable_logical_bytes_returned": 255
+      }
+    },
+    {
+      "method": "POST",
+      "suffix": "/query",
+      "ms": 42.33685999999989,
+      "requestBytes": 127,
+      "status": 200,
+      "responseBytes": 667,
+      "serverMs": 38,
+      "billing": {
+        "billable_logical_bytes_queried": 1280000000,
+        "billable_logical_bytes_returned": 255
+      }
+    },
+    {
+      "method": "POST",
+      "suffix": "/query",
+      "ms": 22.487750000000233,
+      "requestBytes": 127,
+      "status": 200,
+      "responseBytes": 667,
+      "serverMs": 18,
+      "billing": {
+        "billable_logical_bytes_queried": 1280000000,
+        "billable_logical_bytes_returned": 255
+      }
+    },
+    {
+      "method": "POST",
+      "suffix": "/query",
+      "ms": 14.904383000000053,
+      "requestBytes": 127,
+      "status": 200,
+      "responseBytes": 667,
+      "serverMs": 11,
+      "billing": {
+        "billable_logical_bytes_queried": 1280000000,
+        "billable_logical_bytes_returned": 255
+      }
+    },
+    {
+      "method": "POST",
+      "suffix": "/query",
+      "ms": 22.325988000000052,
+      "requestBytes": 185,
+      "status": 200,
+      "responseBytes": 1140,
+      "serverMs": 18,
+      "billing": {
+        "billable_logical_bytes_queried": 1280000000,
+        "billable_logical_bytes_returned": 616
+      }
+    },
+    {
+      "method": "POST",
+      "suffix": "/query",
+      "ms": 20.10943099999986,
+      "requestBytes": 127,
+      "status": 200,
+      "responseBytes": 667,
+      "serverMs": 16,
+      "billing": {
+        "billable_logical_bytes_queried": 1280000000,
+        "billable_logical_bytes_returned": 255
+      }
+    },
+    {
+      "method": "POST",
+      "suffix": "/query",
+      "ms": 14.422832000000199,
+      "requestBytes": 127,
+      "status": 200,
+      "responseBytes": 667,
+      "serverMs": 10,
+      "billing": {
+        "billable_logical_bytes_queried": 1280000000,
+        "billable_logical_bytes_returned": 255
+      }
+    },
+    {
+      "method": "POST",
+      "suffix": "/query",
+      "ms": 24.56598299999996,
+      "requestBytes": 127,
+      "status": 200,
+      "responseBytes": 667,
+      "serverMs": 20,
+      "billing": {
+        "billable_logical_bytes_queried": 1280000000,
+        "billable_logical_bytes_returned": 255
+      }
+    },
+    {
+      "method": "POST",
+      "suffix": "/query",
+      "ms": 20.95184100000006,
+      "requestBytes": 127,
+      "status": 200,
+      "responseBytes": 667,
+      "serverMs": 16,
+      "billing": {
+        "billable_logical_bytes_queried": 1280000000,
+        "billable_logical_bytes_returned": 255
+      }
+    },
+    {
+      "method": "POST",
+      "suffix": "/query",
+      "ms": 28.344528000000082,
+      "requestBytes": 127,
+      "status": 200,
+      "responseBytes": 667,
+      "serverMs": 24,
+      "billing": {
+        "billable_logical_bytes_queried": 1280000000,
+        "billable_logical_bytes_returned": 255
+      }
+    },
+    {
+      "method": "POST",
+      "suffix": "/query",
+      "ms": 20.328734999999597,
+      "requestBytes": 127,
+      "status": 200,
+      "responseBytes": 667,
+      "serverMs": 16,
+      "billing": {
+        "billable_logical_bytes_queried": 1280000000,
+        "billable_logical_bytes_returned": 255
+      }
+    },
+    {
+      "method": "POST",
+      "suffix": "/query",
+      "ms": 20.87121799999977,
+      "requestBytes": 127,
+      "status": 200,
+      "responseBytes": 667,
+      "serverMs": 17,
+      "billing": {
+        "billable_logical_bytes_queried": 1280000000,
+        "billable_logical_bytes_returned": 255
+      }
+    },
+    {
+      "method": "POST",
+      "suffix": "/query",
+      "ms": 15.655473000000256,
+      "requestBytes": 127,
+      "status": 200,
+      "responseBytes": 667,
+      "serverMs": 11,
+      "billing": {
+        "billable_logical_bytes_queried": 1280000000,
+        "billable_logical_bytes_returned": 255
+      }
+    },
+    {
+      "method": "POST",
+      "suffix": "/query",
+      "ms": 21.59199200000012,
+      "requestBytes": 127,
+      "status": 200,
+      "responseBytes": 667,
+      "serverMs": 17,
+      "billing": {
+        "billable_logical_bytes_queried": 1280000000,
+        "billable_logical_bytes_returned": 255
+      }
+    },
+    {
+      "method": "POST",
+      "suffix": "/query",
+      "ms": 16.24786099999983,
+      "requestBytes": 127,
+      "status": 200,
+      "responseBytes": 667,
+      "serverMs": 12,
+      "billing": {
+        "billable_logical_bytes_queried": 1280000000,
+        "billable_logical_bytes_returned": 255
+      }
+    },
+    {
+      "method": "POST",
+      "suffix": "/query",
+      "ms": 20.231873000000178,
+      "requestBytes": 127,
+      "status": 200,
+      "responseBytes": 667,
+      "serverMs": 16,
+      "billing": {
+        "billable_logical_bytes_queried": 1280000000,
+        "billable_logical_bytes_returned": 255
+      }
+    },
+    {
+      "method": "POST",
+      "suffix": "/query",
+      "ms": 15.042671000000155,
+      "requestBytes": 127,
+      "status": 200,
+      "responseBytes": 667,
+      "serverMs": 11,
+      "billing": {
+        "billable_logical_bytes_queried": 1280000000,
+        "billable_logical_bytes_returned": 255
+      }
+    },
+    {
+      "method": "POST",
+      "suffix": "/query",
+      "ms": 13.9478509999999,
+      "requestBytes": 127,
+      "status": 200,
+      "responseBytes": 667,
+      "serverMs": 10,
+      "billing": {
+        "billable_logical_bytes_queried": 1280000000,
+        "billable_logical_bytes_returned": 255
+      }
+    },
+    {
+      "method": "POST",
+      "suffix": "/query",
+      "ms": 19.568502999999964,
+      "requestBytes": 127,
+      "status": 200,
+      "responseBytes": 667,
+      "serverMs": 15,
+      "billing": {
+        "billable_logical_bytes_queried": 1280000000,
+        "billable_logical_bytes_returned": 255
+      }
+    },
+    {
+      "method": "POST",
+      "suffix": "/query",
+      "ms": 14.59918800000014,
+      "requestBytes": 127,
+      "status": 200,
+      "responseBytes": 667,
+      "serverMs": 11,
+      "billing": {
+        "billable_logical_bytes_queried": 1280000000,
+        "billable_logical_bytes_returned": 255
+      }
+    },
+    {
+      "method": "POST",
+      "suffix": "/query",
+      "ms": 20.695860000000266,
+      "requestBytes": 127,
+      "status": 200,
+      "responseBytes": 667,
+      "serverMs": 16,
+      "billing": {
+        "billable_logical_bytes_queried": 1280000000,
+        "billable_logical_bytes_returned": 255
+      }
+    },
+    {
+      "method": "POST",
+      "suffix": "",
+      "ms": 189.86853900000006,
+      "requestBytes": 12418,
+      "status": 200,
+      "responseBytes": 293,
+      "serverMs": 185,
+      "billing": {
+        "billable_logical_bytes_written": 5655,
+        "query": {
+          "billable_logical_bytes_queried": 2560000000,
+          "billable_logical_bytes_returned": 259
+        }
+      }
+    },
+    {
+      "method": "POST",
+      "suffix": "/query",
+      "ms": 26.81415599999991,
+      "requestBytes": 127,
+      "status": 200,
+      "responseBytes": 667,
+      "serverMs": 22,
+      "billing": {
+        "billable_logical_bytes_queried": 1280000000,
+        "billable_logical_bytes_returned": 255
+      }
+    },
+    {
+      "method": "POST",
+      "suffix": "/query",
+      "ms": 19.918586000000232,
+      "requestBytes": 185,
+      "status": 200,
+      "responseBytes": 7433,
+      "serverMs": 15,
+      "billing": {
+        "billable_logical_bytes_queried": 1280000000,
+        "billable_logical_bytes_returned": 6688
+      }
+    },
+    {
+      "method": "POST",
+      "suffix": "/query",
+      "ms": 21.26460700000007,
+      "requestBytes": 185,
+      "status": 200,
+      "responseBytes": 799,
+      "serverMs": 16,
+      "billing": {
+        "billable_logical_bytes_queried": 1280000000,
+        "billable_logical_bytes_returned": 339
+      }
+    },
+    {
+      "method": "POST",
+      "suffix": "/query",
+      "ms": 29.62786099999994,
+      "requestBytes": 127,
+      "status": 200,
+      "responseBytes": 667,
+      "serverMs": 25,
+      "billing": {
+        "billable_logical_bytes_queried": 1280000000,
+        "billable_logical_bytes_returned": 255
+      }
+    },
+    {
+      "method": "POST",
+      "suffix": "/query",
+      "ms": 16.733502000000044,
+      "requestBytes": 185,
+      "status": 200,
+      "responseBytes": 1299,
+      "serverMs": 11,
+      "billing": {
+        "billable_logical_bytes_queried": 1280000000,
+        "billable_logical_bytes_returned": 743
+      }
+    },
+    {
+      "method": "POST",
+      "suffix": "",
+      "ms": 160.47587299999986,
+      "requestBytes": 11863,
+      "status": 200,
+      "responseBytes": 293,
+      "serverMs": 156,
+      "billing": {
+        "billable_logical_bytes_written": 5376,
+        "query": {
+          "billable_logical_bytes_queried": 2560000000,
+          "billable_logical_bytes_returned": 259
+        }
+      }
+    },
+    {
+      "method": "DELETE",
+      "suffix": "",
+      "ms": 353.79003299999977,
+      "requestBytes": 0,
+      "status": 200,
+      "responseBytes": 15
+    }
+  ]
+}

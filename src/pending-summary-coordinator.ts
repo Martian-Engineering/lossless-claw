@@ -1,3 +1,8 @@
+import type { PendingSummaryRepository as PendingSummaryStore } from "./store/ports.js";
+import type {
+  ConversationRepository as ConversationStore,
+  SummaryRepository as SummaryStore,
+} from "./store/ports.js";
 import { randomUUID } from "node:crypto";
 import {
   buildPendingProjectionSnapshot,
@@ -26,14 +31,12 @@ import {
   PendingSummaryEmptySourceCoverage,
   PendingSummaryPreparationWorker,
 } from "./pending-summary-worker.js";
-import type { ConversationStore, MessageRecord } from "./store/conversation-store.js";
+import type { MessageRecord } from "./store/conversation-store.js";
 import {
   MAX_PENDING_NODE_RETRIES,
   type PendingCompactionBatchRecord,
   type PendingSummaryNodeRecord,
-  type PendingSummaryStore,
 } from "./store/pending-summary-store.js";
-import type { SummaryStore } from "./store/summary-store.js";
 import {
   LcmProviderAuthError,
   LcmRuntimeLifecycleError,

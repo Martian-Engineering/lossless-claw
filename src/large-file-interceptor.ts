@@ -1,3 +1,4 @@
+import type { SummaryRepository as SummaryStore } from "./store/ports.js";
 /**
  * Large-payload interception at ingest time: oversized <file> blocks, inline
  * and native image content, oversized tool results, and generic raw payloads
@@ -10,7 +11,6 @@ import { mkdir, writeFile } from "node:fs/promises";
 import { createHash, randomUUID } from "node:crypto";
 import { join } from "node:path";
 import type { LcmConfig } from "./db/config.js";
-import type { SummaryStore } from "./store/summary-store.js";
 import type { AgentMessage } from "./openclaw-bridge.js";
 import { estimateTokens } from "./estimate-tokens.js";
 import {
@@ -247,7 +247,7 @@ export class LargeFileInterceptor {
   }): Promise<{ fileId: string; byteSize: number; summary: string; reference: string }> {
     const fileId = `file_${randomUUID().replace(/-/g, "").slice(0, 16)}`;
     const byteSize = Buffer.from(params.base64Data, "base64").byteLength;
-    const storageUri = await this.storeImageFileContent({
+    const storageUri = this.summaryStore.storeLargeFileBytes ? "" : await this.storeImageFileContent({
       conversationId: params.conversationId,
       fileId,
       extension: params.extension,
@@ -256,7 +256,7 @@ export class LargeFileInterceptor {
     const fileName = params.fileName ?? `image.${params.extension}`;
     const summary = `Image file (${params.extension.toUpperCase()}, ${byteSize.toLocaleString("en-US")} bytes)${params.fileName ? ` — ${params.fileName}` : ""}`;
 
-    await this.summaryStore.insertLargeFile({
+    const fileRecord = {
       fileId,
       conversationId: params.conversationId,
       fileName,
@@ -264,7 +264,13 @@ export class LargeFileInterceptor {
       byteSize,
       storageUri,
       explorationSummary: summary,
-    });
+    };
+    if (this.summaryStore.storeLargeFileBytes)
+      await this.summaryStore.storeLargeFileBytes(
+        fileRecord,
+        Buffer.from(params.base64Data, "base64"),
+      );
+    else await this.summaryStore.insertLargeFile(fileRecord);
 
     const reference = `[${params.label}: ${fileName} (${params.mimeType}, ${byteSize.toLocaleString("en-US")} bytes) | LCM file: ${fileId}]`;
     return { fileId, byteSize, summary, reference };
@@ -657,7 +663,7 @@ export class LargeFileInterceptor {
     });
     const fileId = params.fileId ?? `file_${randomUUID().replace(/-/g, "").slice(0, 16)}`;
     const extension = extensionFromNameOrMime(params.fileName, params.mimeType);
-    const storageUri = await this.storeLargeFileContent({
+    const storageUri = this.summaryStore.storeLargeFileBytes ? "" : await this.storeLargeFileContent({
       conversationId: params.conversationId,
       fileId,
       extension,
@@ -672,7 +678,7 @@ export class LargeFileInterceptor {
       summarizeText,
     });
 
-    await this.summaryStore.insertLargeFile({
+    const fileRecord = {
       fileId,
       conversationId: params.conversationId,
       fileName: params.fileName,
@@ -681,7 +687,13 @@ export class LargeFileInterceptor {
       lineCount,
       storageUri,
       explorationSummary,
-    });
+    };
+    if (this.summaryStore.storeLargeFileBytes)
+      await this.summaryStore.storeLargeFileBytes(
+        fileRecord,
+        Buffer.from(params.content, "utf8"),
+      );
+    else await this.summaryStore.insertLargeFile(fileRecord);
 
     return {
       fileId,

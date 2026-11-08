@@ -8,6 +8,51 @@ The Settings editor displays fixed defaults from the plugin manifest. Automatic 
 
 Grouped settings require OpenClaw `2026.9.5` or newer. Earlier supported hosts ignore the optional `configGroups` metadata and show the complete flat settings form. The runtime minimum remains `2026.9.2`; configuration paths and runtime defaults are unchanged. See [Settings in OpenClaw](../../../docs/configuration.md#settings-in-openclaw) for the section list and compatibility details.
 
+## Native Turbopuffer backend (fork experiment)
+
+SQLite remains the default (`storageBackend: "sqlite"`). This fork also supports
+explicit `storageBackend: "turbopuffer"` with native records, context, DAG edges,
+receipts, lifecycle metadata, authorization and file bytes. It opens no SQLite
+projection and requires no PostgreSQL service. The existing SQLite file is not
+automatically imported; use a new namespace and the explicit migration procedure.
+
+| Setting | Default | Meaning |
+| --- | --- | --- |
+| `storageBackend` / `LCM_STORAGE_BACKEND` | `sqlite` | Explicit backend selection; environment takes precedence. |
+| `turbopuffer.organizationId` | required in native mode | Trusted organization authority. |
+| `turbopuffer.namespacePrefix` | required in native mode | Operator-owned namespace prefix, 1–50 ASCII letters/digits/`_.-`. |
+| `turbopuffer.region` | `aws-us-east-1` | Provider region; choose near the worker. |
+| `turbopuffer.apiKeyEnv` | `LCM_TURBOPUFFER_API_KEY` | Name of the credential environment variable; never the key itself. |
+| `turbopuffer.numShards` | provider default (1) | Optional 1–256 shard count, immutable after the namespace's first write. |
+
+```json
+{
+  "plugins": {
+    "entries": {
+      "lossless-claw": {
+        "config": {
+          "storageBackend": "turbopuffer",
+          "turbopuffer": {
+            "organizationId": "your-organization",
+            "namespacePrefix": "lcm-native-trial",
+            "region": "aws-us-east-1",
+            "apiKeyEnv": "LCM_TURBOPUFFER_API_KEY"
+          }
+        }
+      }
+    }
+  }
+}
+```
+
+Each configured native agent receives its own namespace across its conversations.
+Host session identity selects it; recall arguments cannot select another agent.
+Native mode supports the context-engine lifecycle and recall tools; the SQLite
+context-explorer/repair UI and file administration commands do not apply.
+`/lcm status` and `/lcm doctor` are agent-scoped native diagnostics. The OpenClaw
+minimum remains `2026.9.2`. Full protocol, migration, rollback, cost and benchmark
+limits are in the [native experiment](../../../docs/experiments/turbopuffer-native/README.md).
+
 ## First checks
 
 - Ensure the plugin is installed and enabled.

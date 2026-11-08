@@ -1,0 +1,52 @@
+{
+  "recordedAt": "2026-11-08T08:19:03.407Z",
+  "fixtureSha256": "af724fb7cd2504ac3e593b16090d63179bdd0ee25e3617991e25d8be14f2b5cf",
+  "fixtureBytes": 7039271,
+  "seed": 20261104,
+  "fixtureCounts": {
+    "context_items": 3420,
+    "conversation_compaction_maintenance": 0,
+    "conversation_compaction_telemetry": 0,
+    "conversation_transcript_cursors": 0,
+    "conversation_transcript_epochs": 0,
+    "conversation_transcript_gaps": 0,
+    "conversations": 36,
+    "focus_brief_sources": 0,
+    "focus_briefs": 0,
+    "large_files": 36,
+    "lcm_migration_state": 8,
+    "message_parts": 0,
+    "message_transcript_anchor_trust": 0,
+    "messages": 7200,
+    "pending_compaction_batches": 0,
+    "pending_summary_node_children": 0,
+    "pending_summary_node_messages": 0,
+    "pending_summary_nodes": 0,
+    "summaries": 1260,
+    "summary_messages": 7200,
+    "summary_parents": 1224,
+    "transcript_user_replay_keys": 0,
+    "turn_advancements": 0
+  },
+  "source": {
+    "version": "1.2.0",
+    "commit": "51c3c90bfe82fa649e4895dd1a2c4874b5e28f76"
+  },
+  "postgresSource": "1eebd7e273716799c6ffbbdf78bb1dd5b913f1b0",
+  "clientLocation": "EC2 c7i.large us-east-1a, Turbopuffer aws-us-east-1 HTTPS; PostgreSQL18 loopback Docker 2 CPUs/768MiB",
+  "region": "aws-us-east-1",
+  "concurrency": 1,
+  "results": [],
+  "assertions": {},
+  "cleanup": [],
+  "notes": [
+    "SQLite and PostgreSQL run on the client machine; Turbopuffer is remote HTTPS. This is not a distributed PostgreSQL service comparison.",
+    "Native storage contains the selected agent six conversations; the PostgreSQL fixture contains both organizations and all six agents, accessed through its tenant/agent indexes.",
+    "No inference in retrieval. Compaction uses one deterministic fake summary callback at the inference boundary; recorded inferenceMs is excluded from dbAndAlgorithmMs.",
+    "Small sample counts are experimental evidence, not capacity or production readiness."
+  ],
+  "passed": false,
+  "error": "ENOENT: no such file or directory, open '/home/ubuntu/lcm-native/pg/schema.sql'",
+  "requests": [],
+  "completedAt": "2026-11-08T08:19:03.415Z"
+}

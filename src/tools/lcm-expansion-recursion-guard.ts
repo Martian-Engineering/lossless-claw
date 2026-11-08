@@ -79,11 +79,15 @@ function getOrInitBlockedRequestIds(sessionKey: string): Set<string> {
 function resolveFallbackDelegatedContext(
   sessionKey: string,
   requestId: string,
+  delegatedGrantId?:string|null,
 ): DelegatedExpansionContext | undefined {
   if (!sessionKey) {
     return undefined;
   }
-  const grantId = resolveDelegatedExpansionGrantId(sessionKey);
+  const grantId =
+    delegatedGrantId === undefined
+      ? resolveDelegatedExpansionGrantId(sessionKey)
+      : delegatedGrantId;
   if (!grantId) {
     return undefined;
   }
@@ -135,7 +139,7 @@ export function resolveExpansionRequestId(sessionKey?: string): string {
 /**
  * Resolve the next delegated expansion depth to stamp onto a child session.
  */
-export function resolveNextExpansionDepth(sessionKey?: string): number {
+export function resolveNextExpansionDepth(sessionKey?: string,delegatedGrantId?:string|null): number {
   const key = normalizeSessionKey(sessionKey);
   if (!key) {
     return 1;
@@ -144,7 +148,13 @@ export function resolveNextExpansionDepth(sessionKey?: string): number {
   if (existing) {
     return existing.expansionDepth + 1;
   }
-  return resolveDelegatedExpansionGrantId(key) ? EXPANSION_DELEGATION_DEPTH_CAP + 1 : 1;
+  return (
+    delegatedGrantId === undefined
+      ? resolveDelegatedExpansionGrantId(key)
+      : delegatedGrantId
+  )
+    ? EXPANSION_DELEGATION_DEPTH_CAP + 1
+    : 1;
 }
 
 /**
@@ -192,12 +202,17 @@ export function clearDelegatedExpansionContext(sessionKey: string): void {
 export function evaluateExpansionRecursionGuard(params: {
   sessionKey?: string;
   requestId: string;
+  delegatedGrantId?:string|null;
 }): ExpansionRecursionGuardDecision {
   const sessionKey = normalizeSessionKey(params.sessionKey);
   const requestId = params.requestId.trim();
   const delegatedContext =
     delegatedContextBySessionKey.get(sessionKey) ??
-    resolveFallbackDelegatedContext(sessionKey, requestId || createExpansionRequestId());
+    resolveFallbackDelegatedContext(
+      sessionKey,
+      requestId || createExpansionRequestId(),
+      params.delegatedGrantId,
+    );
 
   if (!delegatedContext) {
     return {

@@ -268,6 +268,7 @@ export async function resolveRequesterConversationScopeId(params: {
  * Each pass creates its own grant/session and always performs cleanup.
  */
 async function runDelegatedExpansionPass(params: {
+  lcm?:LcmContextEngine;
   deps: Pick<
     LcmDependencies,
     | "callGateway"
@@ -296,13 +297,16 @@ async function runDelegatedExpansionPass(params: {
   const childSessionKey = `agent:${requesterAgentId}:subagent:${crypto.randomUUID()}`;
   let runId = "";
 
-  createDelegatedExpansionGrant({
+  const grantInput = {
     delegatedSessionKey: childSessionKey,
     issuerSessionId: params.requesterSessionKey,
     allowedConversationIds: [params.conversationId],
     tokenCap: params.tokenCap,
     ttlMs: MAX_GATEWAY_TIMEOUT_MS,
-  });
+  };
+  if (params.lcm?.createExpansionGrant)
+    await params.lcm.createExpansionGrant(grantInput);
+  else createDelegatedExpansionGrant(grantInput);
   stampDelegatedExpansionContext({
     sessionKey: childSessionKey,
     requestId: params.requestId,
@@ -424,12 +428,20 @@ async function runDelegatedExpansionPass(params: {
     } catch {
       // Cleanup is best-effort.
     }
-    revokeDelegatedExpansionGrantForSession(childSessionKey, { removeBinding: true });
+    if (params.lcm?.revokeExpansionGrant)
+      await params.lcm.revokeExpansionGrant(childSessionKey, {
+        removeBinding: true,
+      });
+    else
+      revokeDelegatedExpansionGrantForSession(childSessionKey, {
+        removeBinding: true,
+      });
     clearDelegatedExpansionContext(childSessionKey);
   }
 }
 
 export async function runDelegatedExpansionLoop(params: {
+  lcm?:LcmContextEngine;
   deps: Pick<
     LcmDependencies,
     | "callGateway"
@@ -453,6 +465,7 @@ export async function runDelegatedExpansionLoop(params: {
   const recursionCheck = evaluateExpansionRecursionGuard({
     sessionKey: params.requesterSessionKey,
     requestId,
+    delegatedGrantId: params.lcm?.resolveExpansionGrant?await params.lcm.resolveExpansionGrant(params.requesterSessionKey):undefined,
   });
   recordExpansionDelegationTelemetry({
     deps: params.deps,
@@ -496,6 +509,7 @@ export async function runDelegatedExpansionLoop(params: {
       visited.add(summaryId);
     }
     const result = await runDelegatedExpansionPass({
+      lcm:params.lcm,
       deps: params.deps,
       requesterSessionKey: params.requesterSessionKey,
       conversationId: params.conversationId,

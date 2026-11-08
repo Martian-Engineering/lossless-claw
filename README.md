@@ -1,5 +1,7 @@
 # lossless-claw
 
+Experimental native Turbopuffer storage is available through an explicit backend selection. It stores the LCM lifecycle directly in Turbopuffer while preserving SQLite as the default. See [the design, configuration, measured PostgreSQL/SQLite comparison and limitations](docs/experiments/turbopuffer-native/README.md).
+
 Lossless Context Management plugin for [OpenClaw](https://github.com/openclaw/openclaw), based on the [LCM paper](https://papers.voltropy.com/LCM) from [Voltropy](https://x.com/Voltropy). Replaces OpenClaw's built-in sliding-window compaction with a DAG-based summarization system that preserves every message while keeping active context within model token limits.
 
 Built and maintained by **[Martian Engineering](https://martian.engineering/?utm_source=github&utm_medium=readme&utm_campaign=lossless-claw)**. Need help with agents, memory, or AI in your own stack? [Get in touch](#about-martian-engineering).
