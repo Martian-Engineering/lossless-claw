@@ -1,6 +1,10 @@
 import { open, realpath } from "node:fs/promises";
 import type { DatabaseSync } from "node:sqlite";
 import { resolve as resolvePath, sep as pathSep } from "node:path";
+import {
+  invalidatePendingContextPositions,
+  resequenceContextItemsInTransaction,
+} from "../db/context-ordinals.js";
 import { withDatabaseTransaction } from "../transaction-mutex.js";
 import { appendConversationScopeConstraint } from "./conversation-scope.js";
 import { sanitizeFts5Query } from "./fts5-sanitize.js";
@@ -901,38 +905,37 @@ export class SummaryStore {
       return;
     }
 
-    this.db
-      .prepare(
-        `DELETE FROM context_items
-       WHERE conversation_id = ?
-         AND item_type = 'message'`,
-      )
-      .run(conversationId);
-
-    if (!Number.isFinite(retainDepth)) {
-      this.db
+    await this.withTransaction(() => {
+      const messages = this.db
         .prepare(
           `DELETE FROM context_items
-         WHERE conversation_id = ?
-           AND item_type = 'summary'`,
+           WHERE conversation_id = ? AND item_type = 'message'`,
         )
         .run(conversationId);
-      return;
-    }
+      const summaries = !Number.isFinite(retainDepth)
+        ? this.db
+            .prepare(
+              `DELETE FROM context_items
+             WHERE conversation_id = ? AND item_type = 'summary'`,
+            )
+            .run(conversationId)
+        : this.db
+            .prepare(
+              `DELETE FROM context_items
+             WHERE conversation_id = ?
+               AND item_type = 'summary'
+               AND summary_id IN (
+                 SELECT summary_id FROM summaries
+                 WHERE conversation_id = ? AND depth < ?
+               )`,
+            )
+            .run(conversationId, conversationId, Math.floor(retainDepth));
 
-    this.db
-      .prepare(
-        `DELETE FROM context_items
-       WHERE conversation_id = ?
-         AND item_type = 'summary'
-         AND summary_id IN (
-           SELECT summary_id
-           FROM summaries
-           WHERE conversation_id = ?
-             AND depth < ?
-         )`,
-      )
-      .run(conversationId, conversationId, Math.floor(retainDepth));
+      if (messages.changes || summaries.changes) {
+        resequenceContextItemsInTransaction(this.db, conversationId);
+        invalidatePendingContextPositions(this.db, conversationId);
+      }
+    });
   }
 
   async appendContextMessage(conversationId: number, messageId: number): Promise<void> {
@@ -1076,32 +1079,7 @@ export class SummaryStore {
     }
 
     // 3. Resequence all ordinals to maintain contiguity (no gaps).
-    this.resequenceContextItemsInTransaction(conversationId);
-  }
-
-  private resequenceContextItemsInTransaction(conversationId: number): void {
-    // Pre-compute ranks from a SELECT, then apply a 2-pass UPDATE loop using
-    // negative temps to avoid UNIQUE constraint violations.
-    const items = this.db
-      .prepare(
-        `SELECT ordinal FROM context_items
-         WHERE conversation_id = ?
-         ORDER BY ordinal`,
-      )
-      .all(conversationId) as unknown as { ordinal: number }[];
-
-    if (items.length > 0 && items.some((item, i) => item.ordinal !== i)) {
-      const updateStmt = this.db.prepare(
-        `UPDATE context_items SET ordinal = ?
-         WHERE conversation_id = ? AND ordinal = ?`,
-      );
-      for (let i = 0; i < items.length; i++) {
-        updateStmt.run(-(i + 1), conversationId, items[i].ordinal);
-      }
-      for (let i = 0; i < items.length; i++) {
-        updateStmt.run(i, conversationId, -(i + 1));
-      }
-    }
+    resequenceContextItemsInTransaction(this.db, conversationId);
   }
 
   async getContextTokenCount(conversationId: number): Promise<number> {

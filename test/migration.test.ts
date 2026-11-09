@@ -406,6 +406,7 @@ describe("runLcmMigrations summary depth backfill", () => {
       { step_name: "backfillSummaryDepths", algorithm_version: 1 },
       { step_name: "backfillSummaryMetadata", algorithm_version: 1 },
       { step_name: "backfillToolCallColumns", algorithm_version: 1 },
+      { step_name: "repairContextItemOrdinals", algorithm_version: 1 },
       { step_name: "repairOpenClawMetadataIdentityState", algorithm_version: 2 },
     ]);
 
@@ -1557,6 +1558,7 @@ describe("runLcmMigrations summary depth backfill", () => {
       "[lcm] migration step skipped: step=backfillSummaryDepths algorithmVersion=1 reason=already-complete",
       "[lcm] migration step skipped: step=backfillSummaryMetadata algorithmVersion=1 reason=already-complete",
       "[lcm] migration step skipped: step=backfillToolCallColumns algorithmVersion=1 reason=already-complete",
+      "[lcm] migration step skipped: step=repairContextItemOrdinals algorithmVersion=1 reason=already-complete",
     ]);
   });
 
@@ -1667,6 +1669,7 @@ describe("runLcmMigrations summary depth backfill", () => {
       { step_name: "backfillSummaryDepths", algorithm_version: 1 },
       { step_name: "backfillSummaryMetadata", algorithm_version: 1 },
       { step_name: "backfillToolCallColumns", algorithm_version: 1 },
+      { step_name: "repairContextItemOrdinals", algorithm_version: 1 },
       { step_name: "repairOpenClawMetadataIdentityState", algorithm_version: 2 },
     ]);
   });
