@@ -625,6 +625,29 @@ describe("lcm plugin registration", () => {
     );
   });
 
+  it("logs each config warning once across registrations", () => {
+    vi.stubEnv("LCM_FRESH_TAIL_COUNT", "abc");
+    const dbPath = join(tmpdir(), `lossless-claw-${Date.now()}-${Math.random().toString(16)}.db`);
+    dbPaths.add(dbPath);
+    const pluginConfig = { enabled: true, dbPath, fallbackMaxTokens: 10, transcriptGcEnabled: true };
+    const first = buildApi(pluginConfig);
+    const second = buildApi(pluginConfig);
+
+    lcmPlugin.register(first.api);
+    lcmPlugin.register(second.api);
+
+    const configWarnings = (log: ReturnType<typeof vi.fn>) =>
+      log.mock.calls.map(([message]) => String(message)).filter((message) => message.includes("Config warning"));
+    expect(configWarnings(first.warnLog)).toEqual([
+      "[lcm] Config warning: env LCM_FRESH_TAIL_COUNT: not a number; used the default (64)",
+      "[lcm] Config warning: plugin config fallbackMaxTokens: below the minimum; used the default (512)",
+    ]);
+    expect(configWarnings(second.warnLog)).toEqual([]);
+    expect(first.warnLog).toHaveBeenCalledWith(
+      "[lcm] Ignoring retired config key plugins.entries.lossless-claw.config.transcriptGcEnabled. Lossless Claw 1.x does not rewrite OpenClaw transcript storage; remove this key after upgrading.",
+    );
+  });
+
   it("warns once and ignores retired transcript maintenance settings", () => {
     const dbPath = join(tmpdir(), `lossless-claw-${Date.now()}-${Math.random().toString(16)}.db`);
     dbPaths.add(dbPath);
