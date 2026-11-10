@@ -13,10 +13,13 @@ function usage(): string {
     "Backfill OpenClaw JSONL session files into lcm.db. Dry-run by default.",
     "",
     "Options:",
+    "  --source-format <format> Source format: openclaw (default) or codex",
     "  --db <path>             Database path (default: ${OPENCLAW_STATE_DIR:-~/.openclaw}/lcm.db)",
     "  --state-dir <path>      OpenClaw state dir (default: ${OPENCLAW_STATE_DIR:-~/.openclaw})",
     "  --sessions-dir <path>   Directory containing *.jsonl sessions; repeatable",
     "  --file <path>           Import one JSONL file; repeatable",
+    "  --session-id <id>       Explicit OpenClaw destination session id (Codex only)",
+    "  --session-key <key>     Explicit OpenClaw destination session key (Codex only)",
     "  --apply                 Write changes after creating a database backup",
     "  --limit <n>             Limit scanned files",
     "  --since <iso-date>      Include files modified at/after the date",
@@ -42,6 +45,15 @@ function parseArgs(argv: string[]): CliOptions {
   for (let idx = 0; idx < argv.length; idx++) {
     const arg = argv[idx];
     switch (arg) {
+      case "--source-format": {
+        const value = requireValue(argv, idx, arg);
+        if (value !== "openclaw" && value !== "codex") {
+          throw new Error("--source-format must be openclaw or codex.");
+        }
+        options.sourceFormat = value;
+        idx += 1;
+        break;
+      }
       case "--db":
         options.dbPath = requireValue(argv, idx, arg);
         idx += 1;
@@ -56,6 +68,14 @@ function parseArgs(argv: string[]): CliOptions {
         break;
       case "--file":
         options.files!.push(requireValue(argv, idx, arg));
+        idx += 1;
+        break;
+      case "--session-id":
+        options.sessionId = requireValue(argv, idx, arg);
+        idx += 1;
+        break;
+      case "--session-key":
+        options.sessionKey = requireValue(argv, idx, arg);
         idx += 1;
         break;
       case "--apply":
@@ -94,6 +114,14 @@ function parseArgs(argv: string[]): CliOptions {
   if (options.files?.length === 0) {
     delete options.files;
   }
+  if (options.sourceFormat === "codex") {
+    if ((options.files?.length ?? 0) !== 1 || (options.sessionDirs?.length ?? 0) > 0) {
+      throw new Error("Codex import requires exactly one --file and does not accept --sessions-dir.");
+    }
+    if (!options.sessionId?.trim() || !options.sessionKey?.trim()) {
+      throw new Error("Codex import requires --session-id and --session-key.");
+    }
+  }
   return options;
 }
 
@@ -119,7 +147,7 @@ function formatHumanSummary(result: Awaited<ReturnType<typeof runSessionMigratio
 
   const notableFiles = verbose
     ? result.files
-    : result.files.filter((file) => file.status === "error" || file.status === "skipped");
+    : result.files.filter((file) => file.status === "error" || file.status === "skipped" || file.warnings.length > 0);
   for (const file of notableFiles) {
     const reason = file.reason ? ` (${file.reason})` : "";
     lines.push(`- ${file.status}${reason}: ${file.file}`);

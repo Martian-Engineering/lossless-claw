@@ -1,4 +1,4 @@
-import { mkdtempSync, rmSync, writeFileSync, existsSync, mkdirSync, appendFileSync } from "node:fs";
+import { mkdtempSync, rmSync, writeFileSync, readFileSync, existsSync, mkdirSync, appendFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
@@ -29,6 +29,38 @@ function writeRawAgentSession(root: string, fileName: string, content: string): 
   const filePath = join(sessionsDir, fileName);
   writeFileSync(filePath, content);
   return filePath;
+}
+
+function writeCodexSession(root: string, fileName: string, entries: unknown[]): string {
+  const filePath = join(root, fileName);
+  writeFileSync(filePath, `${entries.map((entry) => JSON.stringify(entry)).join("\n")}\n`);
+  return filePath;
+}
+
+function codexMeta(id = "codex-thread"): Record<string, unknown> {
+  return {
+    type: "session_meta",
+    payload: { id, timestamp: "2026-10-03T10:00:00.000Z", source: "cli" },
+  };
+}
+
+function codexResponse(payload: Record<string, unknown>, timestamp = "2026-10-03T10:00:01.000Z") {
+  return { type: "response_item", timestamp, payload };
+}
+
+function codexEvent(type: string, message?: string, timestamp = "2026-10-03T10:00:01.000Z") {
+  return { type: "event_msg", timestamp, payload: { type, ...(message !== undefined ? { message } : {}) } };
+}
+
+function codexImportOptions(file: string, dbPath: string, stateDir: string) {
+  return {
+    sourceFormat: "codex" as const,
+    files: [file],
+    sessionId: "openclaw-target-id",
+    sessionKey: "agent:main:codex-import-target",
+    dbPath,
+    stateDir,
+  };
 }
 
 function sessionHeader(id: string): Record<string, unknown> {
@@ -498,5 +530,389 @@ describe("runSessionMigration", () => {
         expect.objectContaining({ file: expect.stringContaining("good.jsonl"), status: "imported" }),
       ]),
     );
+  });
+
+  it("dry-runs one Codex rollout without creating or migrating a database", async () => {
+    const root = tempRoot();
+    const file = writeCodexSession(root, "rollout.jsonl", [
+      codexMeta(),
+      codexResponse({ type: "message", role: "user", content: [{ type: "input_text", text: "Codex request" }] }),
+      codexResponse({ type: "message", role: "assistant", content: [{ type: "output_text", text: "Codex answer" }] }),
+    ]);
+    const dbPath = migratedDb(root);
+
+    const result = await runSessionMigration(codexImportOptions(file, dbPath, root));
+
+    expect(result).toMatchObject({
+      apply: false,
+      scannedFiles: 1,
+      importedMessages: 0,
+      files: [expect.objectContaining({ status: "would-import", sessionId: "openclaw-target-id", candidateMessages: 2 })],
+    });
+    expect(result.files[0]?.warnings).toEqual(
+      expect.arrayContaining([
+        expect.stringContaining("Native LCM continuation requires a later OpenClaw transcript tail"),
+      ]),
+    );
+    expect(existsSync(dbPath)).toBe(false);
+    await expect(runSessionMigration({ ...codexImportOptions(file, dbPath, root), sessionKey: undefined })).rejects.toThrow(
+      "explicit --session-id and --session-key",
+    );
+  });
+
+  it("imports canonical roles, repeated messages, tool arguments, and output with source provenance", async () => {
+    const root = tempRoot();
+    const file = writeCodexSession(root, "rollout.jsonl", [
+      codexMeta("codex-multi-role"),
+      codexResponse({ type: "message", role: "user", content: [{ type: "input_text", text: "repeat me" }] }),
+      { type: "event_msg", timestamp: "2026-10-03T10:00:01.000Z", payload: { type: "user_message", message: "repeat me" } },
+      codexResponse({ type: "message", role: "assistant", content: [{ type: "output_text", text: "reply" }] }),
+      { type: "event_msg", timestamp: "2026-10-03T10:00:02.000Z", payload: { type: "agent_message", message: "reply" } },
+      codexResponse({ type: "message", role: "user", content: [{ type: "input_text", text: "repeat me" }] }),
+      codexResponse({ type: "function_call", name: "shell", arguments: "{\"cmd\":\"pwd\"}", call_id: "call-7" }),
+      codexResponse({ type: "function_call_output", call_id: "call-7", output: "workspace root" }),
+    ]);
+    const dbPath = migratedDb(root);
+
+    const result = await runSessionMigration({ ...codexImportOptions(file, dbPath, root), apply: true });
+    expect(result).toMatchObject({ importedMessages: 5, importedFiles: 1 });
+
+    const { db, conversationStore } = openMigratedDb(dbPath);
+    try {
+      const conversation = await conversationStore.getConversationForSession({ sessionKey: "agent:main:codex-import-target" });
+      expect(conversation).toMatchObject({
+        sessionId: "openclaw-target-id",
+        sessionKey: "agent:main:codex-import-target",
+      });
+      const messages = await conversationStore.getMessages(conversation!.conversationId);
+      expect(messages.map((message) => [message.role, message.content])).toEqual([
+        ["user", "repeat me"],
+        ["assistant", "reply"],
+        ["user", "repeat me"],
+        ["assistant", ""],
+        ["tool", ""],
+      ]);
+      expect(messages.every((message) => message.transcriptEntryId === null)).toBe(true);
+      const callParts = await conversationStore.getMessageParts(messages[3]!.messageId);
+      expect(callParts[0]).toMatchObject({ partType: "tool", toolCallId: "call-7", toolName: "shell" });
+      expect(callParts[0]?.toolInput).toContain("pwd");
+      const outputParts = await conversationStore.getMessageParts(messages[4]!.messageId);
+      expect(outputParts[0]).toMatchObject({ partType: "tool", toolCallId: "call-7" });
+      expect(outputParts[0]?.toolOutput).toContain("workspace root");
+
+      const sourceMarkers = db
+        .prepare("SELECT metadata FROM message_parts WHERE message_id = ? ORDER BY ordinal")
+        .all(messages[0]!.messageId) as Array<{ metadata: string }>;
+      const marker = JSON.parse(sourceMarkers[0]!.metadata) as { codexSource: { id: string; threadId: string; line: number; sourceRecord: { payload: unknown } } };
+      expect(marker.codexSource).toMatchObject({ threadId: "codex-multi-role", line: 2 });
+      expect(marker.codexSource.id).toContain("codex-multi-role");
+      expect(marker.codexSource.sourceRecord.payload).toMatchObject({ role: "user" });
+      expect((marker.codexSource as typeof marker.codexSource & { sessionMeta: { source: string } }).sessionMeta.source).toBe("cli");
+      const secondParts = await conversationStore.getMessageParts(messages[1]!.messageId);
+      const secondMarker = JSON.parse(secondParts[0]!.metadata!) as { codexSource: { sessionMeta?: unknown } };
+      expect(secondMarker.codexSource.sessionMeta).toBeUndefined();
+      expect(await conversationStore.getMessageCount(conversation!.conversationId)).toBe(5);
+    } finally {
+      closeLcmConnection(db);
+    }
+  });
+
+  it("imports the complete source beyond the old 200-item boundary and keeps early records searchable", async () => {
+    const root = tempRoot();
+    const entries: unknown[] = [codexMeta("codex-long")];
+    for (let index = 0; index < 230; index += 1) {
+      entries.push(codexResponse({
+        type: "message",
+        role: index % 2 === 0 ? "user" : "assistant",
+        content: [{ type: index % 2 === 0 ? "input_text" : "output_text", text: index === 0 ? "early searchable canary" : `message ${index}` }],
+      }, `2026-10-03T10:${String(Math.floor(index / 60)).padStart(2, "0")}:${String(index % 60).padStart(2, "0")}.000Z`));
+    }
+    const file = writeCodexSession(root, "long-rollout.jsonl", entries);
+    const dbPath = migratedDb(root);
+
+    const result = await runSessionMigration({ ...codexImportOptions(file, dbPath, root), apply: true });
+
+    expect(result).toMatchObject({ importedMessages: 230, files: [expect.objectContaining({ candidateMessages: 230 })] });
+    const { db, conversationStore } = openMigratedDb(dbPath);
+    try {
+      const conversation = await conversationStore.getConversationForSession({ sessionKey: "agent:main:codex-import-target" });
+      expect(await conversationStore.getMessageCount(conversation!.conversationId)).toBe(230);
+      const search = await conversationStore.searchMessages({
+        conversationId: conversation!.conversationId,
+        query: "canary",
+        mode: "full_text",
+      });
+      expect(search).toHaveLength(1);
+      expect(search[0]?.snippet).toContain("early searchable canary");
+    } finally {
+      closeLcmConnection(db);
+    }
+  });
+
+  it("replays Codex provenance idempotently, imports append-only deltas, and rejects changed history", async () => {
+    const root = tempRoot();
+    const file = writeCodexSession(root, "rollout.jsonl", [
+      codexMeta("codex-delta"),
+      codexResponse({ type: "message", role: "user", content: "first" }),
+      codexResponse({ type: "message", role: "assistant", content: "second" }),
+    ]);
+    const dbPath = migratedDb(root);
+    const options = { ...codexImportOptions(file, dbPath, root), apply: true };
+
+    await runSessionMigration(options);
+    const replay = await runSessionMigration(options);
+    expect(replay).toMatchObject({ importedMessages: 0, files: [expect.objectContaining({ status: "up-to-date", skippedMessages: 2 })] });
+
+    appendFileSync(file, `${JSON.stringify(codexResponse({ type: "message", role: "user", content: "third" }))}\n`);
+    const delta = await runSessionMigration(options);
+    expect(delta).toMatchObject({ importedMessages: 1, files: [expect.objectContaining({ status: "imported", skippedMessages: 2 })] });
+
+    const originalLines = readFileSync(file, "utf8").trimEnd().split("\n");
+    writeFileSync(file, `${originalLines.slice(0, -1).join("\n")}\n`);
+    const truncated = await runSessionMigration(options);
+    expect(truncated).toMatchObject({
+      importedMessages: 0,
+      files: [expect.objectContaining({ status: "error", reason: "codex-source-changed-or-truncated" })],
+    });
+
+    const lines = [...originalLines];
+    const changed = JSON.parse(lines[1]!) as { payload: { content: string } };
+    changed.payload.content = "changed earlier source";
+    lines[1] = JSON.stringify(changed);
+    writeFileSync(file, `${lines.join("\n")}\n`);
+    const rejected = await runSessionMigration(options);
+    expect(rejected).toMatchObject({ importedMessages: 0, files: [expect.objectContaining({ status: "error", reason: "codex-source-changed-or-truncated" })] });
+
+    const reopened = openMigratedDb(dbPath);
+    try {
+      const conversation = await reopened.conversationStore.getConversationForSession({ sessionKey: "agent:main:codex-import-target" });
+      expect(await reopened.conversationStore.getMessageCount(conversation!.conversationId)).toBe(3);
+    } finally {
+      closeLcmConnection(reopened.db);
+    }
+  });
+
+  it("rejects session metadata rewrites and truncation of accepted omitted trailing records", async () => {
+    const root = tempRoot();
+    const originalEntries = [
+      codexMeta("codex-byte-prefix"),
+      codexResponse({ type: "message", role: "user", content: "request" }),
+      codexResponse({ type: "message", role: "assistant", content: "answer" }),
+      codexEvent("task_complete"),
+    ];
+    const file = writeCodexSession(root, "rollout.jsonl", originalEntries);
+    const dbPath = migratedDb(root);
+    const options = { ...codexImportOptions(file, dbPath, root), apply: true };
+
+    await runSessionMigration(options);
+    const originalText = readFileSync(file, "utf8");
+    const changedMetaLines = originalText.trimEnd().split("\n");
+    const changedMeta = JSON.parse(changedMetaLines[0]!) as { payload: Record<string, unknown> };
+    changedMeta.payload.timestamp = "2026-10-04T10:00:00.000Z";
+    changedMetaLines[0] = JSON.stringify(changedMeta);
+    writeFileSync(file, `${changedMetaLines.join("\n")}\n`);
+
+    const changedMetaResult = await runSessionMigration(options);
+    expect(changedMetaResult).toMatchObject({
+      importedMessages: 0,
+      files: [expect.objectContaining({ status: "error", reason: "codex-source-changed-or-truncated" })],
+    });
+
+    writeFileSync(file, originalText);
+    appendFileSync(file, `${JSON.stringify(codexEvent("task_started"))}\n`);
+    const omittedAppend = await runSessionMigration(options);
+    expect(omittedAppend).toMatchObject({ importedMessages: 0, files: [expect.objectContaining({ status: "up-to-date" })] });
+
+    writeFileSync(file, originalText);
+    const truncatedOmittedAppend = await runSessionMigration(options);
+    expect(truncatedOmittedAppend).toMatchObject({
+      importedMessages: 0,
+      files: [expect.objectContaining({ status: "error", reason: "codex-source-changed-or-truncated" })],
+    });
+  });
+
+  it.each([
+    {
+      name: "an accepted mirror followed by a closer canonical record",
+      initialRecords: [
+        codexResponse({ type: "message", role: "user", content: "request" }, "2026-10-03T10:00:00.000Z"),
+        codexEvent("user_message", "request", "2026-10-03T10:00:04.000Z"),
+      ],
+      appended: codexResponse({ type: "message", role: "user", content: "request" }, "2026-10-03T10:00:04.000Z"),
+      expectedLines: [2, 4],
+    },
+    {
+      name: "an earlier event followed by a canonical text record",
+      initialRecords: [codexEvent("user_message", "request")],
+      appended: codexResponse({ type: "message", role: "user", content: [{ type: "input_text", text: "request" }] }),
+      expectedLines: [2, 3],
+    },
+    {
+      name: "an earlier event followed by richer canonical content",
+      initialRecords: [codexEvent("user_message", "request")],
+      appended: codexResponse({ type: "message", role: "user", content: [
+        { type: "input_text", text: "request" },
+        { type: "input_image", image_url: "https://example.invalid/synthetic.png" },
+      ] }),
+      expectedLines: [2, 3],
+    },
+  ])("preserves canonical provenance on replay with $name", async ({ initialRecords, appended, expectedLines }) => {
+    const root = tempRoot();
+    const file = writeCodexSession(root, "rollout.jsonl", [codexMeta("codex-append-mirrors"), ...initialRecords]);
+    const dbPath = migratedDb(root);
+    const options = { ...codexImportOptions(file, dbPath, root), apply: true };
+
+    const initial = await runSessionMigration(options);
+    expect(initial.importedMessages).toBe(1);
+    appendFileSync(file, `${JSON.stringify(appended)}\n`);
+    const replay = await runSessionMigration(options);
+    expect(replay.importedMessages).toBe(1);
+    expect((await runSessionMigration(options)).importedMessages).toBe(0);
+
+    const { db, conversationStore } = openMigratedDb(dbPath);
+    try {
+      const conversation = await conversationStore.getConversationForSession({ sessionKey: "agent:main:codex-import-target" });
+      const messages = await conversationStore.getMessages(conversation!.conversationId);
+      expect(messages).toHaveLength(2);
+      const sources = [];
+      for (const message of messages) {
+        const parts = await db.prepare("SELECT metadata FROM message_parts WHERE message_id = ? ORDER BY ordinal")
+          .all(message.messageId) as Array<{ metadata: string | null }>;
+        sources.push(parts.map((part) => part.metadata && JSON.parse(part.metadata))
+          .find((part) => part?.codexSource)?.codexSource);
+      }
+      expect(sources.map((source) => source.line)).toEqual(expectedLines);
+      expect(sources[1].sourceRecord).toEqual(appended);
+    } finally {
+      closeLcmConnection(db);
+    }
+  });
+
+  it("rejects malformed Codex input without creating a database", async () => {
+    const root = tempRoot();
+    const file = writeRawAgentSession(root, "bad-rollout.jsonl", '{"type":"session_meta","payload":{"id":"bad"}}\nnot-json\n');
+    const dbPath = migratedDb(root);
+
+    const result = await runSessionMigration({ ...codexImportOptions(file, dbPath, root), apply: true });
+
+    expect(result).toMatchObject({
+      apply: true,
+      errorFiles: 1,
+      files: [expect.objectContaining({ status: "error", reason: "invalid-codex-source" })],
+    });
+    expect(existsSync(dbPath)).toBe(false);
+  });
+
+  it("rejects a Codex destination whose session id and key resolve to different conversations", async () => {
+    const root = tempRoot();
+    const file = writeCodexSession(root, "rollout.jsonl", [
+      codexMeta("codex-binding"),
+      codexResponse({ type: "message", role: "user", content: "request" }),
+    ]);
+    const dbPath = migratedDb(root);
+    const { db, conversationStore } = openMigratedDb(dbPath);
+    try {
+      await conversationStore.createConversation({ sessionId: "openclaw-target-id" });
+      await conversationStore.createConversation({ sessionId: "other-target-id", sessionKey: "agent:main:codex-import-target" });
+    } finally {
+      closeLcmConnection(db);
+    }
+
+    const result = await runSessionMigration({ ...codexImportOptions(file, dbPath, root), apply: true });
+    expect(result).toMatchObject({
+      importedMessages: 0,
+      files: [expect.objectContaining({ status: "error", reason: "destination-binding-mismatch" })],
+    });
+
+    const reopened = openMigratedDb(dbPath);
+    try {
+      expect(await reopened.conversationStore.getConversationBySessionId("openclaw-target-id")).toMatchObject({ sessionKey: null });
+      const byKey = await reopened.conversationStore.getConversationBySessionKey("agent:main:codex-import-target");
+      expect(byKey?.sessionId).toBe("other-target-id");
+      expect(await reopened.conversationStore.getMessageCount(byKey!.conversationId)).toBe(0);
+    } finally {
+      closeLcmConnection(reopened.db);
+    }
+  });
+
+  it("refuses to append Codex history after unrelated destination messages already exist", async () => {
+    const root = tempRoot();
+    const file = writeCodexSession(root, "rollout.jsonl", [
+      codexMeta("codex-too-late"),
+      codexResponse({ type: "message", role: "user", content: "old source request" }),
+    ]);
+    const dbPath = migratedDb(root);
+    const { db, conversationStore } = openMigratedDb(dbPath);
+    try {
+      const conversation = await conversationStore.getOrCreateConversation("openclaw-target-id", {
+        sessionKey: "agent:main:codex-import-target",
+      });
+      await conversationStore.createMessage({
+        conversationId: conversation.conversationId,
+        seq: 1,
+        role: "user",
+        content: "already live in this conversation",
+        tokenCount: 6,
+      });
+    } finally {
+      closeLcmConnection(db);
+    }
+
+    const result = await runSessionMigration({ ...codexImportOptions(file, dbPath, root), apply: true });
+    expect(result).toMatchObject({
+      importedMessages: 0,
+      files: [expect.objectContaining({ status: "error", reason: "codex-destination-not-empty" })],
+    });
+
+    const reopened = openMigratedDb(dbPath);
+    try {
+      const conversation = await reopened.conversationStore.getConversationForSession({ sessionKey: "agent:main:codex-import-target" });
+      expect(await reopened.conversationStore.getMessageCount(conversation!.conversationId)).toBe(1);
+      expect((await reopened.conversationStore.getMessages(conversation!.conversationId))[0]?.content).toBe("already live in this conversation");
+    } finally {
+      closeLcmConnection(reopened.db);
+    }
+  });
+
+  it("rejects appending Codex history after a native live message follows the import", async () => {
+    const root = tempRoot();
+    const file = writeCodexSession(root, "rollout.jsonl", [
+      codexMeta("codex-live-mix"),
+      codexResponse({ type: "message", role: "user", content: "imported request" }),
+      codexResponse({ type: "message", role: "assistant", content: "imported answer" }),
+    ]);
+    const dbPath = migratedDb(root);
+    const options = { ...codexImportOptions(file, dbPath, root), apply: true };
+    await runSessionMigration(options);
+
+    const { db, conversationStore } = openMigratedDb(dbPath);
+    try {
+      const conversation = await conversationStore.getConversationForSession({ sessionKey: "agent:main:codex-import-target" });
+      await conversationStore.createMessage({
+        conversationId: conversation!.conversationId,
+        seq: 3,
+        role: "assistant",
+        content: "native live answer",
+        tokenCount: 3,
+      });
+    } finally {
+      closeLcmConnection(db);
+    }
+
+    appendFileSync(file, `${JSON.stringify(codexResponse({ type: "message", role: "user", content: "later source request" }))}\n`);
+    const result = await runSessionMigration(options);
+    expect(result).toMatchObject({
+      importedMessages: 0,
+      files: [expect.objectContaining({ status: "error", reason: "codex-destination-not-empty" })],
+    });
+
+    const reopened = openMigratedDb(dbPath);
+    try {
+      const conversation = await reopened.conversationStore.getConversationForSession({ sessionKey: "agent:main:codex-import-target" });
+      expect(await reopened.conversationStore.getMessageCount(conversation!.conversationId)).toBe(3);
+      expect((await reopened.conversationStore.getMessages(conversation!.conversationId))[2]?.content).toBe("native live answer");
+    } finally {
+      closeLcmConnection(reopened.db);
+    }
   });
 });
