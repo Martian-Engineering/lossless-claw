@@ -1,5 +1,37 @@
 # @martian-engineering/lossless-claw
 
+## 1.2.1
+
+### Patch Changes
+
+- [#1264](https://github.com/Martian-Engineering/lossless-claw/pull/1264) [`150c96f`](https://github.com/Martian-Engineering/lossless-claw/commit/150c96f395227f870b0bdfbb407d3eef3461d171) Thanks [@jalehman](https://github.com/jalehman)! - Bound the forced overflow-recovery raw tail by tokens when `freshTailMaxTokens` is unset. Recovery now caps the protected suffix at 25% of its target, so a default 64-message tail full of large tool results no longer blocks recovery with `no_compaction_progress`. Routine compaction is unchanged.
+
+- [#1288](https://github.com/Martian-Engineering/lossless-claw/pull/1288) [`1d80614`](https://github.com/Martian-Engineering/lossless-claw/commit/1d8061431bb31f1d87ec957d3cca60101207b1f1) Thanks [@rabsef-bicrym](https://github.com/rabsef-bicrym)! - Preserve canonical user metadata and attached runtime context when OpenClaw's recent-history window advances. On hosts exposing the bounded transcript replay reader, LCM restores retained raw users by transcript entry ID while preserving summaries, externalized content, and assembly budgets. Supported hosts without the reader retain the existing replay path and minimum version; operational read failures still use the existing logged assembly-error behavior.
+
+  Assembly budgets count rendered recorded user projections without double-counting private metadata, while retaining native media estimates. A large projection can therefore evict its parent and owned runtime context instead of bypassing the final budget clamp.
+
+- [#1284](https://github.com/Martian-Engineering/lossless-claw/pull/1284) [`51c3c90`](https://github.com/Martian-Engineering/lossless-claw/commit/51c3c90bfe82fa649e4895dd1a2c4874b5e28f76) Thanks [@jalehman](https://github.com/jalehman)! - Report compaction progress to OpenClaw and honor its abort signal. Each committed summary pass now refreshes the host's compaction idle timeout, so multi-round overflow recovery no longer fails with "Compaction timed out" while it is still making progress. When the host aborts, the sweep stops before starting another pass and keeps the summaries it already committed.
+
+- [#1263](https://github.com/Martian-Engineering/lossless-claw/pull/1263) [`d4aa0b5`](https://github.com/Martian-Engineering/lossless-claw/commit/d4aa0b5db46dd1c135d20b0197cc3da212d47667) Thanks [@jalehman](https://github.com/jalehman)! - Forced overflow recovery now honors the host-observed prompt size when the host owns prompt framing. Lossless scales the host's observed overflow into a stored-token target, so it no longer reports a successful no-op while the host is still over its budget.
+
+- [#1265](https://github.com/Martian-Engineering/lossless-claw/pull/1265) [`f5a9501`](https://github.com/Martian-Engineering/lossless-claw/commit/f5a95019d0dd5b746b0644e48af5c83d1f5de2eb) Thanks [@jalehman](https://github.com/jalehman)! - Stop opening the summary spend backoff when forced overflow recovery makes real progress but cannot reach its target because of the protected tail. Partial recovery no longer blocks foreground compaction on later assembles with `deferred compaction backoff active`. A forced pass that spends summarizer calls without reducing context still opens the backoff.
+
+- [#1271](https://github.com/Martian-Engineering/lossless-claw/pull/1271) [`aa63cfe`](https://github.com/Martian-Engineering/lossless-claw/commit/aa63cfe8349252cd1332b893ee6f12e8ddd46475) Thanks [@rabsef-bicrym](https://github.com/rabsef-bicrym)! - Clarify in the injected recall guidance that `lcm_grep` requires `pattern`, not
+  `query`, for both regex and full-text searches. Include a full-text example to
+  distinguish it from `lcm_expand_query`.
+
+- [#1064](https://github.com/Martian-Engineering/lossless-claw/pull/1064) [`8aa975c`](https://github.com/Martian-Engineering/lossless-claw/commit/8aa975c3a46ac8b37dbbc68f1015cb21af5a03ef) Thanks [@brkastner](https://github.com/brkastner)! - Fix `lcm_grep` throwing `Cannot read properties of undefined (reading
+'trim')` when a model omits or misnames the `pattern` argument. Hosts pass
+  model-supplied tool arguments through without schema validation, so the
+  call died with an uncatchable TypeError before any query ran. The tool now
+  returns a tool error naming the expected field, including the `query` vs
+  `pattern` difference against `lcm_expand` and `lcm_expand_query`, so the
+  agent can correct the call and retry.
+
+- [#1276](https://github.com/Martian-Engineering/lossless-claw/pull/1276) [`47e8bc5`](https://github.com/Martian-Engineering/lossless-claw/commit/47e8bc53ba740e88f8d8750b21a5b37d7f971ea1) Thanks [@TheAngryPit](https://github.com/TheAngryPit)! - Use the captured registration config for independent log redaction so plugin registration can complete before OpenClaw's global runtime config is prepared.
+
+- [#1270](https://github.com/Martian-Engineering/lossless-claw/pull/1270) [`b00ffb9`](https://github.com/Martian-Engineering/lossless-claw/commit/b00ffb94f0f8889f245864c7075e9821a3c739b8) Thanks [@jalehman](https://github.com/jalehman)! - Keep lossless-claw consistent when OpenClaw reloads the plugin during a running turn. Delegated expansion grants are now stored in the LCM database, so a delegated `lcm_expand` child no longer fails with "Delegated expansion requires a valid grant" after a reload. Runtime-authored user turns, such as OpenClaw's continuation prompt, keep their `internal_system` provenance and `display: false` flag instead of being stored as messages the user typed. On OpenClaw 2026.9.5 or later, disposing the plugin instance also closes its database, so the next plugin generation does not reuse the retired engine.
+
 ## 1.2.0
 
 <!-- release-rollback-version: 1.1.1 -->
