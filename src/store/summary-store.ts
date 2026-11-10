@@ -1529,6 +1529,9 @@ export class SummaryStore {
       args.push(before.toISOString());
     }
     const whereClause = where.length > 0 ? `WHERE ${where.join(" AND ")}` : "";
+    const MAX_ROW_SCAN = 10_000;
+    // Bound the read in SQL: the JS loop below stops at MAX_ROW_SCAN anyway, and
+    // node:sqlite reads synchronously, so an unbounded SELECT blocks the host.
     const rows = this.db
       .prepare(
         `SELECT summary_id, conversation_id, kind, depth, content, token_count, file_ids,
@@ -1537,11 +1540,11 @@ export class SummaryStore {
                 ${SUMMARY_SEARCH_TIME_EXPR_UNQUALIFIED} AS created_at
          FROM summaries
          ${whereClause}
-         ORDER BY ${SUMMARY_SEARCH_TIME_EXPR_UNQUALIFIED} DESC`,
+         ORDER BY ${SUMMARY_SEARCH_TIME_EXPR_UNQUALIFIED} DESC
+         LIMIT ${MAX_ROW_SCAN}`,
       )
       .all(...args) as unknown as SummaryRow[];
 
-    const MAX_ROW_SCAN = 10_000;
     const results: SummarySearchResult[] = [];
     let scanned = 0;
     for (const row of rows) {
