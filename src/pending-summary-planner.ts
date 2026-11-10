@@ -1,5 +1,6 @@
 import type { SummaryKind } from "./store/summary-store.js";
 import type { MessageRole } from "./store/conversation-store.js";
+import { toolGroupSafeChunkEnd } from "./overflow-tool-groups.js";
 
 export type PendingSummaryPlannerItemType = "message" | "summary";
 
@@ -31,6 +32,8 @@ export type PendingSummaryPlannerNode = {
 
 export type PlanPendingLeafNodesInput = {
   items: PendingSummaryPlannerSnapshotItem[];
+  /** Rows after `items` that are never planned; read only to close a tool group. */
+  followingItems?: PendingSummaryPlannerSnapshotItem[];
   freshTailCount: number;
   freshTailMaxTokens?: number;
   leafChunkTokens: number;
@@ -199,7 +202,39 @@ export function planPendingLeafNodes(
     resetChunk();
   };
 
-  for (const item of items) {
+  // Keep an assistant tool call and its results in one leaf: inside the
+  // plannable range a full chunk waits for the group's results; a group that
+  // runs into the tail is left out, and nothing after it is plannable.
+  const lookahead = [...items, ...sortItemsByOrdinal(input.followingItems ?? [])];
+  const flushAtToolGroupBoundary = (nextIndex: number): boolean => {
+    const roles = chunk.map((item) => item.role);
+    let tailIndex = Infinity;
+    for (let next = nextIndex; next < lookahead.length; next++) {
+      const row = lookahead[next]!;
+      const role = row.itemType === "message" ? row.role : undefined;
+      roles.push(role);
+      if (next >= items.length || row.ordinal >= freshTailOrdinal) {
+        tailIndex = roles.length - 1;
+        break;
+      }
+      if (role !== "tool") {
+        break;
+      }
+    }
+    const end = toolGroupSafeChunkEnd(roles, chunk.length, tailIndex);
+    if (end > chunk.length) {
+      return false;
+    }
+    const reachesTail = end < chunk.length;
+    chunk = chunk.slice(0, end);
+    chunkTokens = chunk.reduce((total, item) => total + normalizeNonNegativeInteger(item.tokenCount), 0);
+    flushChunk();
+    return reachesTail;
+  };
+
+  let index = 0;
+  for (; index < items.length; index++) {
+    const item = items[index]!;
     if (item.ordinal >= freshTailOrdinal) {
       break;
     }
@@ -211,12 +246,12 @@ export function planPendingLeafNodes(
     const tokenCount = normalizeNonNegativeInteger(item.tokenCount);
     chunk.push(item);
     chunkTokens += tokenCount;
-    if (chunkTokens >= chunkTokenBudget) {
-      flushChunk();
+    if (chunkTokens >= chunkTokenBudget && flushAtToolGroupBoundary(index + 1)) {
+      break;
     }
   }
 
-  flushChunk();
+  flushAtToolGroupBoundary(index);
   if (nodes.length === 0) {
     return nodes;
   }

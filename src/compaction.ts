@@ -1,5 +1,9 @@
 import { createHash, randomUUID } from "node:crypto";
-import { resolveRecoveryTailMaxTokens, selectOverflowToolGroup } from "./overflow-tool-groups.js";
+import {
+  resolveRecoveryTailMaxTokens,
+  selectOverflowToolGroup,
+  toolGroupSafeChunkEnd,
+} from "./overflow-tool-groups.js";
 import { contentFromParts } from "./assembler.js";
 import type {
   ConversationStore,
@@ -1813,6 +1817,7 @@ export class CompactionEngine {
     }
 
     const chunk: ContextItemRecord[] = [];
+    const messageCache = new Map<number, MessageRecord | null>();
     let chunkTokens = 0;
     let started = false;
     for (const item of contextItems) {
@@ -1835,7 +1840,7 @@ export class CompactionEngine {
       if (item.messageId == null) {
         continue;
       }
-      const messageTokens = await this.getMessageTokenCount(item.messageId);
+      const messageTokens = await this.getMessageTokenCount(item.messageId, messageCache);
       if (chunk.length > 0 && chunkTokens + messageTokens > threshold) {
         break;
       }
@@ -1847,7 +1852,48 @@ export class CompactionEngine {
       }
     }
 
-    return { items: chunk, rawTokensOutsideTail, threshold };
+    return {
+      items: await this.endLeafChunkAtToolGroup(contextItems, chunk, freshTailOrdinal, messageCache),
+      rawTokensOutsideTail,
+      threshold,
+    };
+  }
+
+  /** Keep an assistant tool call and its results in the same routine leaf chunk. */
+  private async endLeafChunkAtToolGroup(
+    contextItems: ContextItemRecord[],
+    chunk: ContextItemRecord[],
+    freshTailOrdinal: number,
+    messageCache: Map<number, MessageRecord | null>,
+  ): Promise<ContextItemRecord[]> {
+    if (chunk.length === 0) {
+      return chunk;
+    }
+    const roleOf = async (item: ContextItemRecord) =>
+      item.itemType === "message" && item.messageId != null
+        ? (await this.getMessageByIdCached(item.messageId, messageCache))?.role
+        : undefined;
+    const roles: Array<MessageRecord["role"] | undefined> = [];
+    for (const item of chunk) {
+      roles.push(await roleOf(item));
+    }
+    const nextIndex = contextItems.indexOf(chunk[chunk.length - 1]!) + 1;
+    let tailIndex = Infinity;
+    for (const item of contextItems.slice(nextIndex)) {
+      const role = await roleOf(item);
+      roles.push(role);
+      if (item.ordinal >= freshTailOrdinal) {
+        tailIndex = roles.length - 1;
+        break;
+      }
+      if (role !== "tool") {
+        break;
+      }
+    }
+    const end = toolGroupSafeChunkEnd(roles, chunk.length, tailIndex, true);
+    return end <= chunk.length
+      ? chunk.slice(0, end)
+      : [...chunk, ...contextItems.slice(nextIndex, nextIndex + end - chunk.length)];
   }
 
   /** Select one complete in-turn group without weakening routine fresh-tail selection. */
