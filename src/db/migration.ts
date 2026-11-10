@@ -1,5 +1,9 @@
 import type { DatabaseSync } from "node:sqlite";
 import { createHash } from "node:crypto";
+import {
+  invalidatePendingContextPositions,
+  resequenceContextItemsInTransaction,
+} from "./context-ordinals.js";
 import { getLcmDbFeatures } from "./features.js";
 import {
   canonicalizeOpenClawInboundMetadataIdentityContent,
@@ -68,6 +72,7 @@ const VERSIONED_BACKFILL_STEPS = {
   backfillSummaryMetadata: 1,
   backfillToolCallColumns: 1,
   repairOpenClawMetadataIdentityState: 2,
+  repairContextItemOrdinals: 1,
 } as const;
 
 type VersionedBackfillStepName = keyof typeof VERSIONED_BACKFILL_STEPS;
@@ -789,6 +794,20 @@ function runVersionedBackfillStep(
       `[lcm] migration step failed: step=${stepName} algorithmVersion=${algorithmVersion} durationMs=${Date.now() - startedAt} error=${describeMigrationError(error)}`,
     );
     throw error;
+  }
+}
+
+function repairContextItemOrdinals(db: DatabaseSync): void {
+  const conversations = db
+    .prepare(
+      `SELECT conversation_id FROM context_items
+       GROUP BY conversation_id
+       HAVING MIN(ordinal) <> 0 OR MAX(ordinal) <> COUNT(*) - 1`,
+    )
+    .all() as Array<{ conversation_id: number }>;
+  for (const { conversation_id } of conversations) {
+    resequenceContextItemsInTransaction(db, conversation_id);
+    invalidatePendingContextPositions(db, conversation_id);
   }
 }
 
@@ -1719,6 +1738,10 @@ export function runLcmMigrations(
     );
     runVersionedBackfillStep(db, "backfillToolCallColumns", log, () =>
       backfillToolCallColumns(db),
+    );
+
+    runVersionedBackfillStep(db, "repairContextItemOrdinals", log, () =>
+      repairContextItemOrdinals(db),
     );
 
     const detectedFeatures = options?.fts5Available === false ? null : getLcmDbFeatures(db);
