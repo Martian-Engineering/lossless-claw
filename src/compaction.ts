@@ -255,6 +255,9 @@ function generateSummaryId(content: string): string {
   );
 }
 
+/** Prefix identifying the placeholder leaf summary written for a chunk with no extractable text. */
+const TEXTLESS_LEAF_SUMMARY_MARKER = "[textless leaf range]";
+
 /** Maximum estimated tokens for the deterministic fallback truncation. */
 const FALLBACK_MAX_TOKENS = 512;
 const DEFAULT_LEAF_CHUNK_TOKENS = 20_000;
@@ -2400,10 +2403,12 @@ export class CompactionEngine {
       .filter((s): s is string => s !== null)
       .join("\n\n");
     if (!concatenated.trim()) {
-      this.log.warn(
-        `[lcm] leaf compaction skipped; no meaningful content; conversationId=${conversationId}; chunkMessages=${messageContents.length}`,
-      );
-      return { skipped: "empty-source" };
+      return this.collapseTextlessLeafChunk({
+        conversationId,
+        messageItems,
+        messageContents,
+        summaryModel,
+      });
     }
     const fileIds = dedupeOrderedIds(
       messageContents.flatMap((message) => extractFileIdsFromContent(message.content)),
@@ -2479,6 +2484,92 @@ export class CompactionEngine {
     this.invalidateContextCache(conversationId);
 
     return { summaryId, level: summary.level, content: summary.content, removedTokens, addedTokens: tokenCount };
+  }
+
+  /**
+   * Commit one placeholder leaf summary for a chunk whose messages carry no
+   * extractable text.
+   *
+   * Tool-call-only and empty-content assistant turns still hold context
+   * tokens. Skipping them makes every sweep select the same chunk, take no
+   * action, and end in the transcript-wedge verdict, so the placeholder keeps
+   * the sweep moving while the source messages stay in the store and remain
+   * reachable through `lcm_expand`.
+   */
+  private async collapseTextlessLeafChunk(params: {
+    conversationId: number;
+    messageItems: ContextItemRecord[];
+    messageContents: {
+      messageId: number;
+      role: MessageRole;
+      content: string;
+      createdAt: Date;
+      tokenCount: number;
+    }[];
+    summaryModel?: string;
+  }): Promise<LeafPassResult> {
+    const { conversationId, messageItems, messageContents } = params;
+    const ordinals = messageItems.map((item) => item.ordinal);
+    const startOrdinal = Math.min(...ordinals);
+    const endOrdinal = Math.max(...ordinals);
+    const roleCounts = new Map<MessageRole, number>();
+    for (const message of messageContents) {
+      roleCounts.set(message.role, (roleCounts.get(message.role) ?? 0) + 1);
+    }
+    const roleBreakdown = [...roleCounts]
+      .map(([role, count]) => `${role}x${count}`)
+      .join(", ");
+    const earliestAt = new Date(
+      Math.min(...messageContents.map((message) => message.createdAt.getTime())),
+    );
+    const latestAt = new Date(
+      Math.max(...messageContents.map((message) => message.createdAt.getTime())),
+    );
+    const content = [
+      `${TEXTLESS_LEAF_SUMMARY_MARKER} ordinals ${startOrdinal}-${endOrdinal}: ${messageContents.length} message(s) (${roleBreakdown}) between ${formatTimestamp(earliestAt, this.config.timezone)} and ${formatTimestamp(latestAt, this.config.timezone)} carried no extractable text (tool-call-only or empty-content turns).`,
+      "Originals are retained and recoverable via lcm_expand.",
+    ].join("\n");
+    const summaryId = generateSummaryId(content);
+    const tokenCount = estimateTokens(content);
+    const fileIds = dedupeOrderedIds(
+      messageContents.flatMap((message) => extractFileIdsFromContent(message.content)),
+    );
+    const removedTokens = messageContents.reduce(
+      (sum, message) => sum + Math.max(0, Math.floor(message.tokenCount)),
+      0,
+    );
+    const messageIds = messageContents.map((message) => message.messageId);
+
+    await this.summaryStore.withTransaction(async () => {
+      await this.summaryStore.insertSummary({
+        summaryId,
+        conversationId,
+        kind: "leaf",
+        depth: 0,
+        content,
+        tokenCount,
+        fileIds,
+        earliestAt,
+        latestAt,
+        descendantCount: 0,
+        descendantTokenCount: 0,
+        sourceMessageTokenCount: removedTokens,
+        model: params.summaryModel,
+      });
+      await this.summaryStore.linkSummaryToMessages(summaryId, messageIds);
+      await this.summaryStore.replaceContextRangeWithSummary({
+        conversationId,
+        startOrdinal,
+        endOrdinal,
+        summaryId,
+      });
+    });
+    this.invalidateContextCache(conversationId);
+    this.log.warn(
+      `[lcm] leaf compaction collapsed textless chunk; conversationId=${conversationId}; chunkMessages=${messageContents.length}; ordinals=${startOrdinal}-${endOrdinal}; tokensRemoved=${removedTokens}`,
+    );
+
+    return { summaryId, level: "fallback", content, removedTokens, addedTokens: tokenCount };
   }
 
   // ── Private: Condensed Pass ──────────────────────────────────────────────
