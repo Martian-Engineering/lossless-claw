@@ -254,6 +254,13 @@ const HOST_SESSION_END_REASON_DELETED = "deleted";
 const HOST_SESSION_END_REASON_RESET = "reset";
 const CONTEXT_ENGINE_PROJECTION_EPOCH_VERSION = "summary-prefix-v1";
 const DEFERRED_ASSEMBLY_PRESSURE_RATIO = 0.75;
+/**
+ * Default dormancy window before a prepared pending-summary frontier is
+ * published without a compaction event. A conversation that stops taking
+ * turns never grows its context, so it would otherwise never publish.
+ */
+const DEFAULT_PENDING_SUMMARY_DORMANCY_MS = 24 * 60 * 60 * 1000;
+
 const PENDING_SUMMARY_MODEL_UNAVAILABLE_REASON = "pending summary model unavailable";
 type CompactionExecutionParams = {
   /** Authoritative forced-recovery snapshot is fully reconciled. */
@@ -1105,6 +1112,54 @@ export class LcmContextEngine implements ContextEngine {
       this.deps.log.debug(
         `[lcm] background pending summary preparation done conversation=${params.conversationId} ${sessionLabel} changed=${result.compacted} reason=${result.reason ?? "none"} prepReason=${params.reason}`,
       );
+      if (result.reason === "pending summaries ready for publish") {
+        // Preparation deliberately does not publish. Below threshold the
+        // prepared frontier stays hidden until a compaction event, because an
+        // ACTIVE conversation may still extend that frontier with new turns
+        // and publish a better, larger prefix later.
+        //
+        // A DORMANT conversation has no such event coming. Its context never
+        // grows, so no assembly pressure is ever recorded, so no threshold
+        // debt is ever created -- and the ready nodes sit unpublished
+        // indefinitely. That is a deadlock, not a delay: nothing about the
+        // conversation will ever change to unblock it.
+        //
+        // For a dormant conversation only, record threshold-shaped debt so the
+        // existing publication path promotes the prepared frontier. The debt
+        // reason is "threshold" because this IS a threshold-shaped debt: the
+        // frontier is ready to publish and the conversation will never reach
+        // pressure on its own. Active conversations keep the existing
+        // preparation-only contract (no debt, no publication).
+        if (await this.isConversationDormantForPendingSummary(params.conversationId)) {
+          // Only a CURRENT host allowance may be written. A stored
+          // maintenance budget usually comes from a larger model allowance
+          // than this fallback; overwriting it with a smaller value would
+          // shrink the conversation's assembly allowance. When the host
+          // supplies no allowance, leave the stored budget untouched.
+          const currentHostBudget = this.resolveTokenBudget({
+            runtimeSettings: params.runtimeSettings,
+            runtimeContext: params.runtimeContext,
+          });
+          await this.compactionMaintenanceStore.requestProactiveCompactionDebt({
+            conversationId: params.conversationId,
+            reason: "threshold",
+            tokenBudget: currentHostBudget != null ? currentHostBudget : null,
+            currentTokenCount: params.currentTokenCount ?? null,
+          });
+          this.deps.log.debug(
+            `[lcm] background pending summary publication debt recorded conversation=${params.conversationId} ${sessionLabel} tokenBudget=${currentHostBudget ?? "keep-stored"} prepReason=${params.reason}`,
+          );
+          await this.scheduleThresholdPublicationOpportunity({
+            conversationId: params.conversationId,
+            sessionId: params.sessionId,
+            sessionKey: params.sessionKey,
+            tokenBudget: cappedTokenBudget,
+            currentTokenCount: params.currentTokenCount,
+            runtimeSettings: params.runtimeSettings,
+            reason: "pending-summary-prepared",
+          });
+        }
+      }
       if (
         result.pending === true && result.reason === "pending summary work remains"
       ) {
@@ -1115,6 +1170,55 @@ export class LcmContextEngine implements ContextEngine {
     } finally {
       this.pendingSummaryPreparationDrains.delete(params.queueKey);
     }
+  }
+
+  /**
+   * A conversation is dormant for pending-summary purposes when it has not
+   * ingested a message for longer than the dormancy window.
+   *
+   * Such a conversation will never grow its context, so it can never reach a
+   * compaction event on its own. A prepared frontier for it would otherwise
+   * stay hidden forever. An active conversation keeps the normal
+   * preparation-only contract, because its next turn can still extend the
+   * frontier before it publishes.
+   *
+   * The window is deliberately generous. The failure this guards against is a
+   * deadlock, not a delay: a dormant conversation's frontier never publishes
+   * on its own, so waiting costs nothing and risks nothing. The risk of a
+   * window that is too short is publishing a frontier that a still-active
+   * conversation could have extended, so the default errs long.
+   */
+  private async isConversationDormantForPendingSummary(conversationId: number): Promise<boolean> {
+    try {
+      const lastMessage = await this.conversationStore.getLastMessage(conversationId);
+      // The store already parses SQLite's UTC timestamps correctly.
+      const lastMessageAt = lastMessage?.createdAt
+        ? lastMessage.createdAt.getTime()
+        : NaN;
+      // No ingested message at all is the strongest dormancy signal.
+      if (!Number.isFinite(lastMessageAt)) return true;
+      const windowMs = this.resolvePendingSummaryDormancyWindowMs();
+      return Date.now() - lastMessageAt >= windowMs;
+    } catch {
+      // Never block publication on a failed dormancy probe; treat the
+      // conversation as active so the preparation-only contract holds.
+      return false;
+    }
+  }
+
+  /**
+   * The dormancy window before a prepared frontier is published without a
+   * compaction event. Configurable, with a conservative default.
+   */
+  private resolvePendingSummaryDormancyWindowMs(): number {
+    const configured = this.config.pendingSummaryDormancyMs;
+    if (typeof configured === "number" && Number.isFinite(configured)) {
+      // A negative window disables dormant publication entirely: prepared
+      // frontiers then wait for a real compaction event, as before.
+      if (configured < 0) return Number.POSITIVE_INFINITY;
+      return Math.floor(configured);
+    }
+    return DEFAULT_PENDING_SUMMARY_DORMANCY_MS;
   }
 
   /**
@@ -3386,10 +3490,112 @@ export class LcmContextEngine implements ContextEngine {
       const leaf = await this.compaction.evaluateLeafTrigger(
         conversation.conversationId, this.config.leafChunkTokens,
       );
-      if (!leaf.shouldCompact) return outcome;
+      if (!leaf.shouldCompact) {
+        // A prepared frontier that is below the leaf threshold is still
+        // PUBLISHABLE WORK. The leaf trigger measures raw-token pressure,
+        // but preparing a summary is exactly what REMOVES those raw tokens
+        // from the context projection. A conversation whose summaries are
+        // already prepared therefore falls below the threshold with a
+        // finished summary it can never publish, and no future turn will
+        // raise the pressure back up - the prepared state is self-sustaining.
+        //
+        // That is a deadlock, not a delay: nothing about the conversation
+        // will ever change to unblock it. The dormant-publication fix above
+        // cannot help either, because it runs INSIDE the preparation drain,
+        // which this early return skips.
+        //
+        // Publish the ready frontier first. Publication consumes prepared
+        // summaries without resolving a model or spending tokens, so it is
+        // safe to attempt here and cannot make things worse.
+        const publication = await this.publishReadyPendingSummaryFrontierIfIdle(work);
+        if (publication?.changed) return publication;
+        return outcome;
+      }
       result = await this.drainPendingSummaryPreparationIfIdle(work);
     }
     return result ?? outcome;
+  }
+
+  /**
+   * Publish an already-prepared pending-summary frontier when one exists.
+   *
+   * This is the threshold-independent publication path. It is deliberately
+   * narrow: it only acts when the active batch already holds a node with
+   * status "ready" (summary content written, not yet promoted), and it
+   * publishes through the existing "publish-ready-only" policy, which
+   * consumes prepared work WITHOUT resolving a model or spending tokens.
+   *
+   * Why it is needed: the leaf trigger gates publication on
+   * `rawTokensOutsideTail >= leafChunkTokens`. Preparation replaces those
+   * raw tokens with summaries, so a prepared conversation can never satisfy
+   * the trigger again. Without this path the prepared frontier is stranded
+   * forever.
+   */
+  private async publishReadyPendingSummaryFrontierIfIdle(
+    params: PendingSummaryPreparationDrainParams & { queueKey: string; runtimeContext?: ContextEngineMaintenanceRuntimeContext },
+  ): Promise<ContextEngineMaintenanceResult | undefined> {
+    const sessionLabel = formatSessionLabel(params.sessionId, params.sessionKey);
+    const busyQueue = this.sessionOperationQueues.get(params.queueKey);
+    if (busyQueue) {
+      this.deps.log.debug(
+        `[lcm] ready-frontier publication skipped conversation=${params.conversationId} ${sessionLabel} reason=session-queue-busy`,
+      );
+      return;
+    }
+    if (this.pendingSummaryPreparationDrains.has(params.queueKey) || this.deferredCompactionDrains.has(params.queueKey)) {
+      this.deps.log.debug(
+        `[lcm] ready-frontier publication skipped conversation=${params.conversationId} ${sessionLabel} reason=drain-already-running`,
+      );
+      return;
+    }
+
+    let hasReadyFrontier = false;
+    try {
+      const batch = await this.pendingSummaryStore.getActiveBatchForConversation(params.conversationId);
+      if (batch) {
+        const nodes = await this.pendingSummaryStore.getNodesByBatch(batch.batchId);
+        hasReadyFrontier = nodes.some((node) => node.status === "ready");
+      }
+    } catch (error) {
+      // Never block maintenance on a failed probe. If we cannot tell whether
+      // work is ready, leave the conversation alone; the next host pass
+      // retries.
+      this.deps.log.warn(
+        `[lcm] ready-frontier probe failed conversation=${params.conversationId} ${sessionLabel}: ${describeLogError(error)}`,
+      );
+      return;
+    }
+    if (!hasReadyFrontier) return;
+
+    this.pendingSummaryPreparationDrains.add(params.queueKey);
+    try {
+      const cappedTokenBudget = this.applyAssemblyBudgetCap(params.tokenBudget);
+      const result = await this.executePendingCompactionCore({
+        conversationId: params.conversationId,
+        sessionId: params.sessionId,
+        sessionKey: params.sessionKey,
+        tokenBudget: cappedTokenBudget,
+        currentTokenCount: params.currentTokenCount,
+        runtimeSettings: params.runtimeSettings,
+        legacyParams: params.runtimeContext,
+        runtimeContext: params.runtimeContext,
+        sessionQueueHeld: false,
+        publishPolicy: "publish-ready-only",
+      });
+      if (result.compacted) {
+        this.deps.log.debug(
+          `[lcm] ready-frontier published conversation=${params.conversationId} ${sessionLabel} reason=${result.reason ?? "none"}`,
+        );
+      }
+      return {
+        changed: result.compacted,
+        bytesFreed: 0,
+        rewrittenEntries: 0,
+        reason: result.reason,
+      };
+    } finally {
+      this.pendingSummaryPreparationDrains.delete(params.queueKey);
+    }
   }
 
   private async ingestSingle(params: {
