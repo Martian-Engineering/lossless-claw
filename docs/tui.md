@@ -291,7 +291,11 @@ Use `--provider openai-codex` when you want ChatGPT Plus/Pro OAuth from the Code
 
 #### MiniMax regional endpoints
 
-Set `MINIMAX_API_KEY`, then select `--provider minimax` for the global endpoint or `--provider minimax-cn` for the China endpoint. Both provider IDs default to `MiniMax-M3` and use the Anthropic-compatible Messages API:
+Set `MINIMAX_API_KEY`, then select `--provider minimax` for the global endpoint or `--provider minimax-cn` for the China endpoint. Both provider IDs default to `MiniMax-M3.1-Flash` and use the Anthropic-compatible Messages API. Select `--model MiniMax-M3` to use M3. Explicit models from CLI flags or summary environment variables remain unchanged.
+
+Flash always uses adaptive thinking, with the API's default `max` effort; M3 keeps the API's default thinking behavior. Thinking tokens share the `max_tokens` budget with summary text, so allow enough output tokens for both.
+
+Regional defaults:
 
 | Provider ID | Default base URL |
 |-------------|------------------|
