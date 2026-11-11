@@ -120,6 +120,15 @@ export class FakeTranscriptHost {
     return this.visibleMessages().findIndex((event) => event.id === entryId);
   }
 
+  /** Same-session branch: the raw log retains abandoned entries and the generation stays stable. */
+  branch(entryId: string): void {
+    const index = this.path.findIndex((event) => event.id === entryId);
+    if (index < 0) {
+      throw new Error(`unknown entry ${entryId}`);
+    }
+    this.path = this.path.slice(0, index + 1);
+  }
+
   /** Change one message payload in place without changing its id; rotates the generation. */
   rewriteInPlace(entryId: string, message: AgentMessage): void {
     const event = this.visibleMessages().find((candidate) => candidate.id === entryId);

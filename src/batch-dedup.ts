@@ -25,10 +25,9 @@ import { buildMessageIdentityHash } from "./store/message-identity.js";
 import type { LargeFileRecord, SummaryStore } from "./store/summary-store.js";
 import {
   extractAssistantToolCallIdsForPairing,
-  extractToolPairingIdFromRecord,
   extractToolResultIdForPairing,
 } from "./tool-pairing.js";
-import { structuredPartsIdentity } from "./structured-anchor-identity.js";
+import { structuredPartsIdentity, toolProvenanceIdentity } from "./structured-anchor-identity.js";
 
 type RedactSensitiveText = (content: string) => string;
 type StoredIncomingMatch =
@@ -59,10 +58,6 @@ function incomingToolCallIds(message: AgentMessage): Set<string> {
   return new Set(ids);
 }
 
-function sameNonEmptyIds(left: ReadonlySet<string>, right: ReadonlySet<string>): boolean {
-  return left.size > 0 && left.size === right.size && [...left].every((id) => right.has(id));
-}
-
 export class BatchDeduplicator {
   constructor(
     private readonly conversationStore: ConversationStore,
@@ -72,10 +67,9 @@ export class BatchDeduplicator {
   ) {}
 
   /**
-   * Accept host redaction only when both faces carry the same complete set of
-   * tool-call ids and applying redaction to one complete message produces the
-   * other. The provenance gate keeps different secret-bearing tool calls from
-   * collapsing; redactor failure degrades to exact-only dedup.
+   * After the shared provenance check, accept host redaction only for tool
+   * events with ids when redacting one complete face produces the other.
+   * Different raw secrets must not collapse; redactor failure is exact-only.
    */
   private async messagesDifferOnlyByHostRedaction(
     persisted: MessageRecord,
@@ -85,8 +79,6 @@ export class BatchDeduplicator {
     if (persisted.role !== incoming.role || !this.redactSensitiveText) return false;
     const incomingIds = incomingToolCallIds(incomingMessage);
     if (incomingIds.size === 0) return false;
-    const storedIds = await this.storedToolCallIds(persisted.messageId);
-    if (!sameNonEmptyIds(storedIds, incomingIds)) return false;
     try {
       const redactedPersisted = this.redactSensitiveText(persisted.content);
       if (redactedPersisted !== persisted.content && redactedPersisted === incoming.content) {
@@ -99,18 +91,6 @@ export class BatchDeduplicator {
     }
   }
 
-  /** Read stable tool-call provenance from the stored message parts. */
-  private async storedToolCallIds(messageId: number): Promise<Set<string>> {
-    const ids = new Set<string>();
-    for (const part of await this.conversationStore.getMessageParts(messageId)) {
-      if (part.toolCallId) ids.add(part.toolCallId);
-      const metadata = parsePartMetadata(part.metadata);
-      const metadataId = metadata ? extractToolPairingIdFromRecord(metadata) : undefined;
-      if (metadataId) ids.add(metadataId);
-    }
-    return ids;
-  }
-
   private async matchStoredMessageToIncoming(
     storedMessage: MessageRecord,
     incoming: StoredMessage,
@@ -120,28 +100,22 @@ export class BatchDeduplicator {
     incomingRawPayloadContent?: string | null,
   ): Promise<StoredIncomingMatch | null> {
     const storedParts = await this.conversationStore.getMessageParts(storedMessage.messageId);
+    const incomingParts = buildMessageParts({
+      sessionId: "",
+      message: incomingMessage,
+      fallbackContent: incoming.content,
+    });
+    // Byte/redaction proof can explain a body rewrite, never changed tool facts.
+    if (toolProvenanceIdentity(storedParts) !== toolProvenanceIdentity(incomingParts)) return null;
     const storedStructured = structuredPartsIdentity(storedParts);
-    const incomingStructured = structuredPartsIdentity(
-      buildMessageParts({
-        sessionId: "",
-        message: incomingMessage,
-        fallbackContent: incoming.content,
-      }),
-    );
+    const incomingStructured = structuredPartsIdentity(incomingParts);
     const externalizedMatch = await this.messagesAreExternalizedEquivalent(
       storedMessage,
       incoming,
       incomingRawPayloadContent,
     );
     if (externalizedMatch === "externalized") {
-      const storedIds = await this.storedToolCallIds(storedMessage.messageId);
-      const incomingIds = incomingToolCallIds(incomingMessage);
-      if (
-        (storedIds.size === 0 && incomingIds.size === 0) ||
-        sameNonEmptyIds(storedIds, incomingIds)
-      ) {
-        return "externalized";
-      }
+      return "externalized";
     }
     // Text hashes are only candidate indexes. Never equate unrelated tool events.
     if (
