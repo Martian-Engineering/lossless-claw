@@ -3489,10 +3489,112 @@ export class LcmContextEngine implements ContextEngine {
       const leaf = await this.compaction.evaluateLeafTrigger(
         conversation.conversationId, this.config.leafChunkTokens,
       );
-      if (!leaf.shouldCompact) return outcome;
+      if (!leaf.shouldCompact) {
+        // A prepared frontier that is below the leaf threshold is still
+        // PUBLISHABLE WORK. The leaf trigger measures raw-token pressure,
+        // but preparing a summary is exactly what REMOVES those raw tokens
+        // from the context projection. A conversation whose summaries are
+        // already prepared therefore falls below the threshold with a
+        // finished summary it can never publish, and no future turn will
+        // raise the pressure back up - the prepared state is self-sustaining.
+        //
+        // That is a deadlock, not a delay: nothing about the conversation
+        // will ever change to unblock it. The dormant-publication fix above
+        // cannot help either, because it runs INSIDE the preparation drain,
+        // which this early return skips.
+        //
+        // Publish the ready frontier first. Publication consumes prepared
+        // summaries without resolving a model or spending tokens, so it is
+        // safe to attempt here and cannot make things worse.
+        const publication = await this.publishReadyPendingSummaryFrontierIfIdle(work);
+        if (publication?.changed) return publication;
+        return outcome;
+      }
       result = await this.drainPendingSummaryPreparationIfIdle(work);
     }
     return result ?? outcome;
+  }
+
+  /**
+   * Publish an already-prepared pending-summary frontier when one exists.
+   *
+   * This is the threshold-independent publication path. It is deliberately
+   * narrow: it only acts when the active batch already holds a node with
+   * status "ready" (summary content written, not yet promoted), and it
+   * publishes through the existing "publish-ready-only" policy, which
+   * consumes prepared work WITHOUT resolving a model or spending tokens.
+   *
+   * Why it is needed: the leaf trigger gates publication on
+   * `rawTokensOutsideTail >= leafChunkTokens`. Preparation replaces those
+   * raw tokens with summaries, so a prepared conversation can never satisfy
+   * the trigger again. Without this path the prepared frontier is stranded
+   * forever.
+   */
+  private async publishReadyPendingSummaryFrontierIfIdle(
+    params: PendingSummaryPreparationDrainParams & { queueKey: string; runtimeContext?: ContextEngineMaintenanceRuntimeContext },
+  ): Promise<ContextEngineMaintenanceResult | undefined> {
+    const sessionLabel = formatSessionLabel(params.sessionId, params.sessionKey);
+    const busyQueue = this.sessionOperationQueues.get(params.queueKey);
+    if (busyQueue) {
+      this.deps.log.debug(
+        `[lcm] ready-frontier publication skipped conversation=${params.conversationId} ${sessionLabel} reason=session-queue-busy`,
+      );
+      return;
+    }
+    if (this.pendingSummaryPreparationDrains.has(params.queueKey) || this.deferredCompactionDrains.has(params.queueKey)) {
+      this.deps.log.debug(
+        `[lcm] ready-frontier publication skipped conversation=${params.conversationId} ${sessionLabel} reason=drain-already-running`,
+      );
+      return;
+    }
+
+    let hasReadyFrontier = false;
+    try {
+      const batch = await this.pendingSummaryStore.getActiveBatchForConversation(params.conversationId);
+      if (batch) {
+        const nodes = await this.pendingSummaryStore.getNodesByBatch(batch.batchId);
+        hasReadyFrontier = nodes.some((node) => node.status === "ready");
+      }
+    } catch (error) {
+      // Never block maintenance on a failed probe. If we cannot tell whether
+      // work is ready, leave the conversation alone; the next host pass
+      // retries.
+      this.deps.log.warn(
+        `[lcm] ready-frontier probe failed conversation=${params.conversationId} ${sessionLabel}: ${describeLogError(error)}`,
+      );
+      return;
+    }
+    if (!hasReadyFrontier) return;
+
+    this.pendingSummaryPreparationDrains.add(params.queueKey);
+    try {
+      const cappedTokenBudget = this.applyAssemblyBudgetCap(params.tokenBudget);
+      const result = await this.executePendingCompactionCore({
+        conversationId: params.conversationId,
+        sessionId: params.sessionId,
+        sessionKey: params.sessionKey,
+        tokenBudget: cappedTokenBudget,
+        currentTokenCount: params.currentTokenCount,
+        runtimeSettings: params.runtimeSettings,
+        legacyParams: params.runtimeContext,
+        runtimeContext: params.runtimeContext,
+        sessionQueueHeld: false,
+        publishPolicy: "publish-ready-only",
+      });
+      if (result.compacted) {
+        this.deps.log.debug(
+          `[lcm] ready-frontier published conversation=${params.conversationId} ${sessionLabel} reason=${result.reason ?? "none"}`,
+        );
+      }
+      return {
+        changed: result.compacted,
+        bytesFreed: 0,
+        rewrittenEntries: 0,
+        reason: result.reason,
+      };
+    } finally {
+      this.pendingSummaryPreparationDrains.delete(params.queueKey);
+    }
   }
 
   private async ingestSingle(params: {
