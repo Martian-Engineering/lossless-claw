@@ -10,6 +10,7 @@ import type { LcmConfig } from "./db/config.js";
 import {
   extractProviderAuthFailure,
   LcmProviderAuthError,
+  LcmRuntimeLifecycleError,
   LcmSummarySpendLimitError,
   type LcmSummarizeFn,
 } from "./summarize.js";
@@ -253,7 +254,10 @@ export class CompactionGuards {
       params.onAttempt?.();
       try {
         const result = await this.deps.complete(input);
-        if (!extractProviderAuthFailure(result, { requireStructuralSignal: true })) {
+        if (
+          result.error?.kind !== "runtime_lifecycle" &&
+          !extractProviderAuthFailure(result, { requireStructuralSignal: true })
+        ) {
           this.recordSummarySpendCall({
             scopeKey: params.scopeKey,
             reason: params.reason,
@@ -261,7 +265,7 @@ export class CompactionGuards {
         }
         return result;
       } catch (err) {
-        if (!extractProviderAuthFailure(err)) {
+        if (!(err instanceof LcmRuntimeLifecycleError) && !extractProviderAuthFailure(err)) {
           this.recordSummarySpendCall({
             scopeKey: params.scopeKey,
             reason: params.reason,
@@ -297,7 +301,7 @@ export class CompactionGuards {
         });
         return result;
       } catch (err) {
-        if (!(err instanceof LcmProviderAuthError)) {
+        if (!(err instanceof LcmRuntimeLifecycleError) && !(err instanceof LcmProviderAuthError)) {
           this.recordSummarySpendCall({
             scopeKey: params.scopeKey,
             reason: "custom summarizer call",
