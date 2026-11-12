@@ -55,7 +55,9 @@ The native OpenClaw command surface provides in-session operations:
 
 - `/lossless` shows version, enablement/selection state, DB path and size, summary counts, and summary-health status
 - `/lossless backup` creates a timestamped backup of the current LCM SQLite database
-- `/lossless doctor` scans for broken or truncated summaries
+- `/lossless doctor` scans for broken or truncated summaries and reports historical gap claims
+- `/lossless doctor gaps <conversation-id>` previews exact host-visible history recovery from **another session**
+- `/lossless doctor apply gaps <conversation-id> <preview-token>` confirms that preview; the plugin locks the target, backs up and prepares recovery before atomic publication, without Gateway shutdown
 - `/lossless doctor maintenance` reports active actionable compaction debt separately from inactive historical debt, grouped by reason, without writing
 - `/lossless doctor apply maintenance <conversation-id> confirm-inactive` administratively closes one eligible inactive debt row after creating a SQLite backup
 - `/lossless doctor apply` repairs broken summaries in the current conversation after the normal safety preflight
@@ -647,3 +649,8 @@ help bringing agents into your own systems, we'd like to hear from you:
 
 Bug reports and feature requests belong in
 [GitHub Issues](https://github.com/Martian-Engineering/lossless-claw/issues).
+
+### Transcript-gap recovery (draft)
+
+See [the recovery workflow](docs/gap-repair.md) for cross-session doctor preview/apply, automatic backup and isolated preparation, plus the separate developer-only `lcm-gap-repair`
+plan/apply/undo surface, cooperative lifetime fence, and live-qualification limits.

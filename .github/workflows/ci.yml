@@ -144,3 +144,23 @@ jobs:
               console.log("smoke OK — plugin loadable, register surface present");
             }).catch((e) => { console.error("smoke failed:", e); process.exit(1); });
           '
+
+  gap-repair:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        node: [22, 24]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node }}
+          cache: npm
+      - run: npm ci
+      - run: npm run typecheck
+      - run: npm run build:gap-repair && npm run build:gap-recovery-worker
+      - run: npx vitest run test/gap-repair.test.ts test/lcm-command.test.ts test/db-connection.test.ts test/package-metadata.test.ts
+      - name: Verify repair executable is packaged
+        run: |
+          npm pack --dry-run --json > pack-result.json
+          node --input-type=module -e 'import fs from "node:fs"; const p=JSON.parse(fs.readFileSync("pack-result.json")); if(!["dist/gap-repair.js","dist/gap-recovery-worker.js"].every(path=>p[0].files.some(f=>f.path===path))) process.exit(1);'

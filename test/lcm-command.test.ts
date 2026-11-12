@@ -1880,12 +1880,12 @@ describe("lcm command", () => {
     );
 
     const status = await fixture.command.handler(createCommandContext("status", { sessionKey }));
-    expect(status.text).toContain("transcript gaps: 2 gap(s) in 1 conversation(s) · 287 unstored entries · largest 280");
-    expect(status.text).toContain("transcript gaps: 2 gap(s) · 287 unstored entries · largest 280");
+    expect(status.text).toContain("transcript gaps: 2 gap(s) in 1 conversation(s) · 287 historically claimed entries · largest 280");
+    expect(status.text).toContain("transcript gaps: 2 gap(s) · 287 historically claimed entries · largest 280");
 
     const doctor = await fixture.command.handler(createCommandContext("doctor", { sessionKey }));
     expect(doctor.text).toContain("**🕳️ Transcript history gaps**");
-    expect(doctor.text).toContain("this conversation: 2 gap(s) · 287 unstored entries · largest 280");
+    expect(doctor.text).toContain("this conversation: 2 gap(s) · 287 historically claimed entries · largest 280");
     expect(doctor.text).toMatch(/- visible seq 10–289: 280 entries \(source legacy-migration, detected [^)]+\)\n\s+- visible seq 400–406: 7 entries/);
 
     const unresolved = await fixture.command.handler(createCommandContext("doctor"));
