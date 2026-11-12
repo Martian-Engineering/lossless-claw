@@ -6,6 +6,7 @@ import type { OpenClawPluginApi } from "../src/openclaw-bridge.js";
 import lcmPlugin from "../index.js";
 import * as connectionModule from "../src/db/connection.js";
 import { closeLcmConnection } from "../src/db/connection.js";
+import { sessionMaintenanceGate } from "../src/session-maintenance.js";
 import { LcmContextEngine } from "../src/engine.js";
 import { clearAllSharedInit } from "../src/plugin/shared-init.js";
 import { resetStartupBannerLogsForTests } from "../src/startup-banner-log.js";
@@ -362,6 +363,35 @@ describe("lcm plugin registration", () => {
     expect(api.registerCommand).not.toHaveBeenCalled();
     expect(api.registerTool).not.toHaveBeenCalled();
     expect(errorLog).toHaveBeenCalledWith(expect.stringContaining("detectedHost=2026.5.1"));
+  });
+
+  it("factory-wrapper disposal settles cancelled admission without disposing another run", async () => {
+    const dbPath = join(tmpdir(), `lossless-claw-cancel-${Date.now()}-${Math.random().toString(16)}.db`);
+    dbPaths.add(dbPath);
+    const createSpy = vi.spyOn(connectionModule, "createLcmDatabaseConnection");
+    const { api, getFactory } = buildApi({ enabled: true, databasePath: dbPath });
+    lcmPlugin.register(api);
+    const factory = getFactory()!;
+    const first = await factory() as any;
+    const second = await factory() as any;
+    expect(first).not.toBe(second);
+    const db = createSpy.mock.results.find(result => result.type === "return")!.value;
+    const gate = sessionMaintenanceGate(db);
+    await first.assemble({ sessionId: "cancelled", sessionKey: "target", messages: [], tokenBudget: 128000 });
+    let entered = false;
+    const waiting = gate.exclusive("target", async () => { entered = true; });
+    await second.dispose();
+    await new Promise(resolve => setImmediate(resolve));
+    expect(entered).toBe(false);
+    await first.dispose();
+    await waiting;
+    expect(entered).toBe(true);
+    const next = await factory() as any;
+    await next.assemble({ sessionId: "next", sessionKey: "target", messages: [], tokenBudget: 128000 });
+    await first.dispose();
+    await expect(gate.exclusive("target", async () => {}, 5)).rejects.toThrow(/busy/);
+    await next.dispose();
+    await gate.exclusive("target", async () => {});
   });
 
   it("adds registered host memory supplements to context engine assembly", async () => {

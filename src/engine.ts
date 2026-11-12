@@ -5190,6 +5190,10 @@ export class LcmContextEngine implements ContextEngine {
     }
   }
 
+  createMaintenanceRunScope() {
+    return sessionMaintenanceGate(this.db).createRunScope();
+  }
+
   async dispose(): Promise<void> {
     // No-op for plugin singleton — the connection is shared across runs.
     // OpenClaw's runner calls dispose() after every run, but the plugin

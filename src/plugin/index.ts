@@ -5,6 +5,7 @@
  * full-text search, and sub-agent expansion.
  */
 import { join } from "node:path";
+import type { MaintenanceRunScope } from "../session-maintenance.js";
 import { registerContextExplorerRepair } from "../context-explorer-repair.js";
 import { registerContextExplorer } from "../context-explorer.js";
 import { writeFile } from "node:fs/promises";
@@ -187,6 +188,7 @@ async function loadSessionTranscriptRuntimeFunction<Name extends SessionTranscri
 
 /** Delegate to the LCM engine while adding host memory supplements to assemble() results. */
 class MemorySupplementContextEngine implements ContextEngine {
+  private readonly maintenanceRun?: MaintenanceRunScope;
   readonly info: ContextEngine["info"];
   readonly ingestBatch: ContextEngine["ingestBatch"];
   readonly afterTurn: ContextEngine["afterTurn"];
@@ -199,6 +201,9 @@ class MemorySupplementContextEngine implements ContextEngine {
   readonly dispose: ContextEngine["dispose"];
 
   constructor(private readonly inner: ContextEngine) {
+    this.maintenanceRun = (inner as ContextEngine & {
+      createMaintenanceRunScope?: () => MaintenanceRunScope;
+    }).createMaintenanceRunScope?.();
     const ingestBatch = inner.ingestBatch?.bind(inner);
     const afterTurn = inner.afterTurn?.bind(inner);
     const commitTurn = inner.commitTurn?.bind(inner);
@@ -209,19 +214,26 @@ class MemorySupplementContextEngine implements ContextEngine {
     const control = inner.control?.bind(inner);
     const dispose = inner.dispose?.bind(inner);
     this.info = inner.info;
-    this.ingestBatch = ingestBatch ? (params) => ingestBatch(params) : undefined;
-    this.afterTurn = afterTurn ? (params) => afterTurn(params) : undefined;
-    this.commitTurn = commitTurn ? (params) => commitTurn(params) : undefined;
+    this.ingestBatch = ingestBatch ? (params) => this.inRun(() => ingestBatch(params)) : undefined;
+    this.afterTurn = afterTurn ? (params) => this.inRun(() => afterTurn(params)) : undefined;
+    this.commitTurn = commitTurn ? (params) => this.inRun(() => commitTurn(params)) : undefined;
     this.prepareSubagentSpawn = prepareSubagentSpawn
       ? (params) => prepareSubagentSpawn(params)
       : undefined;
     this.onSubagentEnded = onSubagentEnded ? (params) => onSubagentEnded(params) : undefined;
-    this.maintain = maintain ? (params) => maintain(params) : undefined;
+    this.maintain = maintain ? (params) => this.inRun(() => maintain(params)) : undefined;
     this.getControlCapabilities = getControlCapabilities
       ? () => getControlCapabilities()
       : undefined;
     this.control = control ? (params) => control(params) : undefined;
-    this.dispose = dispose ? () => dispose() : undefined;
+    this.dispose = async () => {
+      try { await dispose?.(); }
+      finally { this.maintenanceRun?.dispose(); }
+    };
+  }
+
+  private inRun<T>(operation: () => T): T {
+    return this.maintenanceRun ? this.maintenanceRun.run(operation) : operation();
   }
 
   get config(): unknown {
@@ -253,19 +265,19 @@ class MemorySupplementContextEngine implements ContextEngine {
   }
 
   bootstrap(params: Parameters<ContextEngine["bootstrap"]>[0]) {
-    return this.inner.bootstrap(params);
+    return this.inRun(() => this.inner.bootstrap(params));
   }
 
   ingest(params: Parameters<ContextEngine["ingest"]>[0]) {
-    return this.inner.ingest(params);
+    return this.inRun(() => this.inner.ingest(params));
   }
 
   compact(params: Parameters<ContextEngine["compact"]>[0]) {
-    return this.inner.compact(params);
+    return this.inRun(() => this.inner.compact(params));
   }
 
   async assemble(params: MemorySupplementAssembleParams): Promise<AssembleResult> {
-    const result = await this.inner.assemble(params);
+    const result = await this.inRun(() => this.inner.assemble(params));
     if (result.systemPromptAddition) {
       return result;
     }
