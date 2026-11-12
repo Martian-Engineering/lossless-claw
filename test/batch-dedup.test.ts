@@ -78,6 +78,27 @@ function toolResultMessage(content: string, toolCallId: string): AgentMessage {
   } as AgentMessage;
 }
 
+describe("BatchDeduplicator.matchHostDeliveredAssistantId", () => {
+  it.each([undefined, {}, { mediaUrls: [] }])(
+    "does not query stored messages for assistant rows without delivered media: %j",
+    async (openclawDelivery) => {
+      const store = makeConversationStore({ messages: [] });
+      store.getMessageIdByStableEventKey = vi.fn(async () => null);
+      const dedup = new BatchDeduplicator(store, {} as SummaryStore, "/tmp/lcm-batch-dedup-test");
+      const message = {
+        ...makeMessage({ role: "assistant", content: "A plain assistant reply." }),
+        responseId: "response-without-delivered-media",
+        openclawDelivery,
+      } as AgentMessage;
+
+      await expect(dedup.matchHostDeliveredAssistantId(1, message)).resolves.toBeNull();
+      expect(store.getMessageIdByStableEventKey).not.toHaveBeenCalled();
+      expect(store.getMessageById).not.toHaveBeenCalled();
+      expect(store.getMessageParts).not.toHaveBeenCalled();
+    },
+  );
+});
+
 describe("BatchDeduplicator.matchesPersistedAnchor", () => {
   it("matches an exact persisted replay", async () => {
     const dedup = makeDedup({ messages: [storedMessage("assistant", "exact reply", 1)] });
