@@ -77,6 +77,7 @@
         "freshTailCount",
         "freshTailMaxTokens",
         "maxAssemblyTokenBudget",
+        "defaultTokenBudget",
         "promptAwareEviction"
       ]
     },
@@ -344,6 +345,10 @@
     "summarySpendBackoffMs": {
       "label": "Summary Spend Backoff (ms)",
       "help": "Cooldown after the summarization spend guard opens"
+    },
+    "defaultTokenBudget": {
+      "label": "Default Token Budget",
+      "help": "Fallback only when the host supplies no token allowance (default 128000). Explicit host budgets, stricter recorded debt, and maxAssemblyTokenBudget still apply. Not a model-window declaration."
     },
     "maxAssemblyTokenBudget": {
       "label": "Max Assembly Token Budget",
@@ -712,6 +717,11 @@
         "type": "integer",
         "minimum": 1,
         "default": 1800000
+      },
+      "defaultTokenBudget": {
+        "type": "integer",
+        "minimum": 1,
+        "default": 128000
       },
       "maxAssemblyTokenBudget": {
         "type": "integer",

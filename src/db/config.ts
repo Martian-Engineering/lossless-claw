@@ -26,6 +26,7 @@ export function resolveOpenclawStateDir(env: NodeJS.ProcessEnv = process.env): s
 export const DEFAULT_CRITICAL_BUDGET_PRESSURE_RATIO = 0.90;
 export const DEFAULT_SUMMARY_CALL_WINDOW_MS = 10 * 60 * 1000;
 export const DEFAULT_SUMMARY_MAX_CALLS_PER_WINDOW = 24;
+export const DEFAULT_TOKEN_BUDGET = 128_000;
 export const DEFAULT_SUMMARY_SPEND_BACKOFF_MS = 30 * 60 * 1000;
 
 export type CacheAwareCompactionConfig = {
@@ -178,6 +179,8 @@ export type LcmConfig = {
   independentLogFile: IndependentLogFileConfig;
   /** Hard ceiling for assembly token budget — caps runtime-provided and fallback budgets. */
   maxAssemblyTokenBudget?: number;
+  /** Budget used only when no caller allowance is available (default 128000). */
+  defaultTokenBudget?: number;
   /** Maximum allowed overage factor for summaries relative to target tokens (default 3). */
   summaryMaxOverageFactor: number;
   /** Maximum token budget for deterministic fallback summaries when the LLM summarizer fails (default 512, minimum 64). */
@@ -789,6 +792,9 @@ export function resolveLcmConfigWithDiagnostics(
             ?? toPositiveInteger(toNumber(independentLogFile?.maxFileBytes))
             ?? 100 * 1024 * 1024,
       },
+      defaultTokenBudget:
+        toStrictPositiveInteger(parseFiniteNumber(env.LCM_DEFAULT_TOKEN_BUDGET))
+          ?? toStrictPositiveInteger(toNumber(pc.defaultTokenBudget)) ?? DEFAULT_TOKEN_BUDGET,
       maxAssemblyTokenBudget:
         parseFiniteInt(env.LCM_MAX_ASSEMBLY_TOKEN_BUDGET)
           ?? toNumber(pc.maxAssemblyTokenBudget) ?? undefined,
@@ -866,4 +872,12 @@ export function resolveLcmConfig(
   pluginConfig?: Record<string, unknown>,
 ): LcmConfig {
   return resolveLcmConfigWithDiagnostics(env, pluginConfig).config;
+}
+
+/** Defensive fallback for programmatic configs as well as resolved plugin config. */
+export function resolveDefaultTokenBudget(config: Pick<LcmConfig, "defaultTokenBudget">): number {
+  const value = config.defaultTokenBudget;
+  return typeof value === "number" && Number.isInteger(value) && value >= 1
+    ? value
+    : DEFAULT_TOKEN_BUDGET;
 }
