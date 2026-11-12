@@ -1,3 +1,4 @@
+import type { SummaryRepository as SummaryStore } from "./store/ports.js";
 import type { DatabaseSync } from "node:sqlite";
 import { buildMessageParts, toStoredMessage } from "./message-content.js";
 import type { AgentMessage } from "./openclaw-bridge.js";
@@ -9,20 +10,30 @@ import {
   extractRawIdsFromPartMetadata,
 } from "./replay-metadata.js";
 import { buildMessageIdentityHash } from "./store/message-identity.js";
-import type { SummaryStore } from "./store/summary-store.js";
 import { asRecord, safeString } from "./value-utils.js";
 
-export async function filterPersistedRawIdReplayBatch(params: {
-  db: DatabaseSync;
-  summaryStore: SummaryStore;
-  largeFilesDir: string;
-  log: { warn(message: string): void };
-  sessionContext: string;
-  conversationId: number;
-  sessionId: string;
-  sessionKey?: string;
-  messages: AgentMessage[];
-}): Promise<AgentMessage[]> {
+export type RawReplayCoverage = {
+  find(
+    conversationId: number,
+    role: string,
+    rawId: string,
+    identityHash?: string,
+  ): Promise<Array<{ messageId: number }>>;
+  externalized(
+    conversationId: number,
+    role: string,
+    rawId: string,
+  ): Promise<
+    Array<{
+      messageId: number;
+      fileId: unknown;
+      originalByteSize: unknown;
+      metadata: string | null;
+    }>
+  >;
+  parts(messageId: number): Promise<Array<{ metadata: string | null }>>;
+};
+function sqliteCoverage(db: DatabaseSync): RawReplayCoverage {
   const idMatchPredicate = `(
     json_extract(mp.metadata, '$.raw.id') = ?
     OR json_extract(mp.metadata, '$.raw.call_id') = ?
@@ -38,7 +49,7 @@ export async function filterPersistedRawIdReplayBatch(params: {
     OR json_extract(mp.metadata, '$.toolUseId') = ?
     OR json_extract(mp.metadata, '$.tool_use_id') = ?
   )`;
-  const rawCoverageStmt = params.db.prepare(
+  const rawCoverageStmt = db.prepare(
     `SELECT m.message_id AS messageId
      FROM message_parts mp
      JOIN messages m ON m.message_id = mp.message_id
@@ -48,7 +59,7 @@ export async function filterPersistedRawIdReplayBatch(params: {
        AND json_valid(mp.metadata)
        AND ${idMatchPredicate}`,
   );
-  const identityCoverageStmt = params.db.prepare(
+  const identityCoverageStmt = db.prepare(
     `SELECT m.message_id AS messageId
      FROM message_parts mp
      JOIN messages m ON m.message_id = mp.message_id
@@ -59,7 +70,7 @@ export async function filterPersistedRawIdReplayBatch(params: {
        AND json_valid(mp.metadata)
        AND ${idMatchPredicate}`,
   );
-  const externalizedCoverageStmt = params.db.prepare(
+  const externalizedCoverageStmt = db.prepare(
     `SELECT
        m.message_id AS messageId,
        json_extract(mp.metadata, '$.externalizedFileId') AS fileId,
@@ -74,12 +85,52 @@ export async function filterPersistedRawIdReplayBatch(params: {
        AND json_extract(mp.metadata, '$.externalizationReason') = 'large_tool_result'
        AND ${idMatchPredicate}`,
   );
-  const rawBlockSignatureStmt = params.db.prepare(
+  const rawBlockSignatureStmt = db.prepare(
     `SELECT metadata
      FROM message_parts
      WHERE message_id = ?
      ORDER BY ordinal ASC`,
   );
+
+  const ids = (id: string) => Array.from({ length: 13 }, () => id);
+  return {
+    async find(cid, role, id, identityHash) {
+      return (
+        identityHash === undefined
+          ? rawCoverageStmt.all(cid, role, ...ids(id))
+          : identityCoverageStmt.all(cid, role, identityHash, ...ids(id))
+      ) as Array<{ messageId: number }>;
+    },
+    async externalized(cid, role, id) {
+      return externalizedCoverageStmt.all(cid, role, ...ids(id)) as Array<{
+        messageId: number;
+        fileId: unknown;
+        originalByteSize: unknown;
+        metadata: string | null;
+      }>;
+    },
+    async parts(id) {
+      return rawBlockSignatureStmt.all(id) as Array<{
+        metadata: string | null;
+      }>;
+    },
+  };
+}
+
+export async function filterPersistedRawIdReplayBatch(params: {
+  db?: DatabaseSync;
+  coverage?: RawReplayCoverage;
+  summaryStore: SummaryStore;
+  largeFilesDir: string;
+  log: { warn(message: string): void };
+  sessionContext: string;
+  conversationId: number;
+  sessionId: string;
+  sessionKey?: string;
+  messages: AgentMessage[];
+}): Promise<AgentMessage[]> {
+  if(!params.coverage&&!params.db)throw new Error("Replay coverage storage is required");
+  const coverage=params.coverage??sqliteCoverage(params.db!);
 
   const filtered: AgentMessage[] = [];
   let replayedMessages = 0;
@@ -125,37 +176,14 @@ export async function filterPersistedRawIdReplayBatch(params: {
     const externalizedTextsById = extractPlainToolReplayTextsById(message);
     const coverageByMessageId = new Map<number, Set<string>>();
     for (const rawId of matchedIds) {
-      const rawIdArgs = [
+      const rows = await coverage.find(
+        params.conversationId,
+        stored.role,
         rawId,
-        rawId,
-        rawId,
-        rawId,
-        rawId,
-        rawId,
-        rawId,
-        rawId,
-        rawId,
-        rawId,
-        rawId,
-        rawId,
-        rawId,
-      ];
-      let rows: Array<{ messageId: number }>;
-      if (canMatchWithoutIdentity) {
-        rows = rawCoverageStmt.all(
-          params.conversationId,
-          stored.role,
-          ...rawIdArgs,
-        ) as Array<{ messageId: number }>;
-      } else {
-        const identityHash = buildMessageIdentityHash(stored.role, stored.content);
-        rows = identityCoverageStmt.all(
-          params.conversationId,
-          stored.role,
-          identityHash,
-          ...rawIdArgs,
-        ) as Array<{ messageId: number }>;
-      }
+        canMatchWithoutIdentity
+          ? undefined
+          : buildMessageIdentityHash(stored.role, stored.content),
+      );
       for (const row of rows) {
         const matchedRawIds = coverageByMessageId.get(row.messageId) ?? new Set<string>();
         matchedRawIds.add(rawId);
@@ -169,7 +197,7 @@ export async function filterPersistedRawIdReplayBatch(params: {
         if (rawIds.size !== matchedIds.size) {
           continue;
         }
-        const rows = rawBlockSignatureStmt.all(messageId) as Array<{ metadata: string | null }>;
+        const rows = await coverage.parts(messageId);
         if (rows.length !== parts.length) {
           continue;
         }
@@ -240,7 +268,7 @@ export async function filterPersistedRawIdReplayBatch(params: {
         if (rawIds.size !== matchedIds.size) {
           continue;
         }
-        const rows = rawBlockSignatureStmt.all(messageId) as Array<{ metadata: string | null }>;
+        const rows = await coverage.parts(messageId);
         if (
           rows.length === parts.length &&
           rows.every((row, index) => row.metadata === (parts[index]?.metadata ?? null))
@@ -267,31 +295,7 @@ export async function filterPersistedRawIdReplayBatch(params: {
         }
         const incomingPartMetadata = parts[incomingPartIndex]?.metadata;
         const externalizedByteSize = Buffer.byteLength(externalizedText, "utf8");
-        const rawIdArgs = [
-          rawId,
-          rawId,
-          rawId,
-          rawId,
-          rawId,
-          rawId,
-          rawId,
-          rawId,
-          rawId,
-          rawId,
-          rawId,
-          rawId,
-          rawId,
-        ];
-        const rows = externalizedCoverageStmt.all(
-          params.conversationId,
-          stored.role,
-          ...rawIdArgs,
-        ) as Array<{
-          messageId: number;
-          fileId: unknown;
-          originalByteSize: unknown;
-          metadata: string | null;
-        }>;
+        const rows=await coverage.externalized(params.conversationId,stored.role,rawId);
         for (const row of rows) {
           if (
             typeof row.fileId !== "string" ||

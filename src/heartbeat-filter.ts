@@ -1,3 +1,4 @@
+import type { ConversationRepository as ConversationStore } from "./store/ports.js";
 /**
  * Detection and filtering of synthetic heartbeat turns in transcripts.
  *
@@ -5,7 +6,6 @@
  */
 import { toStoredMessage } from "./message-content.js";
 import type { AgentMessage } from "./openclaw-bridge.js";
-import type { ConversationStore } from "./store/conversation-store.js";
 
 export const HEARTBEAT_OK_TOKEN = "heartbeat_ok";
 

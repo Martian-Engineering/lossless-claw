@@ -31,7 +31,7 @@ describe("delegated own-conversation authorization", () => {
     const { fts5Available } = getLcmDbFeatures(db);
     runLcmMigrations(db, { fts5Available });
     store = new ConversationStore(db, { fts5Available });
-    lcm = { getConversationStore: () => store } as LcmContextEngine;
+    lcm = { getConversationStore: () => store } as unknown as LcmContextEngine;
 
     // Separate identities exercise the real store's key and runtime-ID lookups.
     parentId = (await store.createConversation({

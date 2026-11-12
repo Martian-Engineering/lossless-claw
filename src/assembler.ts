@@ -1,13 +1,20 @@
+import type {
+  ConversationRepository as ConversationStore,
+  FocusBriefRepository as FocusBriefStore,
+  SummaryRepository as SummaryStore,
+} from "./store/ports.js";
 import { createHash } from "node:crypto";
 import type { ContextEngine } from "./openclaw-bridge.js";
 import { sanitizeToolUseResultPairing } from "./transcript-repair.js";
 import type {
-  ConversationStore,
   MessagePartRecord,
   MessageRole,
 } from "./store/conversation-store.js";
-import type { FocusBriefRecord, FocusBriefStore } from "./store/focus-brief-store.js";
-import type { SummaryStore, ContextItemRecord, SummaryRecord } from "./store/summary-store.js";
+import type { FocusBriefRecord } from "./store/focus-brief-store.js";
+import type {
+  ContextItemRecord,
+  SummaryRecord,
+} from "./store/summary-store.js";
 import { estimateTokens } from "./estimate-tokens.js";
 import { formatToolOutputReference } from "./large-files.js";
 import { serializeOpenClawSenderMetadata } from "./openclaw-sender-metadata.js";
@@ -1521,6 +1528,11 @@ export class ContextAssembler {
    * 5. Return the final ordered messages in chronological order.
    */
   async assemble(input: AssembleContextInput): Promise<AssembleContextResult> {
+    return this.summaryStore.withReadSnapshot
+      ? this.summaryStore.withReadSnapshot(() => this.assembleCommitted(input))
+      : this.assembleCommitted(input);
+  }
+  private async assembleCommitted(input: AssembleContextInput): Promise<AssembleContextResult> {
     const { conversationId, tokenBudget } = input;
     const freshTailCount = input.freshTailCount ?? 8;
 
@@ -1534,6 +1546,8 @@ export class ContextAssembler {
         stats: { rawMessageCount: 0, summaryCount: 0, totalContextItems: 0 },
       };
     }
+
+    await this.summaryStore.prefetchContextItems?.(contextItems);
 
     // Step 2: Resolve each context item into a ResolvedItem, then apply any
     // active focus overlay without mutating canonical context_items rows.

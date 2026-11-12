@@ -20,7 +20,7 @@
     "dag"
   ],
   "scripts": {
-    "build": "npm run build:plugin && npm run build:migrate-sessions && npm run build:cli && npm run build:ui",
+    "build": "npm run build:plugin && npm run build:migrate-sessions && npm run build:cli && npm run build:ui && npm run build:turbopuffer-native && npm run build:native-engine",
     "build:plugin": "esbuild index.ts --bundle --platform=node --target=node22 --format=esm --outfile=dist/index.js --external:openclaw --external:\"@earendil-works/*\" --minify-whitespace",
     "build:migrate-sessions": "esbuild src/cli/migrate-sessions.ts --bundle --platform=node --target=node22 --format=esm --outfile=dist/migrate-sessions.js --external:openclaw --external:\"@earendil-works/*\" --minify-whitespace",
     "build:cli": "esbuild cli.ts --bundle --platform=node --target=node22 --format=esm --outfile=dist/cli.js --minify-whitespace",
@@ -31,7 +31,9 @@
     "test:tui": "cd tui && go test ./...",
     "typecheck": "tsc --noEmit --pretty false && tsc -p tsconfig.ui.json",
     "version-packages": "changeset version",
-    "build:ui": "esbuild ui/control-ui.ts --bundle --platform=browser --target=es2022 --format=esm --outfile=dist/control-ui/index.js --minify"
+    "build:ui": "esbuild ui/control-ui.ts --bundle --platform=browser --target=es2022 --format=esm --outfile=dist/control-ui/index.js --minify",
+    "build:turbopuffer-native": "esbuild src/storage/turbopuffer-native/index.ts --bundle --platform=node --target=node22 --format=esm --outfile=dist/experimental/turbopuffer-native.js --metafile=dist/experimental/turbopuffer-native.meta.json",
+    "build:native-engine": "esbuild src/engine.ts --bundle --platform=node --target=node22 --format=esm --outfile=dist/experimental/turbopuffer-engine.js --external:openclaw --external:\"@earendil-works/*\""
   },
   "files": [
     "dist/",
@@ -42,7 +44,9 @@
     "docs/",
     "!docs/superpowers/",
     "README.md",
-    "LICENSE"
+    "LICENSE",
+    "!docs/experiments/turbopuffer-native/evidence/",
+    "!dist/experimental/turbopuffer-fake-host.js"
   ],
   "dependencies": {
     "@sinclair/typebox": "0.34.48"

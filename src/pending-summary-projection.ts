@@ -1,10 +1,16 @@
+import type {
+  ConversationRepository as ConversationStore,
+  SummaryRepository as SummaryStore,
+} from "./store/ports.js";
 import { createHash } from "node:crypto";
 import {
   resolvePendingFreshTailOrdinal,
   type PendingSummaryPlannerSnapshotItem,
 } from "./pending-summary-planner.js";
-import type { ConversationStore } from "./store/conversation-store.js";
-import type { ContextItemRecord, SummaryRecord, SummaryStore } from "./store/summary-store.js";
+import type {
+  ContextItemRecord,
+  SummaryRecord,
+} from "./store/summary-store.js";
 
 export type ProjectionSnapshot = {
   items: PendingSummaryPlannerSnapshotItem[];

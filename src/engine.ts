@@ -1,3 +1,28 @@
+import {
+  NativeDatabase,
+  NativeConversationStore,
+  NativeSummaryStore,
+  NativePendingSummaryStore,
+  NativeFocusBriefStore,
+  NativeCompactionMaintenanceStore,
+  NativeCompactionTelemetryStore,
+  NativeTranscriptCursorStore,
+  NativeUserReplayKeyStore,
+  NativeTranscriptGapStore,
+} from "./storage/turbopuffer-native/index.js";
+import { NativeExpansionAuthorization } from "./storage/turbopuffer-native/authorization.js";
+import { nativeReplayCoverage } from "./storage/turbopuffer-native/replay-coverage.js";
+import { digest as nativeDigest } from "./storage/turbopuffer-native/codec.js";
+import type {
+  ConversationRepository,
+  SummaryRepository,
+  PendingSummaryRepository,
+  FocusBriefRepository,
+  CompactionTelemetryRepository,
+  CompactionMaintenanceRepository,
+  TranscriptCursorRepository,
+  UserReplayKeyRepository,
+} from "./store/ports.js";
 import { createHash } from "node:crypto";
 import { join } from "node:path";
 import type { DatabaseSync } from "node:sqlite";
@@ -467,14 +492,14 @@ export class LcmContextEngine implements ContextEngine {
     };
   }
 
-  private conversationStore: ConversationStore;
-  private summaryStore: SummaryStore;
-  private pendingSummaryStore: PendingSummaryStore;
-  private focusBriefStore: FocusBriefStore;
-  private compactionTelemetryStore: CompactionTelemetryStore;
-  private compactionMaintenanceStore: CompactionMaintenanceStore;
-  private transcriptCursorStore: TranscriptCursorStore;
-  private userReplayKeyStore: UserReplayKeyStore;
+  private conversationStore: ConversationRepository;
+  private summaryStore: SummaryRepository;
+  private pendingSummaryStore: PendingSummaryRepository;
+  private focusBriefStore: FocusBriefRepository;
+  private compactionTelemetryStore: CompactionTelemetryRepository;
+  private compactionMaintenanceStore: CompactionMaintenanceRepository;
+  private transcriptCursorStore: TranscriptCursorRepository;
+  private userReplayKeyStore: UserReplayKeyRepository;
   /** Single transcript writer; null when the host exposes no visible-delta reader. */
   private transcriptDeltaSync: TranscriptDeltaSync | null;
   private missingTranscriptDeltaReaderReported = false;
@@ -483,7 +508,9 @@ export class LcmContextEngine implements ContextEngine {
   private assembler: ContextAssembler;
   private compaction: CompactionEngine;
   private retrieval: RetrievalEngine;
-  private readonly db: DatabaseSync;
+  private readonly db: DatabaseSync | null;
+  private readonly nativeDatabase: NativeDatabase | null;
+  private readonly nativeAuth: NativeExpansionAuthorization | null;
   private migrated = false;
   private readonly fts5Available: boolean = false;
   private readonly ignoreSessionPatterns: RegExp[];
@@ -516,48 +543,66 @@ export class LcmContextEngine implements ContextEngine {
   // ── Scoped context-threshold override resolution ─────────────────────────
   private readonly contextThresholdResolver: ContextThresholdResolver;
 
-  constructor(deps: LcmDependencies, database: DatabaseSync) {
+  constructor(deps: LcmDependencies, database: DatabaseSync | NativeDatabase) {
     this.deps = deps;
     this.config = deps.config;
     this.compactionGuards = new CompactionGuards(this.config, this.deps);
-    this.ignoreSessionPatterns = compileSessionPatterns(this.config.ignoreSessionPatterns);
-    this.statelessSessionPatterns = compileSessionPatterns(this.config.statelessSessionPatterns);
-    this.db = database;
+    this.ignoreSessionPatterns = compileSessionPatterns(
+      this.config.ignoreSessionPatterns,
+    );
+    this.statelessSessionPatterns = compileSessionPatterns(
+      this.config.statelessSessionPatterns,
+    );
+    this.nativeDatabase = NativeDatabase.isNative(database) ? database : null;
+    this.nativeAuth = this.nativeDatabase
+      ? new NativeExpansionAuthorization(this.nativeDatabase)
+      : null;
+    this.db = NativeDatabase.isNative(database) ? null : database;
 
     // Run migrations eagerly at construction time so the schema exists
     // before any lifecycle hook fires.
-    let migrationOk = false;
+    let migrationOk = this.nativeDatabase !== null;
+    if (this.nativeDatabase) this.migrated = true;
     const migrationStartedAt = Date.now();
-    try {
-      runLcmMigrations(this.db, {
-        log: this.deps.log,
-      });
-      this.migrated = true;
+    if (this.db)
+      try {
+        runLcmMigrations(this.db!, {
+          log: this.deps.log,
+        });
+        this.migrated = true;
 
-      // Verify tables were actually created
-      const tables = this.db
-        .prepare("SELECT name FROM sqlite_master WHERE type='table'")
-        .all() as Array<{ name: string }>;
-      if (tables.length === 0) {
-        this.deps.log.warn(
-          "[lcm] Migration completed but database has zero tables — DB may be non-functional",
-        );
-      } else {
-        migrationOk = true;
-        this.deps.log.debug(
-          `[lcm] Migration run completed during engine init: duration=${formatDurationMs(Date.now() - migrationStartedAt)} fts5=${this.fts5Available}`,
-        );
-        this.deps.log.debug(
-          `[lcm] Migration successful — ${tables.length} tables: ${tables.map((t) => t.name).join(", ")}`,
+        // Verify tables were actually created
+        const tables = this.db
+          .prepare("SELECT name FROM sqlite_master WHERE type='table'")
+          .all() as Array<{ name: string }>;
+        if (tables.length === 0) {
+          this.deps.log.warn(
+            "[lcm] Migration completed but database has zero tables — DB may be non-functional",
+          );
+        } else {
+          migrationOk = true;
+          this.deps.log.debug(
+            `[lcm] Migration run completed during engine init: duration=${formatDurationMs(
+              Date.now() - migrationStartedAt,
+            )} fts5=${this.fts5Available}`,
+          );
+          this.deps.log.debug(
+            `[lcm] Migration successful — ${tables.length} tables: ${tables
+              .map((t) => t.name)
+              .join(", ")}`,
+          );
+        }
+      } catch (err) {
+        this.deps.log.error(
+          `[lcm] Migration failed after ${formatDurationMs(
+            Date.now() - migrationStartedAt,
+          )}: ${err instanceof Error ? err.message : String(err)}`,
         );
       }
-    } catch (err) {
-      this.deps.log.error(
-        `[lcm] Migration failed after ${formatDurationMs(Date.now() - migrationStartedAt)}: ${err instanceof Error ? err.message : String(err)}`,
-      );
-    }
 
-    this.fts5Available = getLcmDbFeatures(this.db).fts5Available;
+    this.fts5Available = this.db
+      ? getLcmDbFeatures(this.db).fts5Available
+      : true;
 
     // Only claim ownership of compaction when the DB is operational.
     // Without a working schema, ownsCompaction would disable the runtime's
@@ -587,14 +632,16 @@ export class LcmContextEngine implements ContextEngine {
         "agent-run":
           this.config.hostFallbackMode === "capture-only"
             ? {
-                requiredCapabilities: LOSSLESS_AGENT_RUN_CAPTURE_ONLY_HOST_CAPABILITIES,
+                requiredCapabilities:
+                  LOSSLESS_AGENT_RUN_CAPTURE_ONLY_HOST_CAPABILITIES,
                 unsupportedMessage: [
                   "lossless-claw (hostFallbackMode=capture-only) still requires the bootstrap, after-turn and maintain host capabilities for transcript capture.",
                   "This host does not provide them; switch plugins.slots.contextEngine to legacy for such runs.",
                 ].join(" "),
               }
             : {
-                requiredCapabilities: LOSSLESS_AGENT_RUN_REQUIRED_HOST_CAPABILITIES,
+                requiredCapabilities:
+                  LOSSLESS_AGENT_RUN_REQUIRED_HOST_CAPABILITIES,
                 unsupportedMessage: [
                   "lossless-claw requires a native OpenClaw runtime with the full context-engine agent-run lifecycle.",
                   "Use the native Codex or Pi embedded runtime, switch plugins.slots.contextEngine to legacy for CLI harness runs,",
@@ -602,7 +649,8 @@ export class LcmContextEngine implements ContextEngine {
                 ].join(" "),
               },
         "subagent-spawn": {
-          requiredCapabilities: LOSSLESS_SUBAGENT_SPAWN_REQUIRED_HOST_CAPABILITIES,
+          requiredCapabilities:
+            LOSSLESS_SUBAGENT_SPAWN_REQUIRED_HOST_CAPABILITIES,
           unsupportedMessage: [
             "lossless-claw-managed forked children require host thread bootstrap projection.",
             "Without it, the host may replay a raw parent JSONL branch into the child instead of the LCM-assembled compact view.",
@@ -614,7 +662,8 @@ export class LcmContextEngine implements ContextEngine {
     if (this.config.hostFallbackMode === "capture-only") {
       logStartupBannerOnce({
         key: "host-fallback-capture-only",
-        log: (message) => (this.deps.log.hostWarn ?? this.deps.log.warn)(message),
+        log: (message) =>
+          (this.deps.log.hostWarn ?? this.deps.log.warn)(message),
         message: [
           "[lcm] WARNING: hostFallbackMode=capture-only relaxes the installation-wide agent-run host requirement to bootstrap/after-turn/maintain.",
           "Generic CLI runs persist transcripts and keep recall tools, but do not receive Lossless prompt assembly or host-triggered Lossless compaction.",
@@ -624,18 +673,35 @@ export class LcmContextEngine implements ContextEngine {
       });
     }
 
-    this.conversationStore = new ConversationStore(this.db, {
-      fts5Available: this.fts5Available,
-      replayFloodThresholdExternal: this.config.replayFloodThresholdExternal,
-      replayFloodThresholdInternal: this.config.replayFloodThresholdInternal,
-      onStableEventKeyConflict: ({ conversationId, stableEventKey }) => {
-        this.deps.log.warn(
-          `[lcm] stable-event-key conflict conversation=${conversationId} key=${stableEventKey}; persisted row without stable key`,
-        );
-      },
-    });
-    this.summaryStore = new SummaryStore(this.db, { fts5Available: this.fts5Available });
-    this.pendingSummaryStore = new PendingSummaryStore(this.db);
+    this.conversationStore = this.nativeDatabase
+      ? new NativeConversationStore(this.nativeDatabase, {
+          replayFloodThresholdExternal:
+            this.config.replayFloodThresholdExternal,
+          replayFloodThresholdInternal:
+            this.config.replayFloodThresholdInternal,
+          onStableEventKeyConflict: ({ conversationId }) =>
+            this.deps.log.warn(
+              `[lcm] stable-event-key conflict conversation=${conversationId}; persisted row without stable key`,
+            ),
+        })
+      : new ConversationStore(this.db!, {
+          fts5Available: this.fts5Available,
+          replayFloodThresholdExternal:
+            this.config.replayFloodThresholdExternal,
+          replayFloodThresholdInternal:
+            this.config.replayFloodThresholdInternal,
+          onStableEventKeyConflict: ({ conversationId, stableEventKey }) => {
+            this.deps.log.warn(
+              `[lcm] stable-event-key conflict conversation=${conversationId} key=${stableEventKey}; persisted row without stable key`,
+            );
+          },
+        });
+    this.summaryStore = this.nativeDatabase
+      ? new NativeSummaryStore(this.nativeDatabase)
+      : new SummaryStore(this.db!, { fts5Available: this.fts5Available });
+    this.pendingSummaryStore = this.nativeDatabase
+      ? new NativePendingSummaryStore(this.nativeDatabase)
+      : new PendingSummaryStore(this.db!);
     this.largeFileInterceptor = new LargeFileInterceptor(
       this.config,
       this.summaryStore,
@@ -646,19 +712,32 @@ export class LcmContextEngine implements ContextEngine {
       this.summaryStore,
       this.config.largeFilesDir,
     );
-    this.focusBriefStore = new FocusBriefStore(this.db);
-    this.compactionTelemetryStore = new CompactionTelemetryStore(this.db);
-    this.compactionMaintenanceStore = new CompactionMaintenanceStore(this.db);
-    this.transcriptCursorStore = new TranscriptCursorStore(this.db);
-    this.userReplayKeyStore = new UserReplayKeyStore(this.db);
-    this.transcriptDeltaSync = this.deps.readSessionTranscriptVisibleMessageDelta
+    this.focusBriefStore = this.nativeDatabase
+      ? new NativeFocusBriefStore(this.nativeDatabase)
+      : new FocusBriefStore(this.db!);
+    this.compactionTelemetryStore = this.nativeDatabase
+      ? new NativeCompactionTelemetryStore(this.nativeDatabase)
+      : new CompactionTelemetryStore(this.db!);
+    this.compactionMaintenanceStore = this.nativeDatabase
+      ? new NativeCompactionMaintenanceStore(this.nativeDatabase)
+      : new CompactionMaintenanceStore(this.db!);
+    this.transcriptCursorStore = this.nativeDatabase
+      ? new NativeTranscriptCursorStore(this.nativeDatabase)
+      : new TranscriptCursorStore(this.db!);
+    this.userReplayKeyStore = this.nativeDatabase
+      ? new NativeUserReplayKeyStore(this.nativeDatabase)
+      : new UserReplayKeyStore(this.db!);
+    this.transcriptDeltaSync = this.deps
+      .readSessionTranscriptVisibleMessageDelta
       ? new TranscriptDeltaSync({
           readVisibleDelta: this.deps.readSessionTranscriptVisibleMessageDelta,
           readRawDelta: this.deps.readSessionTranscriptRawDelta,
           cursorStore: this.transcriptCursorStore,
           conversationStore: this.conversationStore,
           replayKeyStore: this.userReplayKeyStore,
-          gapStore: new TranscriptGapStore(this.db),
+          gapStore: this.nativeDatabase
+            ? new NativeTranscriptGapStore(this.nativeDatabase)
+            : new TranscriptGapStore(this.db!),
           log: this.deps.log,
         })
       : null;
@@ -683,19 +762,30 @@ export class LcmContextEngine implements ContextEngine {
       );
       logStartupBannerOnce({
         key: "ignore-session-patterns",
-        log: (message) => (this.deps.log.hostInfo ?? this.deps.log.info)(message),
-        message: `[lcm] Ignoring sessions matching ${this.config.ignoreSessionPatterns.length} pattern(s) from ${source}: ${this.config.ignoreSessionPatterns.join(", ")}`,
+        log: (message) =>
+          (this.deps.log.hostInfo ?? this.deps.log.info)(message),
+        message: `[lcm] Ignoring sessions matching ${
+          this.config.ignoreSessionPatterns.length
+        } pattern(s) from ${source}: ${this.config.ignoreSessionPatterns.join(
+          ", ",
+        )}`,
       });
     }
     if (this.config.statelessSessionPatterns.length > 0) {
       const source = describeLcmConfigSource(
-        this.deps.configDiagnostics?.statelessSessionPatternsSource ?? "default",
+        this.deps.configDiagnostics?.statelessSessionPatternsSource ??
+          "default",
       );
-      const enforcement = this.config.skipStatelessSessions ? "" : " (skipStatelessSessions=false)";
+      const enforcement = this.config.skipStatelessSessions
+        ? ""
+        : " (skipStatelessSessions=false)";
       logStartupBannerOnce({
         key: "stateless-session-patterns",
-        log: (message) => (this.deps.log.hostInfo ?? this.deps.log.info)(message),
-        message: `[lcm] Stateless session patterns${enforcement} from ${source}: ${this.config.statelessSessionPatterns.length} pattern(s): ${this.config.statelessSessionPatterns.join(", ")}`,
+        log: (message) =>
+          (this.deps.log.hostInfo ?? this.deps.log.info)(message),
+        message: `[lcm] Stateless session patterns${enforcement} from ${source}: ${
+          this.config.statelessSessionPatterns.length
+        } pattern(s): ${this.config.statelessSessionPatterns.join(", ")}`,
       });
     }
     this.assembler = new ContextAssembler(
@@ -734,7 +824,10 @@ export class LcmContextEngine implements ContextEngine {
       compactionConfig,
       this.deps.log,
     );
-    this.retrieval = new RetrievalEngine(this.conversationStore, this.summaryStore);
+    this.retrieval = new RetrievalEngine(
+      this.conversationStore,
+      this.summaryStore,
+    );
   }
 
   /**
@@ -789,7 +882,7 @@ export class LcmContextEngine implements ContextEngine {
     }
     const migrationStartedAt = Date.now();
     this.deps.log.debug("[lcm] ensureMigrated: running migrations lazily");
-    runLcmMigrations(this.db, {
+    runLcmMigrations(this.db!, {
       log: this.deps.log,
     });
     this.migrated = true;
@@ -2857,7 +2950,7 @@ export class LcmContextEngine implements ContextEngine {
     const sync = this.requireTranscriptDeltaSync();
     const conversationId = params.conversation.conversationId;
     const request = this.buildTranscriptSyncRequest({ ...params, conversationId });
-    const state = this.transcriptCursorStore.get(conversationId);
+    const state = await this.transcriptCursorStore.get(conversationId);
     let outcome: TranscriptSyncOutcome;
     if (state) {
       const startedAt = Date.now();
@@ -3169,7 +3262,7 @@ export class LcmContextEngine implements ContextEngine {
     return this.withSessionQueue(
       this.resolveSessionQueueKey(sessionId, sessionKey),
       async () => {
-        if (this.findTurnAdvancementReceipt(params, payloadHash)) {
+        if (await this.findTurnAdvancementReceipt(params, payloadHash)) {
           return { status: "duplicate" as const };
         }
         const conversation = await this.conversationStore.getOrCreateConversation(sessionId, {
@@ -3193,7 +3286,7 @@ export class LcmContextEngine implements ContextEngine {
               `[lcm] commitTurn: transcript frontier seq=${facts.frontierSeq} precedes terminal position=${params.terminal.activeMessagePosition} ${sessionLabel}; committing the drained frontier`,
             );
           }
-          this.insertTurnAdvancementReceipt(params, payloadHash, facts.importedMessages);
+          await this.insertTurnAdvancementReceipt(params, payloadHash, facts.importedMessages);
         };
         if (params.isHeartbeat === true && !this.config.preserveHeartbeatPoll) {
           await this.conversationStore.withTransaction(() =>
@@ -3728,7 +3821,7 @@ export class LcmContextEngine implements ContextEngine {
               sessionKey: params.sessionKey,
             });
             messages = await filterPersistedRawIdReplayBatch({
-              db: this.db,
+              ...(this.nativeDatabase?{coverage:nativeReplayCoverage(this.nativeDatabase)}:{db:this.db!}),
               summaryStore: this.summaryStore,
               largeFilesDir: this.config.largeFilesDir,
               log: this.deps.log,
@@ -4000,36 +4093,74 @@ export class LcmContextEngine implements ContextEngine {
    * Return true when this advancement key already has a receipt for the same
    * payload (current or beta.1 hash); throw on a key reused with a different payload.
    */
-  private findTurnAdvancementReceipt(params: CommitTurnParams, payloadHash: string): boolean {
-    const existing = this.db
-      .prepare(
-        `SELECT payload_hash
+  private async findTurnAdvancementReceipt(
+    params: CommitTurnParams,
+    payloadHash: string,
+  ): Promise<boolean> {
+    if (this.nativeDatabase) {
+      const row = await this.nativeDatabase.read((view) =>
+        view.get<{ payloadHash: string }>(
+          `turns/${nativeDigest(params.advancementKey)}`,
+        ),
+      );
+      if (!row) return false;
+      if (
+        row.payloadHash !== payloadHash &&
+        row.payloadHash !==
+          buildTurnAdvancementPayloadHash(
+            params,
+            params.admission.activeMessagePosition,
+          )
+      )
+        throw new Error(
+          `context-engine advancement key collision: ${params.advancementKey}`,
+        );
+      return true;
+    }
+    const existing = this.db!.prepare(
+      `SELECT payload_hash
          FROM turn_advancements
          WHERE advancement_key = ?`,
-      )
-      .get(params.advancementKey) as { payload_hash: string } | undefined;
+    ).get(params.advancementKey) as { payload_hash: string } | undefined;
     if (!existing) {
       return false;
     }
     if (
       existing.payload_hash !== payloadHash &&
       existing.payload_hash !==
-        buildTurnAdvancementPayloadHash(params, params.admission.activeMessagePosition)
+        buildTurnAdvancementPayloadHash(
+          params,
+          params.admission.activeMessagePosition,
+        )
     ) {
-      throw new Error(`context-engine advancement key collision: ${params.advancementKey}`);
+      throw new Error(
+        `context-engine advancement key collision: ${params.advancementKey}`,
+      );
     }
     return true;
   }
 
   /** Record the idempotency receipt for one committed turn. */
-  private insertTurnAdvancementReceipt(
+  private async insertTurnAdvancementReceipt(
     params: CommitTurnParams,
     payloadHash: string,
     messageCount: number,
-  ): void {
-    this.db
-      .prepare(
-        `INSERT INTO turn_advancements (
+  ): Promise<void> {
+    if (this.nativeDatabase) {
+      await this.nativeDatabase.transaction((tx) =>
+        tx.put(`turns/${nativeDigest(params.advancementKey)}`, {
+          payloadHash,
+          sessionId: params.admission.sessionId,
+          sessionKey: params.admission.sessionKey,
+          admissionEntryId: params.admission.entryId,
+          terminalEntryId: params.terminal.entryId,
+          messageCount,
+        }),
+      );
+      return;
+    }
+    this.db!.prepare(
+      `INSERT INTO turn_advancements (
            advancement_key,
            payload_hash,
            session_id,
@@ -4038,16 +4169,15 @@ export class LcmContextEngine implements ContextEngine {
            terminal_entry_id,
            message_count
          ) VALUES (?, ?, ?, ?, ?, ?, ?)`,
-      )
-      .run(
-        params.advancementKey,
-        payloadHash,
-        params.admission.sessionId,
-        params.admission.sessionKey,
-        params.admission.entryId,
-        params.terminal.entryId,
-        messageCount,
-      );
+    ).run(
+      params.advancementKey,
+      payloadHash,
+      params.admission.sessionId,
+      params.admission.sessionKey,
+      params.admission.entryId,
+      params.terminal.entryId,
+      messageCount,
+    );
   }
 
   /**
@@ -4309,7 +4439,7 @@ export class LcmContextEngine implements ContextEngine {
     // Split stored observations into restorable identities and unobserved ids.
     const identities = new Map<string, UserReplayIdentity>();
     const unobserved: string[] = [];
-    for (const state of this.userReplayKeyStore.listRawUserContextKeys(params.conversationId)) {
+    for (const state of await this.userReplayKeyStore.listRawUserContextKeys(params.conversationId)) {
       if (!state.observed) {
         unobserved.push(state.entryId);
       } else if (state.observed.idempotencyKey) {
@@ -4356,6 +4486,30 @@ export class LcmContextEngine implements ContextEngine {
   }
 
   async assemble(params: {
+    sessionId: string;
+    sessionKey?: string;
+    messages: AgentMessage[];
+    tokenBudget?: number;
+    /** Tool names supplied by embedded OpenClaw hosts for the current run. */
+    availableTools?: Set<string>;
+    /** Current model identifier from OpenClaw hosts that predate assemble runtimeContext. */
+    model?: string;
+    /**
+     * Incoming user prompt for this turn. Embedded OpenClaw hosts call assemble()
+     * with the pre-prompt history, adopt the returned messages, and submit this
+     * prompt afterward. Lossless also uses searchable prompt text for relevance-
+     * based eviction; absent or unsearchable text falls back to chronology.
+     */
+    prompt?: string;
+    /** Optional runtime context for override resolution (model, provider, etc.). */
+    runtimeContext?: Record<string, unknown>;
+    runtimeSettings?: ContextEngineRuntimeSettings;
+  }): Promise<AssembleResult> {
+    return this.nativeDatabase
+      ? this.nativeDatabase.read(() => this.assembleCommitted(params))
+      : this.assembleCommitted(params);
+  }
+  private async assembleCommitted(params: {
     sessionId: string;
     sessionKey?: string;
     messages: AgentMessage[];
@@ -5140,14 +5294,16 @@ export class LcmContextEngine implements ContextEngine {
         : undefined;
 
     // Inherit scope from parent grant if one exists (prevents privilege escalation)
-    const parentGrantId = resolveDelegatedExpansionGrantId(parentSessionKey);
+    const parentGrantId = this.nativeAuth
+      ? await this.nativeAuth.resolveSessionGrantId(parentSessionKey)
+      : resolveDelegatedExpansionGrantId(parentSessionKey);
     const parentGrant = parentGrantId
-      ? getRuntimeExpansionAuthManager().getGrant(parentGrantId)
+      ? await this.getExpansionAuthorization().getGrant(parentGrantId)
       : null;
 
     const childTokenCap = parentGrant
       ? Math.min(
-          getRuntimeExpansionAuthManager().getRemainingTokenBudget(parentGrantId!) ?? this.config.maxExpandTokens,
+          (await this.getExpansionAuthorization().getRemainingTokenBudget(parentGrantId!)) ?? this.config.maxExpandTokens,
           this.config.maxExpandTokens,
         )
       : this.config.maxExpandTokens;
@@ -5160,7 +5316,7 @@ export class LcmContextEngine implements ContextEngine {
       ? parentGrant.allowedSummaryIds
       : undefined;
 
-    createDelegatedExpansionGrant({
+    await this.createExpansionGrant({
       delegatedSessionKey: childSessionKey,
       issuerSessionId: parentSessionKey,
       allowedConversationIds: [conversationId],
@@ -5171,8 +5327,8 @@ export class LcmContextEngine implements ContextEngine {
     });
 
     return {
-      rollback: () => {
-        revokeDelegatedExpansionGrantForSession(childSessionKey, { removeBinding: true });
+      rollback: async () => {
+        await this.revokeExpansionGrant(childSessionKey, { removeBinding: true });
       },
     };
   }
@@ -5194,14 +5350,16 @@ export class LcmContextEngine implements ContextEngine {
 
     switch (params.reason) {
       case "deleted":
-        revokeDelegatedExpansionGrantForSession(childSessionKey, { removeBinding: true });
+        await this.revokeExpansionGrant(childSessionKey, { removeBinding: true });
         break;
       case "completed":
-        revokeDelegatedExpansionGrantForSession(childSessionKey);
+        await this.revokeExpansionGrant(childSessionKey);
         break;
       case "released":
       case "swept":
-        removeDelegatedExpansionGrantForSession(childSessionKey);
+        if (this.nativeAuth)
+          await this.nativeAuth.removeSessionBinding(childSessionKey);
+        else removeDelegatedExpansionGrantForSession(childSessionKey);
         break;
     }
   }
@@ -5434,7 +5592,60 @@ export class LcmContextEngine implements ContextEngine {
     });
   }
 
-  async control(params: ContextEngineControlRequest): Promise<ContextEngineControlResult> {
+  getExpansionAuthorization() {
+    return this.nativeAuth ?? getRuntimeExpansionAuthManager();
+  }
+  async createExpansionGrant(
+    input: import("./expansion-auth.js").CreateDelegatedExpansionGrantInput,
+  ) {
+    return this.nativeAuth
+      ? this.nativeAuth.createDelegated(input)
+      : createDelegatedExpansionGrant(input);
+  }
+  async revokeExpansionGrant(
+    session: string,
+    options?: { removeBinding?: boolean },
+  ) {
+    return this.nativeAuth
+      ? this.nativeAuth.revokeForSession(session, options)
+      : revokeDelegatedExpansionGrantForSession(session, options);
+  }
+  async resolveExpansionGrant(session: string) {
+    return this.nativeAuth
+      ? this.nativeAuth.resolveSessionGrantId(session.trim())
+      : resolveDelegatedExpansionGrantId(session);
+  }
+  async control(
+    params: ContextEngineControlRequest,
+  ): Promise<ContextEngineControlResult> {
+    if (this.nativeDatabase) {
+      if (params.operation !== "status" && params.operation !== "doctor")
+        throw new Error("Unsupported native control operation");
+      if (params.agentId && params.agentId !== this.nativeDatabase.agentId)
+        throw new Error("Control request belongs to another native agent");
+      const conversation =
+        await this.conversationStore.getConversationForSession({
+          sessionId: params.sessionId,
+          sessionKey: params.sessionKey,
+        });
+      if (params.operation === "status")
+        return {
+          operation: "status",
+          active: conversation?.active ?? false,
+          messageCount: conversation
+            ? await this.conversationStore.getMessageCount(
+                conversation.conversationId,
+              )
+            : 0,
+        };
+      const head = await this.nativeDatabase.head(),
+        warnings: string[] = [];
+      if (head.indexedRevision < head.revision)
+        warnings.push(
+          `Native search index is behind committed revision ${head.revision}`,
+        );
+      return { operation: "doctor", ok: !warnings.length, warnings };
+    }
     return runLcmProgrammaticControl({
       operation: params.operation,
       ctx: {
@@ -5443,7 +5654,7 @@ export class LcmContextEngine implements ContextEngine {
         sessionKey: params.sessionKey,
         runtimeContext: params.runtimeContext,
       },
-      db: this.db,
+      db: this.db!,
       config: this.config,
       deps: this.deps,
       getLcm: async () => this,
@@ -5474,27 +5685,27 @@ export class LcmContextEngine implements ContextEngine {
     return this.retrieval;
   }
 
-  getConversationStore(): ConversationStore {
+  getConversationStore(): ConversationRepository {
     return this.conversationStore;
   }
 
-  getSummaryStore(): SummaryStore {
+  getSummaryStore(): SummaryRepository {
     return this.summaryStore;
   }
 
-  getPendingSummaryStore(): PendingSummaryStore {
+  getPendingSummaryStore(): PendingSummaryRepository {
     return this.pendingSummaryStore;
   }
 
-  getFocusBriefStore(): FocusBriefStore {
+  getFocusBriefStore(): FocusBriefRepository {
     return this.focusBriefStore;
   }
 
-  getCompactionTelemetryStore(): CompactionTelemetryStore {
+  getCompactionTelemetryStore(): CompactionTelemetryRepository {
     return this.compactionTelemetryStore;
   }
 
-  getCompactionMaintenanceStore(): CompactionMaintenanceStore {
+  getCompactionMaintenanceStore(): CompactionMaintenanceRepository {
     return this.compactionMaintenanceStore;
   }
 

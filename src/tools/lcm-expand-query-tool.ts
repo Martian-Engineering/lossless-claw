@@ -676,7 +676,11 @@ export function createLcmExpandQueryTool(input: {
           : input.sessionId
         )?.trim() ?? "";
       const requestId = resolveExpansionRequestId(callerSessionKey);
+      const delegatedGrantId = lcm.resolveExpansionGrant
+        ? await lcm.resolveExpansionGrant(callerSessionKey)
+        : undefined;
       const recursionCheck = evaluateExpansionRecursionGuard({
+        delegatedGrantId,
         sessionKey: callerSessionKey,
         requestId,
       });
@@ -807,7 +811,7 @@ export function createLcmExpandQueryTool(input: {
         const requesterAgentId = input.deps.normalizeAgentId(
           input.deps.parseAgentSessionKey(callerSessionKey)?.agentId,
         );
-        const childExpansionDepth = resolveNextExpansionDepth(callerSessionKey);
+        const childExpansionDepth = resolveNextExpansionDepth(callerSessionKey,delegatedGrantId);
 
         if (!conversationScope.allConversations) {
           const sourceConversationId = resolveSourceConversationId({
@@ -821,6 +825,7 @@ export function createLcmExpandQueryTool(input: {
             buckets: conversationBuckets,
           });
           const delegatedOutcome = await runDelegatedExpandQuery({
+              lcm,
             deps: input.deps,
             callerSessionKey,
             requesterAgentId,
@@ -869,6 +874,7 @@ export function createLcmExpandQueryTool(input: {
         const delegatedOutcomes = await Promise.all(
           runnableBuckets.map((bucket, index) =>
             runDelegatedExpandQuery({
+              lcm,
               deps: input.deps,
               callerSessionKey,
               requesterAgentId,

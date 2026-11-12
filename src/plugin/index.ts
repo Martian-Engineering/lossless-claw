@@ -1,3 +1,4 @@
+import { registerNativeTurbopufferPlugin } from "./turbopuffer-native.js";
 /**
  * @martian-engineering/lossless-claw — Lossless Context Management plugin for OpenClaw
  *
@@ -1722,6 +1723,18 @@ const lcmPlugin = {
     assertContextEngineRegistrationAvailable(api);
     const registrationConfig = resolveRegistrationConfig(api);
     const deps = createLcmDependencies(api, registrationConfig);
+    if(deps.config.storageBackend==="turbopuffer"){
+      registerNativeTurbopufferPlugin({
+        api,
+        deps,
+        openClawConfig: registrationConfig.openClawConfig,
+        canInitialize: canInitializeRuntimeDatabase(api),
+        wrap: (engine) => new MemorySupplementContextEngine(engine),
+        onDispose: (dispose) => readPluginLifecycle(api)?.onDispose?.(dispose),
+        recallPrompt: LOSSLESS_RECALL_POLICY_PROMPT,
+      });
+      return;
+    }
     const dbPath = deps.config.databasePath;
     const normalizedDbPath = normalizePath(dbPath);
     const allowRuntimeDatabaseInit = canInitializeRuntimeDatabase(api);

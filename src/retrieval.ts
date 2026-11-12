@@ -1,3 +1,7 @@
+import type {
+  ConversationRepository as ConversationStore,
+  SummaryRepository as SummaryStore,
+} from "./store/ports.js";
 import {
   closeSync,
   fstatSync,
@@ -8,12 +12,10 @@ import {
 } from "node:fs";
 import { resolve as resolvePath, sep as pathSep } from "node:path";
 import type {
-  ConversationStore,
   MessageRecord,
   MessageSearchResult,
 } from "./store/conversation-store.js";
 import type {
-  SummaryStore,
   SummaryRecord,
   SummarySearchResult,
   LargeFileRecord,
@@ -172,6 +174,16 @@ export class RetrievalEngine {
       largeFilesDir?: string;
     },
   ): Promise<DescribeResult | null> {
+    if (this.summaryStore.withReadSnapshot)
+      return this.summaryStore.withReadSnapshot(() =>
+        this.describeCommitted(id, options),
+      );
+    return this.describeCommitted(id, options);
+  }
+  private async describeCommitted(
+    id: string,
+    options?: Parameters<RetrievalEngine["describe"]>[1],
+  ): Promise<DescribeResult | null> {
     if (id.startsWith("sum_")) {
       return this.describeSummary(id);
     }
@@ -267,12 +279,54 @@ export class RetrievalEngine {
     // Wave-3 P3 fix: refuse expansion when largeFilesDir is unset in
     // production. Test mocks pass it explicitly; production goes through
     // configView.largeFilesDir which is always populated post-resolver.
-    if (options?.expandFile === true && file.storageUri && options.largeFilesDir) {
+    if (options?.expandFile === true && this.summaryStore.getLargeFileBytes) {
+      const maxBytes = Math.max(
+        1024,
+        Math.min(options.expandFileMaxBytes ?? 32768, 512000),
+      );
+      const bytes = await this.summaryStore.getLargeFileBytes(
+        id,
+        options.startLine === undefined ? { maxBytes: maxBytes + 4 } : {},
+      );
+      if (bytes) {
+        const startLine = Math.max(1, Math.trunc(options.startLine ?? 1)),
+          endLine =
+            options.endLine === undefined
+              ? Infinity
+              : Math.max(1, Math.trunc(options.endLine));
+        const selected =
+          options.startLine === undefined
+            ? bytes
+            : Buffer.from(
+                bytes
+                  .toString("utf8")
+                  .split("\n")
+                  .slice(startLine - 1, endLine)
+                  .join("\n"),
+              );
+        const end = truncateToValidUtf8End(
+          selected,
+          Math.min(maxBytes, selected.length),
+        );
+        content = selected.subarray(0, end).toString("utf8");
+        contentTruncated =
+          selected.length > end ||
+          (options.startLine === undefined &&
+            (file.byteSize ?? bytes.length) > end);
+      }
+    } else if (
+      options?.expandFile === true &&
+      file.storageUri &&
+      options.largeFilesDir
+    ) {
       try {
-        const maxBytes = Math.max(1024, Math.min(
-          options.expandFileMaxBytes ?? 32_768,
-          512_000, // hard cap: 500 KB regardless of caller request
-        ));
+        const maxBytes = Math.max(
+          1024,
+          Math.min(
+            options.expandFileMaxBytes ?? 32_768,
+            512_000, // hard cap: 500 KB regardless of caller request
+          ),
+        );
         // Path validation v2 (Wave-3 P1):
         //   1. realpathSync resolves symlinks. lexical resolvePath did
         //      NOT — a symlink at <storageDir>/file_x.txt -> /etc/passwd
@@ -290,11 +344,23 @@ export class RetrievalEngine {
           const fd = openSync(realTarget, "r");
           try {
             const stat = fstatSync(fd);
-            const startLine = typeof options.startLine === "number" ? Math.max(1, Math.trunc(options.startLine)) : undefined;
-            const endLine = typeof options.endLine === "number" ? Math.max(1, Math.trunc(options.endLine)) : undefined;
+            const startLine =
+              typeof options.startLine === "number"
+                ? Math.max(1, Math.trunc(options.startLine))
+                : undefined;
+            const endLine =
+              typeof options.endLine === "number"
+                ? Math.max(1, Math.trunc(options.endLine))
+                : undefined;
 
             if (startLine != null) {
-              const lineRange = readFileLineRange(fd, stat.size, startLine, endLine ?? Number.POSITIVE_INFINITY, maxBytes);
+              const lineRange = readFileLineRange(
+                fd,
+                stat.size,
+                startLine,
+                endLine ?? Number.POSITIVE_INFINITY,
+                maxBytes,
+              );
               content = lineRange.content;
               contentTruncated = lineRange.truncated;
             } else if (stat.size <= maxBytes) {
@@ -310,7 +376,11 @@ export class RetrievalEngine {
               contentTruncated = true;
             }
           } finally {
-            try { closeSync(fd); } catch { /* fd already closed */ }
+            try {
+              closeSync(fd);
+            } catch {
+              /* fd already closed */
+            }
           }
         }
       } catch {
@@ -324,7 +394,8 @@ export class RetrievalEngine {
       // while adding `messages.large_content = file_xxx`. If the backing
       // file is missing or its path no longer validates, recover the
       // payload from the message row so drilldown remains lossless.
-      const migratedMessage = await this.conversationStore.getMessageByLargeContent(id);
+      const migratedMessage =
+        await this.conversationStore.getMessageByLargeContent(id);
       if (migratedMessage && typeof migratedMessage.content === "string") {
         content = migratedMessage.content;
         contentTruncated = false;
@@ -356,6 +427,11 @@ export class RetrievalEngine {
    * Depending on `scope`, searches messages, summaries, or both (in parallel).
    */
   async grep(input: GrepInput): Promise<GrepResult> {
+    return this.summaryStore.withReadSnapshot
+      ? this.summaryStore.withReadSnapshot(() => this.grepCommitted(input))
+      : this.grepCommitted(input);
+  }
+  private async grepCommitted(input: GrepInput): Promise<GrepResult> {
     const { query, mode, scope, conversationId, conversationIds, fileIds, since, before, limit, sort, largeFilesDir, allConversations } = input;
 
     if (scope === "files") {
@@ -412,6 +488,11 @@ export class RetrievalEngine {
    * - Respects `tokenCap` and sets `truncated` when the cap is exceeded.
    */
   async expand(input: ExpandInput): Promise<ExpandResult> {
+    return this.summaryStore.withReadSnapshot
+      ? this.summaryStore.withReadSnapshot(() => this.expandCommitted(input))
+      : this.expandCommitted(input);
+  }
+  private async expandCommitted(input: ExpandInput): Promise<ExpandResult> {
     const depth = input.depth ?? 1;
     const includeMessages = input.includeMessages ?? false;
     const tokenCap = input.tokenCap ?? Infinity;

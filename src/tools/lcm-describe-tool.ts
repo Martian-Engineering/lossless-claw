@@ -243,11 +243,11 @@ export function createLcmDescribeTool(input: {
         const sessionKey =
           (typeof input.sessionKey === "string" ? input.sessionKey : input.sessionId)?.trim() ?? "";
         const delegatedGrantId = input.deps.isSubagentSessionKey(sessionKey)
-          ? (resolveDelegatedExpansionGrantId(sessionKey) ?? "")
+          ? ((typeof lcm.resolveExpansionGrant==="function"?await lcm.resolveExpansionGrant(sessionKey):resolveDelegatedExpansionGrantId(sessionKey)) ?? "")
           : "";
         const delegatedRemainingBudget =
           delegatedGrantId !== ""
-            ? getRuntimeExpansionAuthManager().getRemainingTokenBudget(delegatedGrantId)
+            ? await (lcm.getExpansionAuthorization?.()??getRuntimeExpansionAuthManager()).getRemainingTokenBudget(delegatedGrantId)
             : null;
         const defaultTokenCap = Math.max(1, Math.trunc(input.deps.config.maxExpandTokens));
         const resolvedTokenCap = (() => {

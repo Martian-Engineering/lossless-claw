@@ -117,15 +117,18 @@ export async function resolveLcmConversationScope(input: {
       : undefined;
 
   if (isDelegatedSession) {
-    const delegatedGrantId = resolveDelegatedExpansionGrantId(normalizedSessionKey!);
-    const authManager = getRuntimeExpansionAuthManager();
+    const delegatedGrantId =
+      typeof input.lcm.resolveExpansionGrant === "function"
+        ? await input.lcm.resolveExpansionGrant(normalizedSessionKey!)
+        : resolveDelegatedExpansionGrantId(normalizedSessionKey!);
+    const authManager = input.lcm.getExpansionAuthorization?.()??getRuntimeExpansionAuthManager();
     const delegatedGrant =
       delegatedGrantId != null
-        ? authManager.getGrant(delegatedGrantId)
+        ? await authManager.getGrant(delegatedGrantId)
         : null;
     if (!delegatedGrant) {
       if (delegatedGrantId) {
-        const validation = authManager.validateExpansion(delegatedGrantId, {
+        const validation = await authManager.validateExpansion(delegatedGrantId, {
           conversationId: explicitConversationId ?? 0,
           summaryIds: [],
           depth: 1,

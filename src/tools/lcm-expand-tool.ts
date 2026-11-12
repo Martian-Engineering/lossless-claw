@@ -146,7 +146,8 @@ export function createLcmExpandTool(input: {
       }
       const retrieval = lcm.getRetrieval();
       const orchestrator = new ExpansionOrchestrator(retrieval);
-      const runtimeAuthManager = getRuntimeExpansionAuthManager();
+      const runtimeAuthManager =
+        lcm.getExpansionAuthorization?.() ?? getRuntimeExpansionAuthManager();
 
       const p = params as Record<string, unknown>;
       const summaryIds = p.summaryIds as string[] | undefined;
@@ -168,10 +169,12 @@ export function createLcmExpandTool(input: {
       }
       const isDelegatedSession = input.deps.isSubagentSessionKey(sessionKey);
       const delegatedGrantId = isDelegatedSession
-        ? (resolveDelegatedExpansionGrantId(sessionKey) ?? undefined)
+        ? ((typeof lcm.resolveExpansionGrant==="function"?await lcm.resolveExpansionGrant(sessionKey):resolveDelegatedExpansionGrantId(sessionKey)) ?? undefined)
         : undefined;
       const delegatedGrant =
-        delegatedGrantId !== undefined ? runtimeAuthManager.getGrant(delegatedGrantId) : null;
+        delegatedGrantId !== undefined
+          ? await runtimeAuthManager.getGrant(delegatedGrantId)
+          : null;
       const authorizedOrchestrator =
         delegatedGrantId !== undefined ? wrapWithAuth(orchestrator, runtimeAuthManager) : null;
 
@@ -277,6 +280,7 @@ export function createLcmExpandTool(input: {
           const delegated =
             canDelegate && resolvedConversationId != null
               ? await runDelegatedExpansionLoop({
+                  lcm,
                   deps: input.deps,
                   requesterSessionKey: sessionKey,
                   conversationId: resolvedConversationId,
@@ -390,6 +394,7 @@ export function createLcmExpandTool(input: {
             resolvedConversationId != null;
           const delegated = canDelegate
             ? await runDelegatedExpansionLoop({
+                  lcm,
                 deps: input.deps,
                 requesterSessionKey: sessionKey,
                 conversationId: resolvedConversationId,

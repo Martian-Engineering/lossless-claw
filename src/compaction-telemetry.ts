@@ -1,3 +1,5 @@
+import type { CompactionTelemetryRepository as CompactionTelemetryStore } from "./store/ports.js";
+import type { CompactionMaintenanceRepository as CompactionMaintenanceStore } from "./store/ports.js";
 /**
  * Compaction telemetry recording: per-conversation cache-state telemetry
  * derived from runtime prompt-cache snapshots, leaf-compaction success
@@ -7,10 +9,8 @@
  */
 import type { ResolvedContextThreshold } from "./context-threshold.js";
 import { readRuntimeModelContext } from "./runtime-model.js";
-import type { CompactionMaintenanceStore } from "./store/compaction-maintenance-store.js";
 import {
   type CacheState,
-  type CompactionTelemetryStore,
   type ConversationCompactionTelemetryRecord,
 } from "./store/compaction-telemetry-store.js";
 import type { LcmDependencies } from "./types.js";

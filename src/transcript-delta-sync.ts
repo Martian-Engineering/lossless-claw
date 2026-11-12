@@ -1,3 +1,9 @@
+import type {
+  ConversationRepository as ConversationStore,
+  TranscriptCursorRepository as TranscriptCursorStore,
+  TranscriptGapRepository as TranscriptGapStore,
+  UserReplayKeyRepository as UserReplayKeyStore,
+} from "./store/ports.js";
 /**
  * Single-writer transcript ingestion: the host transcript is the log and LCM
  * is a projection with a persisted watermark (an opaque visible-delta cursor).
@@ -17,17 +23,15 @@ import type { AgentMessage } from "./openclaw-bridge.js";
 import { batchLooksLikeHeartbeatAckTurn } from "./heartbeat-filter.js";
 import { buildMessageParts, hasPersistableMessageRole, toStoredMessage, toStoredMessageIdentity } from "./message-content.js";
 import { extractOpenClawSenderMetadata } from "./openclaw-sender-metadata.js";
-import type { ConversationStore } from "./store/conversation-store.js";
 import { buildMessageIdentityHash } from "./store/message-identity.js";
 import type {
   ContentMatchCandidate,
   StoredTranscriptRow,
   TranscriptCursorOrigin,
   TranscriptCursorRecord,
-  TranscriptCursorStore,
 } from "./store/transcript-cursor-store.js";
-import type { TranscriptGapStore, TranscriptHistoryGap } from "./store/transcript-gap-store.js";
-import type { TranscriptUserReplayKey, UserReplayKeyStore } from "./store/user-replay-key-store.js";
+import type { TranscriptHistoryGap } from "./store/transcript-gap-store.js";
+import type { TranscriptUserReplayKey } from "./store/user-replay-key-store.js";
 import { attachTranscriptEntryMeta } from "./transcript.js";
 import { isGapEligibleMessage } from "./transcript-gap-eligibility.js";
 import {
@@ -372,10 +376,24 @@ export class TranscriptDeltaSync {
       if (scan.kind === "stop") {
         return this.stopped("resync", scan.status, counters, null, scan.detail, options.reason);
       }
-      const stored = this.deps.cursorStore.listStampedRows(request.conversationId);
+      const stored = await this.deps.cursorStore.listStampedRows(request.conversationId);
       const plan = planResync(scan.entries, stored);
-      const gaps = findHistoryGaps(scan.entries, plan.knownRows, (lowSeq, highSeq) =>
-        this.deps.cursorStore.countRowsBetweenSeq(request.conversationId, lowSeq, highSeq),
+      const pairs: Array<[number,number]> = [];
+      findHistoryGaps(scan.entries,plan.knownRows,(low,high)=>{pairs.push([low,high]);return 0;});
+      const counts=new Map<string,number>();
+      for (const [low, high] of pairs)
+        counts.set(
+          `${low}/${high}`,
+          await this.deps.cursorStore.countRowsBetweenSeq(
+            request.conversationId,
+            low,
+            high,
+          ),
+        );
+      const gaps = findHistoryGaps(
+        scan.entries,
+        plan.knownRows,
+        (low, high) => counts.get(`${low}/${high}`) ?? 0,
       );
       let newGaps = 0;
       const visibleIds = new Set(scan.entries.map((entry) => entry.entryId));
@@ -391,7 +409,7 @@ export class TranscriptDeltaSync {
           : scan.entries.length;
       const rows =
         windowStart < scan.entries.length
-          ? this.listUnclaimedRowsAfter(request, anchored ? (plan.anchorRowSeq ?? 0) : 0, visibleIds, claimed)
+          ? await this.listUnclaimedRowsAfter(request, anchored ? (plan.anchorRowSeq ?? 0) : 0, visibleIds, claimed)
           : [];
       const needsTokens = !anchored && windowStart < scan.entries.length;
       const matched =
@@ -442,8 +460,13 @@ export class TranscriptDeltaSync {
         startIndex: importStart,
         counters,
         beforeFirstPage: async (pageCounters) => {
-          newGaps += this.deps.gapStore.record(request.conversationId, gaps, options.reason);
-          this.recordScannedReplayKeys(request.conversationId, scan.entries, stored, visibleIds);
+          newGaps += await this.deps.gapStore.record(request.conversationId, gaps, options.reason);
+          await this.recordScannedReplayKeys(
+            request.conversationId,
+            scan.entries,
+            stored,
+            visibleIds,
+          );
           await this.applyPlannedRestamps(scan.entries, plan.restamps, pageCounters);
         },
         handle,
@@ -464,7 +487,7 @@ export class TranscriptDeltaSync {
         unstampedRowsBeforeAnchor:
           plan.anchorRowSeq === null
             ? 0
-            : this.deps.cursorStore.countUnstampedRowsThroughSeq(request.conversationId, plan.anchorRowSeq),
+            : await this.deps.cursorStore.countUnstampedRowsThroughSeq(request.conversationId, plan.anchorRowSeq),
         historyGaps: gaps.length,
         historyGapEntries: gaps.reduce((total, gap) => total + gap.entryCount, 0),
         newHistoryGaps: newGaps,
@@ -507,12 +530,12 @@ export class TranscriptDeltaSync {
    * entry records its current key, and stored ids that left the projection
    * record '' so assembly never restores replay identity for them.
    */
-  private recordScannedReplayKeys(
+  private async recordScannedReplayKeys(
     conversationId: number,
     entries: readonly ScannedVisibleEntry[],
     stored: ReadonlyMap<string, StoredTranscriptRow>,
     visibleIds: ReadonlySet<string>,
-  ): void {
+  ): Promise<void> {
     const keys: TranscriptUserReplayKey[] = [];
     for (const entry of entries) {
       if (entry.userReplay) {
@@ -524,7 +547,7 @@ export class TranscriptDeltaSync {
         keys.push({ entryId, idempotencyKey: "", signature: "" });
       }
     }
-    this.deps.replayKeyStore.record(conversationId, keys);
+    await this.deps.replayKeyStore.record(conversationId, keys);
   }
 
   /** Restamp rows whose stored id a visible entry declares it supersedes. */
@@ -815,9 +838,9 @@ export class TranscriptDeltaSync {
           replayKeys.push({ entryId: entry.entryId, ...userReplay });
         }
       }
-      this.deps.replayKeyStore.record(params.request.conversationId, replayKeys);
+      await this.deps.replayKeyStore.record(params.request.conversationId, replayKeys);
       pageCounters.heartbeatAck = batchLooksLikeHeartbeatAckTurn(importedMessages);
-      this.deps.cursorStore.upsert({
+      await this.deps.cursorStore.upsert({
         conversationId: params.request.conversationId,
         cursor: params.cursor,
         frontierEntryId: frontier.entryId,
@@ -905,14 +928,14 @@ export class TranscriptDeltaSync {
   }
 
   /** Stored rows after `afterSeq` whose ids left the projection or were never stamped. */
-  private listUnclaimedRowsAfter(
+  private async listUnclaimedRowsAfter(
     request: TranscriptSyncRequest,
     afterSeq: number,
     visibleIds: ReadonlySet<string>,
     claimed: ReadonlySet<number>,
-  ): ContentMatchCandidate[] {
-    return this.deps.cursorStore
-      .listContentMatchCandidatesAfterSeq(request.conversationId, afterSeq)
+  ): Promise<ContentMatchCandidate[]> {
+    return (await this.deps.cursorStore
+      .listContentMatchCandidatesAfterSeq(request.conversationId, afterSeq))
       .filter(
         (row) =>
           !claimed.has(row.messageId) &&

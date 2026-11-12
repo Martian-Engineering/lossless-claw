@@ -1,16 +1,23 @@
+import type {
+  ConversationRepository as ConversationStore,
+  PendingSummaryRepository as PendingSummaryStore,
+  SummaryRepository as SummaryStore,
+} from "./store/ports.js";
 import { createHash } from "node:crypto";
 import {
   buildPendingProjectionSnapshot,
   buildBatchSourceFingerprint,
   digestText,
 } from "./pending-summary-projection.js";
-import type { ConversationStore, MessageRecord } from "./store/conversation-store.js";
+import type { MessageRecord } from "./store/conversation-store.js";
 import type {
   PendingCompactionBatchRecord,
   PendingSummaryNodeRecord,
-  PendingSummaryStore,
 } from "./store/pending-summary-store.js";
-import type { CreateSummaryInput, SummaryRecord, SummaryStore } from "./store/summary-store.js";
+import type {
+  CreateSummaryInput,
+  SummaryRecord,
+} from "./store/summary-store.js";
 
 export type PendingSummaryPublisherOptions = {
   conversationStore: ConversationStore;

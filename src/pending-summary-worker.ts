@@ -1,3 +1,4 @@
+import type { PendingSummaryRepository as PendingSummaryStore } from "./store/ports.js";
 import type { PendingSummaryNodeRecord } from "./store/pending-summary-store.js";
 
 /**

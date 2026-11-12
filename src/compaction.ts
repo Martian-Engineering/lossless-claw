@@ -1,14 +1,20 @@
+import type {
+  ConversationRepository as ConversationStore,
+  SummaryRepository as SummaryStore,
+} from "./store/ports.js";
 import { createHash, randomUUID } from "node:crypto";
 import { resolveRecoveryTailMaxTokens, selectOverflowToolGroup } from "./overflow-tool-groups.js";
 import { contentFromParts } from "./assembler.js";
 import type {
-  ConversationStore,
   CreateMessagePartInput,
   MessagePartRecord,
   MessageRecord,
   MessageRole,
 } from "./store/conversation-store.js";
-import type { SummaryStore, SummaryRecord, ContextItemRecord } from "./store/summary-store.js";
+import type {
+  SummaryRecord,
+  ContextItemRecord,
+} from "./store/summary-store.js";
 import { estimateTokens, truncateTextToEstimatedTokens } from "./estimate-tokens.js";
 import { extractFileIdsFromContent } from "./large-files.js";
 import { NOOP_LCM_LOGGER, type LcmLogger } from "./lcm-log.js";
@@ -765,7 +771,9 @@ export class CompactionEngine {
     if (!this._contextItemsCache) this._contextItemsCache = new Map();
     this._contextItemsCacheRefCount++;
     try {
-      return await fn();
+      return await (this.summaryStore.withReadSnapshot
+        ? this.summaryStore.withReadSnapshot(fn)
+        : fn());
     } finally {
       this._contextItemsCacheRefCount--;
       if (this._contextItemsCacheRefCount <= 0) {

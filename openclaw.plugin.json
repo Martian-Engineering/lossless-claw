@@ -156,6 +156,8 @@
       "title": "Storage and logging",
       "order": 80,
       "properties": [
+        "storageBackend",
+        "turbopuffer",
         "databasePath",
         "independentLogFile"
       ]
@@ -176,6 +178,15 @@
     }
   ],
   "uiHints": {
+    "storageBackend": {
+      "label": "Storage backend",
+      "group": "storage-logging"
+    },
+    "turbopuffer": {
+      "label": "Native Turbopuffer",
+      "advanced": true,
+      "group": "storage-logging"
+    },
     "enabled": {
       "label": "Enabled",
       "help": "Enable or disable lossless-claw without uninstalling it"
@@ -483,6 +494,44 @@
     "type": "object",
     "additionalProperties": false,
     "properties": {
+      "storageBackend": {
+        "type": "string",
+        "enum": [
+          "sqlite",
+          "turbopuffer"
+        ],
+        "default": "sqlite",
+        "description": "Explicit opt-in to the native Turbopuffer backend in this fork."
+      },
+      "turbopuffer": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "organizationId",
+          "namespacePrefix"
+        ],
+        "properties": {
+          "organizationId": {
+            "type": "string",
+            "minLength": 1
+          },
+          "namespacePrefix": {
+            "type": "string",
+            "pattern": "^[A-Za-z0-9_.-]{1,50}$"
+          },
+          "region": {
+            "type": "string",
+            "default": "aws-us-east-1",
+            "pattern": "^[a-z0-9-]+$"
+          },
+          "apiKeyEnv": {
+            "type": "string",
+            "default": "LCM_TURBOPUFFER_API_KEY",
+            "pattern": "^[A-Za-z_][A-Za-z0-9_]*$"
+          }
+        },
+        "numShards": {"type":"integer","minimum":1,"maximum":256,"description":"Immutable namespace shard count; set before the first write."}
+      },
       "enabled": {
         "type": "boolean",
         "default": true
