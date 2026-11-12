@@ -133,6 +133,7 @@
       "title": "Recall",
       "order": 60,
       "properties": [
+        "conversationScopePolicy",
         "maxExpandTokens",
         "expansionModel",
         "expansionProvider",
@@ -256,6 +257,18 @@
     "maxExpandTokens": {
       "label": "Max Expand Tokens",
       "help": "Token cap for lcm_expand_query expansion calls"
+    },
+    "conversationScopePolicy": {
+      "label": "Conversation Scope Policy",
+      "help": "Optional principal confinement for recall tools in a shared database. Default unrestricted; operator-listed agents may retain global recall."
+    },
+    "conversationScopePolicy.mode": {
+      "label": "Recall Scope Mode",
+      "help": "Principal restricts recall to the host session's agent and direct/group/channel identity. Unrestricted preserves existing behavior."
+    },
+    "conversationScopePolicy.unrestrictedAgents": {
+      "label": "Unrestricted Recall Agents",
+      "help": "Exact agent IDs exempt from principal confinement. Does not widen delegated grants."
     },
     "leafMinFanout": {
       "label": "Leaf Min Fanout",
@@ -626,6 +639,22 @@
         "type": "integer",
         "minimum": 1,
         "default": 4000
+      },
+      "conversationScopePolicy": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "mode": {
+            "type": "string",
+            "enum": ["unrestricted", "principal"],
+            "default": "unrestricted"
+          },
+          "unrestrictedAgents": {
+            "type": "array",
+            "items": { "type": "string", "minLength": 1, "pattern": "^[^:]+$" },
+            "default": []
+          }
+        }
       },
       "leafMinFanout": {
         "type": "integer",

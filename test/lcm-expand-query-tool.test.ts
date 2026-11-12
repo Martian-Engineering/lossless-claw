@@ -404,7 +404,7 @@ describe("createLcmExpandQueryTool", () => {
       timeoutMs: 60_000,
     });
 
-    expect(retrieval.describe).toHaveBeenCalledWith(summaryId);
+    expect(retrieval.describe).toHaveBeenCalledWith(summaryId, { conversationIds: [42] });
     expect(delegatedMessage).toContain(`Seed summary IDs: ${summaryId}`);
     expect(delegatedMessage).toContain("What is CRABPOT_LCM_FACT?");
     expect(delegatedMessage).toContain("lcm_describe");
