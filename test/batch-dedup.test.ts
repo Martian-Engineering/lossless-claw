@@ -63,6 +63,7 @@ function storedMessage(role: string, content: string, messageId: number): Messag
     role: role as MessageRecord["role"],
     content,
     tokenCount: 1,
+    lane: "conversation",
     createdAt: new Date(),
     largeContent: null,
     transcriptEntryId: null,
