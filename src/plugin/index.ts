@@ -1397,6 +1397,7 @@ function createLcmDependencies(
       const modelRef = runtimeModelOverride?.modelRef.trim();
       const runtimeLlm = runtimeLlmComplete ?? getRuntimeLlm(api)?.complete;
       const isBoundRuntimeLlm = !!runtimeLlmComplete;
+      const effectiveReasoning = reasoning?.trim() || reasoningIfSupported?.trim();
       const requestMetadata = {
         request_provider: providerId ?? "(runtime)",
         request_model: modelId || "(runtime)",
@@ -1434,7 +1435,7 @@ function createLcmDependencies(
           // agentId. Plugin-wide api.runtime.llm.complete is gateway-scoped and rejects
           // target-agent overrides unless OpenClaw is explicitly configured otherwise.
           ...(isBoundRuntimeLlm && agentId?.trim() ? { agentId: agentId.trim() } : {}),
-          ...(reasoning !== undefined ? { reasoning } : {}),
+          ...(effectiveReasoning ? { reasoning: effectiveReasoning } : {}),
         });
         const text = typeof result.text === "string" ? result.text : "";
         return {
