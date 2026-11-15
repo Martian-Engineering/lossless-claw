@@ -1641,19 +1641,18 @@ export class LcmContextEngine implements ContextEngine {
         reason: "circuit breaker open",
       };
     }
-    // Manual and force compaction are informed consent to spend; automatic
-    // preparation passes must not burn summarizer calls while the
-    // poor-reduction spend backoff is open for this scope.
+    // The host also sets force during automatic recovery. Only an explicit
+    // manual request may reset the summarizer spend limit.
     const summarySpendScopeKey = this.compactionGuards.resolveSummarySpendScope({
       kind: "compaction",
       scope: breakerScope,
     });
-    if (!publicationOnly && (params.force === true || pendingManualCompaction)) {
+    if (!publicationOnly && pendingManualCompaction) {
       const clearedBackoffUntil =
         this.compactionGuards.clearSummarySpendBackoff(summarySpendScopeKey);
       if (clearedBackoffUntil) {
         this.deps.log.info(
-          `[lcm] compact: ${pendingManualCompaction ? "manual request" : "force compaction"} cleared summary spend backoff conversation=${params.conversationId} ${formatSessionLabel(params.sessionId, params.sessionKey)} scope=${summarySpendScopeKey} previousBackoffUntil=${clearedBackoffUntil.toISOString()}`,
+          `[lcm] compact: manual request cleared summary spend backoff conversation=${params.conversationId} ${formatSessionLabel(params.sessionId, params.sessionKey)} scope=${summarySpendScopeKey} previousBackoffUntil=${clearedBackoffUntil.toISOString()}`,
         );
       }
     } else if (!publicationOnly && this.compactionGuards.getSummarySpendBackoffUntil(summarySpendScopeKey)) {
@@ -2057,18 +2056,19 @@ export class LcmContextEngine implements ContextEngine {
       kind: "compaction",
       scope: compactionScope,
     });
-    // Clear summary spend backoff on manual compaction or force compaction.
-    // force:true is used by overflow recovery and other internal paths that
-    // should not be blocked by an active spend backoff.  Without this, a
-    // previous backoff can prevent overflow recovery from compacting, causing
-    // a context-overflow crash loop.
-    if (manualCompactionRequested || force) {
+    if (manualCompactionRequested) {
       const clearedBackoffUntil = this.compactionGuards.clearSummarySpendBackoff(summarySpendScopeKey);
       if (clearedBackoffUntil) {
         this.deps.log.info(
-          `[lcm] compact: ${manualCompactionRequested ? "manual request" : "force compaction"} cleared summary spend backoff conversation=${params.conversationId} ${sessionLabel} scope=${summarySpendScopeKey} previousBackoffUntil=${clearedBackoffUntil.toISOString()}`,
+          `[lcm] compact: manual request cleared summary spend backoff conversation=${params.conversationId} ${sessionLabel} scope=${summarySpendScopeKey} previousBackoffUntil=${clearedBackoffUntil.toISOString()}`,
         );
       }
+    } else if (this.compactionGuards.getSummarySpendBackoffUntil(summarySpendScopeKey)) {
+      return {
+        ok: false,
+        compacted: false,
+        reason: "summary spend backoff open",
+      };
     }
     let summaryAttempts = 0;
     const { summarize, summaryModel, breakerKey } = await this.resolveSummarize({

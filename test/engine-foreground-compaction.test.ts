@@ -115,6 +115,40 @@ async function prepare(engine: LcmContextEngine) {
 }
 
 describe("foreground compaction before pressure eviction", () => {
+  it.each(["budget", "threshold"] as const)(
+    "keeps automatic %s recovery from resetting the summarizer cooldown",
+    async (compactionTarget) => {
+      const { engine, complete } = fixture();
+      const { conversationId } = await seed(engine, true);
+      const sessionKey = "agent:main:" + SESSION;
+      const before = await persisted(engine, conversationId);
+      const guards = engine.getCompactionGuards();
+      const scopeKey = guards.resolveSummarySpendScope({ kind: "compaction", scope: sessionKey });
+      const backoffUntil = guards.openSummarySpendBackoff({ scopeKey, reason: "call budget exhausted" });
+      const params = {
+        sessionId: SESSION,
+        sessionKey,
+        sessionFile: createSessionFilePath(SESSION),
+        tokenBudget: BUDGET,
+        currentTokenCount: 2 * BUDGET,
+        compactionTarget,
+        force: true,
+      };
+
+      for (let retry = 0; retry < 2; retry++) {
+        expect(await engine.compact(params)).toMatchObject({
+          ok: false,
+          compacted: false,
+          reason: "summary spend backoff open",
+        });
+      }
+
+      expect(guards.getSummarySpendBackoffUntil(scopeKey)).toEqual(backoffUntil);
+      expect(complete).not.toHaveBeenCalled();
+      expect(await persisted(engine, conversationId)).toEqual(before);
+    },
+  );
+
   it("recovers missing maintenance before trimming, preserving history, lineage and the subsequent prefix", async () => {
     const { engine, complete, log } = fixture();
     const { messages, conversationId } = await seed(engine, true);
