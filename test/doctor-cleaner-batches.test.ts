@@ -115,6 +115,49 @@ describe("doctor cleaner apply", () => {
     ).toBe(keptConversationId);
   });
 
+  it("keeps retained summaries searchable when the summary FTS tables are renumbered mid-apply", async () => {
+    const { db, dbPath, keptConversationId } = await seedCleanerDatabase(3);
+    if (!getLcmDbFeatures(db).fts5Available) {
+      return;
+    }
+    const originalExec = db.exec.bind(db);
+    let renumbered = false;
+    vi.spyOn(db, "exec").mockImplementation((sql: string) => {
+      if (sql === "BEGIN IMMEDIATE" && !renumbered) {
+        renumbered = true;
+        for (const table of ["summaries_fts", "summaries_fts_cjk"]) {
+          const exists = db.prepare("SELECT 1 FROM sqlite_master WHERE name = ?").get(table);
+          if (!exists) {
+            continue;
+          }
+          originalExec(`DELETE FROM ${table}`);
+          originalExec(
+            `INSERT INTO ${table} (summary_id, content)
+             SELECT summary_id, content FROM summaries ORDER BY summary_id DESC`,
+          );
+        }
+      }
+      return originalExec(sql);
+    });
+
+    const result = applyDoctorCleaners(db, {
+      databasePath: dbPath,
+      filterIds: ["cron_sessions"],
+      agentIds: ["main"],
+      batchLimits: { maxConversations: 1, maxMessages: 100 },
+    });
+
+    expect(renumbered).toBe(true);
+    expect(result).toMatchObject({ kind: "applied", deletedConversations: 3 });
+    expect(
+      db.prepare("SELECT summary_id FROM summaries_fts WHERE summaries_fts MATCH ?").all("kept"),
+    ).toEqual([{ summary_id: "sum_kept" }]);
+    expect(db.prepare("SELECT summary_id FROM summaries_fts").all()).toEqual([
+      { summary_id: "sum_kept" },
+    ]);
+    expect(keptConversationId).toBeGreaterThan(0);
+  });
+
   it("runs scan and apply on a worker thread without using the caller's connection", async () => {
     const { db, dbPath } = await seedCleanerDatabase(3);
     const untouchable = new Proxy({} as DatabaseSync, {

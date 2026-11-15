@@ -145,4 +145,22 @@ describe("SearchWorkerClient", () => {
       await client.close();
     }
   });
+
+  it("refuses new searches until a timed-out worker has exited, and close waits for it", async () => {
+    const { dbPath, fts5Available } = await seedDatabase(5);
+    const client = new SearchWorkerClient({
+      workerUrl,
+      databasePath: dbPath,
+      fts5Available,
+      timeoutMs: 0,
+    });
+    await expect(client.searchMessages({ query: "gateway", mode: "regex" })).rejects.toThrow(
+      /timed out/,
+    );
+    await expect(client.searchMessages({ query: "gateway", mode: "regex" })).rejects.toThrow(
+      /still stopping/,
+    );
+    await client.close();
+    expect((client as unknown as { retiring: Map<unknown, unknown> }).retiring.size).toBe(0);
+  });
 });

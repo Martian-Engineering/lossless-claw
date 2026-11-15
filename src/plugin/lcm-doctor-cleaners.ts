@@ -444,6 +444,8 @@ function dropTempCleanerTables(db: DatabaseSync): void {
   db.exec(`DROP TABLE IF EXISTS temp.doctor_cleaner_summary_ids`);
   db.exec(`DROP TABLE IF EXISTS temp.doctor_cleaner_batch_conversation_ids`);
   db.exec(`DROP TABLE IF EXISTS temp.doctor_cleaner_summary_fts_rowids`);
+  db.exec(`DROP TABLE IF EXISTS temp.doctor_cleaner_staged_summary_ids`);
+  db.exec(`DROP TABLE IF EXISTS temp.doctor_cleaner_batch_fts_rowids`);
   db.exec(`DROP TABLE IF EXISTS temp.doctor_cleaner_conversation_ids`);
   db.exec(`DROP TABLE IF EXISTS temp.doctor_cleaner_agent_ids`);
 }
@@ -555,6 +557,19 @@ function stageCleanerSummaryFtsRowids(db: DatabaseSync): void {
       PRIMARY KEY (fts_table, summary_id, fts_rowid)
     ) WITHOUT ROWID
   `);
+  db.exec(`CREATE TEMP TABLE doctor_cleaner_staged_summary_ids (summary_id TEXT PRIMARY KEY) WITHOUT ROWID`);
+  db.exec(`
+    CREATE TEMP TABLE doctor_cleaner_batch_fts_rowids (
+      fts_rowid INTEGER PRIMARY KEY,
+      summary_id TEXT NOT NULL
+    )
+  `);
+  db.exec(`
+    INSERT INTO temp.doctor_cleaner_staged_summary_ids (summary_id)
+    SELECT s.summary_id
+    FROM summaries s
+    JOIN temp.doctor_cleaner_conversation_ids ids ON ids.conversation_id = s.conversation_id
+  `);
   for (const table of SUMMARY_FTS_TABLES) {
     if (!hasTable(db, table)) {
       continue;
@@ -563,11 +578,7 @@ function stageCleanerSummaryFtsRowids(db: DatabaseSync): void {
       INSERT INTO temp.doctor_cleaner_summary_fts_rowids (fts_table, fts_rowid, summary_id)
       SELECT '${table}', fts.rowid, fts.summary_id
       FROM ${table} fts
-      WHERE fts.summary_id IN (
-        SELECT s.summary_id
-        FROM summaries s
-        JOIN temp.doctor_cleaner_conversation_ids ids ON ids.conversation_id = s.conversation_id
-      )
+      WHERE fts.summary_id IN (SELECT summary_id FROM temp.doctor_cleaner_staged_summary_ids)
     `);
   }
 }
@@ -645,46 +656,43 @@ function stageCleanerDeleteBatch(
 }
 
 /**
- * Delete the batch's summary FTS rows by their staged rowids. Summaries
- * created after staging have no staged rowid and fall back to a summary_id
- * lookup, which scans the FTS table.
+ * Delete the batch's summary FTS rows by their staged rowids, keeping only
+ * rowids that still hold the same summary_id (an FTS rebuild between staging
+ * and this batch renumbers rows). Summaries whose staged rows no longer match,
+ * or that were created after staging, fall back to a summary_id lookup, which
+ * scans the FTS table.
  */
 function deleteBatchSummaryFtsRows(
   db: DatabaseSync,
   table: (typeof SUMMARY_FTS_TABLES)[number],
 ): void {
+  db.exec(`DELETE FROM temp.doctor_cleaner_batch_fts_rowids`);
   db.prepare(
-    `DELETE FROM ${table}
-     WHERE rowid IN (
-       SELECT staged.fts_rowid
-       FROM temp.doctor_cleaner_summary_fts_rowids staged
-       JOIN temp.doctor_cleaner_summary_ids ids ON ids.summary_id = staged.summary_id
-       WHERE staged.fts_table = ?
-     )`,
+    `INSERT INTO temp.doctor_cleaner_batch_fts_rowids (fts_rowid, summary_id)
+     SELECT staged.fts_rowid, staged.summary_id
+     FROM temp.doctor_cleaner_summary_fts_rowids staged
+     JOIN temp.doctor_cleaner_summary_ids ids ON ids.summary_id = staged.summary_id
+     JOIN ${table} current ON current.rowid = staged.fts_rowid
+     WHERE staged.fts_table = ? AND current.summary_id = staged.summary_id`,
   ).run(table);
-  const unstaged = db.prepare(
-    `SELECT 1 AS found
-     FROM temp.doctor_cleaner_summary_ids ids
-     WHERE NOT EXISTS (
-       SELECT 1
-       FROM temp.doctor_cleaner_summary_fts_rowids staged
-       WHERE staged.fts_table = ? AND staged.summary_id = ids.summary_id
-     )
-     LIMIT 1`,
-  ).get(table) as { found?: number } | undefined;
-  if (unstaged?.found === 1) {
-    db.prepare(
-      `DELETE FROM ${table}
-       WHERE summary_id IN (
-         SELECT ids.summary_id
-         FROM temp.doctor_cleaner_summary_ids ids
-         WHERE NOT EXISTS (
-           SELECT 1
-           FROM temp.doctor_cleaner_summary_fts_rowids staged
-           WHERE staged.fts_table = ? AND staged.summary_id = ids.summary_id
-         )
-       )`,
-    ).run(table);
+  db.exec(
+    `DELETE FROM ${table}
+     WHERE rowid IN (SELECT fts_rowid FROM temp.doctor_cleaner_batch_fts_rowids)`,
+  );
+  const unresolvedSql = `
+    SELECT ids.summary_id
+    FROM temp.doctor_cleaner_summary_ids ids
+    WHERE ids.summary_id NOT IN (SELECT summary_id FROM temp.doctor_cleaner_staged_summary_ids)
+       OR EXISTS (
+         SELECT 1
+         FROM temp.doctor_cleaner_summary_fts_rowids staged
+         WHERE staged.fts_table = ?
+           AND staged.summary_id = ids.summary_id
+           AND staged.fts_rowid NOT IN (SELECT fts_rowid FROM temp.doctor_cleaner_batch_fts_rowids)
+       )`;
+  const unresolved = db.prepare(`${unresolvedSql} LIMIT 1`).get(table);
+  if (unresolved) {
+    db.prepare(`DELETE FROM ${table} WHERE summary_id IN (${unresolvedSql})`).run(table);
   }
 }
 

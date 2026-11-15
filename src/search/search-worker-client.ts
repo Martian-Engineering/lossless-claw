@@ -43,6 +43,8 @@ export class SearchWorkerClient implements MessageSearchExecutor, SummarySearchE
   private worker: Worker | null = null;
   private nextRequestId = 1;
   private readonly pending = new Map<number, PendingSearch>();
+  /** Workers asked to terminate whose native statement may still be running. */
+  private readonly retiring = new Map<Worker, Promise<void>>();
   private closed = false;
   private readonly timeoutMs: number;
 
@@ -66,15 +68,14 @@ export class SearchWorkerClient implements MessageSearchExecutor, SummarySearchE
     return this.request({ kind: "summaries", input });
   }
 
-  /** Reject pending searches and stop the worker. */
+  /** Reject pending searches, stop the worker, and wait for every worker to exit. */
   async close(): Promise<void> {
     this.closed = true;
     const worker = this.worker;
-    this.worker = null;
     if (worker) {
-      this.failPending(worker, new Error("lcm search worker closed"));
-      await worker.terminate();
+      this.replaceWorker(worker, new Error("lcm search worker closed"));
     }
+    await Promise.all(this.retiring.values());
   }
 
   private request<T>(
@@ -82,6 +83,13 @@ export class SearchWorkerClient implements MessageSearchExecutor, SummarySearchE
   ): Promise<SearchOutcome<T>> {
     if (this.closed) {
       return Promise.reject(new Error("lcm search worker closed"));
+    }
+    if (!this.worker && this.retiring.size > 0) {
+      // terminate() cannot interrupt a running SQLite statement, so a replaced
+      // worker may still be scanning. Refuse rather than stack another scan.
+      return Promise.reject(
+        new Error("lcm search worker is still stopping a timed-out search; retry shortly"),
+      );
     }
     const worker = this.ensureWorker();
     const id = this.nextRequestId++;
@@ -144,7 +152,16 @@ export class SearchWorkerClient implements MessageSearchExecutor, SummarySearchE
   private replaceWorker(worker: Worker, error: Error): void {
     if (this.worker === worker) {
       this.worker = null;
-      void worker.terminate();
+      this.retiring.set(
+        worker,
+        new Promise<void>((resolve) => {
+          worker.once("exit", () => {
+            this.retiring.delete(worker);
+            resolve();
+          });
+          void worker.terminate().catch(() => {});
+        }),
+      );
     }
     this.failPending(worker, error);
   }
