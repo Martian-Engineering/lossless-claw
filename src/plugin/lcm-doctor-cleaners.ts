@@ -442,11 +442,17 @@ function dropTempCleanerTables(db: DatabaseSync): void {
   db.exec(`DROP TABLE IF EXISTS temp.doctor_cleaner_first_messages`);
   db.exec(`DROP TABLE IF EXISTS temp.doctor_cleaner_message_ids`);
   db.exec(`DROP TABLE IF EXISTS temp.doctor_cleaner_summary_ids`);
+  db.exec(`DROP TABLE IF EXISTS temp.doctor_cleaner_batch_conversation_ids`);
+  db.exec(`DROP TABLE IF EXISTS temp.doctor_cleaner_summary_fts_rowids`);
   db.exec(`DROP TABLE IF EXISTS temp.doctor_cleaner_conversation_ids`);
   db.exec(`DROP TABLE IF EXISTS temp.doctor_cleaner_agent_ids`);
 }
 
-function stageTempCleanerFirstMessages(db: DatabaseSync): void {
+/**
+ * Stage first-message previews for the conversations the first-message
+ * cleaners could match, reading only their own messages.
+ */
+function stageTempCleanerFirstMessages(db: DatabaseSync, definitions: CleanerDefinition[]): void {
   db.exec(`
     CREATE TEMP TABLE doctor_cleaner_first_messages (
       conversation_id INTEGER PRIMARY KEY,
@@ -454,7 +460,10 @@ function stageTempCleanerFirstMessages(db: DatabaseSync): void {
     )
   `);
   db.exec(`
-    WITH ranked_messages AS (
+    WITH candidates AS (
+      ${buildCandidateConversationsSql(definitions.filter((definition) => definition.needsFirstMessage))}
+    ),
+    ranked_messages AS (
       SELECT
         m.conversation_id,
         substr(m.content, 1, ${SCAN_FIRST_MESSAGE_PREVIEW_LIMIT}) AS content,
@@ -463,6 +472,7 @@ function stageTempCleanerFirstMessages(db: DatabaseSync): void {
           ORDER BY m.seq ASC, m.created_at ASC, m.message_id ASC
         ) AS row_num
       FROM messages m
+      JOIN candidates ON candidates.conversation_id = m.conversation_id
     )
     INSERT INTO temp.doctor_cleaner_first_messages (
       conversation_id,
@@ -476,13 +486,38 @@ function stageTempCleanerFirstMessages(db: DatabaseSync): void {
   `);
 }
 
+/** Build the SQL selecting distinct conversation ids that match `definitions` now. */
+function buildCleanerMatchSql(definitions: CleanerDefinition[]): string {
+  const needsFirstMessage = definitions.some((definition) => definition.needsFirstMessage);
+  return `SELECT DISTINCT conversation_id
+    FROM (
+      ${buildMatchedConversationsSql({
+        definitions,
+        includeFilterId: false,
+        messageStatsTableName: needsFirstMessage
+          ? "temp.doctor_cleaner_first_messages"
+          : undefined,
+      })}
+    )`;
+}
+
+/**
+ * Stage the matched conversations with their message counts. Staging only
+ * reads, so it runs outside any write transaction.
+ */
 function stageCleanerConversationIds(
   db: DatabaseSync,
   definitions: CleanerDefinition[],
   agentIds?: string[],
 ): void {
   dropTempCleanerTables(db);
-  db.exec(`CREATE TEMP TABLE doctor_cleaner_conversation_ids (conversation_id INTEGER PRIMARY KEY)`);
+  db.exec(`
+    CREATE TEMP TABLE doctor_cleaner_conversation_ids (
+      conversation_id INTEGER PRIMARY KEY,
+      message_count INTEGER NOT NULL
+    )
+  `);
+  db.exec(`CREATE TEMP TABLE doctor_cleaner_batch_conversation_ids (conversation_id INTEGER PRIMARY KEY)`);
   db.exec(`CREATE TEMP TABLE doctor_cleaner_summary_ids (summary_id TEXT PRIMARY KEY)`);
   db.exec(`CREATE TEMP TABLE doctor_cleaner_message_ids (message_id INTEGER PRIMARY KEY)`);
 
@@ -490,58 +525,167 @@ function stageCleanerConversationIds(
     return;
   }
   stageCleanerAgentIds(db, agentIds);
-
-  const needsFirstMessage = definitions.some((definition) => definition.needsFirstMessage);
-  if (needsFirstMessage) {
-    stageTempCleanerFirstMessages(db);
+  if (definitions.some((definition) => definition.needsFirstMessage)) {
+    stageTempCleanerFirstMessages(db, definitions);
   }
-  const matchedConversationsSql = buildMatchedConversationsSql({
-    definitions,
-    includeFilterId: false,
-    messageStatsTableName: needsFirstMessage
-      ? "temp.doctor_cleaner_first_messages"
-      : undefined,
-  });
   db.exec(`
-    INSERT INTO temp.doctor_cleaner_conversation_ids (conversation_id)
-    SELECT DISTINCT conversation_id
-    FROM (
-      ${matchedConversationsSql}
-    )
+    INSERT INTO temp.doctor_cleaner_conversation_ids (conversation_id, message_count)
+    SELECT matched.conversation_id, COUNT(m.message_id)
+    FROM (${buildCleanerMatchSql(definitions)}) matched
+    LEFT JOIN messages m ON m.conversation_id = matched.conversation_id
+    GROUP BY matched.conversation_id
   `);
+  stageCleanerSummaryFtsRowids(db);
+}
 
+const SUMMARY_FTS_TABLES = ["summaries_fts", "summaries_fts_cjk"] as const;
+
+/**
+ * Resolve the FTS rowids of every staged summary once. The summary FTS tables
+ * keep summary_id as an UNINDEXED column, so looking rows up by summary_id
+ * scans the whole table; doing that once here keeps per-batch deletes on
+ * rowid lookups.
+ */
+function stageCleanerSummaryFtsRowids(db: DatabaseSync): void {
+  db.exec(`
+    CREATE TEMP TABLE doctor_cleaner_summary_fts_rowids (
+      fts_table TEXT NOT NULL,
+      fts_rowid INTEGER NOT NULL,
+      summary_id TEXT NOT NULL,
+      PRIMARY KEY (fts_table, summary_id, fts_rowid)
+    ) WITHOUT ROWID
+  `);
+  for (const table of SUMMARY_FTS_TABLES) {
+    if (!hasTable(db, table)) {
+      continue;
+    }
+    db.exec(`
+      INSERT INTO temp.doctor_cleaner_summary_fts_rowids (fts_table, fts_rowid, summary_id)
+      SELECT '${table}', fts.rowid, fts.summary_id
+      FROM ${table} fts
+      WHERE fts.summary_id IN (
+        SELECT s.summary_id
+        FROM summaries s
+        JOIN temp.doctor_cleaner_conversation_ids ids ON ids.conversation_id = s.conversation_id
+      )
+    `);
+  }
+}
+
+/**
+ * Split staged conversations into delete batches of at most
+ * `maxMessages` messages (or one oversized conversation) and
+ * `maxConversations` conversations, so each write transaction stays short.
+ */
+function planCleanerDeleteBatches(
+  db: DatabaseSync,
+  limits: { maxConversations: number; maxMessages: number },
+): number[][] {
+  const rows = db
+    .prepare(
+      `SELECT conversation_id, message_count
+       FROM temp.doctor_cleaner_conversation_ids
+       ORDER BY conversation_id`,
+    )
+    .all() as Array<{ conversation_id: number; message_count: number }>;
+  const batches: number[][] = [];
+  let current: number[] = [];
+  let currentMessages = 0;
+  for (const row of rows) {
+    if (
+      current.length > 0
+      && (current.length >= limits.maxConversations
+        || currentMessages + row.message_count > limits.maxMessages)
+    ) {
+      batches.push(current);
+      current = [];
+      currentMessages = 0;
+    }
+    current.push(row.conversation_id);
+    currentMessages += row.message_count;
+  }
+  if (current.length > 0) {
+    batches.push(current);
+  }
+  return batches;
+}
+
+/**
+ * Inside the batch's write transaction, re-check which of `conversationIds`
+ * still match and stage their messages and summaries.
+ */
+function stageCleanerDeleteBatch(
+  db: DatabaseSync,
+  definitions: CleanerDefinition[],
+  conversationIds: number[],
+): number {
+  db.exec(`DELETE FROM temp.doctor_cleaner_batch_conversation_ids`);
+  db.exec(`DELETE FROM temp.doctor_cleaner_summary_ids`);
+  db.exec(`DELETE FROM temp.doctor_cleaner_message_ids`);
+  db.prepare(
+    `INSERT INTO temp.doctor_cleaner_batch_conversation_ids (conversation_id)
+     SELECT conversation_id
+     FROM (${buildCleanerMatchSql(definitions)})
+     WHERE conversation_id IN (${conversationIds.map(() => "?").join(", ")})`,
+  ).run(...conversationIds);
   db.exec(`
     INSERT INTO temp.doctor_cleaner_summary_ids (summary_id)
     SELECT s.summary_id
-    FROM summaries s
-    JOIN temp.doctor_cleaner_conversation_ids ids
-      ON ids.conversation_id = s.conversation_id
+    FROM temp.doctor_cleaner_batch_conversation_ids ids
+    JOIN summaries s ON s.conversation_id = ids.conversation_id
   `);
-
-  db.exec(`
-    INSERT INTO temp.doctor_cleaner_message_ids (message_id)
-    SELECT m.message_id
-    FROM messages m
-    JOIN temp.doctor_cleaner_conversation_ids ids
-      ON ids.conversation_id = m.conversation_id
-  `);
+  return Number(
+    db.prepare(`
+      INSERT INTO temp.doctor_cleaner_message_ids (message_id)
+      SELECT m.message_id
+      FROM temp.doctor_cleaner_batch_conversation_ids ids
+      JOIN messages m ON m.conversation_id = ids.conversation_id
+    `).run().changes ?? 0,
+  );
 }
 
-function readTempCleanerDeleteCounts(db: DatabaseSync): {
-  conversationCount: number;
-  messageCount: number;
-} {
-  const row = db
-    .prepare(
-      `SELECT
-         COALESCE((SELECT COUNT(*) FROM temp.doctor_cleaner_conversation_ids), 0) AS conversation_count,
-         COALESCE((SELECT COUNT(*) FROM temp.doctor_cleaner_message_ids), 0) AS message_count`,
-    )
-    .get() as CleanerCountRow | undefined;
-  return {
-    conversationCount: row?.conversation_count ?? 0,
-    messageCount: row?.message_count ?? 0,
-  };
+/**
+ * Delete the batch's summary FTS rows by their staged rowids. Summaries
+ * created after staging have no staged rowid and fall back to a summary_id
+ * lookup, which scans the FTS table.
+ */
+function deleteBatchSummaryFtsRows(
+  db: DatabaseSync,
+  table: (typeof SUMMARY_FTS_TABLES)[number],
+): void {
+  db.prepare(
+    `DELETE FROM ${table}
+     WHERE rowid IN (
+       SELECT staged.fts_rowid
+       FROM temp.doctor_cleaner_summary_fts_rowids staged
+       JOIN temp.doctor_cleaner_summary_ids ids ON ids.summary_id = staged.summary_id
+       WHERE staged.fts_table = ?
+     )`,
+  ).run(table);
+  const unstaged = db.prepare(
+    `SELECT 1 AS found
+     FROM temp.doctor_cleaner_summary_ids ids
+     WHERE NOT EXISTS (
+       SELECT 1
+       FROM temp.doctor_cleaner_summary_fts_rowids staged
+       WHERE staged.fts_table = ? AND staged.summary_id = ids.summary_id
+     )
+     LIMIT 1`,
+  ).get(table) as { found?: number } | undefined;
+  if (unstaged?.found === 1) {
+    db.prepare(
+      `DELETE FROM ${table}
+       WHERE summary_id IN (
+         SELECT ids.summary_id
+         FROM temp.doctor_cleaner_summary_ids ids
+         WHERE NOT EXISTS (
+           SELECT 1
+           FROM temp.doctor_cleaner_summary_fts_rowids staged
+           WHERE staged.fts_table = ? AND staged.summary_id = ids.summary_id
+         )
+       )`,
+    ).run(table);
+  }
 }
 
 function deleteTempCleanerCandidates(db: DatabaseSync): number {
@@ -577,7 +721,7 @@ function deleteTempCleanerCandidates(db: DatabaseSync): number {
   ).run();
   db.prepare(
     `DELETE FROM context_items
-     WHERE conversation_id IN (SELECT conversation_id FROM temp.doctor_cleaner_conversation_ids)`,
+     WHERE conversation_id IN (SELECT conversation_id FROM temp.doctor_cleaner_batch_conversation_ids)`,
   ).run();
 
   if (hasMessagesFts) {
@@ -586,24 +730,20 @@ function deleteTempCleanerCandidates(db: DatabaseSync): number {
        WHERE rowid IN (SELECT message_id FROM temp.doctor_cleaner_message_ids)`,
     ).run();
   }
-  if (hasSummariesFts) {
-    db.prepare(
-      `DELETE FROM summaries_fts
-       WHERE summary_id IN (SELECT summary_id FROM temp.doctor_cleaner_summary_ids)`,
-    ).run();
-  }
-  if (hasSummariesFtsCjk) {
-    db.prepare(
-      `DELETE FROM summaries_fts_cjk
-       WHERE summary_id IN (SELECT summary_id FROM temp.doctor_cleaner_summary_ids)`,
-    ).run();
+  for (const [table, present] of [
+    ["summaries_fts", hasSummariesFts],
+    ["summaries_fts_cjk", hasSummariesFtsCjk],
+  ] as const) {
+    if (present) {
+      deleteBatchSummaryFtsRows(db, table);
+    }
   }
 
   return Number(
     db
       .prepare(
         `DELETE FROM conversations
-         WHERE conversation_id IN (SELECT conversation_id FROM temp.doctor_cleaner_conversation_ids)`,
+         WHERE conversation_id IN (SELECT conversation_id FROM temp.doctor_cleaner_batch_conversation_ids)`,
       )
       .run().changes ?? 0,
   );
@@ -619,6 +759,19 @@ function buildCleanerBackupPath(databasePath: string): string | null {
   return buildLcmDatabaseBackupPath(databasePath, "doctor-cleaners");
 }
 
+/** Per-transaction size of cleaner deletes. */
+export const DOCTOR_CLEANER_DELETE_BATCH_LIMITS = {
+  maxConversations: 200,
+  maxMessages: 1_000,
+};
+
+/**
+ * Back up the database, then delete matched conversations in short batched
+ * write transactions so concurrent writers on other connections can interleave.
+ * Each batch re-checks its filters and removes whole conversations, so an
+ * interrupted apply leaves only fully kept or fully deleted conversations and
+ * can be rerun.
+ */
 export function applyDoctorCleaners(
   db: DatabaseSync,
   options: {
@@ -626,6 +779,7 @@ export function applyDoctorCleaners(
     filterIds?: DoctorCleanerId[];
     agentIds?: string[];
     vacuum?: boolean;
+    batchLimits?: { maxConversations: number; maxMessages: number };
   },
 ): DoctorCleanerApplyResult {
   const definitions = getCleanerDefinitions(options.filterIds);
@@ -658,24 +812,34 @@ export function applyDoctorCleaners(
   let deletedConversations = 0;
   let deletedMessages = 0;
   let vacuumed = false;
-  let transactionActive = false;
 
   try {
-    db.exec("BEGIN IMMEDIATE");
-    transactionActive = true;
     stageCleanerConversationIds(db, definitions, options.agentIds);
-    const counts = readTempCleanerDeleteCounts(db);
-    deletedMessages = counts.messageCount;
-    if (counts.conversationCount > 0) {
-      deletedConversations = deleteTempCleanerCandidates(db);
+    const batches = planCleanerDeleteBatches(
+      db,
+      options.batchLimits ?? DOCTOR_CLEANER_DELETE_BATCH_LIMITS,
+    );
+    for (const conversationIds of batches) {
+      let transactionActive = false;
+      try {
+        db.exec("BEGIN IMMEDIATE");
+        transactionActive = true;
+        const batchMessages = stageCleanerDeleteBatch(db, definitions, conversationIds);
+        const batchConversations = deleteTempCleanerCandidates(db);
+        db.exec("COMMIT");
+        transactionActive = false;
+        deletedConversations += batchConversations;
+        deletedMessages += batchMessages;
+        // Checkpoint the batch's WAL frames on this connection, so the next
+        // small commit on another connection doesn't inherit the work.
+        db.exec("PRAGMA wal_checkpoint(PASSIVE)");
+      } catch (error) {
+        if (transactionActive) {
+          db.exec("ROLLBACK");
+        }
+        throw error;
+      }
     }
-    db.exec("COMMIT");
-    transactionActive = false;
-  } catch (error) {
-    if (transactionActive) {
-      db.exec("ROLLBACK");
-    }
-    throw error;
   } finally {
     dropTempCleanerTables(db);
   }

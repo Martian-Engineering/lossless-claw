@@ -105,6 +105,8 @@ It should help confirm:
 This command is read-only. Use it to identify likely cleanup candidates before taking any separate cleanup action.
 Its keyed-session filters require an exact configured agent-id segment, an exact `cron` or `subagent` lane segment, and a non-empty lane suffix.
 
+`/lossless doctor clean apply` deletes the matched conversations. It writes a full database backup first, then deletes in short batches of up to 200 conversations or 1,000 messages, with one write transaction per batch, so the Gateway can keep writing between batches. The scan, backup, deletes and the closing `quick_check` run on a worker thread with their own SQLite connection, so they don't block the Gateway event loop. Each batch checks its filters again and removes whole conversations. If an apply is interrupted, the conversations already deleted stay deleted, the rest stay untouched, and running the command again finishes the job. `/lossless backup` and the backups taken before doctor repairs are written the same way, from a worker thread with its own read-only connection. Add `vacuum` only when the Gateway can tolerate a long exclusive lock; otherwise run `VACUUM` while the Gateway is stopped.
+
 ## Interpreting common states
 
 ### `/lossless` tokens vs `/status` context

@@ -1,3 +1,5 @@
+import { getFileBackedDatabasePath } from "./db/connection.js";
+import { resolveBundledSearchWorkerUrl, SearchWorkerClient } from "./search/search-worker-client.js";
 import { createHash } from "node:crypto";
 import { join } from "node:path";
 import type { DatabaseSync } from "node:sqlite";
@@ -483,6 +485,7 @@ export class LcmContextEngine implements ContextEngine {
   private assembler: ContextAssembler;
   private compaction: CompactionEngine;
   private retrieval: RetrievalEngine;
+  private readonly searchWorker: SearchWorkerClient | null;
   private readonly db: DatabaseSync;
   private migrated = false;
   private readonly fts5Available: boolean = false;
@@ -635,6 +638,11 @@ export class LcmContextEngine implements ContextEngine {
       },
     });
     this.summaryStore = new SummaryStore(this.db, { fts5Available: this.fts5Available });
+    this.searchWorker = this.createSearchWorker();
+    if (this.searchWorker) {
+      this.conversationStore.setSearchExecutor(this.searchWorker);
+      this.summaryStore.setSearchExecutor(this.searchWorker);
+    }
     this.pendingSummaryStore = new PendingSummaryStore(this.db);
     this.largeFileInterceptor = new LargeFileInterceptor(
       this.config,
@@ -5204,6 +5212,29 @@ export class LcmContextEngine implements ContextEngine {
         removeDelegatedExpansionGrantForSession(childSessionKey);
         break;
     }
+  }
+
+  /**
+   * Run searches on a worker thread with its own read-only connection when the
+   * database is file-backed and the bundled worker entry is present. In-memory
+   * databases and unbundled source runs search in-process.
+   */
+  private createSearchWorker(): SearchWorkerClient | null {
+    const databasePath = getFileBackedDatabasePath(this.config.databasePath);
+    const workerUrl = resolveBundledSearchWorkerUrl();
+    if (!databasePath || !workerUrl) {
+      return null;
+    }
+    return new SearchWorkerClient({
+      workerUrl,
+      databasePath,
+      fts5Available: this.fts5Available,
+    });
+  }
+
+  /** Stop the search worker thread. Called when the plugin releases its database. */
+  async closeSearchWorker(): Promise<void> {
+    await this.searchWorker?.close();
   }
 
   async dispose(): Promise<void> {

@@ -109,6 +109,11 @@ export interface GrepResult {
   summaries: SummarySearchResult[];
   files: LargeFileSearchResult[];
   totalMatches: number;
+  /**
+   * True when a bounded regex or substring scan stopped before examining every
+   * in-scope row, so older matches may exist beyond the returned results.
+   */
+  scanLimited?: boolean;
 }
 
 export interface ExpandInput {
@@ -379,26 +384,24 @@ export class RetrievalEngine {
 
     const searchInput = { query, mode, conversationId, conversationIds, since, before, limit, sort };
 
-    let messages: MessageSearchResult[] = [];
-    let summaries: SummarySearchResult[] = [];
-
-    if (scope === "messages") {
-      messages = await this.conversationStore.searchMessages(searchInput);
-    } else if (scope === "summaries") {
-      summaries = await this.summaryStore.searchSummaries(searchInput);
-    } else {
-      // scope === "both" — run in parallel
-      [messages, summaries] = await Promise.all([
-        this.conversationStore.searchMessages(searchInput),
-        this.summaryStore.searchSummaries(searchInput),
-      ]);
-    }
+    const empty = { results: [], scanLimited: false };
+    const [messageOutcome, summaryOutcome] = await Promise.all([
+      scope === "summaries"
+        ? empty
+        : this.conversationStore.searchMessagesWithScanInfo(searchInput),
+      scope === "messages"
+        ? empty
+        : this.summaryStore.searchSummariesWithScanInfo(searchInput),
+    ]);
+    const messages: MessageSearchResult[] = messageOutcome.results;
+    const summaries: SummarySearchResult[] = summaryOutcome.results;
 
     return {
       messages,
       summaries,
       files: [],
       totalMatches: messages.length + summaries.length,
+      scanLimited: messageOutcome.scanLimited || summaryOutcome.scanLimited,
     };
   }
 

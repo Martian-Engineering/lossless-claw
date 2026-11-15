@@ -1956,6 +1956,7 @@ const lcmPlugin = {
       }
       unbindExpansionGrants?.();
       unbindExpansionGrants = null;
+      await lcm?.closeSearchWorker();
       if (database) {
         closeLcmConnection(database);
         database = null;

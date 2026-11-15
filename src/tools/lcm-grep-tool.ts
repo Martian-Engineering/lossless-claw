@@ -282,6 +282,13 @@ export function createLcmGrepTool(input: {
         );
       }
       lines.push(`**Total matches:** ${result.totalMatches}`);
+      if (result.scanLimited) {
+        lines.push(
+          mode === "regex"
+            ? "**Scan limit:** regex search examined only the newest rows in scope; older matches may exist. Narrow with conversationId, since or before, or use full_text mode."
+            : "**Scan limit:** substring fallback examined only the newest rows in scope; older matches may exist. Narrow with conversationId, since or before.",
+        );
+      }
       lines.push("");
 
       let currentChars = lines.join("\n").length;
@@ -356,6 +363,7 @@ export function createLcmGrepTool(input: {
             ? { fileScanByteLimit: DEFAULT_LARGE_FILE_SEARCH_MAX_BYTES }
             : {}),
           totalMatches: result.totalMatches,
+          ...(result.scanLimited ? { scanLimited: true } : {}),
           text,
           messages: result.messages.map((msg) => ({
             conversationId: msg.conversationId,
