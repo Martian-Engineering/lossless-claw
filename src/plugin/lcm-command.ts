@@ -20,12 +20,14 @@ import { createLcmDatabaseBackup } from "./lcm-db-backup.js";
 import { describeLogError } from "../lcm-log.js";
 import { listConfiguredAgentIds } from "./openclaw-agent-ids.js";
 import {
-  applyDoctorCleaners,
   getDoctorCleanerApplyUnavailableReason,
   getDoctorCleanerFilterIds,
   scanDoctorCleaners,
+  type DoctorCleanerApplyResult,
   type DoctorCleanerId,
+  type DoctorCleanerScan,
 } from "./lcm-doctor-cleaners.js";
+import { runDoctorCleanerTask } from "./lcm-doctor-cleaner-task.js";
 import {
   detectDoctorMarker,
   getDoctorSummaryStats,
@@ -1980,11 +1982,34 @@ function buildRolloverSplitScanSection(scan: ReturnType<typeof scanRolloverSplit
   return buildSection("⚠️ Rollover split memory", lines);
 }
 
+async function runDoctorCleanerScan(params: {
+  db: DatabaseSync;
+  databasePath: string;
+  filterIds?: DoctorCleanerId[];
+  agentIds: string[];
+}): Promise<DoctorCleanerScan> {
+  const outcome = await runDoctorCleanerTask(params.db, {
+    kind: "scan",
+    databasePath: params.databasePath,
+    filterIds: params.filterIds,
+    agentIds: params.agentIds,
+  });
+  if (outcome.kind !== "scan") {
+    throw new Error("doctor cleaner scan returned an unexpected result");
+  }
+  return outcome.scan;
+}
+
 async function buildDoctorCleanersText(params: {
   db: DatabaseSync;
+  databasePath: string;
   agentIds: string[];
 }): Promise<string> {
-  const scan = scanDoctorCleaners(params.db, undefined, params.agentIds);
+  const scan = await runDoctorCleanerScan({
+    db: params.db,
+    databasePath: params.databasePath,
+    agentIds: params.agentIds,
+  });
   const lines = [
     ...buildHeaderLines(),
     "",
@@ -2038,23 +2063,6 @@ async function buildDoctorCleanersText(params: {
   return lines.join("\n");
 }
 
-function runQuickCheck(db: DatabaseSync): string {
-  const rows = db.prepare(`PRAGMA quick_check`).all() as Array<{ quick_check?: string }>;
-  const results = rows
-    .map((row) => row.quick_check)
-    .filter((value): value is string => typeof value === "string" && value.length > 0);
-
-  if (results.length === 0) {
-    return "unknown";
-  }
-
-  if (results.length === 1 && results[0] === "ok") {
-    return "ok";
-  }
-
-  return results.join("; ");
-}
-
 function isPassingQuickCheck(result: string): boolean {
   return result === "ok";
 }
@@ -2092,7 +2100,7 @@ async function buildBackupText(params: {
 
   let backupPath: string | null;
   try {
-    backupPath = createLcmDatabaseBackup(params.db, {
+    backupPath = await createLcmDatabaseBackup(params.db, {
       databasePath: params.config.databasePath,
       label: "backup",
     });
@@ -2930,7 +2938,12 @@ async function buildDoctorCleanersApplyText(params: {
     return lines.join("\n");
   }
 
-  const before = scanDoctorCleaners(params.db, filterIds, params.agentIds);
+  const before = await runDoctorCleanerScan({
+    db: params.db,
+    databasePath: params.config.databasePath,
+    filterIds,
+    agentIds: params.agentIds,
+  });
   lines.splice(
     lines.length - 1,
     0,
@@ -2956,14 +2969,21 @@ async function buildDoctorCleanersApplyText(params: {
     return lines.join("\n");
   }
 
-  let result: ReturnType<typeof applyDoctorCleaners>;
+  let result: DoctorCleanerApplyResult;
+  let quickCheckResult: string | null;
   try {
-    result = applyDoctorCleaners(params.db, {
+    const outcome = await runDoctorCleanerTask(params.db, {
+      kind: "apply",
       databasePath: params.config.databasePath,
       filterIds,
       agentIds: params.agentIds,
       vacuum: params.vacuum,
     });
+    if (outcome.kind !== "apply") {
+      throw new Error("doctor cleaner apply returned an unexpected result");
+    }
+    result = outcome.result;
+    quickCheckResult = outcome.quickCheck;
   } catch (error) {
     lines.push(
       buildSection("🛠️ Apply", [
@@ -2987,7 +3007,7 @@ async function buildDoctorCleanersApplyText(params: {
     return lines.join("\n");
   }
 
-  const quickCheck = runQuickCheck(params.db);
+  const quickCheck = quickCheckResult ?? "unknown";
   const quickCheckPassed = isPassingQuickCheck(quickCheck);
   lines.push(
     buildSection("🛠️ Apply", [
@@ -3438,6 +3458,7 @@ export function createLcmCommand(params: {
             : {
                 text: await buildDoctorCleanersText({
                   db: await getDb(),
+                  databasePath: params.config.databasePath,
                   agentIds: doctorCleanerAgentIds,
                 }),
               };

@@ -8,6 +8,11 @@ import { buildLikeSearchPlan, containsCjk, createFallbackSnippet } from "./full-
 import { parseUtcTimestamp, parseUtcTimestampOrNull } from "./parse-utc-timestamp.js";
 import { buildFtsOrderBy, type SearchSort } from "./full-text-sort.js";
 import { compileSafeSearchRegex } from "./search-regex.js";
+import {
+  resolveSearchScanLimits,
+  type SearchOutcome,
+  type SearchScanLimits,
+} from "./search-scan.js";
 
 export type SummaryKind = "leaf" | "condensed";
 export type ContextItemType = "message" | "summary";
@@ -466,14 +471,31 @@ function byteOffsetAt(content: string, index: number): number {
 
 // ── SummaryStore ──────────────────────────────────────────────────────────────
 
+/** Executes summary searches somewhere other than the store's own connection. */
+export type SummarySearchExecutor = {
+  searchSummaries(input: SummarySearchInput): Promise<SearchOutcome<SummarySearchResult>>;
+};
+
 export class SummaryStore {
   private readonly fts5Available: boolean;
+  private readonly searchScanLimits: SearchScanLimits;
+  private searchExecutor: SummarySearchExecutor | null = null;
 
   constructor(
     private db: DatabaseSync,
-    options?: { fts5Available?: boolean },
+    options?: {
+      fts5Available?: boolean;
+      /** Bounds for regex content scans. */
+      searchScanLimits?: Partial<SearchScanLimits>;
+    },
   ) {
     this.fts5Available = options?.fts5Available ?? true;
+    this.searchScanLimits = resolveSearchScanLimits(options?.searchScanLimits);
+  }
+
+  /** Route searchSummaries through `executor`, or back in-process with null. */
+  setSearchExecutor(executor: SummarySearchExecutor | null): void {
+    this.searchExecutor = executor;
   }
 
   // ── Summary CRUD ──────────────────────────────────────────────────────────
@@ -1130,47 +1152,52 @@ export class SummaryStore {
 
   // ── Search ────────────────────────────────────────────────────────────────
 
+  /**
+   * Search summaries. Delegates to the configured search executor (the
+   * off-main-thread search worker) when one is attached.
+   */
   async searchSummaries(input: SummarySearchInput): Promise<SummarySearchResult[]> {
+    return (await this.searchSummariesWithScanInfo(input)).results;
+  }
+
+  /** Search summaries and report whether a bounded regex scan stopped early. */
+  async searchSummariesWithScanInfo(
+    input: SummarySearchInput,
+  ): Promise<SearchOutcome<SummarySearchResult>> {
+    if (this.searchExecutor) {
+      return this.searchExecutor.searchSummaries(input);
+    }
+    return this.searchSummariesInProcess(input);
+  }
+
+  /** Run a summary search synchronously on this store's own connection. */
+  searchSummariesInProcess(input: SummarySearchInput): SearchOutcome<SummarySearchResult> {
+    if (input.mode === "full_text") {
+      return { results: this.searchSummariesFullTextModes(input), scanLimited: false };
+    }
+    return this.searchRegex(
+      input.query,
+      input.limit ?? 50,
+      input.conversationId,
+      input.conversationIds,
+      input.since,
+      input.before,
+    );
+  }
+
+  private searchSummariesFullTextModes(input: SummarySearchInput): SummarySearchResult[] {
     const limit = input.limit ?? 50;
 
-    if (input.mode === "full_text") {
-      // FTS5 unicode61 cannot segment CJK ideographs, so CJK queries route
-      // through the trigram FTS table first, then fall back to LIKE with OR
-      // semantics (instead of the original AND logic which fails when the
-      // user's phrasing doesn't exactly match the summary text).
-      if (containsCjk(input.query)) {
-        const cjkSegments = this.extractCjkSegments(input.query);
-        const hasShortCjkSegment = cjkSegments.some((segment) => segment.length < 3);
-        if (!hasShortCjkSegment) {
-          try {
-            const trigramResults = this.searchCjkTrigram(
-              input.query,
-              limit,
-              input.conversationId,
-              input.conversationIds,
-              input.since,
-              input.before,
-              input.sort,
-            );
-            if (trigramResults.length > 0) {
-              return trigramResults;
-            }
-          } catch {
-            // trigram table may not exist; fall through to LIKE OR
-          }
-        }
-        return this.searchLikeCjk(
-          input.query,
-          limit,
-          input.conversationId,
-          input.conversationIds,
-          input.since,
-          input.before,
-        );
-      }
-      if (this.fts5Available) {
+    // FTS5 unicode61 cannot segment CJK ideographs, so CJK queries route
+    // through the trigram FTS table first, then fall back to LIKE with OR
+    // semantics (instead of the original AND logic which fails when the
+    // user's phrasing doesn't exactly match the summary text).
+    if (containsCjk(input.query)) {
+      const cjkSegments = this.extractCjkSegments(input.query);
+      const hasShortCjkSegment = cjkSegments.some((segment) => segment.length < 3);
+      if (!hasShortCjkSegment) {
         try {
-          return this.searchFullText(
+          const trigramResults = this.searchCjkTrigram(
             input.query,
             limit,
             input.conversationId,
@@ -1179,18 +1206,14 @@ export class SummaryStore {
             input.before,
             input.sort,
           );
+          if (trigramResults.length > 0) {
+            return trigramResults;
+          }
         } catch {
-          return this.searchLike(
-            input.query,
-            limit,
-            input.conversationId,
-            input.conversationIds,
-            input.since,
-            input.before,
-          );
+          // trigram table may not exist; fall through to LIKE OR
         }
       }
-      return this.searchLike(
+      return this.searchLikeCjk(
         input.query,
         limit,
         input.conversationId,
@@ -1199,7 +1222,29 @@ export class SummaryStore {
         input.before,
       );
     }
-    return this.searchRegex(
+    if (this.fts5Available) {
+      try {
+        return this.searchFullText(
+          input.query,
+          limit,
+          input.conversationId,
+          input.conversationIds,
+          input.since,
+          input.before,
+          input.sort,
+        );
+      } catch {
+        return this.searchLike(
+          input.query,
+          limit,
+          input.conversationId,
+          input.conversationIds,
+          input.since,
+          input.before,
+        );
+      }
+    }
+    return this.searchLike(
       input.query,
       limit,
       input.conversationId,
@@ -1505,11 +1550,12 @@ export class SummaryStore {
     conversationIds?: number[],
     since?: Date,
     before?: Date,
-  ): SummarySearchResult[] {
+  ): SearchOutcome<SummarySearchResult> {
     const re = compileSafeSearchRegex(pattern);
     if (!re) {
-      return [];
+      return { results: [], scanLimited: false };
     }
+    const maxRows = this.searchScanLimits.regexMaxRows;
 
     const where: string[] = [];
     const args: Array<string | number> = [];
@@ -1537,15 +1583,20 @@ export class SummaryStore {
                 ${SUMMARY_SEARCH_TIME_EXPR_UNQUALIFIED} AS created_at
          FROM summaries
          ${whereClause}
-         ORDER BY ${SUMMARY_SEARCH_TIME_EXPR_UNQUALIFIED} DESC`,
+         ORDER BY ${SUMMARY_SEARCH_TIME_EXPR_UNQUALIFIED} DESC
+         LIMIT ?`,
       )
-      .all(...args) as unknown as SummaryRow[];
+      .iterate(...args, maxRows + 1) as Iterable<SummaryRow>;
 
-    const MAX_ROW_SCAN = 10_000;
     const results: SummarySearchResult[] = [];
     let scanned = 0;
+    let scanLimited = false;
     for (const row of rows) {
-      if (results.length >= limit || scanned >= MAX_ROW_SCAN) {
+      if (results.length >= limit) {
+        break;
+      }
+      if (scanned >= maxRows) {
+        scanLimited = true;
         break;
       }
       scanned++;
@@ -1561,7 +1612,7 @@ export class SummaryStore {
         });
       }
     }
-    return results;
+    return { results, scanLimited };
   }
 
   // ── Large files ───────────────────────────────────────────────────────────

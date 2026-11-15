@@ -188,7 +188,7 @@ export async function closeInactiveCompactionMaintenanceDebt(params: {
 
   let backupPath: string | null;
   try {
-    backupPath = createLcmDatabaseBackup(params.db, {
+    backupPath = await createLcmDatabaseBackup(params.db, {
       databasePath: params.databasePath,
       label: `maintenance-close-${params.conversationId}`,
     });

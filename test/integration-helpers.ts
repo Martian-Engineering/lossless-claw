@@ -198,6 +198,9 @@ export function createMockConversationStore() {
           }));
       },
     ),
+    async searchMessagesWithScanInfo(input: { query: string; mode: string; limit?: number }) {
+      return { results: await this.searchMessages(input), scanLimited: false };
+    },
     // Expose internals for assertions
     _conversations: conversations,
     _messages: messages,
@@ -556,6 +559,10 @@ export function createMockSummaryStore() {
           }));
       },
     ),
+
+    async searchSummariesWithScanInfo(input: { query: string; mode: string; limit?: number }) {
+      return { results: await store.searchSummaries(input), scanLimited: false };
+    },
 
     // ── Large files ─────────────────────────────────────────────────────
 

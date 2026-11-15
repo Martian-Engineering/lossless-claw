@@ -1714,6 +1714,32 @@ export function runLcmMigrations(
         `CREATE INDEX IF NOT EXISTS summaries_conv_depth_kind_idx ON summaries (conversation_id, depth, kind)`,
       ),
     );
+    // messages.created_at is stored after content, so ordering or filtering by
+    // it from the table reads every large row's overflow chain. These indexes
+    // let search rank, page and bound scans from index entries alone.
+    runMigrationStep("createMessageCreatedAtIndexes", log, () =>
+      db.exec(`
+        CREATE INDEX IF NOT EXISTS messages_created_idx ON messages (created_at);
+        CREATE INDEX IF NOT EXISTS messages_conv_created_idx ON messages (conversation_id, created_at);
+      `),
+    );
+    // SQLite checks RESTRICT / SET NULL foreign keys by looking up the child
+    // column for every deleted parent row. Without these indexes each deleted
+    // message or summary scans the whole child table.
+    runMigrationStep("createForeignKeyChildIndexes", log, () =>
+      db.exec(`
+        CREATE INDEX IF NOT EXISTS context_items_message_idx
+          ON context_items (message_id) WHERE message_id IS NOT NULL;
+        CREATE INDEX IF NOT EXISTS context_items_summary_idx
+          ON context_items (summary_id) WHERE summary_id IS NOT NULL;
+        CREATE INDEX IF NOT EXISTS pending_summary_nodes_canonical_summary_idx
+          ON pending_summary_nodes (canonical_summary_id) WHERE canonical_summary_id IS NOT NULL;
+        CREATE INDEX IF NOT EXISTS conversation_transcript_gaps_prev_message_idx
+          ON conversation_transcript_gaps (prev_message_id) WHERE prev_message_id IS NOT NULL;
+        CREATE INDEX IF NOT EXISTS conversation_transcript_gaps_next_message_idx
+          ON conversation_transcript_gaps (next_message_id) WHERE next_message_id IS NOT NULL;
+      `),
+    );
     runVersionedBackfillStep(db, "backfillSummaryMetadata", log, () =>
       backfillSummaryMetadata(db),
     );

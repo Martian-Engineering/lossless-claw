@@ -156,7 +156,7 @@ export async function applyScopedDoctorRepair(params: {
       const unavailable = await withExclusiveDatabaseLock(
         params.db,
         { timeoutMs: DOCTOR_APPLY_DATABASE_LOCK_TIMEOUT_MS },
-        () => {
+        async () => {
           if (params.db.isTransaction) {
             return {
               kind: "unavailable" as const,
@@ -165,7 +165,7 @@ export async function applyScopedDoctorRepair(params: {
             };
           }
 
-          const createdBackupPath = createLcmDatabaseBackup(params.db, {
+          const createdBackupPath = await createLcmDatabaseBackup(params.db, {
             databasePath: params.config.databasePath,
             label: "scoped-doctor-repair",
           });
@@ -176,6 +176,13 @@ export async function applyScopedDoctorRepair(params: {
             };
           }
           backupPath = createdBackupPath;
+          if (params.db.isTransaction) {
+            return {
+              kind: "unavailable" as const,
+              reason:
+                "Lossless Claw wrote the doctor apply backup, but the shared database connection entered another transaction meanwhile.",
+            };
+          }
 
           params.db.exec("BEGIN IMMEDIATE");
           try {

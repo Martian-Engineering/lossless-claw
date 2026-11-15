@@ -1,10 +1,8 @@
 import type { DatabaseSync, SQLInputValue } from "node:sqlite";
 import { getFileBackedDatabasePath } from "../db/connection.js";
 import { isIsolatedCronSessionKey } from "../session-patterns.js";
-import {
-  DELIBERATE_ARCHIVE_CAUSES,
-  normalizeMessageContentForFullTextIndex,
-} from "../store/conversation-store.js";
+import { DELIBERATE_ARCHIVE_CAUSES } from "../store/conversation-store.js";
+import { normalizeMessageContentForFullTextIndex } from "../store/message-fts-content.js";
 import type { ArchiveCause } from "../store/conversation-store.js";
 import { withDatabaseTransaction } from "../transaction-mutex.js";
 import { createLcmDatabaseBackup } from "./lcm-db-backup.js";
@@ -854,7 +852,7 @@ export async function applyRolloverSplitRepair(params: {
     };
   }
 
-  const backupPath = createLcmDatabaseBackup(params.db, {
+  const backupPath = await createLcmDatabaseBackup(params.db, {
     databasePath: params.databasePath,
     label: "rollover-split-repair",
   });
