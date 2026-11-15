@@ -123,6 +123,17 @@ export type LcmConfig = {
   /** Deprecated alias for `sweepMaxDepth`; kept for config compatibility. */
   incrementalMaxDepth: number;
   leafChunkTokens: number;
+  /**
+   * How long a conversation may go without ingesting a message before its
+   * prepared (hidden) pending-summary frontier is published without waiting
+   * for a compaction event. A dormant conversation never grows its context,
+   * so it would otherwise never publish its prepared frontier at all.
+   *
+   * Defaults to 24 hours. Set to a negative value to disable dormant
+   * publication entirely (prepared frontiers then wait for a real compaction
+   * event, as before).
+   */
+  pendingSummaryDormancyMs?: number;
   /** Optional target for summarized-prefix tokens after a full sweep. */
   summaryPrefixTargetTokens?: number;
   /** Hard cap on per-pass iterations within a single full sweep (default 12). */
@@ -725,6 +736,9 @@ export function resolveLcmConfigWithDiagnostics(
       sweepMaxDepth: resolvedSweepMaxDepth,
       incrementalMaxDepth: resolvedSweepMaxDepth,
       leafChunkTokens: resolvedLeafChunkTokens,
+      pendingSummaryDormancyMs:
+        parseFiniteInt(env.LCM_PENDING_SUMMARY_DORMANCY_MS)
+          ?? toNumber(pc.pendingSummaryDormancyMs) ?? undefined,
       summaryPrefixTargetTokens: resolvedSummaryPrefixTargetTokens,
       maxSweepIterations: resolvedMaxSweepIterations,
       sweepDeadlineMs: resolvedSweepDeadlineMs,

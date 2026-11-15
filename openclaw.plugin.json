@@ -87,6 +87,7 @@
       "properties": [
         "sweepMaxDepth",
         "leafChunkTokens",
+        "pendingSummaryDormancyMs",
         "summaryPrefixTargetTokens",
         "leafMinFanout",
         "condensedMinFanout",
@@ -219,6 +220,10 @@
     "leafChunkTokens": {
       "label": "Leaf Chunk Tokens",
       "help": "Maximum source tokens per leaf compaction chunk before summarization (default 20000)"
+    },
+    "pendingSummaryDormancyMs": {
+      "label": "Pending Summary Dormancy (ms)",
+      "help": "How long a conversation may go without ingesting a message before its prepared pending-summary frontier is published without waiting for a compaction event. A dormant conversation never grows its context, so it would otherwise never publish. Defaults to 24 hours (86400000 ms). Set to -1 to disable dormant publication."
     },
     "summaryPrefixTargetTokens": {
       "label": "Summary Prefix Target Tokens",
