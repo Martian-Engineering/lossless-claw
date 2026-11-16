@@ -330,6 +330,16 @@ function buildContextEngineProjectionEpoch(
   ].join(":");
 }
 
+/**
+ * True only for the host's cancellation of `signal`, never for an unrelated
+ * failure. A model call the host canceled surfaces as a lifecycle refusal.
+ */
+function isHostAbortRejection(error: unknown, signal?: AbortSignal): boolean {
+  return signal?.aborted === true &&
+    (error === signal.reason || error instanceof LcmRuntimeLifecycleError ||
+      (error instanceof Error && error.name === "AbortError"));
+}
+
 /** Return whether a typed host owns prompt framing outside Lossless storage. */
 function hostOwnsPromptFraming(runtimeSettings?: ContextEngineRuntimeSettings): boolean {
   const executionHostId = runtimeSettings?.executionHost?.id;
@@ -579,6 +589,7 @@ export class LcmContextEngine implements ContextEngine {
         "runtimeContext",
         "runtimeSettings",
         "onProgress",
+        "abortSignal",
       ],
       transcriptSemantics: {
         currentTurnFence: "before-current-turn-entry-v1",
@@ -1066,6 +1077,7 @@ export class LcmContextEngine implements ContextEngine {
   /** Advance below-threshold pending summary preparation only when the session is idle. */
   private async drainPendingSummaryPreparationIfIdle(
     params: PendingSummaryPreparationDrainParams & { queueKey: string; runtimeContext?: ContextEngineMaintenanceRuntimeContext },
+    abortSignal?: AbortSignal,
   ): Promise<ContextEngineMaintenanceResult | undefined> {
     const sessionLabel = formatSessionLabel(params.sessionId, params.sessionKey);
     const busyQueue = this.sessionOperationQueues.get(params.queueKey);
@@ -1109,6 +1121,7 @@ export class LcmContextEngine implements ContextEngine {
         runtimeContext: params.runtimeContext,
         sessionQueueHeld: false,
         publishPolicy: "prepare-only",
+        abortSignal,
       });
       this.deps.log.debug(
         `[lcm] background pending summary preparation done conversation=${params.conversationId} ${sessionLabel} changed=${result.compacted} reason=${result.reason ?? "none"} prepReason=${params.reason}`,
@@ -1134,6 +1147,7 @@ export class LcmContextEngine implements ContextEngine {
    */
   private async drainDeferredCompactionDebtIfIdle(
     params: DeferredCompactionDebtDrainParams & { queueKey: string; runtimeContext?: ContextEngineMaintenanceRuntimeContext },
+    abortSignal?: AbortSignal,
   ): Promise<ContextEngineMaintenanceResult | undefined> {
     const sessionLabel = formatSessionLabel(params.sessionId, params.sessionKey);
     const busyQueue = this.sessionOperationQueues.get(params.queueKey);
@@ -1188,6 +1202,7 @@ export class LcmContextEngine implements ContextEngine {
         runtimeContext: params.runtimeContext,
         sessionQueueHeld: false,
         pendingPublishPolicy: "publish-if-ready",
+        abortSignal,
       });
       if (result) {
         this.deps.log.debug(
@@ -1249,6 +1264,8 @@ export class LcmContextEngine implements ContextEngine {
     force?: boolean;
     sessionQueueHeld?: boolean;
     pendingPublishPolicy?: PendingCompactionPublishPolicy;
+    /** Host maintenance cancellation; aborted debt stays pending with its retry state. */
+    abortSignal?: AbortSignal;
   }): Promise<(ContextEngineMaintenanceResult & { exhausted?: boolean }) | null> {
     const maintenance = await this.compactionMaintenanceStore.getConversationCompactionMaintenance(
       params.conversationId,
@@ -1474,6 +1491,7 @@ export class LcmContextEngine implements ContextEngine {
         force: params.force === true,
         sessionQueueHeld: params.sessionQueueHeld === true,
         publishPolicy: params.pendingPublishPolicy ?? "publish-if-ready",
+        abortSignal: params.abortSignal,
       });
       let publicationPressureRemains = false;
       if (params.pendingPublishPolicy === "publish-ready-only" && result.compacted) {
@@ -1517,6 +1535,16 @@ export class LcmContextEngine implements ContextEngine {
         ...(compactionExhausted ? { exhausted: true } : {}),
       };
     } catch (error) {
+      if (isHostAbortRejection(error, params.abortSignal)) {
+        // Cancellation is not a failed attempt: release `running`, keep the
+        // debt pending, and leave retry count, backoff and last failure as-is.
+        await this.compactionMaintenanceStore.markProactiveCompactionFinished({
+          conversationId: params.conversationId,
+          keepPending: true,
+          preserveRetryState: true,
+        });
+        throw error;
+      }
       await this.compactionMaintenanceStore.markProactiveCompactionFinished({
         conversationId: params.conversationId,
         finishedAt: new Date(),
@@ -1540,7 +1568,7 @@ export class LcmContextEngine implements ContextEngine {
     conversationId: number;
     sessionId: string;
     sessionKey?: string;
-    result: CompactResult & { pending?: boolean; exhausted?: boolean };
+    result: CompactResult & { pending?: boolean; exhausted?: boolean; canceled?: boolean };
     publicationPressureRemains?: boolean;
     publicationOnly?: boolean;
   }): Promise<void> {
@@ -1550,7 +1578,10 @@ export class LcmContextEngine implements ContextEngine {
     // Manual compaction must not manufacture automatic work or finished rows.
     if (!maintenance?.pending && !maintenance?.running) return;
     const circuitOpen = result.reason === "circuit breaker open";
-    const keepPending = result.pending === true || params.publicationPressureRemains === true ||
+    // A legacy sweep the host cut short is not a failed attempt.
+    const canceledEarly = result.canceled === true;
+    const keepPending = canceledEarly || result.pending === true ||
+      params.publicationPressureRemains === true ||
       ((!result.ok || circuitOpen) && result.exhausted !== true);
     const failureSummary = circuitOpen ? "summary provider circuit breaker is open"
       : result.ok || result.exhausted === true ? null : result.reason ?? "compaction failed";
@@ -1564,7 +1595,8 @@ export class LcmContextEngine implements ContextEngine {
       clearTokenObservations: result.compacted,
       // A publication check that cannot advance is not a successful retry of
       // the provider operation that established the failure and cooldown.
-      preserveRetryState: params.publicationOnly === true && result.ok && !result.compacted && keepPending,
+      preserveRetryState: canceledEarly ||
+        (params.publicationOnly === true && result.ok && !result.compacted && keepPending),
       ...(backoff ? { nextAttemptAfter: backoff } : {}),
     });
     // Queued requests carry the same pre-publication observation as the durable
@@ -1594,7 +1626,7 @@ export class LcmContextEngine implements ContextEngine {
     publishPolicy?: PendingCompactionPublishPolicy;
     abortSignal?: AbortSignal;
     onProgress?: () => void;
-  }): Promise<CompactResult & { pending?: boolean }> {
+  }): Promise<CompactResult & { pending?: boolean; canceled?: boolean }> {
     const breakerScope = this.resolveSessionQueueKey(params.sessionId, params.sessionKey);
     const publicationOnly = params.publishPolicy === "publish-ready-only";
     // Publication consumes prepared work without resolving a model or spending
@@ -1673,11 +1705,18 @@ export class LcmContextEngine implements ContextEngine {
     }
     const withPublishLock =
       params.sessionQueueHeld === true
-        ? undefined
+        ? <T>(operation: () => Promise<T>) => {
+            params.abortSignal?.throwIfAborted();
+            return operation();
+          }
         : <T>(operation: () => Promise<T>) =>
             this.withSessionQueue(
               breakerScope,
-              operation,
+              () => {
+                // The foreground turn that canceled us may have held this queue.
+                params.abortSignal?.throwIfAborted();
+                return operation();
+              },
               {
                 operationName: "pendingSummaryPublish",
                 context: formatSessionLabel(params.sessionId, params.sessionKey),
@@ -1694,7 +1733,7 @@ export class LcmContextEngine implements ContextEngine {
       summarize: resolvedSummarizer.summarize,
       model: resolvedSummarizer.summaryModel,
       leaseOwner: `engine:${params.sessionId}`,
-      ...(withPublishLock ? { withPublishLock } : {}),
+      withPublishLock,
       config: {
         freshTailCount: pendingFreshTailCount,
         freshTailMaxTokens: this.config.freshTailMaxTokens,
@@ -1719,11 +1758,20 @@ export class LcmContextEngine implements ContextEngine {
         ? undefined
         : await this.summaryStore.getContextTokenCount(params.conversationId);
     for (let step = 0; step < maxSteps; step += 1) {
+      // Each step can call the summarizer or publish; never start one after
+      // cancellation. Prepared nodes stay durable for the next pass.
+      params.abortSignal?.throwIfAborted();
       lastResult = await coordinator.runOnce({
         conversationId: params.conversationId,
         sessionKey: params.sessionKey,
         publishPolicy: params.publishPolicy,
       });
+      // A model call the host canceled comes back as a lifecycle interruption
+      // (its claim is already released untouched); report it as cancellation
+      // rather than a failed pass. Real failures keep their normal handling.
+      if (lastResult.status === "failed" && lastResult.lifecycleInterrupted) {
+        params.abortSignal?.throwIfAborted();
+      }
       if (lastResult.status === "published") {
         const tokensAfterPublication = await this.summaryStore.getContextTokenCount(
           params.conversationId,
@@ -1819,7 +1867,10 @@ export class LcmContextEngine implements ContextEngine {
               result: lastResult,
             };
           }
-          const runLegacyCompaction = () => this.executeCompactionCore({
+          const runLegacyCompaction = async () => {
+            // Waiting for the session queue may outlast the host's cancellation.
+            params.abortSignal?.throwIfAborted();
+            const legacy = await this.executeCompactionCore({
             conversationId: params.conversationId,
             sessionId: params.sessionId,
             sessionKey: params.sessionKey,
@@ -1834,7 +1885,14 @@ export class LcmContextEngine implements ContextEngine {
             force: params.force === true,
             abortSignal: params.abortSignal,
             onProgress: params.onProgress,
-          });
+            });
+            // The sweep stops between passes on abort and reports a partial,
+            // unsuccessful result; mark it so the debt is not charged a retry.
+            // An auth failure is a real outcome and keeps its accounting.
+            return !legacy.ok && params.abortSignal?.aborted && !/provider auth failure/.test(legacy.reason ?? "")
+              ? { ...legacy, canceled: true }
+              : legacy;
+          };
           if (params.sessionQueueHeld === true) {
             return runLegacyCompaction();
           }
@@ -1864,6 +1922,8 @@ export class LcmContextEngine implements ContextEngine {
       }
     }
 
+    // The last allowed step may have been the one the host canceled.
+    params.abortSignal?.throwIfAborted();
     return {
       ok: true,
       compacted: false,
@@ -3335,6 +3395,8 @@ export class LcmContextEngine implements ContextEngine {
     sessionKey?: string;
     runtimeContext?: ContextEngineMaintenanceRuntimeContext;
     runtimeSettings?: ContextEngineRuntimeSettings;
+    /** Host cancellation, e.g. a foreground turn needs the session. */
+    abortSignal?: AbortSignal;
   }): Promise<ContextEngineMaintenanceResult> {
     const hostApprovedRuntimeMaintenance =
       params.runtimeContext?.allowDeferredCompactionExecution === true;
@@ -3362,6 +3424,7 @@ export class LcmContextEngine implements ContextEngine {
     });
     if (!conversation) return unchanged("conversation not found");
     if (!hostApprovedRuntimeMaintenance) return unchanged("no deferred maintenance work");
+    params.abortSignal?.throwIfAborted();
 
     const queued = this.maintenanceRequests.get(queueKey);
     const request = queued?.conversationId === conversation.conversationId ? queued : undefined;
@@ -3388,14 +3451,29 @@ export class LcmContextEngine implements ContextEngine {
       reason: maintenance?.reason ?? "leaf-prep",
     };
     let result: ContextEngineMaintenanceResult | undefined;
-    if (maintenance?.pending || maintenance?.running) {
-      result = await this.drainDeferredCompactionDebtIfIdle(work);
-    } else {
-      const leaf = await this.compaction.evaluateLeafTrigger(
-        conversation.conversationId, this.config.leafChunkTokens,
-      );
-      if (!leaf.shouldCompact) return outcome;
-      result = await this.drainPendingSummaryPreparationIfIdle(work);
+    let drained = false;
+    try {
+      if (maintenance?.pending || maintenance?.running) {
+        result = await this.drainDeferredCompactionDebtIfIdle(work, params.abortSignal);
+        drained = true;
+      } else {
+        const leaf = await this.compaction.evaluateLeafTrigger(
+          conversation.conversationId, this.config.leafChunkTokens,
+        );
+        if (!leaf.shouldCompact) return outcome;
+        result = await this.drainPendingSummaryPreparationIfIdle(work, params.abortSignal);
+        drained = true;
+      }
+      // Reject after cleanup so the host sees cancellation, not a result.
+      params.abortSignal?.throwIfAborted();
+    } catch (error) {
+      // A canceled drain keeps the queued request for the next pass (unless a
+      // newer one replaced it). A finished drain already rescheduled its work.
+      if (!drained && isHostAbortRejection(error, params.abortSignal) && queued &&
+        !this.maintenanceRequests.has(queueKey)) {
+        this.maintenanceRequests.set(queueKey, queued);
+      }
+      throw error;
     }
     return result ?? outcome;
   }
