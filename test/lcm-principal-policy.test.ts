@@ -175,10 +175,19 @@ describe("principal-scoped recall with real SQLite stores", () => {
     expect(search).not.toHaveBeenCalled();
   });
 
-  it("rejects a runtime-ID fallback to a different principal", async () => {
+  it("never follows a runtime-ID fallback to a different principal", async () => {
     const result = await createLcmGrepTool({ deps, lcm, sessionKey: ownKey, sessionId: "otherdm" })
       .execute("stale", { pattern: "policyfact" });
-    expect(JSON.stringify(result)).toContain("outside this principal scope");
+    const details = result.details as {
+      error?: string;
+      messages?: Array<{ conversationId: number }>;
+      summaries?: Array<{ conversationId: number }>;
+    };
+    const rows = [...(details.messages ?? []), ...(details.summaries ?? [])];
+    // The policy denies a resolver that follows the foreign runtime ID; a resolver that
+    // keeps the requested key (#1285) stays in the caller's family. Neither returns foreign rows.
+    expect(details.error?.includes("outside this principal scope") || rows.length > 0).toBe(true);
+    for (const row of rows) expect([ids.own, ids.archive]).toContain(row.conversationId);
   });
 
   it("denies an unresolved exact topic within a known principal before content access", async () => {
