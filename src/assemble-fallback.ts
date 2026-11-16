@@ -196,6 +196,23 @@ export function trimMessagesToBudget(
   return stripTrailingAssistantPrefill(kept, options);
 }
 
+// Opening tags as formatSummaryContent / formatFocusBriefContent write them.
+const PINNED_SUMMARY_OPEN = /^<summary id="[^"]*" kind="[^"]*" depth="\d+" descendant_count="\d+"[ >]/;
+const PINNED_FOCUS_BRIEF_OPEN = /^<focus_brief id="[^"]*" prompt="[^"]*" token_count="\d+"[ >]/;
+
+/**
+ * Assembler-shaped wrappers only. This matches on text, so a raw user message
+ * that reproduces a full wrapper (e.g. pasted LCM output) is also pinned.
+ */
+function isPinnedContextMessage(message: AgentMessage): boolean {
+  if (message.role !== "user" || typeof message.content !== "string") {
+    return false;
+  }
+  const content = message.content;
+  return (PINNED_SUMMARY_OPEN.test(content) && content.endsWith("</summary>")) ||
+    (PINNED_FOCUS_BRIEF_OPEN.test(content) && content.endsWith("</focus_brief>"));
+}
+
 /**
  * Safety ratio applied to the assembly token budget when clamping final
  * output by serialized (model-boundary) estimate. Leaves headroom for the
@@ -253,26 +270,65 @@ export function clampMessagesToSerializedBudget(params: {
     };
   }
 
-  // Keep the newest suffix that fits the target (always at least one message),
-  // then recover any tool-pair partners displaced by the budget boundary.
-  const kept: AgentMessage[] = [];
-  let keptTokens = 0;
-  for (let index = messages.length - 1; index >= 0; index -= 1) {
-    const message = messages[index]!;
-    const tokenCount = estimateSerializedMessageTokens(message);
-    if (kept.length > 0 && keptTokens + tokenCount > targetTokens) {
-      break;
+  // Keep the newest suffix that fits (always at least one message), then
+  // recover any tool-pair partners displaced by the budget boundary.
+  const selectSuffix = (candidates: AgentMessage[], budget: number): AgentMessage[] => {
+    let kept = 0;
+    let tokens = 0;
+    for (let index = candidates.length - 1; index >= 0; index -= 1) {
+      const tokenCount = estimateSerializedMessageTokens(candidates[index]!);
+      if (kept > 0 && tokens + tokenCount > budget) {
+        break;
+      }
+      kept += 1;
+      tokens += tokenCount;
     }
-    kept.push(message);
-    keptTokens += tokenCount;
+    return buildProviderValidSuffix({
+      messages: candidates,
+      retainedStartIndex: candidates.length - kept,
+      preserveSubstantiveAssistantTail: params.preserveSubstantiveAssistantTail,
+    });
+  };
+
+  // Leading LCM summaries and focus briefs stand in for all older history.
+  // Evicting them first discards the compressed past to keep raw turns, so
+  // pin them and evict the oldest raw messages. A pin set is used only when
+  // it fits with a valid raw tail that survives assistant-tail stripping;
+  // otherwise drop the oldest pins. With none left this is the plain suffix
+  // clamp, so pinning never pushes a stock-fitting result over the target.
+  let pinnedCount = 0;
+  while (pinnedCount < messages.length - 1 && isPinnedContextMessage(messages[pinnedCount]!)) {
+    pinnedCount += 1;
   }
-  kept.reverse();
-  const providerValidKept = buildProviderValidSuffix({
-    messages,
-    retainedStartIndex: messages.length - kept.length,
-    preserveSubstantiveAssistantTail: params.preserveSubstantiveAssistantTail,
-  });
-  keptTokens = estimateSerializedMessagesTokens(providerValidKept);
+  // The last pin stays a tail candidate: it is the user turn that opens a raw
+  // tail starting mid tool exchange, as it is for the plain suffix clamp.
+  const tailSource = messages.slice(Math.max(0, pinnedCount - 1));
+  const lastPin = pinnedCount > 0 ? messages[pinnedCount - 1] : undefined;
+  const stripOptions = { preserveSubstantiveAssistantTail: params.preserveSubstantiveAssistantTail };
+  const minimalTail = pinnedCount > 0 ? selectSuffix(tailSource, 0) : [];
+  let pinTokens = estimateSerializedMessagesTokens(messages.slice(0, pinnedCount));
+  let providerValidKept: AgentMessage[] | undefined;
+  for (let dropped = 0; dropped < pinnedCount && !providerValidKept; dropped += 1) {
+    if (dropped > 0) {
+      pinTokens -= estimateSerializedMessageTokens(messages[dropped - 1]!);
+    }
+    const pins = messages.slice(dropped, pinnedCount);
+    // Tool-pair recovery can pull an old, large call into the tail and
+    // overshoot; then keep the minimal valid tail rather than drop a pin.
+    // No search between the two tail sizes; add one if minimal tails prove too short.
+    for (const tail of [selectSuffix(tailSource, targetTokens - pinTokens), minimalTail]) {
+      const candidate = tail[0] === lastPin ? [...pins.slice(0, -1), ...tail] : [...pins, ...tail];
+      if (
+        stripTrailingAssistantPrefill(candidate, stripOptions).length > pins.length &&
+        estimateSerializedMessagesTokens(candidate) <= targetTokens
+      ) {
+        providerValidKept = candidate;
+        break;
+      }
+    }
+  }
+  providerValidKept ??= selectSuffix(messages, targetTokens);
+  let keptTokens = estimateSerializedMessagesTokens(providerValidKept);
 
   // Historically an assistant-only suffix was retained when stripping would
   // empty the result. Prompt-separate hosts must still return an empty array
