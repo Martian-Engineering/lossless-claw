@@ -113,7 +113,7 @@ import {
 import { extractStableEventKey } from "./stable-event-key.js";
 import { describeAssembledPrefixChange, formatOverflowDiagnosticsForLog, shouldLogOverflowDiagnostics, type AssemblePrefixSnapshot, type BootstrapImportObservation } from "./assemble-debug.js";
 
-import { buildDegradedLiveAssembleResult, clampMessagesToSerializedBudget, SERIALIZED_OUTPUT_CLAMP_SAFETY_RATIO } from "./assemble-fallback.js";
+import { buildDegradedLiveAssembleResult, clampMessagesToSerializedBudget, SERIALIZED_OUTPUT_CLAMP_SAFETY_RATIO, type LiveWindowState } from "./assemble-fallback.js";
 import { resolveBootstrapMaxTokens } from "./bootstrap-budget.js";
 import { batchLooksLikeHeartbeatAckTurn, pruneHeartbeatOkTurns } from "./heartbeat-filter.js";
 import { appendUncoveredVolatileLiveInputsWithinBudget, isVolatileLiveInputMessage, resolveProtectedFreshTailAssembledIndexes, stripTrailingAssistantPrefill } from "./live-coverage.js";
@@ -256,6 +256,7 @@ const HOST_SESSION_END_REASON_DELETED = "deleted";
 const HOST_SESSION_END_REASON_RESET = "reset";
 const CONTEXT_ENGINE_PROJECTION_EPOCH_VERSION = "summary-prefix-v1";
 const DEFERRED_ASSEMBLY_PRESSURE_RATIO = 0.75;
+const MAX_TRACKED_LIVE_WINDOWS = 1_024;
 const PENDING_SUMMARY_MODEL_UNAVAILABLE_REASON = "pending summary model unavailable";
 type CompactionExecutionParams = {
   /** Authoritative forced-recovery snapshot is fully reconciled. */
@@ -497,6 +498,9 @@ export class LcmContextEngine implements ContextEngine {
   >();
   private deferredCompactionDrains = new Set<string>();
   private pendingSummaryPreparationDrains = new Set<string>();
+  // Bounded live-window heads per conversation, so live fallbacks keep the
+  // provider prompt prefix stable across tool-loop requests.
+  private liveWindows = new Map<number, LiveWindowState>();
   // Data-only requests. The host's background maintain() call owns execution;
   // never capture a foreground async scope or call-bound LLM capability here.
   private maintenanceRequests = new Map<string, DeferredCompactionDebtDrainParams>();
@@ -1871,6 +1875,22 @@ export class LcmContextEngine implements ContextEngine {
       reason: "pending summary work remains",
       result: lastResult,
     };
+  }
+
+  /** Return the live-window state for a conversation, retaining the most recent ones. */
+  private getLiveWindowState(conversationId: number): LiveWindowState {
+    let state = this.liveWindows.get(conversationId);
+    if (state) {
+      this.liveWindows.delete(conversationId);
+    } else {
+      state = {};
+      if (this.liveWindows.size >= MAX_TRACKED_LIVE_WINDOWS) {
+        const oldest = this.liveWindows.keys().next().value;
+        if (oldest !== undefined) this.liveWindows.delete(oldest);
+      }
+    }
+    this.liveWindows.set(conversationId, state);
+    return state;
   }
 
   /** Publish ready work, then prepare at most one bounded pass before eviction. */
@@ -4595,6 +4615,7 @@ export class LcmContextEngine implements ContextEngine {
           messages: fallback.messages,
           tokenBudget,
           preserveSubstantiveAssistantTail: hostDeliversCurrentTurnSeparately,
+          liveWindow: this.getLiveWindowState(conversation.conversationId),
         });
         if (clamp.clamped || clamp.overBudget) {
           this.deps.log.warn(
@@ -4616,6 +4637,7 @@ export class LcmContextEngine implements ContextEngine {
           tokenBudget,
           preserveSubstantiveAssistantTail: hostDeliversCurrentTurnSeparately,
           contextProjection,
+          liveWindow: this.getLiveWindowState(conversation.conversationId),
         });
         this.deps.log.warn(
           `[lcm] assemble: degraded live fallback conversation=${conversation.conversationId} ${sessionLabel} reason=${coverageTrailsLive ? "coverage-trails-live" : foregroundRelief.reason} pressure=${foregroundRelief.pressure} tokenBudget=${tokenBudget} estimatedTokens=${degraded.estimatedTokens}`,
