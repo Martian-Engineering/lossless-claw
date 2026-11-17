@@ -136,18 +136,21 @@ const HOST_ONLY_MESSAGE_FIELDS = new Set([
  * Opaque replay signatures carried on content blocks. Providers receive them
  * as encrypted or identifier state, not as tokenized text. Redacted thinking keeps its signature because that is its only payload.
  */
-const OPAQUE_BLOCK_SIGNATURE_FIELDS: Readonly<Record<string, string>> = {
-  thinking: "thinkingSignature",
-  text: "textSignature",
-  toolCall: "thoughtSignature",
+const OPAQUE_BLOCK_SIGNATURE_FIELDS: Readonly<Record<string, readonly string[]>> = {
+  thinking: ["thinkingSignature", "signature"],
+  text: ["textSignature"],
+  toolCall: ["thoughtSignature"],
+  // Stored form of OpenAI encrypted reasoning.
+  reasoning: ["encrypted_content"],
 };
 
-/** Drop an opaque signature from one content block without mutating it. */
+/** Drop opaque signatures from one content block without mutating it. */
 function stripOpaqueBlockSignature(block: unknown): unknown {
-  if (!isRecord(block) || typeof block.type !== "string") return block;
-  const field = OPAQUE_BLOCK_SIGNATURE_FIELDS[block.type];
-  if (!field || !Object.hasOwn(block, field) || block.redacted === true) return block;
-  const { [field]: _signature, ...visible } = block;
+  if (!isRecord(block) || typeof block.type !== "string" || block.redacted === true) return block;
+  const fields = OPAQUE_BLOCK_SIGNATURE_FIELDS[block.type];
+  if (!fields || !fields.some(field => Object.hasOwn(block, field))) return block;
+  const visible = { ...block };
+  for (const field of fields) delete visible[field];
   return visible;
 }
 
