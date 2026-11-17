@@ -400,6 +400,22 @@ async function runDelegatedQueryAttempt(
   let sessionCleanupComplete = false;
   let sessionCleanupStarted = false;
   let outcome: DelegatedBucketOutcome;
+  // Cancelling an active child changes its session, so the host can reject that delete and ask for a retry.
+  const sessionChanged = (error: unknown) =>
+    (error as { details?: { reason?: unknown } } | null)?.details?.reason === "session-changed" ||
+    /changed before deletion/i.test(formatExpansionFailure(error));
+  const deleteChildSession = async (timeoutMs: number, deadlineMs: number) => {
+    for (let attempt = 1; ; attempt++) {
+      try {
+        await beforeDeadline(() => params.deps.callGateway({
+          method: "sessions.delete", params: { key: childSessionKey, deleteTranscript: true }, timeoutMs,
+        }), deadlineMs);
+        return;
+      } catch (error) {
+        if (attempt >= 3 || !sessionChanged(error)) throw error;
+      }
+    }
+  };
 
   try {
     // Refuse new child work after candidate resolution has consumed the work budget.
@@ -492,9 +508,7 @@ async function runDelegatedQueryAttempt(
       const sourceTokens = remainingTokens == null ? 0 : Math.max(0, params.tokenCap - remainingTokens);
       // Do not start synthesis while the owned navigator can still issue tool calls.
       sessionCleanupStarted = true;
-      await beforeDeadline(() => params.deps.callGateway({
-        method: "sessions.delete", params: { key: childSessionKey, deleteTranscript: true }, timeoutMs: GATEWAY_TIMEOUT_MS,
-      }), Math.min(params.deadline.workDeadlineMs, performance.now() + GATEWAY_TIMEOUT_MS));
+      await deleteChildSession(GATEWAY_TIMEOUT_MS, Math.min(params.deadline.workDeadlineMs, performance.now() + GATEWAY_TIMEOUT_MS));
       sessionCleanupComplete = true;
       revokeDelegatedExpansionGrantForSession(childSessionKey, { removeBinding: true });
       clearDelegatedExpansionContext(childSessionKey);
@@ -600,11 +614,7 @@ async function runDelegatedQueryAttempt(
       sessionCleanupComplete = true;
     } else if (!sessionCleanupStarted && cleanupTimeoutMs > 0) {
       try {
-        await beforeDeadline(() => params.deps.callGateway({
-          method: "sessions.delete",
-          params: { key: childSessionKey, deleteTranscript: true },
-          timeoutMs: Math.min(GATEWAY_TIMEOUT_MS, cleanupTimeoutMs),
-        }), params.deadline.totalDeadlineMs);
+        await deleteChildSession(Math.min(GATEWAY_TIMEOUT_MS, cleanupTimeoutMs), params.deadline.totalDeadlineMs);
         sessionCleanupComplete = true;
       } catch {
         // Cleanup is best-effort.

@@ -110,6 +110,54 @@ describe("delegated query convergence", () => {
     expect(f.callGateway.mock.calls.filter(([r]) => r.method === "sessions.delete")).toHaveLength(1);
   });
 
+  // Hosts cancel the active child first, then can reject the delete because that changed its session.
+  const sessionChanged = () => Promise.reject(new Error("Session agent:test:subagent:owned changed before deletion. Retry."));
+
+  it("retries owned child cleanup when cancelling the child changed its session", async () => {
+    const f = fixture();
+    const original = f.callGateway.getMockImplementation()!;
+    let deletes = 0;
+    f.callGateway.mockImplementation((p) => p.method === "sessions.delete" && ++deletes === 1 ? sessionChanged() : original(p));
+    expect(await f.run()).toMatchObject({ status: "success", reply: { citedIds: ["sum_a"], truncated: true } });
+    expect(deletes).toBe(2);
+    expect(f.complete).toHaveBeenCalledTimes(1);
+  });
+
+  it("recognizes the host's session-changed reason and stops at any other cleanup error", async () => {
+    const f = fixture();
+    const original = f.callGateway.getMockImplementation()!;
+    let deletes = 0;
+    f.callGateway.mockImplementation((p) => {
+      if (p.method !== "sessions.delete") return original(p);
+      return Promise.reject(++deletes === 1
+        ? Object.assign(new Error("reworded"), { details: { reason: "session-changed" } }) : new Error("cleanup failed"));
+    });
+    expect(await f.run()).toMatchObject({ status: "failed", cleanup: "partial" });
+    expect(deletes).toBe(2);
+    expect(f.complete).not.toHaveBeenCalled();
+  });
+
+  it("stops retrying cleanup when the host keeps reporting a changed session", async () => {
+    const f = fixture();
+    const original = f.callGateway.getMockImplementation()!;
+    f.callGateway.mockImplementation((p) => p.method === "sessions.delete" ? sessionChanged() : original(p));
+    expect(await f.run()).toMatchObject({ status: "failed", cleanup: "partial" });
+    expect(f.complete).not.toHaveBeenCalled();
+    expect(f.callGateway.mock.calls.filter(([r]) => r.method === "sessions.delete")).toHaveLength(3);
+  });
+
+  it("retries the final cleanup of a failed attempt the same way", async () => {
+    const f = fixture();
+    const original = f.callGateway.getMockImplementation()!;
+    let deletes = 0;
+    f.callGateway.mockImplementation((p) => {
+      if (p.method === "agent.wait") return Promise.resolve({ status: "error", error: "child failed" });
+      return p.method === "sessions.delete" && ++deletes === 1 ? sessionChanged() : original(p);
+    });
+    expect(await f.run()).toMatchObject({ status: "failed", code: "DELEGATED_EXPANSION_WAIT_FAILED", cleanup: "complete" });
+    expect(deletes).toBe(2);
+  });
+
   it("aborts a stalled synthesis at the original work deadline", async () => {
     vi.useFakeTimers();
     const f = fixture();
