@@ -106,7 +106,7 @@ The **condensed pass** merges summaries at the same depth into a higher-level su
 
 **Foreground pressure recovery (before assembly eviction):**
 - Measures the full assembled projection, including serialized payloads, restored replay metadata, and uncovered volatile live inputs. Stored estimates cannot hide pressure that appears during rendering
-- Measures in provider prompt units: host-only envelope fields (usage, timestamps, response IDs, diagnostics, tool-result `details`) and opaque replay signatures such as encrypted reasoning are not counted, because providers do not tokenize them
+- Measures in provider prompt units: host-only envelope fields (usage, timestamps, response IDs, diagnostics, tool-result `details`) and opaque replay signatures such as encrypted reasoning are not counted, because providers do not tokenize them. A live assistant message still counts at least its provider-measured completion size, matching the host's prompt precheck
 - Above 75% of the assembly budget with pending debt, or the 90% serialized clamp threshold without debt, takes the session queue and first publishes usable prepared summaries with zero model calls
 - If pressure still exceeds the configured `contextThreshold` target (capped at the serialized safety target), runs one bounded prepare-only pass and another publication opportunity. `maxSweepIterations`, summarizer timeouts, spend limits, and cooldowns still apply
 - Does not start generation while background maintenance owns preparation. It never waits for a background publisher while holding the session queue

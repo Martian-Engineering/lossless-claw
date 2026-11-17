@@ -375,6 +375,24 @@ describe("estimateSerializedMessageTokens", () => {
     );
   });
 
+  it("keeps measured completion occupancy as a floor for opaque reasoning", () => {
+    const message = {
+      role: "assistant",
+      content: [
+        { type: "thinking", thinking: "", thinkingSignature: "encrypted".repeat(4_000) },
+        { type: "text", text: "done" },
+      ],
+      usage: {
+        input: 3,
+        output: 20_000,
+        contextUsage: { state: "available", promptTokens: 90_000, totalTokens: 110_000 },
+      },
+    };
+    expect(estimateSerializedMessageTokens(message)).toBe(20_000);
+    const unmeasured = { ...message, usage: { input: 3, output: 20_000 } };
+    expect(estimateSerializedMessageTokens(unmeasured)).toBeLessThan(100);
+  });
+
   it("keeps the signature payload of redacted thinking", () => {
     const payload = "opaque redacted thinking payload ".repeat(400);
     const redacted = {

@@ -264,11 +264,31 @@ export function estimateSerializedMessageTokens(message: unknown): number {
   }
   const serializedEstimate =
     estimateTokens(serialized) + opaqueParts * OPAQUE_BINARY_PART_TOKEN_ESTIMATE;
-  const estimate = Math.max(serializedEstimate, estimateToolResultBoundaryTokens(rendered));
+  const estimate = Math.max(
+    serializedEstimate,
+    estimateToolResultBoundaryTokens(rendered),
+    measuredCompletionOccupancy(message),
+  );
   if (cacheable) {
     serializedEstimateCache.set(message as object, estimate);
   }
   return estimate;
+}
+
+/**
+ * Provider-measured completion size of an assistant message, including
+ * reasoning hidden behind an opaque signature. The host's prompt precheck
+ * counts at least this much for a live assistant message, so the estimate keeps
+ * it as a floor even though the signature bytes themselves are not counted.
+ */
+function measuredCompletionOccupancy(message: unknown): number {
+  if (!isRecord(message) || message.role !== "assistant" || !isRecord(message.usage)) return 0;
+  const usage = message.usage.contextUsage;
+  if (!isRecord(usage) || usage.state !== "available") return 0;
+  const { totalTokens, promptTokens } = usage;
+  if (typeof totalTokens !== "number" || typeof promptTokens !== "number") return 0;
+  const completion = totalTokens - promptTokens;
+  return Number.isFinite(completion) ? Math.max(0, Math.ceil(completion)) : 0;
 }
 
 function estimateBoundaryStringTokens(text: string, charsPerToken: number): number {
