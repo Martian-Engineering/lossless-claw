@@ -161,4 +161,53 @@ describe("default fresh-tail cap", () => {
     expect(assembled.messages.length).toBeGreaterThanOrEqual(DEFAULT_FRESH_TAIL_MIN_MESSAGES);
     expect(assembled.messages.length).toBeLessThan(BACKLOG.length);
   });
+
+  it("scopes the budget to each overlapping compaction call", async () => {
+    const { engine } = createEngine();
+    const sessionId = "default-fresh-tail-cap-overlap";
+    await seedBacklog(engine, sessionId);
+    const conversationId = await conversationIdFor(engine, sessionId);
+    const compaction = (engine as unknown as {
+      compaction: {
+        evaluate: (
+          conversationId: number,
+          tokenBudget: number,
+          observedTokenCount?: number,
+        ) => Promise<{ rawTokensOutsideTail?: number }>;
+      };
+    }).compaction;
+
+    const [wide, narrow] = await Promise.all([
+      compaction.evaluate(conversationId, 80_000, 40_000),
+      compaction.evaluate(conversationId, 40_000, 40_000),
+    ]);
+
+    expect(wide.rawTokensOutsideTail).toBe(20_000);
+    expect(narrow.rawTokensOutsideTail).toBe(30_000);
+  });
+
+  it("applies the default cap to the below-threshold preparation gate", async () => {
+    const { engine } = createEngine({ leafChunkTokens: 20_000 });
+    const sessionId = "default-fresh-tail-cap-leaf-gate";
+    await seedBacklog(engine, sessionId);
+    const conversationId = await conversationIdFor(engine, sessionId);
+    const compaction = (engine as unknown as {
+      compaction: {
+        evaluateLeafTrigger: (
+          conversationId: number,
+          leafChunkTokens?: number,
+          tokenBudget?: number,
+        ) => Promise<{ shouldCompact: boolean; rawTokensOutsideTail: number }>;
+      };
+    }).compaction;
+
+    await expect(compaction.evaluateLeafTrigger(conversationId, 20_000, 80_000)).resolves.toMatchObject({
+      shouldCompact: true,
+      rawTokensOutsideTail: 20_000,
+    });
+    await expect(compaction.evaluateLeafTrigger(conversationId, 20_000)).resolves.toMatchObject({
+      shouldCompact: false,
+      rawTokensOutsideTail: 0,
+    });
+  });
 });

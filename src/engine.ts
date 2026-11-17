@@ -3418,7 +3418,7 @@ export class LcmContextEngine implements ContextEngine {
       result = await this.drainDeferredCompactionDebtIfIdle(work);
     } else {
       const leaf = await this.compaction.evaluateLeafTrigger(
-        conversation.conversationId, this.config.leafChunkTokens,
+        conversation.conversationId, this.config.leafChunkTokens, tokenBudget,
       );
       if (!leaf.shouldCompact) return outcome;
       result = await this.drainPendingSummaryPreparationIfIdle(work);
@@ -3987,6 +3987,7 @@ export class LcmContextEngine implements ContextEngine {
         const leafDecision = await this.compaction.evaluateLeafTrigger(
           conversation.conversationId,
           this.config.leafChunkTokens,
+          tokenBudget,
         );
         this.deps.log.debug(
           `[lcm] pending-summary-prep: selected phase=${params.phase} conversation=${conversation.conversationId} ${sessionLabel} rawTokensOutsideTail=${leafDecision.rawTokensOutsideTail} threshold=${leafDecision.threshold} shouldPrepare=${leafDecision.shouldCompact}`,
