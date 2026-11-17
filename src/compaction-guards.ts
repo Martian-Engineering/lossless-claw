@@ -254,8 +254,14 @@ export class CompactionGuards {
       params.onAttempt?.();
       try {
         const result = await this.deps.complete(input);
+        // A refusal before dispatch carries no provider metadata. A lifecycle result
+        // that does (a host abort after the request started) was provider work.
+        const refusedBeforeDispatch =
+          result.error?.kind === "runtime_lifecycle" &&
+          result.provider === undefined &&
+          result.usage === undefined;
         if (
-          result.error?.kind !== "runtime_lifecycle" &&
+          !refusedBeforeDispatch &&
           !extractProviderAuthFailure(result, { requireStructuralSignal: true })
         ) {
           this.recordSummarySpendCall({

@@ -261,6 +261,29 @@ describe("lifecycle refusal summary spend", () => {
     },
   );
 
+  // A host abort after dispatch resolves with `stopReason: "aborted"`; mapped to a
+  // lifecycle result (#1328), it keeps the provider metadata and usage.
+  const usage = { inputTokens: 1200, outputTokens: 0, totalTokens: 1200 };
+  it.each([
+    ["provider and usage", { provider: "openai", usage }],
+    ["provider only", { provider: "openai" }],
+    ["usage only", { usage }],
+  ])("still charges a lifecycle result for a request that reached the provider (%s)", async (_label, providerWork) => {
+    const f = fixture();
+    const result: CompletionResult = {
+      content: [],
+      error: { kind: "runtime_lifecycle", message: "runtime.llm.complete was aborted by the host" },
+      model: "gpt-test",
+      agentId: "main",
+      ...providerWork,
+    };
+    f.complete.mockResolvedValueOnce(result);
+    await expect(f.call()).resolves.toBe(result);
+    await expect(f.call()).rejects.toBeInstanceOf(LcmSummarySpendLimitError);
+    expect(f.complete).toHaveBeenCalledOnce();
+    expect(f.guards.getSummarySpendBackoffUntil(f.scopeKey)).not.toBeNull();
+  });
+
   it.each(["returned", "thrown", "custom"] as const)("keeps the existing %s auth exclusion", async (route) => {
     const f = fixture();
     const error = authError();
