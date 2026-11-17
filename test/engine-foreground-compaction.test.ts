@@ -20,6 +20,9 @@ function fixture(config: Parameters<typeof createEngineWithDeps>[0] = {}, deps: 
   const engine = createEngineWithDeps({
     contextThreshold: 0.65,
     freshTailCount: 4,
+    // These scenarios size the protected tail by count. The default
+    // budget-relative cap is covered in fresh-tail-default-cap.test.ts.
+    freshTailMaxTokens: 1_000_000,
     leafChunkTokens: 6_000,
     maxSweepIterations: 12,
     summaryProvider: "anthropic",
