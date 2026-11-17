@@ -10,6 +10,7 @@ import type {
 } from "./store/conversation-store.js";
 import type { SummaryStore, SummaryRecord, ContextItemRecord } from "./store/summary-store.js";
 import { estimateTokens, truncateTextToEstimatedTokens } from "./estimate-tokens.js";
+import { resolveFreshTailTokenCap, type FreshTailTokenCap } from "./fresh-tail.js";
 import { extractFileIdsFromContent } from "./large-files.js";
 import { NOOP_LCM_LOGGER, type LcmLogger } from "./lcm-log.js";
 import {
@@ -734,6 +735,8 @@ export class CompactionEngine {
    */
   private _contextItemsCache: Map<number, ContextItemRecord[]> | null = null;
   private _contextItemsCacheRefCount = 0;
+  /** Token budget of the in-flight call per conversation, for the default fresh-tail cap. */
+  private freshTailBudgets = new Map<number, number>();
 
   constructor(
     private conversationStore: ConversationStore,
@@ -775,10 +778,39 @@ export class CompactionEngine {
     }
   }
 
+  /** Run `fn` with `tokenBudget` as the conversation's fresh-tail cap budget. */
+  private async withFreshTailBudget<T>(
+    conversationId: number,
+    tokenBudget: number,
+    fn: () => Promise<T>,
+  ): Promise<T> {
+    const previous = this.freshTailBudgets.get(conversationId);
+    this.freshTailBudgets.set(conversationId, tokenBudget);
+    try {
+      return await fn();
+    } finally {
+      if (previous === undefined) {
+        this.freshTailBudgets.delete(conversationId);
+      } else {
+        this.freshTailBudgets.set(conversationId, previous);
+      }
+    }
+  }
+
   // ── evaluate ─────────────────────────────────────────────────────────────
 
   /** Evaluate whether compaction is needed. */
   async evaluate(
+    conversationId: number,
+    tokenBudget: number,
+    observedTokenCount?: number,
+    options?: { contextThreshold?: number; freshTailCount?: number },
+  ): Promise<CompactionDecision> {
+    return this.withFreshTailBudget(conversationId, tokenBudget, () =>
+      this.evaluateImpl(conversationId, tokenBudget, observedTokenCount, options));
+  }
+
+  private async evaluateImpl(
     conversationId: number,
     tokenBudget: number,
     observedTokenCount?: number,
@@ -891,7 +923,8 @@ export class CompactionEngine {
     summaryModel?: string;
     allowCondensedPasses?: boolean;
   }): Promise<CompactionResult> {
-    return this.withContextCache(() => this._compactLeafImpl(input));
+    return this.withContextCache(() =>
+      this.withFreshTailBudget(input.conversationId, input.tokenBudget, () => this._compactLeafImpl(input)));
   }
 
   private async _compactLeafImpl(input: {
@@ -1070,6 +1103,11 @@ export class CompactionEngine {
     /** Report each committed pass even if a later pass throws. */
     onPassCommitted?: (tokensAfter: number) => void;
   }): Promise<CompactionResult> {
+    return this.withFreshTailBudget(input.conversationId, input.tokenBudget, () =>
+      this.compactFullSweepImpl(input));
+  }
+
+  private async compactFullSweepImpl(input: Parameters<CompactionEngine["compactFullSweep"]>[0]): Promise<CompactionResult> {
     const { conversationId, tokenBudget, summarize, force, hardTrigger } = input;
     // Recovery always retains the initiating user, even when routine tail protection is disabled.
     const freshTailCountOverride = input.allowCurrentTurnCompaction
@@ -1418,7 +1456,8 @@ export class CompactionEngine {
     /** Report each committed pass, e.g. to refresh a host idle timeout. */
     onPassCommitted?: (tokensAfter: number) => void;
   }): Promise<CompactUntilUnderResult> {
-    return this.withContextCache(() => this._compactUntilUnderImpl(input));
+    return this.withContextCache(() =>
+      this.withFreshTailBudget(input.conversationId, input.tokenBudget, () => this._compactUntilUnderImpl(input)));
   }
 
   private async _compactUntilUnderImpl(input: {
@@ -1637,7 +1676,13 @@ export class CompactionEngine {
     if (freshTailCount <= 0) {
       return Infinity;
     }
-    const freshTailMaxTokens = freshTailMaxTokensOverride ?? this.resolveFreshTailMaxTokens();
+    const freshTailCap: FreshTailTokenCap = freshTailMaxTokensOverride !== undefined
+      ? { maxTokens: freshTailMaxTokensOverride, minMessages: 1 }
+      : resolveFreshTailTokenCap(
+          this.resolveFreshTailMaxTokens(),
+          contextItems[0] ? this.freshTailBudgets.get(contextItems[0].conversationId) : undefined,
+        );
+    const freshTailMaxTokens = freshTailCap.maxTokens;
 
     const rawMessageItems = contextItems.filter(
       (item) => item.itemType === "message" && item.messageId != null,
@@ -1669,7 +1714,7 @@ export class CompactionEngine {
       const messageTokens = await this.getMessageTokenCount(item.messageId, messageCache);
       const wouldExceedBudget =
         latestUserProtected &&
-        protectedCount > 0 &&
+        protectedCount >= freshTailCap.minMessages &&
         typeof freshTailMaxTokens === "number" &&
         protectedTokens + messageTokens > freshTailMaxTokens;
       if (wouldExceedBudget) {

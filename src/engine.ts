@@ -94,6 +94,7 @@ import type {
   VisibleSessionTranscriptMessageEntry,
 } from "./types.js";
 import { estimateTokens, estimateSerializedMessagesTokens } from "./estimate-tokens.js";
+import { resolveFreshTailTokenCap } from "./fresh-tail.js";
 import { hashAgentMessageForAssemblyProtection, messagesHaveSameLiveCoverageSignature } from "./message-signatures.js";
 import {
   buildDeterministicFallbackSummary,
@@ -1691,6 +1692,10 @@ export class LcmContextEngine implements ContextEngine {
       params.contextThresholdOverride?.freshTailCount ?? this.config.freshTailCount;
     const pendingLeafChunkTokens =
       params.contextThresholdOverride?.leafChunkTokens ?? this.config.leafChunkTokens;
+    const pendingFreshTailCap = resolveFreshTailTokenCap(
+      this.config.freshTailMaxTokens,
+      params.tokenBudget,
+    );
     const coordinator = new PendingCompactionCoordinator({
       conversationStore: this.conversationStore,
       summaryStore: this.summaryStore,
@@ -1701,7 +1706,8 @@ export class LcmContextEngine implements ContextEngine {
       ...(withPublishLock ? { withPublishLock } : {}),
       config: {
         freshTailCount: pendingFreshTailCount,
-        freshTailMaxTokens: this.config.freshTailMaxTokens,
+        freshTailMaxTokens: pendingFreshTailCap.maxTokens,
+        freshTailMinMessages: pendingFreshTailCap.minMessages,
         leafChunkTokens: pendingLeafChunkTokens,
         condensedMinFanout: this.config.condensedMinFanout,
         condensedMinSourceTokens: this.resolvePendingCondensedMinSourceTokens(),

@@ -92,7 +92,7 @@ lcm messages list --conversation-id 42 --recency 6h --include-content
 
 Without `--include-content`, each row contains a bounded single-line preview. With it, each row also contains the complete stored `content` value.
 
-`lcm messages tail` reads raw messages from the active `context_items` frontier. It applies `freshTailCount` and `freshTailMaxTokens` with the same rules as runtime assembly: the newest message remains protected even when it exceeds the token cap.
+`lcm messages tail` reads raw messages from the active `context_items` frontier. It applies `freshTailCount` and an explicit `freshTailMaxTokens` with the same rules as runtime assembly: the newest message remains protected even when it exceeds the token cap. The CLI has no token budget, so it does not apply the runtime default cap (25% of the budget) when `freshTailMaxTokens` is unset.
 
 ```bash
 lcm messages tail --conversation-id 42
