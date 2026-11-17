@@ -4,6 +4,8 @@ import {
   estimateSerializedMessagesTokens,
   estimateTokens,
 } from "../src/estimate-tokens.js";
+import { toStoredMessage } from "../src/message-content.js";
+import type { AgentMessage } from "../src/openclaw-bridge.js";
 
 describe("estimateTokens", () => {
   it("estimates ASCII text at ~0.25 tokens/char", () => {
@@ -386,5 +388,35 @@ describe("estimateSerializedMessageTokens", () => {
     const message = { role: "user", content: "hello world" };
     const single = estimateSerializedMessageTokens(message);
     expect(estimateSerializedMessagesTokens([message, message])).toBe(single * 2);
+  });
+});
+
+describe("stored token counts", () => {
+  it("do not count opaque reasoning signatures", () => {
+    const base = {
+      role: "assistant",
+      api: "openai-responses",
+      provider: "clawrouter",
+      model: "openai/gpt-6-astra",
+      timestamp: 1794856457226,
+    };
+    const signature = JSON.stringify({
+      id: "rs_1",
+      type: "reasoning",
+      summary: [],
+      content: [],
+      encrypted_content: "gAAAAABq-zxU2h_svkPRj_JX2rbGHRUwKtvlGRLuERZ8o6".repeat(200),
+    });
+    const toolCall = { type: "toolCall", id: "call_1", name: "exec", arguments: { command: "rg degraded" } };
+    const signed = toStoredMessage({
+      ...base,
+      content: [{ type: "thinking", thinking: "", thinkingSignature: signature }, toolCall],
+    } as unknown as AgentMessage);
+    const unsigned = toStoredMessage({
+      ...base,
+      content: [{ type: "thinking", thinking: "" }, toolCall],
+    } as unknown as AgentMessage);
+    expect(signed.tokenCount).toBe(unsigned.tokenCount);
+    expect(signed.tokenCount).toBeLessThan(200);
   });
 });

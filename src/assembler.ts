@@ -8,7 +8,7 @@ import type {
 } from "./store/conversation-store.js";
 import type { FocusBriefRecord, FocusBriefStore } from "./store/focus-brief-store.js";
 import type { SummaryStore, ContextItemRecord, SummaryRecord } from "./store/summary-store.js";
-import { estimateTokens } from "./estimate-tokens.js";
+import { estimateTokens, stripOpaqueBlockSignatures } from "./estimate-tokens.js";
 import { formatToolOutputReference } from "./large-files.js";
 import { serializeOpenClawSenderMetadata } from "./openclaw-sender-metadata.js";
 import { attachTranscriptEntryMeta } from "./transcript.js";
@@ -1963,8 +1963,11 @@ export class ContextAssembler {
       role === "user"
         ? (serializeOpenClawSenderMetadata(msg.openClawSenderMetadata) ?? "")
         : "";
+    // Opaque replay signatures are sent but not tokenized as text.
+    const tokenizedContentText =
+      typeof content === "string" ? content : (JSON.stringify(stripOpaqueBlockSignatures(content)) ?? msg.content);
     const tokenCount = estimateTokens(
-      [contentText, topLevelReasoningText, senderMetadataText].filter(Boolean).join("\n"),
+      [tokenizedContentText, topLevelReasoningText, senderMetadataText].filter(Boolean).join("\n"),
     );
 
     // v4.2 §B (Option C) — `messages.large_content` now stores the

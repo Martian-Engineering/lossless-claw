@@ -151,6 +151,11 @@ function stripOpaqueBlockSignature(block: unknown): unknown {
   return visible;
 }
 
+/** Drop opaque signatures from message content blocks without mutating them. */
+export function stripOpaqueBlockSignatures(content: unknown): unknown {
+  return Array.isArray(content) ? content.map(stripOpaqueBlockSignature) : stripOpaqueBlockSignature(content);
+}
+
 /** Project a message onto the fields a provider request actually carries. */
 function projectProviderVisibleMessage(message: unknown): unknown {
   if (!isRecord(message)) return message;
@@ -159,7 +164,7 @@ function projectProviderVisibleMessage(message: unknown): unknown {
     if (!HOST_ONLY_MESSAGE_FIELDS.has(key)) visible[key] = value;
   }
   if (Array.isArray(visible.content)) {
-    visible.content = visible.content.map(stripOpaqueBlockSignature);
+    visible.content = stripOpaqueBlockSignatures(visible.content);
   }
   return visible;
 }

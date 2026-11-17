@@ -10,8 +10,8 @@ afterEach(cleanupEngineTestState);
 const SESSION = "foreground-recovery";
 const BUDGET = 22_000;
 const SIGNATURE = "synthetic-opaque-signature".repeat(40);
-// Provider-visible tool input that stored token counts omit.
-const TOOL_INPUT = "synthetic-tool-input-payload".repeat(40);
+// Tool output is priced at the provider boundary above its stored estimate.
+const TOOL_OUTPUT = "synthetic tool output payload ".repeat(40);
 
 /** Only completion is synthetic; persistence, planning and publication are real. */
 function fixture(config: Parameters<typeof createEngineWithDeps>[0] = {}, deps: Parameters<typeof createEngineWithDeps>[1] = {}) {
@@ -31,16 +31,16 @@ function fixture(config: Parameters<typeof createEngineWithDeps>[0] = {}, deps: 
 
 /**
  * Build complete user/tool exchanges with opaque signatures that must survive.
- * Tool inputs supply serialized pressure; signatures are not provider tokens.
+ * Tool outputs supply serialized pressure; signatures are not provider tokens.
  */
 function turnMessages(turn: number): AgentMessage[] {
   return [
     makeMessage({ role: "user", content: `Inspect observation ${turn}`, timestamp: turn * 4 + 1 }),
     makeMessage({ role: "assistant", timestamp: turn * 4 + 2, content: [
       { type: "thinking", thinking: "Inspect the observation", thinkingSignature: SIGNATURE },
-      { type: "toolCall", id: `inspect-${turn}`, name: "inspect", arguments: { turn, note: TOOL_INPUT } },
+      { type: "toolCall", id: `inspect-${turn}`, name: "inspect", arguments: { turn } },
     ] }),
-    makeMessage({ role: "toolResult", toolCallId: `inspect-${turn}`, content: `Observation ${turn} is stable`, timestamp: turn * 4 + 3 }),
+    makeMessage({ role: "toolResult", toolCallId: `inspect-${turn}`, content: `Observation ${turn} is stable. ${TOOL_OUTPUT}`, timestamp: turn * 4 + 3 }),
     makeMessage({ role: "assistant", content: `Observation ${turn}: ${"synthetic observation. ".repeat(600)}`, timestamp: turn * 4 + 4 }),
   ].map(message => message.role === "assistant" ? {
     ...message, provider: "anthropic", api: "anthropic-messages", model: "synthetic-summary",
