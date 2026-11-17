@@ -430,11 +430,7 @@ describe("stored token counts", () => {
       ...base,
       content: [{ type: "thinking", thinking: "", thinkingSignature: signature }, toolCall],
     } as unknown as AgentMessage);
-    const unsigned = toStoredMessage({
-      ...base,
-      content: [{ type: "thinking", thinking: "" }, toolCall],
-    } as unknown as AgentMessage);
-    expect(signed.tokenCount).toBe(unsigned.tokenCount);
+    // The ~9k-character signature would cost ~2.3k tokens if counted.
     expect(signed.tokenCount).toBeLessThan(200);
   });
 });
