@@ -1908,6 +1908,46 @@ describe("LcmContextEngine maintain and assemble budget", () => {
     );
   });
 
+  it("assemble() keeps the degraded live window head stable while the mid-turn budget shrinks", async () => {
+    const log = { info: vi.fn(), warn: vi.fn(), error: vi.fn(), debug: vi.fn() };
+    const engine = createEngineWithDepsOverrides({ log });
+    const sessionId = "assemble-degraded-stable-head";
+    const conversation = await engine.getConversationStore().getOrCreateConversation(sessionId, {
+      sessionKey: undefined,
+    });
+    const [storedMessage] = await engine.getConversationStore().createMessagesBulk([
+      { conversationId: conversation.conversationId, seq: 0, role: "user", content: "stored", tokenCount: 30 },
+    ]);
+    await engine.getSummaryStore().appendContextMessages(conversation.conversationId, [storedMessage.messageId]);
+    await engine.getCompactionMaintenanceStore().requestProactiveCompactionDebt({
+      conversationId: conversation.conversationId,
+      reason: "threshold",
+      tokenBudget: 30,
+      currentTokenCount: 29,
+    });
+    // History is fixed during a tool loop; the host shrinks the history budget
+    // as the pending exchange grows.
+    const history = Array.from({ length: 30 }, (_, index) => makeMessage({
+      role: index % 2 === 0 ? "user" : "assistant",
+      content: `turn ${index} ${"history filler ".repeat(110)}`,
+    }));
+
+    const heads: unknown[] = [];
+    for (let tokenBudget = 9_000; tokenBudget >= 3_000; tokenBudget -= 300) {
+      const result = await engine.assemble({ sessionId, messages: history, tokenBudget });
+      expect(result.estimatedTokens).toBeLessThanOrEqual(tokenBudget);
+      heads.push(result.messages[0]?.content);
+    }
+
+    let headChanges = 0;
+    for (let index = 1; index < heads.length; index += 1) {
+      if (heads[index] !== heads[index - 1]) headChanges += 1;
+    }
+    expect(log.warn).toHaveBeenCalledWith(expect.stringContaining("[lcm] assemble: degraded live fallback"));
+    expect(heads).toHaveLength(21);
+    expect(headChanges).toBeLessThanOrEqual(2);
+  });
+
   it("assemble() bounds live context when foreground compaction has no eligible history", async () => {
     const log = {
       info: vi.fn(),

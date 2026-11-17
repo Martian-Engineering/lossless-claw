@@ -319,6 +319,69 @@ describe("estimateSerializedMessageTokens", () => {
     expect(estimateSerializedMessageTokens(message)).toBeGreaterThan(0);
   });
 
+  it("excludes opaque replay signatures and host-only envelope fields", () => {
+    const encryptedReasoning = JSON.stringify({
+      id: "rs_0af2562073b39278016afb3c4940a887d1846d07373dd04a74",
+      type: "reasoning",
+      summary: [],
+      content: [],
+      encrypted_content: "gAAAAABq-zxU2h_svkPRj_JX2rbGHRUwKtvlGRLuERZ8o6".repeat(200),
+    });
+    const visibleAssistant = {
+      role: "assistant",
+      content: [
+        { type: "thinking", thinking: "" },
+        { type: "text", text: "Checked the logs." },
+        { type: "toolCall", id: "call_1", name: "exec", arguments: { command: "rg degraded" } },
+      ],
+    };
+    const recordedAssistant = {
+      role: "assistant",
+      content: [
+        { type: "thinking", thinking: "", thinkingSignature: encryptedReasoning },
+        { type: "text", text: "Checked the logs.", textSignature: '{"v":1,"id":"msg_0d29","phase":"commentary"}' },
+        { type: "toolCall", id: "call_1", name: "exec", arguments: { command: "rg degraded" }, thoughtSignature: "c2lnbmF0dXJl".repeat(50) },
+      ],
+      api: "openai-responses",
+      provider: "clawrouter",
+      model: "openai/gpt-6-astra",
+      responseId: "resp_0d29202084a77e91016afb56097a0487d1ad74850c64ad0395",
+      responseModel: "gpt-6-astra",
+      usage: { input: 3, output: 74, cacheRead: 84697, cacheWrite: 7124, totalTokens: 91898 },
+      diagnostics: [{ type: "openai_responses_terminal", details: { eventType: "response.completed" } }],
+      stopReason: "toolUse",
+      timestamp: 1794856457226,
+    };
+    const visibleToolResult = {
+      role: "toolResult",
+      toolCallId: "call_1",
+      toolName: "exec",
+      content: [{ type: "text", text: "degraded live fallback" }],
+      isError: false,
+    };
+    const recordedToolResult = {
+      ...visibleToolResult,
+      details: { aggregated: "degraded live fallback\n".repeat(2_000), exitCode: 0 },
+      timestamp: 1794855492943,
+    };
+
+    expect(estimateSerializedMessageTokens(recordedAssistant)).toBe(
+      estimateSerializedMessageTokens(visibleAssistant),
+    );
+    expect(estimateSerializedMessageTokens(recordedToolResult)).toBe(
+      estimateSerializedMessageTokens(visibleToolResult),
+    );
+  });
+
+  it("keeps the signature payload of redacted thinking", () => {
+    const payload = "opaque redacted thinking payload ".repeat(400);
+    const redacted = {
+      role: "assistant",
+      content: [{ type: "thinking", thinking: "", thinkingSignature: payload, redacted: true }],
+    };
+    expect(estimateSerializedMessageTokens(redacted)).toBeGreaterThan(estimateTokens(payload));
+  });
+
   it("sums across message lists", () => {
     const message = { role: "user", content: "hello world" };
     const single = estimateSerializedMessageTokens(message);

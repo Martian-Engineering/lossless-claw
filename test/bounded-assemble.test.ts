@@ -18,9 +18,11 @@ import { closeLcmConnection, createLcmDatabaseConnection } from "../src/db/conne
 import { LcmContextEngine } from "../src/engine.js";
 import { estimateSerializedMessagesTokens } from "../src/estimate-tokens.js";
 import {
+  LIVE_WINDOW_LOW_WATERMARK_RATIO,
   SERIALIZED_OUTPUT_CLAMP_SAFETY_RATIO,
   buildDegradedLiveAssembleResult,
   clampMessagesToSerializedBudget,
+  type LiveWindowState,
 } from "../src/assemble-fallback.js";
 import type { AgentMessage } from "../src/openclaw-bridge.js";
 import type { LcmDependencies } from "../src/types.js";
@@ -404,5 +406,84 @@ describe("degraded live fallback preserves a user turn", () => {
     expect(result.messages.length).toBeLessThan(liveMessages.length);
     expect(result.messages.some((message) => message.role === "user")).toBe(true);
     expect(result.estimatedTokens).toBeGreaterThan(0);
+  });
+});
+
+describe("stable bounded live window", () => {
+  function makeTextTurn(index: number): AgentMessage {
+    return {
+      role: index % 2 === 0 ? "user" : "assistant",
+      content: `turn ${index} ${"window filler ".repeat(110)}`,
+    } as unknown as AgentMessage;
+  }
+
+  it("keeps the clamp head fixed while an append-only transcript grows", () => {
+    const tokenBudget = 10_000;
+    const liveWindow: LiveWindowState = {};
+    const transcript = Array.from({ length: 40 }, (_, index) => makeTextTurn(index));
+    const heads: AgentMessage[] = [];
+    for (let length = 24; length <= transcript.length; length += 1) {
+      const result = clampMessagesToSerializedBudget({
+        messages: transcript.slice(0, length),
+        tokenBudget,
+        liveWindow,
+      });
+      expect(result.serializedTokens).toBeLessThanOrEqual(tokenBudget * SERIALIZED_OUTPUT_CLAMP_SAFETY_RATIO);
+      heads.push(result.messages[0]!);
+    }
+
+    const changes = heads.filter((head, index) => index > 0 && head !== heads[index - 1]).length;
+    expect(changes).toBeLessThanOrEqual(2);
+    // A moved head is trimmed to the low watermark, not to the clamp target.
+    const firstClamp = clampMessagesToSerializedBudget({
+      messages: transcript,
+      tokenBudget,
+      liveWindow: {},
+    });
+    expect(firstClamp.serializedTokens).toBeLessThanOrEqual(tokenBudget * LIVE_WINDOW_LOW_WATERMARK_RATIO);
+  });
+
+  it("keeps the degraded head fixed while the budget shrinks over a fixed history", () => {
+    const liveWindow: LiveWindowState = {};
+    const history = Array.from({ length: 30 }, (_, index) => makeTextTurn(index));
+    const heads: AgentMessage[] = [];
+    for (let tokenBudget = 9_000; tokenBudget >= 3_000; tokenBudget -= 300) {
+      const result = buildDegradedLiveAssembleResult({
+        liveMessages: history,
+        tokenBudget,
+        contextProjection: { mode: "thread_bootstrap" },
+        liveWindow,
+      });
+      expect(result.estimatedTokens).toBeLessThanOrEqual(tokenBudget);
+      heads.push(result.messages[0]!);
+    }
+
+    const changes = heads.filter((head, index) => index > 0 && head !== heads[index - 1]).length;
+    expect(changes).toBeLessThanOrEqual(2);
+  });
+
+  it("re-anchors when the anchored message is rewritten", () => {
+    const tokenBudget = 10_000;
+    const liveWindow: LiveWindowState = {};
+    const transcript = Array.from({ length: 40 }, (_, index) => makeTextTurn(index));
+    const first = clampMessagesToSerializedBudget({ messages: transcript, tokenBudget, liveWindow });
+    const anchorIndex = liveWindow.anchor!.index;
+    expect(first.messages[0]).toBe(transcript[anchorIndex]);
+
+    const rewritten = transcript.slice();
+    rewritten[anchorIndex] = { ...transcript[anchorIndex]!, content: "rewritten" } as AgentMessage;
+    const second = clampMessagesToSerializedBudget({ messages: rewritten, tokenBudget, liveWindow });
+    expect(liveWindow.anchor!.hash).not.toBe(undefined);
+    expect(second.messages[0]).toBe(rewritten[liveWindow.anchor!.index]);
+    expect(second.serializedTokens).toBeLessThanOrEqual(tokenBudget * LIVE_WINDOW_LOW_WATERMARK_RATIO);
+  });
+
+  it("re-expands a window that fell below the low watermark of a larger budget", () => {
+    const liveWindow: LiveWindowState = {};
+    const transcript = Array.from({ length: 40 }, (_, index) => makeTextTurn(index));
+    const small = clampMessagesToSerializedBudget({ messages: transcript, tokenBudget: 4_000, liveWindow });
+    const large = clampMessagesToSerializedBudget({ messages: transcript, tokenBudget: 12_000, liveWindow });
+    expect(large.messages.length).toBeGreaterThan(small.messages.length);
+    expect(large.serializedTokens).toBeLessThanOrEqual(12_000 * SERIALIZED_OUTPUT_CLAMP_SAFETY_RATIO);
   });
 });
