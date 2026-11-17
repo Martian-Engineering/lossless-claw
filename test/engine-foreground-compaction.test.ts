@@ -10,8 +10,8 @@ afterEach(cleanupEngineTestState);
 const SESSION = "foreground-recovery";
 const BUDGET = 22_000;
 const SIGNATURE = "synthetic-opaque-signature".repeat(40);
-// Tool output is priced at the provider boundary above its stored estimate.
-const TOOL_OUTPUT = "synthetic tool output payload ".repeat(40);
+// Visible reasoning carries the pressure; opaque signatures are not prompt tokens.
+const REASONING = `Inspect the observation. ${"synthetic reasoning".repeat(54)}`;
 
 /** Only completion is synthetic; persistence, planning and publication are real. */
 function fixture(config: Parameters<typeof createEngineWithDeps>[0] = {}, deps: Parameters<typeof createEngineWithDeps>[1] = {}) {
@@ -29,18 +29,15 @@ function fixture(config: Parameters<typeof createEngineWithDeps>[0] = {}, deps: 
   return { engine, complete, log };
 }
 
-/**
- * Build complete user/tool exchanges with opaque signatures that must survive.
- * Tool outputs supply serialized pressure; signatures are not provider tokens.
- */
+/** Build complete user/tool exchanges with opaque signatures that must survive. */
 function turnMessages(turn: number): AgentMessage[] {
   return [
     makeMessage({ role: "user", content: `Inspect observation ${turn}`, timestamp: turn * 4 + 1 }),
     makeMessage({ role: "assistant", timestamp: turn * 4 + 2, content: [
-      { type: "thinking", thinking: "Inspect the observation", thinkingSignature: SIGNATURE },
+      { type: "thinking", thinking: REASONING, thinkingSignature: SIGNATURE },
       { type: "toolCall", id: `inspect-${turn}`, name: "inspect", arguments: { turn } },
     ] }),
-    makeMessage({ role: "toolResult", toolCallId: `inspect-${turn}`, content: `Observation ${turn} is stable. ${TOOL_OUTPUT}`, timestamp: turn * 4 + 3 }),
+    makeMessage({ role: "toolResult", toolCallId: `inspect-${turn}`, content: `Observation ${turn} is stable`, timestamp: turn * 4 + 3 }),
     makeMessage({ role: "assistant", content: `Observation ${turn}: ${"synthetic observation. ".repeat(600)}`, timestamp: turn * 4 + 4 }),
   ].map(message => message.role === "assistant" ? {
     ...message, provider: "anthropic", api: "anthropic-messages", model: "synthetic-summary",
