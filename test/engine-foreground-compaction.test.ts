@@ -10,6 +10,8 @@ afterEach(cleanupEngineTestState);
 const SESSION = "foreground-recovery";
 const BUDGET = 22_000;
 const SIGNATURE = "synthetic-opaque-signature".repeat(40);
+// Provider-visible tool input that stored token counts omit.
+const TOOL_INPUT = "synthetic-tool-input-payload".repeat(40);
 
 /** Only completion is synthetic; persistence, planning and publication are real. */
 function fixture(config: Parameters<typeof createEngineWithDeps>[0] = {}, deps: Parameters<typeof createEngineWithDeps>[1] = {}) {
@@ -27,13 +29,16 @@ function fixture(config: Parameters<typeof createEngineWithDeps>[0] = {}, deps: 
   return { engine, complete, log };
 }
 
-/** Build complete user/tool exchanges with opaque signatures that must survive. */
+/**
+ * Build complete user/tool exchanges with opaque signatures that must survive.
+ * Tool inputs supply serialized pressure; signatures are not provider tokens.
+ */
 function turnMessages(turn: number): AgentMessage[] {
   return [
     makeMessage({ role: "user", content: `Inspect observation ${turn}`, timestamp: turn * 4 + 1 }),
     makeMessage({ role: "assistant", timestamp: turn * 4 + 2, content: [
       { type: "thinking", thinking: "Inspect the observation", thinkingSignature: SIGNATURE },
-      { type: "toolCall", id: `inspect-${turn}`, name: "inspect", arguments: { turn } },
+      { type: "toolCall", id: `inspect-${turn}`, name: "inspect", arguments: { turn, note: TOOL_INPUT } },
     ] }),
     makeMessage({ role: "toolResult", toolCallId: `inspect-${turn}`, content: `Observation ${turn} is stable`, timestamp: turn * 4 + 3 }),
     makeMessage({ role: "assistant", content: `Observation ${turn}: ${"synthetic observation. ".repeat(600)}`, timestamp: turn * 4 + 4 }),
