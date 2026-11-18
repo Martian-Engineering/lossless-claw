@@ -7,6 +7,7 @@ import { trimBootstrapMessagesToBudget } from "./bootstrap-budget.js";
 import { estimateSerializedMessageTokens, estimateSerializedMessagesTokens } from "./estimate-tokens.js";
 import { resolveForkBoundedLiveSuffix, stripTrailingAssistantPrefill } from "./live-coverage.js";
 import { toStoredMessage } from "./message-content.js";
+import { hashAgentMessageForAssemblyProtection } from "./message-signatures.js";
 import type {
   AgentMessage,
   AssembleResult,
@@ -204,6 +205,69 @@ export function trimMessagesToBudget(
 export const SERIALIZED_OUTPUT_CLAMP_SAFETY_RATIO = 0.9;
 
 /**
+ * Fraction of the budget a bounded live window is trimmed to when it has to
+ * move. Trimming below the budget lets the transcript grow for several
+ * tool-loop requests before the window head moves again.
+ */
+export const LIVE_WINDOW_LOW_WATERMARK_RATIO = 0.6;
+
+/** First retained message of a bounded live window, by position and content. */
+export type LiveWindowAnchor = { index: number; hash: string };
+
+/** Per-conversation window state that bounded live fallbacks read and update. */
+export type LiveWindowState = { anchor?: LiveWindowAnchor };
+
+/**
+ * Choose the first retained index of a bounded live window with hysteresis.
+ *
+ * A provider prompt cache only survives when the prompt head is unchanged, so
+ * the previous start is kept while the suffix from it fits `highWatermarkTokens`
+ * and still fills at least `lowWatermarkTokens`. Otherwise the whole transcript
+ * is kept when it fits, or the newest suffix that fits `lowWatermarkTokens`
+ * (always at least the final message). The anchor is matched by index and
+ * content hash, so a rewritten or truncated transcript re-anchors.
+ */
+export function selectLiveWindowStart(params: {
+  messages: AgentMessage[];
+  highWatermarkTokens: number;
+  lowWatermarkTokens: number;
+  state?: LiveWindowState;
+}): number {
+  const { messages } = params;
+  if (messages.length === 0) {
+    return 0;
+  }
+  const suffixTokens = new Array<number>(messages.length + 1).fill(0);
+  for (let index = messages.length - 1; index >= 0; index -= 1) {
+    suffixTokens[index] = suffixTokens[index + 1]! + estimateSerializedMessageTokens(messages[index]!);
+  }
+  const anchor = params.state?.anchor;
+  const anchorValid = anchor !== undefined &&
+    anchor.index < messages.length &&
+    suffixTokens[anchor.index]! <= params.highWatermarkTokens &&
+    (anchor.index === 0 || suffixTokens[anchor.index]! >= params.lowWatermarkTokens) &&
+    hashAgentMessageForAssemblyProtection(messages[anchor.index]!) === anchor.hash;
+  let startIndex: number;
+  if (anchorValid) {
+    startIndex = anchor.index;
+  } else if (suffixTokens[0]! <= params.highWatermarkTokens) {
+    startIndex = 0;
+  } else {
+    startIndex = messages.length - 1;
+    while (startIndex > 0 && suffixTokens[startIndex - 1]! <= params.lowWatermarkTokens) {
+      startIndex -= 1;
+    }
+  }
+  if (params.state && !(anchorValid && startIndex === anchor.index)) {
+    params.state.anchor = {
+      index: startIndex,
+      hash: hashAgentMessageForAssemblyProtection(messages[startIndex]!),
+    };
+  }
+  return startIndex;
+}
+
+/**
  * Final budget clamp on assembled output, measured by serialized
  * (model-boundary) token estimate rather than stored-content counts.
  *
@@ -220,6 +284,8 @@ export function clampMessagesToSerializedBudget(params: {
   messages: AgentMessage[];
   tokenBudget: number;
   preserveSubstantiveAssistantTail?: boolean;
+  /** Keep the window head stable across calls on an append-only live transcript. */
+  liveWindow?: LiveWindowState;
 }): {
   messages: AgentMessage[];
   serializedTokens: number;
@@ -242,7 +308,19 @@ export function clampMessagesToSerializedBudget(params: {
   const serializedTokens = messages === params.messages
     ? serializedTokensBefore
     : estimateSerializedMessagesTokens(messages);
-  if (serializedTokens <= targetTokens || messages.length === 0) {
+  const liveWindowStart = params.liveWindow && messages.length > 0
+    ? selectLiveWindowStart({
+        messages,
+        highWatermarkTokens: targetTokens,
+        lowWatermarkTokens: Math.floor(params.tokenBudget * LIVE_WINDOW_LOW_WATERMARK_RATIO),
+        state: params.liveWindow,
+      })
+    : undefined;
+  if (
+    liveWindowStart === 0 ||
+    (liveWindowStart === undefined && serializedTokens <= targetTokens) ||
+    messages.length === 0
+  ) {
     return {
       messages,
       serializedTokens,
@@ -254,25 +332,26 @@ export function clampMessagesToSerializedBudget(params: {
   }
 
   // Keep the newest suffix that fits the target (always at least one message),
-  // then recover any tool-pair partners displaced by the budget boundary.
-  const kept: AgentMessage[] = [];
-  let keptTokens = 0;
-  for (let index = messages.length - 1; index >= 0; index -= 1) {
-    const message = messages[index]!;
-    const tokenCount = estimateSerializedMessageTokens(message);
-    if (kept.length > 0 && keptTokens + tokenCount > targetTokens) {
-      break;
+  // or the stable live window, then recover any tool-pair partners displaced
+  // by the budget boundary.
+  let retainedStartIndex = liveWindowStart ?? messages.length - 1;
+  if (liveWindowStart === undefined) {
+    let keptTokens = estimateSerializedMessageTokens(messages[retainedStartIndex]!);
+    while (retainedStartIndex > 0) {
+      const tokenCount = estimateSerializedMessageTokens(messages[retainedStartIndex - 1]!);
+      if (keptTokens + tokenCount > targetTokens) {
+        break;
+      }
+      retainedStartIndex -= 1;
+      keptTokens += tokenCount;
     }
-    kept.push(message);
-    keptTokens += tokenCount;
   }
-  kept.reverse();
   const providerValidKept = buildProviderValidSuffix({
     messages,
-    retainedStartIndex: messages.length - kept.length,
+    retainedStartIndex,
     preserveSubstantiveAssistantTail: params.preserveSubstantiveAssistantTail,
   });
-  keptTokens = estimateSerializedMessagesTokens(providerValidKept);
+  const keptTokens = estimateSerializedMessagesTokens(providerValidKept);
 
   // Historically an assistant-only suffix was retained when stripping would
   // empty the result. Prompt-separate hosts must still return an empty array
@@ -309,6 +388,8 @@ export function buildDegradedLiveAssembleResult(params: {
   tokenBudget: number;
   preserveSubstantiveAssistantTail?: boolean;
   contextProjection: ContextEngineProjection;
+  /** Keep the window head stable across calls on an append-only live transcript. */
+  liveWindow?: LiveWindowState;
 }): AssembleResult {
   const prefillOptions = {
     preserveSubstantiveAssistantTail: params.preserveSubstantiveAssistantTail,
@@ -329,13 +410,21 @@ export function buildDegradedLiveAssembleResult(params: {
     0,
     Math.floor(params.tokenBudget) - estimateAgentMessageTokens(protectedPrefix),
   );
-  let liveTailMessages = trimMessagesToBudget(liveTail, remainingBudget, prefillOptions);
-  if (liveTailMessages.length === 0 && liveTail.length > 0) {
-    liveTailMessages = [liveTail[liveTail.length - 1]!];
+  let retainedStartIndex: number;
+  if (params.liveWindow) {
+    retainedStartIndex = selectLiveWindowStart({
+      messages: liveTail,
+      highWatermarkTokens: remainingBudget,
+      lowWatermarkTokens: Math.floor(remainingBudget * LIVE_WINDOW_LOW_WATERMARK_RATIO),
+      state: params.liveWindow,
+    });
+  } else {
+    const trimmed = trimMessagesToBudget(liveTail, remainingBudget, prefillOptions);
+    retainedStartIndex = liveTail.length - Math.max(trimmed.length, liveTail.length > 0 ? 1 : 0);
   }
-  liveTailMessages = buildProviderValidSuffix({
+  const liveTailMessages = buildProviderValidSuffix({
     messages: liveTail,
-    retainedStartIndex: liveTail.length - liveTailMessages.length,
+    retainedStartIndex,
     preserveSubstantiveAssistantTail: params.preserveSubstantiveAssistantTail,
   });
   const messages = [...protectedPrefix, ...liveTailMessages];

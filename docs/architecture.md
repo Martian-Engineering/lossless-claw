@@ -106,12 +106,14 @@ The **condensed pass** merges summaries at the same depth into a higher-level su
 
 **Foreground pressure recovery (before assembly eviction):**
 - Measures the full assembled projection, including serialized payloads, restored replay metadata, and uncovered volatile live inputs. Stored estimates cannot hide pressure that appears during rendering
+- Measures in provider prompt units: host-only envelope fields (usage, timestamps, response IDs, diagnostics, tool-result `details`) and opaque replay signatures such as encrypted reasoning are not counted, because providers do not tokenize them. A live assistant message still counts at least its provider-measured completion size, matching the host's prompt precheck
 - Above 75% of the assembly budget with pending debt, or the 90% serialized clamp threshold without debt, takes the session queue and first publishes usable prepared summaries with zero model calls
 - If pressure still exceeds the configured `contextThreshold` target (capped at the serialized safety target), runs one bounded prepare-only pass and another publication opportunity. `maxSweepIterations`, summarizer timeouts, spend limits, and cooldowns still apply
 - Does not start generation while background maintenance owns preparation. It never waits for a background publisher while holding the session queue
 - Rebuilds and remeasures canonical context after publication. Remaining pressure or pending work retains maintenance debt; publication alone is not proof that the target was reached
 - Keeps the canonical summary projection when recovery reaches its target, including targets above the 75% degraded-context trigger. Foreground recovery finishes its own debt during preparation-only background work; an active debt drain retains ownership of its maintenance row
 - Logs reduction, target attainment, and the blocker. Protected-tail pressure, unavailable summarization, or exhausted work limits leave the bounded assembly fallback in place. Original messages, parts, and summary lineage remain persisted
+- The bounded live fallback keeps its window head fixed across tool-loop requests while the suffix from that head still fits the budget, so the provider prompt cache survives. When the head must move, the window is trimmed to 60% of the budget so the next move is several requests away
 
 **Full sweep (threshold, manual `/compact`, or overflow):**
 - Phase 1: Repeatedly runs leaf passes until no more eligible chunks

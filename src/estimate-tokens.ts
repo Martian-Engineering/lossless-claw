@@ -101,6 +101,78 @@ function isLikelyOpaqueBinaryString(key: string, value: string): boolean {
 }
 
 /**
+ * Top-level transcript bookkeeping that provider adapters never send:
+ * private metadata, response envelopes, usage, diagnostics and UI-only tool
+ * result details. Counting them would inflate pressure beyond provider-reported
+ * prompt tokens.
+ */
+const HOST_ONLY_MESSAGE_FIELDS = new Set([
+  "__openclaw",
+  "api",
+  "provider",
+  "model",
+  "responseModel",
+  "responseAccessProgram",
+  "responseId",
+  "turnId",
+  "usage",
+  "diagnostics",
+  "stopReason",
+  "endTurn",
+  "errorMessage",
+  "errorCode",
+  "errorType",
+  "errorBody",
+  "retryAfterMs",
+  "openclawDelivery",
+  "timestamp",
+  "details",
+  "provenance",
+  "display",
+  "idempotencyKey",
+]);
+
+/**
+ * Opaque replay signatures carried on content blocks. Providers receive them
+ * as encrypted or identifier state, not as tokenized text. Redacted thinking keeps its signature because that is its only payload.
+ */
+const OPAQUE_BLOCK_SIGNATURE_FIELDS: Readonly<Record<string, readonly string[]>> = {
+  thinking: ["thinkingSignature", "signature"],
+  text: ["textSignature"],
+  toolCall: ["thoughtSignature"],
+  // Stored form of OpenAI encrypted reasoning.
+  reasoning: ["encrypted_content"],
+};
+
+/** Drop opaque signatures from one content block without mutating it. */
+function stripOpaqueBlockSignature(block: unknown): unknown {
+  if (!isRecord(block) || typeof block.type !== "string" || block.redacted === true) return block;
+  const fields = OPAQUE_BLOCK_SIGNATURE_FIELDS[block.type];
+  if (!fields || !fields.some(field => Object.hasOwn(block, field))) return block;
+  const visible = { ...block };
+  for (const field of fields) delete visible[field];
+  return visible;
+}
+
+/** Drop opaque signatures from message content blocks without mutating them. */
+export function stripOpaqueBlockSignatures(content: unknown): unknown {
+  return Array.isArray(content) ? content.map(stripOpaqueBlockSignature) : stripOpaqueBlockSignature(content);
+}
+
+/** Project a message onto the fields a provider request actually carries. */
+function projectProviderVisibleMessage(message: unknown): unknown {
+  if (!isRecord(message)) return message;
+  const visible: Record<string, unknown> = {};
+  for (const [key, value] of Object.entries(message)) {
+    if (!HOST_ONLY_MESSAGE_FIELDS.has(key)) visible[key] = value;
+  }
+  if (Array.isArray(visible.content)) {
+    visible.content = stripOpaqueBlockSignatures(visible.content);
+  }
+  return visible;
+}
+
+/**
  * Memoized serialized estimates keyed by message object identity. assemble()
  * re-measures candidate outputs repeatedly while packing to budget; without
  * memoization a 400-message tool-heavy transcript costs ~O(n²) full
@@ -137,9 +209,9 @@ function projectUserContentForEstimate(message: unknown): unknown {
 /**
  * Estimate the model-boundary token cost of a full message object by
  * serializing its rendered structure, not just its text blocks. A valid
- * recorded user projection replaces visible text before estimation. Top-level
- * `__openclaw` metadata itself is excluded, so neither private metadata nor
- * the replaced text is counted a second time.
+ * recorded user projection replaces visible text before estimation. Host-only
+ * envelope fields (including `__openclaw`) and opaque block signatures are
+ * excluded, so the estimate stays in provider prompt-token units.
  *
  * The LLM-boundary prompt renderer serializes structured tool-call payloads
  * (tool inputs, tool result objects, mirrored identifiers) that text-only
@@ -157,7 +229,7 @@ export function estimateSerializedMessageTokens(message: unknown): number {
       return cached;
     }
   }
-  const rendered = projectUserContentForEstimate(message);
+  const rendered = projectProviderVisibleMessage(projectUserContentForEstimate(message));
   let opaqueParts = 0;
   let serialized = "";
   try {
@@ -166,9 +238,6 @@ export function estimateSerializedMessageTokens(message: unknown): number {
     // which is what the model boundary sees too.
     serialized =
       JSON.stringify(rendered, function (this: unknown, key, value) {
-        if (this === rendered && key === "__openclaw") {
-          return undefined;
-        }
         // User string content, including a recorded projection, is literal
         // text even when it happens to contain a long data URL.
         const isUserText = this === rendered && key === "content" &&
@@ -198,11 +267,31 @@ export function estimateSerializedMessageTokens(message: unknown): number {
   }
   const serializedEstimate =
     estimateTokens(serialized) + opaqueParts * OPAQUE_BINARY_PART_TOKEN_ESTIMATE;
-  const estimate = Math.max(serializedEstimate, estimateToolResultBoundaryTokens(rendered));
+  const estimate = Math.max(
+    serializedEstimate,
+    estimateToolResultBoundaryTokens(rendered),
+    measuredCompletionOccupancy(message),
+  );
   if (cacheable) {
     serializedEstimateCache.set(message as object, estimate);
   }
   return estimate;
+}
+
+/**
+ * Provider-measured completion size of an assistant message, including
+ * reasoning hidden behind an opaque signature. The host's prompt precheck
+ * counts at least this much for a live assistant message, so the estimate keeps
+ * it as a floor even though the signature bytes themselves are not counted.
+ */
+function measuredCompletionOccupancy(message: unknown): number {
+  if (!isRecord(message) || message.role !== "assistant" || !isRecord(message.usage)) return 0;
+  const usage = message.usage.contextUsage;
+  if (!isRecord(usage) || usage.state !== "available") return 0;
+  const { totalTokens, promptTokens } = usage;
+  if (typeof totalTokens !== "number" || typeof promptTokens !== "number") return 0;
+  const completion = totalTokens - promptTokens;
+  return Number.isFinite(completion) ? Math.max(0, Math.ceil(completion)) : 0;
 }
 
 function estimateBoundaryStringTokens(text: string, charsPerToken: number): number {
