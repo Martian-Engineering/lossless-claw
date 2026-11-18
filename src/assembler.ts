@@ -9,6 +9,7 @@ import type {
 import type { FocusBriefRecord, FocusBriefStore } from "./store/focus-brief-store.js";
 import type { SummaryStore, ContextItemRecord, SummaryRecord } from "./store/summary-store.js";
 import { estimateTokens, stripOpaqueBlockSignatures } from "./estimate-tokens.js";
+import { resolveFreshTailTokenCap } from "./fresh-tail.js";
 import { formatToolOutputReference } from "./large-files.js";
 import { serializeOpenClawSenderMetadata } from "./openclaw-sender-metadata.js";
 import { attachTranscriptEntryMeta } from "./transcript.js";
@@ -219,7 +220,7 @@ export interface AssembleContextInput {
   tokenBudget: number;
   /** Number of most recent raw turns to always include (default: 8) */
   freshTailCount?: number;
-  /** Optional token cap for the protected fresh tail; newest message is always preserved. */
+  /** Optional token cap for the protected fresh tail; unset caps it at 25% of `tokenBudget` (at least 8 messages). */
   freshTailMaxTokens?: number;
   /** Optional user query for relevance-based eviction scoring (BM25-lite). When absent or unsearchable, falls back to chronological eviction. */
   prompt?: string;
@@ -1399,6 +1400,7 @@ function resolveFreshTailOrdinal(
   resolved: ResolvedItem[],
   freshTailCount: number,
   freshTailMaxTokens?: number,
+  freshTailMinMessages = 1,
 ): number {
   if (!Number.isFinite(freshTailCount) || freshTailCount <= 0) {
     return Infinity;
@@ -1435,7 +1437,7 @@ function resolveFreshTailOrdinal(
 
     const wouldExceedBudget =
       latestUserProtected &&
-      protectedCount > 0 &&
+      protectedCount >= freshTailMinMessages &&
       typeof tokenCap === "number" &&
       protectedTokens + item.tokens > tokenCap;
     if (wouldExceedBudget) {
@@ -1553,10 +1555,12 @@ export class ContextAssembler {
     }
 
     // Step 3: Split into evictable prefix and protected fresh tail
+    const freshTailCap = resolveFreshTailTokenCap(input.freshTailMaxTokens, tokenBudget);
     const freshTailOrdinal = resolveFreshTailOrdinal(
       resolved,
       freshTailCount,
-      input.freshTailMaxTokens,
+      freshTailCap.maxTokens,
+      freshTailCap.minMessages,
     );
     const orphanStrippingOrdinal = freshTailOrdinal;
     const allToolResultOrdinalsById = new Map<string, number[]>();

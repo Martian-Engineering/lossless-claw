@@ -94,6 +94,7 @@ import type {
   VisibleSessionTranscriptMessageEntry,
 } from "./types.js";
 import { estimateTokens, estimateSerializedMessagesTokens } from "./estimate-tokens.js";
+import { resolveFreshTailTokenCap } from "./fresh-tail.js";
 import { hashAgentMessageForAssemblyProtection, messagesHaveSameLiveCoverageSignature } from "./message-signatures.js";
 import {
   buildDeterministicFallbackSummary,
@@ -1691,6 +1692,10 @@ export class LcmContextEngine implements ContextEngine {
       params.contextThresholdOverride?.freshTailCount ?? this.config.freshTailCount;
     const pendingLeafChunkTokens =
       params.contextThresholdOverride?.leafChunkTokens ?? this.config.leafChunkTokens;
+    const pendingFreshTailCap = resolveFreshTailTokenCap(
+      this.config.freshTailMaxTokens,
+      params.tokenBudget,
+    );
     const coordinator = new PendingCompactionCoordinator({
       conversationStore: this.conversationStore,
       summaryStore: this.summaryStore,
@@ -1701,7 +1706,8 @@ export class LcmContextEngine implements ContextEngine {
       ...(withPublishLock ? { withPublishLock } : {}),
       config: {
         freshTailCount: pendingFreshTailCount,
-        freshTailMaxTokens: this.config.freshTailMaxTokens,
+        freshTailMaxTokens: pendingFreshTailCap.maxTokens,
+        freshTailMinMessages: pendingFreshTailCap.minMessages,
         leafChunkTokens: pendingLeafChunkTokens,
         condensedMinFanout: this.config.condensedMinFanout,
         condensedMinSourceTokens: this.resolvePendingCondensedMinSourceTokens(),
@@ -3412,7 +3418,7 @@ export class LcmContextEngine implements ContextEngine {
       result = await this.drainDeferredCompactionDebtIfIdle(work);
     } else {
       const leaf = await this.compaction.evaluateLeafTrigger(
-        conversation.conversationId, this.config.leafChunkTokens,
+        conversation.conversationId, this.config.leafChunkTokens, tokenBudget,
       );
       if (!leaf.shouldCompact) return outcome;
       result = await this.drainPendingSummaryPreparationIfIdle(work);
@@ -3981,6 +3987,7 @@ export class LcmContextEngine implements ContextEngine {
         const leafDecision = await this.compaction.evaluateLeafTrigger(
           conversation.conversationId,
           this.config.leafChunkTokens,
+          tokenBudget,
         );
         this.deps.log.debug(
           `[lcm] pending-summary-prep: selected phase=${params.phase} conversation=${conversation.conversationId} ${sessionLabel} rawTokensOutsideTail=${leafDecision.rawTokensOutsideTail} threshold=${leafDecision.threshold} shouldPrepare=${leafDecision.shouldCompact}`,

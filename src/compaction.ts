@@ -1,3 +1,4 @@
+import { AsyncLocalStorage } from "node:async_hooks";
 import { createHash, randomUUID } from "node:crypto";
 import { resolveRecoveryTailMaxTokens, selectOverflowToolGroup } from "./overflow-tool-groups.js";
 import { contentFromParts } from "./assembler.js";
@@ -10,6 +11,7 @@ import type {
 } from "./store/conversation-store.js";
 import type { SummaryStore, SummaryRecord, ContextItemRecord } from "./store/summary-store.js";
 import { estimateTokens, truncateTextToEstimatedTokens } from "./estimate-tokens.js";
+import { resolveFreshTailTokenCap, type FreshTailTokenCap } from "./fresh-tail.js";
 import { extractFileIdsFromContent } from "./large-files.js";
 import { NOOP_LCM_LOGGER, type LcmLogger } from "./lcm-log.js";
 import {
@@ -734,6 +736,8 @@ export class CompactionEngine {
    */
   private _contextItemsCache: Map<number, ContextItemRecord[]> | null = null;
   private _contextItemsCacheRefCount = 0;
+  /** Token budget of the in-flight call, for the default fresh-tail cap. */
+  private freshTailBudget = new AsyncLocalStorage<number>();
 
   constructor(
     private conversationStore: ConversationStore,
@@ -775,10 +779,32 @@ export class CompactionEngine {
     }
   }
 
+  /**
+   * Run `fn` with `tokenBudget` as the budget for the default fresh-tail cap.
+   * The budget is scoped to this invocation, so overlapping calls on the same
+   * conversation cannot observe or clear each other's budget.
+   */
+  private withFreshTailBudget<T>(
+    tokenBudget: number | undefined,
+    fn: () => Promise<T>,
+  ): Promise<T> {
+    return tokenBudget === undefined ? fn() : this.freshTailBudget.run(tokenBudget, fn);
+  }
+
   // ── evaluate ─────────────────────────────────────────────────────────────
 
   /** Evaluate whether compaction is needed. */
   async evaluate(
+    conversationId: number,
+    tokenBudget: number,
+    observedTokenCount?: number,
+    options?: { contextThreshold?: number; freshTailCount?: number },
+  ): Promise<CompactionDecision> {
+    return this.withFreshTailBudget(tokenBudget, () =>
+      this.evaluateImpl(conversationId, tokenBudget, observedTokenCount, options));
+  }
+
+  private async evaluateImpl(
     conversationId: number,
     tokenBudget: number,
     observedTokenCount?: number,
@@ -833,12 +859,17 @@ export class CompactionEngine {
    * `leafChunkTokens`. Automatic compaction no longer uses this as a trigger,
    * but it remains useful for diagnostics and explicit maintenance commands.
    */
-  async evaluateLeafTrigger(conversationId: number, leafChunkTokensOverride?: number): Promise<{
+  async evaluateLeafTrigger(
+    conversationId: number,
+    leafChunkTokensOverride?: number,
+    tokenBudget?: number,
+  ): Promise<{
     shouldCompact: boolean;
     rawTokensOutsideTail: number;
     threshold: number;
   }> {
-    const rawTokensOutsideTail = await this.countRawTokensOutsideFreshTail(conversationId);
+    const rawTokensOutsideTail = await this.withFreshTailBudget(tokenBudget, () =>
+      this.countRawTokensOutsideFreshTail(conversationId));
     const threshold = this.resolveLeafChunkTokens(leafChunkTokensOverride);
     return {
       shouldCompact: rawTokensOutsideTail >= threshold,
@@ -891,7 +922,8 @@ export class CompactionEngine {
     summaryModel?: string;
     allowCondensedPasses?: boolean;
   }): Promise<CompactionResult> {
-    return this.withContextCache(() => this._compactLeafImpl(input));
+    return this.withContextCache(() =>
+      this.withFreshTailBudget(input.tokenBudget, () => this._compactLeafImpl(input)));
   }
 
   private async _compactLeafImpl(input: {
@@ -1070,6 +1102,11 @@ export class CompactionEngine {
     /** Report each committed pass even if a later pass throws. */
     onPassCommitted?: (tokensAfter: number) => void;
   }): Promise<CompactionResult> {
+    return this.withFreshTailBudget(input.tokenBudget, () =>
+      this.compactFullSweepImpl(input));
+  }
+
+  private async compactFullSweepImpl(input: Parameters<CompactionEngine["compactFullSweep"]>[0]): Promise<CompactionResult> {
     const { conversationId, tokenBudget, summarize, force, hardTrigger } = input;
     // Recovery always retains the initiating user, even when routine tail protection is disabled.
     const freshTailCountOverride = input.allowCurrentTurnCompaction
@@ -1418,7 +1455,8 @@ export class CompactionEngine {
     /** Report each committed pass, e.g. to refresh a host idle timeout. */
     onPassCommitted?: (tokensAfter: number) => void;
   }): Promise<CompactUntilUnderResult> {
-    return this.withContextCache(() => this._compactUntilUnderImpl(input));
+    return this.withContextCache(() =>
+      this.withFreshTailBudget(input.tokenBudget, () => this._compactUntilUnderImpl(input)));
   }
 
   private async _compactUntilUnderImpl(input: {
@@ -1637,7 +1675,13 @@ export class CompactionEngine {
     if (freshTailCount <= 0) {
       return Infinity;
     }
-    const freshTailMaxTokens = freshTailMaxTokensOverride ?? this.resolveFreshTailMaxTokens();
+    const freshTailCap: FreshTailTokenCap = freshTailMaxTokensOverride !== undefined
+      ? { maxTokens: freshTailMaxTokensOverride, minMessages: 1 }
+      : resolveFreshTailTokenCap(
+          this.resolveFreshTailMaxTokens(),
+          this.freshTailBudget.getStore(),
+        );
+    const freshTailMaxTokens = freshTailCap.maxTokens;
 
     const rawMessageItems = contextItems.filter(
       (item) => item.itemType === "message" && item.messageId != null,
@@ -1669,7 +1713,7 @@ export class CompactionEngine {
       const messageTokens = await this.getMessageTokenCount(item.messageId, messageCache);
       const wouldExceedBudget =
         latestUserProtected &&
-        protectedCount > 0 &&
+        protectedCount >= freshTailCap.minMessages &&
         typeof freshTailMaxTokens === "number" &&
         protectedTokens + messageTokens > freshTailMaxTokens;
       if (wouldExceedBudget) {
