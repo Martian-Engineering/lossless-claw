@@ -14,6 +14,10 @@ type RegisteredEngineFactory = (() => unknown) | undefined;
 const RELOAD_ADMISSION_MESSAGE =
   "Model runtime replacement is in progress; admitted plugin work cannot wait for the reload. Retry after the plugin reload completes.";
 const RETIRED_INVENTORY_MESSAGE = "Plugin inventory has retired; begin a new plugin operation.";
+/** OpenClaw aborts deferred maintenance (and its model calls) when a foreground turn needs the session. */
+const HOST_ABORT_MESSAGE = "Session maintenance yielded to a foreground turn";
+/** Bridge message for a host that resolves a canceled request with stopReason "aborted". */
+const HOST_ABORTED_RESULT_MESSAGE = "runtime.llm.complete was aborted by the host";
 /** A lifecycle refusal only recognizable by OpenClaw's stable error code. */
 const CODED_LIFECYCLE_MESSAGE = "Plugin runtime is restarting.";
 
@@ -34,11 +38,22 @@ function codedHostError(code: string, message: string, cause?: unknown): Error {
   });
 }
 
+/** Mirrors OpenClaw's createAbortError: a plain Error renamed to AbortError. */
+function hostAbortError(message = HOST_ABORT_MESSAGE, options?: ErrorOptions): Error {
+  return Object.assign(new Error(message, options), { name: "AbortError" });
+}
+
 function hostRejection(message: string): Error {
+  if (message === HOST_ABORT_MESSAGE) return hostAbortError();
   if (message === CODED_LIFECYCLE_MESSAGE) return codedHostError("LLM_RUNTIME_LIFECYCLE", message);
   return message === RELOAD_ADMISSION_MESSAGE
     ? new HostAdmissionBlockedError(message, { admissionBlocked: true })
     : new Error(message);
+}
+/** Host outcome for a lifecycle case: a canceled in-flight request resolves empty with stopReason "aborted". */
+async function hostLifecycleOutcome(message: string): Promise<{ text: string; stopReason: string }> {
+  if (message === HOST_ABORTED_RESULT_MESSAGE) return { text: "", stopReason: "aborted" };
+  throw hostRejection(message);
 }
 type RuntimeLlmComplete = ReturnType<typeof vi.fn>;
 
@@ -417,6 +432,11 @@ describe("createLcmDependencies.complete runtime.llm bridge", () => {
       name: "host lifecycle code with an unlisted message",
       error: () => codedHostError("LLM_RUNTIME_LIFECYCLE", CODED_LIFECYCLE_MESSAGE, new Error("retired")),
     },
+    { name: "host maintenance abort", error: () => hostAbortError() },
+    {
+      name: "DOMException abort",
+      error: () => new DOMException("This operation was aborted", "AbortError"),
+    },
     {
       name: "wrapped admissionBlocked cause",
       error: () => new Error("Plugin LLM completion failed", {
@@ -432,6 +452,37 @@ describe("createLcmDependencies.complete runtime.llm bridge", () => {
       const result = await engine.deps.complete({ model: "test", messages: [], maxTokens: 100 });
       expect(result.error).toEqual({ kind: "runtime_lifecycle", message: rejection.message });
       expect(api.logger.error).not.toHaveBeenCalled();
+    } finally {
+      closeLcmConnection(dbPath);
+    }
+  });
+
+  it("classifies a resolved stopReason \"aborted\" completion as lifecycle", async () => {
+    const usage = { input: 120, output: 7 };
+    const runtimeLlmComplete = vi.fn().mockResolvedValue({
+      text: "partial", stopReason: "aborted", provider: "anthropic", model: "m", agentId: "main", usage,
+    });
+    const { api, getFactory, dbPath } = buildApi({ runtimeLlmComplete });
+    try {
+      const engine = getRegisteredEngine(api, getFactory);
+      const result = await engine.deps.complete({ model: "test", messages: [], maxTokens: 100 });
+      expect(result.error).toEqual({ kind: "runtime_lifecycle", message: HOST_ABORTED_RESULT_MESSAGE });
+      // Partial text from a canceled request is never treated as a summary.
+      expect(result.content).toEqual([]);
+      expect(result).toMatchObject({ provider: "anthropic", model: "m", usage });
+    } finally {
+      closeLcmConnection(dbPath);
+    }
+  });
+
+  it.each(["stop", "error", undefined])("leaves stopReason %s results on the normal path", async (stopReason) => {
+    const runtimeLlmComplete = vi.fn().mockResolvedValue({ text: "summary text", stopReason });
+    const { api, getFactory, dbPath } = buildApi({ runtimeLlmComplete });
+    try {
+      const engine = getRegisteredEngine(api, getFactory);
+      const result = await engine.deps.complete({ model: "test", messages: [], maxTokens: 100 });
+      expect(result.error).toBeUndefined();
+      expect(result.content).toEqual([{ type: "text", text: "summary text" }]);
     } finally {
       closeLcmConnection(dbPath);
     }
@@ -459,6 +510,25 @@ describe("createLcmDependencies.complete runtime.llm bridge", () => {
       kind: "provider_error",
     },
     {
+      name: "timeout that is not an abort",
+      error: () => new DOMException("The operation timed out", "TimeoutError"),
+      kind: "provider_error",
+    },
+    {
+      name: "provider failure caused by the client's own abort",
+      error: () =>
+        Object.assign(new Error("Plugin LLM completion failed"), {
+          code: "LLM_COMPLETION_FAILED",
+          cause: hostAbortError(),
+        }),
+      kind: "provider_error",
+    },
+    {
+      name: "provider message that only mentions an abort",
+      error: () => Object.assign(new Error("AbortError: upstream aborted the stream"), { status: 502 }),
+      kind: "provider_error",
+    },
+    {
       name: "missing runtime owner without admission block",
       error: () => new HostAdmissionBlockedError("prepared model runtime owner is not published"),
       kind: "provider_error",
@@ -477,14 +547,20 @@ describe("createLcmDependencies.complete runtime.llm bridge", () => {
   });
 
   it.each(
-    [RETIRED_INVENTORY_MESSAGE, RELOAD_ADMISSION_MESSAGE, CODED_LIFECYCLE_MESSAGE].flatMap((message) => [
+    [
+      RETIRED_INVENTORY_MESSAGE,
+      RELOAD_ADMISSION_MESSAGE,
+      CODED_LIFECYCLE_MESSAGE,
+      HOST_ABORT_MESSAGE,
+      HOST_ABORTED_RESULT_MESSAGE,
+    ].flatMap((message) => [
       { message, partial: false, tokenBudget: 10_000 },
       { message, partial: true, tokenBudget: 10_000 },
       { message, partial: false, tokenBudget: 300 },
       { message, partial: true, tokenBudget: 300 },
     ]),
   )("resumes lifecycle-interrupted work with fresh maintenance capabilities ($partial, $tokenBudget): $message", async ({ message, partial, tokenBudget }) => {
-    const retired = vi.fn().mockImplementation(async () => { throw hostRejection(message); });
+    const retired = vi.fn().mockImplementation(async () => hostLifecycleOutcome(message));
     if (partial) retired.mockResolvedValueOnce({ text: "prepared before retirement" });
     const pluginComplete = vi.fn(async () => { throw new Error("must use call-bound capability"); });
     const { api, getFactory, dbPath } = buildApi({
@@ -584,8 +660,10 @@ describe("createLcmDependencies.complete runtime.llm bridge", () => {
     "Async work scope is closed",
     "Plugin inventory has retired; begin a new plugin operation.",
     RELOAD_ADMISSION_MESSAGE,
+    HOST_ABORT_MESSAGE,
+    HOST_ABORTED_RESULT_MESSAGE,
   ])("keeps pending work and logs one warning when background summarization hits: %s", async (message) => {
-    const retired = vi.fn().mockImplementation(async () => { throw hostRejection(message); });
+    const retired = vi.fn().mockImplementation(async () => hostLifecycleOutcome(message));
     const { api, getFactory, dbPath } = buildApi({
       runtimeLlmComplete: retired,
       pluginConfig: {

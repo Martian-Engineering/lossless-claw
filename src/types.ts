@@ -59,6 +59,8 @@ export type RuntimeLlmCompleteFn = (params: {
   agentId: string;
   usage?: Record<string, unknown>;
   audit?: Record<string, unknown>;
+  /** Reported by newer hosts; "aborted" means the host canceled the request. */
+  stopReason?: string;
 }>;
 
 export type CompleteFn = (params: {
