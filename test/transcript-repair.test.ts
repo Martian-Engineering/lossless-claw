@@ -97,7 +97,23 @@ describe("sanitizeToolUseResultPairing", () => {
         },
       ],
       isError: true,
+      timestamp: 0,
     });
+  });
+
+  it("gives synthetic missing tool results the calling assistant's time", () => {
+    const repaired = sanitizeToolUseResultPairing([
+      {
+        role: "assistant",
+        content: [{ type: "toolCall", id: "call-1", name: "read", arguments: {} }],
+        timestamp: 1_700_000_000_000,
+      },
+    ]);
+
+    expect(repaired.map((message) => [message.role, message.timestamp])).toEqual([
+      ["assistant", 1_700_000_000_000],
+      ["toolResult", 1_700_000_000_000],
+    ]);
   });
 
   it("looks past display-only assistant turns for delayed tool results", () => {

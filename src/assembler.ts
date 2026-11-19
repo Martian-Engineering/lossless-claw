@@ -1178,6 +1178,22 @@ function formatDateForAttribute(date: Date, timezone?: string): string {
 }
 
 /**
+ * Epoch milliseconds of the first valid stored time, or 0 when none is valid.
+ * Assembled messages carry stored times only, never the wall clock: the host
+ * may render a user message's timestamp into model-visible text, so it must
+ * stay identical across turns.
+ */
+export function storedTimeMs(...times: Array<Date | null | undefined>): number {
+  for (const time of times) {
+    const ms = time?.getTime();
+    if (ms !== undefined && Number.isFinite(ms)) {
+      return ms;
+    }
+  }
+  return 0;
+}
+
+/**
  * Format a summary record into the XML payload string the model sees.
  */
 async function formatSummaryContent(
@@ -1820,7 +1836,11 @@ export class ContextAssembler {
     const content = formatFocusBriefContent(brief, this.timezone);
     const focusItem: ResolvedItem = {
       ordinal: firstCoveredOrdinal,
-      message: { role: "user" as const, content } as AgentMessage,
+      message: {
+        role: "user" as const,
+        content,
+        timestamp: storedTimeMs(brief.coveredLatestAt, brief.createdAt),
+      } as AgentMessage,
       tokens: estimateTokens(content),
       isMessage: false,
       isFocusBrief: true,
@@ -1906,6 +1926,7 @@ export class ContextAssembler {
       item.message = {
         role: "assistant",
         content: [{ type: "text", text: String(item.message.content) }],
+        timestamp: item.message.timestamp,
       } as AgentMessage;
     }
   }
@@ -1995,7 +2016,8 @@ export class ContextAssembler {
     const stubEligible = fileIdFromSidecar != null && fileMeta != null && role === "toolResult";
 
     // Cast: these are reconstructed from DB storage, not live agent messages,
-    // so they won't carry the full AgentMessage metadata (timestamp, usage, etc.)
+    // so they carry the stored creation time but not the full live metadata.
+    const timestamp = storedTimeMs(msg.createdAt);
     return {
       ordinal: item.ordinal,
       message:
@@ -2003,6 +2025,7 @@ export class ContextAssembler {
           ? ({
               role,
               content,
+              timestamp,
               ...(modelIdentity ?? {}),
               ...topLevelAssistantReasoning,
               usage: {
@@ -2023,6 +2046,7 @@ export class ContextAssembler {
           : attachTranscriptEntryMeta({
               role,
               content,
+              timestamp,
               ...(role === "user" && msg.openClawSenderMetadata
                 ? { __openclaw: msg.openClawSenderMetadata }
                 : {}),
@@ -2078,7 +2102,11 @@ export class ContextAssembler {
     // preserveCurrentUserBoundary; they must not replace the initiating user.
     return {
       ordinal: item.ordinal,
-      message: { role: "user" as const, content } as AgentMessage,
+      message: {
+        role: "user" as const,
+        content,
+        timestamp: storedTimeMs(summary.latestAt, summary.createdAt),
+      } as AgentMessage,
       tokens,
       isMessage: false,
       text: summary.content,
