@@ -1,10 +1,16 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { DatabaseSync } from "node:sqlite";
+import { getLcmDbFeatures } from "../src/db/features.js";
+import { runLcmMigrations } from "../src/db/migration.js";
 import type { LcmContextEngine } from "../src/engine.js";
 import {
   createDelegatedExpansionGrant,
   resetDelegatedExpansionGrantsForTests,
   revokeDelegatedExpansionGrantForSession,
 } from "../src/expansion-auth.js";
+import { RetrievalEngine } from "../src/retrieval.js";
+import { ConversationStore } from "../src/store/conversation-store.js";
+import { SummaryStore } from "../src/store/summary-store.js";
 import { createLcmExpandTool } from "../src/tools/lcm-expand-tool.js";
 import type { LcmDependencies } from "../src/types.js";
 
@@ -536,5 +542,198 @@ describe("createLcmExpandTool expansion limits", () => {
         },
       },
     });
+  });
+});
+
+function getToolText(result: { content: Array<{ type: string; text?: string }> }): string {
+  return result.content
+    .filter((block) => block.type === "text")
+    .map((block) => block.text)
+    .join("\n");
+}
+
+describe("createLcmExpandTool source-message delivery", () => {
+  const delegatedSessionKey = "agent:main:subagent:source-message-delivery";
+  const leafSummaryId = "sum_source_messages";
+  const condensedSummaryId = "sum_condensed_source_messages";
+  const lateMarker = "EXACT_SOURCE_MARKER_AFTER_PREVIEW_BOUNDARY";
+  const sourceBodies = [
+    "First source message: preserve this exact text.",
+    `${"Synthetic historical context. ".repeat(12)}\n${lateMarker}\n` +
+      "```json\n{\"synthetic\": true, \"label\": \"café 🌙\"}\n```\nFinal source line.",
+    "Third source message: never include this when the budget has already run out.",
+  ];
+  const sourceTokenCounts = [20, 200, 30];
+  let db: DatabaseSync;
+  let conversationStore: ConversationStore;
+  let summaryStore: SummaryStore;
+  let retrieval: RetrievalEngine;
+  let conversationId: number;
+  let messageIds: number[];
+  let tool: ReturnType<typeof createLcmExpandTool>;
+
+  beforeEach(async () => {
+    vi.clearAllMocks();
+    callGatewayMock.mockReset();
+    resetDelegatedExpansionGrantsForTests();
+    db = new DatabaseSync(":memory:");
+    db.exec("PRAGMA foreign_keys = ON");
+    const { fts5Available } = getLcmDbFeatures(db);
+    runLcmMigrations(db, { fts5Available });
+    conversationStore = new ConversationStore(db, { fts5Available });
+    summaryStore = new SummaryStore(db, { fts5Available });
+    retrieval = new RetrievalEngine(conversationStore, summaryStore);
+    const conversation = await conversationStore.createConversation({
+      sessionId: "synthetic-source-messages",
+    });
+    conversationId = conversation.conversationId;
+    const messages = await conversationStore.createMessagesBulk(
+      sourceBodies.map((content, index) => ({
+        conversationId,
+        seq: index + 1,
+        role: index === 1 ? "assistant" as const : "user" as const,
+        content,
+        tokenCount: sourceTokenCounts[index],
+      })),
+    );
+    messageIds = messages.map((message) => message.messageId);
+    await summaryStore.insertSummary({
+      summaryId: leafSummaryId,
+      conversationId,
+      kind: "leaf",
+      content: "A synthetic summary that deliberately omits the exact source facts.",
+      tokenCount: 15,
+    });
+    await summaryStore.linkSummaryToMessages(leafSummaryId, messageIds);
+    await summaryStore.insertSummary({
+      summaryId: condensedSummaryId,
+      conversationId,
+      kind: "condensed",
+      content: "A condensed synthetic summary.",
+      tokenCount: 10,
+    });
+    await summaryStore.linkSummaryToParents(condensedSummaryId, [leafSummaryId]);
+    createDelegatedExpansionGrant({
+      delegatedSessionKey,
+      issuerSessionId: "synthetic-parent",
+      allowedConversationIds: [conversationId],
+      tokenCap: 1_000,
+    });
+    tool = createLcmExpandTool({
+      deps: makeDeps(),
+      lcm: {
+        info: { id: "lcm" },
+        getRetrieval: () => retrieval,
+        getConversationStore: () => conversationStore,
+      } as unknown as LcmContextEngine,
+      sessionId: delegatedSessionKey,
+    });
+  });
+
+  afterEach(() => {
+    db?.close();
+    resetDelegatedExpansionGrantsForTests();
+  });
+
+  it.each([
+    ["leaf", leafSummaryId, 250],
+    ["condensed", condensedSummaryId, 265],
+  ] as const)("delivers full %s source bodies in content and details.text", async (_kind, summaryId, totalTokens) => {
+    const result = await tool.execute("call-source-bodies", {
+      summaryIds: [summaryId],
+      conversationId,
+      includeMessages: true,
+    });
+    const text = getToolText(result);
+
+    for (const body of sourceBodies) {
+      expect(text).toContain(body);
+    }
+    expect(text).toContain(lateMarker);
+    expect(result.details).toMatchObject({
+      text,
+      expansionCount: 1,
+      totalTokens,
+      truncated: false,
+    });
+    expect(callGatewayMock).not.toHaveBeenCalled();
+  });
+
+  it.each([false, undefined])("does not expose source bodies with includeMessages=%s", async (includeMessages) => {
+    const result = await tool.execute("call-summary-only", {
+      summaryIds: [condensedSummaryId],
+      conversationId,
+      ...(includeMessages === undefined ? {} : { includeMessages }),
+    });
+    const text = getToolText(result);
+
+    expect(text).toContain(leafSummaryId);
+    for (const body of sourceBodies) {
+      expect(text).not.toContain(body);
+    }
+    expect(text).not.toContain(lateMarker);
+    expect(result.details).toMatchObject({
+      text,
+      totalTokens: 15,
+      truncated: false,
+    });
+  });
+
+  it("does not render source messages excluded by the token budget", async () => {
+    const result = await tool.execute("call-budgeted-bodies", {
+      summaryIds: [leafSummaryId],
+      conversationId,
+      includeMessages: true,
+      tokenCap: 25,
+    });
+    const text = getToolText(result);
+
+    expect(text).toContain(sourceBodies[0]);
+    for (const index of [1, 2]) {
+      expect(text).not.toContain(sourceBodies[index]);
+      expect(text).not.toContain(`msg#${messageIds[index]}`);
+    }
+    expect(text).not.toContain(lateMarker);
+    expect(result.details).toMatchObject({
+      text,
+      totalTokens: 20,
+      truncated: true,
+    });
+  });
+
+  it("does not expose source bodies from a summary outside the delegated conversation", async () => {
+    const foreignConversation = await conversationStore.createConversation({
+      sessionId: "synthetic-unauthorized-conversation",
+    });
+    const foreignBody = "UNAUTHORIZED_SYNTHETIC_SOURCE_BODY";
+    const foreignMessage = await conversationStore.createMessage({
+      conversationId: foreignConversation.conversationId,
+      seq: 1,
+      role: "user",
+      content: foreignBody,
+      tokenCount: 10,
+    });
+    const foreignSummaryId = "sum_unauthorized_source";
+    await summaryStore.insertSummary({
+      summaryId: foreignSummaryId,
+      conversationId: foreignConversation.conversationId,
+      kind: "leaf",
+      content: "An unrelated synthetic summary.",
+      tokenCount: 5,
+    });
+    await summaryStore.linkSummaryToMessages(foreignSummaryId, [foreignMessage.messageId]);
+    const expandSpy = vi.spyOn(retrieval, "expand");
+
+    const result = await tool.execute("call-unauthorized-bodies", {
+      summaryIds: [foreignSummaryId],
+      conversationId,
+      includeMessages: true,
+    });
+
+    expect(result.details).toMatchObject({
+      error: expect.stringContaining(`outside conversation ${conversationId}`),
+    });
+    expect(JSON.stringify(result)).not.toContain(foreignBody);
+    expect(expandSpy).not.toHaveBeenCalled();
   });
 });
