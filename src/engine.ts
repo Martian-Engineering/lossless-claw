@@ -25,7 +25,7 @@ import type {
   TranscriptEntryAnchor,
   TranscriptTurnAdmission,
 } from "./openclaw-bridge.js";
-import { ContextAssembler } from "./assembler.js";
+import { ContextAssembler, storedTimeMs } from "./assembler.js";
 import { CompactionEngine, type CompactionConfig } from "./compaction.js";
 import { BatchDeduplicator } from "./batch-dedup.js";
 import { CompactionGuards } from "./compaction-guards.js";
@@ -4264,6 +4264,7 @@ export class LcmContextEngine implements ContextEngine {
     const normalizedCoverageText = normalizePromptRecallText(coverageText);
 
     const renderedMatches: string[] = [];
+    let newestMatchMs = 0;
     const seenMatchKeys = new Set<string>();
     for (const identifier of identifiers) {
       if (findPromptRecallIdentifierIndex(normalizedCoverageText, identifier) >= 0) {
@@ -4297,6 +4298,7 @@ export class LcmContextEngine implements ContextEngine {
           continue;
         }
         seenMatchKeys.add(seenMatchKey);
+        newestMatchMs = Math.max(newestMatchMs, storedTimeMs(stored.createdAt));
         renderedMatches.push(
           renderPromptRecallMessage({
             identifier,
@@ -4324,7 +4326,12 @@ export class LcmContextEngine implements ContextEngine {
       "</lossless_claw_prompt_recall>",
     ].join("\n");
     return {
-      message: { role: "user", content } as AgentMessage,
+      message: {
+        role: "user",
+        content,
+        // The newest quoted snippet's stored time keeps the cue deterministic.
+        timestamp: newestMatchMs,
+      } as AgentMessage,
       tokenCount: estimateTokens(content),
       matchedMessages: renderedMatches.length,
     };
