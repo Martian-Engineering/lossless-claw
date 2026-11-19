@@ -139,6 +139,7 @@ function getRegisteredEngine(api: OpenClawPluginApi, getFactory: () => Registere
         messages: Array<{ role: string; content: unknown }>;
         maxTokens: number;
         temperature?: number;
+        reasoning?: string;
         reasoningIfSupported?: string;
       }) => Promise<CompletionResult>;
       resolveModel: (modelRef?: string, providerHint?: string) => {
@@ -198,6 +199,7 @@ describe("createLcmDependencies.complete runtime.llm bridge", () => {
         systemPrompt: "System summary policy.",
         purpose: "lossless-claw compaction summarization",
         authProfileId: "openai-codex:work",
+        reasoning: "low",
       });
       expect(result).toMatchObject({
         content: [{ type: "text", text: "summary output" }],
@@ -206,6 +208,38 @@ describe("createLcmDependencies.complete runtime.llm bridge", () => {
         agentId: "research-agent",
         request_api: "runtime.llm",
       });
+    } finally {
+      closeLcmConnection(dbPath);
+    }
+  });
+
+  it.each([
+    { reasoning: "high", reasoningIfSupported: "low", expected: "high" },
+    { reasoning: " high ", reasoningIfSupported: " low ", expected: "high" },
+    { reasoning: " ", reasoningIfSupported: " low ", expected: "low" },
+    { reasoning: undefined, reasoningIfSupported: undefined, expected: undefined },
+    { reasoning: " ", reasoningIfSupported: " ", expected: undefined },
+  ])("forwards effective reasoning to the host: %j", async ({ reasoning, reasoningIfSupported, expected }) => {
+    const runtimeLlmComplete = vi.fn(async (_request: unknown) => ({ text: "summary output" }));
+    const { api, getFactory, dbPath } = buildApi({ runtimeLlmComplete });
+    const engine = getRegisteredEngine(api, getFactory);
+
+    try {
+      await engine.deps.complete({
+        model: "gpt-5.4",
+        messages: [{ role: "user", content: "Summarize this." }],
+        maxTokens: 256,
+        reasoning,
+        reasoningIfSupported,
+      });
+
+      expect(runtimeLlmComplete).toHaveBeenCalledTimes(1);
+      const request = runtimeLlmComplete.mock.calls[0]?.[0];
+      if (expected === undefined) {
+        expect(request).not.toHaveProperty("reasoning");
+      } else {
+        expect(request).toHaveProperty("reasoning", expected);
+      }
     } finally {
       closeLcmConnection(dbPath);
     }
