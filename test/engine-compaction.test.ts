@@ -1779,6 +1779,51 @@ describe("LcmContextEngine.compact token budget plumbing", () => {
     expect(onProgress).toHaveBeenCalledTimes(2);
   });
 
+  it("hands the host abort signal to the summarizer", async () => {
+    const engine = createEngine();
+    const privateEngine = engine as unknown as {
+      compaction: {
+        evaluate: (conversationId: number, tokenBudget: number, observed?: number) => Promise<unknown>;
+        compactUntilUnder: (input: {
+          summarize: (text: string, aggressive?: boolean, options?: object) => Promise<string>;
+        }) => Promise<unknown>;
+      };
+    };
+    vi.spyOn(privateEngine.compaction, "evaluate").mockResolvedValue({
+      shouldCompact: true,
+      reason: "threshold",
+      currentTokens: 277_403,
+      threshold: 150_000,
+    });
+    vi.spyOn(privateEngine.compaction, "compactUntilUnder").mockImplementation(async (input) => {
+      await input.summarize("chunk", false, { isCondensed: false });
+      return { success: true, actionTaken: true, rounds: 1, finalTokens: 149_500 };
+    });
+    await engine.ingest({
+      sessionId: "summarizer-host-abort",
+      message: { role: "user", content: "trigger" } as AgentMessage,
+    });
+    const summarize = vi.fn(async () => "summary");
+    const controller = new AbortController();
+
+    await engine.compact({
+      sessionId: "summarizer-host-abort",
+      sessionFile: "/tmp/session.jsonl",
+      tokenBudget: 200_000,
+      currentTokenCount: 277_403,
+      force: true,
+      compactionTarget: "budget",
+      abortSignal: controller.signal,
+      legacyParams: { summarize },
+    });
+
+    expect(summarize).toHaveBeenCalledWith(
+      "chunk",
+      false,
+      expect.objectContaining({ isCondensed: false, abortSignal: controller.signal }),
+    );
+  });
+
   it("leaves threshold headroom when forced budget recovery receives a raw host window", async () => {
     const engine = createEngine();
     const privateEngine = engine as unknown as {
