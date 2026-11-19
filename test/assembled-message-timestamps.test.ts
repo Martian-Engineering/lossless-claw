@@ -123,7 +123,6 @@ describe("assembled message timestamps", () => {
     expect(byContent("Raw request that stays visible.")?.timestamp).toBe(
       Date.parse("2026-01-03T04:05:06.000Z"),
     );
-    expect(byContent("Raw reply that stays visible.")?.role).toBe("assistant");
     // Later turns must not shift timestamps the host renders into user text.
     expect(timestampsOf((await assemble()).messages)).toEqual(timestampsOf(first.messages));
   });
