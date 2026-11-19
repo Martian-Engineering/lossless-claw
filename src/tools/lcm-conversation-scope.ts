@@ -111,9 +111,15 @@ export async function resolveLcmConversationScope(input: {
   const isolateCurrentSessionFamily = isIsolatedCronSessionKey(normalizedSessionKey);
   let allowedConversationIds: number[] = [];
 
-  const explicitConversationId =
+  // Conversation IDs start at 1. Strict tool schemas (e.g. OpenAI) fill every
+  // optional property, sending 0 for "not provided", so treat <= 0 as unset.
+  const requestedConversationId =
     typeof params.conversationId === "number" && Number.isFinite(params.conversationId)
       ? Math.trunc(params.conversationId)
+      : undefined;
+  const explicitConversationId =
+    requestedConversationId != null && requestedConversationId > 0
+      ? requestedConversationId
       : undefined;
 
   if (isDelegatedSession) {
