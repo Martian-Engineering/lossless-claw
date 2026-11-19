@@ -15,6 +15,11 @@ export type LcmSummarizeOptions = {
   previousSummary?: string;
   isCondensed?: boolean;
   depth?: number;
+  /**
+   * Host cancellation. When set, a provider error on the last candidate gets
+   * one more attempt after a wait, and an abort cuts that wait short.
+   */
+  abortSignal?: AbortSignal;
 };
 
 export type LcmSummarizeFn = (
@@ -258,6 +263,37 @@ class LcmProviderResponseError extends Error {
  * event loop from starving when a provider hangs.
  */
 const DEFAULT_SUMMARIZER_TIMEOUT_MS = 60_000;
+
+/**
+ * Wait before the one extra attempt after a provider error on the last
+ * candidate. Hosts can briefly refuse a model after one failed call (OpenClaw
+ * cools an auth profile down for 30s), so an immediate retry is refused too.
+ * Only callers that pass an abortSignal wait.
+ */
+const PROVIDER_ERROR_RETRY_DELAY_MS = 35_000;
+
+/** Resolve after `ms`, or early when `signal` aborts. Never rejects. */
+function waitUnlessAborted(ms: number, signal: AbortSignal): Promise<void> {
+  return new Promise((resolve) => {
+    const done = () => {
+      clearTimeout(timer);
+      signal.removeEventListener("abort", done);
+      resolve();
+    };
+    const timer = setTimeout(done, ms);
+    signal.addEventListener("abort", done, { once: true });
+  });
+}
+
+/** Bind host cancellation to every call of `summarize`. */
+export function withSummarizeAbortSignal(
+  summarize: LcmSummarizeFn,
+  abortSignal?: AbortSignal,
+): LcmSummarizeFn {
+  return abortSignal
+    ? (text, aggressive, options) => summarize(text, aggressive, { ...options, abortSignal })
+    : summarize;
+}
 
 /** Error used to distinguish summarizer timeouts from provider failures. */
 class SummarizerTimeoutError extends Error {
@@ -1610,6 +1646,7 @@ export async function createLcmSummarizeFromLegacyParams(params: {
         });
 
     let lastAuthError: LcmProviderAuthError | undefined;
+    let waitedForProviderError = false;
 
     for (let index = 0; index < resolvedCandidates.length; index += 1) {
       const candidate = resolvedCandidates[index]!;
@@ -1646,7 +1683,7 @@ export async function createLcmSummarizeFromLegacyParams(params: {
           ...(reasoning ? { reasoning } : {}),
         }), summarizerTimeoutMs, label);
 
-      const attemptSummarizerCall = async (
+      const attemptSummarizerCallOnce = async (
         label: string,
         reasoning?: string,
         maxTokensOverride?: number,
@@ -1705,6 +1742,40 @@ export async function createLcmSummarizeFromLegacyParams(params: {
             throw err;
           }
           throw new LcmProviderAuthError({ provider, model, failure: authFailure });
+        }
+      };
+
+      // A provider error on the last candidate gets one more attempt after a
+      // wait, so a short host cooldown does not end in a truncation fallback.
+      const attemptSummarizerCall = async (
+        label: string,
+        reasoning?: string,
+        maxTokensOverride?: number,
+      ): Promise<Awaited<ReturnType<typeof params.deps.complete>>> => {
+        try {
+          return await attemptSummarizerCallOnce(label, reasoning, maxTokensOverride);
+        } catch (err) {
+          // Only a caller that passed an abortSignal can be cancelled, so only
+          // such a caller waits. Foreground steps without one keep failing fast.
+          const signal = options?.abortSignal;
+          if (
+            !(err instanceof LcmProviderResponseError) ||
+            nextCandidate ||
+            waitedForProviderError ||
+            !signal ||
+            signal.aborted
+          ) {
+            throw err;
+          }
+          waitedForProviderError = true;
+          params.deps.log.warn(
+            `[lcm] provider error on ${label} attempt; provider=${provider}; model=${model}; waiting ${PROVIDER_ERROR_RETRY_DELAY_MS}ms before one more attempt`,
+          );
+          await waitUnlessAborted(PROVIDER_ERROR_RETRY_DELAY_MS, signal);
+          if (signal.aborted) {
+            throw err;
+          }
+          return attemptSummarizerCallOnce(label, reasoning, maxTokensOverride);
         }
       };
 
