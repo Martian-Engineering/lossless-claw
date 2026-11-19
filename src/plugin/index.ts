@@ -17,6 +17,7 @@ import type {
   OpenClawPluginApi,
 } from "../openclaw-bridge.js";
 import { resolveLcmConfigWithDiagnostics, resolveOpenclawStateDir } from "../db/config.js";
+import { configWarningLabel, describeConfigWarning } from "../db/config-warnings.js";
 import type { LcmConfig } from "../db/config.js";
 import { closeLcmConnection, createLcmDatabaseConnection, normalizePath } from "../db/connection.js";
 import { LcmContextEngine } from "../engine.js";
@@ -1314,6 +1315,15 @@ function createLcmDependencies(
       log: (message) => log.warn(message),
       message:
         "[lcm] LCM_STATELESS_SESSION_PATTERNS from env overrides plugins.entries.lossless-claw.config.statelessSessionPatterns; plugin config array will be ignored",
+    });
+  }
+  for (const warning of diagnostics.warnings) {
+    // Retired keys keep their own startup lines below.
+    if (warning.problem === "retired") continue;
+    logStartupBannerOnce({
+      key: `config-warning:${warning.source}:${warning.setting}`,
+      log: (message) => log.warn(message),
+      message: `[lcm] Config warning: ${configWarningLabel(warning)}: ${describeConfigWarning(warning)}`,
     });
   }
   if (pluginConfig && Object.hasOwn(pluginConfig, "transcriptGcEnabled")) {

@@ -40,6 +40,25 @@ afterEach(() => {
 });
 
 describe("readConfigView", () => {
+  it("includes config warnings in the diagnostics that config show prints", () => {
+    writeConfig({
+      plugins: { entries: { "lossless-claw": { enabled: true, config: { freshTailCount: 10 } } } },
+    });
+
+    const view = readConfigView(configPath, { HOME: directory, LCM_FRESH_TAIL_COUNT: "abc" });
+
+    expect(view.effective.freshTailCount).toBe(10);
+    expect(view.diagnostics.warnings).toEqual([
+      {
+        setting: "freshTailCount",
+        source: "env",
+        name: "LCM_FRESH_TAIL_COUNT",
+        problem: "not-a-number",
+        effect: "used the plugin config value",
+      },
+    ]);
+  });
+
   it("returns only raw and effective Lossless config without unrelated secrets", () => {
     writeConfig({
       gateway: { auth: { token: "unrelated-super-secret" } },

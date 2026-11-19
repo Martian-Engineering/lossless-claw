@@ -12,7 +12,8 @@ type StartupBannerKey =
   | "host-fallback-capture-only"
   | "runtime-llm-unavailable"
   | "runtime-llm-policy-summary-models"
-  | "state-dir";
+  | "state-dir"
+  | `config-warning:${string}`;
 
 type StartupBannerLogState = {
   emitted: Set<StartupBannerKey>;

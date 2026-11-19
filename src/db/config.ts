@@ -1,6 +1,7 @@
 import { homedir } from "os";
 import { join } from "path";
 import { MIN_FALLBACK_MAX_TOKENS } from "../summary-fallback.js";
+import { collectConfigWarnings, type LcmConfigWarning } from "./config-warnings.js";
 
 /**
  * Resolve the active OpenClaw state directory.
@@ -76,6 +77,8 @@ export type LcmConfigDiagnostics = {
   statelessSessionPatternsSource: LcmConfigSource;
   ignoreSessionPatternsEnvOverridesPluginConfig: boolean;
   statelessSessionPatternsEnvOverridesPluginConfig: boolean;
+  /** Values that cannot be used as written; the resolver still falls back exactly as before. */
+  warnings: LcmConfigWarning[];
 };
 
 export type LcmConfig = {
@@ -851,6 +854,7 @@ export function resolveLcmConfigWithDiagnostics(
       ignoreSessionPatternsEnvOverridesPluginConfig: ignoreSessionPatterns.envOverridesPluginConfig,
       statelessSessionPatternsEnvOverridesPluginConfig:
         statelessSessionPatterns.envOverridesPluginConfig,
+      warnings: collectConfigWarnings(env, pluginConfig),
     },
   };
 }
