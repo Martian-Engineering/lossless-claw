@@ -1,15 +1,18 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import type { LcmConfig } from "../src/db/config.js";
 import type { CompactionEngine } from "../src/compaction.js";
-import type { CompactionGuards } from "../src/compaction-guards.js";
+import { CompactionGuards } from "../src/compaction-guards.js";
 import type { CompactionTelemetryRecorder } from "../src/compaction-telemetry.js";
 import type { LcmContextEngine } from "../src/engine.js";
 import type { CompactResult, ContextEngineRuntimeSettings } from "../src/openclaw-bridge.js";
 import { LcmProviderAuthError, LcmRuntimeLifecycleError, LcmRuntimeLlmPolicyError, LcmRuntimeLlmUnavailableError, LcmSummarySpendLimitError } from "../src/summarize.js";
+import type { CompleteFn, CompletionResult } from "../src/types.js";
 import {
   cleanupEngineTestState,
   createEngineWithConfig,
   createEngineWithDeps,
+  createTestConfig,
+  createTestDeps,
   seedBacklogContext,
 } from "./helpers.js";
 
@@ -138,6 +141,124 @@ describe("compactUntilUnder committed work", () => {
       summarize: async () => { throw error; },
     });
     expect(result).toEqual({ success: false, actionTaken: false, rounds: 1, finalTokens: 5_000, error });
+  });
+});
+
+describe("lifecycle refusal summary spend", () => {
+  const message = "Runtime LLM call scope is closed";
+  const success: CompletionResult = { content: [{ type: "text", text: "summary" }] };
+  const input: Parameters<CompleteFn>[0] = { model: "summary", messages: [], maxTokens: 100 };
+
+  function fixture(maxCalls = 1) {
+    const config = createTestConfig(":memory:", {
+      summaryMaxCallsPerWindow: maxCalls,
+      summaryCallWindowMs: 600_000,
+      summarySpendBackoffMs: 1_800_000,
+    });
+    const complete = vi.fn<CompleteFn>().mockResolvedValue(success);
+    const onAttempt = vi.fn();
+    const guards = new CompactionGuards(config, createTestDeps(config, { complete }));
+    const scopeKey = guards.resolveSummarySpendScope({ kind: "compaction", scope: "test-session" });
+    const guarded = guards.buildSummarySpendGuardedDeps({ scopeKey, reason: "test summary", onAttempt });
+    return { guards, scopeKey, complete, onAttempt, call: () => guarded.complete(input) };
+  }
+
+  for (const maxCalls of [1, 3]) {
+    it.each(["returned", "thrown", "custom"] as const)(
+      `preserves the last allowance after a %s lifecycle refusal (limit ${maxCalls})`,
+      async (route) => {
+        const f = fixture(maxCalls);
+        for (let used = 1; used < maxCalls; used += 1) {
+          await f.call();
+        }
+        const error = new LcmRuntimeLifecycleError(message);
+        if (route === "returned") {
+          const result: CompletionResult = { content: [], error: { kind: "runtime_lifecycle", message } };
+          f.complete.mockResolvedValueOnce(result);
+          await expect(f.call()).resolves.toBe(result);
+        } else if (route === "thrown") {
+          f.complete.mockRejectedValueOnce(error);
+          await expect(f.call()).rejects.toBe(error);
+        } else {
+          const interrupted = f.guards.guardCustomSummarize({
+            scopeKey: f.scopeKey,
+            onAttempt: f.onAttempt,
+            summarize: async () => { throw error; },
+          });
+          await expect(interrupted("source")).rejects.toBe(error);
+        }
+        expect(f.guards.getSummarySpendBackoffUntil(f.scopeKey)).toBeNull();
+
+        // A new callback shares the budget, not the retired host capability.
+        const fresh = vi.fn(async () => "fresh summary");
+        const resumed = f.guards.guardCustomSummarize({
+          scopeKey: f.scopeKey, summarize: fresh, onAttempt: f.onAttempt,
+        });
+        await expect(resumed("source")).resolves.toBe("fresh summary");
+        await expect(resumed("source")).rejects.toBeInstanceOf(LcmSummarySpendLimitError);
+        expect(fresh).toHaveBeenCalledOnce();
+        expect(f.onAttempt).toHaveBeenCalledTimes(maxCalls + 1);
+        expect(f.guards.getSummarySpendBackoffUntil(f.scopeKey)).not.toBeNull();
+      },
+    );
+  }
+
+  it.each(["provider result", "summary text", "untyped error", "named error", "custom error", "custom text"])(
+    "still charges a %s with lifecycle wording",
+    async (kind) => {
+      const f = fixture();
+      const error = new Error(message);
+      if (kind === "provider result") {
+        const result: CompletionResult = { content: [], error: { kind: "provider_error", statusCode: 503, message } };
+        f.complete.mockResolvedValueOnce(result);
+        await expect(f.call()).resolves.toBe(result);
+      } else if (kind === "summary text") {
+        const result: CompletionResult = { content: [{ type: "text", text: message }] };
+        f.complete.mockResolvedValueOnce(result);
+        await expect(f.call()).resolves.toBe(result);
+      } else if (kind === "custom text") {
+        const summarize = f.guards.guardCustomSummarize({ scopeKey: f.scopeKey, summarize: async () => message });
+        await expect(summarize("source")).resolves.toBe(message);
+      } else if (kind === "custom error") {
+        const summarize = f.guards.guardCustomSummarize({ scopeKey: f.scopeKey, summarize: async () => { throw error; } });
+        await expect(summarize("source")).rejects.toBe(error);
+      } else {
+        if (kind === "named error") error.name = "LcmRuntimeLifecycleError";
+        f.complete.mockRejectedValueOnce(error);
+        await expect(f.call()).rejects.toBe(error);
+      }
+      const callsBeforeRejection = f.complete.mock.calls.length;
+      await expect(f.call()).rejects.toBeInstanceOf(LcmSummarySpendLimitError);
+      expect(f.complete).toHaveBeenCalledTimes(callsBeforeRejection);
+      expect(f.guards.getSummarySpendBackoffUntil(f.scopeKey)).not.toBeNull();
+    },
+  );
+
+  it.each(["returned", "thrown", "custom"] as const)("keeps the existing %s auth exclusion", async (route) => {
+    const f = fixture();
+    const error = authError();
+    if (route === "returned") {
+      const result: CompletionResult = { content: [], error: { kind: "provider_auth", statusCode: 401, message: "Unauthorized" } };
+      f.complete.mockResolvedValueOnce(result);
+      await expect(f.call()).resolves.toBe(result);
+    } else if (route === "thrown") {
+      f.complete.mockRejectedValueOnce(error);
+      await expect(f.call()).rejects.toBe(error);
+    } else {
+      const summarize = f.guards.guardCustomSummarize({ scopeKey: f.scopeKey, summarize: async () => { throw error; } });
+      await expect(summarize("source")).rejects.toBe(error);
+    }
+    await expect(f.call()).resolves.toBe(success);
+    await expect(f.call()).rejects.toBeInstanceOf(LcmSummarySpendLimitError);
+  });
+
+  it("keeps independent scopes isolated when one reaches the spend limit", async () => {
+    const f = fixture();
+    await f.call();
+    await expect(f.call()).rejects.toBeInstanceOf(LcmSummarySpendLimitError);
+    const other = f.guards.buildSummarySpendGuardedDeps({ scopeKey: "compaction:other", reason: "other summary" });
+    await expect(other.complete(input)).resolves.toBe(success);
+    await expect(other.complete(input)).rejects.toBeInstanceOf(LcmSummarySpendLimitError);
   });
 });
 
