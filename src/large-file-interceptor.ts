@@ -21,6 +21,7 @@ import {
   generateExplorationSummary,
   parseFileBlocks,
 } from "./large-files.js";
+import { resolveExposableLargeFilePath } from "./large-file-path.js";
 import {
   extractStructuredText,
   hasReplayCriticalRawBlock,
@@ -630,7 +631,12 @@ export class LargeFileInterceptor {
     fileId?: string;
     fileName?: string;
     mimeType?: string;
-    formatReference: (input: { fileId: string; byteSize: number; summary: string }) => string;
+    formatReference: (input: {
+      fileId: string;
+      byteSize: number;
+      summary: string;
+      localPath?: string;
+    }) => string;
   }): Promise<{ fileId: string; byteSize: number; summary: string; reference: string }> {
     if (params.fileId) {
       const existing = await this.summaryStore.getLargeFile(params.fileId);
@@ -639,6 +645,9 @@ export class LargeFileInterceptor {
         const summary =
           existing.explorationSummary ??
           `${params.fileName ?? "large payload"} (${byteSize.toLocaleString("en-US")} bytes)`;
+        const localPath = this.config.exposeLargeFilePaths
+          ? await resolveExposableLargeFilePath(this.config.largeFilesDir, existing.storageUri)
+          : undefined;
         return {
           fileId: existing.fileId,
           byteSize,
@@ -647,6 +656,7 @@ export class LargeFileInterceptor {
             fileId: existing.fileId,
             byteSize,
             summary,
+            localPath,
           }),
         };
       }
@@ -683,6 +693,10 @@ export class LargeFileInterceptor {
       explorationSummary,
     });
 
+    const localPath = this.config.exposeLargeFilePaths
+      ? await resolveExposableLargeFilePath(this.config.largeFilesDir, storageUri)
+      : undefined;
+
     return {
       fileId,
       byteSize,
@@ -691,6 +705,7 @@ export class LargeFileInterceptor {
         fileId,
         byteSize,
         summary: explorationSummary,
+        localPath,
       }),
     };
   }
@@ -897,12 +912,13 @@ export class LargeFileInterceptor {
         }),
         fileName: `${externalizedPayload.toolName}.txt`,
         mimeType: "text/plain",
-        formatReference: ({ fileId, byteSize, summary }) =>
+        formatReference: ({ fileId, byteSize, summary, localPath }) =>
           formatToolOutputReference({
             fileId,
             toolName: externalizedPayload.toolName,
             byteSize,
             summary,
+            localPath,
           }),
       });
 

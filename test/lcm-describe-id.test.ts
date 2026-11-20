@@ -63,6 +63,21 @@ describe("extractLcmDescribeId", () => {
     expect(extractLcmDescribeId(input)).toEqual({ ok: true, id: "file_abc123" });
   });
 
+  it("preserves ID extraction when a local path is included", () => {
+    const input = formatToolOutputReference({
+      fileId: "file_abc123",
+      toolName: "exec",
+      byteSize: 1234,
+      summary: "Large command output.",
+      localPath: "C:\\openclaw\\lcm-files\\1\\file_abc123.txt",
+    });
+
+    expect(input).toContain("Local path: C:\\openclaw\\lcm-files\\1\\file_abc123.txt");
+    expect(input).toContain("bounded search or ranged reads");
+    expect(input).toContain("lcm_grep or lcm_describe");
+    expect(extractLcmDescribeId(input)).toEqual({ ok: true, id: "file_abc123" });
+  });
+
   it.each(["FILE_ABC123", "[LCM File: FILE_abc123 | spec.md | text/markdown | 12 bytes]"])(
     "rejects the uppercase ID %s as malformed",
     (input) => {

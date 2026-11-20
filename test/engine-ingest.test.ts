@@ -771,6 +771,7 @@ describe("LcmContextEngine.ingest content extraction", () => {
       expect(storedMessages).toHaveLength(2);
       expect(storedMessages[1].content).toContain("[LCM Tool Output: file_");
       expect(storedMessages[1].content).toContain("tool=exec");
+      expect(storedMessages[1].content).not.toContain("Local path:");
       expect(storedMessages[1].content).not.toContain(toolOutput.slice(0, 64));
 
       const fileIdMatch = storedMessages[1].content.match(/file_[a-f0-9]{16}/);
@@ -829,6 +830,51 @@ describe("LcmContextEngine.ingest content extraction", () => {
         mode: "full_text",
       });
       expect(noisy).toHaveLength(0);
+    });
+  });
+
+  it("includes a validated local path in externalized tool output when opted in", async () => {
+    await withTempHome(async () => {
+      const engine = createEngineWithConfig({
+        largeFileTokenThreshold: 20,
+        exposeLargeFilePaths: true,
+      });
+      const sessionId = randomUUID();
+      const toolOutput = `${"searchable tool output\n".repeat(160)}done`;
+
+      await engine.ingest({
+        sessionId,
+        message: {
+          role: "assistant",
+          content: [{ type: "toolCall", id: "call_path", name: "exec", input: { cmd: "build" } }],
+        } as AgentMessage,
+      });
+      await engine.ingest({
+        sessionId,
+        message: {
+          role: "toolResult",
+          toolCallId: "call_path",
+          toolName: "exec",
+          content: [{
+            type: "tool_result",
+            tool_use_id: "call_path",
+            name: "exec",
+            content: [{ type: "text", text: toolOutput }],
+          }],
+        } as AgentMessage,
+      });
+
+      const conversation = await engine.getConversationStore().getConversationBySessionId(sessionId);
+      expect(conversation).not.toBeNull();
+      const storedMessages = await engine
+        .getConversationStore()
+        .getMessages(conversation!.conversationId);
+      const fileId = storedMessages[1]!.content.match(/file_[a-f0-9]{16}/)?.[0];
+      expect(fileId).toBeDefined();
+      const storedFile = await engine.getSummaryStore().getLargeFile(fileId!);
+      expect(storedFile).not.toBeNull();
+      expect(storedMessages[1]!.content).toContain(`Local path: ${storedFile!.storageUri}`);
+      expect(storedMessages[1]!.content).toContain("lcm_grep or lcm_describe");
     });
   });
 
