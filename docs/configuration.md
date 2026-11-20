@@ -54,6 +54,47 @@ default, validation, or runtime behavior. The host version requirements above
 remain unchanged. Retired options remain ignored; grouping does not reactivate
 them.
 
+## Principal-scoped recall
+
+Recall is unrestricted by default. Operators sharing one database among user-facing
+agents can opt in under `plugins.entries.lossless-claw.config`:
+
+```json
+{
+  "conversationScopePolicy": {
+    "mode": "principal",
+    "unrestrictedAgents": ["main"]
+  }
+}
+```
+
+Principal mode bounds `lcm_grep`, `lcm_describe`, `lcm_expand`, and
+`lcm_expand_query` to the caller's host-supplied session identity. Keys shaped
+`agent:<agent>:<channel>:direct|group|channel:<id>` on `telegram`, `discord`, or
+`line` share a principal through those first five colon-separated segments,
+including any thread suffix. A final
+`:heartbeat` is removed. Other valid `agent:<agent>:...` keys, including custom or
+unknown channels, use their exact key.
+Different agents, channels, DM recipients, and groups remain separate. Archived
+segments remain readable within the same principal.
+
+`allConversations: true` searches multiple conversations within that principal;
+an explicit foreign `conversationId`, summary ID, or file ID cannot expand it.
+Missing/non-agent host keys, missing owners, and empty permitted sets fail closed.
+Tool parameters cannot select another principal. Owner checks precede direct-ID
+content/file reads and creation of delegated expansion grants. Delegated children
+retain their existing grant scope and access to their own exact active child
+conversation; neither this policy nor an unrestricted-agent exception widens grants.
+
+This is in-process recall-tool policy, not an OS isolation boundary. It does not
+isolate database/CLI access, automatic context assembly, or other host tools. Use
+separate OS-protected databases/workspaces for untrusted tenants. The default
+and operator exceptions preserve existing global-recall deployments. No new host
+API or OpenClaw minimum version is required.
+The policy trusts the host's session key and stored conversation ownership. It
+does not defend against database writers or repair corrupted cross-owner summary
+DAG/message links; normal per-conversation DAG integrity remains a prerequisite.
+
 ## Recall tool availability
 
 Lossless declares `lcm_grep`, `lcm_describe`, `lcm_expand`, and
@@ -167,6 +208,10 @@ host policy.
   "leafTargetTokens": 2400,
   "condensedTargetTokens": 2000,
   "maxExpandTokens": 4000,
+  "conversationScopePolicy": {
+    "mode": "unrestricted",
+    "unrestrictedAgents": []
+  },
   "largeFileThresholdTokens": 25000,
   "summaryProvider": "",
   "summaryModel": "",
@@ -339,6 +384,8 @@ The Settings editor displays fixed defaults from the plugin manifest. Automatic 
 | `largeFileTokenThreshold` | `integer` | alias of `largeFileThresholdTokens` | `LCM_LARGE_FILE_TOKEN_THRESHOLD` | Legacy alias accepted by the runtime. Prefer `largeFileThresholdTokens` in new config. |
 | `maxAssemblyTokenBudget` | `integer` | unset | `LCM_MAX_ASSEMBLY_TOKEN_BUDGET` | Optional hard cap for assembly and threshold evaluation, useful with smaller-context models. |
 | `maxExpandTokens` | `integer` | `4000` | `LCM_MAX_EXPAND_TOKENS` | Default token cap for `lcm_expand_query` responses. |
+| `conversationScopePolicy.mode` | `"unrestricted" \| "principal"` | `"unrestricted"` | none | Opt-in owner confinement for the four recall tools. See [Principal-scoped recall](#principal-scoped-recall). |
+| `conversationScopePolicy.unrestrictedAgents` | `string[]` | `[]` | none | Exact operator-listed agent IDs that retain unrestricted top-level recall. Never widens a delegated grant. |
 
 Forked child sessions are also bounded by `bootstrapMaxTokens` during bootstrap
 import. This protects the LCM database from importing unbounded parent history,
