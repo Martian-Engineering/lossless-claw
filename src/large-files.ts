@@ -531,6 +531,58 @@ export function formatToolOutputReference(input: {
   ].join("\n");
 }
 
+/**
+ * Step 5 — self-describing stub for an externalized one-shot tool result.
+ *
+ * Shares the canonical `[LCM Tool Output: …]` header with
+ * `formatToolOutputReference` (keeping existing header matchers working) and
+ * additionally records what the payload is (tool + originating command), how
+ * big it is (bytes + lines), where the original text lives on disk, and the
+ * two supported ways to read it back. Only emitted when
+ * `toolResultExternalization` is enabled.
+ */
+export function formatExternalizedToolResultReference(input: {
+  fileId: string;
+  toolName?: string;
+  command?: string;
+  byteSize: number;
+  lineCount?: number;
+  storageUri?: string;
+  summary: string;
+}): string {
+  const toolName = input.toolName?.trim() || "unknown";
+  const byteSize = Math.max(0, input.byteSize);
+  const sizeParts = [`${byteSize.toLocaleString("en-US")} bytes`];
+  if (typeof input.lineCount === "number" && Number.isFinite(input.lineCount)) {
+    sizeParts.push(`${Math.max(0, input.lineCount).toLocaleString("en-US")} lines`);
+  }
+  const header = `[LCM Tool Output: ${input.fileId} | tool=${toolName} | ${sizeParts.join(" | ")}]`;
+
+  const lines = [header];
+  if (input.command?.trim()) {
+    const command = input.command.trim().split(/\r?\n/, 1)[0] ?? "";
+    const compactCommand = command.length > 200 ? `${command.slice(0, 200)}…` : command;
+    if (compactCommand) {
+      lines.push(`Command: ${compactCommand}`);
+    }
+  }
+  if (input.storageUri?.trim()) {
+    lines.push(`Original text on disk: ${input.storageUri.trim()}`);
+  }
+  lines.push("", "Exploration Summary:", input.summary.trim() || "(no summary available)");
+  lines.push(
+    "",
+    "The tool result above was externalized to disk; this is only a stub. Read the full text back with:",
+  );
+  if (input.storageUri?.trim()) {
+    lines.push(`- read the file directly: ${input.storageUri.trim()}`);
+  }
+  lines.push(
+    `- Call lcm_describe(id="${input.fileId}", expandFile=true) to fetch the full output content from disk.`,
+  );
+  return lines.join("\n");
+}
+
 export function formatRawPayloadReference(input: {
   fileId: string;
   role: string;

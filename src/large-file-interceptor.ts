@@ -15,6 +15,7 @@ import type { AgentMessage } from "./openclaw-bridge.js";
 import { estimateTokens } from "./estimate-tokens.js";
 import {
   extensionFromNameOrMime,
+  formatExternalizedToolResultReference,
   formatFileReference,
   formatRawPayloadReference,
   formatToolOutputReference,
@@ -630,8 +631,22 @@ export class LargeFileInterceptor {
     fileId?: string;
     fileName?: string;
     mimeType?: string;
-    formatReference: (input: { fileId: string; byteSize: number; summary: string }) => string;
-  }): Promise<{ fileId: string; byteSize: number; summary: string; reference: string }> {
+    formatReference: (input: {
+      fileId: string;
+      byteSize: number;
+      summary: string;
+      storageUri?: string;
+      lineCount?: number;
+      command?: string;
+    }) => string;
+  }): Promise<{
+    fileId: string;
+    byteSize: number;
+    summary: string;
+    reference: string;
+    storageUri?: string;
+    lineCount?: number;
+  }> {
     if (params.fileId) {
       const existing = await this.summaryStore.getLargeFile(params.fileId);
       if (existing) {
@@ -639,14 +654,19 @@ export class LargeFileInterceptor {
         const summary =
           existing.explorationSummary ??
           `${params.fileName ?? "large payload"} (${byteSize.toLocaleString("en-US")} bytes)`;
+        const lineCount = existing.lineCount ?? params.content.split(/\r?\n/).length;
         return {
           fileId: existing.fileId,
           byteSize,
           summary,
+          storageUri: existing.storageUri,
+          lineCount,
           reference: params.formatReference({
             fileId: existing.fileId,
             byteSize,
             summary,
+            storageUri: existing.storageUri,
+            lineCount,
           }),
         };
       }
@@ -687,10 +707,14 @@ export class LargeFileInterceptor {
       fileId,
       byteSize,
       summary: explorationSummary,
+      storageUri,
+      lineCount,
       reference: params.formatReference({
         fileId,
         byteSize,
         summary: explorationSummary,
+        storageUri,
+        lineCount,
       }),
     };
   }
@@ -753,12 +777,22 @@ export class LargeFileInterceptor {
     };
   }
 
-  /** Externalize oversized textual tool outputs before they are persisted inline. */
+  /**
+   * Externalize oversized textual tool outputs.
+   *
+   * `allowToolResultExternalization` opts THIS call into Step 5 tool-result
+   * externalization (own threshold + self-describing stub). Only the live
+   * assemble pre-flight sets it, so oversized payloads are externalized
+   * lazily — when they would otherwise be squeezed out of the window —
+   * rather than at ingest time. Callers that leave it unset keep the legacy
+   * `largeFileTokenThreshold` behavior exactly as before.
+   */
   async interceptLargeToolResults(params: {
     conversationId: number;
     message: AgentMessage;
     toolCallInputMap?: ReadonlyMap<string, { name?: string; input?: Record<string, unknown> }>;
     getFileId?: (input: { content: string; toolName: string; callId?: string }) => string;
+    allowToolResultExternalization?: boolean;
   }): Promise<{ rewrittenMessage: AgentMessage; fileIds: string[] } | null> {
     if (
       (params.message.role !== "toolResult" && params.message.role !== "tool") ||
@@ -782,7 +816,17 @@ export class LargeFileInterceptor {
       return null;
     }
 
-    const threshold = Math.max(1, this.config.largeFileTokenThreshold);
+    // Step 5 — tool-result externalization is opt-in PER CALL. Only the live
+    // assemble pre-flight opts in, so the payload is written to disk and
+    // replaced by a stub lazily. Any caller that does not opt in keeps the
+    // legacy `largeFileTokenThreshold` path unchanged.
+    const toolResultExternalizationEnabled = params.allowToolResultExternalization === true;
+    const threshold = Math.max(
+      1,
+      toolResultExternalizationEnabled
+        ? this.config.toolResultExternalizationTokenThreshold ?? 2000
+        : this.config.largeFileTokenThreshold,
+    );
     const rewrittenContent: unknown[] = [];
     const fileIds: string[] = [];
     let interceptedAny = false;
@@ -885,26 +929,61 @@ export class LargeFileInterceptor {
         continue;
       }
 
-      interceptedAny = true;
+      // Step 5 — surface the originating command in the stub when the live
+      // path paired a tool_use with this result (the ingest path has no
+      // cross-message tool input, so the command is simply omitted there).
+      const toolInput = callId ? params.toolCallInputMap?.get(callId)?.input : undefined;
+      const toolCommand = toolInput
+        ? safeString(toolInput.command) ?? safeString(toolInput.cmd)
+        : undefined;
 
-      const externalized = await this.externalizeLargeTextPayload({
-        conversationId: params.conversationId,
-        content: externalizedPayload.content,
-        fileId: params.getFileId?.({
+      let externalized: {
+        fileId: string;
+        byteSize: number;
+        summary: string;
+        reference: string;
+        storageUri?: string;
+        lineCount?: number;
+      };
+      try {
+        externalized = await this.externalizeLargeTextPayload({
+          conversationId: params.conversationId,
           content: externalizedPayload.content,
-          toolName: externalizedPayload.toolName,
-          callId,
-        }),
-        fileName: `${externalizedPayload.toolName}.txt`,
-        mimeType: "text/plain",
-        formatReference: ({ fileId, byteSize, summary }) =>
-          formatToolOutputReference({
-            fileId,
+          fileId: params.getFileId?.({
+            content: externalizedPayload.content,
             toolName: externalizedPayload.toolName,
-            byteSize,
-            summary,
+            callId,
           }),
-      });
+          fileName: `${externalizedPayload.toolName}.txt`,
+          mimeType: "text/plain",
+          formatReference: toolResultExternalizationEnabled
+            ? ({ fileId, byteSize, summary, storageUri, lineCount }) =>
+                formatExternalizedToolResultReference({
+                  fileId,
+                  toolName: externalizedPayload.toolName,
+                  command: toolCommand,
+                  byteSize,
+                  summary,
+                  storageUri,
+                  lineCount,
+                })
+            : ({ fileId, byteSize, summary }) =>
+                formatToolOutputReference({
+                  fileId,
+                  toolName: externalizedPayload.toolName,
+                  byteSize,
+                  summary,
+                }),
+        });
+      } catch {
+        // Step 5 — conservative failure mode: if the payload could not be
+        // written/recorded, keep the original, fully-inlined tool result
+        // rather than losing content to a dangling stub.
+        rewrittenContent.push(item);
+        continue;
+      }
+
+      interceptedAny = true;
 
       const normalizedRawType =
         rawType === "function_call_output" ? "function_call_output" : "tool_result";
