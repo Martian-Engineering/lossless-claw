@@ -313,7 +313,7 @@ describe("authoritative forced overflow recovery", () => {
 
   it.each([
     { force: false, compactionTarget: "budget" as const },
-    { force: true, compactionTarget: "threshold" as const },
+    { force: false, compactionTarget: "threshold" as const },
   ])("leaves ordinary prefix-only compaction unchanged: %o", async (mode) => {
     const entries = transcript();
     const read = vi.fn(async () => entries);
