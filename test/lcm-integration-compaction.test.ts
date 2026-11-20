@@ -423,7 +423,7 @@ describe("LCM integration: compaction", () => {
     expect(leafSummary?.sourceMessageTokenCount).toBe(520);
   });
 
-  it("skips leaf persistence when structured source projects to empty text", async () => {
+  it("collapses a textless leaf chunk into a placeholder summary", async () => {
     const emptySourceEngine = new CompactionEngine(convStore as any, sumStore as any, {
       ...defaultCompactionConfig,
       freshTailCount: 0,
@@ -449,6 +449,15 @@ describe("LCM integration: compaction", () => {
     });
     await sumStore.appendContextMessage(CONV_ID, toolResult.messageId);
 
+    const emptyAssistant = await convStore.createMessage({
+      conversationId: CONV_ID,
+      seq: 2,
+      role: "assistant",
+      content: "",
+      tokenCount: 200,
+    });
+    await sumStore.appendContextMessage(CONV_ID, emptyAssistant.messageId);
+
     const summarize = vi.fn(async () => "should not be called");
     const result = await emptySourceEngine.compactLeaf({
       conversationId: CONV_ID,
@@ -457,10 +466,17 @@ describe("LCM integration: compaction", () => {
       force: true,
     });
 
-    expect(result.actionTaken).toBe(false);
+    expect(result.actionTaken).toBe(true);
     expect(result.authFailure).toBeUndefined();
     expect(summarize).not.toHaveBeenCalled();
-    expect(sumStore._summaries.find((summary) => summary.kind === "leaf")).toBeUndefined();
+
+    const leafSummary = sumStore._summaries.find((summary) => summary.kind === "leaf");
+    expect(leafSummary).toBeDefined();
+    expect(leafSummary!.content).toContain("[textless leaf range]");
+    expect(leafSummary!.sourceMessageTokenCount).toBe(500);
+    expect(convStore._messages.some((message) => message.messageId === toolResult.messageId)).toBe(
+      true,
+    );
     expect(
       sumStore._summaries.some((summary) => summary.content.includes("[Truncated from 0 tokens]")),
     ).toBe(false);
@@ -471,8 +487,8 @@ describe("LCM integration: compaction", () => {
       summarize,
       force: true,
     });
-    expect(sweepResult.actionTaken).toBe(false);
     expect(sweepResult.authFailure).toBeUndefined();
+    expect(sumStore._summaries.filter((summary) => summary.kind === "leaf")).toHaveLength(1);
   });
 
   it("leaf-trigger accounting respects fresh tail token caps", async () => {
