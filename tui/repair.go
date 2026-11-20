@@ -30,7 +30,7 @@ const (
 	anthropicVersion       = "2023-06-01"
 	miniMaxProviderID      = "minimax"
 	miniMaxCNProviderID    = "minimax-cn"
-	miniMaxModel           = "MiniMax-M3"
+	miniMaxModel           = "MiniMax-M3.1-Flash"
 	openAIResponsesModel   = "gpt-5.3-codex"
 	condensedTargetTokens  = 2000
 	defaultHTTPTimeout     = 180 * time.Second
