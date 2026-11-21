@@ -186,6 +186,20 @@ export class RetrievalEngine {
     return null;
   }
 
+  /**
+   * Resolve only the owning conversation of a summary or file ID, without
+   * reading content from disk. Used to authorize a target before it is read.
+   */
+  async getItemConversationId(id: string): Promise<number | null> {
+    if (id.startsWith("sum_")) {
+      return (await this.summaryStore.getSummary(id))?.conversationId ?? null;
+    }
+    if (id.startsWith("file_")) {
+      return (await this.summaryStore.getLargeFile(id))?.conversationId ?? null;
+    }
+    return null;
+  }
+
   private async describeSummary(id: string): Promise<DescribeResult | null> {
     const summary = await this.summaryStore.getSummary(id);
     if (!summary) {

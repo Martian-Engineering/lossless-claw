@@ -1,3 +1,7 @@
+import {
+  createDisclosureGate,
+  runWithReleaseRecheck,
+} from "../disclosure.js";
 import { Type } from "@sinclair/typebox";
 import type { LcmContextEngine } from "../engine.js";
 import {
@@ -126,7 +130,10 @@ export function createLcmDescribeTool(input: {
   getLcm?: () => Promise<LcmContextEngine>;
   sessionId?: string;
   sessionKey?: string;
+  /** Host-bound disclosure capability for this invocation (proposed seam; optional). */
+  disclosure?: unknown;
 }): AnyAgentTool {
+  const disclosureGate = createDisclosureGate(input.disclosure);
   return {
     name: "lcm_describe",
     label: "LCM Describe",
@@ -145,10 +152,16 @@ export function createLcmDescribeTool(input: {
       "fileIds=[file_xxx]) to search the bounded file prefix.",
     parameters: LcmDescribeSchema,
     async execute(_toolCallId, params) {
-      const lcm = input.lcm ?? (await input.getLcm?.());
-      if (!lcm) {
+      const resolvedLcm = input.lcm ?? (await input.getLcm?.());
+      if (!resolvedLcm) {
         throw new Error("LCM engine is unavailable.");
       }
+      return runWithReleaseRecheck({
+        gate: disclosureGate,
+        lcm: resolvedLcm,
+        withheld: (message) => jsonResult({ error: message }),
+        run: async (releaseTracker) => {
+      const lcm = resolvedLcm;
       const retrieval = lcm.getRetrieval();
       const timezone = lcm.timezone;
       const p = params as Record<string, unknown>;
@@ -164,6 +177,7 @@ export function createLcmDescribeTool(input: {
       }
       const id = extracted.id;
       const conversationScope = await resolveLcmConversationScope({
+        disclosure: disclosureGate,
         lcm,
         deps: input.deps,
         sessionId: input.sessionId,
@@ -199,7 +213,28 @@ export function createLcmDescribeTool(input: {
       if (startLine != null && endLine != null && endLine < startLine) {
         return jsonResult({ error: "`endLine` must be greater than or equal to `startLine`." });
       }
-      const result = await retrieval.describe(id, {
+      const disclosureAllowedIds = disclosureGate
+        ? new Set(
+            (conversationScope.conversationIds?.length ?? 0) > 0
+              ? conversationScope.conversationIds
+              : conversationScope.conversationId != null
+                ? [conversationScope.conversationId]
+                : [],
+          )
+        : null;
+      if (disclosureAllowedIds) {
+        // Authorize the target before any body, title, count or file read, and
+        // answer a forbidden ID exactly like a missing one.
+        const owningConversationId = await retrieval.getItemConversationId(id);
+        if (owningConversationId == null || !disclosureAllowedIds.has(owningConversationId)) {
+          return jsonResult({
+            error: `Not found: ${id}`,
+            hint: "Check the ID format (sum_xxx for summaries, file_xxx for files).",
+          });
+        }
+        releaseTracker.track([owningConversationId]);
+      }
+      const described = await retrieval.describe(id, {
         expandFile,
         expandFileMaxBytes,
         startLine,
@@ -207,6 +242,36 @@ export function createLcmDescribeTool(input: {
         // Optional-chained for test mocks that may not expose configView.
         largeFilesDir: lcm.configView?.largeFilesDir,
       });
+
+      let result = described;
+      if (result && result.type === "summary" && result.summary && disclosureAllowedIds) {
+        // Derived references (lineage, subtree, attached files) carry their own
+        // audience: drop anything owned by a conversation outside the gate.
+        const summaryStore = lcm.getSummaryStore();
+        const keepSummary = async (summaryId: string): Promise<boolean> => {
+          const owner = (await summaryStore.getSummary(summaryId))?.conversationId;
+          return owner != null && disclosureAllowedIds.has(owner);
+        };
+        const keepFile = async (fileId: string): Promise<boolean> => {
+          const owner = (await summaryStore.getLargeFile(fileId))?.conversationId;
+          return owner != null && disclosureAllowedIds.has(owner);
+        };
+        const filterAsync = async <T,>(items: T[], keep: (item: T) => Promise<boolean>) => {
+          const decisions = await Promise.all(items.map(keep));
+          return items.filter((_, index) => decisions[index]);
+        };
+        const base = result.summary;
+        result = {
+          ...result,
+          summary: {
+            ...base,
+            parentIds: await filterAsync(base.parentIds, keepSummary),
+            childIds: await filterAsync(base.childIds, keepSummary),
+            subtree: await filterAsync(base.subtree, (node) => keepSummary(node.summaryId)),
+            fileIds: await filterAsync(base.fileIds, keepFile),
+          },
+        };
+      }
 
       if (!result) {
         return jsonResult({
@@ -387,6 +452,8 @@ export function createLcmDescribeTool(input: {
       }
 
       return jsonResult(result);
+        },
+      });
     },
   };
 }

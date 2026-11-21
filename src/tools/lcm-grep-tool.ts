@@ -1,3 +1,7 @@
+import {
+  createDisclosureGate,
+  runWithReleaseRecheck,
+} from "../disclosure.js";
 import { Type } from "@sinclair/typebox";
 import type { LcmContextEngine } from "../engine.js";
 import type { LcmDependencies } from "../types.js";
@@ -159,7 +163,10 @@ export function createLcmGrepTool(input: {
   getLcm?: () => Promise<LcmContextEngine>;
   sessionId?: string;
   sessionKey?: string;
+  /** Host-bound disclosure capability for this invocation (proposed seam; optional). */
+  disclosure?: unknown;
 }): AnyAgentTool {
+  const disclosureGate = createDisclosureGate(input.disclosure);
   return {
     name: "lcm_grep",
     label: "LCM Grep",
@@ -173,10 +180,16 @@ export function createLcmGrepTool(input: {
       "for follow-up with lcm_expand or lcm_describe.",
     parameters: LcmGrepSchema,
     async execute(_toolCallId, params) {
-      const lcm = input.lcm ?? (await input.getLcm?.());
-      if (!lcm) {
+      const resolvedLcm = input.lcm ?? (await input.getLcm?.());
+      if (!resolvedLcm) {
         throw new Error("LCM engine is unavailable.");
       }
+      return runWithReleaseRecheck({
+        gate: disclosureGate,
+        lcm: resolvedLcm,
+        withheld: (message) => jsonResult({ error: message }),
+        run: async (releaseTracker) => {
+      const lcm = resolvedLcm;
       const retrieval = lcm.getRetrieval();
       const timezone = lcm.timezone;
 
@@ -221,6 +234,7 @@ export function createLcmGrepTool(input: {
         });
       }
       const conversationScope = await resolveLcmConversationScope({
+        disclosure: disclosureGate,
         lcm,
         deps: input.deps,
         sessionId: input.sessionId,
@@ -240,7 +254,17 @@ export function createLcmGrepTool(input: {
             "No LCM conversation found for this session. Provide conversationId or set allConversations=true.",
         });
       }
-      const result = await retrieval.grep({
+      const disclosureAllowedIds = disclosureGate
+        ? new Set(
+            (conversationScope.conversationIds?.length ?? 0) > 0
+              ? conversationScope.conversationIds
+              : conversationScope.conversationId != null
+                ? [conversationScope.conversationId]
+                : [],
+          )
+        : null;
+      releaseTracker.track(disclosureAllowedIds ?? []);
+      const rawResult = await retrieval.grep({
         query: pattern,
         mode,
         scope,
@@ -254,6 +278,22 @@ export function createLcmGrepTool(input: {
         largeFilesDir: lcm.configView?.largeFilesDir,
         allConversations: conversationScope.allConversations,
       });
+      // Defense in depth: nothing outside the authorized set survives, even if
+      // a lower layer returns a row from another conversation.
+      const result = disclosureAllowedIds
+        ? (() => {
+            const messages = rawResult.messages.filter((row) => disclosureAllowedIds.has(row.conversationId));
+            const summaries = rawResult.summaries.filter((row) => disclosureAllowedIds.has(row.conversationId));
+            const files = (rawResult.files ?? []).filter((row) => disclosureAllowedIds.has(row.conversationId));
+            return {
+              ...rawResult,
+              messages,
+              summaries,
+              files,
+              totalMatches: messages.length + summaries.length + files.length,
+            };
+          })()
+        : rawResult;
 
       const lines: string[] = [];
       lines.push("## LCM Grep Results");
@@ -391,6 +431,8 @@ export function createLcmGrepTool(input: {
           })),
         },
       };
+        },
+      });
     },
   };
 }
