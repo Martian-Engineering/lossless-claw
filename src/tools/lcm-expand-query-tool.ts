@@ -1,3 +1,8 @@
+import {
+  createDisclosureGate,
+  DISCLOSURE_CONVERSATION_UNAVAILABLE,
+  runWithReleaseRecheck,
+} from "../disclosure.js";
 import { Type } from "@sinclair/typebox";
 import type { LcmContextEngine } from "../engine.js";
 import type { LcmDependencies } from "../types.js";
@@ -482,11 +487,19 @@ async function resolveSummaryCandidates(params: {
   query?: string;
   conversationId?: number;
   conversationIds?: number[];
+  /** When set, explicit IDs outside this set read exactly like missing ones. */
+  disclosureAllowedIds?: ReadonlySet<number> | null;
 }): Promise<SummaryCandidate[]> {
   const retrieval = params.lcm.getRetrieval();
   const candidates = new Map<string, SummaryCandidate>();
 
   for (const summaryId of params.explicitSummaryIds) {
+    if (params.disclosureAllowedIds) {
+      const owner = await retrieval.getItemConversationId(summaryId);
+      if (owner == null || !params.disclosureAllowedIds.has(owner)) {
+        throw new Error(`Summary not found: ${summaryId}`);
+      }
+    }
     const described = await retrieval.describe(summaryId);
     if (!described || described.type !== "summary" || !described.summary) {
       throw new Error(`Summary not found: ${summaryId}`);
@@ -605,7 +618,10 @@ export function createLcmExpandQueryTool(input: {
   requesterSessionKey?: string;
   /** Session key for scope fallback when sessionId is unavailable. */
   sessionKey?: string;
+  /** Host-bound disclosure capability for this invocation (proposed seam; optional). */
+  disclosure?: unknown;
 }): AnyAgentTool {
+  const disclosureGate = createDisclosureGate(input.disclosure);
   const configuredDelegatedWaitTimeoutMs =
     input.deps.config.delegationTimeoutMs || DEFAULT_DELEGATED_WAIT_TIMEOUT_MS;
   const advertisedDynamicToolTimeoutMs = resolveAdvertisedDynamicToolTimeoutMs(
@@ -622,10 +638,16 @@ export function createLcmExpandQueryTool(input: {
     parameters: createLcmExpandQuerySchema(advertisedDynamicToolTimeoutMs),
     async execute(_toolCallId, params) {
       const requestStartedAtMs = performance.now();
-      const lcm = input.lcm ?? (await input.getLcm?.());
-      if (!lcm) {
+      const resolvedLcm = input.lcm ?? (await input.getLcm?.());
+      if (!resolvedLcm) {
         throw new Error("LCM engine is unavailable.");
       }
+      return runWithReleaseRecheck({
+        gate: disclosureGate,
+        lcm: resolvedLcm,
+        withheld: (message) => jsonResult({ error: message }),
+        run: async (releaseTracker) => {
+      const lcm = resolvedLcm;
       const p = params as Record<string, unknown>;
       const explicitSummaryIds = normalizeSummaryIds(p.summaryIds as string[] | undefined);
       const query = typeof p.query === "string" ? p.query.trim() : "";
@@ -714,6 +736,7 @@ export function createLcmExpandQueryTool(input: {
 
       try {
         const conversationScope = await resolveLcmConversationScope({
+          disclosure: disclosureGate,
           lcm,
           deps: input.deps,
           sessionId: input.sessionId,
@@ -751,12 +774,39 @@ export function createLcmExpandQueryTool(input: {
           });
         }
 
+        if (
+          disclosureGate
+          && scopedConversationId != null
+          && (conversationScope.conversationIds?.length ?? 0) === 0
+        ) {
+          // The requester-key fallback resolves a conversation outside the
+          // scope resolver; it needs the same live authorization.
+          const fallbackAllowed = await disclosureGate.authorizeConversationIds(lcm, [
+            scopedConversationId,
+          ]);
+          if (!fallbackAllowed.has(scopedConversationId)) {
+            return jsonResult({ error: DISCLOSURE_CONVERSATION_UNAVAILABLE });
+          }
+        }
+        const disclosureAllowedIds = disclosureGate
+          ? new Set(
+              (conversationScope.conversationIds?.length ?? 0) > 0
+                ? conversationScope.conversationIds
+                : scopedConversationId != null
+                  ? [scopedConversationId]
+                  : [],
+            )
+          : null;
+        if (disclosureAllowedIds) {
+          releaseTracker.track(disclosureAllowedIds);
+        }
         const candidates = await resolveSummaryCandidates({
           lcm,
           explicitSummaryIds,
           query: query || undefined,
           conversationId: scopedConversationId,
           conversationIds: conversationScope.conversationIds,
+          disclosureAllowedIds,
         });
 
         if (candidates.length === 0) {
@@ -953,6 +1003,8 @@ export function createLcmExpandQueryTool(input: {
           requestId,
         });
       }
+        },
+      });
     },
   };
 }

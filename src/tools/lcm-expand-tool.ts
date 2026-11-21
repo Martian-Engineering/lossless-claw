@@ -1,3 +1,8 @@
+import {
+  createDisclosureGate,
+  DISCLOSURE_ITEM_UNAVAILABLE,
+  runWithReleaseRecheck,
+} from "../disclosure.js";
 import { Type } from "@sinclair/typebox";
 import type { LcmContextEngine } from "../engine.js";
 import type { LcmDependencies } from "../types.js";
@@ -127,7 +132,10 @@ export function createLcmExpandTool(input: {
   /** Runtime session key (used for delegated expansion auth scoping). */
   sessionId?: string;
   sessionKey?: string;
+  /** Host-bound disclosure capability for this invocation (proposed seam; optional). */
+  disclosure?: unknown;
 }): AnyAgentTool {
+  const disclosureGate = createDisclosureGate(input.disclosure);
   return {
     name: "lcm_expand",
     label: "LCM Expand",
@@ -140,10 +148,16 @@ export function createLcmExpandTool(input: {
       "plus cited IDs in tool output for follow-up.",
     parameters: LcmExpandSchema,
     async execute(_toolCallId, params) {
-      const lcm = input.lcm ?? (await input.getLcm?.());
-      if (!lcm) {
+      const resolvedLcm = input.lcm ?? (await input.getLcm?.());
+      if (!resolvedLcm) {
         throw new Error("LCM engine is unavailable.");
       }
+      return runWithReleaseRecheck({
+        gate: disclosureGate,
+        lcm: resolvedLcm,
+        withheld: (message) => jsonResult({ error: message }),
+        run: async (releaseTracker) => {
+      const lcm = resolvedLcm;
       const retrieval = lcm.getRetrieval();
       const orchestrator = new ExpansionOrchestrator(retrieval);
       const runtimeAuthManager = getRuntimeExpansionAuthManager();
@@ -183,6 +197,7 @@ export function createLcmExpandTool(input: {
       }
 
       const conversationScope = await resolveLcmConversationScope({
+        disclosure: disclosureGate,
         lcm,
         deps: input.deps,
         sessionId: input.sessionId,
@@ -197,6 +212,19 @@ export function createLcmExpandTool(input: {
           error:
             "lcm_expand requires a single delegated conversation scope. Provide conversationId within the delegated grant.",
         });
+      }
+
+      const disclosureAllowedIds = disclosureGate
+        ? new Set(
+            (conversationScope.conversationIds?.length ?? 0) > 0
+              ? conversationScope.conversationIds
+              : conversationScope.conversationId != null
+                ? [conversationScope.conversationId]
+                : [],
+          )
+        : null;
+      if (disclosureAllowedIds) {
+        releaseTracker.track(disclosureAllowedIds);
       }
 
       const runExpand = async (input: {
@@ -217,6 +245,12 @@ export function createLcmExpandTool(input: {
         (delegatedGrant?.allowedConversationIds.length === 1
           ? delegatedGrant.allowedConversationIds[0]
           : undefined);
+
+      if (disclosureAllowedIds && resolvedConversationId == null) {
+        // Without a single authorized conversation there is no safe target for
+        // a global describe/expand; refuse instead of widening.
+        return jsonResult({ error: DISCLOSURE_ITEM_UNAVAILABLE });
+      }
 
       if (query) {
         try {
@@ -353,6 +387,19 @@ export function createLcmExpandTool(input: {
 
       if (summaryIds && summaryIds.length > 0) {
         try {
+          if (disclosureAllowedIds) {
+            // Forbidden and missing summary IDs are indistinguishable.
+            const unavailable: string[] = [];
+            for (const summaryId of summaryIds) {
+              const owner = await retrieval.getItemConversationId(summaryId);
+              if (owner == null || !disclosureAllowedIds.has(owner)) {
+                unavailable.push(summaryId);
+              }
+            }
+            if (unavailable.length > 0) {
+              return jsonResult({ error: DISCLOSURE_ITEM_UNAVAILABLE });
+            }
+          }
           if (conversationScope.conversationId != null) {
             const outOfScope: string[] = [];
             for (const summaryId of summaryIds) {
@@ -461,6 +508,8 @@ export function createLcmExpandTool(input: {
 
       return jsonResult({
         error: "Either summaryIds or query must be provided.",
+      });
+        },
       });
     },
   };

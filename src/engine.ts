@@ -1,3 +1,4 @@
+import { createDisclosureGate } from "./disclosure.js";
 import { getFileBackedDatabasePath } from "./db/connection.js";
 import { resolveBundledSearchWorkerUrl, SearchWorkerClient } from "./search/search-worker-client.js";
 import { createHash } from "node:crypto";
@@ -426,6 +427,35 @@ type TranscriptProjectionSyncParams = {
 
 /** Capability error reported when a transcript-backed session has no visible-delta reader. */
 const TRANSCRIPT_DELTA_READER_UNAVAILABLE = "transcript delta reader unavailable";
+
+/** Parameters accepted by LcmContextEngine.assemble(). */
+export type LcmAssembleParams = {
+  sessionId: string;
+  sessionKey?: string;
+  messages: AgentMessage[];
+  tokenBudget?: number;
+  /** Tool names supplied by embedded OpenClaw hosts for the current run. */
+  availableTools?: Set<string>;
+  /** Current model identifier from OpenClaw hosts that predate assemble runtimeContext. */
+  model?: string;
+  /**
+   * Incoming user prompt for this turn. Embedded OpenClaw hosts call assemble()
+   * with the pre-prompt history, adopt the returned messages, and submit this
+   * prompt afterward. Lossless also uses searchable prompt text for relevance-
+   * based eviction; absent or unsearchable text falls back to chronology.
+   */
+  prompt?: string;
+  /** Optional runtime context for override resolution (model, provider, etc.). */
+  runtimeContext?: Record<string, unknown>;
+  runtimeSettings?: ContextEngineRuntimeSettings;
+  /**
+   * Host-bound disclosure capability for this assembly (proposed seam,
+   * optional). Also read from `runtimeContext.hostDisclosure`, which hosts
+   * already forward, so no new accepted host param is declared. See
+   * src/disclosure.ts. Absent means unchanged behavior.
+   */
+  hostDisclosure?: unknown;
+};
 
 /** Human-readable bootstrap reason for one transcript-delta sync outcome. */
 function describeTranscriptSyncOutcome(outcome: TranscriptSyncOutcome): string {
@@ -4397,26 +4427,52 @@ export class LcmContextEngine implements ContextEngine {
     return identities;
   }
 
-  async assemble(params: {
+  async assemble(params: LcmAssembleParams): Promise<AssembleResult> {
+    const gate = createDisclosureGate(
+      params.hostDisclosure ?? params.runtimeContext?.hostDisclosure,
+    );
+    if (!gate) {
+      return this.assembleUngated(params);
+    }
+    // Host-bound disclosure: derived context (summaries, replayed history,
+    // externalized file references) is only assembled while the host still
+    // authorizes this session's conversation for the destination audience.
+    // Denial degrades to the host's live messages; stored history is untouched.
+    let conversation: ConversationRecord | null = null;
+    try {
+      this.ensureMigrated();
+      conversation = await this.resolveAssemblyConversation(params);
+    } catch {
+      conversation = null;
+    }
+    if (!conversation || !(await gate.confirm(this, [conversation.conversationId]))) {
+      return this.assembleUngated(params, { denyDerivedContext: true });
+    }
+    const result = await this.assembleUngated(params);
+    // Authority can change while assembly awaits; never release derived
+    // context under a revoked or changed audience.
+    if (!(await gate.confirm(this, [conversation.conversationId]))) {
+      return this.assembleUngated(params, { denyDerivedContext: true });
+    }
+    return result;
+  }
+
+  private async resolveAssemblyConversation(params: {
     sessionId: string;
     sessionKey?: string;
-    messages: AgentMessage[];
-    tokenBudget?: number;
-    /** Tool names supplied by embedded OpenClaw hosts for the current run. */
-    availableTools?: Set<string>;
-    /** Current model identifier from OpenClaw hosts that predate assemble runtimeContext. */
-    model?: string;
-    /**
-     * Incoming user prompt for this turn. Embedded OpenClaw hosts call assemble()
-     * with the pre-prompt history, adopt the returned messages, and submit this
-     * prompt afterward. Lossless also uses searchable prompt text for relevance-
-     * based eviction; absent or unsearchable text falls back to chronology.
-     */
-    prompt?: string;
-    /** Optional runtime context for override resolution (model, provider, etc.). */
-    runtimeContext?: Record<string, unknown>;
-    runtimeSettings?: ContextEngineRuntimeSettings;
-  }): Promise<AssembleResult> {
+  }): Promise<ConversationRecord | null> {
+    return isIsolatedCronSessionKey(params.sessionKey)
+      ? this.conversationStore.getConversationBySessionId(params.sessionId)
+      : this.conversationStore.getConversationForSession({
+          sessionId: params.sessionId,
+          sessionKey: params.sessionKey,
+        });
+  }
+
+  private async assembleUngated(
+    params: LcmAssembleParams,
+    options?: { denyDerivedContext?: boolean },
+  ): Promise<AssembleResult> {
     let liveMessages = params.messages;
     // Return a new fallback array so the runtime hook treats this as assembled
     // context, and strip assistant prefill tails from fallback-only paths.
@@ -4436,6 +4492,9 @@ export class LcmContextEngine implements ContextEngine {
       return { messages: msgs, estimatedTokens: 0 };
     };
 
+    if (options?.denyDerivedContext) {
+      return safeFallback();
+    }
     if (this.shouldIgnoreSession({ sessionId: params.sessionId, sessionKey: params.sessionKey })) {
       return safeFallback();
     }
