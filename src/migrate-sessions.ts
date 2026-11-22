@@ -18,6 +18,7 @@ import {
   hashCodexSource,
   hashCodexSourcePrefix,
   readCodexTranscript,
+  type CodexArchivedSourceRecord,
   type CodexTranscript,
   type CodexTranscriptMessage,
 } from "./codex-transcript.js";
@@ -341,13 +342,27 @@ function sqliteStringLiteral(value: string): string {
 
 function toImportableMessages(prepared: PreparedSessionFile): ImportableMessage[] {
   if (prepared.codex) {
-    return prepared.codex.messages.map((codexSource) => ({
-      message: codexSource.message,
-      stored: toStoredMessage(codexSource.message),
-      transcriptEntryId: null,
-      openClawSenderMetadata: null,
-      codexSource,
-    }));
+    return prepared.codex.messages.map((codexSource) => {
+      const stored = toStoredMessage(codexSource.message);
+      const payload = codexSource.sourceRecord.type === "response_item"
+        ? codexSource.sourceRecord.payload as Record<string, unknown>
+        : undefined;
+      const textValue = (value: unknown): string =>
+        typeof value === "string" ? value : JSON.stringify(value) ?? "";
+      // Search indexes messages.content; replay still uses the original tool blocks.
+      if (payload?.type === "function_call") {
+        stored.content = [textValue(payload.name), textValue(payload.arguments)].filter(Boolean).join("\n");
+      } else if (payload?.type === "function_call_output") {
+        stored.content = textValue(payload.output);
+      }
+      return {
+        message: codexSource.message,
+        stored,
+        transcriptEntryId: null,
+        openClawSenderMetadata: null,
+        codexSource,
+      };
+    });
   }
   return prepared.messages.map((message) => ({
     message,
@@ -520,6 +535,7 @@ function updateCodexPrefixReceipt(
   threadId: string,
   byteLength: number,
   sha256: string,
+  archivedRecords: CodexArchivedSourceRecord[],
 ): void {
   const receipt = readPersistedCodexPrefixReceipt(db, conversationId, threadId);
   if (!receipt) {
@@ -530,6 +546,19 @@ function updateCodexPrefixReceipt(
   }
   const metadata = JSON.parse(receipt.metadata) as Record<string, unknown>;
   const codexSource = metadata.codexSource as Record<string, unknown>;
+  const previousArchive = codexSource.archivedRecords ?? [];
+  if (!Array.isArray(previousArchive)) {
+    throw new MigrationImportError(
+      "invalid-codex-provenance",
+      `Conversation ${conversationId} contains invalid archived Codex records; refusing to overwrite provenance.`,
+    );
+  }
+  const archivedIds = new Set(previousArchive.map((record: CodexArchivedSourceRecord) => record?.sourceId));
+  // Keep archival records off the conversational timeline, including on archive-only replay.
+  codexSource.archivedRecords = [
+    ...previousArchive,
+    ...archivedRecords.filter((record) => !archivedIds.has(record.sourceId)),
+  ];
   codexSource.acceptedPrefix = { byteLength, sha256 };
   const result = db.prepare(`UPDATE message_parts SET metadata = ? WHERE part_id = ?`).run(
     JSON.stringify(metadata),
@@ -821,6 +850,7 @@ async function importPreparedFile(
         prepared.codex.threadId,
         prepared.codex.sourceSize,
         prepared.codex.sourceHash,
+        prepared.codex.archivedRecords,
       );
     }
     await conversationStore.markConversationBootstrapped(conversation.conversationId);

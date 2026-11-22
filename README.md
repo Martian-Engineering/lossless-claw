@@ -132,7 +132,10 @@ Codex mode accepts exactly one `--file` and does not discover files or accept
 rollout, preserves user, assistant, and tool content plus source-record
 provenance, and appends new records on a safe replay. It rejects malformed,
 changed, or truncated sources before committing rows. Codex source ids remain
-in message-part metadata; OpenClaw transcript anchor ids retain their native
+in message-part metadata. Tool names, arguments, and outputs have searchable
+text projections alongside their original structured payloads. Mirrored events
+and lifecycle records are archived in the first imported message's source
+metadata, without adding conversation turns. OpenClaw transcript anchor ids retain their native
 meaning. Native LCM continuation still depends on a later OpenClaw transcript
 tail containing matching user/assistant text. Codex provenance ids do not
 prove that overlap; tool-only or otherwise nonmatching tails may start a fresh

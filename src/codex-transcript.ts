@@ -17,10 +17,16 @@ export type CodexTranscriptMessage = {
   sessionMeta?: JsonRecord;
 };
 
+export type CodexArchivedSourceRecord = Pick<
+  CodexTranscriptMessage,
+  "sourceId" | "threadId" | "line" | "lineHash" | "sourceRecord"
+>;
+
 export type CodexTranscript = {
   threadId: string;
   sessionMeta: JsonRecord;
   messages: CodexTranscriptMessage[];
+  archivedRecords: CodexArchivedSourceRecord[];
   sourceHash: string;
   sourceSize: number;
   sourceMtimeMs: number;
@@ -216,6 +222,16 @@ export async function readCodexTranscript(file: string): Promise<CodexTranscript
   const events: Array<{ item: typeof parsed[number]; payload: JsonRecord }> = [];
   const eventFallback: CodexTranscriptMessage[] = [];
   const unsupported: CodexTranscriptMessage[] = [];
+  const archivedRecords: CodexArchivedSourceRecord[] = [];
+  const archiveRecord = (item: typeof parsed[number]): void => {
+    archivedRecords.push({
+      sourceId: sourceId(threadId, item.line, item.hash),
+      threadId,
+      line: item.line,
+      lineHash: item.hash,
+      sourceRecord: item.record,
+    });
+  };
   const canonicalRoles = new Set<string>();
   for (const item of parsed.slice(1)) {
     const envelope = item.record;
@@ -323,6 +339,7 @@ export async function readCodexTranscript(file: string): Promise<CodexTranscript
       const mirrored = Boolean(mirror);
       if (mirrored && mirror) {
         mirror.candidate.consumed = true;
+        archiveRecord(item);
       }
       if (!mirrored) {
         if (canonicalRoles.has(eventRole)) {
@@ -361,6 +378,8 @@ export async function readCodexTranscript(file: string): Promise<CodexTranscript
         lineHash: item.hash,
         sourceRecord: envelope,
       });
+    } else {
+      archiveRecord(item);
     }
   }
 
@@ -380,6 +399,7 @@ export async function readCodexTranscript(file: string): Promise<CodexTranscript
     threadId,
     sessionMeta,
     messages,
+    archivedRecords,
     sourceHash: digest.digest("hex"),
     sourceSize: after.size,
     sourceMtimeMs: after.mtimeMs,

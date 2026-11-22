@@ -589,8 +589,8 @@ describe("runSessionMigration", () => {
         ["user", "repeat me"],
         ["assistant", "reply"],
         ["user", "repeat me"],
-        ["assistant", ""],
-        ["tool", ""],
+        ["assistant", "shell\n{\"cmd\":\"pwd\"}"],
+        ["tool", "workspace root"],
       ]);
       expect(messages.every((message) => message.transcriptEntryId === null)).toBe(true);
       const callParts = await conversationStore.getMessageParts(messages[3]!.messageId);
@@ -614,6 +614,121 @@ describe("runSessionMigration", () => {
       expect(await conversationStore.getMessageCount(conversation!.conversationId)).toBe(5);
     } finally {
       closeLcmConnection(db);
+    }
+  });
+
+  it("makes Codex tool arguments and output searchable without changing their structured parts", async () => {
+    const root = tempRoot();
+    const call = codexResponse({
+      type: "function_call", name: "shell", call_id: "search-call",
+      arguments: '{"cmd":"echo ARGUMENTCANARY"}',
+    });
+    const output = codexResponse({ type: "function_call_output", call_id: "search-call", output: "OUTPUTCANARYZEBRA" });
+    const file = writeCodexSession(root, "tools.jsonl", [codexMeta("tool-search"), call, output]);
+    const dbPath = migratedDb(root);
+    const options = { ...codexImportOptions(file, dbPath, root), apply: true };
+    expect((await runSessionMigration(options)).importedMessages).toBe(2);
+    expect((await runSessionMigration(options)).importedMessages).toBe(0);
+
+    const { db, conversationStore } = openMigratedDb(dbPath);
+    try {
+      const conversation = await conversationStore.getConversationForSession({ sessionId: options.sessionId });
+      const conversationId = conversation!.conversationId;
+      const messages = await conversationStore.getMessages(conversationId);
+      for (const mode of ["full_text", "regex"] as const) {
+        for (const [query, messageIndex] of [["ARGUMENTCANARY", 0], ["OUTPUTCANARYZEBRA", 1]] as const) {
+          const matches = await conversationStore.searchMessages({ conversationId, mode, query });
+          expect(matches).toHaveLength(1);
+          expect(matches[0]?.messageId).toBe(messages[messageIndex]!.messageId);
+        }
+      }
+      expect(messages[0]?.content).toContain("shell");
+      for (const [index, record] of [call, output].entries()) {
+        const parts = await conversationStore.getMessageParts(messages[index]!.messageId);
+        expect(parts[0]?.partType).toBe("tool");
+        expect(parts[0]?.toolCallId).toBe("search-call");
+        expect(JSON.parse(parts[0]!.metadata!).codexSource.sourceRecord).toEqual(record);
+      }
+    } finally {
+      closeLcmConnection(db);
+    }
+  });
+
+  it("archives mirrored and lifecycle payloads through replay and archive-only appends", async () => {
+    const root = tempRoot();
+    const canonical = codexResponse({ type: "message", role: "user", content: "inspect attached image" });
+    const mirror = {
+      ...codexEvent("user_message", "inspect attached image"),
+      payload: {
+        type: "user_message", message: "inspect attached image", client_id: "CLIENTCANARY",
+        images: ["data:image/png;base64,IMAGECANARY"], local_images: ["/tmp/PATHCANARY.png"],
+      },
+    };
+    const complete = {
+      ...codexEvent("task_complete"),
+      payload: { type: "task_complete", last_agent_message: "COMPLETIONCANARYZEBRA", turn_id: "turn-1" },
+    };
+    const file = writeCodexSession(root, "archive.jsonl", [codexMeta("archive"), canonical, mirror, complete]);
+    const dbPath = migratedDb(root);
+    const options = { ...codexImportOptions(file, dbPath, root), apply: true };
+    expect((await runSessionMigration(options)).importedMessages).toBe(1);
+
+    const readArchive = () => {
+      const { db } = openMigratedDb(dbPath);
+      try {
+        expect(db.prepare("SELECT COUNT(*) AS n FROM messages").get()?.n).toBe(1);
+        expect(db.prepare("SELECT COUNT(*) AS n FROM context_items").get()?.n).toBe(1);
+        const row = db.prepare("SELECT metadata FROM message_parts ORDER BY ordinal LIMIT 1").get() as { metadata: string };
+        const source = JSON.parse(row.metadata).codexSource;
+        expect(source.sourceRecord).toEqual(canonical);
+        return source.archivedRecords as Array<{ sourceId: string; line: number; sourceRecord: unknown }>;
+      } finally {
+        closeLcmConnection(db);
+      }
+    };
+    const initialArchive = readArchive();
+    expect(initialArchive?.map((record) => record.sourceRecord)).toEqual([mirror, complete]);
+    expect(initialArchive?.map((record) => record.line)).toEqual([3, 4]);
+    expect((await runSessionMigration(options)).files[0]?.status).toBe("up-to-date");
+    expect(readArchive()).toEqual(initialArchive);
+
+    const originalText = readFileSync(file, "utf8");
+    const settings = { ...codexEvent("thread_settings_applied"), payload: { type: "thread_settings_applied", value: "SETTINGSCANARY" } };
+    appendFileSync(file, `${JSON.stringify(settings)}\n`);
+    expect((await runSessionMigration(options)).files[0]?.status).toBe("up-to-date");
+    expect(readArchive().map((record) => record.sourceRecord)).toEqual([mirror, complete, settings]);
+    expect((await runSessionMigration(options)).importedMessages).toBe(0);
+    expect(new Set(readArchive().map((record) => record.sourceId)).size).toBe(3);
+
+    writeFileSync(file, originalText);
+    expect((await runSessionMigration(options)).files[0]?.reason).toBe("codex-source-changed-or-truncated");
+    expect(readArchive().map((record) => record.sourceRecord)).toEqual([mirror, complete, settings]);
+  });
+
+  it("rolls back Codex messages and archival provenance when a later insert fails", async () => {
+    const root = tempRoot();
+    const file = writeCodexSession(root, "rollback.jsonl", [
+      codexMeta("rollback"),
+      codexResponse({ type: "message", role: "user", content: "first" }),
+      codexEvent("user_message", "first"),
+      codexResponse({ type: "message", role: "assistant", content: "second" }),
+      codexEvent("task_complete"),
+    ]);
+    const dbPath = migratedDb(root);
+    const { db } = openMigratedDb(dbPath);
+    db.exec(`CREATE TRIGGER fail_second_message BEFORE INSERT ON messages
+      WHEN NEW.seq = 2 BEGIN SELECT RAISE(ABORT, 'injected insert failure'); END`);
+    closeLcmConnection(db);
+
+    const result = await runSessionMigration({ ...codexImportOptions(file, dbPath, root), apply: true });
+    expect(result.files[0]).toMatchObject({ status: "error", importedMessages: 0, error: "injected insert failure" });
+    const reopened = openMigratedDb(dbPath);
+    try {
+      for (const table of ["conversations", "messages", "message_parts", "context_items"]) {
+        expect(reopened.db.prepare(`SELECT COUNT(*) AS n FROM ${table}`).get()?.n).toBe(0);
+      }
+    } finally {
+      closeLcmConnection(reopened.db);
     }
   });
 
