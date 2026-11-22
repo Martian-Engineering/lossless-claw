@@ -1,4 +1,13 @@
-import { describe, expect, it, vi } from "vitest";
+import { DatabaseSync } from "node:sqlite";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { getLcmDbFeatures } from "../src/db/features.js";
+import { runLcmMigrations } from "../src/db/migration.js";
+import type { LcmContextEngine } from "../src/engine.js";
+import { RetrievalEngine } from "../src/retrieval.js";
+import { ConversationStore } from "../src/store/conversation-store.js";
+import { SummaryStore } from "../src/store/summary-store.js";
+import { createLcmGrepTool } from "../src/tools/lcm-grep-tool.js";
+import type { LcmDependencies } from "../src/types.js";
 import { resolveLcmConversationScope } from "../src/tools/lcm-conversation-scope.js";
 
 describe("runtime session recall identity", () => {
@@ -7,7 +16,6 @@ describe("runtime session recall identity", () => {
   async function resolve(input: {
     runtimeKey: string | null;
     runtimeActive?: boolean;
-    keyedActive?: boolean;
     sameConversation?: boolean;
     missingRuntime?: boolean;
   }) {
@@ -15,7 +23,7 @@ describe("runtime session recall identity", () => {
       conversationId: 101,
       sessionId: "keyed-runtime",
       sessionKey: requestedKey,
-      active: input.keyedActive ?? true,
+      active: true,
     };
     const runtime = {
       conversationId: input.sameConversation ? 101 : 202,
@@ -43,10 +51,9 @@ describe("runtime session recall identity", () => {
     return { scope, store, warn };
   }
 
-  it.each([true, false])("keeps the requested key when an active runtime ID collides (keyed active=%s)", async (keyedActive) => {
+  it("keeps the requested key when an active runtime ID collides", async () => {
     const { scope, store, warn } = await resolve({
       runtimeKey: "agent:fixture:internal-review",
-      keyedActive,
     });
     expect(scope).toMatchObject({ conversationId: 101, conversationIds: [101, 100], delegated: false });
     expect(store.getConversationFamilyIds).toHaveBeenCalledWith({
@@ -77,5 +84,93 @@ describe("runtime session recall identity", () => {
     const { scope, warn } = await resolve({ runtimeKey: requestedKey, missingRuntime: true });
     expect(scope.conversationId).toBe(101);
     expect(warn).not.toHaveBeenCalled();
+  });
+});
+
+
+describe("runtime fallback recall identity with persisted conversations", () => {
+  const requestedKey = "agent:fixture:main";
+  const deps = {
+    isSubagentSessionKey: () => false,
+    log: { warn: vi.fn(), info: vi.fn(), error: vi.fn(), debug: vi.fn() },
+  };
+  let db: DatabaseSync;
+  let store: ConversationStore;
+  let lcm: LcmContextEngine;
+  let foreignId: number;
+
+  beforeEach(async () => {
+    db = new DatabaseSync(":memory:");
+    const { fts5Available } = getLcmDbFeatures(db);
+    runLcmMigrations(db, { fts5Available });
+    store = new ConversationStore(db, { fts5Available });
+    const retrieval = new RetrievalEngine(store, new SummaryStore(db, { fts5Available }));
+    lcm = {
+      getConversationStore: () => store,
+      getRetrieval: () => retrieval,
+      timezone: "UTC",
+    } as LcmContextEngine;
+    foreignId = (await store.createConversation({
+      sessionId: "shared-runtime", sessionKey: "agent:fixture:internal-review",
+    })).conversationId;
+    await store.createMessage({
+      conversationId: foreignId, seq: 1, role: "user",
+      content: "collision-sentinel foreign history", tokenCount: 8,
+    });
+  });
+
+  afterEach(() => db.close());
+
+  async function archiveRequestedConversation() {
+    const conversation = await store.createConversation({
+      sessionId: "keyed-runtime", sessionKey: requestedKey,
+    });
+    await store.archiveConversation(conversation.conversationId, "manual-reset");
+  }
+
+  it.each(["archived", "missing"])("leaves the %s requested key unresolved instead of selecting a foreign runtime", async (kind) => {
+    if (kind === "archived") await archiveRequestedConversation();
+    expect(await store.getConversationBySessionKey(requestedKey)).toBeNull();
+    const scope = await resolveLcmConversationScope({
+      lcm, deps, sessionKey: " " + requestedKey + " ", sessionId: "shared-runtime", params: {},
+    });
+    expect(scope).toEqual({
+      conversationId: undefined, conversationIds: undefined,
+      allConversations: false, delegated: false,
+    });
+  });
+
+  it.each(["archived", "missing"])("lcm_grep refuses foreign history for the %s key unless explicitly requested", async (kind) => {
+    if (kind === "archived") await archiveRequestedConversation();
+    const tool = createLcmGrepTool({
+      lcm, deps: deps as unknown as LcmDependencies, sessionKey: requestedKey, sessionId: "shared-runtime",
+    });
+    const params = { pattern: "collision-sentinel", scope: "messages" };
+    const result = await tool.execute("default-scope", params);
+    expect(result.details).toMatchObject({ error: expect.stringContaining("No LCM conversation found") });
+    expect(JSON.stringify(result)).not.toContain("collision-sentinel");
+    for (const override of [{ allConversations: true }, { conversationId: foreignId }]) {
+      const explicit = await tool.execute("explicit-scope", { ...params, ...override });
+      expect(explicit.details).toMatchObject({
+        totalMatches: 1, messages: [expect.objectContaining({ conversationId: foreignId })],
+      });
+    }
+  });
+
+  it("preserves an unkeyed legacy runtime fallback", async () => {
+    const legacy = await store.createConversation({ sessionId: "legacy-runtime" });
+    const scope = await resolveLcmConversationScope({
+      lcm, deps, sessionKey: requestedKey, sessionId: "legacy-runtime", params: {},
+    });
+    expect(scope).toMatchObject({
+      conversationId: legacy.conversationId, conversationIds: [legacy.conversationId],
+    });
+  });
+
+  it("preserves runtime lookup without an explicit key", async () => {
+    const scope = await resolveLcmConversationScope({
+      lcm, deps, sessionId: "shared-runtime", params: {},
+    });
+    expect(scope).toMatchObject({ conversationId: foreignId, conversationIds: [foreignId] });
   });
 });

@@ -31,7 +31,7 @@ async function lookupConversationForSession(input: {
   lcm: LcmContextEngine;
   sessionId?: string;
   sessionKey?: string;
-}): Promise<{ conversationId: number } | null> {
+}): Promise<{ conversationId: number; sessionKey?: string | null } | null> {
   const store = input.lcm.getConversationStore() as ConversationScopeStore;
 
   if (typeof store.getConversationForSession === "function") {
@@ -287,7 +287,11 @@ export async function resolveLcmConversationScope(input: {
     sessionId: normalizedSessionId,
     sessionKey: input.sessionKey,
   });
-  if (!conversation) {
+  const conversationSessionKey = conversation?.sessionKey?.trim();
+  if (
+    !conversation
+    || (normalizedSessionKey && conversationSessionKey && conversationSessionKey !== normalizedSessionKey)
+  ) {
     return {
       conversationId:
         isDelegatedSession && allowedConversationIds.length === 1
