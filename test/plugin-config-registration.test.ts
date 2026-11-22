@@ -458,9 +458,9 @@ describe("lcm plugin registration", () => {
     expect(errorLog).toHaveBeenCalledWith(expect.stringContaining("detectedHost=2026.5.1"));
   });
 
-  it("adds registered host memory supplements to context engine assembly", async () => {
+  it.each(["error", "capture-only"] as const)("adds registered host memory supplements in %s mode", async (hostFallbackMode) => {
     const dbPath = join(tmpdir(), `lossless-claw-${Date.now()}-${Math.random().toString(16)}.db`);
-    const availableTools = new Set(["memory_search"]);
+    const availableTools = new Set(["memory_search", "lcm_grep"]);
     dbPaths.add(dbPath);
     buildMemorySystemPromptAdditionMock.mockReturnValue(
       "## Compiled Wiki Snapshot\nUse the current project glossary.",
@@ -469,6 +469,7 @@ describe("lcm plugin registration", () => {
     const { api, getFactory } = buildApi({
       enabled: true,
       dbPath,
+      hostFallbackMode,
     });
     lcmPlugin.register(api);
 
@@ -485,7 +486,8 @@ describe("lcm plugin registration", () => {
         messages: unknown[];
         availableTools?: Set<string>;
         citationsMode?: string;
-      }) => Promise<{ systemPromptAddition?: string }>;
+        runtimeSettings?: { schemaVersion: 1; executionHost: { id: string; label: null } };
+      }) => Promise<{ systemPromptAddition?: string; messages: unknown[]; estimatedTokens: number }>;
     };
     expect(engine.afterTurn).toBeTypeOf("function");
     expect(engine.commitTurn).toBeTypeOf("function");
@@ -496,7 +498,10 @@ describe("lcm plugin registration", () => {
       messages: [],
       availableTools,
       citationsMode: "inline",
+      runtimeSettings: { schemaVersion: 1, executionHost: { id: "cli:claude-cli", label: null } },
     });
+    expect(result.messages).toEqual([]);
+    expect(result.estimatedTokens).toBe(0);
 
     expect(buildMemorySystemPromptAdditionMock).toHaveBeenCalledWith({
       availableTools,
