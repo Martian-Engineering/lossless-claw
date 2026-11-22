@@ -31,7 +31,7 @@ async function lookupConversationForSession(input: {
   lcm: LcmContextEngine;
   sessionId?: string;
   sessionKey?: string;
-}): Promise<{ conversationId: number } | null> {
+}): Promise<{ conversationId: number; sessionKey?: string | null } | null> {
   const store = input.lcm.getConversationStore() as ConversationScopeStore;
 
   if (typeof store.getConversationForSession === "function") {
@@ -226,8 +226,11 @@ export async function resolveLcmConversationScope(input: {
         !isDelegatedSession && normalizedInputSessionId && !sessionIdAsSessionKey
           ? await store.getConversationBySessionId(normalizedInputSessionId)
           : null;
+      const runtimeSessionKey = byRuntimeSession?.sessionKey?.trim();
       const runtimeSessionOverridesStaleKey =
         byRuntimeSession?.active === true
+        // A reused runtime ID must not override a different stable session identity.
+        && (!runtimeSessionKey || runtimeSessionKey === normalizedSessionKey)
         && byRuntimeSession.conversationId !== bySessionKey.conversationId;
       const conversation = runtimeSessionOverridesStaleKey ? byRuntimeSession : bySessionKey;
       const conversationSessionKey = conversation.sessionKey?.trim();
@@ -284,7 +287,11 @@ export async function resolveLcmConversationScope(input: {
     sessionId: normalizedSessionId,
     sessionKey: input.sessionKey,
   });
-  if (!conversation) {
+  const conversationSessionKey = conversation?.sessionKey?.trim();
+  if (
+    !conversation
+    || (normalizedSessionKey && conversationSessionKey && conversationSessionKey !== normalizedSessionKey)
+  ) {
     return {
       conversationId:
         isDelegatedSession && allowedConversationIds.length === 1
