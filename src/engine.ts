@@ -4417,6 +4417,14 @@ export class LcmContextEngine implements ContextEngine {
     runtimeContext?: Record<string, unknown>;
     runtimeSettings?: ContextEngineRuntimeSettings;
   }): Promise<AssembleResult> {
+    if (
+      this.config.hostFallbackMode === "capture-only" &&
+      params.runtimeSettings?.executionHost?.id?.startsWith("cli:")
+    ) {
+      // CLI hosts own their history; the plugin wrapper still supplies memory instructions.
+      return { messages: [], estimatedTokens: 0 };
+    }
+
     let liveMessages = params.messages;
     // Return a new fallback array so the runtime hook treats this as assembled
     // context, and strip assistant prefill tails from fallback-only paths.
