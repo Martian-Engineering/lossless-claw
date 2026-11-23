@@ -372,26 +372,29 @@ describe("blockFromPart", () => {
     expect(block).toEqual(rawObj);
   });
 
-  it("restores OpenAI reasoning blocks from OpenClaw-normalised format", () => {
-    const part = makePart({
-      partType: "reasoning",
-      metadata: JSON.stringify({
-        raw: {
-          type: "thinking",
-          thinking: "",
-          thinkingSignature: JSON.stringify({
-            type: "reasoning",
-            id: "rs_abc123",
-            encrypted_content: "...",
-          }),
-        },
-      }),
-    });
-    const block = blockFromPart(part) as Record<string, unknown>;
+  it.each([true, false])(
+    "keeps OpenAI Responses reasoning as thinking (stored model identity: %s)",
+    (hasIdentity) => {
+      const thinking = {
+        type: "thinking",
+        thinking: "",
+        thinkingSignature: JSON.stringify({
+          id: "rs_fixture",
+          type: "reasoning",
+          summary: [],
+          encrypted_content: "fixture-encrypted-content",
+        }),
+      };
+      const part = makePart({
+        partType: "reasoning",
+        metadata: JSON.stringify({ raw: thinking }),
+      });
 
-    expect(block.type).toBe("reasoning");
-    expect(block.id).toBe("rs_abc123");
-  });
+      expect(blockFromPart(part, hasIdentity)).toEqual(
+        hasIdentity ? thinking : { type: "thinking", thinking: "" },
+      );
+    },
+  );
 
   it("strips foreign thinkingSignature from DB-sourced thinking blocks", () => {
     const part = makePart({
