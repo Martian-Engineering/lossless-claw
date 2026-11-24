@@ -130,4 +130,14 @@ describe("delegated own-conversation authorization", () => {
     expect(scope).toMatchObject({ delegated: false, conversationId: parentId });
     expect(scope.conversationIds).toEqual([parentId]);
   });
+
+  it.each([0, -1])("treats conversationId %i as not provided", async (id) => {
+    const scope = await resolveLcmConversationScope({
+      lcm, deps, sessionKey: "agent:main:main", sessionId: "parent-runtime",
+      params: { conversationId: id },
+    });
+    expect(scope.error).toBeUndefined();
+    expect(scope).toMatchObject({ delegated: false, conversationId: parentId });
+    expect(scope.conversationIds).toEqual([parentId]);
+  });
 });
