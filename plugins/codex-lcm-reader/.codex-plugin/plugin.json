@@ -1,0 +1,46 @@
+{
+  "name": "codex-lcm-reader",
+  "version": "0.1.0",
+  "description": "Read-only Codex Desktop access to a local OpenClaw lossless-claw LCM database.",
+  "author": {
+    "name": "Martian Engineering",
+    "email": "support@martian.engineering",
+    "url": "https://github.com/Martian-Engineering"
+  },
+  "homepage": "https://github.com/Martian-Engineering/lossless-claw",
+  "repository": "https://github.com/Martian-Engineering/lossless-claw",
+  "license": "MIT",
+  "keywords": [
+    "codex",
+    "openclaw",
+    "lossless-claw",
+    "lcm",
+    "memory",
+    "sqlite"
+  ],
+  "skills": "./skills/",
+  "mcpServers": "./.mcp.json",
+  "interface": {
+    "displayName": "Lossless Codex",
+    "shortDescription": "Search local OpenClaw LCM memory from Codex",
+    "longDescription": "Lossless Codex gives Codex Desktop read-only tools for inspecting a local lossless-claw SQLite database. It exposes bounded recall tools for grep, describe, expand, and expand-query style evidence retrieval without mutating OpenClaw memory.",
+    "developerName": "Martian Engineering",
+    "category": "Engineering",
+    "capabilities": [
+      "Interactive",
+      "Read"
+    ],
+    "websiteURL": "https://github.com/Martian-Engineering/lossless-claw",
+    "privacyPolicyURL": "https://github.com/Martian-Engineering/lossless-claw",
+    "termsOfServiceURL": "https://github.com/Martian-Engineering/lossless-claw",
+    "defaultPrompt": [
+      "Search my local LCM memory",
+      "What did OpenClaw work on yesterday?",
+      "Find prior context for this repo"
+    ],
+    "brandColor": "#2563EB",
+    "composerIcon": "./assets/lcm-reader.svg",
+    "logo": "./assets/lcm-reader.svg",
+    "screenshots": []
+  }
+}
