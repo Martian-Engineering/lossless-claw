@@ -151,6 +151,16 @@ export function createMockConversationStore() {
       return filtered;
     }),
     getMessageById: vi.fn(async (id: number) => messages.find((m) => m.messageId === id) ?? null),
+    getMessagesWithParts: vi.fn(async (ids: number[]) => new Map(
+      messages.filter((message) => ids.includes(message.messageId)).map((message) => [
+        message.messageId,
+        {
+          message,
+          parts: messageParts.filter((part) => part.messageId === message.messageId)
+            .sort((a, b) => a.ordinal - b.ordinal),
+        },
+      ]),
+    )),
     getMessageParts: vi.fn(async (messageId: number) =>
       messageParts
         .filter((part) => part.messageId === messageId)

@@ -1050,6 +1050,17 @@ export class ConversationStore {
     return row?.count === 1;
   }
 
+  /** Provider identity is a candidate, not proof that two payloads are equal. */
+  async getMessageIdByStableEventKey(
+    conversationId: ConversationId,
+    stableEventKey: string,
+  ): Promise<MessageId | null> {
+    const row = this.db.prepare(
+      "SELECT message_id FROM messages WHERE conversation_id = ? AND stable_event_key = ? LIMIT 1",
+    ).get(conversationId, stableEventKey) as { message_id: number } | undefined;
+    return row?.message_id ?? null;
+  }
+
   /**
    * Tier-1 replay-twin gate for the append-only reconcile path: does this
    * conversation already hold a row with the same role, identity hash, and
@@ -1322,6 +1333,37 @@ export class ConversationStore {
       )
       .get(messageId) as unknown as MessageRow | undefined;
     return row ? toMessageRecord(row) : null;
+  }
+
+  /** Hydrate one assembly window without per-message statement preparation. */
+  async getMessagesWithParts(messageIds: MessageId[]): Promise<Map<MessageId, {
+    message: MessageRecord;
+    parts: MessagePartRecord[];
+  }>> {
+    const result = new Map<MessageId, { message: MessageRecord; parts: MessagePartRecord[] }>();
+    const ids = [...new Set(messageIds)];
+    // Keep bindings and temporary row materialization bounded by IDs, not bytes.
+    // Do not retain these facts across assemblies: host reconciliation may edit rows.
+    for (let offset = 0; offset < ids.length; offset += 256) {
+      const batch = ids.slice(offset, offset + 256);
+      const bindings = batch.map(() => "?").join(",");
+      const rows = this.db.prepare(
+        `SELECT message_id, conversation_id, seq, role, content, token_count, created_at, large_content, transcript_entry_id, openclaw_sender_metadata
+         FROM messages WHERE message_id IN (${bindings})`,
+      ).all(...batch) as unknown as MessageRow[];
+      for (const row of rows) {
+        result.set(row.message_id, { message: toMessageRecord(row), parts: [] });
+      }
+      const parts = this.db.prepare(
+        `SELECT part_id, message_id, session_id, part_type, ordinal, text_content,
+                tool_call_id, tool_name, tool_input, tool_output, metadata
+         FROM message_parts WHERE message_id IN (${bindings}) ORDER BY message_id, ordinal`,
+      ).all(...batch) as unknown as MessagePartRow[];
+      for (const part of parts) {
+        result.get(part.message_id)?.parts.push(toMessagePartRecord(part));
+      }
+    }
+    return result;
   }
 
   /** Return the most recent message whose `large_content` sidecar references the given file id. */

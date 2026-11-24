@@ -7,6 +7,7 @@
  * heavy LcmContextEngine scaffolding.
  */
 import { describe, expect, it, beforeEach } from "vitest";
+import type { AssistantMessage } from "@openclaw/ai/types";
 import { ContextAssembler } from "../src/assembler.js";
 import { buildMessageParts } from "../src/message-content.js";
 import {
@@ -28,6 +29,44 @@ describe("LCM integration: model identity round-trip", () => {
     sumStore = createMockSummaryStore();
     wireStores(convStore, sumStore);
     assembler = new ContextAssembler(convStore as any, sumStore as any);
+  });
+
+  it("reassembles OpenAI Responses thinking with its source route and signature intact", async () => {
+    const thinking: Extract<AssistantMessage["content"][number], { type: "thinking" }> = {
+      type: "thinking",
+      thinking: "Synthetic reasoning summary",
+      thinkingSignature: JSON.stringify({
+        type: "reasoning",
+        id: "rs_fixture",
+        summary: [{ type: "summary_text", text: "Synthetic reasoning summary" }],
+        encrypted_content: "fixture-encrypted-content",
+      }),
+    };
+    const text = { type: "text" as const, text: "Visible answer" };
+    const identity = { provider: "openai", api: "openai-responses", model: "gpt-5" };
+    await convStore.createConversation({ sessionId: "test-session" });
+    const message = await convStore.createMessage({
+      conversationId: CONV_ID,
+      seq: 1,
+      role: "assistant",
+      content: text.text,
+      tokenCount: 10,
+    });
+    await convStore.createMessageParts(
+      message.messageId,
+      buildMessageParts({
+        sessionId: "test-session",
+        message: { role: "assistant", content: [text, thinking], ...identity },
+        fallbackContent: text.text,
+      }),
+    );
+    await sumStore.appendContextMessage(CONV_ID, message.messageId);
+
+    const result = await assembler.assemble({ conversationId: CONV_ID, tokenBudget: 100_000 });
+
+    expect(result.messages).toHaveLength(1);
+    expect(result.messages[0]).toMatchObject({ role: "assistant", ...identity });
+    expect(result.messages[0]?.content).toEqual([text, thinking]);
   });
 
   it("preserves model identity and sentinel thinkingSignature through ingest→assemble", async () => {

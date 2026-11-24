@@ -12,11 +12,74 @@ import {
   createEngine,
   createEngineWithDepsOverrides,
   createEngineWithConfig,
+  createEngineWithDepsOverridesAndDb,
   makeMessage,
 } from "./helpers.js";
 
 afterEach(cleanupEngineTestState);
 describe("LcmContextEngine.assemble canonical path", () => {
+  it.each(["cli:claude-cli", "cli:codex-cli"])(
+    "skips all assembly work for capture-only host %s",
+    async (hostId) => {
+      const { engine, db } = createEngineWithDepsOverridesAndDb(
+        {},
+        { hostFallbackMode: "capture-only" },
+      );
+      const lookup = vi.spyOn(engine.getConversationStore(), "getConversationForSession");
+      const assemble = vi.spyOn(ContextAssembler.prototype, "assemble");
+      const prepare = vi.spyOn(db, "prepare");
+      const exec = vi.spyOn(db, "exec");
+      const messages = [makeMessage({ role: "user", content: "native CLI history" })];
+      try {
+        const result = await engine.assemble({
+          sessionId: "capture-only-cli",
+          messages,
+          runtimeSettings: { schemaVersion: 1, executionHost: { id: hostId, label: null } },
+        });
+
+        expect(result).toStrictEqual({ messages: [], estimatedTokens: 0 });
+        expect(messages).toHaveLength(1);
+        expect(lookup).not.toHaveBeenCalled();
+        expect(assemble).not.toHaveBeenCalled();
+        expect(prepare).not.toHaveBeenCalled();
+        expect(exec).not.toHaveBeenCalled();
+      } finally {
+        lookup.mockRestore();
+        assemble.mockRestore();
+        prepare.mockRestore();
+        exec.mockRestore();
+      }
+    },
+  );
+
+  it.each([
+    { mode: "capture-only" as const, hostId: "openclaw-embedded" },
+    { mode: "capture-only" as const, hostId: null },
+    { mode: "capture-only" as const, hostId: undefined },
+    { mode: "capture-only" as const, hostId: "custom:cli:claude-cli" },
+    { mode: "error" as const, hostId: "cli:claude-cli" },
+  ])("preserves normal assembly for $mode / $hostId", async ({ mode, hostId }) => {
+    const engine = createEngineWithConfig({ hostFallbackMode: mode });
+    const sessionId = "normal-assembly";
+    const message = makeMessage({ role: "user", content: "stored context" });
+    await engine.ingest({ sessionId, message });
+    const assemble = vi.spyOn(ContextAssembler.prototype, "assemble");
+    try {
+      const result = await engine.assemble({
+        sessionId,
+        messages: [message],
+        runtimeSettings: hostId === undefined ? undefined : {
+          schemaVersion: 1,
+          executionHost: { id: hostId, label: null },
+        },
+      });
+      expect(assemble).toHaveBeenCalled();
+      expect(result.messages).not.toHaveLength(0);
+    } finally {
+      assemble.mockRestore();
+    }
+  });
+
   it("strips assistant prefill tails when no DB conversation exists", async () => {
     const engine = createEngineWithConfig({ promptAwareEviction: false });
     const liveMessages: AgentMessage[] = [

@@ -703,6 +703,8 @@ export class LcmContextEngine implements ContextEngine {
           replayKeyStore: this.userReplayKeyStore,
           gapStore: new TranscriptGapStore(this.db),
           log: this.deps.log,
+          matchHostDeliveredAssistantId: (conversationId, message) =>
+            this.batchDeduplicator.matchHostDeliveredAssistantId(conversationId, message),
         })
       : null;
     this.telemetryRecorder = new CompactionTelemetryRecorder(
@@ -4473,6 +4475,14 @@ export class LcmContextEngine implements ContextEngine {
     params: LcmAssembleParams,
     options?: { denyDerivedContext?: boolean },
   ): Promise<AssembleResult> {
+    if (
+      this.config.hostFallbackMode === "capture-only" &&
+      params.runtimeSettings?.executionHost?.id?.startsWith("cli:")
+    ) {
+      // CLI hosts own their history; the plugin wrapper still supplies memory instructions.
+      return { messages: [], estimatedTokens: 0 };
+    }
+
     let liveMessages = params.messages;
     // Return a new fallback array so the runtime hook treats this as assembled
     // context, and strip assistant prefill tails from fallback-only paths.

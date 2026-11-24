@@ -35,7 +35,7 @@ async function lookupConversationForSession(input: {
   lcm: LcmContextEngine;
   sessionId?: string;
   sessionKey?: string;
-}): Promise<{ conversationId: number } | null> {
+}): Promise<{ conversationId: number; sessionKey?: string | null } | null> {
   const store = input.lcm.getConversationStore() as ConversationScopeStore;
 
   if (typeof store.getConversationForSession === "function") {
@@ -198,9 +198,15 @@ async function resolveUngatedConversationScope(
   const isolateCurrentSessionFamily = isIsolatedCronSessionKey(normalizedSessionKey);
   let allowedConversationIds: number[] = [];
 
-  const explicitConversationId =
+  // Conversation IDs start at 1. Strict tool schemas (e.g. OpenAI) fill every
+  // optional property, sending 0 for "not provided", so treat <= 0 as unset.
+  const requestedConversationId =
     typeof params.conversationId === "number" && Number.isFinite(params.conversationId)
       ? Math.trunc(params.conversationId)
+      : undefined;
+  const explicitConversationId =
+    requestedConversationId != null && requestedConversationId > 0
+      ? requestedConversationId
       : undefined;
 
   if (isDelegatedSession) {
@@ -313,8 +319,11 @@ async function resolveUngatedConversationScope(
         !isDelegatedSession && normalizedInputSessionId && !sessionIdAsSessionKey
           ? await store.getConversationBySessionId(normalizedInputSessionId)
           : null;
+      const runtimeSessionKey = byRuntimeSession?.sessionKey?.trim();
       const runtimeSessionOverridesStaleKey =
         byRuntimeSession?.active === true
+        // A reused runtime ID must not override a different stable session identity.
+        && (!runtimeSessionKey || runtimeSessionKey === normalizedSessionKey)
         && byRuntimeSession.conversationId !== bySessionKey.conversationId;
       const conversation = runtimeSessionOverridesStaleKey ? byRuntimeSession : bySessionKey;
       const conversationSessionKey = conversation.sessionKey?.trim();
@@ -371,7 +380,11 @@ async function resolveUngatedConversationScope(
     sessionId: normalizedSessionId,
     sessionKey: input.sessionKey,
   });
-  if (!conversation) {
+  const conversationSessionKey = conversation?.sessionKey?.trim();
+  if (
+    !conversation
+    || (normalizedSessionKey && conversationSessionKey && conversationSessionKey !== normalizedSessionKey)
+  ) {
     return {
       conversationId:
         isDelegatedSession && allowedConversationIds.length === 1

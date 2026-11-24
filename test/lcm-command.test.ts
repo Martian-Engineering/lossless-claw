@@ -2318,6 +2318,54 @@ describe("lcm command", () => {
     expect(archivedMessageCount.count).toBe(1);
   });
 
+  it("skips rollover split repair when stable event keys collide", async () => {
+    const fixture = createCommandFixture();
+    tempDirs.add(fixture.tempDir);
+    dbPaths.add(fixture.dbPath);
+
+    const sessionKey = "agent:main:test:rollover-stable-key-collision";
+    const archived = await fixture.conversationStore.createConversation({
+      sessionId: "rollover-stable-key-old",
+      sessionKey,
+    });
+    await createRolloverConversationData(fixture, {
+      conversationId: archived.conversationId,
+      label: "stable_key_old",
+      transcriptEntryId: "stable-key-entry-old",
+    });
+    await fixture.conversationStore.archiveConversation(archived.conversationId, "rollover-fallback");
+    const active = await fixture.conversationStore.createConversation({
+      sessionId: "rollover-stable-key-new",
+      sessionKey,
+    });
+    await createRolloverConversationData(fixture, {
+      conversationId: active.conversationId,
+      label: "stable_key_active",
+      transcriptEntryId: "stable-key-entry-new",
+    });
+    fixture.db
+      .prepare(`UPDATE messages SET stable_event_key = 'shared-event' WHERE conversation_id IN (?, ?)`)
+      .run(archived.conversationId, active.conversationId);
+    setConversationTimes(fixture, archived.conversationId, "2026-06-17 02:00:00", "2026-06-17 02:05:00");
+    setConversationTimes(fixture, active.conversationId, "2026-06-17 02:06:00");
+
+    const scan = await fixture.command.handler(createCommandContext("doctor rollover-splits"));
+    expect(scan.text).toContain("affected safe lanes: 0");
+    expect(scan.text).toContain("needs review: 1");
+
+    const result = await fixture.command.handler(
+      createCommandContext("doctor apply rollover-splits confirm"),
+    );
+    expect(result.text).toContain("repaired lanes: 0");
+    expect(result.text).toContain("skipped for review: 1");
+    expect(result.text).toContain("backup path: skipped (no safe rollover splits)");
+
+    const archivedMessageCount = fixture.db
+      .prepare(`SELECT COUNT(*) AS count FROM messages WHERE conversation_id = ?`)
+      .get(archived.conversationId) as { count: number };
+    expect(archivedMessageCount.count).toBe(1);
+  });
+
   it("ignores isolated cron session-key rollovers", async () => {
     const fixture = createCommandFixture();
     tempDirs.add(fixture.tempDir);
