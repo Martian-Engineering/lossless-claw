@@ -234,6 +234,7 @@ export function contentMatchKey(input: {
  * are never offered.
  */
 export class SuffixContentMatcher {
+  private readonly byId = new Map<number, ContentMatchCandidate>();
   private readonly byKey = new Map<string, ContentMatchCandidate[]>();
   private readonly pointers = new Map<string, number>();
   private lastClaimedSeq = Number.NEGATIVE_INFINITY;
@@ -247,6 +248,7 @@ export class SuffixContentMatcher {
       if (!key) {
         continue;
       }
+      this.byId.set(row.messageId, row);
       const group = this.byKey.get(key) ?? [];
       group.push(row);
       this.byKey.set(key, group);
@@ -256,6 +258,14 @@ export class SuffixContentMatcher {
   /** True when no candidate rows exist. */
   get isEmpty(): boolean {
     return this.byKey.size === 0;
+  }
+
+  /** Proven host delivery may claim only a candidate in the same ordered suffix. */
+  claimMessageId(messageId: number): ContentMatchCandidate | null {
+    const row = this.byId.get(messageId);
+    if (!row || row.seq <= this.lastClaimedSeq) return null;
+    this.lastClaimedSeq = row.seq;
+    return row;
   }
 
   /** Claim the next in-order row for a `contentMatchKey`, or null when none remains. */
