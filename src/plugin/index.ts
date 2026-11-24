@@ -660,6 +660,9 @@ function extractErrorStatusCode(value: unknown, depth = 0): number | undefined {
 /** OpenClaw's stable `runtime.llm.complete` error code for reload/retirement refusals. */
 const HOST_RUNTIME_LIFECYCLE_ERROR_CODE = "LLM_RUNTIME_LIFECYCLE";
 
+/** Reported when the host resolves a completion with `stopReason: "aborted"`. */
+const HOST_ABORTED_COMPLETION_MESSAGE = "runtime.llm.complete was aborted by the host";
+
 const HOST_RUNTIME_LIFECYCLE_MESSAGES = new Set([
   "Async work scope is closed",
   "Plugin inventory has retired; begin a new plugin operation.",
@@ -671,12 +674,24 @@ const HOST_RUNTIME_LIFECYCLE_MESSAGES = new Set([
  * publish `LLM_RUNTIME_LIFECYCLE` classify their own refusals. Older hosts throw
  * uncoded errors: model-runtime reload admission refusals carry `admissionBlocked`,
  * possibly under a wrapper's cause chain, and the exact messages cover the rest.
+ * Host cancellation surfaces as a thrown `AbortError` or (once the provider
+ * request started) as a result with `stopReason: "aborted"`.
  */
 function isHostRuntimeLifecycleRejection(error: unknown): boolean {
   if (isRecord(error) && error.code === HOST_RUNTIME_LIFECYCLE_ERROR_CODE) {
     return true;
   }
   if (HOST_RUNTIME_LIFECYCLE_MESSAGES.has(describeLogError(error))) {
+    return true;
+  }
+  // Lossless never passes its own signal to runtime.llm.complete, so a
+  // top-level AbortError comes from the host canceling the call (for example
+  // deferred maintenance yielding to a foreground turn or reaching its time
+  // budget). That is cancellation, not a provider failure: leave the work for
+  // a later pass instead of writing a truncation fallback summary. An
+  // AbortError nested as the cause of another error is not trusted: a
+  // provider client can abort its own request and report a failure.
+  if (isRecord(error) && error.name === "AbortError") {
     return true;
   }
   let current: unknown = error;
@@ -1437,6 +1452,20 @@ function createLcmDependencies(
           ...(isBoundRuntimeLlm && agentId?.trim() ? { agentId: agentId.trim() } : {}),
           ...(effectiveReasoning ? { reasoning: effectiveReasoning } : {}),
         });
+        // Hosts that report stopReason resolve a mid-request cancellation
+        // instead of throwing; classify it like the thrown AbortError.
+        if (result.stopReason === "aborted") {
+          return {
+            content: [],
+            error: { kind: "runtime_lifecycle", message: HOST_ABORTED_COMPLETION_MESSAGE },
+            provider: result.provider,
+            model: result.model,
+            agentId: result.agentId,
+            usage: result.usage,
+            audit: result.audit,
+            ...requestMetadata,
+          };
+        }
         const text = typeof result.text === "string" ? result.text : "";
         return {
           content: text ? [{ type: "text", text }] : [],
