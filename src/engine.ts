@@ -51,9 +51,11 @@ import { isSqliteBusyError } from "./db/sqlite-errors.js";
 import {
   createDelegatedExpansionGrant,
   getRuntimeExpansionAuthManager,
+  releaseDelegatedExpansionGrantBindingSuppression,
   removeDelegatedExpansionGrantForSession,
   resolveDelegatedExpansionGrantId,
   revokeDelegatedExpansionGrantForSession,
+  suppressDelegatedExpansionGrantBinding,
 } from "./expansion-auth.js";
 import { describeLogError, formatSessionLabel } from "./lcm-log.js";
 import {
@@ -5238,7 +5240,10 @@ export class LcmContextEngine implements ContextEngine {
         throw error;
       }
       // Spawning without a grant is the fail-closed direction: delegated
-      // retrieval tools refuse sub-agent sessions that have no grant.
+      // retrieval tools refuse sub-agent sessions that have no grant. Any
+      // earlier binding for this key is superseded, so stop resolving it and
+      // revoke it once the database is writable.
+      this.queueDelegatedGrantCleanup(childSessionKey, { revoke: true, removeBinding: true });
       this.deps.log.warn(
         `[lcm] prepareSubagentSpawn: spawning child=${childSessionKey} without a delegated expansion grant; database busy: ${describeLogError(error)}`,
       );
@@ -5291,6 +5296,7 @@ export class LcmContextEngine implements ContextEngine {
     cleanup: DelegatedGrantCleanup,
   ): void {
     const pending = this.pendingDelegatedGrantCleanups.get(childSessionKey);
+    suppressDelegatedExpansionGrantBinding(childSessionKey);
     this.pendingDelegatedGrantCleanups.set(childSessionKey, {
       revoke: cleanup.revoke || (pending?.revoke ?? false),
       removeBinding: cleanup.removeBinding || (pending?.removeBinding ?? false),
@@ -5300,9 +5306,11 @@ export class LcmContextEngine implements ContextEngine {
   /**
    * Apply pending delegated grant cleanups in order.
    *
-   * A busy or locked database leaves the remaining cleanups pending for the
-   * next subagent hook and logs a warning instead of throwing; grants still
-   * expire at their TTL. Other errors drop the failing cleanup and propagate.
+   * Pending keys resolve as unbound until their cleanup lands. A busy or
+   * locked database leaves the remaining cleanups pending for the next
+   * subagent hook and logs a warning instead of throwing; grants still expire
+   * at their TTL. Other errors drop the failing cleanup and propagate, keeping
+   * its key unbound.
    */
   private flushDelegatedGrantCleanups(operation: string): void {
     for (const [childSessionKey, cleanup] of Array.from(this.pendingDelegatedGrantCleanups)) {
@@ -5315,6 +5323,7 @@ export class LcmContextEngine implements ContextEngine {
           removeDelegatedExpansionGrantForSession(childSessionKey);
         }
         this.pendingDelegatedGrantCleanups.delete(childSessionKey);
+        releaseDelegatedExpansionGrantBindingSuppression(childSessionKey);
       } catch (error) {
         if (!isSqliteBusyError(error)) {
           this.pendingDelegatedGrantCleanups.delete(childSessionKey);

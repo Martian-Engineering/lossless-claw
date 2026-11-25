@@ -368,6 +368,27 @@ export class ExpansionAuthManager {
 let runtimeExpansionAuthManager = new ExpansionAuthManager();
 
 /**
+ * Child session keys whose stored binding is known to be stale because a
+ * busy database deferred its revocation, removal, or replacement. Resolution
+ * treats them as unbound, so delegated tools refuse instead of using the
+ * stale grant.
+ */
+const suppressedDelegatedBindingKeys = new Set<string>();
+
+/** Treat a child session key as unbound until its binding is rewritten or released. */
+export function suppressDelegatedExpansionGrantBinding(sessionKey: string): void {
+  const key = sessionKey.trim();
+  if (key) {
+    suppressedDelegatedBindingKeys.add(key);
+  }
+}
+
+/** Resume resolving the stored binding for a child session key. */
+export function releaseDelegatedExpansionGrantBindingSuppression(sessionKey: string): void {
+  suppressedDelegatedBindingKeys.delete(sessionKey.trim());
+}
+
+/**
  * Return the singleton auth manager used by runtime delegated expansion flows.
  */
 export function getRuntimeExpansionAuthManager(): ExpansionAuthManager {
@@ -409,6 +430,7 @@ export function createDelegatedExpansionGrant(
     ttlMs: input.ttlMs,
   });
   runtimeExpansionAuthManager.bindSession(delegatedSessionKey, grant.grantId);
+  suppressedDelegatedBindingKeys.delete(delegatedSessionKey);
   return grant;
 }
 
@@ -417,7 +439,7 @@ export function createDelegatedExpansionGrant(
  */
 export function resolveDelegatedExpansionGrantId(sessionKey: string): string | null {
   const key = sessionKey.trim();
-  if (!key) {
+  if (!key || suppressedDelegatedBindingKeys.has(key)) {
     return null;
   }
   return runtimeExpansionAuthManager.resolveSessionGrantId(key);
@@ -462,6 +484,7 @@ export function removeDelegatedExpansionGrantForSession(sessionKey: string): boo
  */
 export function resetDelegatedExpansionGrantsForTests(): void {
   runtimeExpansionAuthManager.clearSessionBindings();
+  suppressedDelegatedBindingKeys.clear();
 }
 
 // ── Authorized wrapper ───────────────────────────────────────────────────────

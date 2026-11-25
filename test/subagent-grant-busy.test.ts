@@ -64,8 +64,19 @@ async function seedParentConversation(
   });
 }
 
+/** The active grant delegated tools would see for a child session key. */
 function activeGrantFor(childSessionKey: string) {
   const grantId = resolveDelegatedExpansionGrantId(childSessionKey);
+  return grantId ? getRuntimeExpansionAuthManager().getGrant(grantId) : null;
+}
+
+/** The binding stored in the database, ignoring in-memory suppression. */
+function storedBindingFor(childSessionKey: string): string | null {
+  return getRuntimeExpansionAuthManager().resolveSessionGrantId(childSessionKey);
+}
+
+function storedActiveGrantFor(childSessionKey: string) {
+  const grantId = storedBindingFor(childSessionKey);
   return grantId ? getRuntimeExpansionAuthManager().getGrant(grantId) : null;
 }
 
@@ -117,7 +128,9 @@ describe("LcmContextEngine.onSubagentEnded under a busy database", () => {
     await expect(
       engine.onSubagentEnded({ childSessionKey: busyChild, reason: "completed" }),
     ).resolves.toBeUndefined();
-    expect(activeGrantFor(busyChild)).not.toBeNull();
+    // The stored grant is still active, but delegated tools no longer resolve it.
+    expect(storedActiveGrantFor(busyChild)).not.toBeNull();
+    expect(resolveDelegatedExpansionGrantId(busyChild)).toBeNull();
     expect(log.warn).toHaveBeenCalledWith(
       expect.stringContaining(`deferring delegated expansion grant cleanup for child=${busyChild}`),
     );
@@ -125,9 +138,12 @@ describe("LcmContextEngine.onSubagentEnded under a busy database", () => {
     await engine.onSubagentEnded({ childSessionKey: otherChild, reason: "deleted" });
 
     expect(revokeSpy).toHaveBeenCalledTimes(3);
+    expect(storedActiveGrantFor(busyChild)).toBeNull();
+    // "completed" keeps the binding, which now resolves to the revoked grant.
+    expect(resolveDelegatedExpansionGrantId(busyChild)).toBe(storedBindingFor(busyChild));
+    expect(storedBindingFor(busyChild)).not.toBeNull();
     expect(activeGrantFor(busyChild)).toBeNull();
-    expect(resolveDelegatedExpansionGrantId(busyChild)).not.toBeNull();
-    expect(resolveDelegatedExpansionGrantId(otherChild)).toBeNull();
+    expect(storedBindingFor(otherChild)).toBeNull();
   });
 
   it("merges repeated busy cleanups for one child into a single pending cleanup", async () => {
@@ -150,10 +166,12 @@ describe("LcmContextEngine.onSubagentEnded under a busy database", () => {
     await engine.onSubagentEnded({ childSessionKey: child, reason: "completed" });
     // The revocation now succeeds but the binding removal is still busy.
     await engine.onSubagentEnded({ childSessionKey: child, reason: "released" });
-    expect(activeGrantFor(child)).toBeNull();
-    expect(resolveDelegatedExpansionGrantId(child)).not.toBeNull();
+    expect(storedActiveGrantFor(child)).toBeNull();
+    expect(storedBindingFor(child)).not.toBeNull();
+    expect(resolveDelegatedExpansionGrantId(child)).toBeNull();
 
     await engine.onSubagentEnded({ childSessionKey: "agent:main:subagent:unbound", reason: "swept" });
+    expect(storedBindingFor(child)).toBeNull();
     expect(resolveDelegatedExpansionGrantId(child)).toBeNull();
   });
 
@@ -241,7 +259,8 @@ describe("LcmContextEngine.prepareSubagentSpawn under a busy database", () => {
       throw busyError;
     });
     expect(() => preparation?.rollback?.()).not.toThrow();
-    expect(activeGrantFor(child)).not.toBeNull();
+    expect(storedActiveGrantFor(child)).not.toBeNull();
+    expect(activeGrantFor(child)).toBeNull();
     expect(log.warn).toHaveBeenCalledWith(
       expect.stringContaining("prepareSubagentSpawn rollback: deferring"),
     );
@@ -250,6 +269,36 @@ describe("LcmContextEngine.prepareSubagentSpawn under a busy database", () => {
       parentSessionKey,
       childSessionKey: "agent:main:subagent:next",
     });
+    expect(storedBindingFor(child)).toBeNull();
+    expect(resolveDelegatedExpansionGrantId(child)).toBeNull();
+  });
+
+  it("does not fall back to a reused child key's earlier grant when the new grant is busy", async () => {
+    const { engine } = createEngineWithLog();
+    const child = "agent:main:subagent:reused";
+    await seedParentConversation(engine, parentSessionKey);
+    // An earlier, broader grant still bound to this key.
+    const earlier = createDelegatedExpansionGrant({
+      delegatedSessionKey: child,
+      issuerSessionId: parentSessionKey,
+      allowedConversationIds: [1, 2, 3],
+      tokenCap: 1_000_000,
+    });
+
+    const busyError = captureRealBusyError();
+    vi.spyOn(getRuntimeExpansionAuthManager(), "bindSession").mockImplementationOnce(() => {
+      throw busyError;
+    });
+
+    await expect(
+      engine.prepareSubagentSpawn({ parentSessionKey, childSessionKey: child }),
+    ).resolves.toBeUndefined();
+    expect(storedBindingFor(child)).toBe(earlier.grantId);
+    expect(resolveDelegatedExpansionGrantId(child)).toBeNull();
+
+    await engine.onSubagentEnded({ childSessionKey: "agent:main:subagent:other", reason: "swept" });
+    expect(getRuntimeExpansionAuthManager().getGrant(earlier.grantId)).toBeNull();
+    expect(storedBindingFor(child)).toBeNull();
     expect(resolveDelegatedExpansionGrantId(child)).toBeNull();
   });
 
