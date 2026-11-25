@@ -1,5 +1,9 @@
 import type { DatabaseSync } from "node:sqlite";
 import { randomUUID } from "node:crypto";
+import {
+  invalidatePendingContextPositions,
+  resequenceContextItemsInTransaction,
+} from "../db/context-ordinals.js";
 import { withDatabaseTransaction } from "../transaction-mutex.js";
 import { appendConversationScopeConstraint } from "./conversation-scope.js";
 import { sanitizeFts5Query } from "./fts5-sanitize.js";
@@ -1457,41 +1461,60 @@ export class ConversationStore {
    * Delete messages and their associated records (context_items, FTS, message_parts).
    *
    * Skips messages referenced by canonical or pending summaries to avoid
-   * breaking summary DAGs. Returns the count of actually deleted messages.
+   * breaking summary DAGs. Runs in one transaction, keeps context ordinals
+   * consecutive, and marks active compaction plans for affected conversations
+   * stale. Returns the count of actually deleted messages.
    */
   async deleteMessages(messageIds: MessageId[]): Promise<number> {
     if (messageIds.length === 0) {
       return 0;
     }
 
-    let deleted = 0;
-    for (const messageId of messageIds) {
-      // Skip if referenced by a summary (ON DELETE RESTRICT would fail anyway)
-      const refRow = this.db
-        .prepare(
-          `SELECT 1 AS found
-           WHERE EXISTS (SELECT 1 FROM summary_messages WHERE message_id = ?)
-              OR EXISTS (SELECT 1 FROM pending_summary_node_messages WHERE message_id = ?)`,
-        )
-        .get(messageId, messageId) as unknown as { found: number } | undefined;
-      if (refRow) {
-        continue;
+    return this.withTransaction(() => {
+      let deleted = 0;
+      const changedContexts = new Set<number>();
+      for (const messageId of messageIds) {
+        // Skip if referenced by a summary (ON DELETE RESTRICT would fail anyway)
+        const refRow = this.db
+          .prepare(
+            `SELECT 1 AS found
+             WHERE EXISTS (SELECT 1 FROM summary_messages WHERE message_id = ?)
+                OR EXISTS (SELECT 1 FROM pending_summary_node_messages WHERE message_id = ?)`,
+          )
+          .get(messageId, messageId) as unknown as { found: number } | undefined;
+        if (refRow) {
+          continue;
+        }
+
+        // Remove from context_items first (RESTRICT constraint)
+        const contextRows = this.db
+          .prepare(
+            `DELETE FROM context_items WHERE item_type = 'message' AND message_id = ?
+             RETURNING conversation_id`,
+          )
+          .all(messageId) as unknown as Array<{ conversation_id: number }>;
+        for (const row of contextRows) {
+          changedContexts.add(row.conversation_id);
+        }
+
+        this.deleteMessageFromFullText(messageId);
+
+        // Delete the message (message_parts cascade via ON DELETE CASCADE)
+        this.db.prepare(`DELETE FROM messages WHERE message_id = ?`).run(messageId);
+
+        deleted += 1;
       }
 
-      // Remove from context_items first (RESTRICT constraint)
-      this.db
-        .prepare(`DELETE FROM context_items WHERE item_type = 'message' AND message_id = ?`)
-        .run(messageId);
+      // Close the ordinal gaps left by removed context items so pending
+      // compaction can still cover the context, and retire plans built on the
+      // old positions.
+      for (const conversationId of changedContexts) {
+        resequenceContextItemsInTransaction(this.db, conversationId);
+        invalidatePendingContextPositions(this.db, conversationId);
+      }
 
-      this.deleteMessageFromFullText(messageId);
-
-      // Delete the message (message_parts cascade via ON DELETE CASCADE)
-      this.db.prepare(`DELETE FROM messages WHERE message_id = ?`).run(messageId);
-
-      deleted += 1;
-    }
-
-    return deleted;
+      return deleted;
+    });
   }
 
   // ── Search ────────────────────────────────────────────────────────────────

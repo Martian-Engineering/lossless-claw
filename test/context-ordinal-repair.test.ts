@@ -1,6 +1,12 @@
 import { DatabaseSync } from "node:sqlite";
 import { afterEach, describe, expect, it } from "vitest";
 import { runLcmMigrations } from "../src/db/migration.js";
+import {
+  HEARTBEAT_OK_TOKEN,
+  HEARTBEAT_TURN_MARKER,
+  OPENCLAW_HEARTBEAT_POLL,
+  pruneHeartbeatOkTurns,
+} from "../src/heartbeat-filter.js";
 import { PendingCompactionCoordinator } from "../src/pending-summary-coordinator.js";
 import { ConversationStore } from "../src/store/conversation-store.js";
 import { PendingSummaryStore } from "../src/store/pending-summary-store.js";
@@ -62,6 +68,39 @@ async function appendMessages(f: Fixture) {
     });
     await f.summaries.appendContextMessage(f.conversationId, message.messageId);
   }
+}
+
+// Append a heartbeat poll/ack cycle between ordinary context messages.
+async function appendMessagesWithHeartbeat(f: Fixture) {
+  const contents = [
+    ["user", "before heartbeat"],
+    ["assistant", "reply before heartbeat"],
+    ["user", `${OPENCLAW_HEARTBEAT_POLL} read ${HEARTBEAT_TURN_MARKER}`],
+    ["assistant", HEARTBEAT_OK_TOKEN],
+  ] as const;
+  const heartbeatIds: number[] = [];
+  for (const [i, [role, content]] of contents.entries()) {
+    const message = await f.conversations.createMessage({
+      conversationId: f.conversationId,
+      seq: i + 8,
+      role,
+      content,
+      tokenCount: 10,
+    });
+    await f.summaries.appendContextMessage(f.conversationId, message.messageId);
+    if (i >= 2) heartbeatIds.push(message.messageId);
+  }
+  for (let i = 0; i < 70; i++) {
+    const message = await f.conversations.createMessage({
+      conversationId: f.conversationId,
+      seq: i + 12,
+      role: i % 2 ? "assistant" : "user",
+      content: `new message ${i}`,
+      tokenCount: 4000,
+    });
+    await f.summaries.appendContextMessage(f.conversationId, message.messageId);
+  }
+  return heartbeatIds;
 }
 
 function coordinator(f: Fixture) {
@@ -278,6 +317,54 @@ describe("context ordinal repair", () => {
     await createPendingBatch(f, "old-plan", "ready");
     const before = mutableState(f.db);
     await f.summaries.pruneForNewSession(f.conversationId, -1);
+    expect(mutableState(f.db)).toEqual(before);
+  });
+
+  it("keeps ordinals consecutive after heartbeat pruning so compaction can publish", async () => {
+    const f = await createFixture();
+    const heartbeatIds = await appendMessagesWithHeartbeat(f);
+    await createPendingBatch(f, "old-plan", "ready");
+
+    await expect(pruneHeartbeatOkTurns(f.conversations, f.conversationId)).resolves.toBe(2);
+
+    const items = await f.summaries.getContextItems(f.conversationId);
+    expect(items.map((item) => item.ordinal)).toEqual(items.map((_, index) => index));
+    expect(items.some((item) => heartbeatIds.includes(item.messageId ?? -1))).toBe(false);
+    expect(await f.pending.getBatch("old-plan")).toMatchObject({ status: "stale" });
+    await expectPublication(f);
+  });
+
+  it("rolls back heartbeat pruning if invalidating old plans fails", async () => {
+    const f = await createFixture();
+    await appendMessagesWithHeartbeat(f);
+    await createPendingBatch(f, "old-plan", "ready");
+    const before = mutableState(f.db);
+    const originalHistory = history(f.db);
+    f.db.exec(`CREATE TRIGGER fail_invalidation BEFORE UPDATE OF status ON pending_compaction_batches
+      BEGIN SELECT RAISE(ABORT, 'invalidation fault'); END`);
+
+    await expect(pruneHeartbeatOkTurns(f.conversations, f.conversationId)).rejects.toThrow(
+      "invalidation fault",
+    );
+
+    expect(mutableState(f.db)).toEqual(before);
+    expect(history(f.db)).toEqual(originalHistory);
+  });
+
+  it("leaves pending plans unchanged when deleted messages were not in context", async () => {
+    const f = await createFixture();
+    const message = await f.conversations.createMessage({
+      conversationId: f.conversationId,
+      seq: 100,
+      role: "user",
+      content: "not in context",
+      tokenCount: 1,
+    });
+    await createPendingBatch(f, "old-plan", "ready");
+    const before = mutableState(f.db);
+
+    await expect(f.conversations.deleteMessages([message.messageId])).resolves.toBe(1);
+
     expect(mutableState(f.db)).toEqual(before);
   });
 

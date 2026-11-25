@@ -213,6 +213,71 @@ describe("heartbeat preservation through afterTurn", () => {
   });
 });
 
+describe("heartbeat pruning serialization", () => {
+  // Pruning resequences context ordinals, so it must hold the session queue
+  // that compaction also uses.
+  it.each([true, false])("prunes under the session queue (transcript target=%s)", async (withTarget) => {
+    const sessionId = `heartbeat-queue-${withTarget}`;
+    const sessionKey = `agent:main:${sessionId}`;
+    const messages = heartbeatTurnMessages().map(({ role, content }) =>
+      makeMessage({ role: role as "user" | "assistant", content }),
+    );
+    const prefix = makeMessage({ role: "user", content: "Earlier ordinary conversation" });
+    const visible = [prefix, ...messages];
+    const { engine } = createEngineWithDepsOverridesAndDb({
+      readVisibleSessionTranscriptMessageEntries: async () => visible.map((message, index) => ({
+        entryId: `queue-${index}`,
+        parentId: index === 0 ? null : `queue-${index - 1}`,
+        seq: index + 1,
+        role: message.role,
+        message,
+        createdAt: `2026-09-14T12:00:0${index}.000Z`,
+      })),
+    }, { preserveHeartbeatPoll: true, pruneHeartbeatOk: true });
+    const sessionTarget = { agentId: "main", sessionId, sessionKey, storePath: "/tmp/heartbeat-host.sqlite" };
+    const turn = {
+      sessionId,
+      sessionKey,
+      sessionFile: "",
+      messages,
+      prePromptMessageCount: 0,
+      isHeartbeat: true,
+      tokenBudget: 100_000,
+    };
+    if (!withTarget) {
+      // Store the turn first; the target-less path only prunes stored messages.
+      await engine.afterTurn({ ...turn, sessionTarget });
+    }
+
+    const store = engine.getConversationStore();
+    const queues = (engine as unknown as {
+      sessionOperationQueues: Map<string, { refCount: number }>;
+    }).sessionOperationQueues;
+    const queueHeld: boolean[] = [];
+    const deleteMessages = store.deleteMessages.bind(store);
+    store.deleteMessages = async (ids) => {
+      queueHeld.push((queues.get(sessionKey)?.refCount ?? 0) > 0);
+      return deleteMessages(ids);
+    };
+    if (withTarget) {
+      await engine.afterTurn({ ...turn, sessionTarget });
+    } else {
+      const conversation = await store.getConversationBySessionId(sessionId);
+      // Re-add an acknowledgement for the target-less afterTurn to prune.
+      await store.createMessage({
+        conversationId: conversation!.conversationId,
+        seq: 10,
+        role: "assistant",
+        content: HEARTBEAT_OK_TOKEN,
+        tokenCount: 1,
+      });
+      await engine.afterTurn(turn);
+    }
+
+    expect(queueHeld).toEqual([true]);
+  });
+});
+
 describe("heartbeat preservation through bootstrap", () => {
   it("prunes acknowledgements re-imported into an existing conversation", async () => {
     const sessionId = "heartbeat-bootstrap-reconcile";

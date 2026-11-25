@@ -3156,16 +3156,24 @@ export class LcmContextEngine implements ContextEngine {
     }
 
     try {
-      const conversation = await this.conversationStore.getConversationForSession(params);
-      if (conversation) {
-        await this.pruneHeartbeatTurnsIfNeeded(
-          conversation.conversationId,
-          params.isHeartbeat === true ||
-            importedHeartbeatAck ||
-            batchLooksLikeHeartbeatAckTurn(runtimeTurnMessages),
-          "afterTurn",
-        );
-      }
+      // Pruning resequences context ordinals, so it must not interleave with
+      // compaction for the same session.
+      await this.withSessionQueue(
+        this.resolveSessionQueueKey(params.sessionId, params.sessionKey),
+        async () => {
+          const conversation = await this.conversationStore.getConversationForSession(params);
+          if (conversation) {
+            await this.pruneHeartbeatTurnsIfNeeded(
+              conversation.conversationId,
+              params.isHeartbeat === true ||
+                importedHeartbeatAck ||
+                batchLooksLikeHeartbeatAckTurn(runtimeTurnMessages),
+              "afterTurn",
+            );
+          }
+        },
+        { operationName: "afterTurn heartbeat prune", context: params.sessionLabel },
+      );
     } catch (err) {
       this.deps.log.warn(`[lcm] afterTurn: heartbeat pruning failed: ${describeLogError(err)}`);
     }
@@ -4199,25 +4207,34 @@ export class LcmContextEngine implements ContextEngine {
       (params.isHeartbeat || batchLooksLikeHeartbeatAckTurn(newMessages))
     ) {
       try {
-        const conversation = await this.conversationStore.getConversationForSession({
-          sessionId,
-          sessionKey,
-        });
-        if (conversation) {
-          const pruned = await pruneHeartbeatOkTurns(this.conversationStore, conversation.conversationId, {
-            keepPoll: this.config.preserveHeartbeatPoll,
-          });
-          if (pruned > 0) {
-            const sessionContext = this.formatSessionLogContext({
-              conversationId: conversation.conversationId,
+        // Pruning resequences context ordinals, so it must not interleave with
+        // compaction for the same session.
+        await this.withSessionQueue(
+          this.resolveSessionQueueKey(sessionId, sessionKey),
+          async () => {
+            const conversation = await this.conversationStore.getConversationForSession({
               sessionId,
               sessionKey,
             });
-            this.deps.log.info(
-              `[lcm] afterTurn: pruned ${pruned} heartbeat ack messages for ${sessionContext}`,
-            );
-          }
-        }
+            if (!conversation) {
+              return;
+            }
+            const pruned = await pruneHeartbeatOkTurns(this.conversationStore, conversation.conversationId, {
+              keepPoll: this.config.preserveHeartbeatPoll,
+            });
+            if (pruned > 0) {
+              const sessionContext = this.formatSessionLogContext({
+                conversationId: conversation.conversationId,
+                sessionId,
+                sessionKey,
+              });
+              this.deps.log.info(
+                `[lcm] afterTurn: pruned ${pruned} heartbeat ack messages for ${sessionContext}`,
+              );
+            }
+          },
+          { operationName: "afterTurn heartbeat prune", context: sessionLabel },
+        );
       } catch (err) {
         this.deps.log.warn(
           `[lcm] afterTurn: heartbeat pruning failed: ${describeLogError(err)}`,
