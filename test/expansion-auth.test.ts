@@ -55,9 +55,9 @@ describe("ExpansionAuthManager", () => {
   // ── createGrant ──────────────────────────────────────────────────────────
 
   describe("createGrant", () => {
-    it("creates a grant with default values", () => {
+    it("creates a grant with default values", async () => {
       const before = Date.now();
-      const grant = manager.createGrant({
+      const grant = await manager.createGrant({
         issuerSessionId: "sess1",
         allowedConversationIds: [1, 2],
       });
@@ -78,8 +78,8 @@ describe("ExpansionAuthManager", () => {
       expect(expiresAtMs).toBeLessThanOrEqual(after + fiveMinMs + 50);
     });
 
-    it("creates a grant with custom values", () => {
-      const grant = manager.createGrant({
+    it("creates a grant with custom values", async () => {
+      const grant = await manager.createGrant({
         issuerSessionId: "sess2",
         allowedConversationIds: [10],
         allowedSummaryIds: ["sum_a", "sum_b"],
@@ -102,16 +102,16 @@ describe("ExpansionAuthManager", () => {
   // ── getGrant ─────────────────────────────────────────────────────────────
 
   describe("getGrant", () => {
-    it("returns a valid grant", () => {
-      const grant = manager.createGrant({
+    it("returns a valid grant", async () => {
+      const grant = await manager.createGrant({
         issuerSessionId: "sess1",
         allowedConversationIds: [1],
       });
       expect(manager.getGrant(grant.grantId)).toEqual(grant);
     });
 
-    it("returns null for expired grant", () => {
-      const grant = manager.createGrant({
+    it("returns null for expired grant", async () => {
+      const grant = await manager.createGrant({
         issuerSessionId: "sess1",
         allowedConversationIds: [1],
         ttlMs: 0,
@@ -120,8 +120,8 @@ describe("ExpansionAuthManager", () => {
       expect(manager.getGrant(grant.grantId)).toBeNull();
     });
 
-    it("returns null for a grant with negative TTL", () => {
-      const grant = manager.createGrant({
+    it("returns null for a grant with negative TTL", async () => {
+      const grant = await manager.createGrant({
         issuerSessionId: "sess1",
         allowedConversationIds: [1],
         ttlMs: -1000,
@@ -129,12 +129,12 @@ describe("ExpansionAuthManager", () => {
       expect(manager.getGrant(grant.grantId)).toBeNull();
     });
 
-    it("returns null for revoked grant", () => {
-      const grant = manager.createGrant({
+    it("returns null for revoked grant", async () => {
+      const grant = await manager.createGrant({
         issuerSessionId: "sess1",
         allowedConversationIds: [1],
       });
-      manager.revokeGrant(grant.grantId);
+      await manager.revokeGrant(grant.grantId);
       expect(manager.getGrant(grant.grantId)).toBeNull();
     });
 
@@ -146,24 +146,24 @@ describe("ExpansionAuthManager", () => {
   // ── revokeGrant ──────────────────────────────────────────────────────────
 
   describe("revokeGrant", () => {
-    it("returns true when revoking existing grant", () => {
-      const grant = manager.createGrant({
+    it("returns true when revoking existing grant", async () => {
+      const grant = await manager.createGrant({
         issuerSessionId: "sess1",
         allowedConversationIds: [1],
       });
-      expect(manager.revokeGrant(grant.grantId)).toBe(true);
+      expect(await manager.revokeGrant(grant.grantId)).toBe(true);
     });
 
-    it("returns false when revoking unknown grant", () => {
-      expect(manager.revokeGrant("grant_nope")).toBe(false);
+    it("returns false when revoking unknown grant", async () => {
+      expect(await manager.revokeGrant("grant_nope")).toBe(false);
     });
 
-    it("makes the grant inaccessible via getGrant", () => {
-      const grant = manager.createGrant({
+    it("makes the grant inaccessible via getGrant", async () => {
+      const grant = await manager.createGrant({
         issuerSessionId: "sess1",
         allowedConversationIds: [1],
       });
-      manager.revokeGrant(grant.grantId);
+      await manager.revokeGrant(grant.grantId);
       expect(manager.getGrant(grant.grantId)).toBeNull();
     });
   });
@@ -173,8 +173,8 @@ describe("ExpansionAuthManager", () => {
   describe("validateExpansion", () => {
     let grantId: string;
 
-    beforeEach(() => {
-      const grant = manager.createGrant({
+    beforeEach(async () => {
+      const grant = await manager.createGrant({
         issuerSessionId: "sess1",
         allowedConversationIds: [1],
         allowedSummaryIds: ["sum_a", "sum_b"],
@@ -216,8 +216,8 @@ describe("ExpansionAuthManager", () => {
       expect(result.reason).toContain("not found");
     });
 
-    it("rejects expired grant", () => {
-      const expiredGrant = manager.createGrant({
+    it("rejects expired grant", async () => {
+      const expiredGrant = await manager.createGrant({
         issuerSessionId: "sess1",
         allowedConversationIds: [1],
         ttlMs: 0,
@@ -232,8 +232,8 @@ describe("ExpansionAuthManager", () => {
       expect(result.reason).toContain("expired");
     });
 
-    it("rejects revoked grant", () => {
-      manager.revokeGrant(grantId);
+    it("rejects revoked grant", async () => {
+      await manager.revokeGrant(grantId);
       const result = manager.validateExpansion(grantId, {
         conversationId: 1,
         summaryIds: ["sum_a"],
@@ -278,8 +278,8 @@ describe("ExpansionAuthManager", () => {
       expect(result.reason).toContain("sum_d");
     });
 
-    it("allows any summaryIds when allowedSummaryIds is empty", () => {
-      const openGrant = manager.createGrant({
+    it("allows any summaryIds when allowedSummaryIds is empty", async () => {
+      const openGrant = await manager.createGrant({
         issuerSessionId: "sess1",
         allowedConversationIds: [1],
         allowedSummaryIds: [],
@@ -293,8 +293,8 @@ describe("ExpansionAuthManager", () => {
       expect(result.valid).toBe(true);
     });
 
-    it("allows any summaryIds when allowedSummaryIds is omitted (defaults to empty)", () => {
-      const openGrant = manager.createGrant({
+    it("allows any summaryIds when allowedSummaryIds is omitted (defaults to empty)", async () => {
+      const openGrant = await manager.createGrant({
         issuerSessionId: "sess1",
         allowedConversationIds: [1],
       });
@@ -342,19 +342,19 @@ describe("ExpansionAuthManager", () => {
   // ── cleanup ──────────────────────────────────────────────────────────────
 
   describe("cleanup", () => {
-    it("removes expired grants", () => {
-      const expired = manager.createGrant({
+    it("removes expired grants", async () => {
+      const expired = await manager.createGrant({
         issuerSessionId: "sess1",
         allowedConversationIds: [1],
         ttlMs: 0,
       });
-      const active = manager.createGrant({
+      const active = await manager.createGrant({
         issuerSessionId: "sess1",
         allowedConversationIds: [2],
         ttlMs: 300_000,
       });
 
-      const removed = manager.cleanup();
+      const removed = await manager.cleanup();
       expect(removed).toBe(1);
 
       // Active grant still retrievable
@@ -363,44 +363,44 @@ describe("ExpansionAuthManager", () => {
       // even before cleanup for expired, but after cleanup the entry is fully removed)
     });
 
-    it("removes revoked grants", () => {
-      const grant = manager.createGrant({
+    it("removes revoked grants", async () => {
+      const grant = await manager.createGrant({
         issuerSessionId: "sess1",
         allowedConversationIds: [1],
       });
-      manager.revokeGrant(grant.grantId);
+      await manager.revokeGrant(grant.grantId);
 
-      const removed = manager.cleanup();
+      const removed = await manager.cleanup();
       expect(removed).toBe(1);
     });
 
-    it("removes both expired and revoked grants in one pass", () => {
-      manager.createGrant({
+    it("removes both expired and revoked grants in one pass", async () => {
+      await manager.createGrant({
         issuerSessionId: "sess1",
         allowedConversationIds: [1],
         ttlMs: 0,
       });
-      const revoked = manager.createGrant({
+      const revoked = await manager.createGrant({
         issuerSessionId: "sess1",
         allowedConversationIds: [2],
       });
-      manager.revokeGrant(revoked.grantId);
-      manager.createGrant({
+      await manager.revokeGrant(revoked.grantId);
+      await manager.createGrant({
         issuerSessionId: "sess1",
         allowedConversationIds: [3],
         ttlMs: 300_000,
       });
 
-      const removed = manager.cleanup();
+      const removed = await manager.cleanup();
       expect(removed).toBe(2);
     });
 
-    it("returns 0 when nothing to clean", () => {
-      manager.createGrant({
+    it("returns 0 when nothing to clean", async () => {
+      await manager.createGrant({
         issuerSessionId: "sess1",
         allowedConversationIds: [1],
       });
-      expect(manager.cleanup()).toBe(0);
+      expect(await manager.cleanup()).toBe(0);
     });
   });
 });
@@ -422,7 +422,7 @@ describe("wrapWithAuth", () => {
   });
 
   it("delegates to orchestrator when grant is valid", async () => {
-    const grant = manager.createGrant({
+    const grant = await manager.createGrant({
       issuerSessionId: "sess1",
       allowedConversationIds: [1],
       allowedSummaryIds: [],
@@ -471,7 +471,7 @@ describe("wrapWithAuth", () => {
   });
 
   it("throws when grant is expired", async () => {
-    const grant = manager.createGrant({
+    const grant = await manager.createGrant({
       issuerSessionId: "sess1",
       allowedConversationIds: [1],
       ttlMs: 0,
@@ -492,11 +492,11 @@ describe("wrapWithAuth", () => {
   });
 
   it("throws when grant is revoked", async () => {
-    const grant = manager.createGrant({
+    const grant = await manager.createGrant({
       issuerSessionId: "sess1",
       allowedConversationIds: [1],
     });
-    manager.revokeGrant(grant.grantId);
+    await manager.revokeGrant(grant.grantId);
 
     const authorized = wrapWithAuth(mockOrchestrator, manager);
     const request: ExpansionRequest = {
@@ -512,7 +512,7 @@ describe("wrapWithAuth", () => {
   });
 
   it("passes through explicit tokenCap values", async () => {
-    const grant = manager.createGrant({
+    const grant = await manager.createGrant({
       issuerSessionId: "sess1",
       allowedConversationIds: [1],
       allowedSummaryIds: [],
@@ -538,7 +538,7 @@ describe("wrapWithAuth", () => {
   });
 
   it("injects remaining tokenCap when request omits it", async () => {
-    const grant = manager.createGrant({
+    const grant = await manager.createGrant({
       issuerSessionId: "sess1",
       allowedConversationIds: [1],
       allowedSummaryIds: [],
@@ -560,7 +560,7 @@ describe("wrapWithAuth", () => {
   });
 
   it("clamps requested tokenCap to remaining grant budget", async () => {
-    const grant = manager.createGrant({
+    const grant = await manager.createGrant({
       issuerSessionId: "sess1",
       allowedConversationIds: [1],
       tokenCap: 1000,
@@ -588,7 +588,7 @@ describe("wrapWithAuth", () => {
   });
 
   it("fails when grant token budget is exhausted across calls", async () => {
-    const grant = manager.createGrant({
+    const grant = await manager.createGrant({
       issuerSessionId: "sess1",
       allowedConversationIds: [1],
       tokenCap: 500,

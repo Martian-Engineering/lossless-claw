@@ -21,8 +21,8 @@ import {
   tempDirs,
 } from "./helpers.js";
 
-afterEach(() => {
-  cleanupEngineTestState();
+afterEach(async () => {
+  await cleanupEngineTestState();
 });
 
 /** Produce the error node:sqlite throws when another connection holds the write lock. */
@@ -112,13 +112,13 @@ describe("deferred delegated grant cleanups across grant stores", () => {
     return new DatabaseSync(join(dir, "lcm.db"));
   }
 
-  it("never applies or clears one database's deferred cleanup from another store", () => {
+  it("never applies or clears one database's deferred cleanup from another store", async () => {
     const child = "agent:main:subagent:cross-store";
     const storeA = openStore("a");
     const storeB = openStore("b");
     try {
       bindRuntimeExpansionGrantDatabase(storeA);
-      const grantA = createDelegatedExpansionGrant({
+      const grantA = await createDelegatedExpansionGrant({
         delegatedSessionKey: child,
         issuerSessionId: "agent:main:main",
         allowedConversationIds: [1],
@@ -127,8 +127,8 @@ describe("deferred delegated grant cleanups across grant stores", () => {
 
       // A generation bound to another database finds nothing to apply.
       bindRuntimeExpansionGrantDatabase(storeB);
-      expect(flushDeferredDelegatedExpansionGrantCleanups()).toBeNull();
-      createDelegatedExpansionGrant({
+      expect(await flushDeferredDelegatedExpansionGrantCleanups()).toBeNull();
+      await createDelegatedExpansionGrant({
         delegatedSessionKey: child,
         issuerSessionId: "agent:main:main",
         allowedConversationIds: [2],
@@ -138,7 +138,7 @@ describe("deferred delegated grant cleanups across grant stores", () => {
       // A torn-down generation falls back to a private in-memory store.
       const unbindA = bindRuntimeExpansionGrantDatabase(storeA);
       unbindA();
-      expect(flushDeferredDelegatedExpansionGrantCleanups()).toBeNull();
+      expect(await flushDeferredDelegatedExpansionGrantCleanups()).toBeNull();
 
       // A new connection to database A still sees the key as unbound.
       const reopenedA = new DatabaseSync(storeA.location()!);
@@ -147,7 +147,7 @@ describe("deferred delegated grant cleanups across grant stores", () => {
         expect(getRuntimeExpansionAuthManager().resolveSessionGrantId(child)).toBe(grantA.grantId);
         expect(resolveDelegatedExpansionGrantId(child)).toBeNull();
 
-        expect(flushDeferredDelegatedExpansionGrantCleanups()).toBeNull();
+        expect(await flushDeferredDelegatedExpansionGrantCleanups()).toBeNull();
         expect(getRuntimeExpansionAuthManager().getGrant(grantA.grantId)).toBeNull();
         expect(getRuntimeExpansionAuthManager().resolveSessionGrantId(child)).toBeNull();
       } finally {
@@ -166,12 +166,12 @@ describe("LcmContextEngine.onSubagentEnded under a busy database", () => {
     const { engine, log } = createEngineWithLog();
     const busyChild = "agent:main:subagent:busy-child";
     const otherChild = "agent:main:subagent:other-child";
-    createDelegatedExpansionGrant({
+    await createDelegatedExpansionGrant({
       delegatedSessionKey: busyChild,
       issuerSessionId: "agent:main:main",
       allowedConversationIds: [1],
     });
-    createDelegatedExpansionGrant({
+    await createDelegatedExpansionGrant({
       delegatedSessionKey: otherChild,
       issuerSessionId: "agent:main:main",
       allowedConversationIds: [1],
@@ -208,7 +208,7 @@ describe("LcmContextEngine.onSubagentEnded under a busy database", () => {
   it("merges repeated busy cleanups for one child into a single pending cleanup", async () => {
     const { engine } = createEngineWithLog();
     const child = "agent:main:subagent:merged";
-    createDelegatedExpansionGrant({
+    const grant = await createDelegatedExpansionGrant({
       delegatedSessionKey: child,
       issuerSessionId: "agent:main:main",
       allowedConversationIds: [1],
@@ -223,13 +223,15 @@ describe("LcmContextEngine.onSubagentEnded under a busy database", () => {
     });
 
     await engine.onSubagentEnded({ childSessionKey: child, reason: "completed" });
-    // The revocation now succeeds but the binding removal is still busy.
+    // The merged revoke-and-unbind runs as one transaction, so the busy binding
+    // removal rolls the revocation back and both stay pending.
     await engine.onSubagentEnded({ childSessionKey: child, reason: "released" });
-    expect(storedActiveGrantFor(child)).toBeNull();
+    expect(storedActiveGrantFor(child)).not.toBeNull();
     expect(storedBindingFor(child)).not.toBeNull();
     expect(resolveDelegatedExpansionGrantId(child)).toBeNull();
 
     await engine.onSubagentEnded({ childSessionKey: "agent:main:subagent:unbound", reason: "swept" });
+    expect(manager.getGrant(grant.grantId)).toBeNull();
     expect(storedBindingFor(child)).toBeNull();
     expect(resolveDelegatedExpansionGrantId(child)).toBeNull();
   });
@@ -237,7 +239,7 @@ describe("LcmContextEngine.onSubagentEnded under a busy database", () => {
   it("rethrows errors that are not busy or locked", async () => {
     const { engine } = createEngineWithLog();
     const child = "agent:main:subagent:broken";
-    createDelegatedExpansionGrant({
+    await createDelegatedExpansionGrant({
       delegatedSessionKey: child,
       issuerSessionId: "agent:main:main",
       allowedConversationIds: [1],
@@ -317,7 +319,7 @@ describe("LcmContextEngine.prepareSubagentSpawn under a busy database", () => {
     vi.spyOn(getRuntimeExpansionAuthManager(), "revokeGrant").mockImplementationOnce(() => {
       throw busyError;
     });
-    expect(() => preparation?.rollback?.()).not.toThrow();
+    await expect(Promise.resolve(preparation?.rollback?.())).resolves.toBeUndefined();
     expect(storedActiveGrantFor(child)).not.toBeNull();
     expect(activeGrantFor(child)).toBeNull();
     expect(log.warn).toHaveBeenCalledWith(
@@ -337,7 +339,7 @@ describe("LcmContextEngine.prepareSubagentSpawn under a busy database", () => {
     const child = "agent:main:subagent:reused";
     await seedParentConversation(engine, parentSessionKey);
     // An earlier, broader grant still bound to this key.
-    const earlier = createDelegatedExpansionGrant({
+    const earlier = await createDelegatedExpansionGrant({
       delegatedSessionKey: child,
       issuerSessionId: parentSessionKey,
       allowedConversationIds: [1, 2, 3],

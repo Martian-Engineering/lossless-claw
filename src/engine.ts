@@ -5193,7 +5193,7 @@ export class LcmContextEngine implements ContextEngine {
         ? Math.floor(params.ttlMs)
         : undefined;
 
-    this.flushDelegatedGrantCleanups("prepareSubagentSpawn");
+    await this.flushDelegatedGrantCleanups("prepareSubagentSpawn");
 
     // Inherit scope from parent grant if one exists (prevents privilege escalation)
     const parentGrantId = resolveDelegatedExpansionGrantId(parentSessionKey);
@@ -5217,7 +5217,7 @@ export class LcmContextEngine implements ContextEngine {
       : undefined;
 
     try {
-      createDelegatedExpansionGrant({
+      await createDelegatedExpansionGrant({
         delegatedSessionKey: childSessionKey,
         issuerSessionId: parentSessionKey,
         allowedConversationIds: [conversationId],
@@ -5242,9 +5242,9 @@ export class LcmContextEngine implements ContextEngine {
     }
 
     return {
-      rollback: () => {
+      rollback: async () => {
         deferDelegatedExpansionGrantCleanup(childSessionKey, { revoke: true, removeBinding: true });
-        this.flushDelegatedGrantCleanups("prepareSubagentSpawn rollback");
+        await this.flushDelegatedGrantCleanups("prepareSubagentSpawn rollback");
       },
     };
   }
@@ -5276,7 +5276,7 @@ export class LcmContextEngine implements ContextEngine {
         deferDelegatedExpansionGrantCleanup(childSessionKey, { revoke: false, removeBinding: true });
         break;
     }
-    this.flushDelegatedGrantCleanups("onSubagentEnded");
+    await this.flushDelegatedGrantCleanups("onSubagentEnded");
   }
 
   /**
@@ -5285,8 +5285,8 @@ export class LcmContextEngine implements ContextEngine {
    * the next subagent hook and logs a warning instead of throwing; the stored
    * grants still expire at their TTL.
    */
-  private flushDelegatedGrantCleanups(operation: string): void {
-    const blocked = flushDeferredDelegatedExpansionGrantCleanups();
+  private async flushDelegatedGrantCleanups(operation: string): Promise<void> {
+    const blocked = await flushDeferredDelegatedExpansionGrantCleanups();
     if (blocked) {
       this.deps.log.warn(
         `[lcm] ${operation}: deferring delegated expansion grant cleanup for child=${blocked.sessionKey} (${blocked.pending} pending); database busy: ${describeLogError(blocked.error)}`,
