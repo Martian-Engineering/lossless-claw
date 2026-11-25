@@ -7,7 +7,10 @@ import { join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { isSqliteBusyError } from "../src/db/sqlite-errors.js";
 import {
+  bindRuntimeExpansionGrantDatabase,
   createDelegatedExpansionGrant,
+  deferDelegatedExpansionGrantCleanup,
+  flushDeferredDelegatedExpansionGrantCleanups,
   getRuntimeExpansionAuthManager,
   resolveDelegatedExpansionGrantId,
 } from "../src/expansion-auth.js";
@@ -99,6 +102,62 @@ describe("isSqliteBusyError", () => {
     expect(isSqliteBusyError(new Error("disk I/O error"))).toBe(false);
     expect(isSqliteBusyError("database is locked")).toBe(false);
     expect(isSqliteBusyError(undefined)).toBe(false);
+  });
+});
+
+describe("deferred delegated grant cleanups across grant stores", () => {
+  function openStore(name: string): DatabaseSync {
+    const dir = mkdtempSync(join(tmpdir(), `lossless-claw-grant-store-${name}-`));
+    tempDirs.push(dir);
+    return new DatabaseSync(join(dir, "lcm.db"));
+  }
+
+  it("never applies or clears one database's deferred cleanup from another store", () => {
+    const child = "agent:main:subagent:cross-store";
+    const storeA = openStore("a");
+    const storeB = openStore("b");
+    try {
+      bindRuntimeExpansionGrantDatabase(storeA);
+      const grantA = createDelegatedExpansionGrant({
+        delegatedSessionKey: child,
+        issuerSessionId: "agent:main:main",
+        allowedConversationIds: [1],
+      });
+      deferDelegatedExpansionGrantCleanup(child, { revoke: true, removeBinding: true });
+
+      // A generation bound to another database finds nothing to apply.
+      bindRuntimeExpansionGrantDatabase(storeB);
+      expect(flushDeferredDelegatedExpansionGrantCleanups()).toBeNull();
+      createDelegatedExpansionGrant({
+        delegatedSessionKey: child,
+        issuerSessionId: "agent:main:main",
+        allowedConversationIds: [2],
+      });
+      expect(resolveDelegatedExpansionGrantId(child)).not.toBeNull();
+
+      // A torn-down generation falls back to a private in-memory store.
+      const unbindA = bindRuntimeExpansionGrantDatabase(storeA);
+      unbindA();
+      expect(flushDeferredDelegatedExpansionGrantCleanups()).toBeNull();
+
+      // A new connection to database A still sees the key as unbound.
+      const reopenedA = new DatabaseSync(storeA.location()!);
+      try {
+        bindRuntimeExpansionGrantDatabase(reopenedA);
+        expect(getRuntimeExpansionAuthManager().resolveSessionGrantId(child)).toBe(grantA.grantId);
+        expect(resolveDelegatedExpansionGrantId(child)).toBeNull();
+
+        expect(flushDeferredDelegatedExpansionGrantCleanups()).toBeNull();
+        expect(getRuntimeExpansionAuthManager().getGrant(grantA.grantId)).toBeNull();
+        expect(getRuntimeExpansionAuthManager().resolveSessionGrantId(child)).toBeNull();
+      } finally {
+        bindRuntimeExpansionGrantDatabase(new DatabaseSync(":memory:"));
+        reopenedA.close();
+      }
+    } finally {
+      storeA.close();
+      storeB.close();
+    }
   });
 });
 
