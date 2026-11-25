@@ -592,13 +592,28 @@ function ensureTranscriptGapTable(db: DatabaseSync): void {
   `);
 }
 
+/**
+ * Fill in identity hashes for messages that lack one.
+ *
+ * The partial index holds only rows whose hash is missing, so it is empty once
+ * every row is hashed and the lookup below costs one index probe instead of a
+ * full scan of messages. Building the index on an existing database scans the
+ * table once; later inserts without a hash enter the index and are hashed on
+ * the next run. INDEXED BY makes the query fail rather than silently fall back
+ * to a table scan if the planner ever stops using the index.
+ */
 function backfillMessageIdentityHashes(
   db: DatabaseSync,
   options?: { managesOwnTransaction?: boolean },
 ): void {
+  db.exec(
+    `CREATE INDEX IF NOT EXISTS messages_missing_identity_hash_idx
+     ON messages (message_id)
+     WHERE identity_hash IS NULL OR identity_hash = ''`,
+  );
   const selectStmt = db.prepare(
     `SELECT message_id, role, content
-     FROM messages
+     FROM messages INDEXED BY messages_missing_identity_hash_idx
      WHERE message_id > ?
        AND (identity_hash IS NULL OR identity_hash = '')
      ORDER BY message_id
