@@ -1,7 +1,7 @@
-import { mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { AgentMessage, OpenClawPluginApi } from "../src/openclaw-bridge.js";
 import lcmPlugin from "../index.js";
 import * as connectionModule from "../src/db/connection.js";
@@ -43,6 +43,30 @@ type RegisteredEngineFactory = (() => unknown) | undefined;
 type HookHandler = (event: unknown, context: unknown) => unknown;
 type RegisteredContextEngine = { id: string; factory: () => unknown };
 
+const generatedDbPaths = new Set<string>();
+const generatedDbDirs = new Set<string>();
+
+/** Create a throwaway database path so registrations never open the default state-dir database. */
+function createTempDbPath(): string {
+  const dir = mkdtempSync(join(tmpdir(), "lossless-claw-registration-db-"));
+  generatedDbDirs.add(dir);
+  const dbPath = join(dir, "lcm.db");
+  generatedDbPaths.add(dbPath);
+  return dbPath;
+}
+
+/** Give a non-empty plugin config an explicit temp dbPath unless the test already chose one. */
+function withExplicitDbPath(pluginConfig: unknown): unknown {
+  if (!pluginConfig || typeof pluginConfig !== "object" || Array.isArray(pluginConfig)) {
+    return pluginConfig;
+  }
+  const config = pluginConfig as Record<string, unknown>;
+  if (Object.keys(config).length === 0 || config.dbPath !== undefined || config.databasePath !== undefined) {
+    return pluginConfig;
+  }
+  return { ...config, dbPath: createTempDbPath() };
+}
+
 function buildApi(
   pluginConfig: unknown,
   options?: {
@@ -81,7 +105,7 @@ function buildApi(
     name: "Lossless Context Management",
     source: "/tmp/lossless-claw",
     config: {},
-    pluginConfig,
+    pluginConfig: withExplicitDbPath(pluginConfig),
     ...(options?.registrationMode ? { registrationMode: options.registrationMode } : {}),
     runtime: {
       subagent: {
@@ -214,12 +238,28 @@ function compactionAndDefaultModelConfig(params: {
 describe("lcm plugin registration", () => {
   const dbPaths = new Set<string>();
   const tempDirs = new Set<string>();
+  let defaultStateDir = "";
+
+  beforeEach(() => {
+    defaultStateDir = mkdtempSync(join(tmpdir(), "lossless-claw-registration-state-"));
+    tempDirs.add(defaultStateDir);
+    vi.stubEnv("OPENCLAW_STATE_DIR", defaultStateDir);
+    vi.stubEnv("LCM_DATABASE_PATH", undefined);
+  });
 
   afterEach(() => {
-    for (const dbPath of dbPaths) {
+    // Every registration must name its database; none may fall back to the state-dir default.
+    const defaultDbPath = join(defaultStateDir, "lcm.db");
+    const openedDefaultDb = existsSync(defaultDbPath);
+    for (const dbPath of [...dbPaths, ...generatedDbPaths, defaultDbPath]) {
       closeLcmConnection(dbPath);
     }
     dbPaths.clear();
+    generatedDbPaths.clear();
+    for (const dir of generatedDbDirs) {
+      rmSync(dir, { recursive: true, force: true });
+    }
+    generatedDbDirs.clear();
     clearAllSharedInit();
     resetStartupBannerLogsForTests();
     buildMemorySystemPromptAdditionMock.mockReset();
@@ -233,6 +273,7 @@ describe("lcm plugin registration", () => {
       rmSync(dir, { recursive: true, force: true });
     }
     tempDirs.clear();
+    expect(openedDefaultDb).toBe(false);
   });
 
   it.each(["unsupported", "canonical", "empty", "rejected"] as const)(
@@ -1113,6 +1154,7 @@ describe("lcm plugin registration", () => {
                 enabled: true,
                 config: {
                   summaryModel: "openai-codex/gpt-5.4",
+                  dbPath: createTempDbPath(),
                 },
               },
             },
@@ -1138,6 +1180,7 @@ describe("lcm plugin registration", () => {
             enabled: true,
             config: {
               summaryModel: "openai-codex/gpt-5.5",
+              dbPath: createTempDbPath(),
             },
           },
         },
