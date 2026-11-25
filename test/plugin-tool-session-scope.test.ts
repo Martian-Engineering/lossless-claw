@@ -1,3 +1,6 @@
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import type { OpenClawPluginApi } from "../src/openclaw-bridge.js";
 import { clearAllSharedInit } from "../src/plugin/shared-init.js";
@@ -35,7 +38,7 @@ vi.mock("../src/tools/lcm-expand-query-tool.js", () => ({
 
 const lcmPluginPromise = import("../index.js");
 
-function buildToolDiscoveryApi(): OpenClawPluginApi {
+function buildToolDiscoveryApi(dbPath: string): OpenClawPluginApi {
   const log = {
     info: vi.fn(),
     warn: vi.fn(),
@@ -47,7 +50,7 @@ function buildToolDiscoveryApi(): OpenClawPluginApi {
     name: "Lossless Context Management",
     source: "/tmp/lossless-claw",
     registrationMode: "tool-discovery",
-    pluginConfig: { enabled: true },
+    pluginConfig: { enabled: true, dbPath },
     config: {},
     runtime: {
       llm: {
@@ -81,14 +84,22 @@ function buildToolDiscoveryApi(): OpenClawPluginApi {
 }
 
 describe("plugin recall tool session scope", () => {
+  const tempDirs: string[] = [];
+
   afterEach(() => {
     clearAllSharedInit();
     vi.clearAllMocks();
+    for (const dir of tempDirs.splice(0)) {
+      rmSync(dir, { recursive: true, force: true });
+    }
   });
 
-  it("passes both runtime session id and stable session key to recall tools", async () => {
+  // The plugin import resolves inside this test, so its time counts against the test timeout.
+  it("passes both runtime session id and stable session key to recall tools", { timeout: 20000 }, async () => {
     const lcmPlugin = (await lcmPluginPromise).default;
-    const api = buildToolDiscoveryApi();
+    const dir = mkdtempSync(join(tmpdir(), "lossless-claw-tool-scope-"));
+    tempDirs.push(dir);
+    const api = buildToolDiscoveryApi(join(dir, "lcm.db"));
 
     lcmPlugin.register(api);
 
