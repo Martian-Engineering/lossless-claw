@@ -182,3 +182,130 @@ it("observes no replay identity for keyless entries", () => {
   const entry: Pick<VisibleSessionTranscriptMessageEntry, "message"> = { message: { role: "user", content: "x" } as AgentMessage };
   expect(observeUserReplayIdentity(entry.message)).toEqual({ idempotencyKey: "", signature: "" });
 });
+
+it("replays canonical users and carriers after the host hydration window advances", async () => {
+  const sessionId = "bounded-host-replay";
+  const sessionKey = "agent:main:bounded-host-replay";
+  const users = Array.from({ length: 4 }, (_, index) => attachTranscriptEntryMeta({
+    role: "user", content: `request ${index}`, timestamp: 1_800_000_000_123 + index,
+    idempotencyKey: `turn-${index}`,
+    provenance: { kind: "inter_session", sourceSessionKey: "agent:main:child", sourceTool: "subagent_settle" },
+    __openclaw: { modelPromptProjection: { version: 1, text: `recorded request ${index}` } },
+  } as AgentMessage, { entryId: `bounded-${index}`, parentId: null, timestamp: null }));
+  const carriers = users.map((_, index) => runtimeCarrier(index));
+  const readSessionTranscriptReplayGroups = vi.fn(async ({ entryIds }: { entryIds: string[] }) =>
+    users.flatMap((message, index) => entryIds.includes(`bounded-${index}`)
+      ? [{ entryId: `bounded-${index}`, message, carriers: [carriers[index]!] }] : []));
+  const engine = createEngineWithDepsOverrides({ readSessionTranscriptReplayGroups });
+  for (const message of users.slice(0, 3)) await seedStoredMessage(engine, { sessionId, sessionKey, message });
+  const conversation = await engine.getConversationStore().getConversationForSession({ sessionId, sessionKey });
+  await engine.getSummaryStore().insertSummary({
+    summaryId: "bounded-summary", conversationId: conversation!.conversationId,
+    kind: "leaf", depth: 0, content: "Earlier history", tokenCount: 4,
+  });
+  await engine.getSummaryStore().replaceContextRangeWithSummary({
+    conversationId: conversation!.conversationId, startOrdinal: 0, endOrdinal: 0, summaryId: "bounded-summary",
+  });
+  const assemble = (messages: AgentMessage[]) => engine.assemble({
+    sessionId, sessionKey, messages, tokenBudget: 100_000, availableTools: new Set(), prompt: "next",
+  });
+  const before = await assemble([users[1]!, carriers[1]!, users[2]!, carriers[2]!]);
+  await seedStoredMessage(engine, { sessionId, sessionKey, message: users[3]! });
+  const after = await assemble([users[3]!, carriers[3]!]);
+  expect(after.messages.slice(0, before.messages.length)).toEqual(before.messages);
+  expect(after.messages.filter(message => message.role === "custom")).toEqual(carriers.slice(1));
+  expect(after.messages.find(message => Reflect.get(message, "idempotencyKey") === "turn-1"))
+    .toMatchObject({ timestamp: users[1]!.timestamp, provenance: Reflect.get(users[1]!, "provenance"),
+      __openclaw: Reflect.get(users[1]!, "__openclaw") });
+  expect(readSessionTranscriptReplayGroups.mock.calls.at(-1)?.[0].entryIds)
+    .toEqual(["bounded-1", "bounded-2", "bounded-3"]);
+});
+
+it("does not restore canonical carriers onto changed or unanchored content", () => {
+  const source = { role: "user", content: "original", timestamp: 123 } as AgentMessage;
+  const anchored = attachTranscriptEntryMeta({ ...source }, { entryId: "entry", parentId: null, timestamp: null });
+  const carrier = runtimeCarrier(0);
+  const sources = new Map([["entry", { message: source, carriers: [carrier] }]]);
+  for (const message of [source, { ...anchored, content: "externalized" } as AgentMessage]) {
+    expect(restoreRawUserReplay([message], [], new Map(), sources).messages).toEqual([message]);
+  }
+  const replay = restoreRawUserReplay([anchored], [], new Map(), sources);
+  expect(replay.messages).toEqual([anchored, carrier]);
+  expect(replay.carrierParents.get(carrier)).toBe(replay.messages[0]);
+});
+
+it("logs canonical-reader rejection and returns the intentional bounded live fallback", async () => {
+  const sessionId = "canonical-reader-rejection";
+  const sessionKey = `agent:main:${sessionId}`;
+  const failure = new RangeError("Session transcript replay exceeds maxBytes (8388608)");
+  const readSessionTranscriptReplayGroups = vi.fn(async () => { throw failure; });
+  const log = { debug: vi.fn(), info: vi.fn(), warn: vi.fn(), error: vi.fn() };
+  const engine = createEngineWithDepsOverrides({ readSessionTranscriptReplayGroups, log });
+  const stored = attachTranscriptEntryMeta({ role: "user", content: "retained canonical history" } as AgentMessage,
+    { entryId: "retained-entry", parentId: null, timestamp: null });
+  await seedStoredMessage(engine, { sessionId, sessionKey, message: stored });
+  const latest = { role: "user", content: "latest live request" } as AgentMessage;
+  const result = await engine.assemble({
+    sessionId, sessionKey,
+    messages: [{ role: "user", content: "older live context ".repeat(1000) } as AgentMessage, latest],
+    tokenBudget: 256, availableTools: new Set(), prompt: "next",
+  });
+  expect(readSessionTranscriptReplayGroups).toHaveBeenCalledWith(expect.objectContaining({
+    entryIds: ["retained-entry"],
+  }));
+  // This is explicit degraded coverage, not a guarantee that canonical history survived.
+  expect(result.messages).toEqual([latest]);
+  expect(result.contextProjection).toBeUndefined();
+  expect(result.estimatedTokens).toBe(estimateSerializedMessagesTokens([latest]));
+  expect(result.estimatedTokens).toBeLessThanOrEqual(256);
+  expect(log.debug).toHaveBeenCalledWith(expect.stringContaining(
+    "assemble: failed for session=canonical-reader-rejection",
+  ));
+  expect(log.debug).toHaveBeenCalledWith(expect.stringContaining(failure.message));
+  expect(log.warn).toHaveBeenCalledWith(expect.stringContaining("reason=assemble-error"));
+});
+
+it.each([false, true])("evicts canonical carriers with their parent under a tight serialized budget (recorded projection: %s)", async (withProjection) => {
+  const sessionId = "canonical-carrier-budget";
+  const sessionKey = `agent:main:${sessionId}`;
+  const users = Array.from({ length: 3 }, (_, index) => attachTranscriptEntryMeta({
+    role: "user", content: `request ${index}`, timestamp: 1_800_000_000_000 + index,
+    idempotencyKey: `budget-turn-${index}`,
+    ...(withProjection && index === 1 ? {
+      __openclaw: { modelPromptProjection: { version: 1, text: "recorded input ".repeat(2000) } },
+    } : {}),
+  } as AgentMessage, { entryId: `budget-entry-${index}`, parentId: null, timestamp: null }));
+  const carriers = users.map((_, index) => runtimeCarrier(index));
+  const readSessionTranscriptReplayGroups = vi.fn(async ({ entryIds }: { entryIds: string[] }) =>
+    users.flatMap((message, index) => entryIds.includes(`budget-entry-${index}`)
+      ? [{ entryId: `budget-entry-${index}`, message, carriers: [carriers[index]!] }] : []));
+  const engine = createEngineWithDepsOverrides({ readSessionTranscriptReplayGroups });
+  for (const message of users) await seedStoredMessage(engine, { sessionId, sessionKey, message });
+  const conversation = await engine.getConversationStore().getConversationForSession({ sessionId, sessionKey });
+  await engine.getSummaryStore().insertSummary({
+    summaryId: "budget-summary", conversationId: conversation!.conversationId,
+    kind: "leaf", depth: 0, content: "Earlier history", tokenCount: 4,
+  });
+  await engine.getSummaryStore().replaceContextRangeWithSummary({
+    conversationId: conversation!.conversationId, startOrdinal: 0, endOrdinal: 0, summaryId: "budget-summary",
+  });
+  const assemble = (tokenBudget: number) => engine.assemble({
+    sessionId, sessionKey, messages: [users[2]!], tokenBudget,
+    availableTools: new Set(), prompt: "next",
+  });
+  const full = await assemble(100_000);
+  expect(full.messages.filter(message => message.role === "custom")).toEqual(carriers.slice(1));
+  // The suffix fits its first carrier, but not that carrier's parent user.
+  const suffix = full.messages.slice(full.messages.indexOf(carriers[1]!));
+  const tokenBudget = withProjection ? 512 : Math.ceil(estimateSerializedMessagesTokens(suffix) / 0.9);
+  const bounded = await assemble(tokenBudget);
+  expect(readSessionTranscriptReplayGroups.mock.calls.at(-1)?.[0].entryIds)
+    .toEqual(["budget-entry-1", "budget-entry-2"]);
+  expect(bounded.messages).not.toContain(carriers[1]);
+  expect(bounded.messages.some(message => Reflect.get(message, "idempotencyKey") === "budget-turn-1")).toBe(false);
+  expect(bounded.messages.filter(message => message.role === "custom")).toEqual([carriers[2]]);
+  const carrierIndex = bounded.messages.indexOf(carriers[2]!);
+  expect(bounded.messages[carrierIndex - 1]).toMatchObject({ idempotencyKey: "budget-turn-2" });
+  expect(bounded.estimatedTokens).toBe(estimateSerializedMessagesTokens(bounded.messages));
+  expect(bounded.estimatedTokens).toBeLessThanOrEqual(tokenBudget);
+});

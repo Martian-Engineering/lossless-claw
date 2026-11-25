@@ -246,8 +246,8 @@ describe("FTS fallback", () => {
       .spyOn(conversationStore as unknown as { searchFullText: (...args: unknown[]) => unknown[] }, "searchFullText")
       .mockReturnValue(messageLikeResult);
     const messageLikeSpy = vi
-      .spyOn(conversationStore as unknown as { searchLike: (...args: unknown[]) => unknown[] }, "searchLike")
-      .mockReturnValue(messageLikeResult);
+      .spyOn(conversationStore as unknown as { searchLike: (...args: unknown[]) => unknown }, "searchLike")
+      .mockReturnValue({ results: messageLikeResult, scanLimited: false });
     const summaryFtsSpy = vi
       .spyOn(summaryStore as unknown as { searchFullText: (...args: unknown[]) => unknown[] }, "searchFullText")
       .mockReturnValue(summaryLikeResult);

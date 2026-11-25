@@ -145,8 +145,8 @@ function buildLcmEngine(params: {
 }
 
 describe("LCM tools session scoping", () => {
-  beforeEach(() => {
-    resetDelegatedExpansionGrantsForTests();
+  beforeEach(async () => {
+    await resetDelegatedExpansionGrantsForTests();
   });
 
   it("lcm_grep metadata explains focused FTS5 query construction", () => {
@@ -197,6 +197,34 @@ describe("LCM tools session scoping", () => {
       "full_text mode does not support regex syntax",
     );
     expect((result.details as { error?: string }).error).toContain('mode: "regex"');
+  });
+
+  it("lcm_grep reports a missing pattern instead of throwing", async () => {
+    const retrieval = {
+      grep: vi.fn(async () => ({
+        messages: [],
+        summaries: [],
+        totalMatches: 0,
+      })),
+      expand: vi.fn(),
+      describe: vi.fn(),
+    };
+
+    const tool = createLcmGrepTool({
+      deps: makeDeps(),
+      lcm: buildLcmEngine({ retrieval, conversationId: 42 }) as never,
+      sessionId: "session-1",
+    });
+    // Hosts forward model-supplied arguments unvalidated, so the omitted
+    // required parameter has to surface as a tool error, not a TypeError.
+    const result = await tool.execute("call-missing-pattern", {
+      mode: "full_text",
+      allConversations: true,
+      sort: "recency",
+    });
+
+    expect(retrieval.grep).not.toHaveBeenCalled();
+    expect((result.details as { error?: string }).error).toContain("Missing required `pattern`");
   });
 
   it("lcm_grep still forwards regex alternation in regex mode", async () => {
@@ -312,7 +340,7 @@ describe("LCM tools session scoping", () => {
       describe: vi.fn(),
     };
 
-    createDelegatedExpansionGrant({
+    await createDelegatedExpansionGrant({
       delegatedSessionKey: "agent:main:subagent:session-1",
       issuerSessionId: "main",
       allowedConversationIds: [42],
@@ -556,7 +584,7 @@ describe("LCM tools session scoping", () => {
     );
   });
 
-  it("lcm_grep prefers the active runtime session when the tool sessionKey is stale", async () => {
+  it("lcm_grep prefers the active runtime generation for the same sessionKey", async () => {
     const retrieval = {
       grep: vi.fn(async (input: { conversationIds?: number[] }) => {
         const found = input.conversationIds?.includes(1987) === true;
@@ -585,6 +613,7 @@ describe("LCM tools session scoping", () => {
       lcm: buildLcmEngine({
         retrieval,
         conversationId: 1987,
+        conversationSessionKey: "agent:main:telegram:default:direct:stale-chat",
         conversationIdBySessionKey: 1884,
         conversationFamilyIdsByRoot: {
           1884: [1884],
@@ -610,7 +639,7 @@ describe("LCM tools session scoping", () => {
     );
     expect(deps.log.warn).toHaveBeenCalledWith(
       expect.stringContaining(
-        "alternativeConversation=1987 alternativeSessionKey=agent:main:main alternativeActive=true",
+        "alternativeConversation=1987 alternativeSessionKey=agent:main:telegram:default:direct:stale-chat alternativeActive=true",
       ),
     );
   });
@@ -935,7 +964,7 @@ describe("LCM tools session scoping", () => {
       describe: vi.fn(),
     };
 
-    createDelegatedExpansionGrant({
+    await createDelegatedExpansionGrant({
       delegatedSessionKey: "agent:main:subagent:session-1",
       issuerSessionId: "main",
       allowedConversationIds: [42],
@@ -984,7 +1013,7 @@ describe("LCM tools session scoping", () => {
       })),
     };
 
-    createDelegatedExpansionGrant({
+    await createDelegatedExpansionGrant({
       delegatedSessionKey,
       issuerSessionId: "main",
       allowedConversationIds: [42],
@@ -1025,7 +1054,7 @@ describe("LCM tools session scoping", () => {
       describe: vi.fn(),
     };
 
-    createDelegatedExpansionGrant({
+    await createDelegatedExpansionGrant({
       delegatedSessionKey: "agent:main:subagent:session-1",
       issuerSessionId: "main",
       allowedConversationIds: [42],
@@ -1153,7 +1182,7 @@ describe("LCM tools session scoping", () => {
       })),
     };
 
-    createDelegatedExpansionGrant({
+    await createDelegatedExpansionGrant({
       delegatedSessionKey: "agent:main:subagent:session-1",
       issuerSessionId: "main",
       allowedConversationIds: [42],

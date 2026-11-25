@@ -3,7 +3,7 @@
  *
  * Extracted from engine.ts (Phase 1 of the engine decomposition).
  */
-import { estimateSerializedMessagesTokens, estimateTokens } from "./estimate-tokens.js";
+import { estimateSerializedMessagesTokens, estimateTokens, stripOpaqueBlockSignatures } from "./estimate-tokens.js";
 import { isTextBlock } from "./message-content.js";
 import type { AgentMessage } from "./openclaw-bridge.js";
 import { asRecord } from "./value-utils.js";
@@ -45,7 +45,7 @@ export function estimateContentTokensForRole(params: {
       return estimateTokens(content[0].text);
     }
 
-    const serialized = JSON.stringify(content);
+    const serialized = JSON.stringify(stripOpaqueBlockSignatures(content));
     return estimateTokens(typeof serialized === "string" ? serialized : "");
   }
 
@@ -54,7 +54,7 @@ export function estimateContentTokensForRole(params: {
       return estimateTokens(content.text);
     }
 
-    const serialized = JSON.stringify([content]);
+    const serialized = JSON.stringify([stripOpaqueBlockSignatures(content)]);
     return estimateTokens(typeof serialized === "string" ? serialized : "");
   }
 

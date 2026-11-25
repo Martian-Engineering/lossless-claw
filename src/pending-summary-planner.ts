@@ -1,3 +1,4 @@
+import { normalizeFreshTailMinMessages } from "./fresh-tail.js";
 import type { SummaryKind } from "./store/summary-store.js";
 import type { MessageRole } from "./store/conversation-store.js";
 
@@ -33,6 +34,8 @@ export type PlanPendingLeafNodesInput = {
   items: PendingSummaryPlannerSnapshotItem[];
   freshTailCount: number;
   freshTailMaxTokens?: number;
+  /** Newest messages protected before `freshTailMaxTokens` applies. */
+  freshTailMinMessages?: number;
   leafChunkTokens: number;
   nodeIdPrefix: string;
 };
@@ -105,6 +108,7 @@ export function resolvePendingFreshTailOrdinal(input: {
   items: PendingSummaryPlannerSnapshotItem[];
   freshTailCount: number;
   freshTailMaxTokens?: number;
+  freshTailMinMessages?: number;
 }): number {
   const freshTailCount = normalizeNonNegativeInteger(input.freshTailCount);
   if (freshTailCount <= 0) {
@@ -115,6 +119,7 @@ export function resolvePendingFreshTailOrdinal(input: {
     typeof input.freshTailMaxTokens === "number" && Number.isFinite(input.freshTailMaxTokens)
       ? Math.max(0, Math.floor(input.freshTailMaxTokens))
       : undefined;
+  const freshTailMinMessages = normalizeFreshTailMinMessages(input.freshTailMinMessages);
   const messageItems = sortItemsByOrdinal(input.items).filter((item) => item.itemType === "message");
   const latestUserOrdinal = [...messageItems]
     .reverse()
@@ -138,7 +143,7 @@ export function resolvePendingFreshTailOrdinal(input: {
     const tokenCount = normalizeNonNegativeInteger(item.tokenCount);
     const exceedsTokenCap =
       latestUserProtected &&
-      protectedCount > 0 &&
+      protectedCount >= freshTailMinMessages &&
       typeof freshTailMaxTokens === "number" &&
       protectedTokens + tokenCount > freshTailMaxTokens;
     if (exceedsTokenCap) {

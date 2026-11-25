@@ -40,7 +40,7 @@ export async function buildPendingProjectionSnapshot(
   conversationId: number,
   conversationStore: ConversationStore,
   summaryStore: SummaryStore,
-  config: { freshTailCount: number; freshTailMaxTokens?: number },
+  config: { freshTailCount: number; freshTailMaxTokens?: number; freshTailMinMessages?: number },
 ): Promise<ProjectionSnapshot> {
   const contextItems = await summaryStore.getContextItems(conversationId);
   const summaryById = new Map<string, SummaryRecord>();
@@ -101,6 +101,7 @@ export async function buildPendingProjectionSnapshot(
     items,
     freshTailCount: config.freshTailCount,
     freshTailMaxTokens: config.freshTailMaxTokens,
+    freshTailMinMessages: config.freshTailMinMessages,
   });
   const compactableItems = items.filter((item) => item.ordinal < freshTailOrdinal);
   const compactableStartOrdinal =

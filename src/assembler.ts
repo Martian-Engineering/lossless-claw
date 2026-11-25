@@ -4,11 +4,13 @@ import { sanitizeToolUseResultPairing } from "./transcript-repair.js";
 import type {
   ConversationStore,
   MessagePartRecord,
+  MessageRecord,
   MessageRole,
 } from "./store/conversation-store.js";
 import type { FocusBriefRecord, FocusBriefStore } from "./store/focus-brief-store.js";
 import type { SummaryStore, ContextItemRecord, SummaryRecord } from "./store/summary-store.js";
-import { estimateTokens } from "./estimate-tokens.js";
+import { estimateTokens, stripOpaqueBlockSignatures } from "./estimate-tokens.js";
+import { resolveFreshTailTokenCap } from "./fresh-tail.js";
 import { formatToolOutputReference } from "./large-files.js";
 import { serializeOpenClawSenderMetadata } from "./openclaw-sender-metadata.js";
 import { attachTranscriptEntryMeta } from "./transcript.js";
@@ -219,7 +221,7 @@ export interface AssembleContextInput {
   tokenBudget: number;
   /** Number of most recent raw turns to always include (default: 8) */
   freshTailCount?: number;
-  /** Optional token cap for the protected fresh tail; newest message is always preserved. */
+  /** Optional token cap for the protected fresh tail; unset caps it at 25% of `tokenBudget` (at least 8 messages). */
   freshTailMaxTokens?: number;
   /** Optional user query for relevance-based eviction scoring (BM25-lite). When absent or unsearchable, falls back to chronological eviction. */
   prompt?: string;
@@ -357,6 +359,27 @@ function pickModelIdentity(parts: MessagePartRecord[]): StoredModelIdentity | un
   return undefined;
 }
 
+/**
+ * Read the host input provenance persisted by buildMessageParts, returned as
+ * the message fields OpenClaw reads (`provenance`, `display`).
+ */
+function pickInputProvenance(
+  parts: MessagePartRecord[],
+): { provenance?: Record<string, unknown>; display?: false } {
+  const decoded = parseJson(parts[0]?.metadata ?? null);
+  if (!decoded || typeof decoded !== "object") {
+    return {};
+  }
+  const record = decoded as { messageProvenance?: unknown; messageDisplay?: unknown };
+  const provenance = record.messageProvenance;
+  return {
+    ...(provenance && typeof provenance === "object" && !Array.isArray(provenance)
+      ? { provenance: provenance as Record<string, unknown> }
+      : {}),
+    ...(record.messageDisplay === false ? { display: false as const } : {}),
+  };
+}
+
 /** True when the part's message-level metadata carries a stored model identity. */
 function hasStoredModelIdentity(part: MessagePartRecord): boolean {
   return pickModelIdentity([part]) !== undefined;
@@ -426,27 +449,6 @@ function reasoningBlockFromPart(part: MessagePartRecord, rawType?: string): unkn
       : { type, text: part.textContent };
   }
   return { type };
-}
-
-/**
- * Detect if a raw block is an OpenClaw-normalised OpenAI reasoning item.
- * OpenClaw converts OpenAI `{type:"reasoning", id:"rs_…", encrypted_content:"…"}`
- * into `{type:"thinking", thinking:"", thinkingSignature:"{…}"}`.
- * When we reassemble for the OpenAI provider we need the original back.
- */
-function tryRestoreOpenAIReasoning(raw: Record<string, unknown>): Record<string, unknown> | null {
-  if (raw.type !== "thinking") return null;
-  const sig = raw.thinkingSignature;
-  if (typeof sig !== "string" || !sig.startsWith("{")) return null;
-  try {
-    const parsed = JSON.parse(sig) as Record<string, unknown>;
-    if (parsed.type === "reasoning" && typeof parsed.id === "string") {
-      return parsed;
-    }
-  } catch {
-    // not valid JSON — leave as-is
-  }
-  return null;
 }
 
 /** @internal Exported for testing only. */
@@ -608,11 +610,6 @@ export function blockFromPart(
   const hasModelIdentity = messageHasStoredModelIdentity ?? hasStoredModelIdentity(part);
   const metadata = getPartMetadata(part);
   if (metadata.raw && typeof metadata.raw === "object") {
-    // If this is an OpenClaw-normalised OpenAI reasoning block, restore the original
-    // OpenAI format so the Responses API gets the {type:"reasoning", id:"rs_…"} it expects.
-    const restored = tryRestoreOpenAIReasoning(metadata.raw as Record<string, unknown>);
-    if (restored) return restored;
-
     // Don't return raw for tool call/result blocks — they need to go through
     // toolCallBlockFromPart/toolResultBlockFromPart which properly normalize
     // arguments (stringify if object) and format for the target provider.
@@ -1156,6 +1153,22 @@ function formatDateForAttribute(date: Date, timezone?: string): string {
 }
 
 /**
+ * Epoch milliseconds of the first valid stored time, or 0 when none is valid.
+ * Assembled messages carry stored times only, never the wall clock: the host
+ * may render a user message's timestamp into model-visible text, so it must
+ * stay identical across turns.
+ */
+export function storedTimeMs(...times: Array<Date | null | undefined>): number {
+  for (const time of times) {
+    const ms = time?.getTime();
+    if (ms !== undefined && Number.isFinite(ms)) {
+      return ms;
+    }
+  }
+  return 0;
+}
+
+/**
  * Format a summary record into the XML payload string the model sees.
  */
 async function formatSummaryContent(
@@ -1378,6 +1391,7 @@ function resolveFreshTailOrdinal(
   resolved: ResolvedItem[],
   freshTailCount: number,
   freshTailMaxTokens?: number,
+  freshTailMinMessages = 1,
 ): number {
   if (!Number.isFinite(freshTailCount) || freshTailCount <= 0) {
     return Infinity;
@@ -1414,7 +1428,7 @@ function resolveFreshTailOrdinal(
 
     const wouldExceedBudget =
       latestUserProtected &&
-      protectedCount > 0 &&
+      protectedCount >= freshTailMinMessages &&
       typeof tokenCap === "number" &&
       protectedTokens + item.tokens > tokenCap;
     if (wouldExceedBudget) {
@@ -1532,10 +1546,12 @@ export class ContextAssembler {
     }
 
     // Step 3: Split into evictable prefix and protected fresh tail
+    const freshTailCap = resolveFreshTailTokenCap(input.freshTailMaxTokens, tokenBudget);
     const freshTailOrdinal = resolveFreshTailOrdinal(
       resolved,
       freshTailCount,
-      input.freshTailMaxTokens,
+      freshTailCap.maxTokens,
+      freshTailCap.minMessages,
     );
     const orphanStrippingOrdinal = freshTailOrdinal;
     const allToolResultOrdinalsById = new Map<string, number[]>();
@@ -1795,7 +1811,11 @@ export class ContextAssembler {
     const content = formatFocusBriefContent(brief, this.timezone);
     const focusItem: ResolvedItem = {
       ordinal: firstCoveredOrdinal,
-      message: { role: "user" as const, content } as AgentMessage,
+      message: {
+        role: "user" as const,
+        content,
+        timestamp: storedTimeMs(brief.coveredLatestAt, brief.createdAt),
+      } as AgentMessage,
       tokens: estimateTokens(content),
       isMessage: false,
       isFocusBrief: true,
@@ -1827,12 +1847,32 @@ export class ContextAssembler {
    */
   private async resolveItems(contextItems: ContextItemRecord[]): Promise<ResolvedItem[]> {
     const resolved: ResolvedItem[] = [];
-
-    for (const item of contextItems) {
-      const result = await this.resolveItem(item);
-      if (result) {
-        resolved.push(result);
+    for (let offset = 0; offset < contextItems.length;) {
+      const item = contextItems[offset]!;
+      if (item.itemType !== "message" || item.messageId == null) {
+        if (item.itemType === "summary" && item.summaryId != null) {
+          const summary = await this.resolveSummaryItem(item);
+          if (summary) resolved.push(summary);
+        }
+        offset++;
+        continue;
       }
+      // Do not prefetch across summaries or retain source rows across invocations.
+      // The caller's order, not IN-query order, owns duplicate context occurrences.
+      let end = offset;
+      while (end < contextItems.length && end - offset < 256 &&
+             contextItems[end]!.itemType === "message" && contextItems[end]!.messageId != null) end++;
+      const batch = contextItems.slice(offset, end);
+      const sources = await this.conversationStore.getMessagesWithParts(batch.map((entry) => entry.messageId!));
+      for (const entry of batch) {
+        const source = sources.get(entry.messageId!);
+        if (!source) continue;
+        // Legacy block reconstruction backfills part fields in place. Each context
+        // occurrence must get fresh records, as it did with individual SQL reads.
+        const result = await this.resolveMessageItem(entry, source.message, source.parts.map((part) => ({ ...part })));
+        if (result) resolved.push(result);
+      }
+      offset = end;
     }
 
     return resolved;
@@ -1881,37 +1921,15 @@ export class ContextAssembler {
       item.message = {
         role: "assistant",
         content: [{ type: "text", text: String(item.message.content) }],
+        timestamp: item.message.timestamp,
       } as AgentMessage;
     }
   }
 
   /**
-   * Resolve a single context item.
-   */
-  private async resolveItem(item: ContextItemRecord): Promise<ResolvedItem | null> {
-    if (item.itemType === "message" && item.messageId != null) {
-      return this.resolveMessageItem(item);
-    }
-
-    if (item.itemType === "summary" && item.summaryId != null) {
-      return this.resolveSummaryItem(item);
-    }
-
-    // Malformed item — skip
-    return null;
-  }
-
-  /**
    * Resolve a context item that references a raw message.
    */
-  private async resolveMessageItem(item: ContextItemRecord): Promise<ResolvedItem | null> {
-    const msg = await this.conversationStore.getMessageById(item.messageId!);
-    if (!msg) {
-      return null;
-    }
-
-    const parts = await this.conversationStore.getMessageParts(msg.messageId);
-
+  private async resolveMessageItem(item: ContextItemRecord, msg: MessageRecord, parts: MessagePartRecord[]): Promise<ResolvedItem | null> {
     // Skip empty assistant messages left by error/aborted responses.
     // These waste context tokens and can confuse models that reject
     // consecutive empty assistant turns.  Only skip when both the stored
@@ -1942,8 +1960,11 @@ export class ContextAssembler {
       role === "user"
         ? (serializeOpenClawSenderMetadata(msg.openClawSenderMetadata) ?? "")
         : "";
+    // Opaque replay signatures are sent but not tokenized as text.
+    const tokenizedContentText =
+      typeof content === "string" ? content : (JSON.stringify(stripOpaqueBlockSignatures(content)) ?? msg.content);
     const tokenCount = estimateTokens(
-      [contentText, topLevelReasoningText, senderMetadataText].filter(Boolean).join("\n"),
+      [tokenizedContentText, topLevelReasoningText, senderMetadataText].filter(Boolean).join("\n"),
     );
 
     // v4.2 §B (Option C) — `messages.large_content` now stores the
@@ -1967,7 +1988,8 @@ export class ContextAssembler {
     const stubEligible = fileIdFromSidecar != null && fileMeta != null && role === "toolResult";
 
     // Cast: these are reconstructed from DB storage, not live agent messages,
-    // so they won't carry the full AgentMessage metadata (timestamp, usage, etc.)
+    // so they carry the stored creation time but not the full live metadata.
+    const timestamp = storedTimeMs(msg.createdAt);
     return {
       ordinal: item.ordinal,
       message:
@@ -1975,6 +1997,7 @@ export class ContextAssembler {
           ? ({
               role,
               content,
+              timestamp,
               ...(modelIdentity ?? {}),
               ...topLevelAssistantReasoning,
               usage: {
@@ -1995,9 +2018,11 @@ export class ContextAssembler {
           : attachTranscriptEntryMeta({
               role,
               content,
+              timestamp,
               ...(role === "user" && msg.openClawSenderMetadata
                 ? { __openclaw: msg.openClawSenderMetadata }
                 : {}),
+              ...(role === "user" ? pickInputProvenance(parts) : {}),
               ...(toolCallId ? { toolCallId } : {}),
               ...(toolName ? { toolName } : {}),
               ...(role === "toolResult" && toolIsError !== undefined ? { isError: toolIsError } : {}),
@@ -2049,7 +2074,11 @@ export class ContextAssembler {
     // preserveCurrentUserBoundary; they must not replace the initiating user.
     return {
       ordinal: item.ordinal,
-      message: { role: "user" as const, content } as AgentMessage,
+      message: {
+        role: "user" as const,
+        content,
+        timestamp: storedTimeMs(summary.latestAt, summary.createdAt),
+      } as AgentMessage,
       tokens,
       isMessage: false,
       text: summary.content,

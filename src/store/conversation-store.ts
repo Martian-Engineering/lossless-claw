@@ -8,6 +8,12 @@ import { buildMessageIdentityHash } from "./message-identity.js";
 import { parseUtcTimestamp, parseUtcTimestampOrNull } from "./parse-utc-timestamp.js";
 import { buildFtsOrderBy, type SearchSort } from "./full-text-sort.js";
 import { compileSafeSearchRegex } from "./search-regex.js";
+import { normalizeMessageContentForFullTextIndex } from "./message-fts-content.js";
+import {
+  resolveSearchScanLimits,
+  type SearchOutcome,
+  type SearchScanLimits,
+} from "./search-scan.js";
 import {
   parseOpenClawSenderMetadata,
   serializeOpenClawSenderMetadata,
@@ -263,15 +269,6 @@ interface TranscriptEntryAnchorCandidateRow {
   content: string;
 }
 
-interface MessageSearchRow {
-  message_id: number;
-  conversation_id: number;
-  role: MessageRole;
-  snippet: string;
-  rank: number;
-  created_at: string;
-}
-
 interface MessagePartRow {
   part_id: string;
   message_id: number;
@@ -372,17 +369,6 @@ function toTranscriptEntryAnchorCandidate(
   };
 }
 
-function toSearchResult(row: MessageSearchRow): MessageSearchResult {
-  return {
-    messageId: row.message_id,
-    conversationId: row.conversation_id,
-    role: row.role,
-    snippet: row.snippet,
-    createdAt: parseUtcTimestamp(row.created_at),
-    rank: row.rank,
-  };
-}
-
 function toMessagePartRecord(row: MessagePartRow): MessagePartRecord {
   return {
     partId: row.part_id,
@@ -399,55 +385,56 @@ function toMessagePartRecord(row: MessagePartRow): MessagePartRecord {
   };
 }
 
-/** Normalize persisted message text before indexing it in the message FTS table. */
-export function normalizeMessageContentForFullTextIndex(content: string): string | null {
-  if (typeof content !== "string") return null;
-  const trimmed = content.trim();
-  if (!trimmed) {
-    return null;
-  }
+type MessageScanRow = {
+  message_id: number;
+  conversation_id: number;
+  role: MessageRole;
+  content: string;
+  created_at: string;
+};
 
-  const isExternalizedReference =
-    trimmed.startsWith("[LCM File:") || trimmed.startsWith("[LCM Tool Output:");
-  if (!isExternalizedReference) {
-    return content;
-  }
+/** Executes message searches somewhere other than the store's own connection. */
+export type MessageSearchExecutor = {
+  searchMessages(input: MessageSearchInput): Promise<SearchOutcome<MessageSearchResult>>;
+};
 
-  const lines = trimmed
-    .split(/\r?\n/)
-    .map((line) => line.trim())
-    .filter((line) => line.length > 0);
-  if (lines.length === 0) {
-    return null;
+/** Append inclusive-since / exclusive-before filters on a message timestamp column. */
+function appendMessageTimeConstraints(
+  where: string[],
+  args: Array<string | number>,
+  columnExpr: string,
+  since?: Date,
+  before?: Date,
+): void {
+  if (since) {
+    where.push(`julianday(${columnExpr}) >= julianday(?)`);
+    args.push(since.toISOString());
   }
+  if (before) {
+    where.push(`julianday(${columnExpr}) < julianday(?)`);
+    args.push(before.toISOString());
+  }
+}
 
-  const header = lines[0] ?? "";
-  const summaryLines: string[] = [];
-  let inSummary = false;
-  for (let index = 1; index < lines.length; index += 1) {
-    const line = lines[index]!;
-    if (line === "Exploration Summary:") {
-      inSummary = true;
-      continue;
+/** Return rows in the order of `ids`, dropping ids with no row. */
+function orderRowsByIds<T extends { message_id: number }>(rows: T[], ids: number[]): T[] {
+  const byId = new Map(rows.map((row) => [row.message_id, row]));
+  const ordered: T[] = [];
+  for (const id of ids) {
+    const row = byId.get(id);
+    if (row) {
+      ordered.push(row);
     }
-    // Filter both legacy "Use lcm_describe …" and v4.2 "Call lcm_describe(…)"
-    // hint lines so they don't pollute the FTS index for unrelated queries.
-    if (line.startsWith("Use lcm_describe") || line.startsWith("Call lcm_describe")) {
-      continue;
-    }
-    if (inSummary) {
-      summaryLines.push(line);
-    }
   }
-
-  const normalized = [header, ...summaryLines].filter((line) => line.length > 0).join("\n");
-  return normalized || null;
+  return ordered;
 }
 
 // ── ConversationStore ─────────────────────────────────────────────────────────
 
 export class ConversationStore {
   private readonly fts5Available: boolean;
+  private readonly searchScanLimits: SearchScanLimits;
+  private searchExecutor: MessageSearchExecutor | null = null;
   private readonly replayFloodThresholdExternal: number;
   private readonly replayFloodThresholdInternal: number;
   private readonly onStableEventKeyConflict?: (info: {
@@ -476,12 +463,20 @@ export class ConversationStore {
         conversationId: ConversationId;
         stableEventKey: string;
       }) => void;
+      /** Bounds for regex and LIKE content scans. */
+      searchScanLimits?: Partial<SearchScanLimits>;
     },
   ) {
     this.fts5Available = options?.fts5Available ?? true;
+    this.searchScanLimits = resolveSearchScanLimits(options?.searchScanLimits);
     this.replayFloodThresholdExternal = options?.replayFloodThresholdExternal ?? 3;
     this.replayFloodThresholdInternal = options?.replayFloodThresholdInternal ?? 32;
     this.onStableEventKeyConflict = options?.onStableEventKeyConflict;
+  }
+
+  /** Route searchMessages through `executor`, or back in-process with null. */
+  setSearchExecutor(executor: MessageSearchExecutor | null): void {
+    this.searchExecutor = executor;
   }
 
   // ── Transaction helpers ──────────────────────────────────────────────────
@@ -1047,6 +1042,17 @@ export class ConversationStore {
     return row?.count === 1;
   }
 
+  /** Provider identity is a candidate, not proof that two payloads are equal. */
+  async getMessageIdByStableEventKey(
+    conversationId: ConversationId,
+    stableEventKey: string,
+  ): Promise<MessageId | null> {
+    const row = this.db.prepare(
+      "SELECT message_id FROM messages WHERE conversation_id = ? AND stable_event_key = ? LIMIT 1",
+    ).get(conversationId, stableEventKey) as { message_id: number } | undefined;
+    return row?.message_id ?? null;
+  }
+
   /**
    * Tier-1 replay-twin gate for the append-only reconcile path: does this
    * conversation already hold a row with the same role, identity hash, and
@@ -1321,6 +1327,37 @@ export class ConversationStore {
     return row ? toMessageRecord(row) : null;
   }
 
+  /** Hydrate one assembly window without per-message statement preparation. */
+  async getMessagesWithParts(messageIds: MessageId[]): Promise<Map<MessageId, {
+    message: MessageRecord;
+    parts: MessagePartRecord[];
+  }>> {
+    const result = new Map<MessageId, { message: MessageRecord; parts: MessagePartRecord[] }>();
+    const ids = [...new Set(messageIds)];
+    // Keep bindings and temporary row materialization bounded by IDs, not bytes.
+    // Do not retain these facts across assemblies: host reconciliation may edit rows.
+    for (let offset = 0; offset < ids.length; offset += 256) {
+      const batch = ids.slice(offset, offset + 256);
+      const bindings = batch.map(() => "?").join(",");
+      const rows = this.db.prepare(
+        `SELECT message_id, conversation_id, seq, role, content, token_count, created_at, large_content, transcript_entry_id, openclaw_sender_metadata
+         FROM messages WHERE message_id IN (${bindings})`,
+      ).all(...batch) as unknown as MessageRow[];
+      for (const row of rows) {
+        result.set(row.message_id, { message: toMessageRecord(row), parts: [] });
+      }
+      const parts = this.db.prepare(
+        `SELECT part_id, message_id, session_id, part_type, ordinal, text_content,
+                tool_call_id, tool_name, tool_input, tool_output, metadata
+         FROM message_parts WHERE message_id IN (${bindings}) ORDER BY message_id, ordinal`,
+      ).all(...batch) as unknown as MessagePartRow[];
+      for (const part of parts) {
+        result.get(part.message_id)?.parts.push(toMessagePartRecord(part));
+      }
+    }
+    return result;
+  }
+
   /** Return the most recent message whose `large_content` sidecar references the given file id. */
   async getMessageByLargeContent(fileId: string): Promise<MessageRecord | null> {
     const row = this.db
@@ -1459,61 +1496,44 @@ export class ConversationStore {
 
   // ── Search ────────────────────────────────────────────────────────────────
 
+  /**
+   * Search messages. Delegates to the configured search executor (the
+   * off-main-thread search worker) when one is attached.
+   */
   async searchMessages(input: MessageSearchInput): Promise<MessageSearchResult[]> {
+    return (await this.searchMessagesWithScanInfo(input)).results;
+  }
+
+  /** Search messages and report whether a bounded content scan stopped early. */
+  async searchMessagesWithScanInfo(
+    input: MessageSearchInput,
+  ): Promise<SearchOutcome<MessageSearchResult>> {
+    if (this.searchExecutor) {
+      return this.searchExecutor.searchMessages(input);
+    }
+    return this.searchMessagesInProcess(input);
+  }
+
+  /** Run a message search synchronously on this store's own connection. */
+  searchMessagesInProcess(input: MessageSearchInput): SearchOutcome<MessageSearchResult> {
     const limit = input.limit ?? 50;
 
     if (input.mode === "full_text") {
       // FTS5 unicode61 can return incomplete matches for CJK text, so route
-      // those queries through the existing LIKE fallback path immediately.
+      // those queries through the bounded LIKE scan immediately.
       if (containsCjk(input.query)) {
-        return this.searchLike(
-          input.query,
-          limit,
-          input.conversationId,
-          input.conversationIds,
-          input.since,
-          input.before,
-        );
+        return this.searchLike(input, limit);
       }
       if (this.fts5Available) {
         try {
-          return this.searchFullText(
-            input.query,
-            limit,
-            input.conversationId,
-            input.conversationIds,
-            input.since,
-            input.before,
-            input.sort,
-          );
+          return { results: this.searchFullText(input, limit), scanLimited: false };
         } catch {
-          return this.searchLike(
-            input.query,
-            limit,
-            input.conversationId,
-            input.conversationIds,
-            input.since,
-            input.before,
-          );
+          return this.searchLike(input, limit);
         }
       }
-      return this.searchLike(
-        input.query,
-        limit,
-        input.conversationId,
-        input.conversationIds,
-        input.since,
-        input.before,
-      );
+      return this.searchLike(input, limit);
     }
-    return this.searchRegex(
-      input.query,
-      limit,
-      input.conversationId,
-      input.conversationIds,
-      input.since,
-      input.before,
-    );
+    return this.searchRegex(input, limit);
   }
 
   private indexMessageForFullText(messageId: MessageId, content: string): void {
@@ -1737,175 +1757,250 @@ export class ConversationStore {
     }
   }
 
-  private searchFullText(
-    query: string,
-    limit: number,
-    conversationId?: ConversationId,
-    conversationIds?: ConversationId[],
-    since?: Date,
-    before?: Date,
-    sort?: SearchSort,
-  ): MessageSearchResult[] {
-    const where: string[] = ["messages_fts MATCH ?"];
-    const args: Array<string | number> = [sanitizeFts5Query(query)];
+  /**
+   * FTS5 search in two phases so per-row work only touches the returned page:
+   *
+   * 1. Rank FTS hits against the (conversation_id, created_at) and
+   *    (created_at) indexes. `created_at` is stored after `content` in the
+   *    messages row, so reading it from the table walks each large row's
+   *    overflow chain; the covering indexes avoid that, and recency order
+   *    stops after `limit` hits.
+   * 2. Load role, conversation and snippet for at most `limit` messages.
+   */
+  private searchFullText(input: MessageSearchInput, limit: number): MessageSearchResult[] {
+    const ftsQuery = sanitizeFts5Query(input.query);
+    const where: string[] = [];
+    const args: Array<string | number> = [ftsQuery];
     appendConversationScopeConstraint({
       where,
       args,
       columnExpr: "m.conversation_id",
-      conversationId,
-      conversationIds,
+      conversationId: input.conversationId,
+      conversationIds: input.conversationIds,
     });
-    if (since) {
-      where.push("julianday(m.created_at) >= julianday(?)");
-      args.push(since.toISOString());
-    }
-    if (before) {
-      where.push("julianday(m.created_at) < julianday(?)");
-      args.push(before.toISOString());
-    }
+    appendMessageTimeConstraints(where, args, "m.created_at", input.since, input.before);
     args.push(limit);
-    const orderBy = buildFtsOrderBy(sort, "m.created_at");
+    const orderBy = buildFtsOrderBy(input.sort, "m.created_at");
 
-    const sql = `SELECT
-         m.message_id,
-         m.conversation_id,
-         m.role,
-         snippet(messages_fts, 0, '', '', '...', 32) AS snippet,
-         rank,
-         m.created_at
-       FROM messages_fts
-       JOIN messages m ON m.message_id = messages_fts.rowid
-       WHERE ${where.join(" AND ")}
-       ORDER BY ${orderBy}
-       LIMIT ?`;
-    const rows = this.db.prepare(sql).all(...args) as unknown as MessageSearchRow[];
-    return rows.map(toSearchResult);
-  }
-
-  private searchLike(
-    query: string,
-    limit: number,
-    conversationId?: ConversationId,
-    conversationIds?: ConversationId[],
-    since?: Date,
-    before?: Date,
-  ): MessageSearchResult[] {
-    const plan = buildLikeSearchPlan("content", query);
-    if (plan.terms.length === 0) {
-      return [];
-    }
-
-    const where: string[] = [...plan.where];
-    const args: Array<string | number> = [...plan.args];
-    appendConversationScopeConstraint({
-      where,
-      args,
-      columnExpr: "conversation_id",
-      conversationId,
-      conversationIds,
-    });
-    if (since) {
-      where.push("julianday(created_at) >= julianday(?)");
-      args.push(since.toISOString());
-    }
-    if (before) {
-      where.push("julianday(created_at) < julianday(?)");
-      args.push(before.toISOString());
-    }
-    args.push(limit);
-
-    const whereClause = where.length > 0 ? `WHERE ${where.join(" AND ")}` : "";
-    const rows = this.db
+    const ranked = this.db
       .prepare(
-        `SELECT message_id, conversation_id, seq, role, content, token_count, created_at, large_content, transcript_entry_id, openclaw_sender_metadata
-         FROM messages
-         ${whereClause}
-         ORDER BY created_at DESC
+        `WITH hits AS MATERIALIZED (
+           SELECT rowid AS message_id, rank
+           FROM messages_fts
+           WHERE messages_fts MATCH ?
+         )
+         SELECT m.message_id, m.created_at, hits.rank AS rank
+         FROM messages AS m
+         CROSS JOIN hits ON hits.message_id = m.message_id
+         ${where.length > 0 ? `WHERE ${where.join(" AND ")}` : ""}
+         ORDER BY ${orderBy}
          LIMIT ?`,
       )
-      .all(...args) as unknown as MessageRow[];
-
-    return rows
-      .map((row): MessageSearchResult | null => {
-        const normalizedContent = normalizeMessageContentForFullTextIndex(row.content) ?? row.content;
-        const haystack = normalizedContent.toLowerCase();
-        const matchesAllTerms = plan.terms.every((term) => haystack.includes(term));
-        if (!matchesAllTerms) {
-          return null;
-        }
-        return {
-          messageId: row.message_id,
-          conversationId: row.conversation_id,
-          role: row.role,
-          snippet: createFallbackSnippet(normalizedContent, plan.terms),
-          createdAt: parseUtcTimestamp(row.created_at),
-          rank: 0,
-        };
-      })
-      .filter((row): row is MessageSearchResult => row !== null);
-  }
-
-  private searchRegex(
-    pattern: string,
-    limit: number,
-    conversationId?: ConversationId,
-    conversationIds?: ConversationId[],
-    since?: Date,
-    before?: Date,
-  ): MessageSearchResult[] {
-    // SQLite has no native POSIX regex; fetch candidates and filter in JS
-    const re = compileSafeSearchRegex(pattern);
-    if (!re) {
+      .all(...args) as unknown as Array<{ message_id: number; created_at: string; rank: number }>;
+    if (ranked.length === 0) {
       return [];
     }
 
-    const where: string[] = [];
-    const args: Array<string | number> = [];
-    appendConversationScopeConstraint({
-      where,
-      args,
-      columnExpr: "conversation_id",
-      conversationId,
-      conversationIds,
-    });
-    if (since) {
-      where.push("julianday(created_at) >= julianday(?)");
-      args.push(since.toISOString());
-    }
-    if (before) {
-      where.push("julianday(created_at) < julianday(?)");
-      args.push(before.toISOString());
-    }
-    const whereClause = where.length > 0 ? `WHERE ${where.join(" AND ")}` : "";
-    const rows = this.db
-      .prepare(
-        `SELECT message_id, conversation_id, seq, role, content, token_count, created_at, large_content, transcript_entry_id, openclaw_sender_metadata
-         FROM messages
-         ${whereClause}
-         ORDER BY created_at DESC`,
-      )
-      .all(...args) as unknown as MessageRow[];
+    const ids = ranked.map((row) => row.message_id);
+    const placeholders = ids.map(() => "?").join(", ");
+    const details = new Map(
+      (
+        this.db
+          .prepare(
+            `SELECT message_id, conversation_id, role
+             FROM messages
+             WHERE message_id IN (${placeholders})`,
+          )
+          .all(...ids) as unknown as Array<{
+          message_id: number;
+          conversation_id: number;
+          role: MessageRole;
+        }>
+      ).map((row) => [row.message_id, row]),
+    );
+    const snippets = new Map(
+      (
+        this.db
+          .prepare(
+            `SELECT rowid AS message_id, snippet(messages_fts, 0, '', '', '...', 32) AS snippet
+             FROM messages_fts
+             WHERE messages_fts MATCH ? AND rowid IN (${placeholders})`,
+          )
+          .all(ftsQuery, ...ids) as unknown as Array<{ message_id: number; snippet: string }>
+      ).map((row) => [row.message_id, row.snippet]),
+    );
 
-    const MAX_ROW_SCAN = 10_000;
     const results: MessageSearchResult[] = [];
-    let scanned = 0;
-    for (const row of rows) {
-      if (results.length >= limit || scanned >= MAX_ROW_SCAN) {
-        break;
+    for (const row of ranked) {
+      const detail = details.get(row.message_id);
+      if (!detail) {
+        continue;
       }
-      scanned++;
-      const match = re.exec(row.content);
-      if (match) {
-        results.push({
-          messageId: row.message_id,
-          conversationId: row.conversation_id,
-          role: row.role,
-          snippet: match[0],
-          createdAt: parseUtcTimestamp(row.created_at),
-          rank: 0,
-        });
-      }
+      results.push({
+        messageId: row.message_id,
+        conversationId: detail.conversation_id,
+        role: detail.role,
+        snippet: snippets.get(row.message_id) ?? "",
+        createdAt: parseUtcTimestamp(row.created_at),
+        rank: row.rank,
+      });
     }
     return results;
+  }
+
+  /**
+   * Substring fallback for CJK queries, missing FTS5, or FTS syntax errors.
+   * LIKE cannot use an index, so it runs as a bounded newest-first scan.
+   */
+  private searchLike(input: MessageSearchInput, limit: number): SearchOutcome<MessageSearchResult> {
+    const plan = buildLikeSearchPlan("content", input.query);
+    if (plan.terms.length === 0) {
+      return { results: [], scanLimited: false };
+    }
+
+    const results: MessageSearchResult[] = [];
+    const scanLimited = this.scanMessagesNewestFirst(
+      input,
+      this.searchScanLimits.likeMaxRows,
+      (ids) => {
+        const rows = this.db
+          .prepare(
+            `SELECT message_id, conversation_id, role, content, created_at
+             FROM messages
+             WHERE message_id IN (${ids.map(() => "?").join(", ")})
+               AND ${plan.where.join(" AND ")}`,
+          )
+          .all(...ids, ...plan.args) as unknown as MessageScanRow[];
+        for (const row of orderRowsByIds(rows, ids)) {
+          const normalizedContent =
+            normalizeMessageContentForFullTextIndex(row.content) ?? row.content;
+          const haystack = normalizedContent.toLowerCase();
+          if (!plan.terms.every((term) => haystack.includes(term))) {
+            continue;
+          }
+          results.push({
+            messageId: row.message_id,
+            conversationId: row.conversation_id,
+            role: row.role,
+            snippet: createFallbackSnippet(normalizedContent, plan.terms),
+            createdAt: parseUtcTimestamp(row.created_at),
+            rank: 0,
+          });
+          if (results.length >= limit) {
+            return true;
+          }
+        }
+        return false;
+      },
+    );
+    return { results, scanLimited };
+  }
+
+  /**
+   * SQLite has no native regex, so candidates are matched in JS during a
+   * bounded newest-first scan that holds at most one chunk in memory.
+   */
+  private searchRegex(input: MessageSearchInput, limit: number): SearchOutcome<MessageSearchResult> {
+    const re = compileSafeSearchRegex(input.query);
+    if (!re) {
+      return { results: [], scanLimited: false };
+    }
+
+    const results: MessageSearchResult[] = [];
+    const scanLimited = this.scanMessagesNewestFirst(
+      input,
+      this.searchScanLimits.regexMaxRows,
+      (ids) => {
+        const rows = this.db
+          .prepare(
+            `SELECT message_id, conversation_id, role, content, created_at
+             FROM messages
+             WHERE message_id IN (${ids.map(() => "?").join(", ")})`,
+          )
+          .all(...ids) as unknown as MessageScanRow[];
+        for (const row of orderRowsByIds(rows, ids)) {
+          const match = re.exec(row.content);
+          if (!match) {
+            continue;
+          }
+          results.push({
+            messageId: row.message_id,
+            conversationId: row.conversation_id,
+            role: row.role,
+            snippet: match[0],
+            createdAt: parseUtcTimestamp(row.created_at),
+            rank: 0,
+          });
+          if (results.length >= limit) {
+            return true;
+          }
+        }
+        return false;
+      },
+    );
+    return { results, scanLimited };
+  }
+
+  /**
+   * Walk in-scope message ids newest-first in keyset chunks over the
+   * created_at indexes, handing each chunk to `visit` until it reports it is
+   * satisfied. Returns true when the row or time budget stopped the walk while
+   * older in-scope rows remained unexamined.
+   */
+  private scanMessagesNewestFirst(
+    input: MessageSearchInput,
+    maxRows: number,
+    visit: (ids: number[]) => boolean,
+  ): boolean {
+    const baseWhere: string[] = [];
+    const baseArgs: Array<string | number> = [];
+    appendConversationScopeConstraint({
+      where: baseWhere,
+      args: baseArgs,
+      columnExpr: "conversation_id",
+      conversationId: input.conversationId,
+      conversationIds: input.conversationIds,
+    });
+    appendMessageTimeConstraints(baseWhere, baseArgs, "created_at", input.since, input.before);
+
+    const { chunkRows, maxScanMs } = this.searchScanLimits;
+    const startedAt = Date.now();
+    let cursor: { createdAt: string; messageId: number } | null = null;
+    let scanned = 0;
+    for (;;) {
+      const budgetSpent = scanned >= maxRows || Date.now() - startedAt >= maxScanMs;
+      const where = [...baseWhere];
+      const args = [...baseArgs];
+      if (cursor) {
+        where.push("(created_at, message_id) < (?, ?)");
+        args.push(cursor.createdAt, cursor.messageId);
+      }
+      const take = budgetSpent ? 1 : Math.min(chunkRows, maxRows - scanned);
+      args.push(take);
+      const rows = this.db
+        .prepare(
+          `SELECT message_id, created_at
+           FROM messages
+           ${where.length > 0 ? `WHERE ${where.join(" AND ")}` : ""}
+           ORDER BY created_at DESC, message_id DESC
+           LIMIT ?`,
+        )
+        .all(...args) as unknown as Array<{ message_id: number; created_at: string }>;
+      if (budgetSpent) {
+        return rows.length > 0;
+      }
+      if (rows.length === 0) {
+        return false;
+      }
+      scanned += rows.length;
+      const last = rows[rows.length - 1]!;
+      cursor = { createdAt: last.created_at, messageId: last.message_id };
+      if (visit(rows.map((row) => row.message_id))) {
+        return false;
+      }
+      if (rows.length < take) {
+        return false;
+      }
+    }
   }
 }

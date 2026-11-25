@@ -4,6 +4,8 @@ import {
   estimateSerializedMessagesTokens,
   estimateTokens,
 } from "../src/estimate-tokens.js";
+import { toStoredMessage } from "../src/message-content.js";
+import type { AgentMessage } from "../src/openclaw-bridge.js";
 
 describe("estimateTokens", () => {
   it("estimates ASCII text at ~0.25 tokens/char", () => {
@@ -110,6 +112,56 @@ describe("estimateSerializedMessageTokens", () => {
     expect(estimateSerializedMessageTokens(messageWithPrivateMetadata)).toBe(
       estimateSerializedMessageTokens(visibleMessage),
     );
+  });
+
+  it.each([
+    { name: "string replacement", content: "old input ".repeat(500), text: "recorded input", rendered: "recorded input" },
+    { name: "empty projection", content: "old input ".repeat(500), text: "", rendered: "" },
+    { name: "literal data URL", content: "short", text: `data:text/plain,${"x".repeat(9000)}`, rendered: `data:text/plain,${"x".repeat(9000)}` },
+    {
+      name: "first text block only",
+      content: [{ type: "text", text: "original", marker: "kept" }, { type: "text", text: "later text" }],
+      text: "recorded input",
+      rendered: [{ type: "text", text: "recorded input", marker: "kept" }, { type: "text", text: "later text" }],
+    },
+    {
+      name: "media-only content",
+      content: [{ type: "image", data: "AA==", mimeType: "image/png" }],
+      text: "recorded input",
+      rendered: [{ type: "text", text: "recorded input" }, { type: "image", data: "AA==", mimeType: "image/png" }],
+    },
+  ])("counts rendered model-prompt content once: $name", ({ content, text, rendered }) => {
+    const message = {
+      role: "user", content,
+      __openclaw: { modelPromptProjection: { version: 1, text }, upstreamUserText: "private".repeat(1000) },
+    };
+    const original = structuredClone(message);
+    expect(estimateSerializedMessageTokens(message)).toBe(estimateTokens(JSON.stringify({ role: "user", content: rendered })));
+    expect(message).toEqual(original);
+  });
+
+  it("counts large recorded projections while retaining native media estimates", () => {
+    const text = "recorded input ".repeat(2000);
+    const image = { type: "image", data: "A1b2".repeat(8192), mimeType: "image/png" };
+    const message = {
+      role: "user", content: [image, { type: "text", text: "short" }, { type: "text", text: "later" }],
+      __openclaw: { modelPromptProjection: { version: 1, text } },
+    };
+    const rendered = { role: "user", content: [image, { type: "text", text }, { type: "text", text: "later" }] };
+    const estimated = estimateSerializedMessageTokens(message);
+    expect(estimated).toBe(estimateSerializedMessageTokens(rendered));
+    expect(estimated).toBeGreaterThan(estimateTokens(text) + 1500);
+    expect(estimated).toBeLessThan(estimateTokens(text) + 2000);
+  });
+
+  it.each([
+    { role: "user", projection: { version: 2, text: "ignored".repeat(1000) } },
+    { role: "user", projection: { version: 1, text: 123 } },
+    { role: "assistant", projection: { version: 1, text: "ignored".repeat(1000) } },
+  ])("keeps visible content for non-rendered projection metadata: %j", ({ role, projection }) => {
+    const visible = { role, content: "visible input" };
+    expect(estimateSerializedMessageTokens({ ...visible, __openclaw: { modelPromptProjection: projection } }))
+      .toBe(estimateSerializedMessageTokens(visible));
   });
 
   it("still counts private-looking keys inside rendered tool payloads", () => {
@@ -269,9 +321,116 @@ describe("estimateSerializedMessageTokens", () => {
     expect(estimateSerializedMessageTokens(message)).toBeGreaterThan(0);
   });
 
+  it("excludes opaque replay signatures and host-only envelope fields", () => {
+    const encryptedReasoning = JSON.stringify({
+      id: "rs_0af2562073b39278016afb3c4940a887d1846d07373dd04a74",
+      type: "reasoning",
+      summary: [],
+      content: [],
+      encrypted_content: "gAAAAABq-zxU2h_svkPRj_JX2rbGHRUwKtvlGRLuERZ8o6".repeat(200),
+    });
+    const visibleAssistant = {
+      role: "assistant",
+      content: [
+        { type: "thinking", thinking: "" },
+        { type: "text", text: "Checked the logs." },
+        { type: "toolCall", id: "call_1", name: "exec", arguments: { command: "rg degraded" } },
+      ],
+    };
+    const recordedAssistant = {
+      role: "assistant",
+      content: [
+        { type: "thinking", thinking: "", thinkingSignature: encryptedReasoning },
+        { type: "text", text: "Checked the logs.", textSignature: '{"v":1,"id":"msg_0d29","phase":"commentary"}' },
+        { type: "toolCall", id: "call_1", name: "exec", arguments: { command: "rg degraded" }, thoughtSignature: "c2lnbmF0dXJl".repeat(50) },
+      ],
+      api: "openai-responses",
+      provider: "clawrouter",
+      model: "openai/gpt-6-astra",
+      responseId: "resp_0d29202084a77e91016afb56097a0487d1ad74850c64ad0395",
+      responseModel: "gpt-6-astra",
+      usage: { input: 3, output: 74, cacheRead: 84697, cacheWrite: 7124, totalTokens: 91898 },
+      diagnostics: [{ type: "openai_responses_terminal", details: { eventType: "response.completed" } }],
+      stopReason: "toolUse",
+      timestamp: 1794856457226,
+    };
+    const visibleToolResult = {
+      role: "toolResult",
+      toolCallId: "call_1",
+      toolName: "exec",
+      content: [{ type: "text", text: "degraded live fallback" }],
+      isError: false,
+    };
+    const recordedToolResult = {
+      ...visibleToolResult,
+      details: { aggregated: "degraded live fallback\n".repeat(2_000), exitCode: 0 },
+      timestamp: 1794855492943,
+    };
+
+    expect(estimateSerializedMessageTokens(recordedAssistant)).toBe(
+      estimateSerializedMessageTokens(visibleAssistant),
+    );
+    expect(estimateSerializedMessageTokens(recordedToolResult)).toBe(
+      estimateSerializedMessageTokens(visibleToolResult),
+    );
+  });
+
+  it("keeps measured completion occupancy as a floor for opaque reasoning", () => {
+    const message = {
+      role: "assistant",
+      content: [
+        { type: "thinking", thinking: "", thinkingSignature: "encrypted".repeat(4_000) },
+        { type: "text", text: "done" },
+      ],
+      usage: {
+        input: 3,
+        output: 20_000,
+        contextUsage: { state: "available", promptTokens: 90_000, totalTokens: 110_000 },
+      },
+    };
+    expect(estimateSerializedMessageTokens(message)).toBe(20_000);
+    const unmeasured = { ...message, usage: { input: 3, output: 20_000 } };
+    expect(estimateSerializedMessageTokens(unmeasured)).toBeLessThan(100);
+  });
+
+  it("keeps the signature payload of redacted thinking", () => {
+    const payload = "opaque redacted thinking payload ".repeat(400);
+    const redacted = {
+      role: "assistant",
+      content: [{ type: "thinking", thinking: "", thinkingSignature: payload, redacted: true }],
+    };
+    expect(estimateSerializedMessageTokens(redacted)).toBeGreaterThan(estimateTokens(payload));
+  });
+
   it("sums across message lists", () => {
     const message = { role: "user", content: "hello world" };
     const single = estimateSerializedMessageTokens(message);
     expect(estimateSerializedMessagesTokens([message, message])).toBe(single * 2);
+  });
+});
+
+describe("stored token counts", () => {
+  it("do not count opaque reasoning signatures", () => {
+    const base = {
+      role: "assistant",
+      api: "openai-responses",
+      provider: "clawrouter",
+      model: "openai/gpt-6-astra",
+      timestamp: 1794856457226,
+    };
+    const signature = JSON.stringify({
+      id: "rs_1",
+      type: "reasoning",
+      summary: [],
+      content: [],
+      encrypted_content: "gAAAAABq-zxU2h_svkPRj_JX2rbGHRUwKtvlGRLuERZ8o6".repeat(200),
+    });
+    const toolCall = { type: "toolCall", id: "call_1", name: "exec", arguments: { command: "rg degraded" } };
+    const signed = toStoredMessage({
+      ...base,
+      content: [{ type: "thinking", thinking: "", thinkingSignature: signature }, toolCall],
+    } as unknown as AgentMessage);
+    // The ~9k-character signature would cost ~2.3k tokens if counted.
+    expect(signed.tokenCount).toBeLessThan(200);
   });
 });

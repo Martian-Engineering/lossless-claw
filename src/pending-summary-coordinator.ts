@@ -49,6 +49,8 @@ const PENDING_BATCH_RETENTION_MS = 7 * 24 * 60 * 60 * 1000;
 export type PendingCompactionCoordinatorConfig = {
   freshTailCount: number;
   freshTailMaxTokens?: number;
+  /** Newest messages protected before `freshTailMaxTokens` applies. */
+  freshTailMinMessages?: number;
   leafChunkTokens: number;
   condensedMinFanout: number;
   condensedMinSourceTokens: number;
@@ -461,6 +463,7 @@ export class PendingCompactionCoordinator {
       items: input.snapshot.items,
       freshTailCount: this.config.freshTailCount,
       freshTailMaxTokens: this.config.freshTailMaxTokens,
+      freshTailMinMessages: this.config.freshTailMinMessages,
       leafChunkTokens: this.config.leafChunkTokens,
       nodeIdPrefix,
     });

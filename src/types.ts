@@ -59,6 +59,8 @@ export type RuntimeLlmCompleteFn = (params: {
   agentId: string;
   usage?: Record<string, unknown>;
   audit?: Record<string, unknown>;
+  /** Reported by newer hosts; "aborted" means the host canceled the request. */
+  stopReason?: string;
 }>;
 
 export type CompleteFn = (params: {
@@ -247,6 +249,14 @@ export interface LcmDependencies {
   readVisibleSessionTranscriptMessageEntries?: (
     target: SessionTranscriptReadTarget,
   ) => Promise<VisibleSessionTranscriptMessageEntry[]>;
+
+  /**
+   * Restore retained raw users and carriers from the host's canonical active branch.
+   * The plugin adapter returns undefined only when the host lacks this SDK capability.
+   */
+  readSessionTranscriptReplayGroups?: (
+    params: SessionTranscriptReadTarget & { entryIds: string[]; maxBytes?: number },
+  ) => Promise<Array<{ entryId: string; message: AgentMessage; carriers: AgentMessage[] }> | undefined>;
 
   /** Read one bounded page of OpenClaw's visible-message delta after an opaque cursor. */
   readSessionTranscriptVisibleMessageDelta?: (

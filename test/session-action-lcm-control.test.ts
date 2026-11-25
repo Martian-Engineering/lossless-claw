@@ -37,6 +37,7 @@ function buildHarness(control: (input: unknown) => Promise<unknown>) {
     getCachedEngine: () => engine as never,
     waitForEngine: async () => engine as never,
     waitForDatabase: async () => ({}) as never,
+    retain: () => async () => undefined,
   });
 
   const api = {

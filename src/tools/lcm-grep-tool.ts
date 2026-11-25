@@ -181,7 +181,16 @@ export function createLcmGrepTool(input: {
       const timezone = lcm.timezone;
 
       const p = params as Record<string, unknown>;
-      const pattern = (p.pattern as string).trim();
+      // Hosts pass model-supplied arguments through without schema validation, so a
+      // missing or misnamed `pattern` reaches us as undefined. Report it as a tool
+      // error the model can act on instead of throwing a TypeError it cannot.
+      const pattern = typeof p.pattern === "string" ? p.pattern.trim() : "";
+      if (!pattern) {
+        return jsonResult({
+          error:
+            'Missing required `pattern`. Pass the search text as `pattern` (a regular expression when mode is "regex", an FTS5 query when mode is "full_text"). Note that lcm_expand and lcm_expand_query use `query`, but lcm_grep uses `pattern`.',
+        });
+      }
       const mode = (p.mode as "regex" | "full_text") ?? "regex";
       const scope = (p.scope as "messages" | "summaries" | "both" | "files") ?? "both";
       const fileIds = Array.isArray(p.fileIds)
@@ -273,6 +282,13 @@ export function createLcmGrepTool(input: {
         );
       }
       lines.push(`**Total matches:** ${result.totalMatches}`);
+      if (result.scanLimited) {
+        lines.push(
+          mode === "regex"
+            ? "**Scan limit:** regex search examined only the newest rows in scope; older matches may exist. Narrow with conversationId, since or before, or use full_text mode."
+            : "**Scan limit:** substring fallback examined only the newest rows in scope; older matches may exist. Narrow with conversationId, since or before.",
+        );
+      }
       lines.push("");
 
       let currentChars = lines.join("\n").length;
@@ -347,6 +363,7 @@ export function createLcmGrepTool(input: {
             ? { fileScanByteLimit: DEFAULT_LARGE_FILE_SEARCH_MAX_BYTES }
             : {}),
           totalMatches: result.totalMatches,
+          ...(result.scanLimited ? { scanLimited: true } : {}),
           text,
           messages: result.messages.map((msg) => ({
             conversationId: msg.conversationId,

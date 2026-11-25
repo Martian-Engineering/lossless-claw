@@ -406,6 +406,7 @@ describe("runLcmMigrations summary depth backfill", () => {
       { step_name: "backfillSummaryDepths", algorithm_version: 1 },
       { step_name: "backfillSummaryMetadata", algorithm_version: 1 },
       { step_name: "backfillToolCallColumns", algorithm_version: 1 },
+      { step_name: "repairContextItemOrdinals", algorithm_version: 1 },
       { step_name: "repairOpenClawMetadataIdentityState", algorithm_version: 2 },
     ]);
 
@@ -781,6 +782,79 @@ describe("runLcmMigrations summary depth backfill", () => {
       .prepare(`SELECT identity_hash FROM messages WHERE conversation_id = ? AND seq = ?`)
       .get(1, 1_204) as { identity_hash: string | null };
     expect(sampledRow.identity_hash).toBe(buildMessageIdentityHash("assistant", "batch message 1204"));
+  });
+
+  it("finds messages missing identity hashes through a partial index instead of a table scan", () => {
+    const db = createTestDb("identity-hash-steady-state.db");
+    runLcmMigrations(db, { fts5Available: false });
+
+    db.prepare(`INSERT INTO conversations (conversation_id, session_id) VALUES (?, ?)`).run(
+      1,
+      "identity-hash-steady-state-session",
+    );
+    const insertMessage = db.prepare(
+      `INSERT INTO messages (conversation_id, seq, role, content, token_count, identity_hash)
+       VALUES (?, ?, ?, ?, ?, ?)`,
+    );
+    for (let index = 0; index < 50; index += 1) {
+      insertMessage.run(1, index, "assistant", `hashed message ${index}`, 3, `existing-${index}`);
+    }
+
+    const missingQuery = `SELECT message_id FROM messages
+       WHERE message_id > 0 AND (identity_hash IS NULL OR identity_hash = '')
+       ORDER BY message_id LIMIT 1000`;
+    const countIndexedMissing = () =>
+      (
+        db
+          .prepare(
+            `SELECT COUNT(*) AS count FROM messages INDEXED BY messages_missing_identity_hash_idx
+             WHERE identity_hash IS NULL OR identity_hash = ''`,
+          )
+          .get() as { count: number }
+      ).count;
+
+    // Steady state: nothing is missing, so the index is empty and the backfill
+    // query probes it instead of scanning messages.
+    runLcmMigrations(db, { fts5Available: false });
+    expect(countIndexedMissing()).toBe(0);
+    const plan = (
+      db.prepare(`EXPLAIN QUERY PLAN ${missingQuery}`).all() as Array<{ detail: string }>
+    ).map((row) => row.detail);
+    expect(plan.some((detail) => detail.includes("messages_missing_identity_hash_idx"))).toBe(
+      true,
+    );
+    expect(plan.some((detail) => /^SCAN messages\b(?! USING)/.test(detail))).toBe(false);
+    // Rows that already carry a hash are never rewritten.
+    expect(
+      (
+        db.prepare(`SELECT identity_hash FROM messages WHERE conversation_id = 1 AND seq = 7`).get() as {
+          identity_hash: string;
+        }
+      ).identity_hash,
+    ).toBe("existing-7");
+
+    // Rows written later without a hash enter the index and get backfilled.
+    insertMessage.run(1, 50, "user", "later message without hash", 3, null);
+    insertMessage.run(1, 51, "assistant", "later message with empty hash", 3, "");
+    expect(countIndexedMissing()).toBe(2);
+
+    runLcmMigrations(db, { fts5Available: false });
+
+    expect(countIndexedMissing()).toBe(0);
+    const backfilled = db
+      .prepare(
+        `SELECT seq, identity_hash FROM messages WHERE conversation_id = 1 AND seq >= 50 ORDER BY seq`,
+      )
+      .all() as Array<{ seq: number; identity_hash: string }>;
+    expect(backfilled).toEqual([
+      { seq: 50, identity_hash: buildMessageIdentityHash("user", "later message without hash") },
+      {
+        seq: 51,
+        identity_hash: buildMessageIdentityHash("assistant", "later message with empty hash"),
+      },
+    ]);
+    const total = db.prepare(`SELECT COUNT(*) AS count FROM messages`).get() as { count: number };
+    expect(total.count).toBe(52);
   });
 
   it("repairs legacy OpenClaw metadata identity hashes", () => {
@@ -1557,6 +1631,7 @@ describe("runLcmMigrations summary depth backfill", () => {
       "[lcm] migration step skipped: step=backfillSummaryDepths algorithmVersion=1 reason=already-complete",
       "[lcm] migration step skipped: step=backfillSummaryMetadata algorithmVersion=1 reason=already-complete",
       "[lcm] migration step skipped: step=backfillToolCallColumns algorithmVersion=1 reason=already-complete",
+      "[lcm] migration step skipped: step=repairContextItemOrdinals algorithmVersion=1 reason=already-complete",
     ]);
   });
 
@@ -1667,6 +1742,7 @@ describe("runLcmMigrations summary depth backfill", () => {
       { step_name: "backfillSummaryDepths", algorithm_version: 1 },
       { step_name: "backfillSummaryMetadata", algorithm_version: 1 },
       { step_name: "backfillToolCallColumns", algorithm_version: 1 },
+      { step_name: "repairContextItemOrdinals", algorithm_version: 1 },
       { step_name: "repairOpenClawMetadataIdentityState", algorithm_version: 2 },
     ]);
   });

@@ -26,7 +26,7 @@ describe("delegated own-conversation authorization", () => {
   let foreignId: number;
 
   beforeEach(async () => {
-    resetDelegatedExpansionGrantsForTests();
+    await resetDelegatedExpansionGrantsForTests();
     db = new DatabaseSync(":memory:");
     const { fts5Available } = getLcmDbFeatures(db);
     runLcmMigrations(db, { fts5Available });
@@ -45,8 +45,8 @@ describe("delegated own-conversation authorization", () => {
     })).conversationId;
   });
 
-  afterEach(() => {
-    resetDelegatedExpansionGrantsForTests();
+  afterEach(async () => {
+    await resetDelegatedExpansionGrantsForTests();
     db.close();
   });
 
@@ -62,7 +62,7 @@ describe("delegated own-conversation authorization", () => {
   }
 
   it("adds only the active exact-key child without mutating the source grant", async () => {
-    const sourceGrant = grant();
+    const sourceGrant = await grant();
     const scope = await resolveLcmConversationScope({
       lcm, deps, sessionKey: childKey, sessionId: "foreign-runtime",
       params: { allConversations: true },
@@ -73,7 +73,7 @@ describe("delegated own-conversation authorization", () => {
   });
 
   it("accepts a delegated session key supplied through sessionId", async () => {
-    grant();
+    await grant();
     const scope = await resolveLcmConversationScope({
       lcm, deps, sessionId: childKey, params: { conversationId: childId },
     });
@@ -82,7 +82,7 @@ describe("delegated own-conversation authorization", () => {
   });
 
   it.each(["inactive", "foreign"])("rejects an ungranted %s conversation", async (kind) => {
-    grant();
+    await grant();
     if (kind === "inactive") await store.archiveConversation(childId, "manual-reset");
     const scope = await resolveLcmConversationScope({
       lcm, deps, sessionKey: childKey, sessionId: "child-runtime",
@@ -92,8 +92,8 @@ describe("delegated own-conversation authorization", () => {
   });
 
   it.each(["absent", "empty", "expired", "revoked"])("rejects own access with an %s grant", async (kind) => {
-    if (kind !== "absent") grant(kind === "empty" ? [] : [parentId], kind === "expired" ? -1 : 60_000);
-    if (kind === "revoked") revokeDelegatedExpansionGrantForSession(childKey);
+    if (kind !== "absent") await grant(kind === "empty" ? [] : [parentId], kind === "expired" ? -1 : 60_000);
+    if (kind === "revoked") await revokeDelegatedExpansionGrantForSession(childKey);
     const scope = await resolveLcmConversationScope({
       lcm, deps, sessionKey: childKey, params: { conversationId: childId },
     });
@@ -102,7 +102,7 @@ describe("delegated own-conversation authorization", () => {
   });
 
   it("preserves explicitly granted parent access", async () => {
-    grant();
+    await grant();
     const scope = await resolveLcmConversationScope({
       lcm, deps, sessionKey: childKey, params: { conversationId: parentId },
     });
@@ -112,7 +112,7 @@ describe("delegated own-conversation authorization", () => {
 
   it("does not broaden grants when exact-key lookup misses and runtime ID belongs elsewhere", async () => {
     const missingKey = "agent:main:subagent:missing";
-    createDelegatedExpansionGrant({
+    await createDelegatedExpansionGrant({
       delegatedSessionKey: missingKey, issuerSessionId: "parent-runtime",
       allowedConversationIds: [parentId], tokenCap: 100,
     });
@@ -127,6 +127,16 @@ describe("delegated own-conversation authorization", () => {
     const scope = await resolveLcmConversationScope({
       lcm, deps, sessionKey: "agent:main:main", sessionId: "parent-runtime", params: {},
     });
+    expect(scope).toMatchObject({ delegated: false, conversationId: parentId });
+    expect(scope.conversationIds).toEqual([parentId]);
+  });
+
+  it.each([0, -1])("treats conversationId %i as not provided", async (id) => {
+    const scope = await resolveLcmConversationScope({
+      lcm, deps, sessionKey: "agent:main:main", sessionId: "parent-runtime",
+      params: { conversationId: id },
+    });
+    expect(scope.error).toBeUndefined();
     expect(scope).toMatchObject({ delegated: false, conversationId: parentId });
     expect(scope.conversationIds).toEqual([parentId]);
   });

@@ -2,6 +2,8 @@
 
 Lossless Context Management plugin for [OpenClaw](https://github.com/openclaw/openclaw), based on the [LCM paper](https://papers.voltropy.com/LCM) from [Voltropy](https://x.com/Voltropy). Replaces OpenClaw's built-in sliding-window compaction with a DAG-based summarization system that preserves every message while keeping active context within model token limits.
 
+Built and maintained by **[Martian Engineering](https://martian.engineering/?utm_source=github&utm_medium=readme&utm_campaign=lossless-claw)**. Need help with agents, memory, or AI in your own stack? [Get in touch](#about-martian-engineering).
+
 ## Table of contents
 
 - [What it does](#what-it-does)
@@ -14,6 +16,7 @@ Lossless Context Management plugin for [OpenClaw](https://github.com/openclaw/op
   - [Line endings](#line-endings)
 - [Security](#security)
 - [License](#license)
+- [About Martian Engineering](#about-martian-engineering)
 
 ## What it does
 
@@ -111,6 +114,42 @@ npx --package @martian-engineering/lossless-claw@latest lossless-claw-migrate-se
 ```
 
 The command defaults to `${OPENCLAW_STATE_DIR:-~/.openclaw}` and `${OPENCLAW_STATE_DIR:-~/.openclaw}/lcm.db`. `--apply` creates a timestamped SQLite backup before writing when the database already exists. Use `--file <path>` or repeatable `--sessions-dir <path>` for targeted imports, `--since <iso-date>` or `--limit <n>` to narrow a batch, and `--json` for machine-readable output.
+
+The same command can import one Codex rollout JSONL file. Codex imports require
+an explicit target OpenClaw session id and session key; the Codex thread id is
+kept as source provenance and is not used as the destination identity:
+
+```bash
+lossless-claw-migrate-sessions \
+  --source-format codex \
+  --file ~/.codex/sessions/2026/10/03/rollout-<thread-id>.jsonl \
+  --session-id '<openclaw-session-id>' \
+  --session-key 'agent:main:<conversation>'
+```
+
+Codex mode accepts exactly one `--file` and does not discover files or accept
+`--sessions-dir`, `--limit`, or `--since`. It reads the complete available
+rollout, preserves user, assistant, and tool content plus source-record
+provenance, and appends new records on a safe replay. It rejects malformed,
+changed, or truncated sources before committing rows. Codex source ids remain
+in message-part metadata. Tool names, arguments, and outputs have searchable
+text projections alongside their original structured payloads. Mirrored events
+and lifecycle records are archived in the first imported message's source
+metadata, without adding conversation turns. OpenClaw transcript anchor ids retain their native
+meaning. Native LCM continuation still depends on a later OpenClaw transcript
+tail containing matching user/assistant text. Codex provenance ids do not
+prove that overlap; tool-only or otherwise nonmatching tails may start a fresh
+conversation. The CLI prints this limitation with the import result. If the
+rollout is marked paginated or forked, the result also warns that inherited
+Codex history was not resolved, so only the available file was imported. The
+target must be fresh or contain only a prior import of that same Codex thread;
+the CLI refuses to append old history after live messages or to merge a second
+Codex thread into that destination. This command does not run summarization or
+make model calls.
+
+The default source format remains `openclaw`, so existing invocations keep
+their current behavior. Codex imports should still be run in dry-run mode and
+reviewed before adding `--apply`.
 
 ## Quick start
 
@@ -625,3 +664,22 @@ for the supported disclosure process and response expectations.
 ## License
 
 MIT
+
+## About Martian Engineering
+
+lossless-claw is built, maintained, and funded by
+[Martian Engineering](https://martian.engineering/?utm_source=github&utm_medium=readme&utm_campaign=lossless-claw).
+
+We're a small team of senior engineers who build products, integrations, data
+systems, and agents inside our clients' stacks, and run hands-on AI training for
+engineering teams in their own codebases.
+
+If you're running lossless-claw in production, building on OpenClaw, or want
+help bringing agents into your own systems, we'd like to hear from you:
+
+- Email: [clients@martian.engineering](mailto:clients@martian.engineering)
+- Book a call: [30-minute intro](https://calendly.com/drew-tada-martian/30min?utm_source=github&utm_medium=readme&utm_campaign=lossless-claw)
+- More of our open source: [github.com/Martian-Engineering](https://github.com/Martian-Engineering)
+
+Bug reports and feature requests belong in
+[GitHub Issues](https://github.com/Martian-Engineering/lossless-claw/issues).

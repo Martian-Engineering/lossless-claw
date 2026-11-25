@@ -1,3 +1,5 @@
+import { getFileBackedDatabasePath } from "./db/connection.js";
+import { resolveBundledSearchWorkerUrl, SearchWorkerClient } from "./search/search-worker-client.js";
 import { createHash } from "node:crypto";
 import { join } from "node:path";
 import type { DatabaseSync } from "node:sqlite";
@@ -23,7 +25,7 @@ import type {
   TranscriptEntryAnchor,
   TranscriptTurnAdmission,
 } from "./openclaw-bridge.js";
-import { ContextAssembler } from "./assembler.js";
+import { ContextAssembler, storedTimeMs } from "./assembler.js";
 import { CompactionEngine, type CompactionConfig } from "./compaction.js";
 import { BatchDeduplicator } from "./batch-dedup.js";
 import { CompactionGuards } from "./compaction-guards.js";
@@ -45,12 +47,13 @@ import { readRuntimeModelContext } from "./runtime-model.js";
 import type { LcmConfig } from "./db/config.js";
 import { getLcmDbFeatures } from "./db/features.js";
 import { runLcmMigrations } from "./db/migration.js";
+import { isSqliteBusyError } from "./db/sqlite-errors.js";
 import {
   createDelegatedExpansionGrant,
+  deferDelegatedExpansionGrantCleanup,
+  flushDeferredDelegatedExpansionGrantCleanups,
   getRuntimeExpansionAuthManager,
-  removeDelegatedExpansionGrantForSession,
   resolveDelegatedExpansionGrantId,
-  revokeDelegatedExpansionGrantForSession,
 } from "./expansion-auth.js";
 import { describeLogError, formatSessionLabel } from "./lcm-log.js";
 import {
@@ -92,6 +95,7 @@ import type {
   VisibleSessionTranscriptMessageEntry,
 } from "./types.js";
 import { estimateTokens, estimateSerializedMessagesTokens } from "./estimate-tokens.js";
+import { resolveFreshTailTokenCap } from "./fresh-tail.js";
 import { hashAgentMessageForAssemblyProtection, messagesHaveSameLiveCoverageSignature } from "./message-signatures.js";
 import {
   buildDeterministicFallbackSummary,
@@ -106,11 +110,12 @@ import {
   observeUserReplayIdentity,
   restoreRawUserReplay,
   type UserReplayIdentity,
+  type UserReplaySource,
 } from "./user-replay.js";
 import { extractStableEventKey } from "./stable-event-key.js";
 import { describeAssembledPrefixChange, formatOverflowDiagnosticsForLog, shouldLogOverflowDiagnostics, type AssemblePrefixSnapshot, type BootstrapImportObservation } from "./assemble-debug.js";
 
-import { buildDegradedLiveAssembleResult, clampMessagesToSerializedBudget, SERIALIZED_OUTPUT_CLAMP_SAFETY_RATIO } from "./assemble-fallback.js";
+import { buildDegradedLiveAssembleResult, clampMessagesToSerializedBudget, SERIALIZED_OUTPUT_CLAMP_SAFETY_RATIO, type LiveWindowState } from "./assemble-fallback.js";
 import { resolveBootstrapMaxTokens } from "./bootstrap-budget.js";
 import { batchLooksLikeHeartbeatAckTurn, pruneHeartbeatOkTurns } from "./heartbeat-filter.js";
 import { appendUncoveredVolatileLiveInputsWithinBudget, isVolatileLiveInputMessage, resolveProtectedFreshTailAssembledIndexes, stripTrailingAssistantPrefill } from "./live-coverage.js";
@@ -253,6 +258,7 @@ const HOST_SESSION_END_REASON_DELETED = "deleted";
 const HOST_SESSION_END_REASON_RESET = "reset";
 const CONTEXT_ENGINE_PROJECTION_EPOCH_VERSION = "summary-prefix-v1";
 const DEFERRED_ASSEMBLY_PRESSURE_RATIO = 0.75;
+const MAX_TRACKED_LIVE_WINDOWS = 1_024;
 const PENDING_SUMMARY_MODEL_UNAVAILABLE_REASON = "pending summary model unavailable";
 type CompactionExecutionParams = {
   /** Authoritative forced-recovery snapshot is fully reconciled. */
@@ -273,6 +279,10 @@ type CompactionExecutionParams = {
   legacyParams?: Record<string, unknown>;
   /** Force compaction even if below threshold */
   force?: boolean;
+  /** Host cancellation for long compactions; committed passes are kept. */
+  abortSignal?: AbortSignal;
+  /** Refreshes the host compaction idle timeout after each committed pass. */
+  onProgress?: () => void;
 };
 type ContextEngineMaintenanceRuntimeContext = Record<string, unknown> & {
   allowDeferredCompactionExecution?: boolean;
@@ -439,7 +449,6 @@ function describeTranscriptSyncOutcome(outcome: TranscriptSyncOutcome): string {
 // ── LcmContextEngine ────────────────────────────────────────────────────────
 
 
-
 export class LcmContextEngine implements ContextEngine {
   readonly info: ContextEngineInfo;
 
@@ -478,6 +487,7 @@ export class LcmContextEngine implements ContextEngine {
   private assembler: ContextAssembler;
   private compaction: CompactionEngine;
   private retrieval: RetrievalEngine;
+  private readonly searchWorker: SearchWorkerClient | null;
   private readonly db: DatabaseSync;
   private migrated = false;
   private readonly fts5Available: boolean = false;
@@ -489,6 +499,9 @@ export class LcmContextEngine implements ContextEngine {
   >();
   private deferredCompactionDrains = new Set<string>();
   private pendingSummaryPreparationDrains = new Set<string>();
+  // Bounded live-window heads per conversation, so live fallbacks keep the
+  // provider prompt prefix stable across tool-loop requests.
+  private liveWindows = new Map<number, LiveWindowState>();
   // Data-only requests. The host's background maintain() call owns execution;
   // never capture a foreground async scope or call-bound LLM capability here.
   private maintenanceRequests = new Map<string, DeferredCompactionDebtDrainParams>();
@@ -564,7 +577,14 @@ export class LcmContextEngine implements ContextEngine {
       id: "lossless-claw",
       name: "Lossless Context Management Engine",
       version: packageJson.version,
-      acceptedHostParams: ["sessionKey", "sessionTarget", "prompt", "runtimeContext", "runtimeSettings"],
+      acceptedHostParams: [
+        "sessionKey",
+        "sessionTarget",
+        "prompt",
+        "runtimeContext",
+        "runtimeSettings",
+        "onProgress",
+      ],
       transcriptSemantics: {
         currentTurnFence: "before-current-turn-entry-v1",
         turnAdvancementIdempotency: "atomic-idempotent-v1",
@@ -623,6 +643,11 @@ export class LcmContextEngine implements ContextEngine {
       },
     });
     this.summaryStore = new SummaryStore(this.db, { fts5Available: this.fts5Available });
+    this.searchWorker = this.createSearchWorker();
+    if (this.searchWorker) {
+      this.conversationStore.setSearchExecutor(this.searchWorker);
+      this.summaryStore.setSearchExecutor(this.searchWorker);
+    }
     this.pendingSummaryStore = new PendingSummaryStore(this.db);
     this.largeFileInterceptor = new LargeFileInterceptor(
       this.config,
@@ -650,6 +675,8 @@ export class LcmContextEngine implements ContextEngine {
           log: this.deps.log,
           matchesPersistedAnchor: (messageId, message) =>
             this.batchDeduplicator.matchesPersistedAnchor(messageId, message),
+          matchHostDeliveredAssistantId: (conversationId, message) =>
+            this.batchDeduplicator.matchHostDeliveredAssistantId(conversationId, message),
         })
       : null;
     this.telemetryRecorder = new CompactionTelemetryRecorder(
@@ -1574,6 +1601,8 @@ export class LcmContextEngine implements ContextEngine {
     sessionQueueHeld?: boolean;
     maxPendingSteps?: number;
     publishPolicy?: PendingCompactionPublishPolicy;
+    abortSignal?: AbortSignal;
+    onProgress?: () => void;
   }): Promise<CompactResult & { pending?: boolean }> {
     const breakerScope = this.resolveSessionQueueKey(params.sessionId, params.sessionKey);
     const publicationOnly = params.publishPolicy === "publish-ready-only";
@@ -1667,6 +1696,10 @@ export class LcmContextEngine implements ContextEngine {
       params.contextThresholdOverride?.freshTailCount ?? this.config.freshTailCount;
     const pendingLeafChunkTokens =
       params.contextThresholdOverride?.leafChunkTokens ?? this.config.leafChunkTokens;
+    const pendingFreshTailCap = resolveFreshTailTokenCap(
+      this.config.freshTailMaxTokens,
+      params.tokenBudget,
+    );
     const coordinator = new PendingCompactionCoordinator({
       conversationStore: this.conversationStore,
       summaryStore: this.summaryStore,
@@ -1677,7 +1710,8 @@ export class LcmContextEngine implements ContextEngine {
       ...(withPublishLock ? { withPublishLock } : {}),
       config: {
         freshTailCount: pendingFreshTailCount,
-        freshTailMaxTokens: this.config.freshTailMaxTokens,
+        freshTailMaxTokens: pendingFreshTailCap.maxTokens,
+        freshTailMinMessages: pendingFreshTailCap.minMessages,
         leafChunkTokens: pendingLeafChunkTokens,
         condensedMinFanout: this.config.condensedMinFanout,
         condensedMinSourceTokens: this.resolvePendingCondensedMinSourceTokens(),
@@ -1812,6 +1846,8 @@ export class LcmContextEngine implements ContextEngine {
             customInstructions: params.customInstructions,
             compactionTarget: params.compactionTarget,
             force: params.force === true,
+            abortSignal: params.abortSignal,
+            onProgress: params.onProgress,
           });
           if (params.sessionQueueHeld === true) {
             return runLegacyCompaction();
@@ -1849,6 +1885,22 @@ export class LcmContextEngine implements ContextEngine {
       reason: "pending summary work remains",
       result: lastResult,
     };
+  }
+
+  /** Return the live-window state for a conversation, retaining the most recent ones. */
+  private getLiveWindowState(conversationId: number): LiveWindowState {
+    let state = this.liveWindows.get(conversationId);
+    if (state) {
+      this.liveWindows.delete(conversationId);
+    } else {
+      state = {};
+      if (this.liveWindows.size >= MAX_TRACKED_LIVE_WINDOWS) {
+        const oldest = this.liveWindows.keys().next().value;
+        if (oldest !== undefined) this.liveWindows.delete(oldest);
+      }
+    }
+    this.liveWindows.set(conversationId, state);
+    return state;
   }
 
   /** Publish ready work, then prepare at most one bounded pass before eviction. */
@@ -2269,6 +2321,8 @@ export class LcmContextEngine implements ContextEngine {
           ...(runtimeAdjustedSweepTargetTokens !== undefined
             ? { stopAtTokens: runtimeAdjustedSweepTargetTokens }
             : {}),
+          ...(params.abortSignal ? { abortSignal: params.abortSignal } : {}),
+          onPassCommitted: () => params.onProgress?.(),
         });
 
       let sweepResult: Awaited<ReturnType<CompactionEngine["compact"]>>;
@@ -2498,6 +2552,8 @@ export class LcmContextEngine implements ContextEngine {
       ...(effectiveCurrentTokens !== undefined ? { currentTokens: effectiveCurrentTokens } : {}),
       summarize,
       summaryModel,
+      ...(params.abortSignal ? { abortSignal: params.abortSignal } : {}),
+      onPassCommitted: () => params.onProgress?.(),
     });
     // Host lifecycle and capability/policy failures must still fail closed.
     if (compactResult.error instanceof LcmRuntimeLifecycleError ||
@@ -3366,7 +3422,7 @@ export class LcmContextEngine implements ContextEngine {
       result = await this.drainDeferredCompactionDebtIfIdle(work);
     } else {
       const leaf = await this.compaction.evaluateLeafTrigger(
-        conversation.conversationId, this.config.leafChunkTokens,
+        conversation.conversationId, this.config.leafChunkTokens, tokenBudget,
       );
       if (!leaf.shouldCompact) return outcome;
       result = await this.drainPendingSummaryPreparationIfIdle(work);
@@ -3935,6 +3991,7 @@ export class LcmContextEngine implements ContextEngine {
         const leafDecision = await this.compaction.evaluateLeafTrigger(
           conversation.conversationId,
           this.config.leafChunkTokens,
+          tokenBudget,
         );
         this.deps.log.debug(
           `[lcm] pending-summary-prep: selected phase=${params.phase} conversation=${conversation.conversationId} ${sessionLabel} rawTokensOutsideTail=${leafDecision.rawTokensOutsideTail} threshold=${leafDecision.threshold} shouldPrepare=${leafDecision.shouldCompact}`,
@@ -4211,6 +4268,7 @@ export class LcmContextEngine implements ContextEngine {
     const normalizedCoverageText = normalizePromptRecallText(coverageText);
 
     const renderedMatches: string[] = [];
+    let newestMatchMs = 0;
     const seenMatchKeys = new Set<string>();
     for (const identifier of identifiers) {
       if (findPromptRecallIdentifierIndex(normalizedCoverageText, identifier) >= 0) {
@@ -4244,6 +4302,7 @@ export class LcmContextEngine implements ContextEngine {
           continue;
         }
         seenMatchKeys.add(seenMatchKey);
+        newestMatchMs = Math.max(newestMatchMs, storedTimeMs(stored.createdAt));
         renderedMatches.push(
           renderPromptRecallMessage({
             identifier,
@@ -4271,7 +4330,12 @@ export class LcmContextEngine implements ContextEngine {
       "</lossless_claw_prompt_recall>",
     ].join("\n");
     return {
-      message: { role: "user", content } as AgentMessage,
+      message: {
+        role: "user",
+        content,
+        // The newest quoted snippet's stored time keeps the cue deterministic.
+        timestamp: newestMatchMs,
+      } as AgentMessage,
       tokenCount: estimateTokens(content),
       matchedMessages: renderedMatches.length,
     };
@@ -4357,6 +4421,14 @@ export class LcmContextEngine implements ContextEngine {
     runtimeContext?: Record<string, unknown>;
     runtimeSettings?: ContextEngineRuntimeSettings;
   }): Promise<AssembleResult> {
+    if (
+      this.config.hostFallbackMode === "capture-only" &&
+      params.runtimeSettings?.executionHost?.id?.startsWith("cli:")
+    ) {
+      // CLI hosts own their history; the plugin wrapper still supplies memory instructions.
+      return { messages: [], estimatedTokens: 0 };
+    }
+
     let liveMessages = params.messages;
     // Return a new fallback array so the runtime hook treats this as assembled
     // context, and strip assistant prefill tails from fallback-only paths.
@@ -4470,7 +4542,22 @@ export class LcmContextEngine implements ContextEngine {
       });
       const assembledFreshTailCount =
         resolvedContextThreshold.freshTailCount ?? this.config.freshTailCount;
-      const replayIdentities = liveMessages.some(
+      const replayTarget = resolveSessionTranscriptReadTarget(params);
+      // The host's recent hydration window is not the authority for retained
+      // history. Read only the raw users LCM still retains, with their carriers.
+      const replayGroups =
+        replayTarget && this.deps.readSessionTranscriptReplayGroups
+          ? await this.deps.readSessionTranscriptReplayGroups({
+              ...replayTarget,
+              entryIds: this.userReplayKeyStore.listRawUserContextKeys(conversation.conversationId)
+                .map(state => state.entryId),
+            })
+          : undefined;
+      // Undefined means unsupported; an empty canonical result is authoritative.
+      const replaySources: Map<string, UserReplaySource> | undefined = replayGroups === undefined
+        ? undefined
+        : new Map(replayGroups.map(group => [group.entryId, group]));
+      const replayIdentities = !replaySources && liveMessages.some(
         message => message.role === "user" && typeof Reflect.get(message, "idempotencyKey") === "string",
       )
         ? await this.loadRawUserReplayIdentities({
@@ -4523,7 +4610,7 @@ export class LcmContextEngine implements ContextEngine {
             protectedAssembledIndexes: new Set<number>(),
             tokenBudget: Number.MAX_SAFE_INTEGER,
           });
-          const replay = restoreRawUserReplay(withLiveInputs.messages, liveMessages, replayIdentities);
+          const replay = restoreRawUserReplay(withLiveInputs.messages, liveMessages, replayIdentities, replaySources);
           return Math.max(
             await this.summaryStore.getContextTokenCount(conversation.conversationId),
             estimateSerializedMessagesTokens(replay.messages),
@@ -4554,6 +4641,7 @@ export class LcmContextEngine implements ContextEngine {
           messages: fallback.messages,
           tokenBudget,
           preserveSubstantiveAssistantTail: hostDeliversCurrentTurnSeparately,
+          liveWindow: this.getLiveWindowState(conversation.conversationId),
         });
         if (clamp.clamped || clamp.overBudget) {
           this.deps.log.warn(
@@ -4575,6 +4663,7 @@ export class LcmContextEngine implements ContextEngine {
           tokenBudget,
           preserveSubstantiveAssistantTail: hostDeliversCurrentTurnSeparately,
           contextProjection,
+          liveWindow: this.getLiveWindowState(conversation.conversationId),
         });
         this.deps.log.warn(
           `[lcm] assemble: degraded live fallback conversation=${conversation.conversationId} ${sessionLabel} reason=${coverageTrailsLive ? "coverage-trails-live" : foregroundRelief.reason} pressure=${foregroundRelief.pressure} tokenBudget=${tokenBudget} estimatedTokens=${degraded.estimatedTokens}`,
@@ -4715,7 +4804,7 @@ export class LcmContextEngine implements ContextEngine {
       // budget math above runs on stored-content token counts, which undercount
       // live messages that carry structured tool payloads; this is the last
       // line of defense that keeps assembled output deliverable to the model.
-      const replay = restoreRawUserReplay(volatileLiveInputAppend.messages, liveMessages, replayIdentities);
+      const replay = restoreRawUserReplay(volatileLiveInputAppend.messages, liveMessages, replayIdentities, replaySources);
       let serializedClamp = clampMessagesToSerializedBudget({
         messages: replay.messages,
         tokenBudget,
@@ -4964,6 +5053,10 @@ export class LcmContextEngine implements ContextEngine {
     legacyParams?: Record<string, unknown>;
     /** Force compaction even if below threshold */
     force?: boolean;
+    /** Host cancellation (run abort or compaction safety timeout). */
+    abortSignal?: AbortSignal;
+    /** Host idle-timeout refresh; requires "onProgress" in acceptedHostParams. */
+    onProgress?: () => void;
   }): Promise<CompactResult> {
     const recoveryTarget = params.force === true && params.compactionTarget === "budget"
       ? resolveSessionTranscriptReadTarget(params)
@@ -5049,6 +5142,8 @@ export class LcmContextEngine implements ContextEngine {
           force: params.force,
           sessionQueueHeld: true,
           maxPendingSteps: manualPendingStepCap,
+          abortSignal: params.abortSignal,
+          onProgress: params.onProgress,
         };
         const result: CompactResult & { pending?: boolean } = authoritativeRecovery
           ? await this.executeCompactionCore(execution)
@@ -5100,6 +5195,8 @@ export class LcmContextEngine implements ContextEngine {
         ? Math.floor(params.ttlMs)
         : undefined;
 
+    await this.flushDelegatedGrantCleanups("prepareSubagentSpawn");
+
     // Inherit scope from parent grant if one exists (prevents privilege escalation)
     const parentGrantId = resolveDelegatedExpansionGrantId(parentSessionKey);
     const parentGrant = parentGrantId
@@ -5121,19 +5218,35 @@ export class LcmContextEngine implements ContextEngine {
       ? parentGrant.allowedSummaryIds
       : undefined;
 
-    createDelegatedExpansionGrant({
-      delegatedSessionKey: childSessionKey,
-      issuerSessionId: parentSessionKey,
-      allowedConversationIds: [conversationId],
-      allowedSummaryIds: childAllowedSummaryIds,
-      tokenCap: childTokenCap,
-      maxDepth: childMaxDepth,
-      ttlMs,
-    });
+    try {
+      await createDelegatedExpansionGrant({
+        delegatedSessionKey: childSessionKey,
+        issuerSessionId: parentSessionKey,
+        allowedConversationIds: [conversationId],
+        allowedSummaryIds: childAllowedSummaryIds,
+        tokenCap: childTokenCap,
+        maxDepth: childMaxDepth,
+        ttlMs,
+      });
+    } catch (error) {
+      if (!isSqliteBusyError(error)) {
+        throw error;
+      }
+      // Spawning without a grant is the fail-closed direction: delegated
+      // retrieval tools refuse sub-agent sessions that have no grant. Any
+      // earlier binding for this key is superseded, so stop resolving it and
+      // revoke it once the database is writable.
+      deferDelegatedExpansionGrantCleanup(childSessionKey, { revoke: true, removeBinding: true });
+      this.deps.log.warn(
+        `[lcm] prepareSubagentSpawn: spawning child=${childSessionKey} without a delegated expansion grant; database busy: ${describeLogError(error)}`,
+      );
+      return undefined;
+    }
 
     return {
-      rollback: () => {
-        revokeDelegatedExpansionGrantForSession(childSessionKey, { removeBinding: true });
+      rollback: async () => {
+        deferDelegatedExpansionGrantCleanup(childSessionKey, { revoke: true, removeBinding: true });
+        await this.flushDelegatedGrantCleanups("prepareSubagentSpawn rollback");
       },
     };
   }
@@ -5155,16 +5268,55 @@ export class LcmContextEngine implements ContextEngine {
 
     switch (params.reason) {
       case "deleted":
-        revokeDelegatedExpansionGrantForSession(childSessionKey, { removeBinding: true });
+        deferDelegatedExpansionGrantCleanup(childSessionKey, { revoke: true, removeBinding: true });
         break;
       case "completed":
-        revokeDelegatedExpansionGrantForSession(childSessionKey);
+        deferDelegatedExpansionGrantCleanup(childSessionKey, { revoke: true, removeBinding: false });
         break;
       case "released":
       case "swept":
-        removeDelegatedExpansionGrantForSession(childSessionKey);
+        deferDelegatedExpansionGrantCleanup(childSessionKey, { revoke: false, removeBinding: true });
         break;
     }
+    await this.flushDelegatedGrantCleanups("onSubagentEnded");
+  }
+
+  /**
+   * Apply queued delegated grant cleanups. Queued keys resolve as unbound until
+   * their cleanup lands. A busy or locked database leaves the rest queued for
+   * the next subagent hook and logs a warning instead of throwing; the stored
+   * grants still expire at their TTL.
+   */
+  private async flushDelegatedGrantCleanups(operation: string): Promise<void> {
+    const blocked = await flushDeferredDelegatedExpansionGrantCleanups();
+    if (blocked) {
+      this.deps.log.warn(
+        `[lcm] ${operation}: deferring delegated expansion grant cleanup for child=${blocked.sessionKey} (${blocked.pending} pending); database busy: ${describeLogError(blocked.error)}`,
+      );
+    }
+  }
+
+  /**
+   * Run searches on a worker thread with its own read-only connection when the
+   * database is file-backed and the bundled worker entry is present. In-memory
+   * databases and unbundled source runs search in-process.
+   */
+  private createSearchWorker(): SearchWorkerClient | null {
+    const databasePath = getFileBackedDatabasePath(this.config.databasePath);
+    const workerUrl = resolveBundledSearchWorkerUrl();
+    if (!databasePath || !workerUrl) {
+      return null;
+    }
+    return new SearchWorkerClient({
+      workerUrl,
+      databasePath,
+      fts5Available: this.fts5Available,
+    });
+  }
+
+  /** Stop the search worker thread. Called when the plugin releases its database. */
+  async closeSearchWorker(): Promise<void> {
+    await this.searchWorker?.close();
   }
 
   async dispose(): Promise<void> {

@@ -140,6 +140,17 @@ describe("budgetStartIndex", () => {
 describe("SuffixContentMatcher", () => {
   const samePayload = async () => true;
 
+  it("keeps proven-delivery claims within the offered ordered suffix", async () => {
+    const matcher = new SuffixContentMatcher([row(1, 10, null), row(2, 20, null), row(3, 30, null)]);
+    expect(matcher.claimMessageId(99)).toBeNull();
+    expect((await matcher.claim("h1", samePayload))?.messageId).toBe(1);
+    expect(matcher.claimMessageId(1)).toBeNull();
+    expect(matcher.claimMessageId(2)?.messageId).toBe(2);
+    expect(await matcher.claim("h2", samePayload)).toBeNull();
+    expect((await matcher.claim("h3", samePayload))?.messageId).toBe(3);
+    expect(matcher.claimMessageId(2)).toBeNull();
+  });
+
   it("claims identical content in stored order", async () => {
     const matcher = new SuffixContentMatcher([row(3, 30, null, "x"), row(1, 10, "old-1", "x"), row(2, 20, "old-2", "y")]);
     expect((await matcher.claim("x", samePayload))?.messageId).toBe(1);

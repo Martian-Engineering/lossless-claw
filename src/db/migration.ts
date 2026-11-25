@@ -1,5 +1,9 @@
 import type { DatabaseSync } from "node:sqlite";
 import { createHash } from "node:crypto";
+import {
+  invalidatePendingContextPositions,
+  resequenceContextItemsInTransaction,
+} from "./context-ordinals.js";
 import { getLcmDbFeatures } from "./features.js";
 import {
   canonicalizeOpenClawInboundMetadataIdentityContent,
@@ -68,6 +72,7 @@ const VERSIONED_BACKFILL_STEPS = {
   backfillSummaryMetadata: 1,
   backfillToolCallColumns: 1,
   repairOpenClawMetadataIdentityState: 2,
+  repairContextItemOrdinals: 1,
 } as const;
 
 type VersionedBackfillStepName = keyof typeof VERSIONED_BACKFILL_STEPS;
@@ -587,13 +592,28 @@ function ensureTranscriptGapTable(db: DatabaseSync): void {
   `);
 }
 
+/**
+ * Fill in identity hashes for messages that lack one.
+ *
+ * The partial index holds only rows whose hash is missing, so it is empty once
+ * every row is hashed and the lookup below costs one index probe instead of a
+ * full scan of messages. Building the index on an existing database scans the
+ * table once; later inserts without a hash enter the index and are hashed on
+ * the next run. INDEXED BY makes the query fail rather than silently fall back
+ * to a table scan if the planner ever stops using the index.
+ */
 function backfillMessageIdentityHashes(
   db: DatabaseSync,
   options?: { managesOwnTransaction?: boolean },
 ): void {
+  db.exec(
+    `CREATE INDEX IF NOT EXISTS messages_missing_identity_hash_idx
+     ON messages (message_id)
+     WHERE identity_hash IS NULL OR identity_hash = ''`,
+  );
   const selectStmt = db.prepare(
     `SELECT message_id, role, content
-     FROM messages
+     FROM messages INDEXED BY messages_missing_identity_hash_idx
      WHERE message_id > ?
        AND (identity_hash IS NULL OR identity_hash = '')
      ORDER BY message_id
@@ -789,6 +809,20 @@ function runVersionedBackfillStep(
       `[lcm] migration step failed: step=${stepName} algorithmVersion=${algorithmVersion} durationMs=${Date.now() - startedAt} error=${describeMigrationError(error)}`,
     );
     throw error;
+  }
+}
+
+function repairContextItemOrdinals(db: DatabaseSync): void {
+  const conversations = db
+    .prepare(
+      `SELECT conversation_id FROM context_items
+       GROUP BY conversation_id
+       HAVING MIN(ordinal) <> 0 OR MAX(ordinal) <> COUNT(*) - 1`,
+    )
+    .all() as Array<{ conversation_id: number }>;
+  for (const { conversation_id } of conversations) {
+    resequenceContextItemsInTransaction(db, conversation_id);
+    invalidatePendingContextPositions(db, conversation_id);
   }
 }
 
@@ -1714,11 +1748,41 @@ export function runLcmMigrations(
         `CREATE INDEX IF NOT EXISTS summaries_conv_depth_kind_idx ON summaries (conversation_id, depth, kind)`,
       ),
     );
+    // messages.created_at is stored after content, so ordering or filtering by
+    // it from the table reads every large row's overflow chain. These indexes
+    // let search rank, page and bound scans from index entries alone.
+    runMigrationStep("createMessageCreatedAtIndexes", log, () =>
+      db.exec(`
+        CREATE INDEX IF NOT EXISTS messages_created_idx ON messages (created_at);
+        CREATE INDEX IF NOT EXISTS messages_conv_created_idx ON messages (conversation_id, created_at);
+      `),
+    );
+    // SQLite checks RESTRICT / SET NULL foreign keys by looking up the child
+    // column for every deleted parent row. Without these indexes each deleted
+    // message or summary scans the whole child table.
+    runMigrationStep("createForeignKeyChildIndexes", log, () =>
+      db.exec(`
+        CREATE INDEX IF NOT EXISTS context_items_message_idx
+          ON context_items (message_id) WHERE message_id IS NOT NULL;
+        CREATE INDEX IF NOT EXISTS context_items_summary_idx
+          ON context_items (summary_id) WHERE summary_id IS NOT NULL;
+        CREATE INDEX IF NOT EXISTS pending_summary_nodes_canonical_summary_idx
+          ON pending_summary_nodes (canonical_summary_id) WHERE canonical_summary_id IS NOT NULL;
+        CREATE INDEX IF NOT EXISTS conversation_transcript_gaps_prev_message_idx
+          ON conversation_transcript_gaps (prev_message_id) WHERE prev_message_id IS NOT NULL;
+        CREATE INDEX IF NOT EXISTS conversation_transcript_gaps_next_message_idx
+          ON conversation_transcript_gaps (next_message_id) WHERE next_message_id IS NOT NULL;
+      `),
+    );
     runVersionedBackfillStep(db, "backfillSummaryMetadata", log, () =>
       backfillSummaryMetadata(db),
     );
     runVersionedBackfillStep(db, "backfillToolCallColumns", log, () =>
       backfillToolCallColumns(db),
+    );
+
+    runVersionedBackfillStep(db, "repairContextItemOrdinals", log, () =>
+      repairContextItemOrdinals(db),
     );
 
     const detectedFeatures = options?.fts5Available === false ? null : getLcmDbFeatures(db);

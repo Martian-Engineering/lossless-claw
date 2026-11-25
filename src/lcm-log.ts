@@ -85,8 +85,12 @@ function readRuntimeConfigCandidates(api: OpenClawPluginApi): Record<string, unk
   return candidates;
 }
 
-function readOpenClawRedactionConfig(api: OpenClawPluginApi): IndependentLogRedactionConfig {
-  const loggingConfig = readRuntimeConfigCandidates(api)
+function readOpenClawRedactionConfig(
+  api: OpenClawPluginApi,
+  openClawConfig: unknown,
+): IndependentLogRedactionConfig {
+  const candidates = isRecord(openClawConfig) ? [openClawConfig] : readRuntimeConfigCandidates(api);
+  const loggingConfig = candidates
     .map((candidate) => candidate.logging)
     .find(isRecord);
   const redactSensitive = loggingConfig?.redactSensitive;
@@ -105,10 +109,14 @@ function shouldWriteIndependentDebug(api: OpenClawPluginApi): boolean {
 }
 
 /** Create the LCM logger, preferring OpenClaw's runtime child logger. */
-export function createLcmLogger(api: OpenClawPluginApi, config: LcmConfig): LcmLogger {
+export function createLcmLogger(
+  api: OpenClawPluginApi,
+  config: LcmConfig,
+  openClawConfig?: unknown,
+): LcmLogger {
   const fileLogger = createIndependentLcmFileLogger(
     config.independentLogFile,
-    readOpenClawRedactionConfig(api),
+    readOpenClawRedactionConfig(api, openClawConfig),
   );
   const writeDebugToFile = shouldWriteIndependentDebug(api);
   const runtimeLogger = api.runtime?.logging?.getChildLogger?.({ plugin: "lossless-claw" });

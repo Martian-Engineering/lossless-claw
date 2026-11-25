@@ -127,6 +127,12 @@ describe("lcm plugin prompt hook", () => {
     expect(result.prependSystemContext).toContain("Recall order for compacted conversation history:");
     expect(result.prependSystemContext).toContain("1. `lcm_grep` — search by regex or full-text");
     expect(result.prependSystemContext).toContain("`lcm_grep` routing guidance");
+    expect(result.prependSystemContext).toContain(
+      "`lcm_grep` requires `pattern`, not `query`, in both search modes",
+    );
+    expect(result.prependSystemContext).toContain(
+      'lcm_grep(pattern: "database migration", mode: "full_text")',
+    );
     expect(result.prependSystemContext).toContain('Prefer `mode: "full_text"` for keyword or topical recall');
     expect(result.prependSystemContext).toContain("Full-text queries are not regexes");
     expect(result.prependSystemContext).toContain("Alternation (`A|B`)");

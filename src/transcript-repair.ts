@@ -285,9 +285,15 @@ function shouldUseCandidateToolResult(
 function makeMissingToolResult(params: {
   toolCallId: string;
   toolName?: string;
+  timestamp?: number;
 }): AgentMessageLike {
   return {
     role: "toolResult",
+    // Inherit the calling assistant's time so the synthetic result stays deterministic.
+    timestamp:
+      typeof params.timestamp === "number" && Number.isFinite(params.timestamp)
+        ? params.timestamp
+        : 0,
     toolCallId: params.toolCallId,
     toolName: params.toolName ?? "unknown",
     content: [
@@ -585,6 +591,7 @@ export function sanitizeToolUseResultPairing<T extends AgentMessageLike>(
         const missing = makeMissingToolResult({
           toolCallId: call.id,
           toolName: call.name,
+          timestamp: assistantMsg.timestamp,
         });
         changed = true;
         pushToolResult(missing as T);

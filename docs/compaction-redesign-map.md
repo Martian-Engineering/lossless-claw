@@ -131,7 +131,7 @@ The fresh tail:
 
 - is always included during assembly
 - is excluded from leaf summarization
-- may be capped by `freshTailMaxTokens`
+- is capped by `freshTailMaxTokens`, or by default at 25% of the token budget while keeping at least 8 messages
 - expands through the newest user message when count or token limits would split its assistant/tool suffix
 
 Relevant code:

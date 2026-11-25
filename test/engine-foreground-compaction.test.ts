@@ -10,6 +10,8 @@ afterEach(cleanupEngineTestState);
 const SESSION = "foreground-recovery";
 const BUDGET = 22_000;
 const SIGNATURE = "synthetic-opaque-signature".repeat(40);
+// Visible reasoning carries the pressure; opaque signatures are not prompt tokens.
+const REASONING = `Inspect the observation. ${"synthetic reasoning".repeat(54)}`;
 
 /** Only completion is synthetic; persistence, planning and publication are real. */
 function fixture(config: Parameters<typeof createEngineWithDeps>[0] = {}, deps: Parameters<typeof createEngineWithDeps>[1] = {}) {
@@ -18,6 +20,9 @@ function fixture(config: Parameters<typeof createEngineWithDeps>[0] = {}, deps: 
   const engine = createEngineWithDeps({
     contextThreshold: 0.65,
     freshTailCount: 4,
+    // These scenarios size the protected tail by count. The default
+    // budget-relative cap is covered in fresh-tail-default-cap.test.ts.
+    freshTailMaxTokens: 1_000_000,
     leafChunkTokens: 6_000,
     maxSweepIterations: 12,
     summaryProvider: "anthropic",
@@ -32,7 +37,7 @@ function turnMessages(turn: number): AgentMessage[] {
   return [
     makeMessage({ role: "user", content: `Inspect observation ${turn}`, timestamp: turn * 4 + 1 }),
     makeMessage({ role: "assistant", timestamp: turn * 4 + 2, content: [
-      { type: "thinking", thinking: "Inspect the observation", thinkingSignature: SIGNATURE },
+      { type: "thinking", thinking: REASONING, thinkingSignature: SIGNATURE },
       { type: "toolCall", id: `inspect-${turn}`, name: "inspect", arguments: { turn } },
     ] }),
     makeMessage({ role: "toolResult", toolCallId: `inspect-${turn}`, content: `Observation ${turn} is stable`, timestamp: turn * 4 + 3 }),

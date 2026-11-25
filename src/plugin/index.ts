@@ -20,6 +20,7 @@ import { resolveLcmConfigWithDiagnostics, resolveOpenclawStateDir } from "../db/
 import type { LcmConfig } from "../db/config.js";
 import { closeLcmConnection, createLcmDatabaseConnection, normalizePath } from "../db/connection.js";
 import { LcmContextEngine } from "../engine.js";
+import { bindRuntimeExpansionGrantDatabase } from "../expansion-auth.js";
 import { createLcmLogger, describeLogError } from "../lcm-log.js";
 import { logStartupBannerOnce } from "../startup-banner-log.js";
 import { getSharedInit, setSharedInit, removeSharedInit } from "./shared-init.js";
@@ -42,6 +43,7 @@ import type {
   VisibleSessionTranscriptMessageEntry,
 } from "../types.js";
 import { listConfiguredAgentIds, normalizeAgentId } from "./openclaw-agent-ids.js";
+import { loadCanonicalReplayReader } from "./canonical-replay.js";
 
 const MIN_CONTEXT_ENGINE_OPENCLAW_VERSION = "2026.9.2";
 
@@ -371,6 +373,8 @@ const LOSSLESS_RECALL_POLICY_PROMPT = [
   "3. `lcm_expand_query` — deep recall: spawns bounded sub-agent, expands DAG, and returns answer plus cited summary IDs in tool output for follow-up (~120s, don't ration it)",
   "",
   "**`lcm_grep` routing guidance:**",
+  "- `lcm_grep` requires `pattern`, not `query`, in both search modes; `lcm_expand_query` uses `query` for its search input.",
+  '- Example: `lcm_grep(pattern: "database migration", mode: "full_text")`.',
   '- Prefer `mode: "full_text"` for keyword or topical recall; keep `mode: "regex"` for regular expressions and literal patterns that use regex syntax.',
   '- Full-text queries are not regexes. Alternation (`A|B`), regex wildcards (`.*`), character classes (`[abc]`), and anchors (`^foo`, `foo$`) require `mode: "regex"`.',
   '- Full-text queries use FTS5 semantics, and FTS5 defaults to AND matching, so extra terms make matching stricter rather than broader.',
@@ -559,6 +563,17 @@ function hasReadOnlyRuntimeInspectionSignal(api: OpenClawPluginApi): boolean {
 }
 
 /** Runtime DB initialization is disabled for read-only inspection registrations. */
+/** Instance lifecycle exposed by OpenClaw 2026.9.5+ hosts; absent on older hosts. */
+type PluginInstanceLifecycle = {
+  onDispose?: (cleanup: () => void | Promise<void>) => unknown;
+};
+
+/** Read the optional instance lifecycle without depending on newer SDK types. */
+function readPluginLifecycle(api: OpenClawPluginApi): PluginInstanceLifecycle | undefined {
+  const lifecycle = (api as { lifecycle?: unknown }).lifecycle;
+  return lifecycle && typeof lifecycle === "object" ? (lifecycle as PluginInstanceLifecycle) : undefined;
+}
+
 function canInitializeRuntimeDatabase(api: OpenClawPluginApi): boolean {
   if (isReadOnlyRegistrationMode(readPluginRegistrationMode(api))) {
     return false;
@@ -645,6 +660,9 @@ function extractErrorStatusCode(value: unknown, depth = 0): number | undefined {
 /** OpenClaw's stable `runtime.llm.complete` error code for reload/retirement refusals. */
 const HOST_RUNTIME_LIFECYCLE_ERROR_CODE = "LLM_RUNTIME_LIFECYCLE";
 
+/** Reported when the host resolves a completion with `stopReason: "aborted"`. */
+const HOST_ABORTED_COMPLETION_MESSAGE = "runtime.llm.complete was aborted by the host";
+
 const HOST_RUNTIME_LIFECYCLE_MESSAGES = new Set([
   "Async work scope is closed",
   "Plugin inventory has retired; begin a new plugin operation.",
@@ -656,12 +674,24 @@ const HOST_RUNTIME_LIFECYCLE_MESSAGES = new Set([
  * publish `LLM_RUNTIME_LIFECYCLE` classify their own refusals. Older hosts throw
  * uncoded errors: model-runtime reload admission refusals carry `admissionBlocked`,
  * possibly under a wrapper's cause chain, and the exact messages cover the rest.
+ * Host cancellation surfaces as a thrown `AbortError` or (once the provider
+ * request started) as a result with `stopReason: "aborted"`.
  */
 function isHostRuntimeLifecycleRejection(error: unknown): boolean {
   if (isRecord(error) && error.code === HOST_RUNTIME_LIFECYCLE_ERROR_CODE) {
     return true;
   }
   if (HOST_RUNTIME_LIFECYCLE_MESSAGES.has(describeLogError(error))) {
+    return true;
+  }
+  // Lossless never passes its own signal to runtime.llm.complete, so a
+  // top-level AbortError comes from the host canceling the call (for example
+  // deferred maintenance yielding to a foreground turn or reaching its time
+  // budget). That is cancellation, not a provider failure: leave the work for
+  // a later pass instead of writing a truncation fallback summary. An
+  // AbortError nested as the cause of another error is not trusted: a
+  // provider client can abort its own request and report a failure.
+  if (isRecord(error) && error.name === "AbortError") {
     return true;
   }
   let current: unknown = error;
@@ -1283,7 +1313,7 @@ function createLcmDependencies(
   const envSnapshot = snapshotPluginEnv();
   const pluginConfig = registrationConfig.pluginConfig;
   const { config, diagnostics } = resolveLcmConfigWithDiagnostics(process.env, pluginConfig);
-  const log = createLcmLogger(api, config);
+  const log = createLcmLogger(api, config, registrationConfig.openClawConfig);
 
   if (diagnostics.ignoreSessionPatternsEnvOverridesPluginConfig) {
     logStartupBannerOnce({
@@ -1382,6 +1412,7 @@ function createLcmDependencies(
       const modelRef = runtimeModelOverride?.modelRef.trim();
       const runtimeLlm = runtimeLlmComplete ?? getRuntimeLlm(api)?.complete;
       const isBoundRuntimeLlm = !!runtimeLlmComplete;
+      const effectiveReasoning = reasoning?.trim() || reasoningIfSupported?.trim();
       const requestMetadata = {
         request_provider: providerId ?? "(runtime)",
         request_model: modelId || "(runtime)",
@@ -1419,8 +1450,22 @@ function createLcmDependencies(
           // agentId. Plugin-wide api.runtime.llm.complete is gateway-scoped and rejects
           // target-agent overrides unless OpenClaw is explicitly configured otherwise.
           ...(isBoundRuntimeLlm && agentId?.trim() ? { agentId: agentId.trim() } : {}),
-          ...(reasoning !== undefined ? { reasoning } : {}),
+          ...(effectiveReasoning ? { reasoning: effectiveReasoning } : {}),
         });
+        // Hosts that report stopReason resolve a mid-request cancellation
+        // instead of throwing; classify it like the thrown AbortError.
+        if (result.stopReason === "aborted") {
+          return {
+            content: [],
+            error: { kind: "runtime_lifecycle", message: HOST_ABORTED_COMPLETION_MESSAGE },
+            provider: result.provider,
+            model: result.model,
+            agentId: result.agentId,
+            usage: result.usage,
+            audit: result.audit,
+            ...requestMetadata,
+          };
+        }
         const text = typeof result.text === "string" ? result.text : "";
         return {
           content: text ? [{ type: "text", text }] : [],
@@ -1532,6 +1577,10 @@ function createLcmDependencies(
     readLatestAssistantReply,
     resolveAgentDir: () => api.resolvePath("."),
 
+    readSessionTranscriptReplayGroups: async (params) => {
+      const read = await loadCanonicalReplayReader();
+      return read ? await read(params) : undefined;
+    },
     readVisibleSessionTranscriptMessageEntries: async (target) => {
       const read = await loadSessionTranscriptRuntimeFunction(
         "readVisibleSessionTranscriptMessageEntries",
@@ -1715,6 +1764,7 @@ const lcmPlugin = {
     if (existingInit && !existingInit.stopped) {
       deps.log.debug(`[lcm] Reusing shared engine init for db=${normalizedDbPath}`);
       wirePluginHandlers(api, deps, existingInit, registrationConfig.openClawConfig);
+      readPluginLifecycle(api)?.onDispose?.(existingInit.retain());
       return;
     }
 
@@ -1727,6 +1777,7 @@ const lcmPlugin = {
     let rejectDeferredInit: ((error: Error) => void) | null = null;
     let stopped = false;
     let shared: SharedLcmInit | null = null;
+    let unbindExpansionGrants: (() => void) | null = null;
 
     /** Normalize unknown failures into stable Error instances. */
     function toInitError(error: unknown): Error {
@@ -1739,6 +1790,7 @@ const lcmPlugin = {
       const nextDatabase = createLcmDatabaseConnection(dbPath);
       try {
         const nextEngine = new LcmContextEngine(deps, nextDatabase);
+        unbindExpansionGrants = bindRuntimeExpansionGrantDatabase(nextDatabase);
         database = nextDatabase;
         lcm = nextEngine;
         initError = null;
@@ -1894,11 +1946,29 @@ const lcmPlugin = {
       }
     }
 
+    let disposableUsers = 0;
+    /** Count one disposable registration; its release closes the DB after the last one. */
+    function retainForDisposal(): () => Promise<void> {
+      disposableUsers += 1;
+      let released = false;
+      return async () => {
+        if (released) {
+          return;
+        }
+        released = true;
+        disposableUsers -= 1;
+        if (disposableUsers === 0) {
+          await releaseRuntimeResources();
+        }
+      };
+    }
+
     const nextShared: SharedLcmInit = {
       stopped: false,
       getCachedEngine: () => lcm,
       waitForEngine,
       waitForDatabase,
+      retain: retainForDisposal,
     };
     shared = nextShared;
     if (allowRuntimeDatabaseInit) {
@@ -1907,20 +1977,34 @@ const lcmPlugin = {
 
     api.on("gateway_start", reinitializeAfterGatewayStop);
 
-    api.on("gateway_stop", async () => {
+    /** Close this registration's database and drop its process-wide shared init. */
+    async function releaseRuntimeResources(): Promise<void> {
       stopped = true;
       nextShared.stopped = true;
       if (!lcm && !database) {
         rejectDeferredEngine(new Error("[lcm] Database connection closed after gateway_stop"));
       }
+      unbindExpansionGrants?.();
+      unbindExpansionGrants = null;
+      await lcm?.closeSearchWorker();
       if (database) {
         closeLcmConnection(database);
         database = null;
       }
       lcm = null;
       resetInitializationState();
-      removeSharedInit(normalizedDbPath);
-    });
+      // A newer registration may already own this path; leave its entry alone.
+      if (getSharedInit(normalizedDbPath) === nextShared) {
+        removeSharedInit(normalizedDbPath);
+      }
+    }
+
+    api.on("gateway_stop", releaseRuntimeResources);
+    // Hosts that retire plugin instances (plugin reload) await these callbacks.
+    // Later registrations for other agent contexts reuse this database, so the
+    // last disposed registration closes it. Teardown is idempotent, so running
+    // after gateway_stop is harmless.
+    readPluginLifecycle(api)?.onDispose?.(nextShared.retain());
 
     wirePluginHandlers(api, deps, nextShared, registrationConfig.openClawConfig);
 

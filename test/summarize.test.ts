@@ -93,6 +93,76 @@ describe("createLcmSummarizeFromLegacyParams", () => {
     vi.unstubAllEnvs();
   });
 
+  describe("punctuation-only reasoning remnants", () => {
+    const bareResponse = (source: "content" | "envelope", text: string) =>
+      source === "content"
+        ? { content: [{ type: "text", text }] }
+        : { content: [], output_text: text };
+
+    it.each(["content", "envelope"] as const)("retries bare punctuation-only %s summaries", async (source) => {
+      const complete = vi.fn()
+        .mockResolvedValueOnce(bareResponse(source, "..."))
+        .mockResolvedValueOnce({ content: [{ type: "text", text: "Recovered conversation summary." }] });
+      const summarize = await createSummarizeFn({ deps: makeDeps({ complete }), legacyParams: {} });
+      expect(await summarize!("Conversation source details", false)).toBe("Recovered conversation summary.");
+      expect(complete).toHaveBeenCalledTimes(2);
+    });
+
+    it.each(["content", "envelope"] as const)("falls back after bare punctuation-only retry %s summaries", async (source) => {
+      const complete = vi.fn()
+        .mockResolvedValueOnce({ content: [] })
+        .mockResolvedValueOnce(bareResponse(source, "。… \u200b"));
+      const summarize = await createSummarizeFn({ deps: makeDeps({ complete }), legacyParams: {} });
+      expect(await summarize!("Conversation source details", false)).toContain("Conversation source details");
+      expect(complete).toHaveBeenCalledTimes(2);
+    });
+
+    it.each(["短摘要", "I", "42", "✅"])("preserves substantive output without reasoning alongside bare punctuation-only checks: %s", async (text) => {
+      const complete = vi.fn().mockResolvedValue(bareResponse("content", text));
+      const summarize = await createSummarizeFn({ deps: makeDeps({ complete }), legacyParams: {} });
+      expect(await summarize!("Conversation source details", false)).toBe(text);
+      expect(complete).toHaveBeenCalledTimes(1);
+    });
+
+    const responseFor = (source: "content" | "envelope", suffix: string) => {
+      const body = `<think>PRIVATE_REASONING_REMNANT</think>${suffix}`;
+      return source === "content"
+        ? { content: [{ type: "text", text: body }] }
+        : { content: [{ type: "text", text: "<think>PRIVATE_CONTENT_REASONING</think>" }], output_text: body };
+    };
+
+    it.each(["content", "envelope"] as const)("retries a punctuation-only %s remnant", async (source) => {
+      const complete = vi.fn()
+        .mockResolvedValueOnce(responseFor(source, "."))
+        .mockResolvedValueOnce({ content: [{ type: "text", text: "Recovered conversation summary." }] });
+      const deps = makeDeps({ complete });
+      const summarize = await createSummarizeFn({ deps, legacyParams: {} });
+      expect(await summarize!("Conversation source details", false)).toBe("Recovered conversation summary.");
+      expect(complete).toHaveBeenCalledTimes(2);
+      expect(getDepsLogText(deps)).not.toContain("PRIVATE_REASONING_REMNANT");
+    });
+
+    it.each(["content", "envelope"] as const)("falls back when the retry %s remnant contains only Unicode punctuation and formatting", async (source) => {
+      const complete = vi.fn()
+        .mockResolvedValueOnce({ content: [] })
+        .mockResolvedValueOnce(responseFor(source, "。… \u200b"));
+      const deps = makeDeps({ complete });
+      const summarize = await createSummarizeFn({ deps, legacyParams: {} });
+      const summary = await summarize!("Conversation source details", false);
+      expect(summary).toContain("Conversation source details");
+      expect(summary).not.toContain("PRIVATE_REASONING_REMNANT");
+      expect(complete).toHaveBeenCalledTimes(2);
+    });
+
+    it.each(["短摘要", "I", "42", "✅"])("preserves a substantive short remnant: %s", async (suffix) => {
+      const complete = vi.fn().mockResolvedValue(responseFor("content", suffix));
+      const deps = makeDeps({ complete });
+      const summarize = await createSummarizeFn({ deps, legacyParams: {} });
+      expect(await summarize!("Conversation source details", false)).toBe(suffix);
+      expect(complete).toHaveBeenCalledTimes(1);
+    });
+  });
+
   it.each([false, true])("does not retry providers or synthesize fallback after host scope closure (retry=%s)", async (retry) => {
     const complete = vi.fn().mockResolvedValue({
       content: [], error: { kind: "runtime_lifecycle", message: "Async work scope is closed" },
@@ -2171,6 +2241,86 @@ describe("createLcmSummarizeFromLegacyParams", () => {
       expect(summary).toBe("summary output");
       // Only the single original call — no retry.
       expect(vi.mocked(deps.complete)).toHaveBeenCalledTimes(1);
+    });
+  });
+
+  describe("summary sanitization diagnostics", () => {
+    it.each(["content", "envelope"] as const)(
+      "reports a mixed %s response rewrite without disclosing its content",
+      async (source) => {
+        const body = "<think>PRIVATE_REASONING_PAYLOAD</think>PRIVATE_VISIBLE_SUMMARY";
+        const deps = makeDeps({
+          complete: vi.fn(async () => source === "content"
+            ? { content: [{ type: "text", text: body }] }
+            : { content: [], output_text: body }),
+        });
+        const summarize = await createSummarizeFn({ deps, legacyParams: {} });
+
+        expect(await summarize!("Conversation to summarize", false)).toBe("PRIVATE_VISIBLE_SUMMARY");
+        expect(deps.complete).toHaveBeenCalledTimes(1);
+        expect(deps.log.warn).toHaveBeenCalledExactlyOnceWith(
+          `[lcm] stripped reasoning-shaped content from summary; provider=anthropic; ` +
+            `model=claude-opus-4-5; source=${source}; ` +
+            `before_chars=${body.length}; after_chars=${"PRIVATE_VISIBLE_SUMMARY".length}`,
+        );
+        expect(getDepsLogText(deps)).not.toContain("PRIVATE_REASONING_PAYLOAD");
+        expect(getDepsLogText(deps)).not.toContain("PRIVATE_VISIBLE_SUMMARY");
+      },
+    );
+
+    it("reports a retry rewrite without disclosing the visible summary", async () => {
+      const body = "<think>PRIVATE_RETRY_REASONING</think>Visible summary.";
+      const complete = vi.fn()
+        .mockResolvedValueOnce({ content: [] })
+        .mockResolvedValueOnce({ content: [{ type: "text", text: body }] });
+      const deps = makeDeps({ complete });
+      const summarize = await createSummarizeFn({ deps, legacyParams: {} });
+
+      expect(await summarize!("Conversation to summarize", false)).toBe("Visible summary.");
+      expect(complete).toHaveBeenCalledTimes(2);
+      expect(deps.log.warn).toHaveBeenCalledWith(
+        `[lcm] stripped reasoning-shaped content from summary; provider=anthropic; ` +
+          `model=claude-opus-4-5; source=retry; before_chars=${body.length}; after_chars=${"Visible summary.".length}`,
+      );
+      expect(getDepsLogText(deps)).not.toContain("PRIVATE_RETRY_REASONING");
+    });
+
+    it.each([false, true])("reports envelope sanitization after reasoning-only content (retry=%s)", async (retry) => {
+      const content = "<think>PRIVATE_CONTENT_REASONING</think>";
+      const envelope = "<think>PRIVATE_ENVELOPE_REASONING</think>Visible envelope summary.";
+      const response = { content: [{ type: "text", text: content }], output_text: envelope };
+      const complete = vi.fn().mockResolvedValue(response);
+      if (retry) complete.mockResolvedValueOnce({ content: [] });
+      const deps = makeDeps({ complete });
+      const summarize = await createSummarizeFn({ deps, legacyParams: {} });
+
+      expect(await summarize!("Conversation to summarize", false)).toBe("Visible envelope summary.");
+      expect(complete).toHaveBeenCalledTimes(retry ? 2 : 1);
+      expect(deps.log.warn).toHaveBeenCalledWith(
+        `[lcm] stripped reasoning-shaped content from summary; provider=anthropic; ` +
+          `model=claude-opus-4-5; source=${retry ? "retry" : "envelope"}; ` +
+          `before_chars=${envelope.length}; after_chars=${"Visible envelope summary.".length}`,
+      );
+      expect(getDepsLogText(deps)).not.toContain("PRIVATE_CONTENT_REASONING");
+      expect(getDepsLogText(deps)).not.toContain("PRIVATE_ENVELOPE_REASONING");
+    });
+
+    it("keeps plain summaries quiet and retains the reasoning-only warning", async () => {
+      const plainDeps = makeDeps();
+      const plainSummarize = await createSummarizeFn({ deps: plainDeps, legacyParams: {} });
+      expect(await plainSummarize!("Conversation to summarize", false)).toBe("summary output");
+      expect(plainDeps.log.warn).not.toHaveBeenCalled();
+
+      const reasoningDeps = makeDeps({
+        complete: vi.fn()
+          .mockResolvedValueOnce({ content: [{ type: "text", text: "<think>PRIVATE_ONLY</think>" }] })
+          .mockResolvedValueOnce({ content: [{ type: "text", text: "Recovered summary" }] }),
+      });
+      const reasoningSummarize = await createSummarizeFn({ deps: reasoningDeps, legacyParams: {} });
+      expect(await reasoningSummarize!("Conversation to summarize", false)).toBe("Recovered summary");
+      expect(getDepsLogText(reasoningDeps, ["warn"])).toContain("dropped reasoning-shaped summary on first attempt");
+      expect(getDepsLogText(reasoningDeps, ["warn"])).not.toContain("stripped reasoning-shaped content from summary");
+      expect(getDepsLogText(reasoningDeps)).not.toContain("PRIVATE_ONLY");
     });
   });
 

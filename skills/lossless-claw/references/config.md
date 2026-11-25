@@ -118,16 +118,16 @@ Good starting range:
 
 ### `freshTailMaxTokens`
 
-Optional token cap for the protected fresh tail.
+Token cap for the protected fresh tail. When unset, the tail is capped at 25% of the call's token budget while always keeping the newest 8 messages; an explicit value replaces that default.
 
 Why it matters:
 
-- Prevents a few huge tool results from making the "fresh" suffix effectively uncompactable.
+- Prevents a few huge tool results, or a 64-message tail of tool exchanges, from making the "fresh" suffix effectively uncompactable.
 - Routine compaction preserves the newest user and its following suffix even above the cap. Forced budget recovery may summarize older complete tool groups, as described above.
 
 Good starting range:
 
-- Leave unset unless large tool outputs are forcing avoidable cost or overflow.
+- Leave unset to use the budget-relative default; set a fixed value only when a deployment needs a specific tail size.
 - Start around `12000` to `32000` when you want a softer, size-aware fresh tail.
 
 ### `promptAwareEviction`

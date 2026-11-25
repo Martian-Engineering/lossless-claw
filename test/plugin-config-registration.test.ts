@@ -1,8 +1,8 @@
-import { mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { afterEach, describe, expect, it, vi } from "vitest";
-import type { OpenClawPluginApi } from "../src/openclaw-bridge.js";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import type { AgentMessage, OpenClawPluginApi } from "../src/openclaw-bridge.js";
 import lcmPlugin from "../index.js";
 import * as connectionModule from "../src/db/connection.js";
 import { closeLcmConnection } from "../src/db/connection.js";
@@ -10,8 +10,26 @@ import { LcmContextEngine } from "../src/engine.js";
 import { clearAllSharedInit } from "../src/plugin/shared-init.js";
 import { resetStartupBannerLogsForTests } from "../src/startup-banner-log.js";
 import { runDelegatedExpansionLoop } from "../src/tools/lcm-expand-tool.delegation.js";
+import { FakeTranscriptHost } from "./transcript-delta-fake-host.js";
 
 const buildMemorySystemPromptAdditionMock = vi.hoisted(() => vi.fn());
+const transcriptRuntime = vi.hoisted(() => ({
+  modulePath: "openclaw/plugin-sdk/context-engine-transcript-runtime",
+  replay: undefined as unknown,
+  visible: vi.fn(),
+  raw: vi.fn(),
+  entries: vi.fn(),
+}));
+
+vi.mock("openclaw/plugin-sdk/session-transcript-runtime", () => ({
+  readSessionTranscriptVisibleMessageDelta: transcriptRuntime.visible,
+  readSessionTranscriptRawDelta: transcriptRuntime.raw,
+  readVisibleSessionTranscriptMessageEntries: transcriptRuntime.entries,
+}));
+
+vi.mock(transcriptRuntime.modulePath, () => ({
+  get readSessionTranscriptReplayGroups() { return transcriptRuntime.replay; },
+}));
 
 vi.mock("openclaw/plugin-sdk/core", () => ({
   buildMemorySystemPromptAddition: buildMemorySystemPromptAdditionMock,
@@ -24,6 +42,30 @@ vi.mock("openclaw/plugin-sdk/logging-core", () => ({
 type RegisteredEngineFactory = (() => unknown) | undefined;
 type HookHandler = (event: unknown, context: unknown) => unknown;
 type RegisteredContextEngine = { id: string; factory: () => unknown };
+
+const generatedDbPaths = new Set<string>();
+const generatedDbDirs = new Set<string>();
+
+/** Create a throwaway database path so registrations never open the default state-dir database. */
+function createTempDbPath(): string {
+  const dir = mkdtempSync(join(tmpdir(), "lossless-claw-registration-db-"));
+  generatedDbDirs.add(dir);
+  const dbPath = join(dir, "lcm.db");
+  generatedDbPaths.add(dbPath);
+  return dbPath;
+}
+
+/** Give a non-empty plugin config an explicit temp dbPath unless the test already chose one. */
+function withExplicitDbPath(pluginConfig: unknown): unknown {
+  if (!pluginConfig || typeof pluginConfig !== "object" || Array.isArray(pluginConfig)) {
+    return pluginConfig;
+  }
+  const config = pluginConfig as Record<string, unknown>;
+  if (Object.keys(config).length === 0 || config.dbPath !== undefined || config.databasePath !== undefined) {
+    return pluginConfig;
+  }
+  return { ...config, dbPath: createTempDbPath() };
+}
 
 function buildApi(
   pluginConfig: unknown,
@@ -63,7 +105,7 @@ function buildApi(
     name: "Lossless Context Management",
     source: "/tmp/lossless-claw",
     config: {},
-    pluginConfig,
+    pluginConfig: withExplicitDbPath(pluginConfig),
     ...(options?.registrationMode ? { registrationMode: options.registrationMode } : {}),
     runtime: {
       subagent: {
@@ -196,22 +238,115 @@ function compactionAndDefaultModelConfig(params: {
 describe("lcm plugin registration", () => {
   const dbPaths = new Set<string>();
   const tempDirs = new Set<string>();
+  let defaultStateDir = "";
+
+  beforeEach(() => {
+    defaultStateDir = mkdtempSync(join(tmpdir(), "lossless-claw-registration-state-"));
+    tempDirs.add(defaultStateDir);
+    vi.stubEnv("OPENCLAW_STATE_DIR", defaultStateDir);
+    vi.stubEnv("LCM_DATABASE_PATH", undefined);
+  });
 
   afterEach(() => {
-    for (const dbPath of dbPaths) {
+    // Every registration must name its database; none may fall back to the state-dir default.
+    const defaultDbPath = join(defaultStateDir, "lcm.db");
+    const openedDefaultDb = existsSync(defaultDbPath);
+    for (const dbPath of [...dbPaths, ...generatedDbPaths, defaultDbPath]) {
       closeLcmConnection(dbPath);
     }
     dbPaths.clear();
+    generatedDbPaths.clear();
+    for (const dir of generatedDbDirs) {
+      rmSync(dir, { recursive: true, force: true });
+    }
+    generatedDbDirs.clear();
     clearAllSharedInit();
     resetStartupBannerLogsForTests();
     buildMemorySystemPromptAdditionMock.mockReset();
+    transcriptRuntime.replay = undefined;
+    transcriptRuntime.visible.mockReset();
+    transcriptRuntime.raw.mockReset();
+    transcriptRuntime.entries.mockReset();
     vi.restoreAllMocks();
     vi.unstubAllEnvs();
     for (const dir of tempDirs) {
       rmSync(dir, { recursive: true, force: true });
     }
     tempDirs.clear();
+    expect(openedDefaultDb).toBe(false);
   });
+
+  it.each(["unsupported", "canonical", "empty", "rejected"] as const)(
+    "assembles retained history through the registered plugin on a %s replay host",
+    async (capability) => {
+      const dir = mkdtempSync(join(tmpdir(), "lcm-replay-host-"));
+      tempDirs.add(dir);
+      const dbPath = join(dir, "lcm.db");
+      dbPaths.add(dbPath);
+      const sessionId = "replay-host";
+      const sessionKey = "agent:main:replay-host";
+      const sessionTarget = { agentId: "main", sessionId, sessionKey };
+      const host = new FakeTranscriptHost(sessionId);
+      const users = Array.from({ length: 3 }, (_, index) => ({
+        role: "user", content: `request ${index}`, timestamp: 1000 + index,
+        idempotencyKey: `turn-${index}`,
+        provenance: { kind: "inter_session", sourceSessionKey: "agent:main:child", sourceTool: "subagent_settle" },
+      } as AgentMessage));
+      const entryIds = users.map(message => host.append(message));
+      const carrier = {
+        role: "custom", customType: "openclaw.runtime-context", display: false,
+        content: "retained runtime context", timestamp: 1001,
+        details: { source: "openclaw-runtime-context", runtimeContextCarrier: true },
+      } as AgentMessage;
+      transcriptRuntime.visible.mockImplementation(host.readVisibleDelta);
+      transcriptRuntime.raw.mockImplementation(host.readRawDelta);
+      transcriptRuntime.entries.mockImplementation(host.readVisibleEntries);
+      const readReplay = vi.fn(async () => {
+        if (capability === "rejected") throw new Error("canonical read unavailable");
+        return capability === "empty" ? [] : [{ entryId: entryIds[1], message: users[1], carriers: [carrier] }];
+      });
+      transcriptRuntime.replay = capability === "unsupported" ? undefined : readReplay;
+      const { api, getFactory, debugLog } = buildApi({
+        enabled: true, dbPath, independentLogFile: { enabled: false },
+      });
+      lcmPlugin.register(api);
+      const engine = getFactory()!() as Pick<LcmContextEngine,
+        "bootstrap" | "assemble" | "getConversationStore" | "getSummaryStore">;
+      await engine.bootstrap({ sessionId, sessionKey, sessionTarget });
+      const conversation = await engine.getConversationStore().getConversationForSession({ sessionId, sessionKey });
+      await engine.getSummaryStore().insertSummary({
+        summaryId: "retained-summary", conversationId: conversation!.conversationId,
+        kind: "leaf", depth: 0, content: "Earlier summarized history", tokenCount: 8,
+      });
+      await engine.getSummaryStore().replaceContextRangeWithSummary({
+        conversationId: conversation!.conversationId, startOrdinal: 0, endOrdinal: 0, summaryId: "retained-summary",
+      });
+      // Supported hosts must restore history outside the live window. The
+      // unsupported path can only restore carriers still in that window.
+      const live = capability === "canonical" ? [users[2]!] : [users[1]!, carrier, users[2]!];
+      const result = await engine.assemble({
+        sessionId, sessionKey, sessionTarget, messages: live, tokenBudget: 100_000,
+      } as Parameters<typeof engine.assemble>[0]);
+      if (capability === "rejected") {
+        expect(result.messages).toEqual(live);
+        expect(debugLog).toHaveBeenCalledWith(expect.stringContaining("canonical read unavailable"));
+        return;
+      }
+      expect(JSON.stringify(result.messages[0])).toContain("Earlier summarized history");
+      if (capability === "empty") {
+        // A valid empty response must not fall back to live carrier replay.
+        expect(result.messages).not.toContainEqual(carrier);
+      } else {
+        const index = result.messages.findIndex(message => Reflect.get(message, "idempotencyKey") === "turn-1");
+        expect(index).toBeGreaterThan(0);
+        expect(result.messages[index + 1]).toEqual(carrier);
+        if (capability === "canonical") expect(result.messages[index]).toMatchObject({ provenance: Reflect.get(users[1]!, "provenance") });
+      }
+      if (capability === "unsupported") expect(readReplay).not.toHaveBeenCalled();
+      else expect(readReplay).toHaveBeenCalledWith(expect.objectContaining({ entryIds: entryIds.slice(1) }));
+      expect(debugLog.mock.calls.flat().join(" ")).not.toContain("assemble: failed");
+    },
+  );
 
   it("registers only the lossless-claw context engine id", () => {
     const { api, getRegisteredContextEngines } = buildApi({ enabled: true });
@@ -364,9 +499,9 @@ describe("lcm plugin registration", () => {
     expect(errorLog).toHaveBeenCalledWith(expect.stringContaining("detectedHost=2026.5.1"));
   });
 
-  it("adds registered host memory supplements to context engine assembly", async () => {
+  it.each(["error", "capture-only"] as const)("adds registered host memory supplements in %s mode", async (hostFallbackMode) => {
     const dbPath = join(tmpdir(), `lossless-claw-${Date.now()}-${Math.random().toString(16)}.db`);
-    const availableTools = new Set(["memory_search"]);
+    const availableTools = new Set(["memory_search", "lcm_grep"]);
     dbPaths.add(dbPath);
     buildMemorySystemPromptAdditionMock.mockReturnValue(
       "## Compiled Wiki Snapshot\nUse the current project glossary.",
@@ -375,6 +510,7 @@ describe("lcm plugin registration", () => {
     const { api, getFactory } = buildApi({
       enabled: true,
       dbPath,
+      hostFallbackMode,
     });
     lcmPlugin.register(api);
 
@@ -391,7 +527,8 @@ describe("lcm plugin registration", () => {
         messages: unknown[];
         availableTools?: Set<string>;
         citationsMode?: string;
-      }) => Promise<{ systemPromptAddition?: string }>;
+        runtimeSettings?: { schemaVersion: 1; executionHost: { id: string; label: null } };
+      }) => Promise<{ systemPromptAddition?: string; messages: unknown[]; estimatedTokens: number }>;
     };
     expect(engine.afterTurn).toBeTypeOf("function");
     expect(engine.commitTurn).toBeTypeOf("function");
@@ -402,7 +539,10 @@ describe("lcm plugin registration", () => {
       messages: [],
       availableTools,
       citationsMode: "inline",
+      runtimeSettings: { schemaVersion: 1, executionHost: { id: "cli:claude-cli", label: null } },
     });
+    expect(result.messages).toEqual([]);
+    expect(result.estimatedTokens).toBe(0);
 
     expect(buildMemorySystemPromptAdditionMock).toHaveBeenCalledWith({
       availableTools,
@@ -1014,6 +1154,7 @@ describe("lcm plugin registration", () => {
                 enabled: true,
                 config: {
                   summaryModel: "openai-codex/gpt-5.4",
+                  dbPath: createTempDbPath(),
                 },
               },
             },
@@ -1039,6 +1180,7 @@ describe("lcm plugin registration", () => {
             enabled: true,
             config: {
               summaryModel: "openai-codex/gpt-5.5",
+              dbPath: createTempDbPath(),
             },
           },
         },

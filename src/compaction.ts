@@ -1,3 +1,4 @@
+import { AsyncLocalStorage } from "node:async_hooks";
 import { createHash, randomUUID } from "node:crypto";
 import { resolveRecoveryTailMaxTokens, selectOverflowToolGroup } from "./overflow-tool-groups.js";
 import { contentFromParts } from "./assembler.js";
@@ -10,6 +11,7 @@ import type {
 } from "./store/conversation-store.js";
 import type { SummaryStore, SummaryRecord, ContextItemRecord } from "./store/summary-store.js";
 import { estimateTokens, truncateTextToEstimatedTokens } from "./estimate-tokens.js";
+import { resolveFreshTailTokenCap, type FreshTailTokenCap } from "./fresh-tail.js";
 import { extractFileIdsFromContent } from "./large-files.js";
 import { NOOP_LCM_LOGGER, type LcmLogger } from "./lcm-log.js";
 import {
@@ -254,6 +256,9 @@ function generateSummaryId(content: string): string {
       .slice(0, 16)
   );
 }
+
+/** Prefix identifying the placeholder leaf summary written for a chunk with no extractable text. */
+const TEXTLESS_LEAF_SUMMARY_MARKER = "[textless leaf range]";
 
 /** Maximum estimated tokens for the deterministic fallback truncation. */
 const FALLBACK_MAX_TOKENS = 512;
@@ -734,6 +739,8 @@ export class CompactionEngine {
    */
   private _contextItemsCache: Map<number, ContextItemRecord[]> | null = null;
   private _contextItemsCacheRefCount = 0;
+  /** Token budget of the in-flight call, for the default fresh-tail cap. */
+  private freshTailBudget = new AsyncLocalStorage<number>();
 
   constructor(
     private conversationStore: ConversationStore,
@@ -775,10 +782,32 @@ export class CompactionEngine {
     }
   }
 
+  /**
+   * Run `fn` with `tokenBudget` as the budget for the default fresh-tail cap.
+   * The budget is scoped to this invocation, so overlapping calls on the same
+   * conversation cannot observe or clear each other's budget.
+   */
+  private withFreshTailBudget<T>(
+    tokenBudget: number | undefined,
+    fn: () => Promise<T>,
+  ): Promise<T> {
+    return tokenBudget === undefined ? fn() : this.freshTailBudget.run(tokenBudget, fn);
+  }
+
   // ── evaluate ─────────────────────────────────────────────────────────────
 
   /** Evaluate whether compaction is needed. */
   async evaluate(
+    conversationId: number,
+    tokenBudget: number,
+    observedTokenCount?: number,
+    options?: { contextThreshold?: number; freshTailCount?: number },
+  ): Promise<CompactionDecision> {
+    return this.withFreshTailBudget(tokenBudget, () =>
+      this.evaluateImpl(conversationId, tokenBudget, observedTokenCount, options));
+  }
+
+  private async evaluateImpl(
     conversationId: number,
     tokenBudget: number,
     observedTokenCount?: number,
@@ -833,12 +862,17 @@ export class CompactionEngine {
    * `leafChunkTokens`. Automatic compaction no longer uses this as a trigger,
    * but it remains useful for diagnostics and explicit maintenance commands.
    */
-  async evaluateLeafTrigger(conversationId: number, leafChunkTokensOverride?: number): Promise<{
+  async evaluateLeafTrigger(
+    conversationId: number,
+    leafChunkTokensOverride?: number,
+    tokenBudget?: number,
+  ): Promise<{
     shouldCompact: boolean;
     rawTokensOutsideTail: number;
     threshold: number;
   }> {
-    const rawTokensOutsideTail = await this.countRawTokensOutsideFreshTail(conversationId);
+    const rawTokensOutsideTail = await this.withFreshTailBudget(tokenBudget, () =>
+      this.countRawTokensOutsideFreshTail(conversationId));
     const threshold = this.resolveLeafChunkTokens(leafChunkTokensOverride);
     return {
       shouldCompact: rawTokensOutsideTail >= threshold,
@@ -867,6 +901,8 @@ export class CompactionEngine {
     summaryModel?: string;
     /** Optional operation-wide wall-clock deadline shared across rounds. */
     operationDeadlineAt?: number;
+    /** Host cancellation; the sweep stops before starting another pass. */
+    abortSignal?: AbortSignal;
     /** Report each committed pass even if a later pass throws. */
     onPassCommitted?: (tokensAfter: number) => void;
   }): Promise<CompactionResult> {
@@ -889,7 +925,8 @@ export class CompactionEngine {
     summaryModel?: string;
     allowCondensedPasses?: boolean;
   }): Promise<CompactionResult> {
-    return this.withContextCache(() => this._compactLeafImpl(input));
+    return this.withContextCache(() =>
+      this.withFreshTailBudget(input.tokenBudget, () => this._compactLeafImpl(input)));
   }
 
   private async _compactLeafImpl(input: {
@@ -1060,9 +1097,19 @@ export class CompactionEngine {
      * the whole operation run `maxRounds × sweepDeadlineMs`.
      */
     operationDeadlineAt?: number;
+    /**
+     * Host cancellation (e.g. its compaction safety timeout). Committed passes
+     * stay persisted; the sweep only declines to start another pass.
+     */
+    abortSignal?: AbortSignal;
     /** Report each committed pass even if a later pass throws. */
     onPassCommitted?: (tokensAfter: number) => void;
   }): Promise<CompactionResult> {
+    return this.withFreshTailBudget(input.tokenBudget, () =>
+      this.compactFullSweepImpl(input));
+  }
+
+  private async compactFullSweepImpl(input: Parameters<CompactionEngine["compactFullSweep"]>[0]): Promise<CompactionResult> {
     const { conversationId, tokenBudget, summarize, force, hardTrigger } = input;
     // Recovery always retains the initiating user, even when routine tail protection is disabled.
     const freshTailCountOverride = input.allowCurrentTurnCompaction
@@ -1148,11 +1195,14 @@ export class CompactionEngine {
       }
       const hitIterationCap = sweepIterations >= maxSweepIterations;
       const hitDeadline = Date.now() >= sweepDeadlineAt;
-      if (hitIterationCap || hitDeadline) {
+      const aborted = input.abortSignal?.aborted === true;
+      if (hitIterationCap || hitDeadline || aborted) {
         stoppedAtBudget = true;
         const clampedByOperation =
           hitDeadline && sweepDeadlineAt < ownSweepDeadlineAt;
-        const limit = hitIterationCap
+        const limit = aborted
+          ? `host abort`
+          : hitIterationCap
           ? `iteration cap ${maxSweepIterations}`
           : clampedByOperation
             ? `compactUntilUnder operation deadline`
@@ -1403,8 +1453,13 @@ export class CompactionEngine {
     currentTokens?: number;
     summarize: CompactionSummarizeFn;
     summaryModel?: string;
+    /** Host cancellation; each sweep stops before starting another pass. */
+    abortSignal?: AbortSignal;
+    /** Report each committed pass, e.g. to refresh a host idle timeout. */
+    onPassCommitted?: (tokensAfter: number) => void;
   }): Promise<CompactUntilUnderResult> {
-    return this.withContextCache(() => this._compactUntilUnderImpl(input));
+    return this.withContextCache(() =>
+      this.withFreshTailBudget(input.tokenBudget, () => this._compactUntilUnderImpl(input)));
   }
 
   private async _compactUntilUnderImpl(input: {
@@ -1421,6 +1476,10 @@ export class CompactionEngine {
     currentTokens?: number;
     summarize: CompactionSummarizeFn;
     summaryModel?: string;
+    /** Host cancellation; each sweep stops before starting another pass. */
+    abortSignal?: AbortSignal;
+    /** Report each committed pass, e.g. to refresh a host idle timeout. */
+    onPassCommitted?: (tokensAfter: number) => void;
   }): Promise<CompactUntilUnderResult> {
     const { conversationId, tokenBudget, summarize } = input;
     const targetTokens =
@@ -1493,9 +1552,11 @@ export class CompactionEngine {
           force: true,
           summaryModel: input.summaryModel,
           operationDeadlineAt,
+          ...(input.abortSignal ? { abortSignal: input.abortSignal } : {}),
           onPassCommitted: (tokensAfter) => {
             actionTaken = true;
             committedTokens = tokensAfter;
+            input.onPassCommitted?.(tokensAfter);
           },
         });
       } catch (error) {
@@ -1617,7 +1678,13 @@ export class CompactionEngine {
     if (freshTailCount <= 0) {
       return Infinity;
     }
-    const freshTailMaxTokens = freshTailMaxTokensOverride ?? this.resolveFreshTailMaxTokens();
+    const freshTailCap: FreshTailTokenCap = freshTailMaxTokensOverride !== undefined
+      ? { maxTokens: freshTailMaxTokensOverride, minMessages: 1 }
+      : resolveFreshTailTokenCap(
+          this.resolveFreshTailMaxTokens(),
+          this.freshTailBudget.getStore(),
+        );
+    const freshTailMaxTokens = freshTailCap.maxTokens;
 
     const rawMessageItems = contextItems.filter(
       (item) => item.itemType === "message" && item.messageId != null,
@@ -1649,7 +1716,7 @@ export class CompactionEngine {
       const messageTokens = await this.getMessageTokenCount(item.messageId, messageCache);
       const wouldExceedBudget =
         latestUserProtected &&
-        protectedCount > 0 &&
+        protectedCount >= freshTailCap.minMessages &&
         typeof freshTailMaxTokens === "number" &&
         protectedTokens + messageTokens > freshTailMaxTokens;
       if (wouldExceedBudget) {
@@ -2380,10 +2447,12 @@ export class CompactionEngine {
       .filter((s): s is string => s !== null)
       .join("\n\n");
     if (!concatenated.trim()) {
-      this.log.warn(
-        `[lcm] leaf compaction skipped; no meaningful content; conversationId=${conversationId}; chunkMessages=${messageContents.length}`,
-      );
-      return { skipped: "empty-source" };
+      return this.collapseTextlessLeafChunk({
+        conversationId,
+        messageItems,
+        messageContents,
+        summaryModel,
+      });
     }
     const fileIds = dedupeOrderedIds(
       messageContents.flatMap((message) => extractFileIdsFromContent(message.content)),
@@ -2459,6 +2528,92 @@ export class CompactionEngine {
     this.invalidateContextCache(conversationId);
 
     return { summaryId, level: summary.level, content: summary.content, removedTokens, addedTokens: tokenCount };
+  }
+
+  /**
+   * Commit one placeholder leaf summary for a chunk whose messages carry no
+   * extractable text.
+   *
+   * Tool-call-only and empty-content assistant turns still hold context
+   * tokens. Skipping them makes every sweep select the same chunk, take no
+   * action, and end in the transcript-wedge verdict, so the placeholder keeps
+   * the sweep moving while the source messages stay in the store and remain
+   * reachable through `lcm_expand`.
+   */
+  private async collapseTextlessLeafChunk(params: {
+    conversationId: number;
+    messageItems: ContextItemRecord[];
+    messageContents: {
+      messageId: number;
+      role: MessageRole;
+      content: string;
+      createdAt: Date;
+      tokenCount: number;
+    }[];
+    summaryModel?: string;
+  }): Promise<LeafPassResult> {
+    const { conversationId, messageItems, messageContents } = params;
+    const ordinals = messageItems.map((item) => item.ordinal);
+    const startOrdinal = Math.min(...ordinals);
+    const endOrdinal = Math.max(...ordinals);
+    const roleCounts = new Map<MessageRole, number>();
+    for (const message of messageContents) {
+      roleCounts.set(message.role, (roleCounts.get(message.role) ?? 0) + 1);
+    }
+    const roleBreakdown = [...roleCounts]
+      .map(([role, count]) => `${role}x${count}`)
+      .join(", ");
+    const earliestAt = new Date(
+      Math.min(...messageContents.map((message) => message.createdAt.getTime())),
+    );
+    const latestAt = new Date(
+      Math.max(...messageContents.map((message) => message.createdAt.getTime())),
+    );
+    const content = [
+      `${TEXTLESS_LEAF_SUMMARY_MARKER} ordinals ${startOrdinal}-${endOrdinal}: ${messageContents.length} message(s) (${roleBreakdown}) between ${formatTimestamp(earliestAt, this.config.timezone)} and ${formatTimestamp(latestAt, this.config.timezone)} carried no extractable text (tool-call-only or empty-content turns).`,
+      "Originals are retained and recoverable via lcm_expand.",
+    ].join("\n");
+    const summaryId = generateSummaryId(content);
+    const tokenCount = estimateTokens(content);
+    const fileIds = dedupeOrderedIds(
+      messageContents.flatMap((message) => extractFileIdsFromContent(message.content)),
+    );
+    const removedTokens = messageContents.reduce(
+      (sum, message) => sum + Math.max(0, Math.floor(message.tokenCount)),
+      0,
+    );
+    const messageIds = messageContents.map((message) => message.messageId);
+
+    await this.summaryStore.withTransaction(async () => {
+      await this.summaryStore.insertSummary({
+        summaryId,
+        conversationId,
+        kind: "leaf",
+        depth: 0,
+        content,
+        tokenCount,
+        fileIds,
+        earliestAt,
+        latestAt,
+        descendantCount: 0,
+        descendantTokenCount: 0,
+        sourceMessageTokenCount: removedTokens,
+        model: params.summaryModel,
+      });
+      await this.summaryStore.linkSummaryToMessages(summaryId, messageIds);
+      await this.summaryStore.replaceContextRangeWithSummary({
+        conversationId,
+        startOrdinal,
+        endOrdinal,
+        summaryId,
+      });
+    });
+    this.invalidateContextCache(conversationId);
+    this.log.warn(
+      `[lcm] leaf compaction collapsed textless chunk; conversationId=${conversationId}; chunkMessages=${messageContents.length}; ordinals=${startOrdinal}-${endOrdinal}; tokensRemoved=${removedTokens}`,
+    );
+
+    return { summaryId, level: "fallback", content, removedTokens, addedTokens: tokenCount };
   }
 
   // ── Private: Condensed Pass ──────────────────────────────────────────────

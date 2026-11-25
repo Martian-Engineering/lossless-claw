@@ -49,6 +49,8 @@ Use `mode: "full_text"` for keyword or topical recall. Full-text queries are not
 | `limit` | number | | 50 | Max results (1–200) |
 | `sort` | string | | `"recency"` | `"recency"`, `"relevance"`, or `"hybrid"` for full-text ranking |
 
+Searches run on a worker thread with a separate read-only SQLite connection, so a slow search never blocks the Gateway. `full_text` searches use the FTS5 indexes. Regex searches, and the substring fallback used for CJK queries or when FTS5 is unavailable, read message content newest-first with a fixed budget: regex searches examine at most 10,000 rows in scope, the substring fallback at most 100,000 rows, and each stops after 10 seconds. When a search hits its budget before checking every row in scope, the result says **Scan limit** and `details.scanLimited` is `true`. Older matches may exist, so narrow the search with `conversationId`, `since` or `before`, or use `full_text` mode.
+
 **Returns:** Array of matches with:
 - `id` — Message, summary, or file ID
 - `type` — `"message"`, `"summary"`, or `"file"`

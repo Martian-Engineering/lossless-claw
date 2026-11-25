@@ -67,10 +67,11 @@ export function toolProvenanceIdentity(
 /** Structured provenance, not the parent's lossy plain-text index key. */
 export function structuredPartsIdentity(
   parts: readonly Omit<CreateMessagePartInput, "sessionId">[],
+  includeTextOnly = false,
 ): string | null {
   // String tool results keep provenance only in text-part metadata. Ignoring
   // those fields would let changed tool names or error flags reuse an old row.
-  if (!parts.some((part) => {
+  if (!includeTextOnly && !parts.some((part) => {
     return part.partType !== "text" || part.toolCallId || toolProvenance(part) !== null;
   })) return null;
   return JSON.stringify(

@@ -206,7 +206,7 @@
     },
     "freshTailMaxTokens": {
       "label": "Fresh Tail Max Tokens",
-      "help": "Optional token cap for the protected fresh tail; routine compaction preserves the newest user-led suffix, while forced overflow recovery may summarize older complete tool groups"
+      "help": "Token cap for the protected fresh tail. Unset caps it at 25% of the token budget while keeping at least 8 messages; routine compaction preserves the newest user-led suffix, while forced overflow recovery may summarize older complete tool groups"
     },
     "promptAwareEviction": {
       "label": "Prompt-Aware Eviction",

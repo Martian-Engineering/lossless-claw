@@ -296,7 +296,7 @@ async function runDelegatedExpansionPass(params: {
   const childSessionKey = `agent:${requesterAgentId}:subagent:${crypto.randomUUID()}`;
   let runId = "";
 
-  createDelegatedExpansionGrant({
+  await createDelegatedExpansionGrant({
     delegatedSessionKey: childSessionKey,
     issuerSessionId: params.requesterSessionKey,
     allowedConversationIds: [params.conversationId],
@@ -424,7 +424,7 @@ async function runDelegatedExpansionPass(params: {
     } catch {
       // Cleanup is best-effort.
     }
-    revokeDelegatedExpansionGrantForSession(childSessionKey, { removeBinding: true });
+    await revokeDelegatedExpansionGrantForSession(childSessionKey, { removeBinding: true });
     clearDelegatedExpansionContext(childSessionKey);
   }
 }

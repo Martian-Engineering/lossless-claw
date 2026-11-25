@@ -1,6 +1,8 @@
+import { DatabaseSync } from "node:sqlite";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import type { LcmContextEngine } from "../src/engine.js";
 import {
+  bindRuntimeExpansionGrantDatabase,
   createDelegatedExpansionGrant,
   resolveDelegatedExpansionGrantId,
   resetDelegatedExpansionGrantsForTests,
@@ -13,6 +15,7 @@ import {
 } from "../src/tools/lcm-expansion-recursion-guard.js";
 import { createLcmExpandQueryTool } from "../src/tools/lcm-expand-query-tool.js";
 import { createLcmGrepTool } from "../src/tools/lcm-grep-tool.js";
+import { withExclusiveDatabaseLock } from "../src/transaction-mutex.js";
 import type { LcmDependencies } from "../src/types.js";
 
 const callGatewayMock = vi.fn();
@@ -160,10 +163,10 @@ function makeEngine(params: {
 }
 
 describe("createLcmExpandQueryTool", () => {
-  beforeEach(() => {
+  beforeEach(async () => {
     vi.clearAllMocks();
     callGatewayMock.mockReset();
-    resetDelegatedExpansionGrantsForTests();
+    await resetDelegatedExpansionGrantsForTests();
     resetExpansionDelegationGuardForTests();
   });
 
@@ -1430,6 +1433,69 @@ describe("createLcmExpandQueryTool", () => {
     expect(result.details).toMatchObject({
       error: "lcm_expand_query timed out waiting for delegated expansion (1s).",
     });
+  });
+
+  it("refuses the spawn when waiting to create the grant consumes the work budget", async () => {
+    const retrieval = makeRetrieval();
+    retrieval.describe.mockResolvedValue({
+      type: "summary",
+      summary: { conversationId: 42 },
+    });
+    callGatewayMock.mockImplementation(async () => ({ ok: true }));
+
+    const grantDb = new DatabaseSync(":memory:");
+    const unbind = bindRuntimeExpansionGrantDatabase(grantDb);
+    const realNow = performance.now.bind(performance);
+    let clockOffsetMs = 0;
+    const nowSpy = vi.spyOn(performance, "now").mockImplementation(() => realNow() + clockOffsetMs);
+    try {
+      let releaseLock!: () => void;
+      let markLocked!: () => void;
+      const locked = new Promise<void>((resolve) => {
+        markLocked = resolve;
+      });
+      const held = withExclusiveDatabaseLock(grantDb, { timeoutMs: 5_000 }, async () => {
+        markLocked();
+        await new Promise<void>((resolve) => {
+          releaseLock = resolve;
+        });
+      });
+      await locked;
+
+      const tool = createLcmExpandQueryTool({
+        deps: makeDeps(),
+        lcm: makeEngine({ retrieval }),
+        sessionId: "agent:main:main",
+        requesterSessionKey: "agent:main:main",
+      });
+      const pending = tool.execute("call-grant-wait", {
+        summaryIds: ["sum_a"],
+        prompt: "Summarize root cause",
+        conversationId: 42,
+        timeoutMs: 60_000,
+      });
+
+      await vi.waitFor(() => {
+        expect(retrieval.describe).toHaveBeenCalled();
+      });
+      await new Promise((resolve) => setTimeout(resolve, 20));
+      clockOffsetMs = 10 * 60_000;
+      releaseLock();
+      await held;
+      const result = await pending;
+
+      const methods = callGatewayMock.mock.calls.map(
+        ([opts]) => (opts as { method?: string }).method,
+      );
+      expect(methods).not.toContain("agent");
+      expect(result.details).toMatchObject({
+        error: expect.stringContaining("lcm_expand_query timed out waiting for delegated expansion"),
+      });
+    } finally {
+      nowSpy.mockRestore();
+      unbind();
+      grantDb.close();
+    }
   });
 
   it("cleans up delegated session and grant when agent call fails", async () => {
@@ -2795,7 +2861,7 @@ describe("createLcmExpandQueryTool", () => {
   it("blocks delegated re-entry with deterministic recursion errors", async () => {
     const retrieval = makeRetrieval();
     const delegatedSessionKey = "agent:main:subagent:recursive";
-    createDelegatedExpansionGrant({
+    await createDelegatedExpansionGrant({
       delegatedSessionKey,
       issuerSessionId: "agent:main:main",
       allowedConversationIds: [42],
