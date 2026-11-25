@@ -279,9 +279,9 @@ describe("ReDoS protection", () => {
 // ── Grant Scope Inheritance (#72) ───────────────────────────────────────────
 
 describe("Grant scope inheritance", () => {
-  it("rejects depth exceeding grant maxDepth via clamping in wrapWithAuth", () => {
+  it("rejects depth exceeding grant maxDepth via clamping in wrapWithAuth", async () => {
     const manager = new ExpansionAuthManager();
-    const grant = manager.createGrant({
+    const grant = await manager.createGrant({
       issuerSessionId: "parent",
       allowedConversationIds: [1],
       maxDepth: 3,
@@ -298,9 +298,9 @@ describe("Grant scope inheritance", () => {
     expect(result.valid).toBe(true);
   });
 
-  it("request at exactly maxDepth succeeds validation", () => {
+  it("request at exactly maxDepth succeeds validation", async () => {
     const manager = new ExpansionAuthManager();
-    const grant = manager.createGrant({
+    const grant = await manager.createGrant({
       issuerSessionId: "parent",
       allowedConversationIds: [1],
       maxDepth: 3,
@@ -316,18 +316,18 @@ describe("Grant scope inheritance", () => {
     expect(result.valid).toBe(true);
   });
 
-  it("consumed tokens reduce remaining budget for subsequent calls", () => {
+  it("consumed tokens reduce remaining budget for subsequent calls", async () => {
     const manager = new ExpansionAuthManager();
-    const grant = manager.createGrant({
+    const grant = await manager.createGrant({
       issuerSessionId: "parent",
       allowedConversationIds: [1],
       tokenCap: 1000,
     });
 
     expect(manager.getRemainingTokenBudget(grant.grantId)).toBe(1000);
-    manager.consumeTokenBudget(grant.grantId, 600);
+    await manager.consumeTokenBudget(grant.grantId, 600);
     expect(manager.getRemainingTokenBudget(grant.grantId)).toBe(400);
-    manager.consumeTokenBudget(grant.grantId, 400);
+    await manager.consumeTokenBudget(grant.grantId, 400);
     expect(manager.getRemainingTokenBudget(grant.grantId)).toBe(0);
   });
 });

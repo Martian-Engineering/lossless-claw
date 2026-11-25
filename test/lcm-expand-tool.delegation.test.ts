@@ -85,10 +85,10 @@ function makeDeps() {
 }
 
 describe("runDelegatedExpansionLoop recursion guard", () => {
-  beforeEach(() => {
+  beforeEach(async () => {
     vi.clearAllMocks();
     callGatewayMock.mockReset();
-    resetDelegatedExpansionGrantsForTests();
+    await resetDelegatedExpansionGrantsForTests();
     resetExpansionDelegationGuardForTests();
   });
 

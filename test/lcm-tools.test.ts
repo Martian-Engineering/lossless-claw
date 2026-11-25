@@ -145,8 +145,8 @@ function buildLcmEngine(params: {
 }
 
 describe("LCM tools session scoping", () => {
-  beforeEach(() => {
-    resetDelegatedExpansionGrantsForTests();
+  beforeEach(async () => {
+    await resetDelegatedExpansionGrantsForTests();
   });
 
   it("lcm_grep metadata explains focused FTS5 query construction", () => {
@@ -340,7 +340,7 @@ describe("LCM tools session scoping", () => {
       describe: vi.fn(),
     };
 
-    createDelegatedExpansionGrant({
+    await createDelegatedExpansionGrant({
       delegatedSessionKey: "agent:main:subagent:session-1",
       issuerSessionId: "main",
       allowedConversationIds: [42],
@@ -964,7 +964,7 @@ describe("LCM tools session scoping", () => {
       describe: vi.fn(),
     };
 
-    createDelegatedExpansionGrant({
+    await createDelegatedExpansionGrant({
       delegatedSessionKey: "agent:main:subagent:session-1",
       issuerSessionId: "main",
       allowedConversationIds: [42],
@@ -1013,7 +1013,7 @@ describe("LCM tools session scoping", () => {
       })),
     };
 
-    createDelegatedExpansionGrant({
+    await createDelegatedExpansionGrant({
       delegatedSessionKey,
       issuerSessionId: "main",
       allowedConversationIds: [42],
@@ -1054,7 +1054,7 @@ describe("LCM tools session scoping", () => {
       describe: vi.fn(),
     };
 
-    createDelegatedExpansionGrant({
+    await createDelegatedExpansionGrant({
       delegatedSessionKey: "agent:main:subagent:session-1",
       issuerSessionId: "main",
       allowedConversationIds: [42],
@@ -1182,7 +1182,7 @@ describe("LCM tools session scoping", () => {
       })),
     };
 
-    createDelegatedExpansionGrant({
+    await createDelegatedExpansionGrant({
       delegatedSessionKey: "agent:main:subagent:session-1",
       issuerSessionId: "main",
       allowedConversationIds: [42],

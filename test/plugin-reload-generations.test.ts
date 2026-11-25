@@ -118,13 +118,13 @@ describe("plugin reload across generations", () => {
     const dbPath = tempDbPath(dbPaths);
 
     const first = await loadGeneration(dbPath);
-    const grant = first.auth.createDelegatedExpansionGrant({
+    const grant = await first.auth.createDelegatedExpansionGrant({
       delegatedSessionKey: CHILD_SESSION_KEY,
       issuerSessionId: "agent:main:main",
       allowedConversationIds: [42],
       tokenCap: 900,
     });
-    first.auth.getRuntimeExpansionAuthManager().consumeTokenBudget(grant.grantId, 100);
+    await first.auth.getRuntimeExpansionAuthManager().consumeTokenBudget(grant.grantId, 100);
     await retireGeneration(first);
 
     const second = await loadGeneration(dbPath);
@@ -145,7 +145,7 @@ describe("plugin reload across generations", () => {
     const dbPath = tempDbPath(dbPaths);
 
     const first = await loadGeneration(dbPath);
-    const grant = first.auth.createDelegatedExpansionGrant({
+    const grant = await first.auth.createDelegatedExpansionGrant({
       delegatedSessionKey: CHILD_SESSION_KEY,
       issuerSessionId: "agent:main:main",
       allowedConversationIds: [42],
@@ -167,7 +167,7 @@ describe("plugin reload across generations", () => {
     const result = JSON.stringify(await expand?.execute("call-1", { summaryIds: ["sum_missing"] }));
     expect(result).toContain("requires a valid grant");
 
-    expect(second.auth.flushDeferredDelegatedExpansionGrantCleanups()).toBeNull();
+    expect(await second.auth.flushDeferredDelegatedExpansionGrantCleanups()).toBeNull();
     expect(manager.getGrant(grant.grantId)).toBeNull();
     expect(manager.resolveSessionGrantId(CHILD_SESSION_KEY)).toBeNull();
     await retireGeneration(second);

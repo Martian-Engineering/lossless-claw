@@ -333,7 +333,7 @@ async function runDelegatedQueryAttempt(
     }
 
     // Bind the temporary child to this bucket and the preallocated token cap.
-    createDelegatedExpansionGrant({
+    await createDelegatedExpansionGrant({
       delegatedSessionKey: childSessionKey,
       issuerSessionId: params.callerSessionKey || "main",
       allowedConversationIds: [params.bucket.conversationId],
@@ -351,6 +351,16 @@ async function runDelegatedQueryAttempt(
       stampedBy: "lcm_expand_query",
     });
     grantCreated = true;
+
+    // Grant creation waits for open database transactions; refuse the spawn if
+    // that wait consumed the remaining work budget.
+    if (remainingDeadlineMs(params.deadline.workDeadlineMs, performance.now()) <= 0) {
+      phase = "wait";
+      timedOut = true;
+      throw new Error(
+        `lcm_expand_query timed out waiting for delegated expansion (${params.delegatedWaitTimeoutSeconds}s).`,
+      );
+    }
 
     // Spawn and wait consume the same absolute work deadline.
     const spawnTimeoutMs = Math.max(
@@ -499,7 +509,7 @@ async function runDelegatedQueryAttempt(
       }
     }
     if (grantCreated) {
-      revokeDelegatedExpansionGrantForSession(childSessionKey, { removeBinding: true });
+      await revokeDelegatedExpansionGrantForSession(childSessionKey, { removeBinding: true });
     }
     clearDelegatedExpansionContext(childSessionKey);
   }
