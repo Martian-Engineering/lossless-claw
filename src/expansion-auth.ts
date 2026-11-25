@@ -1,4 +1,5 @@
 import { DatabaseSync } from "node:sqlite";
+import { isSqliteBusyError } from "./db/sqlite-errors.js";
 import type { ExpansionOrchestrator, ExpansionRequest, ExpansionResult } from "./expansion.js";
 
 // ── Types ────────────────────────────────────────────────────────────────────
@@ -124,10 +125,18 @@ function toGrant(row: GrantRow): ExpansionGrant {
  */
 export class ExpansionAuthManager {
   private readonly db: DatabaseSync;
+  /**
+   * Identity of the grant store: the database file, which every plugin
+   * generation opening it shares, or a unique id for an in-memory database.
+   */
+  readonly storeKey: string;
 
   constructor(db: DatabaseSync = new DatabaseSync(":memory:")) {
     this.db = db;
     ensureExpansionGrantTables(db);
+    const main = (db.prepare(`PRAGMA database_list`).all() as Array<{ name: string; file: string }>)
+      .find((row) => row.name === "main");
+    this.storeKey = main?.file ? `file:${main.file}` : `memory:${crypto.randomUUID()}`;
   }
 
   /** True when this manager stores grants in the given database. */
@@ -367,6 +376,125 @@ export class ExpansionAuthManager {
 
 let runtimeExpansionAuthManager = new ExpansionAuthManager();
 
+/** Delegated grant writes owed to a child session key. */
+export type DelegatedExpansionGrantCleanup = {
+  revoke: boolean;
+  removeBinding: boolean;
+};
+
+/** A deferred cleanup that the database was still too busy to apply. */
+export type DeferredDelegatedExpansionGrantCleanup = {
+  sessionKey: string;
+  error: unknown;
+  pending: number;
+};
+
+type DeferredGrantCleanupState = {
+  /** Cleanups a busy database deferred, keyed by child session key. */
+  pending: Map<string, DelegatedExpansionGrantCleanup>;
+  /**
+   * Child session keys whose stored binding is known to be stale. Resolution
+   * treats them as unbound, so delegated tools refuse instead of using it.
+   */
+  suppressed: Set<string>;
+};
+
+// Process-global, keyed by grant store, so a plugin reload, which loads a
+// fresh copy of this module over the same database, keeps honoring and
+// retrying deferred cleanups, while a generation bound to another store never
+// applies or clears them.
+const DEFERRED_GRANT_CLEANUP_STATE = Symbol.for(
+  "@martian-engineering/lossless-claw/expansion-auth/deferred-grant-cleanups",
+);
+
+function deferredGrantCleanupStates(): Map<string, DeferredGrantCleanupState> {
+  const holder = globalThis as typeof globalThis & {
+    [DEFERRED_GRANT_CLEANUP_STATE]?: Map<string, DeferredGrantCleanupState>;
+  };
+  holder[DEFERRED_GRANT_CLEANUP_STATE] ??= new Map();
+  return holder[DEFERRED_GRANT_CLEANUP_STATE];
+}
+
+/** Deferred cleanup state for the runtime manager's store, created when asked. */
+function deferredGrantCleanupState(create: true): DeferredGrantCleanupState;
+function deferredGrantCleanupState(create?: false): DeferredGrantCleanupState | undefined;
+function deferredGrantCleanupState(create = false): DeferredGrantCleanupState | undefined {
+  const states = deferredGrantCleanupStates();
+  const storeKey = runtimeExpansionAuthManager.storeKey;
+  let state = states.get(storeKey);
+  if (!state && create) {
+    state = { pending: new Map(), suppressed: new Set() };
+    states.set(storeKey, state);
+  }
+  return state;
+}
+
+/** Forget deferred cleanup state for a child key in the runtime manager's store. */
+function clearDeferredGrantCleanup(sessionKey: string): void {
+  const state = deferredGrantCleanupState();
+  if (!state) {
+    return;
+  }
+  state.pending.delete(sessionKey);
+  state.suppressed.delete(sessionKey);
+  if (state.pending.size === 0 && state.suppressed.size === 0) {
+    deferredGrantCleanupStates().delete(runtimeExpansionAuthManager.storeKey);
+  }
+}
+
+/**
+ * Queue a delegated grant cleanup for a child session key, merged with any
+ * still-pending one. The key resolves as unbound until the cleanup lands or a
+ * new grant is bound to it.
+ */
+export function deferDelegatedExpansionGrantCleanup(
+  sessionKey: string,
+  cleanup: DelegatedExpansionGrantCleanup,
+): void {
+  const key = sessionKey.trim();
+  if (!key) {
+    return;
+  }
+  const state = deferredGrantCleanupState(true);
+  const pending = state.pending.get(key);
+  state.suppressed.add(key);
+  state.pending.set(key, {
+    revoke: cleanup.revoke || (pending?.revoke ?? false),
+    removeBinding: cleanup.removeBinding || (pending?.removeBinding ?? false),
+  });
+}
+
+/**
+ * Apply deferred delegated grant cleanups in order.
+ *
+ * Returns the first cleanup a busy or locked database blocked, leaving it and
+ * the rest pending, or null when none remain. Other errors drop the failing
+ * cleanup and propagate, keeping its key unbound.
+ */
+export function flushDeferredDelegatedExpansionGrantCleanups(): DeferredDelegatedExpansionGrantCleanup | null {
+  const state = deferredGrantCleanupState();
+  if (!state) {
+    return null;
+  }
+  for (const [key, cleanup] of Array.from(state.pending)) {
+    try {
+      if (cleanup.revoke) {
+        revokeDelegatedExpansionGrantForSession(key, { removeBinding: cleanup.removeBinding });
+      } else if (cleanup.removeBinding) {
+        removeDelegatedExpansionGrantForSession(key);
+      }
+      clearDeferredGrantCleanup(key);
+    } catch (error) {
+      if (!isSqliteBusyError(error)) {
+        state.pending.delete(key);
+        throw error;
+      }
+      return { sessionKey: key, error, pending: state.pending.size };
+    }
+  }
+  return null;
+}
+
 /**
  * Return the singleton auth manager used by runtime delegated expansion flows.
  */
@@ -409,6 +537,8 @@ export function createDelegatedExpansionGrant(
     ttlMs: input.ttlMs,
   });
   runtimeExpansionAuthManager.bindSession(delegatedSessionKey, grant.grantId);
+  // The new binding replaces any stale one, so no cleanup is owed for the key.
+  clearDeferredGrantCleanup(delegatedSessionKey);
   return grant;
 }
 
@@ -417,7 +547,7 @@ export function createDelegatedExpansionGrant(
  */
 export function resolveDelegatedExpansionGrantId(sessionKey: string): string | null {
   const key = sessionKey.trim();
-  if (!key) {
+  if (!key || deferredGrantCleanupState()?.suppressed.has(key)) {
     return null;
   }
   return runtimeExpansionAuthManager.resolveSessionGrantId(key);
@@ -462,6 +592,7 @@ export function removeDelegatedExpansionGrantForSession(sessionKey: string): boo
  */
 export function resetDelegatedExpansionGrantsForTests(): void {
   runtimeExpansionAuthManager.clearSessionBindings();
+  deferredGrantCleanupStates().clear();
 }
 
 // ── Authorized wrapper ───────────────────────────────────────────────────────
