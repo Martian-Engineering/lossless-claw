@@ -160,10 +160,10 @@ function makeEngine(params: {
 }
 
 describe("createLcmExpandQueryTool", () => {
-  beforeEach(() => {
+  beforeEach(async () => {
     vi.clearAllMocks();
     callGatewayMock.mockReset();
-    resetDelegatedExpansionGrantsForTests();
+    await resetDelegatedExpansionGrantsForTests();
     resetExpansionDelegationGuardForTests();
   });
 
@@ -2795,7 +2795,7 @@ describe("createLcmExpandQueryTool", () => {
   it("blocks delegated re-entry with deterministic recursion errors", async () => {
     const retrieval = makeRetrieval();
     const delegatedSessionKey = "agent:main:subagent:recursive";
-    createDelegatedExpansionGrant({
+    await createDelegatedExpansionGrant({
       delegatedSessionKey,
       issuerSessionId: "agent:main:main",
       allowedConversationIds: [42],

@@ -521,10 +521,10 @@ export async function ingestAndReadStoredContent(params: {
  * mocks, closes the shared LCM connection, resets delegated expansion grants,
  * and removes any temp directories registered in `tempDirs`.
  */
-export function cleanupEngineTestState(): void {
+export async function cleanupEngineTestState(): Promise<void> {
   vi.restoreAllMocks();
   closeLcmConnection();
-  resetDelegatedExpansionGrantsForTests();
+  await resetDelegatedExpansionGrantsForTests();
   for (const dir of tempDirs.splice(0)) {
     rmSync(dir, { recursive: true, force: true });
   }

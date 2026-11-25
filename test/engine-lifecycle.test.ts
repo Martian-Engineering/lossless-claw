@@ -335,19 +335,19 @@ describe("LcmContextEngine ignored sessions", () => {
     expect(included).toBeDefined();
     expect(resolveDelegatedExpansionGrantId(childSessionKey)).not.toBeNull();
 
-    included?.rollback?.();
+    await included?.rollback?.();
     expect(resolveDelegatedExpansionGrantId(childSessionKey)).toBeNull();
   });
 
   it("skips onSubagentEnded for ignored sessions while cleaning up included child grants", async () => {
     const ignoredChildSessionKey = "agent:main:cron:child";
     const includedChildSessionKey = "agent:main:subagent:child";
-    createDelegatedExpansionGrant({
+    await createDelegatedExpansionGrant({
       delegatedSessionKey: ignoredChildSessionKey,
       issuerSessionId: "issuer-1",
       allowedConversationIds: [1],
     });
-    createDelegatedExpansionGrant({
+    await createDelegatedExpansionGrant({
       delegatedSessionKey: includedChildSessionKey,
       issuerSessionId: "issuer-2",
       allowedConversationIds: [2],
@@ -741,13 +741,13 @@ describe("LcmContextEngine stateless sessions", () => {
     expect(skipped).toBeUndefined();
     expect(resolveDelegatedExpansionGrantId(childSessionKey)).not.toBeNull();
 
-    included?.rollback?.();
+    await included?.rollback?.();
     expect(resolveDelegatedExpansionGrantId(childSessionKey)).toBeNull();
   });
 
   it("skips subagent cleanup for stateless child session keys", async () => {
     const childSessionKey = statelessSessionKey;
-    createDelegatedExpansionGrant({
+    await createDelegatedExpansionGrant({
       delegatedSessionKey: childSessionKey,
       issuerSessionId: "issuer-1",
       allowedConversationIds: [1],

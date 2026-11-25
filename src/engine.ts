@@ -5214,7 +5214,7 @@ export class LcmContextEngine implements ContextEngine {
       ? parentGrant.allowedSummaryIds
       : undefined;
 
-    createDelegatedExpansionGrant({
+    await createDelegatedExpansionGrant({
       delegatedSessionKey: childSessionKey,
       issuerSessionId: parentSessionKey,
       allowedConversationIds: [conversationId],
@@ -5225,8 +5225,8 @@ export class LcmContextEngine implements ContextEngine {
     });
 
     return {
-      rollback: () => {
-        revokeDelegatedExpansionGrantForSession(childSessionKey, { removeBinding: true });
+      rollback: async () => {
+        await revokeDelegatedExpansionGrantForSession(childSessionKey, { removeBinding: true });
       },
     };
   }
@@ -5248,14 +5248,14 @@ export class LcmContextEngine implements ContextEngine {
 
     switch (params.reason) {
       case "deleted":
-        revokeDelegatedExpansionGrantForSession(childSessionKey, { removeBinding: true });
+        await revokeDelegatedExpansionGrantForSession(childSessionKey, { removeBinding: true });
         break;
       case "completed":
-        revokeDelegatedExpansionGrantForSession(childSessionKey);
+        await revokeDelegatedExpansionGrantForSession(childSessionKey);
         break;
       case "released":
       case "swept":
-        removeDelegatedExpansionGrantForSession(childSessionKey);
+        await removeDelegatedExpansionGrantForSession(childSessionKey);
         break;
     }
   }

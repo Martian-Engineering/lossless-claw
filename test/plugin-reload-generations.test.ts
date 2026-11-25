@@ -118,13 +118,13 @@ describe("plugin reload across generations", () => {
     const dbPath = tempDbPath(dbPaths);
 
     const first = await loadGeneration(dbPath);
-    const grant = first.auth.createDelegatedExpansionGrant({
+    const grant = await first.auth.createDelegatedExpansionGrant({
       delegatedSessionKey: CHILD_SESSION_KEY,
       issuerSessionId: "agent:main:main",
       allowedConversationIds: [42],
       tokenCap: 900,
     });
-    first.auth.getRuntimeExpansionAuthManager().consumeTokenBudget(grant.grantId, 100);
+    await first.auth.getRuntimeExpansionAuthManager().consumeTokenBudget(grant.grantId, 100);
     await retireGeneration(first);
 
     const second = await loadGeneration(dbPath);
