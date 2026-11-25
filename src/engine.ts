@@ -47,6 +47,7 @@ import { readRuntimeModelContext } from "./runtime-model.js";
 import type { LcmConfig } from "./db/config.js";
 import { getLcmDbFeatures } from "./db/features.js";
 import { runLcmMigrations } from "./db/migration.js";
+import { isSqliteBusyError } from "./db/sqlite-errors.js";
 import {
   createDelegatedExpansionGrant,
   getRuntimeExpansionAuthManager,
@@ -447,12 +448,18 @@ function describeTranscriptSyncOutcome(outcome: TranscriptSyncOutcome): string {
 
 // ── LcmContextEngine ────────────────────────────────────────────────────────
 
-
+/** Delegated grant writes owed to an ended or rolled-back subagent. */
+type DelegatedGrantCleanup = {
+  revoke: boolean;
+  removeBinding: boolean;
+};
 
 export class LcmContextEngine implements ContextEngine {
   readonly info: ContextEngineInfo;
 
   private config: LcmConfig;
+  /** Delegated grant cleanups a busy database deferred, keyed by child session key. */
+  private readonly pendingDelegatedGrantCleanups = new Map<string, DelegatedGrantCleanup>();
 
   /** Get the configured timezone, falling back to system timezone. */
   get timezone(): string {
@@ -5193,6 +5200,8 @@ export class LcmContextEngine implements ContextEngine {
         ? Math.floor(params.ttlMs)
         : undefined;
 
+    this.flushDelegatedGrantCleanups("prepareSubagentSpawn");
+
     // Inherit scope from parent grant if one exists (prevents privilege escalation)
     const parentGrantId = resolveDelegatedExpansionGrantId(parentSessionKey);
     const parentGrant = parentGrantId
@@ -5214,19 +5223,34 @@ export class LcmContextEngine implements ContextEngine {
       ? parentGrant.allowedSummaryIds
       : undefined;
 
-    createDelegatedExpansionGrant({
-      delegatedSessionKey: childSessionKey,
-      issuerSessionId: parentSessionKey,
-      allowedConversationIds: [conversationId],
-      allowedSummaryIds: childAllowedSummaryIds,
-      tokenCap: childTokenCap,
-      maxDepth: childMaxDepth,
-      ttlMs,
-    });
+    try {
+      createDelegatedExpansionGrant({
+        delegatedSessionKey: childSessionKey,
+        issuerSessionId: parentSessionKey,
+        allowedConversationIds: [conversationId],
+        allowedSummaryIds: childAllowedSummaryIds,
+        tokenCap: childTokenCap,
+        maxDepth: childMaxDepth,
+        ttlMs,
+      });
+    } catch (error) {
+      if (!isSqliteBusyError(error)) {
+        throw error;
+      }
+      // Spawning without a grant is the fail-closed direction: delegated
+      // retrieval tools refuse sub-agent sessions that have no grant.
+      this.deps.log.warn(
+        `[lcm] prepareSubagentSpawn: spawning child=${childSessionKey} without a delegated expansion grant; database busy: ${describeLogError(error)}`,
+      );
+      return undefined;
+    }
+    // The new binding replaces any earlier one for this child key.
+    this.pendingDelegatedGrantCleanups.delete(childSessionKey);
 
     return {
       rollback: () => {
-        revokeDelegatedExpansionGrantForSession(childSessionKey, { removeBinding: true });
+        this.queueDelegatedGrantCleanup(childSessionKey, { revoke: true, removeBinding: true });
+        this.flushDelegatedGrantCleanups("prepareSubagentSpawn rollback");
       },
     };
   }
@@ -5248,15 +5272,59 @@ export class LcmContextEngine implements ContextEngine {
 
     switch (params.reason) {
       case "deleted":
-        revokeDelegatedExpansionGrantForSession(childSessionKey, { removeBinding: true });
+        this.queueDelegatedGrantCleanup(childSessionKey, { revoke: true, removeBinding: true });
         break;
       case "completed":
-        revokeDelegatedExpansionGrantForSession(childSessionKey);
+        this.queueDelegatedGrantCleanup(childSessionKey, { revoke: true, removeBinding: false });
         break;
       case "released":
       case "swept":
-        removeDelegatedExpansionGrantForSession(childSessionKey);
+        this.queueDelegatedGrantCleanup(childSessionKey, { revoke: false, removeBinding: true });
         break;
+    }
+    this.flushDelegatedGrantCleanups("onSubagentEnded");
+  }
+
+  /** Record a delegated grant cleanup, merging it with any still-pending one for the key. */
+  private queueDelegatedGrantCleanup(
+    childSessionKey: string,
+    cleanup: DelegatedGrantCleanup,
+  ): void {
+    const pending = this.pendingDelegatedGrantCleanups.get(childSessionKey);
+    this.pendingDelegatedGrantCleanups.set(childSessionKey, {
+      revoke: cleanup.revoke || (pending?.revoke ?? false),
+      removeBinding: cleanup.removeBinding || (pending?.removeBinding ?? false),
+    });
+  }
+
+  /**
+   * Apply pending delegated grant cleanups in order.
+   *
+   * A busy or locked database leaves the remaining cleanups pending for the
+   * next subagent hook and logs a warning instead of throwing; grants still
+   * expire at their TTL. Other errors drop the failing cleanup and propagate.
+   */
+  private flushDelegatedGrantCleanups(operation: string): void {
+    for (const [childSessionKey, cleanup] of Array.from(this.pendingDelegatedGrantCleanups)) {
+      try {
+        if (cleanup.revoke) {
+          revokeDelegatedExpansionGrantForSession(childSessionKey, {
+            removeBinding: cleanup.removeBinding,
+          });
+        } else if (cleanup.removeBinding) {
+          removeDelegatedExpansionGrantForSession(childSessionKey);
+        }
+        this.pendingDelegatedGrantCleanups.delete(childSessionKey);
+      } catch (error) {
+        if (!isSqliteBusyError(error)) {
+          this.pendingDelegatedGrantCleanups.delete(childSessionKey);
+          throw error;
+        }
+        this.deps.log.warn(
+          `[lcm] ${operation}: deferring delegated expansion grant cleanup for child=${childSessionKey} (${this.pendingDelegatedGrantCleanups.size} pending); database busy: ${describeLogError(error)}`,
+        );
+        return;
+      }
     }
   }
 
