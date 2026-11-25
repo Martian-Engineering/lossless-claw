@@ -141,6 +141,38 @@ describe("plugin reload across generations", () => {
     await retireGeneration(second);
   }, 30_000);
 
+  it("keeps a busy-deferred grant cleanup unbound and pending on the next generation", async () => {
+    const dbPath = tempDbPath(dbPaths);
+
+    const first = await loadGeneration(dbPath);
+    const grant = first.auth.createDelegatedExpansionGrant({
+      delegatedSessionKey: CHILD_SESSION_KEY,
+      issuerSessionId: "agent:main:main",
+      allowedConversationIds: [42],
+    });
+    // The state a busy database leaves after a child ends or is respawned.
+    first.auth.deferDelegatedExpansionGrantCleanup(CHILD_SESSION_KEY, {
+      revoke: true,
+      removeBinding: true,
+    });
+    expect(first.auth.resolveDelegatedExpansionGrantId(CHILD_SESSION_KEY)).toBeNull();
+    await retireGeneration(first);
+
+    const second = await loadGeneration(dbPath);
+    expect(second.auth).not.toBe(first.auth);
+    const manager = second.auth.getRuntimeExpansionAuthManager();
+    expect(manager.resolveSessionGrantId(CHILD_SESSION_KEY)).toBe(grant.grantId);
+    expect(second.auth.resolveDelegatedExpansionGrantId(CHILD_SESSION_KEY)).toBeNull();
+    const expand = second.tools.get("lcm_expand")?.({ sessionKey: CHILD_SESSION_KEY });
+    const result = JSON.stringify(await expand?.execute("call-1", { summaryIds: ["sum_missing"] }));
+    expect(result).toContain("requires a valid grant");
+
+    expect(second.auth.flushDeferredDelegatedExpansionGrantCleanups()).toBeNull();
+    expect(manager.getGrant(grant.grantId)).toBeNull();
+    expect(manager.resolveSessionGrantId(CHILD_SESSION_KEY)).toBeNull();
+    await retireGeneration(second);
+  }, 30_000);
+
   it("releases its engine on disposal so the next generation does not reuse it", async () => {
     const dbPath = tempDbPath(dbPaths);
     const { getSharedInit } = await import("../src/plugin/shared-init.js");
