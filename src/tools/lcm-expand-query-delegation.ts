@@ -352,6 +352,16 @@ async function runDelegatedQueryAttempt(
     });
     grantCreated = true;
 
+    // Grant creation waits for open database transactions; refuse the spawn if
+    // that wait consumed the remaining work budget.
+    if (remainingDeadlineMs(params.deadline.workDeadlineMs, performance.now()) <= 0) {
+      phase = "wait";
+      timedOut = true;
+      throw new Error(
+        `lcm_expand_query timed out waiting for delegated expansion (${params.delegatedWaitTimeoutSeconds}s).`,
+      );
+    }
+
     // Spawn and wait consume the same absolute work deadline.
     const spawnTimeoutMs = Math.max(
       1,
