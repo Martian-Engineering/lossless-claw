@@ -6,11 +6,16 @@ import { defineConfig } from "vitest/config";
 
 const testHome = mkdtempSync(join(tmpdir(), "lossless-claw-vitest-home-"));
 const testOpenClawDir = join(testHome, ".openclaw");
-const testDbPath = join(testOpenClawDir, "lcm.db");
 // Keep plugin file logs out of the production /tmp/openclaw rolling log.
 const testLogFile = join(testHome, "logs", "lossless-claw-test.log");
 
 mkdirSync(testOpenClawDir, { recursive: true });
+
+// Agent and operator shells often export the live Gateway's state paths. Drop
+// the inherited database and large-file overrides so defaults resolve under
+// the test state dir, while per-test plugin config such as dbPath still wins.
+delete process.env.LCM_DATABASE_PATH;
+delete process.env.LCM_LARGE_FILES_DIR;
 
 export default defineConfig({
   test: {
@@ -26,6 +31,7 @@ export default defineConfig({
     exclude: ["**/.worktrees/**"],
     env: {
       HOME: testHome,
+      OPENCLAW_STATE_DIR: testOpenClawDir,
       LCM_LOG_FILE: testLogFile,
     },
   },

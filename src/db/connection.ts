@@ -1,5 +1,6 @@
 import { mkdirSync } from "node:fs";
-import { dirname, resolve } from "node:path";
+import { userInfo } from "node:os";
+import { dirname, join, resolve } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 
 type ConnectionKey = string;
@@ -37,6 +38,33 @@ export function normalizePath(dbPath: string): ConnectionKey {
     return trimmed.length > 0 ? trimmed : ":memory:";
   }
   return fileBackedDatabasePath;
+}
+
+/**
+ * Return true when a vitest process would open a database file directly in the
+ * OS user's real `~/.openclaw` state dir (for example the live `lcm.db`).
+ *
+ * The real home comes from the passwd entry, so the vitest HOME sandbox does
+ * not hide it. Outside vitest this always returns false.
+ */
+export function isLiveStateDatabaseUnderTest(
+  dbPath: string,
+  env: NodeJS.ProcessEnv = process.env,
+): boolean {
+  if (!env.VITEST) {
+    return false;
+  }
+  const fileBackedDatabasePath = getFileBackedDatabasePath(dbPath);
+  if (!fileBackedDatabasePath) {
+    return false;
+  }
+  let realHome: string;
+  try {
+    realHome = userInfo().homedir;
+  } catch {
+    return false;
+  }
+  return !!realHome && dirname(fileBackedDatabasePath) === join(resolve(realHome), ".openclaw");
 }
 
 function ensureDbDirectory(dbPath: string): void {
@@ -123,6 +151,11 @@ function closeDatabase(db: DatabaseSync | undefined): void {
  * Connections are tracked so tests can close them by path via closeLcmConnection().
  */
 export function createLcmDatabaseConnection(dbPath: string): DatabaseSync {
+  if (isLiveStateDatabaseUnderTest(dbPath)) {
+    throw new Error(
+      `[lcm] Refusing to open ${getFileBackedDatabasePath(dbPath)} under vitest: it is in the real OpenClaw state dir.`,
+    );
+  }
   ensureDbDirectory(dbPath);
   const db = createDatabaseSync(dbPath);
   try {
