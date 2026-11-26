@@ -290,4 +290,26 @@ describe("delivery-mirror dedup", () => {
       expect(count).toBe(2);
     }
   });
+
+  it("skips OpenClaw model-fallback notices that have no matching response", async () => {
+    const engine = createEngine();
+    const sessionId = randomUUID();
+    await engine.ingest({ sessionId, sessionKey: undefined, message: makeUserMessage("hi") });
+
+    const notice = {
+      ...makeAssistantMessage({
+        text: "Model switched from provider-a/model-a to provider-b/model-b (billing).",
+        model: "delivery-mirror",
+        entryId: randomUUID(),
+      }),
+      provider: "openclaw",
+      openclawDeliveryMirror: { kind: "model-fallback", phase: "switched" },
+    } as AgentMessage;
+    const result = await engine.ingest({ sessionId, sessionKey: undefined, message: notice });
+    expect(result.ingested).toBe(false);
+
+    const store = engine.getConversationStore();
+    const conversation = await store.getConversationForSession({ sessionId });
+    expect(await store.getMessageCount(conversation!.conversationId)).toBe(1);
+  });
 });

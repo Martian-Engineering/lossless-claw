@@ -921,6 +921,23 @@ export function isLikelyInjectedDeliveryMessage(message: AgentMessage): boolean 
   return stored.role === "system" && INJECTED_DELIVERY_TRANSCRIPT_PATTERN.test(stored.content);
 }
 
+/**
+ * Model switch/restore notices that OpenClaw appends for its own transcript and
+ * never replays to providers, so they must not enter assembled context.
+ */
+export function isOpenClawModelFallbackNotice(message: AgentMessage): boolean {
+  const record = message as unknown as {
+    role?: unknown;
+    model?: unknown;
+    openclawDeliveryMirror?: { kind?: unknown } | null;
+  };
+  return (
+    record.role === "assistant" &&
+    record.model === "delivery-mirror" &&
+    record.openclawDeliveryMirror?.kind === "model-fallback"
+  );
+}
+
 export function isOpenClawRuntimeContextLeak(stored: Pick<StoredMessage, "role" | "content">): boolean {
   return (
     stored.role === "assistant" &&
