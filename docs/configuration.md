@@ -553,7 +553,21 @@ SELECT summary_id, depth, token_count FROM summaries ORDER BY token_count DESC L
 Back it up with:
 
 ```bash
-cp "${OPENCLAW_STATE_DIR:-$HOME/.openclaw}/lcm.db" "${OPENCLAW_STATE_DIR:-$HOME/.openclaw}/lcm.db.backup"
+openclaw backup create --verify
+```
+
+The plugin manifest declares the default `lcm.db` and `lcm-files` as durable
+backup resources, so OpenClaw 2026.9.5 and later capture `lcm.db` with SQLite's
+online backup API (a consistent snapshot, verified in the archive's SQLite
+inventory) instead of copying the live database and its `-wal`/`-shm` files.
+OpenClaw 2026.9.2 to 2026.9.4 accept the declaration but still copy the files
+as bytes. A custom `databasePath` outside the state directory is not covered by
+the declaration; snapshot it yourself.
+
+For a standalone copy, use SQLite's online backup rather than `cp` (copying a
+live WAL-mode database can capture a torn state):
+
+```bash
 sqlite3 "${OPENCLAW_STATE_DIR:-$HOME/.openclaw}/lcm.db" ".backup ${OPENCLAW_STATE_DIR:-$HOME/.openclaw}/lcm.db.backup"
 ```
 
