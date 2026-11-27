@@ -1681,6 +1681,7 @@ function wirePluginHandlers(
         getLcm: shared.waitForEngine,
         sessionId: ctx.sessionId,
         sessionKey: ctx.sessionKey,
+        disclosure: (ctx as { hostDisclosure?: unknown }).hostDisclosure,
       }),
     { name: "lcm_grep" },
   );
@@ -1691,6 +1692,7 @@ function wirePluginHandlers(
         getLcm: shared.waitForEngine,
         sessionId: ctx.sessionId,
         sessionKey: ctx.sessionKey,
+        disclosure: (ctx as { hostDisclosure?: unknown }).hostDisclosure,
       }),
     { name: "lcm_describe" },
   );
@@ -1701,6 +1703,7 @@ function wirePluginHandlers(
         getLcm: shared.waitForEngine,
         sessionId: ctx.sessionId,
         sessionKey: ctx.sessionKey,
+        disclosure: (ctx as { hostDisclosure?: unknown }).hostDisclosure,
       }),
     { name: "lcm_expand" },
   );
@@ -1711,6 +1714,7 @@ function wirePluginHandlers(
         getLcm: shared.waitForEngine,
         sessionId: ctx.sessionId,
         sessionKey: ctx.sessionKey,
+        disclosure: (ctx as { hostDisclosure?: unknown }).hostDisclosure,
         requesterSessionKey: ctx.sessionKey,
       }),
     { name: "lcm_expand_query" },

@@ -135,4 +135,34 @@ describe("plugin recall tool session scope", () => {
       }),
     );
   });
+
+  it("forwards the host disclosure capability from the tool context, and only that", async () => {
+    const lcmPlugin = (await lcmPluginPromise).default;
+    const api = buildToolDiscoveryApi();
+    lcmPlugin.register(api);
+    const factories = new Map(
+      (api.registerTool as ReturnType<typeof vi.fn>).mock.calls.map(([factory, options]) => [
+        options.name,
+        factory,
+      ]),
+    );
+    const hostDisclosure = { version: 1, requesterId: "p", audienceId: "a" };
+    for (const name of ["lcm_grep", "lcm_describe", "lcm_expand", "lcm_expand_query"]) {
+      factories.get(name)({ sessionId: "s", sessionKey: "agent:main:main", hostDisclosure });
+    }
+    for (const mock of [
+      toolFactoryMocks.grep,
+      toolFactoryMocks.describe,
+      toolFactoryMocks.expand,
+      toolFactoryMocks.expandQuery,
+    ]) {
+      expect(mock).toHaveBeenCalledWith(expect.objectContaining({ disclosure: hostDisclosure }));
+    }
+
+    vi.clearAllMocks();
+    factories.get("lcm_grep")({ sessionId: "s", sessionKey: "agent:main:main" });
+    expect(toolFactoryMocks.grep).toHaveBeenCalledWith(
+      expect.objectContaining({ disclosure: undefined }),
+    );
+  });
 });

@@ -668,6 +668,14 @@ export class ConversationStore {
     return rows.map(toConversationRecord);
   }
 
+  /** List every conversation ID (active and archived), oldest first. */
+  async listConversationIds(): Promise<number[]> {
+    const rows = this.db
+      .prepare(`SELECT conversation_id FROM conversations ORDER BY conversation_id ASC`)
+      .all() as unknown as Array<{ conversation_id: number }>;
+    return rows.map((row) => row.conversation_id);
+  }
+
   async getOrCreateConversation(
     sessionId: string,
     titleOrOpts?: string | { title?: string; sessionKey?: string },

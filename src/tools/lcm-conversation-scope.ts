@@ -3,6 +3,10 @@ import {
   getRuntimeExpansionAuthManager,
   resolveDelegatedExpansionGrantId,
 } from "../expansion-auth.js";
+import {
+  DISCLOSURE_CONVERSATION_UNAVAILABLE,
+  type LcmDisclosureGate,
+} from "../disclosure.js";
 import { isIsolatedCronSessionKey } from "../session-patterns.js";
 import type { LcmDependencies } from "../types.js";
 
@@ -89,13 +93,96 @@ export function parseIsoTimestampParam(
  * 2. allConversations=true (cross-conversation mode)
  * 3. Current session's LCM conversation
  */
-export async function resolveLcmConversationScope(input: {
+export type ResolveLcmConversationScopeInput = {
   lcm: LcmContextEngine;
   params: Record<string, unknown>;
   sessionId?: string;
   sessionKey?: string;
   deps?: Pick<LcmDependencies, "isSubagentSessionKey" | "log">;
-}): Promise<LcmConversationScope> {
+  /**
+   * Host-bound disclosure gate. When present the resolved scope is intersected
+   * with live host authority; `allConversations` becomes the authorized set
+   * instead of the whole database.
+   */
+  disclosure?: LcmDisclosureGate | null;
+};
+
+export async function resolveLcmConversationScope(
+  input: ResolveLcmConversationScopeInput,
+): Promise<LcmConversationScope> {
+  const scope = await resolveUngatedConversationScope(input);
+  return applyDisclosureToScope(input, scope);
+}
+
+async function applyDisclosureToScope(
+  input: ResolveLcmConversationScopeInput,
+  scope: LcmConversationScope,
+): Promise<LcmConversationScope> {
+  const gate = input.disclosure;
+  if (!gate || scope.error) {
+    return scope;
+  }
+  const denied = (): LcmConversationScope => ({
+    allConversations: false,
+    delegated: scope.delegated,
+    error: DISCLOSURE_CONVERSATION_UNAVAILABLE,
+  });
+
+  if (scope.allConversations) {
+    // A global request selects targets; it never grants access to them.
+    const ids = await gate.listAuthorizedConversationIds(input.lcm);
+    if (ids.length === 0) {
+      return denied();
+    }
+    return {
+      conversationId: ids.length === 1 ? ids[0] : undefined,
+      conversationIds: ids,
+      allConversations: true,
+      delegated: scope.delegated,
+    };
+  }
+
+  const requested =
+    scope.conversationIds && scope.conversationIds.length > 0
+      ? scope.conversationIds
+      : scope.conversationId != null
+        ? [scope.conversationId]
+        : undefined;
+  if (!requested) {
+    return scope;
+  }
+  const allowed = await gate.authorizeConversationIds(input.lcm, requested);
+  const explicit =
+    typeof input.params.conversationId === "number"
+    && Number.isFinite(input.params.conversationId)
+      ? Math.trunc(input.params.conversationId)
+      : undefined;
+  if (explicit != null && !allowed.has(explicit)) {
+    return denied();
+  }
+  const filtered = requested.filter((id) => allowed.has(id));
+  if (filtered.length === 0) {
+    return denied();
+  }
+  return {
+    // Never invent a single-conversation scope the ungated resolver did not have.
+    conversationId:
+      scope.conversationId != null
+        ? allowed.has(scope.conversationId)
+          ? scope.conversationId
+          : filtered.length === 1
+            ? filtered[0]
+            : undefined
+        : undefined,
+    conversationIds: filtered,
+    allConversations: false,
+    delegated: scope.delegated,
+  };
+}
+
+async function resolveUngatedConversationScope(
+  input: ResolveLcmConversationScopeInput,
+): Promise<LcmConversationScope> {
   const { lcm, params } = input;
   const explicitSessionKey = input.sessionKey?.trim();
   const normalizedInputSessionId = input.sessionId?.trim();
