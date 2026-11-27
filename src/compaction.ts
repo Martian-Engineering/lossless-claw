@@ -866,13 +866,14 @@ export class CompactionEngine {
     conversationId: number,
     leafChunkTokensOverride?: number,
     tokenBudget?: number,
+    freshTailCountOverride?: number,
   ): Promise<{
     shouldCompact: boolean;
     rawTokensOutsideTail: number;
     threshold: number;
   }> {
     const rawTokensOutsideTail = await this.withFreshTailBudget(tokenBudget, () =>
-      this.countRawTokensOutsideFreshTail(conversationId));
+      this.countRawTokensOutsideFreshTail(conversationId, freshTailCountOverride));
     const threshold = this.resolveLeafChunkTokens(leafChunkTokensOverride);
     return {
       shouldCompact: rawTokensOutsideTail >= threshold,

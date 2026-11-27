@@ -357,6 +357,8 @@ export type ContextEngine = {
     runtimeContext?: Record<string, unknown>;
     runtimeSettings?: ContextEngineRuntimeSettings;
     legacyParams?: Record<string, unknown>;
+    /** Why the host requested compaction; "manual" is an operator's /compact. */
+    reason?: string;
     force?: boolean;
   }): Promise<CompactResult>;
   getControlCapabilities?(): ContextEngineControlCapabilities | Promise<ContextEngineControlCapabilities>;
