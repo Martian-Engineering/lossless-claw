@@ -30,6 +30,8 @@ export type ExpansionResult = {
     messages: Array<{
       messageId: number;
       role: string;
+      /** Full source text selected within the retrieval token budget. */
+      content: string;
       snippet: string;
       tokenCount: number;
     }>;
@@ -72,7 +74,7 @@ export function resolveExpansionTokenCap(input: {
 
 /**
  * Convert a single RetrievalEngine.expand() result into the ExpansionResult
- * entry format, truncating content to short snippets.
+ * entry format, preserving selected message bodies alongside display snippets.
  */
 function toExpansionEntry(
   summaryId: string,
@@ -89,6 +91,7 @@ function toExpansionEntry(
     messages: raw.messages.map((m) => ({
       messageId: m.messageId,
       role: m.role,
+      content: m.content,
       snippet: truncateSnippet(m.content),
       tokenCount: m.tokenCount,
     })),
@@ -240,10 +243,12 @@ export function distillForSubagent(result: ExpansionResult): string {
     }
 
     if (entry.messages.length > 0) {
-      const msgParts = entry.messages.map(
-        (m) => `msg#${m.messageId} (${m.role}, ${m.tokenCount} tokens)`,
-      );
-      lines.push(`Messages: ${msgParts.join(", ")}`);
+      lines.push("Messages:");
+      for (const message of entry.messages) {
+        lines.push(`#### msg#${message.messageId} (${message.role}, ${message.tokenCount} tokens)`);
+        lines.push(message.content);
+        lines.push("");
+      }
     }
 
     // Show a snippet for children that have content
