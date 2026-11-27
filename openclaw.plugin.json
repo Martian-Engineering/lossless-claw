@@ -6,6 +6,18 @@
   },
   "name": "Lossless Context Management",
   "kind": "context-engine",
+  "backupResources": [
+    {
+      "disposition": "include",
+      "scope": "state",
+      "relativePath": "lcm.db"
+    },
+    {
+      "disposition": "include",
+      "scope": "state",
+      "relativePath": "lcm-files"
+    }
+  ],
   "activation": {
     "onStartup": true
   },

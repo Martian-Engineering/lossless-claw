@@ -189,3 +189,27 @@ describe("openclaw.plugin.json manifest drift guard (#570)", () => {
     expect(manifest.configSchema.properties.largeFilesDir?.description).toContain("OPENCLAW_STATE_DIR");
   });
 });
+
+describe("openclaw.plugin.json backupResources", () => {
+  // OpenClaw (>= 2026.9.5) takes a verified online SQLite snapshot of every
+  // `include` resource during `openclaw backup create`. Without this
+  // declaration lcm.db is byte-copied with its -wal/-shm sidecars while the
+  // engine may be writing, which is not a consistent backup.
+  it("declares the default database and large-files directory as durable state", () => {
+    const resources = (manifest as { backupResources?: unknown[] }).backupResources;
+    expect(resources).toEqual(
+      expect.arrayContaining([
+        { disposition: "include", scope: "state", relativePath: "lcm.db" },
+        { disposition: "include", scope: "state", relativePath: "lcm-files" },
+      ]),
+    );
+  });
+
+  it("only uses strict relative POSIX paths OpenClaw accepts", () => {
+    const resources = ((manifest as { backupResources?: Array<{ relativePath: string }> }).backupResources ?? []);
+    for (const { relativePath } of resources) {
+      expect(relativePath).not.toMatch(/^\/|\\|(^|\/)\.\.?(\/|$)|\/\//);
+      expect(relativePath.length).toBeGreaterThan(0);
+    }
+  });
+});
