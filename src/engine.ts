@@ -277,6 +277,8 @@ type CompactionExecutionParams = {
   runtimeSettings?: ContextEngineRuntimeSettings;
   /** Back-compat param name. */
   legacyParams?: Record<string, unknown>;
+  /** Host-reported compaction reason; "manual" means an operator asked. */
+  reason?: string;
   /** Force compaction even if below threshold */
   force?: boolean;
   /** Host cancellation for long compactions; committed passes are kept. */
@@ -284,6 +286,18 @@ type CompactionExecutionParams = {
   /** Refreshes the host compaction idle timeout after each committed pass. */
   onProgress?: () => void;
 };
+/** OpenClaw's /compact sends reason "manual"; /lcm compact sets runtimeContext.manualCompaction. */
+function isManualCompactionRequest(params: {
+  reason?: string;
+  runtimeContext?: Record<string, unknown>;
+  legacyParams?: Record<string, unknown>;
+}): boolean {
+  return (
+    params.reason === "manual" ||
+    (asRecord(params.runtimeContext) ?? asRecord(params.legacyParams))?.manualCompaction === true
+  );
+}
+
 type ContextEngineMaintenanceRuntimeContext = Record<string, unknown> & {
   allowDeferredCompactionExecution?: boolean;
 };
@@ -1595,6 +1609,7 @@ export class LcmContextEngine implements ContextEngine {
     runtimeSettings?: ContextEngineRuntimeSettings;
     legacyParams?: Record<string, unknown>;
     customInstructions?: string;
+    reason?: string;
     force?: boolean;
     sessionQueueHeld?: boolean;
     maxPendingSteps?: number;
@@ -1616,8 +1631,7 @@ export class LcmContextEngine implements ContextEngine {
         if (publication.compacted) return publication;
       }
     }
-    const pendingManualCompaction =
-      (asRecord(params.runtimeContext) ?? asRecord(params.legacyParams))?.manualCompaction === true;
+    const pendingManualCompaction = isManualCompactionRequest(params);
     const allowEmergencyFallback = params.force === true || pendingManualCompaction;
     const resolvedSummarizer = publicationOnly ? {
       summarize: async () => {
@@ -1843,6 +1857,7 @@ export class LcmContextEngine implements ContextEngine {
             legacyParams: params.legacyParams,
             customInstructions: params.customInstructions,
             compactionTarget: params.compactionTarget,
+            reason: params.reason,
             force: params.force === true,
             abortSignal: params.abortSignal,
             onProgress: params.onProgress,
@@ -2065,12 +2080,7 @@ export class LcmContextEngine implements ContextEngine {
     const { force = false } = params;
     const legacyParams = asRecord(params.runtimeContext) ?? params.legacyParams;
     const lp = legacyParams ?? {};
-    const manualCompactionRequested =
-      (
-        lp as {
-          manualCompaction?: unknown;
-        }
-      ).manualCompaction === true;
+    const manualCompactionRequested = isManualCompactionRequest(params);
     const forceCompaction = force || manualCompactionRequested;
     const resolvedTokenBudget = this.resolveTokenBudget({
       tokenBudget: params.tokenBudget,
@@ -2451,6 +2461,29 @@ export class LcmContextEngine implements ContextEngine {
         (isUnderTargetAfterSweep ||
           promptSafeAfterSweep ||
           (sweepResult.actionTaken && !isThresholdSweep));
+      // A manual request already forced the sweep, so a no-op means nothing
+      // outside the protected fresh tail was eligible. Say why after the
+      // outcome phrase hosts classify.
+      let manualNothingEligibleReason: string | undefined;
+      if (
+        manualCompactionRequested &&
+        !sweepResult.actionTaken &&
+        !sweepResult.authFailure &&
+        !thresholdSweepStoppedAtBudget &&
+        !thresholdSweepTranscriptWedge
+      ) {
+        const leaf = await this.compaction.evaluateLeafTrigger(
+          conversationId,
+          resolvedContextThreshold.leafChunkTokens,
+          tokenBudget,
+          resolvedContextThreshold.freshTailCount,
+        );
+        const outcome = isUnderTargetAfterSweep ? "already under target" : "nothing to compact";
+        manualNothingEligibleReason =
+          leaf.rawTokensOutsideTail === 0
+            ? `${outcome}: all raw messages are in the protected fresh tail and older summaries are not ready to condense`
+            : `${outcome}: ${leaf.rawTokensOutsideTail} raw tokens outside the protected fresh tail did not form a summarizable chunk`;
+      }
       const sweepReason = sweepResult.authFailure
         ? (sweepResult.actionTaken
             ? "provider auth failure after partial compaction"
@@ -2461,6 +2494,8 @@ export class LcmContextEngine implements ContextEngine {
             : "compacted but still over target"
         : sweepResult.actionTaken
           ? "compacted"
+          : manualNothingEligibleReason
+            ? manualNothingEligibleReason
           : isUnderTargetAfterSweep
             ? "already under target"
             : thresholdSweepTranscriptWedge
@@ -5066,6 +5101,8 @@ export class LcmContextEngine implements ContextEngine {
     runtimeSettings?: ContextEngineRuntimeSettings;
     /** Back-compat param name. */
     legacyParams?: Record<string, unknown>;
+    /** Why OpenClaw requested compaction; "manual" is an operator's /compact. */
+    reason?: string;
     /** Force compaction even if below threshold */
     force?: boolean;
     /** Host cancellation (run abort or compaction safety timeout). */
@@ -5154,6 +5191,7 @@ export class LcmContextEngine implements ContextEngine {
           runtimeContext: params.runtimeContext,
           runtimeSettings: params.runtimeSettings,
           legacyParams: params.legacyParams,
+          reason: params.reason,
           force: params.force,
           sessionQueueHeld: true,
           maxPendingSteps: manualPendingStepCap,

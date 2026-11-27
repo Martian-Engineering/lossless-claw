@@ -1604,10 +1604,67 @@ describe("LcmContextEngine.compact token budget plumbing", () => {
 
     expect(result.ok).toBe(true);
     expect(result.compacted).toBe(false);
-    expect(result.reason).toBe("already under target");
+    expect(result.reason).toBe(
+      "already under target: all raw messages are in the protected fresh tail and older summaries are not ready to condense",
+    );
     expect(result.result?.tokensBefore).toBe(12_000);
     expect(result.result?.tokensAfter).toBe(4_200);
   });
+
+  it.each([
+    {
+      tokensAfter: 4_200,
+      ok: true,
+      reason:
+        "already under target: all raw messages are in the protected fresh tail and older summaries are not ready to condense",
+    },
+    {
+      tokensAfter: 9_000,
+      ok: false,
+      reason:
+        "nothing to compact: all raw messages are in the protected fresh tail and older summaries are not ready to condense",
+    },
+  ])(
+    "treats OpenClaw reason=manual as a manual sweep (tokensAfter=$tokensAfter)",
+    async ({ tokensAfter, ok, reason }) => {
+      const engine = createEngine();
+      const privateEngine = engine as unknown as {
+        compaction: {
+          evaluate: (conversationId: number, tokenBudget: number) => Promise<unknown>;
+          compactFullSweep: (input: unknown) => Promise<unknown>;
+        };
+      };
+      vi.spyOn(privateEngine.compaction, "evaluate").mockResolvedValue({
+        shouldCompact: false,
+        reason: "none",
+        currentTokens: 9_000,
+        threshold: 7_500,
+      });
+      const sweep = vi.spyOn(privateEngine.compaction, "compactFullSweep").mockResolvedValue({
+        actionTaken: false,
+        tokensBefore: 9_000,
+        tokensAfter,
+        condensed: false,
+      });
+
+      await engine.ingest({
+        sessionId: "openclaw-manual-reason-session",
+        message: { role: "user", content: "compact please" } as AgentMessage,
+      });
+
+      const result = await engine.compact({
+        sessionId: "openclaw-manual-reason-session",
+        sessionFile: "/tmp/session.jsonl",
+        tokenBudget: 10_000,
+        compactionTarget: "threshold",
+        force: true,
+        reason: "manual",
+      });
+
+      expect(sweep).toHaveBeenCalledWith(expect.objectContaining({ force: true }));
+      expect(result).toMatchObject({ ok, compacted: false, reason });
+    },
+  );
 
   it("reports threshold full-sweep compaction as incomplete when tokensAfter remains over target", async () => {
     const engine = createEngine();
