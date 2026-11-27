@@ -151,6 +151,7 @@ export type TranscriptDeltaSyncDeps = {
   replayKeyStore: UserReplayKeyStore;
   gapStore: TranscriptGapStore;
   log: LcmDependencies["log"];
+  matchesPersistedAnchor: (messageId: number, message: AgentMessage) => Promise<boolean>;
   matchHostDeliveredAssistantId?: (conversationId: number, message: AgentMessage) => Promise<number | null>;
   yieldToEventLoop?: () => Promise<void>;
 };
@@ -570,12 +571,15 @@ export class TranscriptDeltaSync {
             ? Math.max(1, toStoredMessage(entry.message).tokenCount)
             : 0;
         }
-        const key = matcher.isEmpty ? null : contentMatchKeyForEntry(entry);
-        let row = key ? matcher.claim(key) : null;
-        if (!row && !matcher.isEmpty && this.deps.matchHostDeliveredAssistantId) {
-          const hosted = attachTranscriptEntryMeta(entry.message, {
-            entryId: entry.entryId, parentId: entry.parentId, timestamp: entry.createdAt ?? null,
-          });
+        if (matcher.isEmpty) continue;
+        const key = contentMatchKeyForEntry(entry);
+        const hosted = messageFromVisibleEntry(entry);
+        let row = key
+          ? await matcher.claim(key, (candidate) =>
+              this.deps.matchesPersistedAnchor(candidate.messageId, hosted),
+            )
+          : null;
+        if (!row && this.deps.matchHostDeliveredAssistantId) {
           const messageId = await this.deps.matchHostDeliveredAssistantId(request.conversationId, hosted);
           if (messageId !== null) row = matcher.claimMessageId(messageId);
         }
