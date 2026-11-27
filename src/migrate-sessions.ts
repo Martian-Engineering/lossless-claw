@@ -5,7 +5,7 @@ import { homedir } from "node:os";
 import { DatabaseSync } from "node:sqlite";
 import { closeLcmConnection, createLcmDatabaseConnection } from "./db/connection.js";
 import { runLcmMigrations } from "./db/migration.js";
-import { buildMessageParts, filterPersistableMessages, toStoredMessage, type StoredMessage } from "./message-content.js";
+import { buildMessageParts, filterPersistableMessages, isOpenClawModelFallbackNotice, toStoredMessage, type StoredMessage } from "./message-content.js";
 import type { AgentMessage } from "./openclaw-bridge.js";
 import {
   extractOpenClawSenderMetadata,
@@ -283,7 +283,9 @@ async function prepareSessionFile(
     readTranscriptHeader(file),
     readLeafPathMessages(file),
   ]);
-  const messages = filterPersistableMessages(rawMessages);
+  const messages = filterPersistableMessages(rawMessages).filter(
+    (message) => !isOpenClawModelFallbackNotice(message),
+  );
   const sessionId = header.sessionHeaderId ?? basename(file, extname(file));
 
   if (messages.length === 0) {

@@ -137,6 +137,28 @@ describe("runSessionMigration", () => {
     expect(existsSync(dbPath)).toBe(false);
   });
 
+  it("leaves OpenClaw model-fallback notices out of imports", async () => {
+    const root = tempRoot();
+    writeAgentSession(root, "session-a.jsonl", [
+      sessionHeader("session-a"),
+      messageEntry("m1", null, "user", "hello from history"),
+      {
+        ...messageEntry("m2", "m1", "assistant", ""),
+        message: {
+          role: "assistant",
+          content: "Selected model provider-a/model-a restored.",
+          model: "delivery-mirror",
+          openclawDeliveryMirror: { kind: "model-fallback", phase: "restored" },
+        },
+      },
+      messageEntry("m3", "m2", "assistant", "saved reply"),
+    ]);
+
+    const result = await runSessionMigration({ dbPath: migratedDb(root), stateDir: root });
+
+    expect(result.files[0]).toMatchObject({ status: "would-import", candidateMessages: 2 });
+  });
+
   it("imports a fresh session into conversations, messages, parts, context, and FTS", async () => {
     const root = tempRoot();
     writeAgentSession(root, "session-a.jsonl", [

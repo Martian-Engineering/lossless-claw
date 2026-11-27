@@ -119,7 +119,7 @@ import { buildDegradedLiveAssembleResult, clampMessagesToSerializedBudget, SERIA
 import { resolveBootstrapMaxTokens } from "./bootstrap-budget.js";
 import { batchLooksLikeHeartbeatAckTurn, pruneHeartbeatOkTurns } from "./heartbeat-filter.js";
 import { appendUncoveredVolatileLiveInputsWithinBudget, isVolatileLiveInputMessage, resolveProtectedFreshTailAssembledIndexes, stripTrailingAssistantPrefill } from "./live-coverage.js";
-import { buildMessageParts, extractMessageContent, filterPersistableMessages, hasPersistableMessageRole, isOpenClawRuntimeContextLeak, toStoredMessage } from "./message-content.js";
+import { buildMessageParts, extractMessageContent, filterPersistableMessages, hasPersistableMessageRole, isOpenClawModelFallbackNotice, isOpenClawRuntimeContextLeak, toStoredMessage } from "./message-content.js";
 import { batchHasRawReplayIds, filterPersistedRawIdReplayBatch } from "./raw-id-replay-filter.js";
 import { PROMPT_RECALL_MAX_MESSAGES, PROMPT_RECALL_SEARCH_CANDIDATE_LIMIT, buildPromptRecallProjectionFingerprint, extractPromptRecallIdentifiers, extractPromptRecallSnippet, findPromptRecallIdentifierIndex, isPromptRecallEligibleRole, normalizePromptRecallCoverageText, normalizePromptRecallText, renderPromptRecallMessage } from "./prompt-recall.js";
 import { estimateAgentMessageTokens, extractRuntimePromptTokenCount } from "./token-accounting.js";
@@ -3485,7 +3485,7 @@ export class LcmContextEngine implements ContextEngine {
     if (isHeartbeat && !this.config.preserveHeartbeatPoll) {
       return { ingested: false };
     }
-    if (!hasPersistableMessageRole(message)) {
+    if (!hasPersistableMessageRole(message) || isOpenClawModelFallbackNotice(message)) {
       return { ingested: false };
     }
     const openClawSenderMetadata = extractOpenClawSenderMetadata(message);
