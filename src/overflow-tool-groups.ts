@@ -2,6 +2,7 @@ import type { ContextItemRecord } from "./store/summary-store.js";
 import type {
   MessagePartRecord,
   MessageRecord,
+  MessageRole,
 } from "./store/conversation-store.js";
 
 /** Stored context plus tool identities needed to select a complete recovery group. */
@@ -117,6 +118,35 @@ export function selectOverflowToolGroup(
     if (selectedTokens >= chunkTokens) return selected;
   }
   return selected;
+}
+
+/**
+ * Move a routine leaf chunk end off an open tool group.
+ *
+ * `roles` holds the chunk rows from index 0, then the rows after it through
+ * the first one that may not join the chunk (`tailIndex`); `undefined` marks a
+ * non-message item. Results are stored right after their call, so a group is
+ * an assistant row plus the contiguous tool rows after it; a call without
+ * results is a closed group. Returns the new end: before the group when
+ * `shrinkBeforeGroup` and the group does not start the chunk, otherwise past
+ * its results, or before it when they reach `tailIndex` (0 means wait for the
+ * tail to move).
+ */
+export function toolGroupSafeChunkEnd(
+  roles: ReadonlyArray<MessageRole | undefined>,
+  end: number,
+  tailIndex: number,
+  shrinkBeforeGroup = false
+): number {
+  if (end <= 0 || roles[end] !== "tool") return end;
+  let groupStart = end - 1;
+  while (groupStart >= 0 && roles[groupStart] === "tool") groupStart--;
+  // A run of orphan results left by an older split is not repaired here.
+  if (groupStart < 0 || roles[groupStart] !== "assistant") return end;
+  if (shrinkBeforeGroup && groupStart > 0) return groupStart;
+  let close = end + 1;
+  while (close < roles.length && roles[close] === "tool") close++;
+  return close <= tailIndex ? close : groupStart;
 }
 
 /** Bound the recent raw suffix independently of the retained initiating user. */
