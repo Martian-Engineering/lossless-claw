@@ -67,12 +67,33 @@ it.each(["force", "manual"])("%s publication preserves generation cooldown witho
   expect(await f.engine.getConversationStore().getMessages(f.conversationId)).toEqual(raw);
 });
 
-it.each(["force", "manual"])("%s preparation still clears cooldown when generation is required", async mode => {
+it("manual preparation clears cooldown when generation is required", async () => {
   const f = await publicationFixture(false);
   expect(f.complete).not.toHaveBeenCalled();
   const result = await f.engine.compact({ sessionId: f.sessionId, sessionFile: "", tokenBudget: 100000,
-    ...(mode === "force" ? { force: true } : { runtimeContext: { manualCompaction: true } }) });
+    runtimeContext: { manualCompaction: true } });
   expect(result.compacted).toBe(true);
   expect(f.complete).toHaveBeenCalled();
   expect(f.guards.getSummarySpendBackoffUntil(f.scopeKey)).toBeNull();
+});
+
+it("forced preparation resumes generation after the original cooldown expires", async () => {
+  vi.useFakeTimers({ toFake: ["Date"] });
+  try {
+    const f = await publicationFixture(false);
+    const params = { sessionId: f.sessionId, sessionFile: "", tokenBudget: 100000, force: true };
+    vi.setSystemTime(f.deadline.getTime() - 1);
+    expect(await f.engine.compact(params)).toMatchObject({
+      ok: false, compacted: false, reason: "summary spend backoff open",
+    });
+    expect(f.complete).not.toHaveBeenCalled();
+    expect(f.guards.getSummarySpendBackoffUntil(f.scopeKey)).toEqual(f.deadline);
+
+    vi.setSystemTime(f.deadline);
+    expect(await f.engine.compact(params)).toMatchObject({ ok: true, compacted: true });
+    expect(f.complete).toHaveBeenCalled();
+    expect(f.guards.getSummarySpendBackoffUntil(f.scopeKey)).toBeNull();
+  } finally {
+    vi.useRealTimers();
+  }
 });
