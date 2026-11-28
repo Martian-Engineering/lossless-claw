@@ -156,6 +156,7 @@ function getRegisteredEngine(api: OpenClawPluginApi, getFactory: () => Registere
         temperature?: number;
         reasoning?: string;
         reasoningIfSupported?: string;
+        signal?: AbortSignal;
       }) => Promise<CompletionResult>;
       resolveModel: (modelRef?: string, providerHint?: string) => {
         provider: string;
@@ -504,6 +505,42 @@ describe("createLcmDependencies.complete runtime.llm bridge", () => {
       // Partial text from a canceled request is never treated as a summary.
       expect(result.content).toEqual([]);
       expect(result).toMatchObject({ provider: "anthropic", model: "m", usage });
+    } finally {
+      closeLcmConnection(dbPath);
+    }
+  });
+
+  it.each([
+    { name: "thrown AbortError", complete: () => vi.fn().mockRejectedValue(hostAbortError()) },
+    {
+      name: "resolved stopReason aborted",
+      complete: () => vi.fn().mockResolvedValue({ text: "", stopReason: "aborted", provider: "anthropic", model: "m" }),
+    },
+  ])("does not classify the caller's own abort as host lifecycle ($name)", async ({ complete }) => {
+    const { api, getFactory, dbPath } = buildApi({ runtimeLlmComplete: complete() });
+    try {
+      const engine = getRegisteredEngine(api, getFactory);
+      const controller = new AbortController();
+      controller.abort();
+      const result = await engine.deps.complete({
+        model: "test", messages: [], maxTokens: 100, signal: controller.signal,
+      });
+      expect(result.error?.kind).toBe("provider_error");
+      expect(result.content).toEqual([]);
+    } finally {
+      closeLcmConnection(dbPath);
+    }
+  });
+
+  it("still classifies a host abort as lifecycle while the caller's signal has not fired", async () => {
+    const { api, getFactory, dbPath } = buildApi({ runtimeLlmComplete: vi.fn().mockRejectedValue(hostAbortError()) });
+    try {
+      const engine = getRegisteredEngine(api, getFactory);
+      const result = await engine.deps.complete({
+        model: "test", messages: [], maxTokens: 100, signal: new AbortController().signal,
+      });
+      expect(result.error?.kind).toBe("runtime_lifecycle");
+      expect(api.logger.error).not.toHaveBeenCalled();
     } finally {
       closeLcmConnection(dbPath);
     }

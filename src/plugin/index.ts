@@ -662,6 +662,7 @@ const HOST_RUNTIME_LIFECYCLE_ERROR_CODE = "LLM_RUNTIME_LIFECYCLE";
 
 /** Reported when the host resolves a completion with `stopReason: "aborted"`. */
 const HOST_ABORTED_COMPLETION_MESSAGE = "runtime.llm.complete was aborted by the host";
+const CALLER_ABORTED_COMPLETION_MESSAGE = "runtime.llm.complete was aborted by the caller";
 
 const HOST_RUNTIME_LIFECYCLE_MESSAGES = new Set([
   "Async work scope is closed",
@@ -677,21 +678,22 @@ const HOST_RUNTIME_LIFECYCLE_MESSAGES = new Set([
  * Host cancellation surfaces as a thrown `AbortError` or (once the provider
  * request started) as a result with `stopReason: "aborted"`.
  */
-function isHostRuntimeLifecycleRejection(error: unknown): boolean {
+function isHostRuntimeLifecycleRejection(error: unknown, callerAborted = false): boolean {
   if (isRecord(error) && error.code === HOST_RUNTIME_LIFECYCLE_ERROR_CODE) {
     return true;
   }
   if (HOST_RUNTIME_LIFECYCLE_MESSAGES.has(describeLogError(error))) {
     return true;
   }
-  // Lossless never passes its own signal to runtime.llm.complete, so a
-  // top-level AbortError comes from the host canceling the call (for example
-  // deferred maintenance yielding to a foreground turn or reaching its time
-  // budget). That is cancellation, not a provider failure: leave the work for
-  // a later pass instead of writing a truncation fallback summary. An
-  // AbortError nested as the cause of another error is not trusted: a
-  // provider client can abort its own request and report a failure.
-  if (isRecord(error) && error.name === "AbortError") {
+  // Unless the caller's own signal fired (delegated recall synthesis passes
+  // one for its work deadline), a top-level AbortError comes from the host
+  // canceling the call (for example deferred maintenance yielding to a
+  // foreground turn or reaching its time budget). That is cancellation, not a
+  // provider failure: leave the work for a later pass instead of writing a
+  // truncation fallback summary. An AbortError nested as the cause of another
+  // error is not trusted: a provider client can abort its own request and
+  // report a failure.
+  if (!callerAborted && isRecord(error) && error.name === "AbortError") {
     return true;
   }
   let current: unknown = error;
@@ -1406,6 +1408,8 @@ function createLcmDependencies(
       temperature,
       reasoning,
       reasoningIfSupported,
+      signal,
+      purpose,
     }) => {
       const providerId = provider?.trim();
       const modelId = model.trim();
@@ -1444,7 +1448,8 @@ function createLcmDependencies(
             ? { temperature }
             : {}),
           ...(typeof system === "string" && system.trim() ? { systemPrompt: system.trim() } : {}),
-          purpose: "lossless-claw compaction summarization",
+          purpose: purpose ?? "lossless-claw compaction summarization",
+          ...(signal ? { signal } : {}),
           ...(authProfileId?.trim() ? { authProfileId: authProfileId.trim() } : {}),
           // Only context-engine supplied runtime LLM capabilities may carry an explicit
           // agentId. Plugin-wide api.runtime.llm.complete is gateway-scoped and rejects
@@ -1457,7 +1462,10 @@ function createLcmDependencies(
         if (result.stopReason === "aborted") {
           return {
             content: [],
-            error: { kind: "runtime_lifecycle", message: HOST_ABORTED_COMPLETION_MESSAGE },
+            // The caller's own deadline is a failed call, not host cancellation.
+            error: signal?.aborted
+              ? { kind: "provider_error", message: CALLER_ABORTED_COMPLETION_MESSAGE }
+              : { kind: "runtime_lifecycle", message: HOST_ABORTED_COMPLETION_MESSAGE },
             provider: result.provider,
             model: result.model,
             agentId: result.agentId,
@@ -1479,7 +1487,7 @@ function createLcmDependencies(
       } catch (err) {
         // Host lifecycle rejections are classified, not logged: the summarizer
         // caller reports them once with the retained-work context.
-        if (isHostRuntimeLifecycleRejection(err)) {
+        if (isHostRuntimeLifecycleRejection(err, signal?.aborted === true)) {
           return {
             content: [],
             error: { kind: "runtime_lifecycle", message: describeLogError(err) },
