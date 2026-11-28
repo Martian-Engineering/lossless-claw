@@ -349,6 +349,7 @@ describe("resolveLcmConfig", () => {
       statelessSessionPatternsSource: "env",
       ignoreSessionPatternsEnvOverridesPluginConfig: true,
       statelessSessionPatternsEnvOverridesPluginConfig: true,
+      warnings: [],
     });
   });
 

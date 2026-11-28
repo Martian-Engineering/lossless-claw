@@ -1,0 +1,384 @@
+// Vitest Snapshot v1, https://vitest.dev/guide/snapshot.html
+
+exports[`config resolution identity > resolves every input exactly as the pre-warnings resolver did 1`] = `
+{
+  "defaults": {
+    "bootstrapMaxTokens": 6000,
+    "cacheAwareCompaction": {
+      "cacheTTLSeconds": 300,
+      "coldCacheObservationThreshold": 3,
+      "criticalBudgetPressureRatio": 0.9,
+      "enabled": true,
+      "hotCacheBudgetHeadroomRatio": 0.2,
+      "hotCachePressureFactor": 4,
+      "maxColdCacheCatchupPasses": 2,
+    },
+    "circuitBreakerCooldownMs": 1800000,
+    "circuitBreakerThreshold": 5,
+    "compactUntilUnderDeadlineMs": 300000,
+    "condensedMinFanout": 4,
+    "condensedMinFanoutHard": 2,
+    "condensedTargetTokens": 2000,
+    "contextThreshold": 0.75,
+    "contextThresholdOverrides": [],
+    "customInstructions": "",
+    "databasePath": "/identity-state/lcm.db",
+    "delegationTimeoutMs": 120000,
+    "dynamicLeafChunkTokens": {
+      "enabled": true,
+      "max": 40000,
+    },
+    "enableSummaryThinking": true,
+    "enabled": true,
+    "expansionModel": "",
+    "expansionProvider": "",
+    "fallbackMaxTokens": 512,
+    "fallbackProviders": [],
+    "freshTailCount": 64,
+    "freshTailMaxTokens": undefined,
+    "hostFallbackMode": "error",
+    "ignoreSessionPatterns": [],
+    "incrementalMaxDepth": 1,
+    "independentLogFile": {
+      "enabled": true,
+      "file": undefined,
+      "maxFileBytes": 104857600,
+    },
+    "largeFileSummaryModel": "",
+    "largeFileSummaryProvider": "",
+    "largeFileTokenThreshold": 25000,
+    "largeFilesDir": "/identity-state/lcm-files",
+    "leafChunkTokens": 20000,
+    "leafMinFanout": 8,
+    "leafTargetTokens": 2400,
+    "maxAssemblyTokenBudget": undefined,
+    "maxExpandTokens": 4000,
+    "maxSweepIterations": 12,
+    "newSessionRetainDepth": 2,
+    "preserveHeartbeatPoll": false,
+    "proactiveThresholdCompactionMode": "deferred",
+    "promptAwareEviction": false,
+    "pruneHeartbeatOk": false,
+    "replayFloodThresholdExternal": 3,
+    "replayFloodThresholdInternal": 32,
+    "skipStatelessSessions": true,
+    "statelessSessionPatterns": [],
+    "stripInjectedContextTags": [
+      "active_memory_plugin",
+      "relevant-memories",
+      "relevant_memories",
+      "hindsight_memories",
+    ],
+    "stubLargeToolPayloads": false,
+    "summaryCallWindowMs": 600000,
+    "summaryMaxCallsPerWindow": 24,
+    "summaryMaxOverageFactor": 3,
+    "summaryModel": "",
+    "summaryPrefixTargetTokens": undefined,
+    "summaryProvider": "",
+    "summarySpendBackoffMs": 1800000,
+    "summaryTimeoutMs": 60000,
+    "sweepDeadlineMs": 120000,
+    "sweepMaxDepth": 1,
+    "timezone": "UTC",
+  },
+  "resolved": {
+    "defaults": {},
+    "env LCM_BOOTSTRAP_MAX_TOKENS="abc"": {},
+    "env LCM_CACHE_AWARE_COMPACTION_ENABLED="off"": {},
+    "env LCM_CIRCUIT_BREAKER_THRESHOLD="x"": {},
+    "env LCM_COLD_CACHE_OBSERVATION_THRESHOLD="0"": {
+      "cacheAwareCompaction": {
+        "cacheTTLSeconds": 300,
+        "coldCacheObservationThreshold": 1,
+        "criticalBudgetPressureRatio": 0.9,
+        "enabled": true,
+        "hotCacheBudgetHeadroomRatio": 0.2,
+        "hotCachePressureFactor": 4,
+        "maxColdCacheCatchupPasses": 2,
+      },
+    },
+    "env LCM_COLD_CACHE_OBSERVATION_THRESHOLD="2.5"": {
+      "cacheAwareCompaction": {
+        "cacheTTLSeconds": 300,
+        "coldCacheObservationThreshold": 2,
+        "criticalBudgetPressureRatio": 0.9,
+        "enabled": true,
+        "hotCacheBudgetHeadroomRatio": 0.2,
+        "hotCachePressureFactor": 4,
+        "maxColdCacheCatchupPasses": 2,
+      },
+    },
+    "env LCM_CONTEXT_THRESHOLD="0.6"": {
+      "contextThreshold": 0.6,
+    },
+    "env LCM_CONTEXT_THRESHOLD="0.6abc"": {
+      "contextThreshold": 0.6,
+    },
+    "env LCM_CONTEXT_THRESHOLD="x"": {},
+    "env LCM_CRITICAL_BUDGET_PRESSURE_RATIO="-1"": {
+      "cacheAwareCompaction": {
+        "cacheTTLSeconds": 300,
+        "coldCacheObservationThreshold": 3,
+        "criticalBudgetPressureRatio": 0,
+        "enabled": true,
+        "hotCacheBudgetHeadroomRatio": 0.2,
+        "hotCachePressureFactor": 4,
+        "maxColdCacheCatchupPasses": 2,
+      },
+    },
+    "env LCM_DELEGATION_TIMEOUT_MS="5000"": {
+      "delegationTimeoutMs": 5000,
+    },
+    "env LCM_DELEGATION_TIMEOUT_MS="abc"": {},
+    "env LCM_DYNAMIC_LEAF_CHUNK_TOKENS_ENABLED="tru"": {
+      "dynamicLeafChunkTokens": {
+        "enabled": false,
+        "max": 40000,
+      },
+    },
+    "env LCM_DYNAMIC_LEAF_CHUNK_TOKENS_MAX="10"": {
+      "dynamicLeafChunkTokens": {
+        "enabled": true,
+        "max": 20000,
+      },
+    },
+    "env LCM_ENABLED=""": {},
+    "env LCM_ENABLED="false"": {
+      "enabled": false,
+    },
+    "env LCM_ENABLED="tru"": {},
+    "env LCM_ENABLED="true"": {},
+    "env LCM_ENABLE_SUMMARY_THINKING="false"": {
+      "enableSummaryThinking": false,
+    },
+    "env LCM_ENABLE_SUMMARY_THINKING="nope"": {
+      "enableSummaryThinking": false,
+    },
+    "env LCM_FALLBACK_MAX_TOKENS="10"": {},
+    "env LCM_FALLBACK_MAX_TOKENS="100.5"": {
+      "fallbackMaxTokens": 100,
+    },
+    "env LCM_FALLBACK_MAX_TOKENS="64"": {
+      "fallbackMaxTokens": 64,
+    },
+    "env LCM_FALLBACK_MAX_TOKENS="abc"": {},
+    "env LCM_FRESH_TAIL_COUNT="-5"": {
+      "freshTailCount": -5,
+    },
+    "env LCM_FRESH_TAIL_COUNT="1.5"": {
+      "freshTailCount": 1,
+    },
+    "env LCM_FRESH_TAIL_COUNT="2.0"": {
+      "freshTailCount": 2,
+    },
+    "env LCM_FRESH_TAIL_COUNT="20abc"": {
+      "freshTailCount": 20,
+    },
+    "env LCM_FRESH_TAIL_COUNT="32"": {
+      "freshTailCount": 32,
+    },
+    "env LCM_FRESH_TAIL_COUNT="abc"": {},
+    "env LCM_FRESH_TAIL_MAX_TOKENS="1000"": {
+      "freshTailMaxTokens": 1000,
+    },
+    "env LCM_FRESH_TAIL_MAX_TOKENS="x"": {},
+    "env LCM_HOST_FALLBACK_MODE="  "": {},
+    "env LCM_HOST_FALLBACK_MODE="Capture-Only"": {},
+    "env LCM_HOST_FALLBACK_MODE="bogus"": {},
+    "env LCM_HOST_FALLBACK_MODE="capture-only"": {
+      "hostFallbackMode": "capture-only",
+    },
+    "env LCM_HOST_FALLBACK_MODE="error"": {},
+    "env LCM_HOT_CACHE_BUDGET_HEADROOM_RATIO="2"": {
+      "cacheAwareCompaction": {
+        "cacheTTLSeconds": 300,
+        "coldCacheObservationThreshold": 3,
+        "criticalBudgetPressureRatio": 0.9,
+        "enabled": true,
+        "hotCacheBudgetHeadroomRatio": 0.95,
+        "hotCachePressureFactor": 4,
+        "maxColdCacheCatchupPasses": 2,
+      },
+    },
+    "env LCM_HOT_CACHE_PRESSURE_FACTOR="0.5"": {
+      "cacheAwareCompaction": {
+        "cacheTTLSeconds": 300,
+        "coldCacheObservationThreshold": 3,
+        "criticalBudgetPressureRatio": 0.9,
+        "enabled": true,
+        "hotCacheBudgetHeadroomRatio": 0.2,
+        "hotCachePressureFactor": 1,
+        "maxColdCacheCatchupPasses": 2,
+      },
+    },
+    "env LCM_HOT_CACHE_PRESSURE_FACTOR="x"": {},
+    "env LCM_INCREMENTAL_MAX_DEPTH="3"": {
+      "incrementalMaxDepth": 3,
+      "sweepMaxDepth": 3,
+    },
+    "env LCM_LEAF_CHUNK_TOKENS="0x10"": {
+      "dynamicLeafChunkTokens": {
+        "enabled": true,
+        "max": 0,
+      },
+      "leafChunkTokens": 0,
+    },
+    "env LCM_LEAF_CHUNK_TOKENS="1e3"": {
+      "dynamicLeafChunkTokens": {
+        "enabled": true,
+        "max": 2,
+      },
+      "leafChunkTokens": 1,
+    },
+    "env LCM_LEAF_CHUNK_TOKENS="30000"": {
+      "bootstrapMaxTokens": 9000,
+      "dynamicLeafChunkTokens": {
+        "enabled": true,
+        "max": 60000,
+      },
+      "leafChunkTokens": 30000,
+    },
+    "env LCM_LOG_FILE_ENABLED="fals"": {},
+    "env LCM_LOG_FILE_ENABLED="false"": {
+      "independentLogFile": {
+        "enabled": false,
+        "file": undefined,
+        "maxFileBytes": 104857600,
+      },
+    },
+    "env LCM_LOG_MAX_FILE_BYTES="0"": {
+      "independentLogFile": {
+        "enabled": true,
+        "file": undefined,
+        "maxFileBytes": 1,
+      },
+    },
+    "env LCM_LOG_MAX_FILE_BYTES="abc"": {},
+    "env LCM_MAX_SWEEP_ITERATIONS="-4"": {
+      "maxSweepIterations": 1,
+    },
+    "env LCM_MAX_SWEEP_ITERATIONS="0"": {
+      "maxSweepIterations": 1,
+    },
+    "env LCM_MAX_SWEEP_ITERATIONS="5"": {
+      "maxSweepIterations": 5,
+    },
+    "env LCM_MAX_SWEEP_ITERATIONS="abc"": {},
+    "env LCM_PRESERVE_HEARTBEAT_POLL="0"": {},
+    "env LCM_PRESERVE_HEARTBEAT_POLL="1"": {
+      "preserveHeartbeatPoll": true,
+    },
+    "env LCM_PRESERVE_HEARTBEAT_POLL="yes"": {},
+    "env LCM_PROACTIVE_THRESHOLD_COMPACTION_MODE=""": {},
+    "env LCM_PROACTIVE_THRESHOLD_COMPACTION_MODE="INLINE"": {
+      "proactiveThresholdCompactionMode": "inline",
+    },
+    "env LCM_PROACTIVE_THRESHOLD_COMPACTION_MODE="inline"": {
+      "proactiveThresholdCompactionMode": "inline",
+    },
+    "env LCM_PROACTIVE_THRESHOLD_COMPACTION_MODE="sideways"": {},
+    "env LCM_PROMPT_AWARE_EVICTION_ENABLED="tru"": {},
+    "env LCM_PROMPT_AWARE_EVICTION_ENABLED="true"": {
+      "promptAwareEviction": true,
+    },
+    "env LCM_PRUNE_HEARTBEAT_OK="1"": {},
+    "env LCM_PRUNE_HEARTBEAT_OK="true"": {
+      "pruneHeartbeatOk": true,
+    },
+    "env LCM_REPLAY_FLOOD_THRESHOLD_EXTERNAL="0"": {},
+    "env LCM_REPLAY_FLOOD_THRESHOLD_EXTERNAL="1.5"": {
+      "replayFloodThresholdExternal": 1,
+    },
+    "env LCM_REPLAY_FLOOD_THRESHOLD_EXTERNAL="5"": {
+      "replayFloodThresholdExternal": 5,
+    },
+    "env LCM_REPLAY_FLOOD_THRESHOLD_EXTERNAL="abc"": {},
+    "env LCM_REPLAY_FLOOD_THRESHOLD_INTERNAL="-1"": {},
+    "env LCM_SKIP_STATELESS_SESSIONS="false"": {
+      "skipStatelessSessions": false,
+    },
+    "env LCM_SKIP_STATELESS_SESSIONS="tru"": {
+      "skipStatelessSessions": false,
+    },
+    "env LCM_SKIP_STATELESS_SESSIONS="true"": {},
+    "env LCM_STUB_LARGE_TOOL_PAYLOADS="yes"": {},
+    "env LCM_SUMMARY_MAX_OVERAGE_FACTOR="x"": {},
+    "env LCM_SUMMARY_PREFIX_TARGET_TOKENS="0"": {
+      "summaryPrefixTargetTokens": 1,
+    },
+    "env LCM_SWEEP_DEADLINE_MS="0.5"": {
+      "sweepDeadlineMs": 1,
+    },
+    "env LCM_SWEEP_MAX_DEPTH="2"": {
+      "incrementalMaxDepth": 2,
+      "sweepMaxDepth": 2,
+    },
+    "env LCM_SWEEP_MAX_DEPTH="abc"": {},
+    "env below minimum, plugin valid": {
+      "fallbackMaxTokens": 256,
+    },
+    "env boolean typo, plugin false": {},
+    "env enum typo, plugin valid": {
+      "proactiveThresholdCompactionMode": "inline",
+    },
+    "env host typo, plugin capture-only": {},
+    "env invalid int, plugin valid": {
+      "freshTailCount": 10,
+    },
+    "env replay invalid, plugin invalid": {},
+    "plugin {"autoRotateSessionFiles":{"enabled":true}}": {},
+    "plugin {"cacheAwareCompaction":{"enabled":0}}": {},
+    "plugin {"cacheAwareCompaction":{"hotCacheBudgetHeadroomRatio":2}}": {
+      "cacheAwareCompaction": {
+        "cacheTTLSeconds": 300,
+        "coldCacheObservationThreshold": 3,
+        "criticalBudgetPressureRatio": 0.9,
+        "enabled": true,
+        "hotCacheBudgetHeadroomRatio": 0.95,
+        "hotCachePressureFactor": 4,
+        "maxColdCacheCatchupPasses": 2,
+      },
+    },
+    "plugin {"dynamicLeafChunkTokens":{"enabled":"x"}}": {},
+    "plugin {"enabled":"false"}": {
+      "enabled": false,
+    },
+    "plugin {"enabled":"yes"}": {},
+    "plugin {"fallbackMaxTokens":"abc"}": {},
+    "plugin {"fallbackMaxTokens":100.5}": {},
+    "plugin {"fallbackMaxTokens":10}": {},
+    "plugin {"freshTailCount":"abc"}": {},
+    "plugin {"hostFallbackMode":"bogus"}": {},
+    "plugin {"hostFallbackMode":"capture-only"}": {
+      "hostFallbackMode": "capture-only",
+    },
+    "plugin {"incrementalMaxDepth":3}": {
+      "incrementalMaxDepth": 3,
+      "sweepMaxDepth": 3,
+    },
+    "plugin {"independentLogFile":{"enabled":"no"}}": {},
+    "plugin {"maxSweepIterations":0}": {
+      "maxSweepIterations": 1,
+    },
+    "plugin {"maxSweepIterations":2.7}": {
+      "maxSweepIterations": 2,
+    },
+    "plugin {"proactiveThresholdCompactionMode":"Inline"}": {
+      "proactiveThresholdCompactionMode": "inline",
+    },
+    "plugin {"proactiveThresholdCompactionMode":"sideways"}": {},
+    "plugin {"promptAwareEviction":"true"}": {
+      "promptAwareEviction": true,
+    },
+    "plugin {"replayFloodThresholdExternal":0}": {},
+    "plugin {"replayFloodThresholdInternal":2.5}": {},
+    "plugin {"skipStatelessSessions":1}": {},
+    "plugin {"sweepMaxDepth":2,"incrementalMaxDepth":3}": {
+      "incrementalMaxDepth": 2,
+      "sweepMaxDepth": 2,
+    },
+    "plugin {"transcriptGcEnabled":true}": {},
+  },
+}
+`;
