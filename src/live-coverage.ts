@@ -4,7 +4,7 @@
  * Extracted from engine.ts (Phase 1 of the engine decomposition).
  */
 import { contentFromParts } from "./assembler.js";
-import { buildMessageParts, hasSubstantiveAssistantContent, toStoredMessage, toSyntheticMessagePartRecord } from "./message-content.js";
+import { buildMessageParts, hasSubstantiveAssistantContent, toStoredMessage, toStoredMessageIdentity, toSyntheticMessagePartRecord } from "./message-content.js";
 import { createLiveCoverageSignature, hashAgentMessageForAssemblyProtection, messagesHaveSameLiveCoverageSignature } from "./message-signatures.js";
 import type { AgentMessage } from "./openclaw-bridge.js";
 import {
@@ -320,6 +320,16 @@ export function matchVolatileLiveInputsToCoverageSlots(params: {
   assembledMessages: AgentMessage[];
   volatileLiveInputs: VolatileLiveInputCandidate[];
 }): Map<number, number> {
+  if (params.volatileLiveInputs.length === 0 || params.assembledMessages.length === 0) {
+    return new Map();
+  }
+
+  // Compare prepared identities, not repeated content parsing/token estimation
+  // for every live-input/history pair. These values belong to this assembly only.
+  const assembledSignatures = params.assembledMessages.map(createLiveCoverageSignature);
+  const liveSignatures = params.volatileLiveInputs.map((entry) => createLiveCoverageSignature(entry.message));
+  const assembledContents = params.assembledMessages.map((message) => toStoredMessageIdentity(message).content);
+
   const entryIndexesByLiveText = new Map<string, number[]>();
   for (let entryIndex = 0; entryIndex < params.volatileLiveInputs.length; entryIndex++) {
     const entry = params.volatileLiveInputs[entryIndex] as VolatileLiveInputCandidate;
@@ -344,16 +354,14 @@ export function matchVolatileLiveInputsToCoverageSlots(params: {
     }
   };
 
-  for (const [liveText, entryIndexes] of entryIndexesByLiveText.entries()) {
+  for (const entryIndexes of entryIndexesByLiveText.values()) {
     for (let assembledIndex = 0; assembledIndex < params.assembledMessages.length; assembledIndex++) {
       const assembledMessage = params.assembledMessages[assembledIndex] as AgentMessage;
-      const assembled = toStoredMessage(assembledMessage);
-      if (!isSummaryWrapperContent(assembled.content)) {
+      const assembledContent = assembledContents[assembledIndex] as string;
+      const assembledSignature = assembledSignatures[assembledIndex] as string;
+      if (!isSummaryWrapperContent(assembledContent)) {
         const exactEntryIndexes = entryIndexes.filter((entryIndex) =>
-          messagesHaveSameLiveCoverageSignature(
-            assembledMessage,
-            (params.volatileLiveInputs[entryIndex] as VolatileLiveInputCandidate).message,
-          )
+          assembledSignature === liveSignatures[entryIndex]
         );
         if (exactEntryIndexes.length > 0) {
           addCandidateSlots(exactEntryIndexes, assembledIndex, 1);
@@ -361,6 +369,11 @@ export function matchVolatileLiveInputsToCoverageSlots(params: {
         continue;
       }
 
+      // Volatile inputs require an exact signature even for summary wrappers;
+      // substring coverage in liveInputCoverageCapacity applies only to history.
+      if (assembledSignature !== liveSignatures[entryIndexes[0] as number]) {
+        continue;
+      }
       const representativeEntry = params.volatileLiveInputs[entryIndexes[0] as number] as VolatileLiveInputCandidate;
       const capacity = liveInputCoverageCapacity({
         assembledMessage,
@@ -373,8 +386,7 @@ export function matchVolatileLiveInputsToCoverageSlots(params: {
 
       const entryIndexesBySignature = new Map<string, number[]>();
       for (const entryIndex of entryIndexes) {
-        const entry = params.volatileLiveInputs[entryIndex] as VolatileLiveInputCandidate;
-        const signature = createLiveCoverageSignature(entry.message);
+        const signature = liveSignatures[entryIndex] as string;
         const signatureEntryIndexes = entryIndexesBySignature.get(signature);
         if (signatureEntryIndexes) {
           signatureEntryIndexes.push(entryIndex);
@@ -388,7 +400,7 @@ export function matchVolatileLiveInputsToCoverageSlots(params: {
         const firstEntry = params.volatileLiveInputs[signatureEntryIndexes[0] as number] as VolatileLiveInputCandidate;
         const liveContent = toStoredMessage(firstEntry.message).content;
         const exactCapacity = liveContent
-          ? countNonOverlappingOccurrences({ haystack: assembled.content, needle: liveContent })
+          ? countNonOverlappingOccurrences({ haystack: assembledContent, needle: liveContent })
           : 0;
         const slotCount = Math.min(exactCapacity, signatureEntryIndexes.length);
         if (slotCount > 0) {
