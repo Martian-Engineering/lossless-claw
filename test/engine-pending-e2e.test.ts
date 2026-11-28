@@ -24,7 +24,10 @@ function createFakeComplete() {
   return { complete, inputs };
 }
 
-function createPendingE2eEngine(complete: ReturnType<typeof createFakeComplete>["complete"]) {
+function createPendingE2eEngine(
+  complete: ReturnType<typeof createFakeComplete>["complete"],
+  overrides: Parameters<typeof createEngineWithDeps>[0] = {},
+) {
   return createEngineWithDeps(
     {
       freshTailCount: 1,
@@ -35,6 +38,7 @@ function createPendingE2eEngine(complete: ReturnType<typeof createFakeComplete>[
       proactiveThresholdCompactionMode: "deferred",
       summaryProvider: "anthropic",
       summaryModel: "claude-opus-4-5",
+      ...overrides,
     },
     { complete },
   );
@@ -151,6 +155,30 @@ describe("pending summary compaction engine e2e (mocked LLM)", () => {
       // when pressure remains. A model call proves that the retained debt gave
       // this normal preparation path authority to advance work.
       expect(complete.mock.calls.length).toBeGreaterThan(0);
+    },
+    30_000,
+  );
+
+  it(
+    "passes the configured timezone to deferred leaf preparation",
+    async () => {
+      const { complete, inputs } = createFakeComplete();
+      const engine = createPendingE2eEngine(complete, { timezone: "Asia/Tokyo" });
+      const sessionId = "pending-e2e-timezone";
+      const sessionFile = createSessionFilePath(sessionId);
+
+      await seedBacklogContext(engine, sessionId, [120, 120, 120]);
+      await engine.ingest({
+        sessionId,
+        message: makeMessage({ role: "user", content: "fresh tail" }),
+      });
+      await runAfterTurn(engine, sessionId, sessionFile, {
+        tokenBudget: 10_000,
+        currentTokenCount: 300,
+      });
+      await waitForReadyNodes(engine, await conversationIdFor(engine, sessionId), 3);
+
+      expect(inputs[0]).toMatch(/\[\d{4}-\d{2}-\d{2} \d{2}:\d{2} GMT\+9 \| /);
     },
     30_000,
   );

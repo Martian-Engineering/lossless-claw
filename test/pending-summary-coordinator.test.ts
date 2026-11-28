@@ -101,6 +101,49 @@ describe("PendingCompactionCoordinator", () => {
     expect(getContextItems).not.toHaveBeenCalled();
   });
 
+  it("stamps leaf source messages in the configured timezone", async () => {
+    const { conversationStore, pendingSummaryStore, summaryStore } = createStores();
+    const conversation = await conversationStore.createConversation({
+      sessionId: "pending-coordinator-timezone-session",
+    });
+    const messages = await conversationStore.createMessagesBulk(
+      [1, 2, 3].map((seq) => ({
+        conversationId: conversation.conversationId,
+        seq,
+        role: "user" as const,
+        content: `message number ${seq}`,
+        tokenCount: 4,
+        createdAt: new Date("2026-01-15T20:30:00.000Z"),
+      })),
+    );
+    await summaryStore.appendContextMessages(
+      conversation.conversationId,
+      messages.map((message) => message.messageId),
+    );
+    const summarize = vi.fn(async (_sourceText: string) => "leaf summary");
+    const coordinator = new PendingCompactionCoordinator({
+      conversationStore,
+      pendingSummaryStore,
+      summaryStore,
+      model: "test-model",
+      leaseOwner: "test-worker",
+      config: {
+        freshTailCount: 1,
+        leafChunkTokens: 8,
+        condensedMinFanout: 2,
+        condensedMinSourceTokens: 1,
+        condensedChunkTokens: 100,
+        timezone: "Asia/Tokyo",
+      },
+      summarize,
+    });
+
+    await coordinator.runOnce({ conversationId: conversation.conversationId });
+    await coordinator.runOnce({ conversationId: conversation.conversationId });
+
+    expect(summarize.mock.calls[0]![0]).toContain("[2026-01-16 05:30 GMT+9 | user]");
+  });
+
   it("prepares hidden leaves and condensation before publishing one canonical swap", async () => {
     const { conversationStore, pendingSummaryStore, summaryStore } = createStores();
     const conversation = await conversationStore.createConversation({
