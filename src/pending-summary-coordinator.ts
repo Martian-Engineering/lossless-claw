@@ -7,6 +7,7 @@ import {
 } from "./pending-summary-projection.js";
 import {
   extractMeaningfulMessageText,
+  formatTimestamp,
   resolveLeafSummaryMessageContent,
   stripInjectedContextBlocks,
 } from "./compaction.js";
@@ -57,6 +58,8 @@ export type PendingCompactionCoordinatorConfig = {
   condensedChunkTokens: number;
   leaseMs?: number;
   stripInjectedContextTags?: string[];
+  /** IANA timezone for source message timestamps, as in the synchronous leaf pass. */
+  timezone?: string;
 };
 
 export type PendingCompactionCoordinatorOptions = {
@@ -124,6 +127,7 @@ async function formatMessageForSummary(
   store: Pick<ConversationStore, "getMessageParts">,
   message: MessageRecord,
   stripInjectedContextTags?: string[],
+  timezone?: string,
 ): Promise<string> {
   const resolved = await resolveLeafSummaryMessageContent(store, message);
   const content = extractMeaningfulMessageText(
@@ -132,7 +136,7 @@ async function formatMessageForSummary(
   if (!content) {
     return "";
   }
-  return [`[${message.createdAt.toISOString()} | ${message.role}]`, content].join("\n").trim();
+  return [`[${formatTimestamp(message.createdAt, timezone)} | ${message.role}]`, content].join("\n").trim();
 }
 
 /**
@@ -852,6 +856,7 @@ export class PendingCompactionCoordinator {
             this.conversationStore,
             message,
             this.config.stripInjectedContextTags,
+            this.config.timezone,
           ),
         );
       }

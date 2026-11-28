@@ -1730,6 +1730,7 @@ export class LcmContextEngine implements ContextEngine {
         condensedChunkTokens: pendingLeafChunkTokens,
         leaseMs: this.config.summaryTimeoutMs,
         stripInjectedContextTags: this.config.stripInjectedContextTags,
+        timezone: this.config.timezone,
       },
     });
 
