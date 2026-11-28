@@ -1073,6 +1073,55 @@ describe("LcmContextEngine maintain and assemble budget", () => {
     ).resolves.toBeNull();
   });
 
+  it("pending preparation hands the host abort signal to the summarizer", async () => {
+    const engine = createEngineWithDeps({
+      freshTailCount: 0,
+      leafChunkTokens: 100,
+      maxSweepIterations: 1,
+    });
+    const sessionId = "pending-summarizer-host-abort";
+    const conversation = await engine.getConversationStore().getOrCreateConversation(sessionId, {
+      sessionKey: undefined,
+    });
+    const messages = await engine.getConversationStore().createMessagesBulk(
+      Array.from({ length: 3 }, (_, index) => ({
+        conversationId: conversation.conversationId,
+        seq: index + 1,
+        role: index % 2 === 0 ? "user" as const : "assistant" as const,
+        content: `abort source ${index}`,
+        tokenCount: 100,
+        skipReplayTimestampFloodGuard: true,
+      })),
+    );
+    await engine.getSummaryStore().appendContextMessages(
+      conversation.conversationId,
+      messages.map((message) => message.messageId),
+    );
+    const summarize = vi.fn(async () => "prepared summary");
+    const controller = new AbortController();
+
+    const privateEngine = engine as unknown as {
+      executePendingCompactionCore: (params: unknown) => Promise<unknown>;
+    };
+    await privateEngine.executePendingCompactionCore({
+      conversationId: conversation.conversationId,
+      sessionId,
+      tokenBudget: 4_096,
+      currentTokenCount: 9_000,
+      sessionQueueHeld: true,
+      publishPolicy: "prepare-only",
+      maxPendingSteps: 2,
+      legacyParams: { summarize },
+      abortSignal: controller.signal,
+    });
+
+    expect(summarize).toHaveBeenCalledWith(
+      expect.any(String),
+      false,
+      expect.objectContaining({ abortSignal: controller.signal }),
+    );
+  });
+
   it("manual compact keeps threshold debt pending after a partial pending publish", async () => {
     const complete = vi.fn(async () => ({
       content: [{ type: "text", text: "prepared summary" }],

@@ -88,7 +88,7 @@ import {
   type TranscriptSyncRequest,
 } from "./transcript-delta-sync.js";
 import { SummaryStore, type ContextItemRecord } from "./store/summary-store.js";
-import { createLcmSummarizeFromLegacyParams, FALLBACK_SUMMARY_MARKER, LcmProviderAuthError, LcmRuntimeLifecycleError, LcmRuntimeLlmPolicyError, LcmRuntimeLlmUnavailableError, LcmSummarySpendLimitError, type LcmSummarizeFn } from "./summarize.js";
+import { createLcmSummarizeFromLegacyParams, FALLBACK_SUMMARY_MARKER, withSummarizeAbortSignal, LcmProviderAuthError, LcmRuntimeLifecycleError, LcmRuntimeLlmPolicyError, LcmRuntimeLlmUnavailableError, LcmSummarySpendLimitError, type LcmSummarizeFn } from "./summarize.js";
 import type {
   LcmDependencies,
   SessionTranscriptReadTarget,
@@ -1716,7 +1716,7 @@ export class LcmContextEngine implements ContextEngine {
       conversationStore: this.conversationStore,
       summaryStore: this.summaryStore,
       pendingSummaryStore: this.pendingSummaryStore,
-      summarize: resolvedSummarizer.summarize,
+      summarize: withSummarizeAbortSignal(resolvedSummarizer.summarize, params.abortSignal),
       model: resolvedSummarizer.summaryModel,
       leaseOwner: `engine:${params.sessionId}`,
       ...(withPublishLock ? { withPublishLock } : {}),
@@ -2117,7 +2117,7 @@ export class LcmContextEngine implements ContextEngine {
       }
     }
     let summaryAttempts = 0;
-    const { summarize, summaryModel, breakerKey } = await this.resolveSummarize({
+    const { summarize: resolvedSummarize, summaryModel, breakerKey } = await this.resolveSummarize({
       legacyParams: this.buildSummarizerLegacyParams({
         legacyParams,
         sessionKey: params.sessionKey,
@@ -2128,6 +2128,7 @@ export class LcmContextEngine implements ContextEngine {
         summaryAttempts += 1;
       },
     });
+    const summarize = withSummarizeAbortSignal(resolvedSummarize, params.abortSignal);
     if (breakerKey && this.compactionGuards.isCircuitBreakerOpen(breakerKey)) {
       return {
         ok: true,
