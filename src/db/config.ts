@@ -114,6 +114,27 @@ export type LcmConfig = {
    * Default false; flag-flip is reversible at runtime.
    */
   stubLargeToolPayloads: boolean;
+  /**
+   * Step 5 — externalize oversized one-shot tool results (exec output, log
+   * dumps, …) in the live assemble pre-flight: the full payload is written to
+   * `largeFilesDir` and only a self-describing stub stays in context.
+   *
+   * Deliberately NOT applied at ingest: the persisted row keeps its full
+   * text, so a payload is moved to disk only when assembly actually needs
+   * the space. Default false. When false every existing path (including the
+   * legacy `largeFileTokenThreshold` ingest intercept and the
+   * `stubLargeToolPayloads` assemble path) is byte-for-byte unchanged.
+   */
+  toolResultExternalization?: boolean;
+  /**
+   * Step 5 — token threshold above which a tool result is externalized in
+   * the live assemble pre-flight. Only consulted when
+   * `toolResultExternalization` is true; ignored otherwise so the default
+   * configuration is unchanged. Default 4000: the stub is ~460 tokens, so
+   * the stub is ~11% of what it replaces (~9x cheaper); below that the
+   * pointer starts eating the budget it is meant to save.
+   */
+  toolResultExternalizationTokenThreshold?: number;
   newSessionRetainDepth: number;
   leafMinFanout: number;
   condensedMinFanout: number;
@@ -710,6 +731,19 @@ export function resolveLcmConfigWithDiagnostics(
         env.LCM_STUB_LARGE_TOOL_PAYLOADS !== undefined
           ? env.LCM_STUB_LARGE_TOOL_PAYLOADS === "true"
           : toBool(pc.stubLargeToolPayloads) ?? false,
+      // Step 5 — tool-result externalization. Default false so the existing
+      // ingest/assemble paths are untouched unless explicitly enabled.
+      toolResultExternalization:
+        env.LCM_TOOL_RESULT_EXTERNALIZATION !== undefined
+          ? env.LCM_TOOL_RESULT_EXTERNALIZATION === "true"
+          : toBool(pc.toolResultExternalization) ?? false,
+      toolResultExternalizationTokenThreshold:
+        parseFiniteInt(env.LCM_TOOL_RESULT_EXTERNALIZATION_THRESHOLD)
+          ?? toNumber(pc.toolResultExternalizationTokenThreshold)
+          // 4000 is measured, not arbitrary: the stub is ~460 tokens, so at
+          // 4000 the stub is ~11% of what it replaces (~9x cheaper). Below
+          // that the pointer starts eating the budget it is meant to save.
+          ?? 4000,
       newSessionRetainDepth:
         parseFiniteInt(env.LCM_NEW_SESSION_RETAIN_DEPTH)
           ?? toNumber(pc.newSessionRetainDepth) ?? 2,
