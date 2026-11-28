@@ -18,8 +18,8 @@ lossless-claw 支援**主模型與摘要模型分離**：
 | 角色 | 模型範例 | 說明 |
 |------|---------|------|
 | 主模型 | Claude Opus / Sonnet | 處理對話 |
-| LCM 摘要 | MiniMax M2.7 HS | 生成摘要，節省成本 |
-| LCM 展開 | MiniMax M2.7 HS | 展開摘要細節 |
+| LCM 摘要 | MiniMax-M3.1-Flash | 生成摘要，節省成本 |
+| LCM 展開 | MiniMax-M3.1-Flash | 展開摘要細節 |
 
 ## 快速開始
 
@@ -35,7 +35,7 @@ openclaw plugins enable lossless-claw
 # "plugins": { "slots": { "contextEngine": "lossless-claw" } }
 ```
 
-### 配置範例（混搭 MiniMax M2.7 HS）
+### 配置範例（混搭 MiniMax-M3.1-Flash）
 
 ```json
 {
@@ -46,9 +46,9 @@ openclaw plugins enable lossless-claw
     "entries": {
       "lossless-claw": {
         "config": {
-          "summaryModel": "minimax/MiniMax-M2.7-highspeed",
+          "summaryModel": "minimax/MiniMax-M3.1-Flash",
           "summaryProvider": "minimax",
-          "expansionModel": "minimax/MiniMax-M2.7-highspeed",
+          "expansionModel": "minimax/MiniMax-M3.1-Flash",
           "expansionProvider": "minimax",
           "contextThreshold": 0.75
         }
